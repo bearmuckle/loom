@@ -167,6 +167,8 @@ const MAX_SEARCH_CONTEXT_LINES: usize = 5;
 const DEFAULT_LIST_MAX_ENTRIES: usize = 1_000;
 const MAX_LIST_MAX_ENTRIES: usize = 10_000;
 const MAX_LIST_DEPTH: usize = 32;
+/// Cap for a scoped (single-subtree) listing used by search and glob tools.
+const MAX_SCOPED_LIST_ENTRIES: usize = 100_000;
 
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const MIN_COMMAND_TIMEOUT_MS: u64 = 100;
@@ -692,8 +694,8 @@ impl ToolExecutor {
         };
         let mut files = Vec::new();
         let mut truncated = false;
-        let entries = match self.workspace.snapshot() {
-            Ok(snapshot) => snapshot.entries,
+        let entries = match self.workspace.list(relative, None, MAX_SCOPED_LIST_ENTRIES) {
+            Ok(entries) => entries,
             Err(error) => return ToolResult::failure(call, error.message),
         };
         for entry in entries {
@@ -1251,9 +1253,8 @@ impl ToolExecutor {
         let mut truncated = false;
         for entry in self
             .workspace
-            .snapshot()
+            .list(requested_relative, None, MAX_SCOPED_LIST_ENTRIES)
             .map_err(|error| error.message)?
-            .entries
         {
             if entry.kind != loom_workspace::WorkspaceEntryKind::File {
                 continue;
@@ -1291,9 +1292,8 @@ impl ToolExecutor {
         let mut truncated = false;
         for entry in self
             .workspace
-            .snapshot()
+            .list(requested_relative, None, MAX_SCOPED_LIST_ENTRIES)
             .map_err(|error| error.message)?
-            .entries
         {
             if entry.kind != loom_workspace::WorkspaceEntryKind::File {
                 continue;
@@ -2287,7 +2287,12 @@ mod tests {
         let workspace = Workspace::open(AgentSessionId::new(), &root).unwrap();
         workspace.mount_directory("sources/local", &source).unwrap();
         let executor = ToolExecutor::new_with_workspace(workspace);
-        let listed = executor.execute(&call("list_files", serde_json::json!({"path": "."})));
+        // Attached directories are opaque from the root, so the tool lists the
+        // mount explicitly to see its contents.
+        let listed = executor.execute(&call(
+            "list_files",
+            serde_json::json!({"path": "sources/local"}),
+        ));
         assert!(listed.output.contains("sources/local/note.txt"));
         let read = executor.execute(&call(
             "read_file",

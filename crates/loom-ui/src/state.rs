@@ -408,8 +408,10 @@ impl SystemNote {
     }
 }
 
-/// Appends streamed assistant text. Once a turn has ended with a tool call,
-/// further text starts a fresh turn so each response reads as its own message.
+/// Appends streamed assistant text. The model's tool-using cycles belong to one
+/// agent response, so text after a tool call continues the same turn; only a
+/// different timeline item (a user message, plan, or system note) starts a new
+/// one.
 pub(crate) fn push_assistant_text(timeline: &mut Vec<TimelineItem>, text: &str) {
     if text.is_empty() {
         return;
@@ -419,7 +421,9 @@ pub(crate) fn push_assistant_text(timeline: &mut Vec<TimelineItem>, text: &str) 
         Some(TimelineItem::Assistant(turn))
             if matches!(
                 turn.parts.last(),
-                None | Some(AssistantPart::Text(_)) | Some(AssistantPart::Reasoning(_))
+                None | Some(AssistantPart::Text(_))
+                    | Some(AssistantPart::Reasoning(_))
+                    | Some(AssistantPart::Tool(_))
             )
     );
     if starts_new_turn {
@@ -446,7 +450,9 @@ pub(crate) fn push_assistant_reasoning(timeline: &mut Vec<TimelineItem>, text: &
         Some(TimelineItem::Assistant(turn))
             if matches!(
                 turn.parts.last(),
-                None | Some(AssistantPart::Text(_)) | Some(AssistantPart::Reasoning(_))
+                None | Some(AssistantPart::Text(_))
+                    | Some(AssistantPart::Reasoning(_))
+                    | Some(AssistantPart::Tool(_))
             )
     );
     if starts_new_turn {
@@ -768,37 +774,42 @@ mod tests {
     }
 
     #[test]
-    fn assistant_deltas_merge_and_restart_after_a_tool_part() {
+    fn assistant_deltas_merge_across_a_tool_part() {
         let mut timeline = Vec::new();
         push_assistant_text(&mut timeline, "Hello ");
         push_assistant_text(&mut timeline, "world");
         assert_eq!(timeline.len(), 1);
-        let TimelineItem::Assistant(turn) = &timeline[0] else {
-            panic!("expected assistant turn");
-        };
-        assert!(turn.streaming);
-        assert_eq!(
-            turn.parts,
-            vec![AssistantPart::Text("Hello world".to_owned())]
-        );
+        {
+            let TimelineItem::Assistant(turn) = &timeline[0] else {
+                panic!("expected assistant turn");
+            };
+            assert!(turn.streaming);
+            assert_eq!(
+                turn.parts,
+                vec![AssistantPart::Text("Hello world".to_owned())]
+            );
+        }
 
         upsert_tool_part(
             &mut timeline,
             tool(ToolCallId::new(), "read_file", ToolPartStatus::Queued),
         );
         push_assistant_text(&mut timeline, "Next response");
-        assert_eq!(timeline.len(), 2);
-        let TimelineItem::Assistant(second) = &timeline[1] else {
-            panic!("expected second assistant turn");
+        // A tool-using response stays one agent entry, so text after a tool
+        // continues the same turn instead of opening a new one.
+        assert_eq!(timeline.len(), 1);
+        let TimelineItem::Assistant(turn) = &timeline[0] else {
+            panic!("expected one assistant turn");
         };
-        assert_eq!(
-            second.parts,
-            vec![AssistantPart::Text("Next response".to_owned())]
-        );
+        assert_eq!(turn.parts.len(), 3);
+        assert!(matches!(turn.parts[0], AssistantPart::Text(ref text) if text == "Hello world"));
+        assert!(matches!(turn.parts[1], AssistantPart::Tool(_)));
+        assert!(matches!(turn.parts[2], AssistantPart::Text(ref text) if text == "Next response"));
+        assert!(turn.streaming);
     }
 
     #[test]
-    fn tool_updates_find_the_existing_part_across_interleaved_items() {
+    fn tool_updates_find_the_existing_part_within_one_turn() {
         let id = ToolCallId::new();
         let mut timeline = Vec::new();
         upsert_tool_part(&mut timeline, tool(id, "read_file", ToolPartStatus::Queued));
@@ -807,7 +818,7 @@ mod tests {
         completed.output = Some("file contents".to_owned());
         completed.elapsed_ms = Some(12);
         upsert_tool_part(&mut timeline, completed.clone());
-        assert_eq!(timeline.len(), 2);
+        assert_eq!(timeline.len(), 1);
 
         let parts = timeline
             .iter()
@@ -823,7 +834,7 @@ mod tests {
         assert_eq!(part.status, ToolPartStatus::Completed);
         assert_eq!(part.output.as_deref(), Some("file contents"));
         assert_eq!(part.elapsed_ms, Some(12));
-        assert!(!parts.iter().any(|_| false));
+        assert!(matches!(parts[1], AssistantPart::Text(text) if text == "Working on it"));
     }
 
     #[test]
@@ -842,6 +853,29 @@ mod tests {
                 AssistantPart::Reasoning("Considering options.".to_owned()),
                 AssistantPart::Text("Here is the answer.".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn reasoning_after_a_tool_continues_the_same_turn() {
+        let mut timeline = Vec::new();
+        push_assistant_reasoning(&mut timeline, "first thought");
+        upsert_tool_part(
+            &mut timeline,
+            tool(ToolCallId::new(), "read_file", ToolPartStatus::Completed),
+        );
+        push_assistant_reasoning(&mut timeline, "second thought");
+        assert_eq!(timeline.len(), 1);
+        let TimelineItem::Assistant(turn) = &timeline[0] else {
+            panic!("expected one assistant turn");
+        };
+        assert_eq!(turn.parts.len(), 3);
+        assert!(
+            matches!(turn.parts[0], AssistantPart::Reasoning(ref text) if text == "first thought")
+        );
+        assert!(matches!(turn.parts[1], AssistantPart::Tool(_)));
+        assert!(
+            matches!(turn.parts[2], AssistantPart::Reasoning(ref text) if text == "second thought")
         );
     }
 

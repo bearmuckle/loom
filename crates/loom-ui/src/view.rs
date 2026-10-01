@@ -246,8 +246,7 @@ pub(crate) fn command_palette_icon() -> AssetIconName {
 
 #[cfg(not(target_family = "wasm"))]
 use crate::connection::{
-    list_models, list_usable_provider_ids, negotiate, set_workspace_config, start_run,
-    worker_node_status, workspace_config,
+    list_models, negotiate, set_workspace_config, start_run, worker_node_status, workspace_config,
 };
 #[cfg(target_family = "wasm")]
 use crate::{
@@ -457,6 +456,9 @@ pub(crate) struct LoomView {
     node_model_provider_names: BTreeMap<String, BTreeMap<ModelId, String>>,
     model_catalog_node_id: Option<String>,
     model_refreshes_in_flight: BTreeSet<String>,
+    /// Wall-clock time of the last model-catalog refresh per node. Used to
+    /// throttle on-demand provider discovery from the model selection.
+    model_catalog_refreshed_at: BTreeMap<String, Timestamp>,
     model_select: Option<Entity<ModelSelectState>>,
     default_model_select: Option<Entity<ModelSelectState>>,
     model_select_subscription: Option<Subscription>,
@@ -477,6 +479,9 @@ pub(crate) struct LoomView {
     provider_setup_status: BTreeMap<loom_model::ProviderId, String>,
     pub(crate) theme_choice: ThemeChoice,
     font_scale_percent: u16,
+    /// Whether provider reasoning is shown in the transcript. Off by default;
+    /// this is presentation-only and never changes what is sent to providers.
+    pub(crate) show_reasoning: bool,
     appearance_subscription: Option<Subscription>,
     /// App-wide keystroke interceptor for shortcuts that must work regardless
     /// of which element (if any) holds focus.
@@ -494,6 +499,7 @@ pub(crate) struct LoomView {
     pub(crate) activity_records: BTreeMap<ActivityId, AgentActivityRecord>,
     pub(crate) expanded_tools: BTreeSet<ToolCallId>,
     pub(crate) expanded_tool_groups: BTreeSet<u64>,
+    pub(crate) expanded_tool_usage: BTreeSet<u64>,
     pub(crate) expanded_reasoning: BTreeSet<u64>,
     pub(crate) approval_request_in_flight: bool,
     approval_settings_request_in_flight: bool,
@@ -1279,6 +1285,7 @@ impl LoomView {
             node_model_provider_names: BTreeMap::new(),
             model_catalog_node_id: Some(node_id),
             model_refreshes_in_flight: BTreeSet::new(),
+            model_catalog_refreshed_at: BTreeMap::new(),
             model_select: None,
             default_model_select: None,
             model_select_subscription: None,
@@ -1299,6 +1306,7 @@ impl LoomView {
             provider_setup_status: BTreeMap::new(),
             theme_choice: ThemeChoice::System,
             font_scale_percent: DEFAULT_FONT_SCALE_PERCENT,
+            show_reasoning: false,
             appearance_subscription: None,
             shortcut_interceptor: None,
             after_sequence: None,
@@ -1314,6 +1322,7 @@ impl LoomView {
             activity_records: BTreeMap::new(),
             expanded_tools: BTreeSet::new(),
             expanded_tool_groups: BTreeSet::new(),
+            expanded_tool_usage: BTreeSet::new(),
             expanded_reasoning: BTreeSet::new(),
             approval_request_in_flight: false,
             approval_settings_request_in_flight: false,

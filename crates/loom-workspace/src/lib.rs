@@ -111,7 +111,8 @@ struct WorkspaceState {
     control: WorkspaceControl,
     checkpoints: BTreeMap<CheckpointId, Checkpoint>,
     edits: Vec<EditRecord>,
-    watcher_snapshot: Option<SessionFilesystemSnapshot>,
+    /// Highest change sequence already returned by [`Workspace::poll_changes`].
+    polled_sequence: EventSequence,
     next_sequence: EventSequence,
     changes: Vec<SessionFilesystemChange>,
     generation: u64,
@@ -212,7 +213,7 @@ impl Workspace {
     fn open_inner(
         session_id: AgentSessionId,
         requested: PathBuf,
-        scan_initial: bool,
+        _scan_initial: bool,
     ) -> Result<Self> {
         let root = Self::canonical_root(&requested)?;
         let workspace = Self {
@@ -223,7 +224,7 @@ impl Workspace {
                     control: WorkspaceControl::Agent,
                     checkpoints: BTreeMap::new(),
                     edits: Vec::new(),
-                    watcher_snapshot: None,
+                    polled_sequence: EventSequence::default(),
                     next_sequence: EventSequence::default(),
                     changes: Vec::new(),
                     generation: 1,
@@ -235,10 +236,6 @@ impl Workspace {
                 mounts: Mutex::new(BTreeMap::new()),
             }),
         };
-        if scan_initial {
-            let snapshot = workspace.snapshot()?;
-            workspace.lock_state()?.watcher_snapshot = Some(snapshot);
-        }
         Ok(workspace)
     }
 
@@ -658,11 +655,11 @@ impl Workspace {
         state.delta = WorkspaceStateDelta::default();
         state.delta_batches.clear();
         state.next_sequence = persisted.next_sequence;
+        state.polled_sequence = persisted.next_sequence;
         state.changes = persisted.changes;
         // Restored state is the durable baseline in this process.
         state.generation = 0;
         state.persisted_generation = 0;
-        state.watcher_snapshot = Some(self.snapshot()?);
         Ok(())
     }
 
@@ -676,16 +673,24 @@ impl Workspace {
 
     pub fn snapshot(&self) -> Result<SessionFilesystemSnapshot> {
         let mut entries = Vec::new();
-        self.collect_entries(&self.inner.root, Path::new("."), &mut entries)?;
+        self.collect_entries(
+            &self.inner.root,
+            Path::new("."),
+            None,
+            MAX_SNAPSHOT_ENTRIES,
+            &mut entries,
+        )?;
+        // Attached directories are opaque here: listing the workspace root must
+        // not walk arbitrarily large mount sources. Callers that need a mount's
+        // contents use [`Self::list`] with an explicit path inside it.
         for (relative, source) in self.mounted_directories()? {
             entries.push(WorkspaceEntry {
-                path: relative.clone(),
+                path: relative,
                 kind: WorkspaceEntryKind::Directory,
                 size: 0,
                 modified_at: modified_at(&source),
                 revision: "directory".to_owned(),
             });
-            self.collect_entries(&source, Path::new(&relative), &mut entries)?;
         }
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(SessionFilesystemSnapshot {
@@ -694,6 +699,61 @@ impl Workspace {
             captured_at: Timestamp::now(),
             entries,
         })
+    }
+
+    /// Metadata-only listing of an explicitly requested subtree.
+    ///
+    /// Unlike [`Self::snapshot`], this resolves through mounted directories, so a
+    /// caller can walk a single project without walking every other mount.
+    /// `depth` limits how many levels below `relative` are returned (`None`
+    /// returns the whole subtree) and `limit` caps the number of entries.
+    pub fn list(
+        &self,
+        relative: &str,
+        depth: Option<usize>,
+        limit: usize,
+    ) -> Result<Vec<WorkspaceEntry>> {
+        let requested = self.resolve_relative(relative, false)?;
+        let (base, display_base) = self.scoped_base(relative)?;
+        let suffix = requested.strip_prefix(&base).unwrap_or(Path::new(""));
+        let display_prefix = display_base.join(suffix);
+        let mut entries = Vec::new();
+        self.collect_entries(
+            &requested,
+            &display_prefix,
+            depth,
+            limit.max(1),
+            &mut entries,
+        )?;
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(entries)
+    }
+
+    /// Resolves the absolute base and workspace-relative prefix for a scoped
+    /// listing. A path inside an attached directory is rooted at that mount's
+    /// source; everything else is rooted at the workspace root.
+    fn scoped_base(&self, relative: &str) -> Result<(PathBuf, PathBuf)> {
+        let path = Path::new(relative);
+        let mount = self
+            .mounted_directories()?
+            .into_iter()
+            .filter(|(mount_path, _)| path.starts_with(mount_path))
+            .max_by_key(|(mount_path, _)| mount_path.len());
+        if let Some((mount_path, source)) = mount {
+            let source = fs::canonicalize(&source).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::WorkspaceAccessDenied,
+                    format!(
+                        "could not resolve mount source '{}': {error}",
+                        source.display()
+                    ),
+                    false,
+                )
+            })?;
+            Ok((source, PathBuf::from(mount_path)))
+        } else {
+            Ok((self.inner.root.clone(), PathBuf::new()))
+        }
     }
 
     pub fn read_file(&self, relative: &str) -> Result<SessionFilesystemFile> {
@@ -755,6 +815,7 @@ impl Workspace {
             ));
         }
         let path = self.resolve_relative(relative, true)?;
+        let existed = path.exists();
         let before_bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
@@ -812,6 +873,15 @@ impl Workspace {
             source,
         });
         state.next_edit_id = edit_id.saturating_add(1);
+        self.record_change(
+            &mut state,
+            relative,
+            if existed {
+                WorkspaceChangeKind::Modified
+            } else {
+                WorkspaceChangeKind::Created
+            },
+        );
         Self::advance_generation(&mut state);
         Ok(WorkspaceByteWriteResult {
             path: relative.to_owned(),
@@ -855,6 +925,7 @@ impl Workspace {
         };
         let before_content = before.clone().unwrap_or_default();
         let before_revision = revision(&before_content);
+        let created = before.is_none();
         if let Some(expected) = edit.expected_revision.as_deref()
             && expected != before_revision
         {
@@ -916,6 +987,12 @@ impl Workspace {
             source,
         });
         state.next_edit_id = edit_id.saturating_add(1);
+        let kind = if created {
+            WorkspaceChangeKind::Created
+        } else {
+            WorkspaceChangeKind::Modified
+        };
+        self.record_change(&mut state, &edit.path, kind);
         if source == WorkspaceControl::Agent {
             let mut changed_checkpoints = Vec::new();
             for checkpoint in state.checkpoints.values_mut() {
@@ -1078,6 +1155,15 @@ impl Workspace {
                 source: WorkspaceControl::User,
             });
             state.next_edit_id = edit_id.saturating_add(1);
+            self.record_change(
+                &mut state,
+                &relative,
+                if existed {
+                    WorkspaceChangeKind::Modified
+                } else {
+                    WorkspaceChangeKind::Deleted
+                },
+            );
             Self::advance_generation(&mut state);
         }
         Ok(RevertResult {
@@ -1118,6 +1204,7 @@ impl Workspace {
                 edit.path
             )));
         }
+        let had_before = edit.before.is_some() || edit.before_bytes.is_some();
         match edit.before {
             Some(before) => fs::write(&path, &before),
             None => match edit.before_bytes {
@@ -1140,6 +1227,15 @@ impl Workspace {
         })?;
         state.edits.remove(index);
         state.delta.deleted_edits.push(edit.id);
+        self.record_change(
+            &mut state,
+            &edit.path,
+            if had_before {
+                WorkspaceChangeKind::Modified
+            } else {
+                WorkspaceChangeKind::Deleted
+            },
+        );
         let content = match fs::read_to_string(&path) {
             Ok(content) => content,
             Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
@@ -1167,58 +1263,27 @@ impl Workspace {
         })
     }
 
-    pub fn poll_changes(&self) -> Result<Vec<SessionFilesystemChange>> {
-        let current = self.snapshot()?;
-        let mut state = self.lock_state()?;
-        let previous = state
-            .watcher_snapshot
-            .replace(current.clone())
-            .unwrap_or_else(|| current.clone());
-        let before = previous
-            .entries
-            .into_iter()
-            .map(|entry| (entry.path.clone(), entry))
-            .collect::<BTreeMap<_, _>>();
-        let after = current
-            .entries
-            .into_iter()
-            .map(|entry| (entry.path.clone(), entry))
-            .collect::<BTreeMap<_, _>>();
-        let paths = before
-            .keys()
-            .chain(after.keys())
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let mut changes = Vec::new();
-        for path in paths {
-            let kind = match (before.get(&path), after.get(&path)) {
-                (None, Some(_)) => Some(WorkspaceChangeKind::Created),
-                (Some(_), None) => Some(WorkspaceChangeKind::Deleted),
-                (Some(previous), Some(current)) if previous.revision != current.revision => {
-                    Some(WorkspaceChangeKind::Modified)
-                }
-                _ => None,
-            };
-            if let Some(kind) = kind {
-                state.next_sequence = state.next_sequence.next();
-                let change = SessionFilesystemChange {
-                    sequence: state.next_sequence,
-                    session_id: self.inner.session_id,
-                    path: path.clone(),
-                    kind,
-                    revision: after.get(&path).map(|entry| entry.revision.clone()),
-                };
-                state.changes.push(change.clone());
-                changes.push(change);
-            }
-        }
-        let retained_before = state
+    /// Records a workspace change caused by an explicit edit.
+    ///
+    /// Change tracking is event-sourced: Loom edits are the source of truth, so
+    /// no snapshot diffing (and therefore no tree walk) is performed.
+    fn record_change(&self, state: &mut WorkspaceState, path: &str, kind: WorkspaceChangeKind) {
+        let before = state
             .changes
             .iter()
             .map(|change| change.sequence)
             .collect::<BTreeSet<_>>();
+        state.next_sequence = state.next_sequence.next();
+        let change = SessionFilesystemChange {
+            sequence: state.next_sequence,
+            session_id: self.inner.session_id,
+            path: path.to_owned(),
+            kind,
+            revision: None,
+        };
+        state.changes.push(change.clone());
         trim_filesystem_change_history(&mut state.changes);
-        let retained_after = state
+        let retained = state
             .changes
             .iter()
             .map(|change| change.sequence)
@@ -1226,10 +1291,22 @@ impl Workspace {
         state
             .delta
             .deleted_changes
-            .extend(retained_before.difference(&retained_after).copied());
-        state.delta.changes.extend(changes.iter().cloned());
-        if !changes.is_empty() {
-            Self::advance_generation(&mut state);
+            .extend(before.difference(&retained).copied());
+        state.delta.changes.push(change);
+    }
+
+    /// Returns changes recorded since the previous poll. This no longer walks
+    /// the tree: changes are appended by [`Self::record_change`] as edits land.
+    pub fn poll_changes(&self) -> Result<Vec<SessionFilesystemChange>> {
+        let mut state = self.lock_state()?;
+        let changes = state
+            .changes
+            .iter()
+            .filter(|change| change.sequence > state.polled_sequence)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(last) = changes.last() {
+            state.polled_sequence = last.sequence;
         }
         Ok(changes)
     }
@@ -1238,7 +1315,6 @@ impl Workspace {
         &self,
         after: Option<EventSequence>,
     ) -> Result<Vec<SessionFilesystemChange>> {
-        let _ = self.poll_changes()?;
         Ok(self
             .lock_state()?
             .changes
@@ -1252,8 +1328,11 @@ impl Workspace {
         &self,
         path: &Path,
         relative: &Path,
+        max_depth: Option<usize>,
+        limit: usize,
         entries: &mut Vec<WorkspaceEntry>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let max_depth = max_depth.unwrap_or(usize::MAX);
         let mut walker = WalkBuilder::new(path);
         walker
             .hidden(false)
@@ -1263,7 +1342,9 @@ impl Workspace {
             .git_exclude(false)
             .parents(false)
             .ignore(false)
-            .filter_entry(|entry| !is_ignored_directory(entry.file_name()));
+            .filter_entry(move |entry| {
+                entry.depth() <= max_depth && !is_ignored_directory(entry.file_name())
+            });
 
         for entry in walker.build() {
             let entry = entry.map_err(|error| {
@@ -1277,12 +1358,8 @@ impl Workspace {
             if child_path == path {
                 continue;
             }
-            if entries.len() >= MAX_SNAPSHOT_ENTRIES {
-                return Err(LoomError::new(
-                    ErrorCode::ToolExecution,
-                    format!("workspace snapshot exceeds {MAX_SNAPSHOT_ENTRIES} entries"),
-                    false,
-                ));
+            if entries.len() >= limit {
+                return Ok(true);
             }
             let child_relative = child_path.strip_prefix(path).map_err(|error| {
                 LoomError::new(
@@ -1301,33 +1378,37 @@ impl Workspace {
             if file_type.is_symlink() {
                 continue;
             }
-            let path = display_relative(&relative.join(child_relative));
+            let display = display_relative(&relative.join(child_relative));
             if file_type.is_dir() {
                 entries.push(WorkspaceEntry {
-                    path,
+                    path: display,
                     kind: WorkspaceEntryKind::Directory,
                     size: 0,
                     modified_at: modified_at(child_path),
                     revision: "directory".to_owned(),
                 });
             } else if file_type.is_file() {
-                let content = fs::read(child_path).map_err(|error| {
+                let metadata = entry.metadata().map_err(|error| {
                     LoomError::new(
                         ErrorCode::ToolExecution,
-                        format!("could not read '{}': {error}", child_relative.display()),
+                        format!("could not inspect '{}': {error}", child_relative.display()),
                         false,
                     )
                 })?;
+                // Listing is metadata-only. Reading file contents here made
+                // snapshots of an attached directory read and hash every byte
+                // under it; content hashes are only needed when a caller reads
+                // a file or captures an edit.
                 entries.push(WorkspaceEntry {
-                    path,
+                    path: display,
                     kind: WorkspaceEntryKind::File,
-                    size: content.len() as u64,
+                    size: metadata.len(),
                     modified_at: modified_at(child_path),
-                    revision: revision_bytes(&content),
+                    revision: entry_fingerprint(&metadata),
                 });
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     fn resolve_relative(&self, relative: &str, allow_missing: bool) -> Result<PathBuf> {
@@ -1480,6 +1561,18 @@ fn modified_at(path: &Path) -> Option<Timestamp> {
         .ok()
         .and_then(|duration| duration.as_millis().try_into().ok())
         .map(Timestamp::from_unix_millis)
+}
+
+/// Cheap metadata-only revision used for listings. It intentionally does not
+/// read file contents; callers that need a content hash read the file.
+fn entry_fingerprint(metadata: &fs::Metadata) -> String {
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{}:{}", metadata.len(), modified_nanos)
 }
 
 fn revision(content: &str) -> String {
@@ -1696,20 +1789,47 @@ mod tests {
         let watcher = workspace.watch();
         assert!(watcher.poll().unwrap().is_empty());
 
-        fs::write(root.join("new.txt"), "created").unwrap();
+        // Creation through an agent edit.
+        workspace
+            .apply_edit(WorkspaceEdit {
+                path: "new.txt".to_owned(),
+                old_text: String::new(),
+                new_text: "created".to_owned(),
+                expected_revision: None,
+            })
+            .unwrap();
         let created = watcher.poll().unwrap();
         assert_eq!(created.len(), 1);
         assert_eq!(created[0].path, "new.txt");
         assert_eq!(created[0].kind, WorkspaceChangeKind::Created);
 
-        fs::write(root.join("new.txt"), "updated").unwrap();
-        let modified = watcher.events_since(Some(created[0].sequence)).unwrap();
+        // Modification through a second agent edit.
+        workspace
+            .apply_edit(WorkspaceEdit {
+                path: "new.txt".to_owned(),
+                old_text: "created".to_owned(),
+                new_text: "updated".to_owned(),
+                expected_revision: None,
+            })
+            .unwrap();
+        let modified = watcher.poll().unwrap();
         assert_eq!(modified.len(), 1);
         assert_eq!(modified[0].kind, WorkspaceChangeKind::Modified);
 
-        fs::remove_file(root.join("new.txt")).unwrap();
+        // A file created and then undone yields a deletion.
+        workspace
+            .apply_edit(WorkspaceEdit {
+                path: "gone.txt".to_owned(),
+                old_text: String::new(),
+                new_text: "temporary".to_owned(),
+                expected_revision: None,
+            })
+            .unwrap();
+        assert_eq!(watcher.poll().unwrap().len(), 1);
+        workspace.undo_last_agent_edit().unwrap();
         let deleted = watcher.poll().unwrap();
         assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].path, "gone.txt");
         assert_eq!(deleted[0].kind, WorkspaceChangeKind::Deleted);
         assert!(deleted[0].revision.is_none());
         assert!(deleted[0].sequence > modified[0].sequence);
@@ -1766,9 +1886,8 @@ mod tests {
         );
         assert!(
             workspace
-                .snapshot()
+                .list("sources/local", None, 1000)
                 .unwrap()
-                .entries
                 .iter()
                 .any(|entry| entry.path == "sources/local/note.txt")
         );

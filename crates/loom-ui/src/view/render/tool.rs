@@ -14,68 +14,42 @@ impl LoomView {
             .child(div().w(px(3.)).h(px(13.)).rounded_full().bg(rgb(0x9ad7bd)))
             .child(div().text_xs().text_color(rgb(0x9ad7bd)).child("Agent"));
         let mut body = div().px_3().py_2().flex().flex_col().gap_1().child(role);
+
+        // Every reasoning part in the response is gathered into one disclosure
+        // at the top of the agent entry, so a tool-using model that thinks
+        // before each call still reads as a single turn.
+        let reasoning = turn
+            .parts
+            .iter()
+            .enumerate()
+            .filter_map(|(part_index, part)| match part {
+                AssistantPart::Reasoning(text) if !text.trim().is_empty() => {
+                    Some((part_index, text.as_str()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if self.show_reasoning && !reasoning.is_empty() {
+            let first_part_index = reasoning[0].0;
+            let combined = reasoning
+                .iter()
+                .map(|(_, text)| text.trim())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            body = body.child(Self::render_reasoning(
+                index,
+                first_part_index,
+                &combined,
+                self.expanded_reasoning
+                    .contains(&tool_element_id(index, first_part_index)),
+                parent,
+            ));
+        }
+
         let mut part_index = 0;
         while part_index < turn.parts.len() {
             match &turn.parts[part_index] {
-                AssistantPart::Reasoning(text) => {
-                    if !text.trim().is_empty() {
-                        let key = tool_element_id(index, part_index);
-                        let expanded = self.expanded_reasoning.contains(&key);
-                        let parent_for_toggle = parent.clone();
-                        let mut block = div()
-                            .id(("reasoning", key))
-                            .test_support()
-                            .flex()
-                            .flex_col()
-                            .pl_2()
-                            .border_l_2()
-                            .border_color(rgb(0x3b4555))
-                            .child(
-                                Button::new(("reasoning-header", key))
-                                    .ghost()
-                                    .small()
-                                    .w_full()
-                                    .accessibility_label("Reasoning")
-                                    .on_click(move |_, _, cx| {
-                                        parent_for_toggle
-                                            .update(cx, |this, cx| this.toggle_reasoning(key, cx));
-                                    })
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .text_xs()
-                                            .child(
-                                                div()
-                                                    .text_color(rgb(0x64748b))
-                                                    .child(if expanded { "⌄" } else { "›" }),
-                                            )
-                                            .child(
-                                                div().text_color(rgb(0x94a3b8)).child("Reasoning"),
-                                            )
-                                            .when(!expanded, |element| {
-                                                element.child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w(px(0.))
-                                                        .truncate()
-                                                        .text_color(rgb(0x64748b))
-                                                        .child(reasoning_preview(text)),
-                                                )
-                                            }),
-                                    ),
-                            );
-                        if expanded {
-                            block = block.child(div().mt_1().child(render_timeline_text(
-                                format!("transcript-reasoning-{index}-{part_index}"),
-                                text.clone(),
-                                0x94a3b8,
-                            )));
-                        }
-                        body = body.child(block);
-                    }
+                AssistantPart::Reasoning(_) => {
                     part_index += 1;
                 }
                 AssistantPart::Text(text) => {
@@ -92,29 +66,24 @@ impl LoomView {
                     }
                     part_index += 1;
                 }
-                AssistantPart::Tool(part) => {
+                AssistantPart::Tool(_) => {
+                    // All tool calls in a response collapse behind one usage
+                    // summary line; expanding it reveals the existing per-tool
+                    // presentation. Reasoning between calls is gathered at the
+                    // top of the entry, so it does not split the run.
                     let mut end = part_index + 1;
                     while end < turn.parts.len() {
                         match &turn.parts[end] {
-                            AssistantPart::Tool(next) if next.name == part.name => end += 1,
+                            AssistantPart::Tool(_) | AssistantPart::Reasoning(_) => end += 1,
                             _ => break,
                         }
                     }
-                    if end - part_index >= TOOL_GROUP_THRESHOLD {
-                        body = body.child(self.render_tool_group(
-                            &turn.parts[part_index..end],
-                            index,
-                            part_index,
-                            parent,
-                        ));
-                    } else {
-                        for offset in part_index..end {
-                            if let Some(AssistantPart::Tool(part)) = turn.parts.get(offset) {
-                                body =
-                                    body.child(self.render_tool_part(part, index, offset, parent));
-                            }
-                        }
-                    }
+                    body = body.child(self.render_tool_usage(
+                        &turn.parts[part_index..end],
+                        index,
+                        part_index,
+                        parent,
+                    ));
                     part_index = end;
                 }
                 AssistantPart::Evidence(links) => {
@@ -131,6 +100,229 @@ impl LoomView {
             body = body.child(streaming_caret(index));
         }
         body.into_any()
+    }
+
+    /// The gathered reasoning disclosure for one agent entry. The caller
+    /// concatenates every reasoning part; the disclosure is keyed by the first
+    /// reasoning part so its expansion state survives re-renders.
+    fn render_reasoning(
+        index: usize,
+        first_part_index: usize,
+        text: &str,
+        expanded: bool,
+        parent: &Entity<LoomView>,
+    ) -> gpui_kit::AnyElement {
+        let key = tool_element_id(index, first_part_index);
+        let parent_for_toggle = parent.clone();
+        let mut block = div()
+            .id(("reasoning", key))
+            .test_support()
+            .flex()
+            .flex_col()
+            .pl_2()
+            .border_l_2()
+            .border_color(rgb(0x3b4555))
+            .child(
+                Button::new(("reasoning-header", key))
+                    .ghost()
+                    .small()
+                    .w_full()
+                    .accessibility_label("Reasoning")
+                    .on_click(move |_, _, cx| {
+                        parent_for_toggle.update(cx, |this, cx| this.toggle_reasoning(key, cx));
+                    })
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_xs()
+                            .child(div().text_color(rgb(0x64748b)).child(if expanded {
+                                "⌄"
+                            } else {
+                                "›"
+                            }))
+                            .child(div().text_color(rgb(0x94a3b8)).child("Reasoning"))
+                            .when(!expanded, |element| {
+                                element.child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .text_color(rgb(0x64748b))
+                                        .child(reasoning_preview(text)),
+                                )
+                            }),
+                    ),
+            );
+        if expanded {
+            block = block.child(div().mt_1().child(render_timeline_text(
+                format!("transcript-reasoning-{index}-{first_part_index}"),
+                text.to_owned(),
+                0x94a3b8,
+            )));
+        }
+        block.into_any()
+    }
+
+    /// One collapsed line for a run of tool calls, summarizing the tools by type
+    /// and invocation count. Expanding it shows the existing per-tool
+    /// presentation. An active run stays open so progress and approval decisions
+    /// remain visible.
+    pub(crate) fn render_tool_usage(
+        &self,
+        parts: &[AssistantPart],
+        index: usize,
+        first_part_index: usize,
+        parent: &Entity<LoomView>,
+    ) -> gpui_kit::AnyElement {
+        let tools = parts
+            .iter()
+            .filter_map(|part| match part {
+                AssistantPart::Tool(tool) => Some(tool.as_ref()),
+                _ => None,
+            })
+            .collect::<Vec<&ToolPart>>();
+        if tools.is_empty() {
+            return div().into_any();
+        }
+        let status = tool_group_status(&tools);
+        let status_color = match status {
+            ToolPartStatus::Failed => rgb(0xfca5a5),
+            ToolPartStatus::Running => rgb(0x93c5fd),
+            ToolPartStatus::Queued | ToolPartStatus::Cancelled => rgb(0x94a3b8),
+            ToolPartStatus::Completed
+            | ToolPartStatus::AwaitingApproval
+            | ToolPartStatus::AwaitingInput => rgb(0x9ad7bd),
+        };
+        let status_label = status.label();
+        let key = tool_element_id(index, first_part_index);
+        let expanded = status == ToolPartStatus::Running || self.expanded_tool_usage.contains(&key);
+        let total_ms = tools.iter().filter_map(|tool| tool.elapsed_ms).sum::<u64>();
+        let duration = (total_ms > 0).then(|| format_duration(total_ms));
+        let summary = tool_usage_summary(&tools);
+        let failed = tool_failure_count(&tools);
+        let failure_note =
+            (failed > 0 && status != ToolPartStatus::Failed).then(|| format!("{failed} failed"));
+        let accessibility_failure = failure_note
+            .as_deref()
+            .map(|note| format!(", {note}"))
+            .unwrap_or_default();
+        let parent_for_toggle = parent.clone();
+        let mut block = div()
+            .id(("tool-usage", key))
+            .test_support()
+            .w_full()
+            .pl_2()
+            .border_l_2()
+            .border_color(status_color.opacity(0.4))
+            .flex()
+            .flex_col()
+            .child(
+                Button::new(("tool-usage-header", key))
+                    .ghost()
+                    .small()
+                    .w_full()
+                    .accessibility_label(format!(
+                        "Tools used: {summary}, {status_label}{accessibility_failure}"
+                    ))
+                    .on_click(move |_, _, cx| {
+                        parent_for_toggle.update(cx, |this, cx| this.toggle_tool_usage(key, cx));
+                    })
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_xs()
+                            .child(
+                                Icon::new(AssetIconName::Wrench)
+                                    .size_4()
+                                    .flex_shrink_0()
+                                    .text_color(status_color),
+                            )
+                            .child(div().text_color(rgb(0x64748b)).child(if expanded {
+                                "⌄"
+                            } else {
+                                "›"
+                            }))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_color(rgb(0xdbeafe))
+                                    .child(summary),
+                            )
+                            .child(div().text_color(status_color).child(status_label))
+                            .when_some(failure_note, |element, note| {
+                                element.child(div().text_color(rgb(0xfca5a5)).child(note))
+                            })
+                            .when_some(duration, |element, duration| {
+                                element.child(div().text_color(rgb(0x64748b)).child(duration))
+                            }),
+                    ),
+            );
+        if expanded {
+            block = block.child(div().mt_1().flex().flex_col().child(self.render_tool_run(
+                parts,
+                index,
+                first_part_index,
+                parent,
+            )));
+        }
+        block.into_any()
+    }
+
+    /// The per-tool presentation shown once the usage summary is expanded:
+    /// same-kind runs of at least `TOOL_GROUP_THRESHOLD` collapse into one group
+    /// row, everything else renders as an individual block, keeping the order in
+    /// which the calls arrived.
+    pub(crate) fn render_tool_run(
+        &self,
+        parts: &[AssistantPart],
+        index: usize,
+        first_part_index: usize,
+        parent: &Entity<LoomView>,
+    ) -> gpui_kit::AnyElement {
+        let mut run = div().flex().flex_col();
+        let mut cursor = 0;
+        while cursor < parts.len() {
+            let Some(AssistantPart::Tool(part)) = parts.get(cursor) else {
+                cursor += 1;
+                continue;
+            };
+            let mut end = cursor + 1;
+            while end < parts.len() {
+                match &parts[end] {
+                    AssistantPart::Tool(next) if next.name == part.name => end += 1,
+                    _ => break,
+                }
+            }
+            if end - cursor >= TOOL_GROUP_THRESHOLD {
+                run = run.child(self.render_tool_group(
+                    &parts[cursor..end],
+                    index,
+                    first_part_index + cursor,
+                    parent,
+                ));
+            } else {
+                for offset in cursor..end {
+                    if let Some(AssistantPart::Tool(part)) = parts.get(offset) {
+                        run = run.child(self.render_tool_part(
+                            part,
+                            index,
+                            first_part_index + offset,
+                            parent,
+                        ));
+                    }
+                }
+            }
+            cursor = end;
+        }
+        run.into_any()
     }
 
     /// One collapsed row for a run of same-kind tool calls, expandable to the
@@ -163,13 +355,20 @@ impl LoomView {
         };
         let status_label = status.label();
         let key = tool_element_id(index, first_part_index);
-        // A running group stays open so progress is visible; a failed group and a
-        // settled group collapse like any other entry and can be reopened.
+        // A running group stays open so progress is visible; a settled group
+        // collapses like any other entry and can be reopened.
         let expanded =
             matches!(status, ToolPartStatus::Running) || self.expanded_tool_groups.contains(&key);
         let total_ms = tools.iter().filter_map(|tool| tool.elapsed_ms).sum::<u64>();
         let duration = (total_ms > 0).then(|| format_duration(total_ms));
         let label = tool_group_label(&first.name, tools.len());
+        let failed = tool_failure_count(&tools);
+        let failure_note =
+            (failed > 0 && status != ToolPartStatus::Failed).then(|| format!("{failed} failed"));
+        let accessibility_failure = failure_note
+            .as_deref()
+            .map(|note| format!(", {note}"))
+            .unwrap_or_default();
         let parent_for_toggle = parent.clone();
         let mut group = div()
             .id(("tool-group", key))
@@ -185,7 +384,7 @@ impl LoomView {
                     .ghost()
                     .small()
                     .w_full()
-                    .accessibility_label(format!("{label}, {status_label}"))
+                    .accessibility_label(format!("{label}, {status_label}{accessibility_failure}"))
                     .on_click(move |_, _, cx| {
                         parent_for_toggle.update(cx, |this, cx| this.toggle_tool_group(key, cx));
                     })
@@ -216,6 +415,9 @@ impl LoomView {
                                     .child(label),
                             )
                             .child(div().text_color(status_color).child(status_label))
+                            .when_some(failure_note, |element, note| {
+                                element.child(div().text_color(rgb(0xfca5a5)).child(note))
+                            })
                             .when_some(duration, |element, duration| {
                                 element.child(div().text_color(rgb(0x64748b)).child(duration))
                             }),

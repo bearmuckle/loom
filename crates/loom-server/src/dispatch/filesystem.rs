@@ -22,8 +22,7 @@ impl InProcessConnection {
                 Ok(ServerResponse::Filesystem(
                     FilesystemResponse::SessionDirectories {
                         directories: self
-                            .session_filesystem(session_id)?
-                            .mounted_directories()?
+                            .session_mounted_directories(session_id)?
                             .into_iter()
                             .map(|(path, source)| SessionDirectory {
                                 path,

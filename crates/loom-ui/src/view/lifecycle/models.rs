@@ -1,67 +1,63 @@
 use super::*;
 
+/// How long a discovered model catalog is considered fresh. On-demand
+/// discovery is skipped until this interval elapses so opening the model
+/// selection does not contact provider APIs on every interaction.
+const MODEL_CATALOG_STALENESS_MILLIS: u64 = 5 * 60 * 1000;
+
 impl LoomView {
-    /// Refreshes the model list. The synchronous variant is only used during
-    /// the startup bootstrap, before the window exists.
+    /// Loads the model catalog cached with the backend during the startup
+    /// bootstrap. Provider model discovery is deliberately not run here so the
+    /// window can open without waiting on provider APIs; discovery happens
+    /// asynchronously on demand via [`Self::refresh_models_on_demand`].
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn refresh_models(&mut self) {
-        let provider_ids = match list_usable_provider_ids(&self.connection) {
-            Ok(provider_ids) => provider_ids,
-            Err(error) => {
-                self.record_status(format!(
-                    "Could not list providers for model refresh: {error}"
-                ));
-                return;
-            }
-        };
         let catalog = match list_models(&self.connection) {
-            Ok(models) => models,
+            Ok(catalog) => catalog,
             Err(error) => {
                 self.record_status(format!("Could not load available models: {error}"));
                 return;
             }
         };
-        let mut provider_names = catalog.provider_names;
-        let mut models = catalog.models;
-        for provider_id in provider_ids {
-            let response = self
-                .connection
-                .request(RequestEnvelope::new(ClientRequest::Provider(
-                    ProviderRequest::DiscoverProviderModels {
-                        provider_id: provider_id.clone(),
-                    },
-                )));
-            match response.result {
-                Ok(ServerResponse::Provider(ProviderResponse::Models { models: discovered })) => {
-                    for model in discovered {
-                        provider_names.insert(
-                            model.id.clone(),
-                            crate::connection::provider_name_for_id(provider_id.as_str()),
-                        );
-                        models.push(model.id);
-                    }
-                }
-                Err(error) => self.record_status(format!(
-                    "Model discovery unavailable for {}: {}",
-                    provider_id.as_str(),
-                    error.message
-                )),
-                Ok(response) => self.record_backend_error(
-                    "model discovery",
-                    unexpected_response("model list", response),
-                ),
-            }
-        }
-        models.sort();
-        models.dedup();
         self.node_model_provider_names
-            .insert(self.default_backend_node_id.clone(), provider_names);
-        self.apply_models(models);
+            .insert(self.default_backend_node_id.clone(), catalog.provider_names);
+        self.apply_models(catalog.models);
+    }
+
+    /// Refreshes the active node's model catalog when the cached catalog is
+    /// stale. Discovery runs off the UI thread, so callers such as opening the
+    /// model selection never block on network access.
+    pub(crate) fn refresh_models_on_demand(&mut self, cx: &mut Context<Self>) {
+        let node_id = self
+            .session_node_ids
+            .get(&self.active_session.id)
+            .cloned()
+            .unwrap_or_else(|| self.default_backend_node_id.clone());
+        let now = Timestamp::now();
+        if let Some(last) = self.model_catalog_refreshed_at.get(&node_id)
+            && now.as_unix_millis().saturating_sub(last.as_unix_millis())
+                < MODEL_CATALOG_STALENESS_MILLIS
+        {
+            return;
+        }
+        self.refresh_models_for_node_async_with(node_id, false, cx);
     }
 
     pub(crate) fn refresh_models_for_node_async(
         &mut self,
         node_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.refresh_models_for_node_async_with(node_id, true, cx);
+    }
+
+    /// Shared discovery path. Explicit refreshes (for example a newly connected
+    /// node) clear the active catalog first; a stale on-demand refresh keeps the
+    /// cached list visible until the fresh catalog arrives.
+    fn refresh_models_for_node_async_with(
+        &mut self,
+        node_id: String,
+        clear_active_models: bool,
         cx: &mut Context<Self>,
     ) {
         let Some(backend) = self.node_backends.get(&node_id).cloned() else {
@@ -79,11 +75,13 @@ impl LoomView {
         if !self.model_refreshes_in_flight.insert(node_id.clone()) {
             return;
         }
+        self.model_catalog_refreshed_at
+            .insert(node_id.clone(), Timestamp::now());
         let active_node_id = self
             .session_node_ids
             .get(&self.active_session.id)
             .map(String::as_str);
-        if active_node_id == Some(node_id.as_str()) {
+        if clear_active_models && active_node_id == Some(node_id.as_str()) {
             self.models.clear();
             self.model_catalog_node_id = None;
             cx.notify();

@@ -79,8 +79,12 @@ impl InProcessConnection {
                 }),
             ),
             ClientRequest::Provider(ProviderRequest::DiscoverProviderModels { provider_id }) => {
+                let models = self.backend.providers.discover_models(&provider_id)?;
+                // Cache the discovered catalog durably so later startups can
+                // serve it without contacting the provider.
+                self.backend.persist_state()?;
                 Ok(ServerResponse::Provider(ProviderResponse::Models {
-                    models: self.backend.providers.discover_models(&provider_id)?,
+                    models,
                 }))
             }
             ClientRequest::Provider(ProviderRequest::GetProviderHealth { provider_id }) => {

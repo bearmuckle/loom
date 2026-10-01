@@ -469,6 +469,14 @@ impl LoomView {
         cx.notify();
     }
 
+    /// Expands or collapses the single summary line for a run of tool calls.
+    pub(crate) fn toggle_tool_usage(&mut self, key: u64, cx: &mut Context<Self>) {
+        if !self.expanded_tool_usage.remove(&key) {
+            self.expanded_tool_usage.insert(key);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn toggle_reasoning(&mut self, key: u64, cx: &mut Context<Self>) {
         if !self.expanded_reasoning.remove(&key) {
             self.expanded_reasoning.insert(key);

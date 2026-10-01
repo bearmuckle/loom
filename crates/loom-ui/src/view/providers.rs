@@ -1083,6 +1083,13 @@ impl LoomView {
         self.apply_appearance(appearance, window, cx);
     }
 
+    /// Toggles whether provider reasoning is shown in the transcript. The
+    /// setting is presentation-only, so it never affects the provider request.
+    pub(crate) fn toggle_show_reasoning(&mut self, cx: &mut Context<Self>) {
+        self.show_reasoning = !self.show_reasoning;
+        cx.notify();
+    }
+
     pub(crate) fn observe_system_appearance(
         &mut self,
         window: &mut Window,

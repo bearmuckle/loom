@@ -1,7 +1,11 @@
 use super::*;
 
 impl LoomView {
-    pub(crate) fn render_model_picker(&self, phone: bool) -> impl IntoElement {
+    pub(crate) fn render_model_picker(
+        &self,
+        phone: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let mut picker = div().flex().items_center();
         if let Some(state) = &self.model_select {
             picker = picker.child(
@@ -10,6 +14,15 @@ impl LoomView {
                     .items_center()
                     .rounded_md()
                     .hover(|style| style.bg(rgb(0x293244)))
+                    // Opening the picker is the on-demand trigger for provider
+                    // model discovery; the refresh itself is throttled and runs
+                    // off the UI thread.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _, _, cx| {
+                            view.refresh_models_on_demand(cx);
+                        }),
+                    )
                     .child(
                         Select::new(state)
                             .id("session-model-select")

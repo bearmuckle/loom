@@ -5,6 +5,43 @@ impl InProcessConnection {
         self.backend.restore_session_filesystem(session_id)
     }
 
+    /// Lists a session's mounted directories without restoring its workspace.
+    ///
+    /// Restoring a workspace captures a baseline snapshot that recursively walks
+    /// every mounted tree. Mounts can point at arbitrarily large directories
+    /// (for example a user's Downloads folder), so a cheap metadata read must not
+    /// trigger that scan. The in-memory mounts are authoritative once a
+    /// workspace is live; otherwise the persisted directory rows are used.
+    pub(crate) fn session_mounted_directories(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<Vec<(String, std::path::PathBuf)>> {
+        if let Some(filesystem) = self.backend.session_filesystems()?.get(&session_id) {
+            return filesystem.mounted_directories();
+        }
+        let persistence = self.backend.persistence.as_ref().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::RecoveryRequired,
+                format!("filesystem for session {session_id} is unavailable"),
+                true,
+            )
+        })?;
+        let record = persistence
+            .load_filesystem_record(session_id)?
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    format!("filesystem for session {session_id} is unavailable"),
+                    true,
+                )
+            })?;
+        Ok(record
+            .directories
+            .into_iter()
+            .map(|directory| (directory.path, std::path::PathBuf::from(directory.source)))
+            .collect())
+    }
+
     pub(crate) fn import_session_directory(
         &self,
         session_id: AgentSessionId,
