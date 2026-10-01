@@ -328,6 +328,7 @@ impl Render for LoomView {
                                 element.child(
                                     Button::new("open-session-drawer")
                                         .label("Projects")
+                                        .small()
                                         .h(layout.control_size())
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.session_drawer_open = true;
@@ -388,7 +389,12 @@ impl Render for LoomView {
                         Button::new("session-sources")
                             .icon(Icon::new(AssetIconName::ListTree))
                             .ghost()
-                            .when(layout.phone, |button| button.with_size(layout.control_size()))
+                            .when(layout.phone, |button| {
+                                button
+                                    .large()
+                                    .h(layout.control_size())
+                                    .w(layout.control_size())
+                            })
                             .when(!layout.phone, |button| button.small())
                             .accessibility_label("Session sources")
                             .dropdown_menu({
@@ -492,22 +498,27 @@ impl Render for LoomView {
                                 }
                             }),
                             ))
-                            .child(header_tooltip("toggle-review-sidebar-tooltip", "Toggle side panel",
-                        Button::new("toggle-review-sidebar")
+                            .child(
+                                Button::new("toggle-review-sidebar")
                             .icon(Icon::new(if self.review.open {
                                 IconName::PanelRightClose
                             } else {
                                 IconName::PanelRightOpen
                             }))
                             .ghost()
-                            .when(layout.phone, |button| button.with_size(layout.control_size()))
+                            .when(layout.phone, |button| {
+                                button
+                                    .large()
+                                    .h(layout.control_size())
+                                    .w(layout.control_size())
+                            })
                             .when(!layout.phone, |button| button.small())
                             .accessibility_label("Toggle side panel")
                             .when(self.review.open, |button| button.secondary())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.toggle_review_pane(cx);
                             })),
-                            )),
+                            ),
                     ),
             )
             .child(
@@ -611,49 +622,49 @@ impl Render for LoomView {
             // Initializes the per-frame selection registry before selectable
             // text participants prepaint and register themselves.
             .child(TextSelectionLayer)
-            .child(
-                div()
-                    .h(px(30.))
-                    .w_full()
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .bg(rgb(0x1b1d24))
-                    .border_b_1()
-                    .border_color(rgb(0x30343f))
-                    .when(cfg!(target_os = "macos"), |element| element.pl(px(72.)))
-                    .child(
-                        div()
-                            .id("window-titlebar-drag")
-                            .flex()
-                            .flex_1()
-                            .items_center()
-                            .gap_2()
-                            .cursor_pointer()
-                            .window_control_area(WindowControlArea::Drag)
-                            .on_mouse_down(MouseButton::Left, |event, window, _| {
-                                if event.click_count == 2 {
-                                    window.zoom_window();
-                                } else {
-                                    window.start_window_move();
-                                }
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(div().text_xs().text_color(rgb(0x8f98a6)).child("Loom"))
-                                    .child(
-                                        div().text_xs().text_color(rgb(0x64748b)).child(
+            .when(!cfg!(target_family = "wasm"), |element| {
+                element.child(
+                    div()
+                        .h(px(30.))
+                        .w_full()
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .bg(rgb(0x1b1d24))
+                        .border_b_1()
+                        .border_color(rgb(0x30343f))
+                        .when(cfg!(target_os = "macos"), |element| element.pl(px(72.)))
+                        .child(
+                            div()
+                                .id("window-titlebar-drag")
+                                .flex()
+                                .flex_1()
+                                .items_center()
+                                .gap_2()
+                                .cursor_pointer()
+                                .window_control_area(WindowControlArea::Drag)
+                                .on_mouse_down(MouseButton::Left, |event, window, _| {
+                                    if event.click_count == 2 {
+                                        window.zoom_window();
+                                    } else {
+                                        window.start_window_move();
+                                    }
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div().text_xs().text_color(rgb(0x8f98a6)).child("Loom"),
+                                        )
+                                        .child(div().text_xs().text_color(rgb(0x64748b)).child(
                                             if self.demo_workspace { "Demo" } else { "Local" },
-                                        ),
-                                    ),
-                            ),
-                    )
-                    .when(!cfg!(target_family = "wasm"), |element| {
-                        element.child(
+                                        )),
+                                ),
+                        )
+                        .child(
                             div().flex().items_center().gap_1().ml_2().child(
                                 div()
                                     .id("window-close")
@@ -669,12 +680,6 @@ impl Render for LoomView {
                                         style.bg(rgb(0x7f1d1d)).text_color(rgb(0xffffff))
                                     })
                                     .cursor_pointer()
-                                    .tooltip(|_, cx| {
-                                        cx.new(|_| LoomTooltip {
-                                            text: "Close window".into(),
-                                        })
-                                        .into()
-                                    })
                                     .window_control_area(WindowControlArea::Close)
                                     .child(Icon::new(IconName::Close).size_4())
                                     .on_mouse_down(MouseButton::Left, |_, window, cx| {
@@ -686,9 +691,9 @@ impl Render for LoomView {
                                         window.remove_window();
                                     }),
                             ),
-                        )
-                    }),
-            )
+                        ),
+                )
+            })
             .child(
                 div()
                     .flex_1()
@@ -719,6 +724,10 @@ impl Render for LoomView {
                                 .bottom(px(0.))
                                 .left(px(0.))
                                 .w(layout.sidebar_width)
+                                // The full-width drawer covers the panes, so it
+                                // must capture taps instead of letting them
+                                // reach the header and timeline behind it.
+                                .occlude()
                                 .shadow_lg()
                                 .child(self.render_session_sidebar(&view, layout, cx)),
                         )

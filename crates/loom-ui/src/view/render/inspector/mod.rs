@@ -53,7 +53,25 @@ impl LoomView {
                     .items_center()
                     .justify_between()
                     .gap_2()
-                    .child(div().text_xs().text_color(rgb(0x93c5fd)).child(title))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .when(layout.phone, |element| {
+                                element.child(
+                                    Button::new("close-inspector")
+                                        .icon(Icon::new(IconName::ChevronLeft))
+                                        .ghost()
+                                        .large()
+                                        .h(layout.control_size())
+                                        .w(layout.control_size())
+                                        .accessibility_label("Back")
+                                        .on_click(cx.listener(Self::close_review)),
+                                )
+                            })
+                            .child(div().text_xs().text_color(rgb(0x93c5fd)).child(title)),
+                    )
                     .child(
                         div()
                             .flex()
@@ -67,14 +85,16 @@ impl LoomView {
                                         .child(self.inspector_status_summary()),
                                 )
                             })
-                            .child(
-                                Button::new("close-inspector")
-                                    .label("Close")
-                                    .ghost()
-                                    .small()
-                                    .tooltip("Close inspector panel")
-                                    .on_click(cx.listener(Self::close_review)),
-                            ),
+                            .when(!layout.phone, |element| {
+                                element.child(
+                                    Button::new("close-inspector")
+                                        .label("Close")
+                                        .ghost()
+                                        .small()
+                                        .accessibility_label("Close")
+                                        .on_click(cx.listener(Self::close_review)),
+                                )
+                            }),
                     ),
             )
             .child(self.render_inspector_tabs(cx));

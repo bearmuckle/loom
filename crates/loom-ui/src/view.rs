@@ -104,7 +104,6 @@ const COMPACT_LAYOUT_WIDTH: Pixels = px(960.);
 const PHONE_LAYOUT_WIDTH: Pixels = px(700.);
 const COMPACT_SIDEBAR_WIDTH: Pixels = px(200.);
 const FULL_SIDEBAR_WIDTH: Pixels = px(250.);
-const PHONE_SIDEBAR_WIDTH: Pixels = px(300.);
 const COMPACT_REVIEW_WIDTH: Pixels = px(440.);
 const FULL_REVIEW_WIDTH: Pixels = px(600.);
 const TIMELINE_CONTENT_MAX_WIDTH: Pixels = px(760.);

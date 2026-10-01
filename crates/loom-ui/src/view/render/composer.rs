@@ -196,7 +196,10 @@ impl LoomView {
                                             .icon(Icon::new(command_palette_icon()))
                                             .ghost()
                                             .when(layout.phone, |button| {
-                                                button.with_size(layout.control_size())
+                                                button
+                                                    .large()
+                                                    .h(layout.control_size())
+                                                    .w(layout.control_size())
                                             })
                                             .when(!layout.phone, |button| button.xsmall())
                                             .tooltip(format!(
@@ -220,7 +223,7 @@ impl LoomView {
                                                 .label("Stop")
                                                 .danger()
                                                 .when(layout.phone, |button| {
-                                                    button.h(layout.control_size())
+                                                    button.small().h(layout.control_size())
                                                 })
                                                 .when(!layout.phone, |button| button.small())
                                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -233,7 +236,10 @@ impl LoomView {
                                             .icon(Icon::new(AssetIconName::ArrowUp))
                                             .primary()
                                             .when(layout.phone, |button| {
-                                                button.with_size(layout.control_size())
+                                                button
+                                                    .large()
+                                                    .h(layout.control_size())
+                                                    .w(layout.control_size())
                                             })
                                             .when(!layout.phone, |button| button.small())
                                             .tooltip("Send (↵)")

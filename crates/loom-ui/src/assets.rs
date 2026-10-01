@@ -13,6 +13,7 @@ gpui_kit::assets::icon_assets!(
         BotMessageSquare,
         Brain,
         Check,
+        ChevronLeft,
         ChevronUp,
         Circle,
         Clock,

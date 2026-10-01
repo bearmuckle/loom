@@ -75,7 +75,6 @@ impl LoomView {
     }
 
     #[cfg(target_family = "wasm")]
-    #[cfg(target_family = "wasm")]
     pub(crate) fn render_disconnected(
         &self,
         window: &Window,
@@ -89,18 +88,6 @@ impl LoomView {
             .flex_col()
             .bg(rgb(0x111318))
             .text_color(rgb(0xe5e7eb))
-            .child(
-                div()
-                    .h(px(30.))
-                    .w_full()
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .bg(rgb(0x1b1d24))
-                    .border_b_1()
-                    .border_color(rgb(0x30343f))
-                    .child(div().text_xs().text_color(rgb(0x8f98a6)).child("Loom")),
-            )
             .child(
                 div()
                     .flex_1()

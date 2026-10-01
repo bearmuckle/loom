@@ -12,10 +12,13 @@ impl LoomView {
             .icon(Icon::new(IconName::Plus))
             .ghost()
             .when(layout.phone, |button| {
-                button.with_size(layout.control_size())
+                button
+                    .large()
+                    .h(layout.control_size())
+                    .w(layout.control_size())
             })
             .when(!layout.phone, |button| button.small())
-            .tooltip("New project")
+            .accessibility_label("New project")
             .on_click(cx.listener(Self::new_session))
             .into_any_element()
     }
@@ -89,6 +92,9 @@ impl LoomView {
         let menu_sessions = sessions.clone();
         let menu_view = view.clone();
         let menu_project = self.project_snapshot.clone();
+        // Shared so the per-row overflow menu can build the session context
+        // menu lazily without cloning the project snapshot every frame.
+        let row_project = std::rc::Rc::new(self.project_snapshot.clone());
         KitTree::new(&tree, move |index, entry, selected, _, app| {
             let session_id = entry.item().id.to_string();
             let Some(session) = sessions
@@ -162,12 +168,7 @@ impl LoomView {
                                 .text_color(rgb(0x8f98a6))
                                 .child(tree_indicator),
                         )
-                        .child(
-                            Icon::new(icon)
-                                .when(layout.phone, |icon| icon.size_5())
-                                .when(!layout.phone, |icon| icon.size_4())
-                                .text_color(icon_color),
-                        )
+                        .child(Icon::new(icon).size_4().text_color(icon_color))
                         .child(
                             div()
                                 .flex_1()
@@ -222,15 +223,41 @@ impl LoomView {
                         })
                         .when_some(node_indicator, |element, indicator| {
                             element.child(indicator)
+                        })
+                        .when(layout.phone, |element| {
+                            // Touch has no right-click, so expose the session
+                            // context menu (rename/archive) as a row action.
+                            let menu_session = session.clone();
+                            let menu_project = row_project.clone();
+                            let menu_view = view.clone();
+                            element.child(
+                                Button::new(("session-tree-menu", index))
+                                    .icon(Icon::new(IconName::Ellipsis))
+                                    .ghost()
+                                    .small()
+                                    .accessibility_label("Project actions")
+                                    .dropdown_menu(move |menu, _window, _cx| {
+                                        Self::build_project_session_context_menu(
+                                            menu,
+                                            menu_session.clone(),
+                                            (*menu_project).clone(),
+                                            menu_view.clone(),
+                                        )
+                                    }),
+                            )
                         }),
                 )
                 .on_click(move |_, _, cx| {
                     click_view.update(cx, |this, cx| {
+                        // Selecting from the phone drawer navigates, so dismiss
+                        // the drawer even when the session is already active.
+                        this.session_drawer_open = false;
                         // Re-selecting the session already on screen would
                         // reload and briefly blank the conversation.
                         if this.active_session.id != click_session.id {
                             this.select_session(click_session.clone(), cx);
                         }
+                        cx.notify();
                     });
                 })
         })
@@ -346,10 +373,12 @@ impl LoomView {
                     .when(layout.phone, |element| {
                         element.child(
                             Button::new("close-session-drawer")
-                                .label("Close")
+                                .icon(Icon::new(IconName::ChevronLeft))
                                 .ghost()
+                                .large()
                                 .h(layout.control_size())
-                                .tooltip("Close session drawer")
+                                .w(layout.control_size())
+                                .accessibility_label("Back")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.session_drawer_open = false;
                                     cx.notify();
@@ -362,15 +391,7 @@ impl LoomView {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(
-                        div()
-                            .when(layout.phone, |element| {
-                                element.text_size(layout.nav_row_font_size())
-                            })
-                            .when(!layout.phone, |element| element.text_xs())
-                            .text_color(rgb(0x8f98a6))
-                            .child("Projects"),
-                    )
+                    .child(div().text_xs().text_color(rgb(0x8f98a6)).child("Projects"))
                     .child(
                         div()
                             .flex()
@@ -382,11 +403,13 @@ impl LoomView {
                                     .icon(Icon::new(IconName::Settings))
                                     .ghost()
                                     .when(layout.phone, |button| {
-                                        button.with_size(layout.control_size())
+                                        button
+                                            .large()
+                                            .h(layout.control_size())
+                                            .w(layout.control_size())
                                     })
                                     .when(!layout.phone, |button| button.small())
                                     .accessibility_label("Settings")
-                                    .tooltip("Settings")
                                     .on_click({
                                         let view = view.clone();
                                         move |_, _, cx| {
@@ -399,7 +422,12 @@ impl LoomView {
                     ),
             )
             .when_some(self.session_filter_input.as_ref(), |element, input| {
-                element.child(KitInput::new(input).id("session-filter").small())
+                let field = KitInput::new(input).id("session-filter");
+                // The phone drawer opts into the medium field so the filter
+                // reads at the same scale as the list rows; desktop keeps the
+                // compact field used across the rest of the sidebar.
+                let field = if layout.phone { field } else { field.small() };
+                element.child(field)
             })
             .child(
                 div()
