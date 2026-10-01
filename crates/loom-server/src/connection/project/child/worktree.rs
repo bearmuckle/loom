@@ -223,12 +223,6 @@ impl InProcessConnection {
         })?;
         let (task, mut worktree) =
             self.load_project_child_worktree(project_id, manager_session_id, task_id)?;
-        if expected_parent_revision != worktree.base_revision {
-            return Err(LoomError::conflict(format!(
-                "child worktree was based on {}, not requested parent revision {}",
-                worktree.base_revision, expected_parent_revision
-            )));
-        }
         if task.status != loom_core::DelegatedTaskStatus::Completed {
             return Err(LoomError::invalid_state(
                 "a project child can be integrated only after its task completes",
@@ -243,6 +237,7 @@ impl InProcessConnection {
             worktree.status,
             ProjectWorktreeStatus::Ready
                 | ProjectWorktreeStatus::Stale
+                | ProjectWorktreeStatus::Conflict
                 | ProjectWorktreeStatus::Integrating
         ) {
             return Err(LoomError::invalid_state(format!(
@@ -314,6 +309,20 @@ impl InProcessConnection {
 
         let parent_git =
             self.session_git(worktree.parent_session_id, worktree.parent_repository_id)?;
+        if parent_git.operation_in_progress()? {
+            worktree.status = ProjectWorktreeStatus::RecoveryRequired;
+            worktree.error = Some(
+                "parent checkout has an in-progress Git operation; resolve it before integrating"
+                    .to_owned(),
+            );
+            worktree.updated_at = Timestamp::now();
+            self.save_project_worktree_state(&worktree)?;
+            return Err(LoomError::new(
+                ErrorCode::RecoveryRequired,
+                worktree.error.clone().unwrap_or_default(),
+                true,
+            ));
+        }
         let parent_status = parent_git.status()?;
         if !parent_status.clean || parent_status.branch.is_none() {
             return Err(LoomError::conflict(
@@ -324,75 +333,94 @@ impl InProcessConnection {
             LoomError::invalid_state("parent repository HEAD does not point to a commit")
         })?;
 
-        if worktree.status == ProjectWorktreeStatus::Integrating {
-            if parent_revision == child_revision {
-                worktree.status = ProjectWorktreeStatus::Integrated;
-                worktree.integrated_revision = Some(child_revision);
-                worktree.error = None;
-                worktree.updated_at = Timestamp::now();
-                self.save_project_worktree_state(&worktree)?;
-                return Ok(ServerResponse::Project(
-                    ProjectResponse::ProjectChildWorktreeUpdated(worktree),
-                ));
-            }
-            if parent_revision != worktree.base_revision {
-                worktree.status = ProjectWorktreeStatus::RecoveryRequired;
-                worktree.error = Some(format!(
-                    "parent checkout is at {parent_revision} while recovering integration of {}",
-                    worktree
-                        .result_revision
-                        .as_deref()
-                        .unwrap_or("unknown revision")
-                ));
-                worktree.updated_at = Timestamp::now();
-                self.save_project_worktree_state(&worktree)?;
-                return Err(LoomError::new(
-                    ErrorCode::RecoveryRequired,
-                    worktree.error.clone().unwrap_or_default(),
-                    true,
-                ));
-            }
+        // The caller reviewed against `expected_parent_revision`; it must be in
+        // the parent's history so we never integrate onto a rewritten or
+        // unrelated checkout. The parent is otherwise free to have advanced.
+        if !parent_git.is_ancestor_revision(&expected_parent_revision, &parent_revision)? {
+            return Err(LoomError::conflict(format!(
+                "parent checkout at {parent_revision} does not descend from the expected revision {expected_parent_revision}; re-review before integrating"
+            )));
         }
 
-        if parent_revision != worktree.base_revision {
-            worktree.status = ProjectWorktreeStatus::Stale;
-            worktree.error = Some(format!(
-                "parent checkout advanced from {} to {parent_revision}; child changes were preserved",
-                worktree.base_revision
-            ));
+        // A prior attempt may have integrated the child without recording it,
+        // for example if it was interrupted mid-integration. Completing that
+        // record is idempotent and never replays the merge.
+        if parent_git.is_ancestor_revision(&child_revision, &parent_revision)? {
+            worktree.status = ProjectWorktreeStatus::Integrated;
+            worktree.result_revision = Some(child_revision);
+            worktree.integrated_revision = Some(parent_revision);
+            worktree.conflict_paths.clear();
+            worktree.error = None;
             worktree.updated_at = Timestamp::now();
             self.save_project_worktree_state(&worktree)?;
-            return Err(LoomError::conflict(
-                "parent checkout advanced since this child worktree was created; child changes were preserved",
+            return Ok(ServerResponse::Project(
+                ProjectResponse::ProjectChildWorktreeUpdated(worktree),
             ));
         }
 
         worktree.result_revision = Some(child_revision.clone());
+        worktree.conflict_paths.clear();
         worktree.status = ProjectWorktreeStatus::Integrating;
         worktree.error = None;
         worktree.updated_at = Timestamp::now();
         self.save_project_worktree_state(&worktree)?;
-        match parent_git.advance_clean_head_revisions(&worktree.base_revision, &child_revision) {
-            Ok(integrated_revision) => {
-                worktree.status = ProjectWorktreeStatus::Integrated;
-                worktree.integrated_revision = Some(integrated_revision);
-                worktree.error = None;
+
+        let message = format!(
+            "loom: integrate project child task {} ({})",
+            task.task_id, task.child_name
+        );
+        match parent_git.integrate_merge_revisions(&parent_revision, &child_revision, &message) {
+            Ok(loom_vcs::MergeIntegrationOutcome::AlreadyPresent) => {
+                self.finish_project_child_integration(&mut worktree, &parent_revision)
+            }
+            Ok(loom_vcs::MergeIntegrationOutcome::FastForward(revision))
+            | Ok(loom_vcs::MergeIntegrationOutcome::Merged(revision)) => {
+                let revision = revision.to_string();
+                self.finish_project_child_integration(&mut worktree, &revision)
+            }
+            Ok(loom_vcs::MergeIntegrationOutcome::Conflicted(paths)) => {
+                worktree.status = ProjectWorktreeStatus::Conflict;
+                worktree.conflict_paths = paths.clone();
+                worktree.error = Some(format!(
+                    "integration conflicted in {}; the parent checkout and child worktree were preserved",
+                    paths.join(", ")
+                ));
                 worktree.updated_at = Timestamp::now();
                 self.save_project_worktree_state(&worktree)?;
-                Ok(ServerResponse::Project(
-                    ProjectResponse::ProjectChildWorktreeUpdated(worktree),
+                Err(LoomError::conflict(
+                    worktree.error.clone().unwrap_or_default(),
                 ))
             }
             Err(error) => {
-                // Keep the integration intent retryable. A retry can detect a
-                // completed fast-forward, safely retry from the base, or move
-                // the record to recovery-required if the parent diverged.
+                // Keep the integration intent retryable. A retry detects an
+                // already-integrated child, safely retries the merge, or moves
+                // the record to recovery-required when the parent checkout
+                // needs explicit attention.
                 worktree.error = Some(error.message.clone());
+                if error.code == ErrorCode::RecoveryRequired {
+                    worktree.status = ProjectWorktreeStatus::RecoveryRequired;
+                }
                 worktree.updated_at = Timestamp::now();
                 self.save_project_worktree_state(&worktree)?;
                 Err(error)
             }
         }
+    }
+
+    fn finish_project_child_integration(
+        &self,
+        worktree: &mut ProjectWorktreeRecord,
+        integrated_revision: &str,
+    ) -> Result<ServerResponse> {
+        worktree.status = ProjectWorktreeStatus::Integrated;
+        worktree.integrated_revision = Some(integrated_revision.to_owned());
+        worktree.conflict_paths.clear();
+        worktree.error = None;
+        worktree.updated_at = Timestamp::now();
+        self.save_project_worktree_state(worktree)?;
+        Ok(ServerResponse::Project(
+            ProjectResponse::ProjectChildWorktreeUpdated(worktree.clone()),
+        ))
     }
 
     pub(crate) fn cleanup_project_child_worktree(
@@ -535,6 +563,58 @@ impl InProcessConnection {
                 worktree: worktree.clone(),
             },
         });
+        Ok(())
+    }
+
+    /// Reconciles worktrees left mid-integration by a crash or restart.
+    ///
+    /// An integration is finalized only when the parent checkout already
+    /// contains the reviewed child revision. An in-progress Git operation on
+    /// the parent is surfaced as recovery-required and never replayed or
+    /// auto-resolved. Anything else is left for an explicit integration retry.
+    pub(crate) fn reconcile_project_child_integrations(&self, project_id: ProjectId) -> Result<()> {
+        let Some(persistence) = self.backend.persistence.as_ref() else {
+            return Ok(());
+        };
+        for task in persistence.list_project_tasks(project_id)? {
+            if !task.code_change {
+                continue;
+            }
+            let Some(mut worktree) = persistence.load_project_worktree_by_task(task.task_id)?
+            else {
+                continue;
+            };
+            if worktree.status != ProjectWorktreeStatus::Integrating {
+                continue;
+            }
+            let Some(child_revision) = worktree.result_revision.clone() else {
+                continue;
+            };
+            let parent_git =
+                self.session_git(worktree.parent_session_id, worktree.parent_repository_id)?;
+            if parent_git.operation_in_progress()? {
+                worktree.status = ProjectWorktreeStatus::RecoveryRequired;
+                worktree.error = Some(
+                    "parent checkout has an in-progress Git operation; resolve it before integrating"
+                        .to_owned(),
+                );
+                worktree.updated_at = Timestamp::now();
+                self.save_project_worktree_state(&worktree)?;
+                continue;
+            }
+            let parent_status = parent_git.status()?;
+            let Some(parent_revision) = parent_status.head else {
+                continue;
+            };
+            if parent_git.is_ancestor_revision(&child_revision, &parent_revision)? {
+                worktree.status = ProjectWorktreeStatus::Integrated;
+                worktree.integrated_revision = Some(parent_revision);
+                worktree.conflict_paths.clear();
+                worktree.error = None;
+                worktree.updated_at = Timestamp::now();
+                self.save_project_worktree_state(&worktree)?;
+            }
+        }
         Ok(())
     }
 

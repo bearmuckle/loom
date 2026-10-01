@@ -56,8 +56,9 @@ message card is present, the transcript copy is suppressed. Child context menus
 provide pause/resume/interrupt/cancel controls.
 Project archive waits until child tasks are terminal, then archives the
 descendants with the root. Code-changing children use isolated linked
-worktrees; managers can review bounded diffs, fast-forward eligible commits,
-and retain or remove child checkouts with an explicit cleanup disposition.
+worktrees; managers can review bounded diffs, integrate eligible commits by
+fast-forward or conflict-aware merge, and retain or remove child checkouts with
+an explicit cleanup disposition.
 Workspace settings bound delegated-agent parallelism from one to sixteen
 (default four); additional tasks remain durable and queued. A project can have
 up to fifty queued or active delegated tasks.
@@ -152,11 +153,19 @@ revision. Siblings never share a mutable checkout, and parentage grants no
 shared-filesystem access.
 
 The parent reviews a child's result and performs or directs integration into
-its own branch. A child never writes or merges into its parent's worktree. The
-initial integration mode is fast-forward only: require a clean parent at the
-expected base and review of the exact child `HEAD`; if that revision changes,
-review it again. Stale or diverged parent revisions remain reviewable and
-recoverable; automatic merge and conflict resolution are not supported. Each
+its own branch. A child never writes or merges into its parent's worktree.
+Integration requires a clean parent checkout, an expected parent revision that
+is in the parent's history, and review of the exact child `HEAD`; if that
+revision changes, review it again. Integration fast-forwards when the child
+descends from the parent and otherwise merges the two histories in memory: a
+clean result becomes a two-parent merge commit and advances the parent branch,
+while a conflict leaves the branch, index, and working tree untouched, records
+the conflicting paths, and preserves both checkouts for explicit recovery.
+Because the parent is free to keep committing while a child runs, a fast-forward
+is no longer required; a rewound or rewritten parent revision is still refused.
+An interrupted integration is finalized only when the parent already contains
+the reviewed revision, and an in-progress Git operation on the parent is
+surfaced as recovery-required rather than replayed or auto-resolved. Each
 level integrates its descendants before returning its result upward; the
 project manager owns final integration into the project branch and the
 user-facing summary. Record base/result revisions, review and integration
@@ -335,12 +344,14 @@ child independently; project state reconstructs after reconnect.
    the parent implicit filesystem access. Require the child result to be a
    commit based on the recorded base before integration. Record the reviewed
    child `HEAD`; if that revision changes, require another review.
-4. **Implemented:** add explicit parent review and integration commands. The first integration
-   mode is fast-forward only: require review of the exact child revision, a
-   clean parent checkout, and an exact expected `HEAD`; capture the resulting
-   revision. Surface stale or
-   diverged bases without replaying or rewriting commits, and retain the child
-   checkout for recovery.
+4. **Implemented:** add explicit parent review and integration commands.
+   Integration requires review of the exact child revision and a clean parent
+   checkout whose `HEAD` descends from the expected revision; it fast-forwards a
+   descendant child and otherwise applies a conflict-aware merge commit. Record
+   the base, reviewed child revision, and resulting integrated revision.
+   Conflicts are refused with their paths and both checkouts preserved, and an
+   interrupted or already-integrated attempt is finalized idempotently without
+   replaying or rewriting commits.
 5. **Implemented:** persist creation/recovery and cleanup intent before filesystem mutations.
    Reconcile interrupted setup/removal on restart; never recreate a missing
    `Ready` checkout as an empty one or force-remove changed work implicitly.
@@ -351,10 +362,12 @@ child independently; project state reconstructs after reconnect.
    in Slice 4 passed their end-to-end tests.
 
 **Exit:** met for direct children. Siblings work in isolated worktrees and
-their parent can review and fast-forward integrate eligible child commits.
-Stale or diverged children remain reviewable and recoverable without
-discarding unmerged work; merge and conflict-resolution workflows remain a
-later design step.
+their parent can review and integrate eligible child commits by fast-forward or
+a conflict-aware merge. A manager may keep working and committing while a code
+child runs, is woken by a durable completion notification, and integrates the
+reviewed revision into its current checkout. Conflicting or interrupted
+integration is refused and recoverable without discarding unmerged work;
+automatic conflict resolution remains out of scope.
 
 ### Slice 4: deeper hierarchy and branch communication
 
@@ -417,10 +430,11 @@ cancellation. Depth-three delegation is enabled.
 6. **Implemented and end-to-end validated:** preserve upward code
    ownership: a depth-two agent reviews and integrates a
    depth-three commit into its own branch before returning, then the project
-   root reviews and integrates that branch. Require a clean exact base and
-   review of the exact child `HEAD` at each edge; retain stale or diverged
-   work for explicit recovery. The nested worktree E2E confirms each parent's
-   `HEAD` advances to the same descendant commit only after review.
+   root reviews and integrates that branch. Require a clean parent checkout,
+   an expected revision in the parent's history, and review of the exact child
+   `HEAD` at each edge; fast-forward or merge as appropriate, and retain
+   conflicting or diverged work for explicit recovery. The nested worktree E2E
+   confirms each parent's `HEAD` advances only after review.
 7. **Implemented; nested projection and control-state tests added:** project
    sessions render recursively, nest under their persisted parent, and reveal
    their owner chain when selected. Controls, review, and integration actions

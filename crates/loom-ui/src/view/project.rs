@@ -584,12 +584,16 @@ impl LoomView {
                 if can_integrate
                     && terminal
                     && task.status == loom_core::DelegatedTaskStatus::Completed
-                    && worktree.status == loom_core::ProjectWorktreeStatus::Ready
+                    && matches!(
+                        worktree.status,
+                        loom_core::ProjectWorktreeStatus::Ready
+                            | loom_core::ProjectWorktreeStatus::Stale
+                    )
                     && let Some(expected_child_revision) = worktree.result_revision.clone()
                 {
                     let integrate_view = menu_view.clone();
                     let expected_parent_revision = worktree.base_revision.clone();
-                    menu = menu.item(PopupMenuItem::new("Fast-forward child changes").on_click(
+                    menu = menu.item(PopupMenuItem::new("Integrate child changes").on_click(
                         move |_, _, cx| {
                             integrate_view.update(cx, |view, cx| {
                                 view.integrate_project_child_from_ui(

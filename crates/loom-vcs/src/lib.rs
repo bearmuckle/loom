@@ -5,9 +5,9 @@ use std::{
 };
 
 use git2::{
-    BranchType, Cred, DiffFormat, DiffOptions, FetchOptions, Oid, PushOptions, RemoteCallbacks,
-    Repository, Status, StatusOptions, WorktreeAddOptions, WorktreeLockStatus,
-    WorktreePruneOptions,
+    BranchType, Cred, DiffFormat, DiffOptions, FetchOptions, MergeOptions, Oid, PushOptions,
+    RemoteCallbacks, Repository, RepositoryState, Signature, Status, StatusOptions,
+    WorktreeAddOptions, WorktreeLockStatus, WorktreePruneOptions,
     build::{CheckoutBuilder, RepoBuilder},
 };
 use loom_core::{ErrorCode, LoomError, Result, Timestamp};
@@ -19,6 +19,20 @@ pub use loom_protocol::{
 #[derive(Clone, Debug)]
 pub struct GitService {
     root: PathBuf,
+}
+
+/// Outcome of integrating a reviewed child revision into a parent checkout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MergeIntegrationOutcome {
+    /// The parent checkout already contains the child revision.
+    AlreadyPresent,
+    /// The child revision was integrated by fast-forward.
+    FastForward(Oid),
+    /// The child revision was integrated with a two-parent merge commit.
+    Merged(Oid),
+    /// The parent and child conflict; no branch, index, or working tree change
+    /// was made and the conflicting paths are reported.
+    Conflicted(Vec<String>),
 }
 
 impl GitService {
@@ -519,6 +533,252 @@ impl GitService {
         })?;
         self.advance_clean_head(expected_head_oid, target_commit_oid)
             .map(|revision| revision.to_string())
+    }
+
+    /// Reports the Git operation state of this checkout.
+    ///
+    /// A non-clean state means an operation such as a merge or rebase is
+    /// already in progress and must be recovered explicitly before Loom may
+    /// touch the checkout.
+    pub fn operation_state(&self) -> Result<RepositoryState> {
+        Ok(self.repository()?.state())
+    }
+
+    /// Returns true when the checkout has an in-progress Git operation.
+    pub fn operation_in_progress(&self) -> Result<bool> {
+        Ok(self.operation_state()? != RepositoryState::Clean)
+    }
+
+    /// Returns true when `ancestor` is `descendant` or an ancestor of it.
+    pub fn is_ancestor(&self, ancestor: Oid, descendant: Oid) -> Result<bool> {
+        if ancestor == descendant {
+            return Ok(true);
+        }
+        self.repository()?
+            .graph_descendant_of(descendant, ancestor)
+            .map_err(|error| git_error("could not verify Git ancestry", error))
+    }
+
+    /// String-based wrapper for [`Self::is_ancestor`].
+    pub fn is_ancestor_revision(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        let ancestor = Oid::from_str(ancestor).map_err(|error| {
+            LoomError::invalid_request(format!(
+                "invalid Git ancestor revision '{ancestor}': {error}"
+            ))
+        })?;
+        let descendant = Oid::from_str(descendant).map_err(|error| {
+            LoomError::invalid_request(format!(
+                "invalid Git descendant revision '{descendant}': {error}"
+            ))
+        })?;
+        self.is_ancestor(ancestor, descendant)
+    }
+
+    /// Integrates a reviewed child commit into the clean checked-out branch at
+    /// `expected_parent`.
+    ///
+    /// A fast-forward is used when the child descends from the parent. When the
+    /// parent has advanced independently, the two histories are merged in
+    /// memory: a clean result is committed as a two-parent merge commit and
+    /// checked out, while a conflict leaves the branch, index, and working tree
+    /// completely untouched and returns the conflicting paths.
+    pub fn integrate_merge(
+        &self,
+        expected_parent: Oid,
+        child_commit: Oid,
+        message: &str,
+    ) -> Result<MergeIntegrationOutcome> {
+        let repository = self.repository()?;
+        if repository.state() != RepositoryState::Clean {
+            return Err(LoomError::new(
+                ErrorCode::RecoveryRequired,
+                "cannot integrate while another Git operation is in progress",
+                true,
+            ));
+        }
+
+        let head = repository
+            .head()
+            .map_err(|error| git_error("could not read parent Git HEAD", error))?;
+        if !head.is_branch() {
+            return Err(LoomError::invalid_state(
+                "cannot integrate into a detached or non-local Git HEAD",
+            ));
+        }
+        let branch_refname = head
+            .name()
+            .map_err(|error| git_error("could not read the parent Git branch name", error))?
+            .to_owned();
+        let head_target = head.target().ok_or_else(|| {
+            LoomError::invalid_state("the checked-out Git branch does not point to a commit")
+        })?;
+        if head_target != expected_parent {
+            return Err(LoomError::conflict(format!(
+                "parent Git HEAD changed: expected {expected_parent}, found {head_target}"
+            )));
+        }
+
+        let mut status_options = StatusOptions::new();
+        status_options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .include_ignored(true)
+            .recurse_ignored_dirs(true)
+            .include_unreadable(true)
+            .include_unreadable_as_untracked(true);
+        let statuses = repository
+            .statuses(Some(&mut status_options))
+            .map_err(|error| git_error("could not inspect parent Git checkout", error))?;
+        if !statuses.is_empty() {
+            return Err(LoomError::conflict(
+                "cannot integrate into a parent Git checkout with staged, modified, untracked, ignored, or unreadable files",
+            ));
+        }
+
+        if child_commit == expected_parent {
+            return Ok(MergeIntegrationOutcome::AlreadyPresent);
+        }
+        let child = repository
+            .find_commit(child_commit)
+            .map_err(|error| git_error("could not resolve child Git commit", error))?;
+        if repository
+            .graph_descendant_of(expected_parent, child_commit)
+            .map_err(|error| git_error("could not verify child Git ancestry", error))?
+        {
+            return Ok(MergeIntegrationOutcome::AlreadyPresent);
+        }
+        if repository
+            .graph_descendant_of(child_commit, expected_parent)
+            .map_err(|error| git_error("could not verify child Git ancestry", error))?
+        {
+            let revision = self.advance_clean_head(expected_parent, child_commit)?;
+            return Ok(MergeIntegrationOutcome::FastForward(revision));
+        }
+
+        let parent = repository
+            .find_commit(expected_parent)
+            .map_err(|error| git_error("could not resolve parent Git commit", error))?;
+        let mut index = repository
+            .merge_commits(&parent, &child, Some(&MergeOptions::new()))
+            .map_err(|error| git_error("could not compute project child merge", error))?;
+        if index.has_conflicts() {
+            let conflicts = index.conflicts().map_err(|error| {
+                git_error("could not inspect project child merge conflicts", error)
+            })?;
+            let mut paths = Vec::new();
+            for conflict in conflicts {
+                let conflict = conflict.map_err(|error| {
+                    git_error("could not read project child merge conflict", error)
+                })?;
+                if let Some(entry) = conflict.our.or(conflict.their).or(conflict.ancestor) {
+                    paths.push(String::from_utf8_lossy(&entry.path).replace('\\', "/"));
+                }
+            }
+            paths.sort();
+            paths.dedup();
+            return Ok(MergeIntegrationOutcome::Conflicted(paths));
+        }
+
+        let tree_oid = index
+            .write_tree_to(&repository)
+            .map_err(|error| git_error("could not write project child merge tree", error))?;
+        let tree = repository
+            .find_tree(tree_oid)
+            .map_err(|error| git_error("could not read project child merge tree", error))?;
+        let signature = repository
+            .signature()
+            .or_else(|_| Signature::now("loom", "loom@localhost"))
+            .map_err(|error| git_error("could not resolve a Git signature for the merge", error))?;
+        let merge_commit = repository
+            .commit(
+                None,
+                &signature,
+                &signature,
+                message,
+                &tree,
+                &[&parent, &child],
+            )
+            .map_err(|error| git_error("could not create the project child merge commit", error))?;
+        let merge_commit = repository
+            .find_commit(merge_commit)
+            .map_err(|error| git_error("could not read the project child merge commit", error))?;
+
+        let mut checkout = CheckoutBuilder::new();
+        checkout.safe().update_index(true);
+        if let Err(error) = repository.checkout_tree(merge_commit.as_object(), Some(&mut checkout))
+        {
+            return Err(git_error(
+                &format!(
+                    "safe checkout of merge result {} failed; parent branch remains at {expected_parent} and checkout state was preserved",
+                    merge_commit.id()
+                ),
+                error,
+            ));
+        }
+
+        let mut transaction = repository
+            .transaction()
+            .map_err(|error| git_error("could not start parent branch update", error))?;
+        transaction
+            .lock_ref(&branch_refname)
+            .map_err(|error| git_error("could not lock parent branch for integration", error))?;
+        let locked_target = repository
+            .find_reference(&branch_refname)
+            .map_err(|error| git_error("could not re-read locked parent branch", error))?
+            .target()
+            .ok_or_else(|| LoomError::invalid_state("locked parent branch has no target commit"))?;
+        if locked_target != expected_parent {
+            return Err(LoomError::conflict(format!(
+                "parent Git branch changed before integration: expected {expected_parent}, found {locked_target}"
+            )));
+        }
+        transaction
+            .set_target(
+                &branch_refname,
+                merge_commit.id(),
+                None,
+                "loom: merge reviewed project child",
+            )
+            .map_err(|error| {
+                git_error(
+                    &format!(
+                        "could not update parent branch to {}; checkout state was preserved for recovery",
+                        merge_commit.id()
+                    ),
+                    error,
+                )
+            })?;
+        transaction.commit().map_err(|error| {
+            git_error(
+                &format!(
+                    "could not commit parent branch update to {}; checkout state was preserved for recovery",
+                    merge_commit.id()
+                ),
+                error,
+            )
+        })?;
+
+        Ok(MergeIntegrationOutcome::Merged(merge_commit.id()))
+    }
+
+    /// String-based wrapper for [`Self::integrate_merge`].
+    pub fn integrate_merge_revisions(
+        &self,
+        expected_parent: &str,
+        child_commit: &str,
+        message: &str,
+    ) -> Result<MergeIntegrationOutcome> {
+        let expected_parent_oid = Oid::from_str(expected_parent).map_err(|error| {
+            LoomError::invalid_request(format!(
+                "invalid expected parent Git revision '{expected_parent}': {error}"
+            ))
+        })?;
+        let child_commit_oid = Oid::from_str(child_commit).map_err(|error| {
+            LoomError::invalid_request(format!(
+                "invalid child Git revision '{child_commit}': {error}"
+            ))
+        })?;
+        self.integrate_merge(expected_parent_oid, child_commit_oid, message)
     }
 
     /// Creates a linked worktree at `path`, based on `base_commit`, and checks
@@ -1438,6 +1698,134 @@ mod tests {
 
         assert_eq!(
             git.advance_clean_head(expected, target).unwrap_err().code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(
+            git.repository().unwrap().head().unwrap().target(),
+            Some(expected)
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("README.md")).unwrap(),
+            "local change\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn write_commit(root: &Path, file: &str, content: &str, message: &str) {
+        fs::write(root.join(file), content).unwrap();
+        run(root, &["add", "--", file]);
+        run(root, &["commit", "-qm", message]);
+    }
+
+    #[test]
+    fn merge_integration_fast_forwards_a_descendant_child() {
+        let (git, root) = repository();
+        let expected = git.repository().unwrap().head().unwrap().target().unwrap();
+        let (target, _, _) = descendant_commit(&git, &root);
+
+        assert_eq!(
+            git.integrate_merge(expected, target, "integrate child")
+                .unwrap(),
+            MergeIntegrationOutcome::FastForward(target)
+        );
+        assert_eq!(
+            git.repository().unwrap().head().unwrap().target(),
+            Some(target)
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("README.md")).unwrap(),
+            "after\n"
+        );
+        assert!(git.status().unwrap().clean);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn merge_integration_merges_an_advanced_parent_without_conflict() {
+        let (git, root) = repository();
+        let parent_branch = git.current_branch().unwrap().unwrap();
+        let child_branch = format!("codex/child-{}", loom_core::RepositoryId::new());
+        run(&root, &["checkout", "-qb", &child_branch]);
+        write_commit(&root, "child.txt", "child\n", "child change");
+        let child = git.repository().unwrap().head().unwrap().target().unwrap();
+        run(&root, &["checkout", "-q", &parent_branch]);
+        write_commit(&root, "README.md", "parent advanced\n", "parent change");
+        let parent_advanced = git.repository().unwrap().head().unwrap().target().unwrap();
+
+        let MergeIntegrationOutcome::Merged(merge) = git
+            .integrate_merge(parent_advanced, child, "integrate child")
+            .unwrap()
+        else {
+            panic!("expected a clean merge commit");
+        };
+        let repository = git.repository().unwrap();
+        assert_eq!(repository.head().unwrap().target(), Some(merge));
+        let commit = repository.find_commit(merge).unwrap();
+        assert_eq!(commit.parent_count(), 2);
+        assert_eq!(commit.parent_id(0).unwrap(), parent_advanced);
+        assert_eq!(commit.parent_id(1).unwrap(), child);
+        assert_eq!(
+            fs::read_to_string(root.join("README.md")).unwrap(),
+            "parent advanced\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("child.txt")).unwrap(),
+            "child\n"
+        );
+        assert!(git.status().unwrap().clean);
+        assert_eq!(
+            git.integrate_merge(merge, child, "integrate child")
+                .unwrap(),
+            MergeIntegrationOutcome::AlreadyPresent
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn merge_integration_reports_conflicts_without_touching_the_checkout() {
+        let (git, root) = repository();
+        let parent_branch = git.current_branch().unwrap().unwrap();
+        let child_branch = format!("codex/child-{}", loom_core::RepositoryId::new());
+        let base = git.repository().unwrap().head().unwrap().target().unwrap();
+        assert!(
+            git.is_ancestor_revision(&base.to_string(), &base.to_string())
+                .unwrap()
+        );
+        run(&root, &["checkout", "-qb", &child_branch]);
+        write_commit(&root, "README.md", "child version\n", "child change");
+        let child = git.repository().unwrap().head().unwrap().target().unwrap();
+        run(&root, &["checkout", "-q", &parent_branch]);
+        write_commit(&root, "README.md", "parent version\n", "parent change");
+        let parent_advanced = git.repository().unwrap().head().unwrap().target().unwrap();
+
+        assert_eq!(
+            git.integrate_merge(parent_advanced, child, "integrate child")
+                .unwrap(),
+            MergeIntegrationOutcome::Conflicted(vec!["README.md".to_owned()])
+        );
+        let repository = git.repository().unwrap();
+        assert_eq!(repository.head().unwrap().target(), Some(parent_advanced));
+        assert_eq!(
+            fs::read_to_string(root.join("README.md")).unwrap(),
+            "parent version\n"
+        );
+        let status = git.status().unwrap();
+        assert!(status.clean);
+        assert!(status.conflicts.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn merge_integration_rejects_a_dirty_parent_checkout() {
+        let (git, root) = repository();
+        let expected = git.repository().unwrap().head().unwrap().target().unwrap();
+        let (child, _, _) = descendant_commit(&git, &root);
+        fs::write(root.join("README.md"), "local change\n").unwrap();
+
+        assert_eq!(
+            git.integrate_merge(expected, child, "integrate child")
+                .unwrap_err()
+                .code,
             ErrorCode::Conflict
         );
         assert_eq!(

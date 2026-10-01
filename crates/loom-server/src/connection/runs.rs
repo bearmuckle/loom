@@ -487,7 +487,7 @@ impl InProcessConnection {
                     instructions.push_str(" Review child code with `review_project_child` before deciding whether to integrate.");
                 }
                 if input.options.project_integration_enabled {
-                    instructions.push_str(" Use `integrate_project_child` only after reviewing the completed child and confirming its exact base revision; integration fast-forwards the clean parent checkout and cannot merge divergent branches.");
+                    instructions.push_str(" Use `integrate_project_child` only after reviewing the completed child, supplying the base revision from review. Integration fast-forwards when possible and otherwise merges the reviewed revision into your clean checkout; you may keep committing while children run, and a conflict is refused with paths preserved.");
                 }
                 if input.options.project_messaging_enabled {
                     instructions.push_str(" Use `send_project_agent_message` with `target_session_id` to direct a child or reply to questions and blockers; `task_id` is optional context only. Message delivery is durable and may wait until the child reaches a safe model-turn boundary.");
@@ -542,7 +542,7 @@ impl InProcessConnection {
                         instructions.push_str(" Review a completed code child with `review_project_child` before deciding whether to integrate.");
                     }
                     if input.options.project_integration_enabled {
-                        instructions.push_str(" Use `integrate_project_child` only after review and only when the child's exact base revision still matches your clean checkout.");
+                        instructions.push_str(" Use `integrate_project_child` only after review, supplying the base revision from review. Integration fast-forwards when possible and otherwise merges the reviewed revision into your clean checkout, so you may keep committing to your branch while children run.");
                     }
                     if input.options.project_child_control_enabled {
                         instructions.push_str(" Use `control_project_child` with a direct child's task_id only when lifecycle intervention is needed.");

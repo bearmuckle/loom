@@ -187,7 +187,7 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_integrate_children {
             definitions.push(ToolDefinition {
                 name: "integrate_project_child".to_owned(),
-                description: "Fast-forward the clean parent checkout to a completed code child's committed revision. Supply the exact base revision reported by review; integration fails and preserves the child worktree if the parent has changed or the child does not descend from that base.".to_owned(),
+                description: "Integrate a completed, reviewed code child's committed revision into your clean parent checkout. Supply the base revision reported by review. Integration fast-forwards when possible and otherwise creates a merge commit, so your checkout may have advanced. A conflict is refused with its paths preserved; nothing is force-applied or partially landed.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
