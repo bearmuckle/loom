@@ -8,10 +8,10 @@ use loom_core::{
 };
 use loom_model::ModelId;
 use loom_protocol::{
-    CURRENT_PROTOCOL_VERSION, ClientRequest, ControlRequest, ControlResponse, EventsRequest,
-    EventsResponse, ProviderRequest, ProviderResponse, RequestEnvelope, RunRequest, RunResponse,
-    ServerEvent, ServerResponse, SessionRequest, SessionResponse, TerminalRequest,
-    TerminalResponse, WorkerNodeStatus, WorkspaceRequest, WorkspaceResponse, decode_response,
+    ClientRequest, ControlRequest, ControlResponse, EventsRequest, EventsResponse, ProviderRequest,
+    ProviderResponse, RequestEnvelope, RunRequest, RunResponse, ServerEvent, ServerResponse,
+    SessionRequest, SessionResponse, TerminalRequest, TerminalResponse, WorkerNodeStatus,
+    WorkspaceRequest, WorkspaceResponse, decode_response,
 };
 use loom_server::{
     AuthTokenStore, AuthorizationScope, InProcessBackend, RemoteServer, RemoteServerConfig,
@@ -22,33 +22,7 @@ use tokio_tungstenite::{
     tungstenite::{Message, client::IntoClientRequest},
 };
 
-fn capabilities() -> CapabilitySet {
-    CapabilitySet::new([
-        Capability::CreateAgentSession,
-        Capability::ReadAgentSession,
-        Capability::ControlAgentSession,
-        Capability::SubscribeSessionEvents,
-        Capability::StartAgentRun,
-        Capability::ReadAgentRun,
-        Capability::ControlAgentRun,
-        Capability::ApproveAgentAction,
-        Capability::ConfigureApprovalPolicy,
-        Capability::ListProviders,
-        Capability::ManageWorkspaces,
-        Capability::ManageSessionRepositories,
-        Capability::ReadSessionFilesystem,
-        Capability::WriteSessionFilesystem,
-        Capability::ConfigureProviders,
-        Capability::ReadWorkspaceConfig,
-        Capability::ReadVcsStatus,
-        Capability::ReadVcsDiff,
-        Capability::ReadSessionTaskEvidence,
-        Capability::ReadWorkerNodeStatus,
-        Capability::OpenSessionTerminal,
-        Capability::ControlSessionTerminal,
-        Capability::JsonProtocol,
-    ])
-}
+mod support;
 
 async fn server() -> (
     Arc<InProcessBackend>,
@@ -118,8 +92,8 @@ async fn negotiate(connection: &mut WebSocketConnection) {
     let response = connection
         .request(RequestEnvelope::new(ClientRequest::Control(
             ControlRequest::Negotiate {
-                client_version: CURRENT_PROTOCOL_VERSION,
-                capabilities: capabilities(),
+                client_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+                capabilities: support::capabilities(),
             },
         )))
         .await
@@ -561,8 +535,8 @@ async fn workspace_scopes_restrict_session_creation() {
     setup
         .request(RequestEnvelope::new(ClientRequest::Control(
             ControlRequest::Negotiate {
-                client_version: CURRENT_PROTOCOL_VERSION,
-                capabilities: capabilities(),
+                client_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+                capabilities: support::capabilities(),
             },
         )))
         .result
@@ -633,8 +607,8 @@ async fn session_scopes_filter_workspace_session_listing() {
     setup
         .request(RequestEnvelope::new(ClientRequest::Control(
             ControlRequest::Negotiate {
-                client_version: CURRENT_PROTOCOL_VERSION,
-                capabilities: capabilities(),
+                client_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+                capabilities: support::capabilities(),
             },
         )))
         .result

@@ -2242,90 +2242,6 @@ fn m5_session_projections_reconnect_and_archive_authoritatively() {
 }
 
 #[test]
-fn creates_session_and_reads_event_stream() {
-    let backend = InProcessBackend::new();
-    let connection = backend.connect();
-    negotiate(&connection);
-
-    let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
-        WorkspaceRequest::CreateWorkspace {
-            name: "In-process workspace".to_owned(),
-        },
-    )));
-    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
-        workspace.result.unwrap()
-    else {
-        panic!("unexpected workspace response");
-    };
-    let create = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
-        WorkspaceRequest::CreateAgentSessionInWorkspace {
-            workspace_id: workspace.id,
-            name: "In-process demo".to_owned(),
-        },
-    )));
-    let session_id = match create.result.unwrap() {
-        ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => snapshot.id,
-        response => panic!("unexpected response: {response:?}"),
-    };
-
-    let events = connection.request(RequestEnvelope::new(ClientRequest::Events(
-        EventsRequest::GetSessionEvents {
-            session_id: Some(session_id),
-            workspace_id: None,
-            after_sequence: None,
-            stream_epoch: None,
-        },
-    )));
-    let ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) =
-        events.result.unwrap()
-    else {
-        panic!("unexpected response");
-    };
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].session_id, session_id);
-
-    let initial = connection.request(RequestEnvelope::new(ClientRequest::Session(
-        SessionRequest::GetAgentSessionInitialState { session_id },
-    )));
-    let ServerResponse::Session(SessionResponse::AgentSessionInitialState(initial)) =
-        initial.result.unwrap()
-    else {
-        panic!("unexpected initial state response");
-    };
-    assert_eq!(initial.cursor, events[0].sequence);
-    let renamed = connection.request(RequestEnvelope::new(ClientRequest::Session(
-        SessionRequest::RenameAgentSession {
-            session_id,
-            name: "Renamed after snapshot".to_owned(),
-        },
-    )));
-    assert!(matches!(
-        renamed.result,
-        Ok(ServerResponse::Session(
-            SessionResponse::AgentSessionRenamed(_)
-        ))
-    ));
-    let resumed = connection.request(RequestEnvelope::new(ClientRequest::Events(
-        EventsRequest::GetSessionEvents {
-            session_id: Some(session_id),
-            workspace_id: None,
-            after_sequence: Some(initial.cursor),
-            stream_epoch: None,
-        },
-    )));
-    let ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) =
-        resumed.result.unwrap()
-    else {
-        panic!("unexpected incremental event response");
-    };
-    assert_eq!(events.len(), 1);
-    assert!(matches!(
-        events[0].event,
-        ServerEvent::AgentSessionRenamed { .. }
-    ));
-}
-
-#[test]
 fn runs_deterministic_agent_through_approvals() {
     let root = git_repository();
     let backend = InProcessBackend::new();
@@ -2567,32 +2483,6 @@ fn runs_deterministic_agent_through_approvals() {
     );
     fs::remove_dir_all(&backend.session_root_base).unwrap();
     fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn requires_negotiation_before_session_requests() {
-    let backend = InProcessBackend::new();
-    let connection = backend.connect();
-    let response = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
-        WorkspaceRequest::ListWorkspaces,
-    )));
-
-    assert_eq!(response.result.unwrap_err().code, ErrorCode::InvalidRequest);
-}
-
-#[test]
-fn unknown_run_is_structured_not_found() {
-    let backend = InProcessBackend::new();
-    let connection = backend.connect();
-    negotiate(&connection);
-
-    let response = connection.request(RequestEnvelope::new(ClientRequest::Run(
-        RunRequest::GetAgentRun {
-            run_id: loom_core::RunId::new(),
-        },
-    )));
-
-    assert_eq!(response.result.unwrap_err().code, ErrorCode::NotFound);
 }
 
 #[test]
