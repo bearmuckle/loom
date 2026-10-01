@@ -12,8 +12,8 @@ use loom_core::{
 };
 use loom_model::ProviderUsageSummary;
 use loom_protocol::{
-    AgentRunState, GitDiff, GitDiffLine, GitRepositoryStatus, SessionFilesystemChange,
-    SessionFilesystemFile, WorkspaceEntry,
+    AgentPlanProgress, AgentRunState, GitDiff, GitDiffLine, GitRepositoryStatus,
+    SessionFilesystemChange, SessionFilesystemFile, WorkspaceEntry,
 };
 
 use crate::MAX_TIMELINE_OUTPUT;
@@ -302,13 +302,104 @@ pub(crate) enum TimelineItem {
     User(String),
     Assistant(AssistantTurn),
     System(SystemNote),
-    Plan {
-        steps: Vec<String>,
-        completed: BTreeSet<u32>,
-        active: Option<u32>,
-    },
     ProjectMessage(AgentMessageRecord),
     ProjectMessageContext(String),
+}
+
+/// Live progress for the active run's plan.
+///
+/// A plan is run-scoped status rather than a conversation message, so it is
+/// kept out of the timeline and rendered once as a banner pinned above the
+/// transcript, with a compact summary in the inspector.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct PlanState {
+    pub(crate) steps: Vec<String>,
+    pub(crate) completed: BTreeSet<u32>,
+    pub(crate) active: Option<u32>,
+}
+
+impl PlanState {
+    pub(crate) fn new(steps: Vec<String>) -> Self {
+        Self {
+            steps,
+            completed: BTreeSet::new(),
+            active: None,
+        }
+    }
+
+    /// Rebuilds plan progress sent by the backend, which derives it from the
+    /// run's persisted step events. Returns `None` when the run has no plan.
+    pub(crate) fn from_projection(
+        steps: Vec<String>,
+        progress: &AgentPlanProgress,
+    ) -> Option<Self> {
+        if steps.is_empty() {
+            return None;
+        }
+        Some(Self {
+            steps,
+            completed: progress.completed.iter().copied().collect(),
+            active: progress.active,
+        })
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    pub(crate) fn total(&self) -> usize {
+        self.steps.len()
+    }
+
+    pub(crate) fn done_count(&self) -> usize {
+        let total = self.steps.len();
+        self.completed
+            .iter()
+            .filter(|index| usize::try_from(**index).is_ok_and(|index| index < total))
+            .count()
+    }
+
+    pub(crate) fn status(&self, index: u32) -> PlanStepStatus {
+        if self.completed.contains(&index) {
+            PlanStepStatus::Done
+        } else if self.active == Some(index) {
+            PlanStepStatus::Active
+        } else {
+            PlanStepStatus::Pending
+        }
+    }
+
+    pub(crate) fn active_step(&self) -> Option<&str> {
+        self.active
+            .and_then(|index| self.steps.get(index as usize))
+            .map(String::as_str)
+    }
+
+    /// The completed fraction in `0.0..=1.0`, used by the progress bars.
+    pub(crate) fn fraction(&self) -> f32 {
+        if self.steps.is_empty() {
+            0.0
+        } else {
+            self.done_count() as f32 / self.steps.len() as f32
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PlanStepStatus {
+    Done,
+    Active,
+    Pending,
+}
+
+impl PlanStepStatus {
+    pub(crate) fn marker(self) -> &'static str {
+        match self {
+            Self::Done => "✓",
+            Self::Active => "▶",
+            Self::Pending => "○",
+        }
+    }
 }
 
 /// One assistant response, rendered as an ordered list of parts. A response is
@@ -608,6 +699,42 @@ mod tests {
         for (index, tab) in InspectorTab::ALL.into_iter().enumerate() {
             assert_eq!(tab.index(), index);
         }
+    }
+
+    #[test]
+    fn plan_state_tracks_step_status_and_progress() {
+        let mut plan = PlanState::new(vec![
+            "Inspect".to_owned(),
+            "Edit".to_owned(),
+            "Verify".to_owned(),
+        ]);
+        assert!(!plan.is_empty());
+        assert_eq!(plan.total(), 3);
+        assert_eq!(plan.done_count(), 0);
+        assert_eq!(plan.fraction(), 0.0);
+        assert_eq!(plan.active_step(), None);
+        assert_eq!(plan.status(0), PlanStepStatus::Pending);
+
+        plan.active = Some(1);
+        assert_eq!(plan.active_step(), Some("Edit"));
+        assert_eq!(plan.status(1), PlanStepStatus::Active);
+        assert_eq!(plan.status(1).marker(), "▶");
+
+        plan.completed.insert(0);
+        plan.completed.insert(1);
+        plan.active = None;
+        assert_eq!(plan.done_count(), 2);
+        assert!((plan.fraction() - 2.0 / 3.0).abs() < 1e-6);
+        assert_eq!(plan.status(0), PlanStepStatus::Done);
+        assert_eq!(plan.status(0).marker(), "✓");
+        assert_eq!(plan.status(2), PlanStepStatus::Pending);
+        assert_eq!(plan.status(2).marker(), "○");
+
+        let empty = PlanState::default();
+        assert!(empty.is_empty());
+        assert_eq!(empty.total(), 0);
+        assert_eq!(empty.fraction(), 0.0);
+        assert_eq!(empty.active_step(), None);
     }
 
     #[test]

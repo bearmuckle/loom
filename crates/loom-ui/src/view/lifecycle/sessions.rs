@@ -114,6 +114,8 @@ impl LoomView {
 
     pub(crate) fn reset_projection(&mut self) {
         self.timeline.clear();
+        self.plan = None;
+        self.plan_collapsed = false;
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
         self.transcript_before_ordinal = None;
         self.transcript_loaded_ordinals.clear();

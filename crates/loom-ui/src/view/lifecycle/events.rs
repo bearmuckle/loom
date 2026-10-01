@@ -31,6 +31,9 @@ impl LoomView {
                         self.after_sequence = Some(event.sequence);
                         self.consume_event(&event.event);
                     }
+                    if let Some(projection) = fallback.as_ref() {
+                        self.seed_plan_from_projection(projection);
+                    }
                     if self.timeline.is_empty()
                         && let Some(projection) = fallback
                     {
@@ -99,6 +102,9 @@ impl LoomView {
         for event in events {
             self.after_sequence = Some(event.sequence);
             self.consume_event(&event.event);
+        }
+        if let Some(projection) = fallback.as_ref() {
+            self.seed_plan_from_projection(projection);
         }
         if self.timeline.is_empty()
             && let Some(projection) = fallback
@@ -185,6 +191,9 @@ impl LoomView {
                     self.transcript_has_older = false;
                     self.transcript_loading = false;
                     self.activity_records.clear();
+                    // A plan belongs to one run, so a new run starts without one.
+                    self.plan = None;
+                    self.plan_collapsed = false;
                 }
                 self.context_inspection = None;
                 self.active_run = Some(snapshot.clone());
@@ -197,26 +206,8 @@ impl LoomView {
                     .iter()
                     .map(|step| step.description.clone())
                     .collect::<Vec<_>>();
-                if let Some(TimelineItem::Plan {
-                    steps: existing,
-                    completed,
-                    active,
-                }) = self
-                    .timeline
-                    .iter_mut()
-                    .rev()
-                    .find(|item| matches!(item, TimelineItem::Plan { .. }))
-                {
-                    *existing = steps;
-                    completed.clear();
-                    *active = None;
-                } else {
-                    self.timeline.push(TimelineItem::Plan {
-                        steps,
-                        completed: BTreeSet::new(),
-                        active: None,
-                    });
-                }
+                self.plan = Some(PlanState::new(steps));
+                self.plan_collapsed = false;
             }
             AgentEvent::UserMessage {
                 run_id,
@@ -243,27 +234,15 @@ impl LoomView {
                 push_assistant_reasoning(&mut self.timeline, text);
             }
             AgentEvent::StepStarted { index, .. } => {
-                if let Some(TimelineItem::Plan { active, .. }) = self
-                    .timeline
-                    .iter_mut()
-                    .rev()
-                    .find(|item| matches!(item, TimelineItem::Plan { .. }))
-                {
-                    *active = Some(*index);
+                if let Some(plan) = self.plan.as_mut() {
+                    plan.active = Some(*index);
                 }
             }
             AgentEvent::StepCompleted { index, .. } => {
-                if let Some(TimelineItem::Plan {
-                    completed, active, ..
-                }) = self
-                    .timeline
-                    .iter_mut()
-                    .rev()
-                    .find(|item| matches!(item, TimelineItem::Plan { .. }))
-                {
-                    completed.insert(*index);
-                    if active == &Some(*index) {
-                        *active = None;
+                if let Some(plan) = self.plan.as_mut() {
+                    plan.completed.insert(*index);
+                    if plan.active == Some(*index) {
+                        plan.active = None;
                     }
                 }
             }
@@ -478,7 +457,25 @@ impl LoomView {
         }
     }
 
+    /// Seeds the pinned plan from a run snapshot when the event stream has not
+    /// already established one. Progress comes from the backend so a reopened
+    /// session keeps its completed and active markers.
+    pub(crate) fn seed_plan_from_projection(&mut self, projection: &AgentRunSnapshotProjection) {
+        if self.plan.is_some() {
+            return;
+        }
+        self.plan = PlanState::from_projection(
+            projection
+                .plan
+                .iter()
+                .map(|step| step.description.clone())
+                .collect(),
+            &projection.plan_progress,
+        );
+    }
+
     pub(crate) fn apply_run_projection(&mut self, projection: AgentRunSnapshotProjection) {
+        self.seed_plan_from_projection(&projection);
         self.active_run_id = Some(projection.run.id);
         self.active_run = Some(projection.run.clone());
         self.run_state = Some(projection.run.state);
@@ -515,21 +512,7 @@ impl LoomView {
             })
             .collect::<Vec<_>>();
         if self.timeline.is_empty() {
-            let mut timeline = timeline_items_from_messages(messages, activity_records.clone());
-            if !projection.plan.is_empty() {
-                timeline.insert(
-                    0,
-                    TimelineItem::Plan {
-                        steps: projection
-                            .plan
-                            .into_iter()
-                            .map(|step| step.description)
-                            .collect(),
-                        completed: BTreeSet::new(),
-                        active: None,
-                    },
-                );
-            }
+            let timeline = timeline_items_from_messages(messages, activity_records.clone());
             self.timeline = timeline;
         } else {
             for activity in &activity_records {

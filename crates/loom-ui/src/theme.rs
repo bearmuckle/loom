@@ -76,7 +76,7 @@ enum ColorRole {
 const fn legacy_color_role(value: u32) -> Option<ColorRole> {
     match value {
         0x111318 | 0x10141b | 0x0f1115 => Some(ColorRole::Background),
-        0x14161a | 0x17191f | 0x171c25 => Some(ColorRole::Surface),
+        0x14161a | 0x17191f | 0x171c25 | 0x181c26 => Some(ColorRole::Surface),
         0x191c22 | 0x1b1d24 | 0x20242c => Some(ColorRole::Control),
         0x202b3b | 0x25334a | 0x263b58 | 0x293244 => Some(ColorRole::Active),
         0x293b56 => Some(ColorRole::ControlHover),

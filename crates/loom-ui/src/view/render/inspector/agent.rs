@@ -43,64 +43,16 @@ impl LoomView {
         if let Some(elapsed) = self.run_elapsed_ms() {
             session_rows = session_rows.child(info_row("Elapsed", format_elapsed_ms(elapsed)));
         }
+        if let Some(plan) = self.plan.as_ref().filter(|plan| !plan.is_empty()) {
+            session_rows = session_rows.child(info_row("Plan", plan_summary_line(plan)));
+        }
         content = content.child(card("Run", session_rows));
 
         content = content.child(self.render_usage_card());
-        content = content.child(self.render_agent_plan_card());
         content = content.child(self.render_agent_tools_card());
         content = content.child(self.render_agent_evidence_card());
 
         content
-    }
-
-    fn render_agent_plan_card(&self) -> impl IntoElement {
-        let plan = self.timeline.iter().rev().find_map(|item| match item {
-            TimelineItem::Plan {
-                steps,
-                completed,
-                active,
-            } => Some((steps, completed, active)),
-            _ => None,
-        });
-        let body = match plan {
-            Some((steps, completed, active)) => {
-                let mut list = div().flex().flex_col().gap_1();
-                for (index, step) in steps.iter().enumerate() {
-                    let index = index as u32;
-                    let (marker, color) = if completed.contains(&index) {
-                        ("✓", rgb(0x86efac))
-                    } else if *active == Some(index) {
-                        ("›", rgb(0x93c5fd))
-                    } else {
-                        ("○", rgb(0x64748b))
-                    };
-                    list = list.child(
-                        div()
-                            .flex()
-                            .items_start()
-                            .gap_2()
-                            .text_sm()
-                            .child(
-                                div()
-                                    .w(px(14.))
-                                    .flex_shrink_0()
-                                    .text_color(color)
-                                    .child(marker),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .text_color(rgb(0xe5e7eb))
-                                    .child(step.clone()),
-                            ),
-                    );
-                }
-                list.into_any_element()
-            }
-            None => empty_note("No plan has been proposed for this run.").into_any_element(),
-        };
-        card("Plan", body)
     }
 
     fn render_agent_tools_card(&self) -> impl IntoElement {
@@ -125,7 +77,7 @@ impl LoomView {
                         .items_center()
                         .justify_between()
                         .gap_2()
-                        .text_sm()
+                        .text_size(card_value_font())
                         .child(div().text_color(rgb(0xb7c0d0)).child(label))
                         .child(
                             div()
@@ -156,7 +108,7 @@ impl LoomView {
                         .flex()
                         .items_start()
                         .gap_2()
-                        .text_sm()
+                        .text_size(card_value_font())
                         .child(
                             div()
                                 .flex_shrink_0()
@@ -191,4 +143,53 @@ impl LoomView {
             .unwrap_or_else(|| Timestamp::now().as_unix_millis());
         Some(end.saturating_sub(run.started_at.as_unix_millis()))
     }
+}
+
+/// A single-line plan summary for the Run card: completed count, the active
+/// step, and a mini progress bar. The full checklist lives in the transcript's
+/// pinned plan banner.
+fn plan_summary_line(plan: &PlanState) -> impl IntoElement {
+    let detail = if let Some(step) = plan.active_step() {
+        format!("active: {step}")
+    } else if plan.done_count() >= plan.total() {
+        "complete".to_owned()
+    } else {
+        "not started".to_owned()
+    };
+    div()
+        .id("run-plan-summary")
+        .test_support()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .flex_shrink_0()
+                .font_family(mono_font())
+                .child(format!("{}/{}", plan.done_count(), plan.total())),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
+                .text_color(rgb(0x8f98a6))
+                .child(detail),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .w(px(54.))
+                .h(px(4.))
+                .rounded_full()
+                .bg(rgb(0x293244))
+                .child(
+                    div()
+                        .h_full()
+                        .rounded_full()
+                        .w(gpui_kit::relative(plan.fraction()))
+                        .bg(rgb(0x60a5fa)),
+                ),
+        )
 }

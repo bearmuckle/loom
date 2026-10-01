@@ -812,38 +812,6 @@ impl LoomView {
                 }
                 card.into_any()
             }
-            TimelineItem::Plan {
-                steps,
-                completed,
-                active,
-            } => {
-                let mut card = div()
-                    .px_3()
-                    .py_2()
-                    .text_color(rgb(0xb7c0d0))
-                    .child(div().text_xs().text_color(rgb(0x8f98a6)).child("Plan"));
-                for (index, step) in steps.iter().enumerate() {
-                    let index = index as u32;
-                    let marker = if completed.contains(&index) {
-                        "✓"
-                    } else if active == &Some(index) {
-                        ">"
-                    } else {
-                        "○"
-                    };
-                    card = card.child(
-                        div()
-                            .text_xs()
-                            .text_color(if completed.contains(&index) {
-                                rgb(0x9ad7bd)
-                            } else {
-                                rgb(0xb7c0d0)
-                            })
-                            .child(format!("{marker} {}", step)),
-                    );
-                }
-                card.into_any()
-            }
         }
     }
 

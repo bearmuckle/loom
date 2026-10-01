@@ -33,7 +33,7 @@ use loom_persistence::{
 };
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
-    AgentActivityRecord, AgentExecutionStateRecord, AgentRunMessageHeader,
+    AgentActivityRecord, AgentExecutionStateRecord, AgentPlanProgress, AgentRunMessageHeader,
     AgentRunSnapshotProjection, AgentRunTranscriptMessage, AgentSessionInitialState,
     AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION, ClientRequest, ContextRequest,
     ContextResponse, ControlRequest, ControlResponse, EventsRequest, EventsResponse,

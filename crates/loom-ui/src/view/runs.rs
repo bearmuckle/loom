@@ -397,16 +397,10 @@ impl LoomView {
     }
 
     pub(crate) fn transcript_insertion_index(&self) -> usize {
-        let mut index = usize::from(matches!(
-            self.timeline.first(),
-            Some(TimelineItem::Plan { .. })
-        ));
         let task = self.session_task_cache.get(&self.active_session.id);
-        if matches!(self.timeline.get(index), Some(TimelineItem::User(text)) if task == Some(text))
-        {
-            index += 1;
-        }
-        index
+        usize::from(
+            matches!(self.timeline.first(), Some(TimelineItem::User(text)) if task == Some(text)),
+        )
     }
 
     pub(crate) fn ensure_session_task_message(&mut self, session_id: AgentSessionId) {
@@ -418,11 +412,7 @@ impl LoomView {
             .iter()
             .any(|item| matches!(item, TimelineItem::User(text) if text == &task))
         {
-            let index = usize::from(matches!(
-                self.timeline.first(),
-                Some(TimelineItem::Plan { .. })
-            ));
-            self.timeline.insert(index, TimelineItem::User(task));
+            self.timeline.insert(0, TimelineItem::User(task));
         }
     }
 }

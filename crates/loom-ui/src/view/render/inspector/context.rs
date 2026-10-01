@@ -93,7 +93,7 @@ impl LoomView {
                                 div()
                                     .flex_1()
                                     .min_w(px(0.))
-                                    .text_sm()
+                                    .text_size(card_value_font())
                                     .text_color(rgb(0xe5e7eb))
                                     .child(item.label.clone()),
                             )

@@ -1,5 +1,24 @@
 use super::*;
 
+/// Compact typography for inspector cards. Sizes are logical pixels converted
+/// through the app's rem base so user font scaling still applies.
+const CARD_TITLE_FONT_SIZE: f32 = 11.5;
+const CARD_LABEL_FONT_SIZE: f32 = 11.5;
+const CARD_VALUE_FONT_SIZE: f32 = 13.;
+
+fn card_title_font() -> gpui_kit::Rems {
+    gpui_kit::rems(CARD_TITLE_FONT_SIZE / BASE_FONT_SIZE)
+}
+
+fn card_label_font() -> gpui_kit::Rems {
+    gpui_kit::rems(CARD_LABEL_FONT_SIZE / BASE_FONT_SIZE)
+}
+
+/// The standard body text size inside an inspector card.
+pub(crate) fn card_value_font() -> gpui_kit::Rems {
+    gpui_kit::rems(CARD_VALUE_FONT_SIZE / BASE_FONT_SIZE)
+}
+
 mod agent;
 mod changes;
 mod context;
@@ -107,6 +126,11 @@ impl LoomView {
                             Some(changed_files.to_string())
                         }
                         InspectorTab::Agent if pending_attention > 0 => Some("•".to_owned()),
+                        InspectorTab::Agent => self
+                            .plan
+                            .as_ref()
+                            .filter(|plan| !plan.is_empty())
+                            .map(|plan| format!("{}/{}", plan.done_count(), plan.total())),
                         _ => None,
                     };
                     let mut item = Tab::new().label(tab.label());
@@ -271,7 +295,7 @@ pub(crate) fn git_status_color(kind: GitFileStatusKind) -> Rgba {
 /// A small uppercase heading inside the inspector.
 pub(crate) fn section_heading(label: &str) -> impl IntoElement {
     div()
-        .text_xs()
+        .text_size(card_title_font())
         .text_color(rgb(0x93c5fd))
         .child(label.to_owned())
 }
@@ -280,7 +304,7 @@ pub(crate) fn section_heading(label: &str) -> impl IntoElement {
 pub(crate) fn empty_note(text: &str) -> impl IntoElement {
     div()
         .p_3()
-        .text_sm()
+        .text_size(card_value_font())
         .text_color(rgb(0x8f98a6))
         .child(text.to_owned())
 }
@@ -302,7 +326,7 @@ pub(crate) fn card(title: &str, body: impl IntoElement) -> impl IntoElement {
                 .py_2()
                 .border_b_1()
                 .border_color(rgb(0x293244))
-                .text_xs()
+                .text_size(card_title_font())
                 .text_color(rgb(0x93c5fd))
                 .child(title.to_owned()),
         )
@@ -320,7 +344,7 @@ pub(crate) fn info_row(label: &str, value: impl IntoElement) -> impl IntoElement
             div()
                 .w(px(96.))
                 .flex_shrink_0()
-                .text_xs()
+                .text_size(card_label_font())
                 .text_color(rgb(0x8f98a6))
                 .child(label.to_owned()),
         )
@@ -328,7 +352,7 @@ pub(crate) fn info_row(label: &str, value: impl IntoElement) -> impl IntoElement
             div()
                 .flex_1()
                 .min_w(px(0.))
-                .text_sm()
+                .text_size(card_value_font())
                 .text_color(rgb(0xe5e7eb))
                 .child(value),
         )
