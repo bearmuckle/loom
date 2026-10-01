@@ -4366,7 +4366,6 @@ dependencies = [
  "flate2",
  "loom-core",
  "loom-model",
- "loom-protocol",
  "loom-session",
  "rusqlite",
  "serde",

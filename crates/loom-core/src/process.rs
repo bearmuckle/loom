@@ -1,4 +1,4 @@
-use loom_core::{EventSequence, TaskId, TerminalId, Timestamp};
+use crate::{EventSequence, TaskId, TerminalId, Timestamp};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

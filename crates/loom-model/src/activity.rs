@@ -1,8 +1,7 @@
 use loom_core::{ActivityId, RunId, StepId, Timestamp};
-use loom_model::{ModelId, ToolCall};
 use serde::{Deserialize, Serialize};
 
-use crate::ToolResult;
+use crate::{ModelId, ToolCall, ToolResult};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

@@ -238,16 +238,16 @@ fn run_checkpoint_is_scoped_and_rolls_back_session_and_run_with_feed_failure() {
         next_sequence: EventSequence::new(1),
         retention_limit: 250,
         events: vec![ServerEventEnvelope {
-            protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+            protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
             sequence: EventSequence::new(1),
             session_id: invalid_session_id,
-            event: loom_protocol::ServerEvent::AgentSessionCreated {
+            event: loom_model::ServerEvent::AgentSessionCreated {
                 snapshot: changed_session.clone(),
             },
         }],
         workspace_events: Vec::new(),
     };
-    let plan = loom_protocol::AgentPlan { steps: Vec::new() };
+    let plan = loom_model::AgentPlan { steps: Vec::new() };
     let mut updated_activity = initial_activity.clone();
     updated_activity.status = AgentActivityStatus::Completed;
     updated_activity.completed_at = Some(Timestamp::from_unix_millis(3));
@@ -380,10 +380,10 @@ fn run_checkpoint_is_scoped_and_rolls_back_session_and_run_with_feed_failure() {
         next_sequence: EventSequence::new(1),
         retention_limit: 250,
         events: vec![ServerEventEnvelope {
-            protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+            protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
             sequence: EventSequence::new(1),
             session_id: session.id,
-            event: loom_protocol::ServerEvent::AgentSessionCreated {
+            event: loom_model::ServerEvent::AgentSessionCreated {
                 snapshot: changed_session.clone(),
             },
         }],
@@ -3321,12 +3321,12 @@ fn run_interactions_round_trip_and_commit_atomically_with_the_feed() {
         interactions: Some(vec![interaction.clone()]),
     };
     let run_summaries = BTreeMap::from([(run_id, summary.clone())]);
-    let input_event = loom_protocol::ServerEventEnvelope {
-        protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+    let input_event = loom_model::ServerEventEnvelope {
+        protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
         sequence: EventSequence::new(1),
         session_id: session.id,
-        event: loom_protocol::ServerEvent::Agent {
-            event: loom_protocol::AgentEvent::NeedsInput {
+        event: loom_model::ServerEvent::Agent {
+            event: loom_model::AgentEvent::NeedsInput {
                 run_id,
                 attempt_id,
                 control_revision: 1,
@@ -3398,12 +3398,12 @@ fn run_interactions_round_trip_and_commit_atomically_with_the_feed() {
     });
     summary.execution_state = Some(execution.clone());
     summary.interactions = Some(vec![interaction.clone()]);
-    let resolved_event = loom_protocol::ServerEventEnvelope {
-        protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+    let resolved_event = loom_model::ServerEventEnvelope {
+        protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
         sequence: EventSequence::new(2),
         session_id: session.id,
-        event: loom_protocol::ServerEvent::Agent {
-            event: loom_protocol::AgentEvent::UserMessage {
+        event: loom_model::ServerEvent::Agent {
+            event: loom_model::AgentEvent::UserMessage {
                 run_id,
                 attempt_id,
                 control_revision: 2,
@@ -3825,10 +3825,10 @@ fn reconnect_feed_is_indexed_bounded_and_atomic_with_catalog_writes() {
         .into_iter()
         .map(
             |(sequence, session_id, event_snapshot)| ServerEventEnvelope {
-                protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+                protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
                 sequence: EventSequence::new(sequence),
                 session_id,
-                event: loom_protocol::ServerEvent::AgentSessionCreated {
+                event: loom_model::ServerEvent::AgentSessionCreated {
                     snapshot: event_snapshot,
                 },
             },
@@ -3886,18 +3886,18 @@ fn reconnect_feed_is_indexed_bounded_and_atomic_with_catalog_writes() {
         retention_limit: 100,
         events: vec![
             ServerEventEnvelope {
-                protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+                protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
                 sequence: EventSequence::new(5),
                 session_id,
-                event: loom_protocol::ServerEvent::AgentSessionCreated {
+                event: loom_model::ServerEvent::AgentSessionCreated {
                     snapshot: snapshot.clone(),
                 },
             },
             ServerEventEnvelope {
-                protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+                protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
                 sequence: EventSequence::new(6),
                 session_id: second_session_id,
-                event: loom_protocol::ServerEvent::AgentSessionCreated {
+                event: loom_model::ServerEvent::AgentSessionCreated {
                     snapshot: AgentSessionSnapshot {
                         id: second_session_id,
                         workspace_id,
@@ -3981,10 +3981,10 @@ fn workspace_reconnect_feed_is_isolated_indexed_and_tracks_pruning() {
         updated_at: Timestamp::from_unix_millis(1),
     };
     let event = |sequence, id, workspace_id| ServerEventEnvelope {
-        protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+        protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
         sequence: EventSequence::new(sequence),
         session_id: id,
-        event: loom_protocol::ServerEvent::AgentSessionCreated {
+        event: loom_model::ServerEvent::AgentSessionCreated {
             snapshot: snapshot(id, workspace_id),
         },
     };
@@ -4066,10 +4066,10 @@ fn workspace_only_events_share_the_cursor_and_persist_with_bounded_retention() {
     let store = FilePersistence::open(&path).unwrap();
     let workspace_id = WorkspaceId::new();
     let workspace_event = |sequence, name: &str| WorkspaceEventEnvelope {
-        protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+        protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
         sequence: EventSequence::new(sequence),
         workspace_id,
-        event: loom_protocol::WorkspaceEvent::Renamed {
+        event: loom_model::WorkspaceEvent::Renamed {
             name: name.to_owned(),
         },
     };
@@ -4088,7 +4088,7 @@ fn workspace_only_events_share_the_cursor_and_persist_with_bounded_retention() {
     assert_eq!(events.len(), 1);
     assert!(matches!(&events[0], WorkspaceFeedEvent::Workspace(event)
         if event.sequence == EventSequence::new(2)
-            && matches!(&event.event, loom_protocol::WorkspaceEvent::Renamed { name } if name == "Second")));
+            && matches!(&event.event, loom_model::WorkspaceEvent::Renamed { name } if name == "Second")));
     let cursor = store
         .load_feed_workspace_cursor(workspace_id)
         .unwrap()
@@ -4125,25 +4125,25 @@ fn session_and_workspace_feed_share_the_global_payload_budget() {
         next_sequence: EventSequence::new(3),
         retention_limit: 100,
         events: vec![ServerEventEnvelope {
-            protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+            protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
             sequence: EventSequence::new(1),
             session_id,
-            event: loom_protocol::ServerEvent::AgentSessionCreated { snapshot },
+            event: loom_model::ServerEvent::AgentSessionCreated { snapshot },
         }],
         workspace_events: vec![
             WorkspaceEventEnvelope {
-                protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+                protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
                 sequence: EventSequence::new(2),
                 workspace_id,
-                event: loom_protocol::WorkspaceEvent::Renamed {
+                event: loom_model::WorkspaceEvent::Renamed {
                     name: "workspace mutation one".to_owned(),
                 },
             },
             WorkspaceEventEnvelope {
-                protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+                protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
                 sequence: EventSequence::new(3),
                 workspace_id,
-                event: loom_protocol::WorkspaceEvent::Renamed {
+                event: loom_model::WorkspaceEvent::Renamed {
                     name: "workspace mutation two".to_owned(),
                 },
             },
@@ -4173,10 +4173,10 @@ fn session_and_workspace_feed_share_the_global_payload_budget() {
 fn reconnect_event_decoder_accepts_compressed_rows_and_rejects_corruption() {
     let session_id = AgentSessionId::new();
     let event = ServerEventEnvelope {
-        protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+        protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
         sequence: EventSequence::new(7),
         session_id,
-        event: loom_protocol::ServerEvent::AgentSessionCreated {
+        event: loom_model::ServerEvent::AgentSessionCreated {
             snapshot: AgentSessionSnapshot {
                 id: session_id,
                 workspace_id: WorkspaceId::new(),

@@ -1,5 +1,5 @@
+use crate::ToolCall;
 use loom_core::ToolCallId;
-use loom_model::ToolCall;
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolResult {

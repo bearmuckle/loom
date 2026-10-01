@@ -94,12 +94,12 @@ Suggested backend boundaries:
   session, run, filesystem, feed, project) behind a `Persistence` supertrait.
   Durable state is written in per-mutation transactions, and large immutable
   payloads live in a content-addressed store inside SQLite. It uses a single
-  baseline schema (currently version 2); a database written by any other
-  revision is rejected unchanged and must be wiped. `FilePersistence` and
-  `FilePersistence::in_memory()` share the same schema, repository, and
-  serialization code path. The crate depends only on neutral domain crates
-  (`loom-core`/`loom-model`) and the protocol contract, never on
-  `loom-session`/`loom-providers`.
+  typed schema (currently version 4, with an in-place ladder from version 2);
+  a database written by an unsupported revision is rejected unchanged and must
+  be wiped. `FilePersistence` and `FilePersistence::in_memory()` share the same
+  schema, repository, and serialization code path. The crate depends only on
+  neutral domain crates (`loom-core`/`loom-model`), never on the protocol
+  contract or `loom-session`/`loom-providers`.
 - `loom-tools`: typed tool definitions, permission checks, execution policies,
   result normalization, and tool adapters. Workspace exploration is bounded:
   search supports literal or regex matching with context and a result cap,
