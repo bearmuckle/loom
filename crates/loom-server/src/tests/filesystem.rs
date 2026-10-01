@@ -127,40 +127,185 @@ fn filesystem_change_response_detects_pruned_client_cursors() {
 }
 
 #[test]
-fn github_repository_fetch_paginates_sorts_and_maps_api_records() {
+fn github_repository_search_maps_and_sorts_api_records() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
-        let (first, _) = listener.accept().unwrap();
-        let page_one = (0..100)
-            .map(|index| github_repository_json(&format!("owner/repo-{index:03}")))
-            .collect::<Vec<_>>();
-        respond_http(first, "200 OK", &serde_json::to_string(&page_one).unwrap());
-        let (second, _) = listener.accept().unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let items = vec![
+            github_repository_json("owner/zeta"),
+            github_repository_json("owner/alpha"),
+            github_repository_json("owner/alpha"),
+        ];
         respond_http(
-            second,
+            stream,
             "200 OK",
-            &serde_json::to_string(&vec![github_repository_json("owner/aaa")]).unwrap(),
+            &serde_json::json!({ "items": items }).to_string(),
         );
     });
 
-    let repositories =
-        fetch_github_repositories("fixture-token", &format!("http://{address}/user/repos"))
-            .unwrap();
+    let repositories = search_github_repositories_at(
+        "fixture-token",
+        "loom",
+        &format!("http://{address}/search/repositories"),
+    )
+    .unwrap();
     server.join().unwrap();
 
-    assert_eq!(repositories.len(), 101);
-    assert_eq!(repositories.first().unwrap().full_name, "owner/aaa");
-    assert_eq!(repositories.last().unwrap().full_name, "owner/repo-099");
+    assert_eq!(repositories.len(), 2);
+    assert_eq!(repositories.first().unwrap().full_name, "owner/alpha");
     assert_eq!(
-        repositories[1].clone_url,
-        "https://github.com/owner/repo-000.git"
+        repositories.last().unwrap().clone_url,
+        "https://github.com/owner/zeta.git"
     );
-    assert_eq!(repositories[1].default_branch, "main");
+    assert_eq!(repositories.last().unwrap().default_branch, "main");
 }
 
 #[test]
-fn github_repository_fetch_normalizes_transport_and_payload_errors() {
+fn github_repository_search_requires_two_characters_before_any_request() {
+    for query in ["", " ", "a"] {
+        let error = search_github_repositories_at(
+            "fixture-token",
+            query,
+            "http://127.0.0.1:1/search/repositories",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+    }
+}
+
+#[test]
+fn importing_a_local_git_directory_attaches_it_as_a_repository() {
+    let source = git_repository();
+    let backend = InProcessBackend::new();
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Import".to_owned(),
+        },
+    )));
+    let Ok(ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace))) =
+        created.result
+    else {
+        panic!("expected workspace creation");
+    };
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
+            workspace_id: workspace.id,
+            name: "Import".to_owned(),
+        },
+    )));
+    let Ok(ServerResponse::Session(SessionResponse::AgentSessionCreated(session))) = created.result
+    else {
+        panic!("expected session creation");
+    };
+
+    let imported = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::ImportSessionDirectory {
+            session_id: session.id,
+            source: source.display().to_string(),
+            path: "imported".to_owned(),
+        },
+    )));
+    assert!(matches!(
+        imported.result,
+        Ok(ServerResponse::Filesystem(
+            FilesystemResponse::SessionDirectoryImported {
+                repository: Some(_),
+                ..
+            }
+        ))
+    ));
+
+    let _ = fs::remove_dir_all(&source);
+}
+
+#[test]
+fn attach_can_reuse_a_cached_github_clone_without_the_network() {
+    let source = git_repository();
+    let backend = InProcessBackend::new();
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+
+    // Seed the node cache with a mirror of a GitHub-shaped repository.
+    let url = "https://github.com/owner/cached.git";
+    let mirror = backend.repository_mirror_path(url).unwrap();
+    GitService::create_mirror(&source, &mirror, url).unwrap();
+    backend
+        .register_cloned_repository(&ClonedRepository {
+            full_name: "owner/cached".to_owned(),
+            clone_url: url.to_owned(),
+            branch: Some("main".to_owned()),
+            last_used_at: Timestamp::from_unix_millis(1),
+        })
+        .unwrap();
+    assert_eq!(backend.cached_repositories().unwrap().len(), 1);
+
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Reuse".to_owned(),
+        },
+    )));
+    let Ok(ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace))) =
+        created.result
+    else {
+        panic!("expected workspace creation");
+    };
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
+            workspace_id: workspace.id,
+            name: "Reuse".to_owned(),
+        },
+    )));
+    let Ok(ServerResponse::Session(SessionResponse::AgentSessionCreated(session))) = created.result
+    else {
+        panic!("expected session creation");
+    };
+
+    let attached = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+        RepositoryRequest::AttachSessionRepository {
+            session_id: session.id,
+            source: url.to_owned(),
+            path: "repo".to_owned(),
+            revision: None,
+            reuse_local: true,
+        },
+    )));
+    let Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(repository))) =
+        attached.result
+    else {
+        panic!("expected cached attachment: {:?}", attached.result.err());
+    };
+    assert_eq!(repository.source, "cached");
+
+    // A checkout cloned from the node mirror still points `origin` at GitHub.
+    let filesystem = backend.restore_session_filesystem(session.id).unwrap();
+    let checkout = filesystem.directory_path(&repository.path).unwrap();
+    let config = fs::read_to_string(checkout.join(".git/config")).unwrap();
+    assert!(
+        config.contains(url),
+        "cached checkout origin should be the GitHub URL: {config}"
+    );
+
+    let _ = fs::remove_dir_all(&source);
+}
+
+#[test]
+fn github_repository_search_reports_transport_failures() {
+    let error = search_github_repositories_at(
+        "fixture-token",
+        "loom",
+        "http://127.0.0.1:1/search/repositories",
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::ProviderAuthentication);
+    assert!(error.retryable);
+}
+
+#[test]
+fn github_repository_search_normalizes_transport_and_payload_errors() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
@@ -170,10 +315,11 @@ fn github_repository_fetch_normalizes_transport_and_payload_errors() {
         respond_http(unauthorized, "401 Unauthorized", "{}");
     });
 
-    let endpoint = format!("http://{address}/user/repos");
-    let malformed = fetch_github_repositories("fixture-token", &endpoint).unwrap_err();
+    let endpoint = format!("http://{address}/search/repositories");
+    let malformed = search_github_repositories_at("fixture-token", "loom", &endpoint).unwrap_err();
     assert_eq!(malformed.code, ErrorCode::ProviderInvalidResponse);
-    let unauthorized = fetch_github_repositories("fixture-token", &endpoint).unwrap_err();
+    let unauthorized =
+        search_github_repositories_at("fixture-token", "loom", &endpoint).unwrap_err();
     assert_eq!(unauthorized.code, ErrorCode::ProviderAuthentication);
     assert!(unauthorized.retryable);
     server.join().unwrap();
@@ -520,6 +666,7 @@ fn workspace_sessions_get_independent_filesystems_and_repository_clones() {
                 source: source.display().to_string(),
                 path: "repo".to_owned(),
                 revision: None,
+                reuse_local: false,
             },
         )));
         let Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(
@@ -699,6 +846,7 @@ fn session_filesystem_and_repository_metadata_survive_restart() {
                 source: source.display().to_string(),
                 path: "repo".to_owned(),
                 revision: None,
+                reuse_local: false,
             },
         )));
         assert!(
@@ -947,6 +1095,7 @@ fn forked_session_filesystem_and_policy_survive_restart_and_checkpoint_revert() 
                 source: source.display().to_string(),
                 path: "repo".to_owned(),
                 revision: None,
+                reuse_local: false,
             },
         )));
         assert!(matches!(

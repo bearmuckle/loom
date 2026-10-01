@@ -465,6 +465,7 @@ async fn m4_demo_remote(
                     source: workspace_root.display().to_string(),
                     path: "repo".to_owned(),
                     revision: None,
+                    reuse_local: false,
                 },
             )))
             .await?
@@ -1044,6 +1045,7 @@ fn attach_repository(
             source: root.display().to_string(),
             path: "repo".to_owned(),
             revision: None,
+            reuse_local: false,
         },
     )));
     match response.result? {

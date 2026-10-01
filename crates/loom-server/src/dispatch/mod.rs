@@ -79,7 +79,10 @@ impl InProcessConnection {
             ClientRequest::Filesystem(FilesystemRequest::DetachSessionDirectory { .. }) => {
                 self.filesystem_dispatch(request, request_id)
             }
-            ClientRequest::Repository(RepositoryRequest::ListGitHubRepositories) => {
+            ClientRequest::Repository(RepositoryRequest::SearchGitHubRepositories { .. }) => {
+                self.repository_dispatch(request, request_id)
+            }
+            ClientRequest::Repository(RepositoryRequest::ListClonedRepositories) => {
                 self.repository_dispatch(request, request_id)
             }
             ClientRequest::Run(RunRequest::StartSessionAgentRun { .. }) => {

@@ -82,6 +82,7 @@ fn runs_deterministic_agent_through_approvals() {
             source: root.display().to_string(),
             path: "repo".to_owned(),
             revision: None,
+            reuse_local: false,
         },
     )));
     assert!(

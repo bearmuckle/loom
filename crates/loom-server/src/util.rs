@@ -29,10 +29,24 @@ pub(crate) fn should_prune_worker_feed(
         || accumulated_bytes.saturating_add(pending_bytes) >= FEED_PRUNE_AFTER_NEW_BYTES
 }
 
-pub(crate) fn fetch_github_repositories(
+pub(crate) fn search_github_repositories(
     token: &str,
+    query: &str,
+) -> Result<Vec<GitHubRepository>> {
+    search_github_repositories_at(token, query, "https://api.github.com/search/repositories")
+}
+
+pub(crate) fn search_github_repositories_at(
+    token: &str,
+    query: &str,
     endpoint: &str,
 ) -> Result<Vec<GitHubRepository>> {
+    let query = query.trim();
+    if query.chars().count() < GITHUB_REPOSITORY_QUERY_MIN_CHARS {
+        return Err(LoomError::invalid_request(format!(
+            "GitHub repository search requires at least {GITHUB_REPOSITORY_QUERY_MIN_CHARS} characters"
+        )));
+    }
     run_github_async(async {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -44,60 +58,62 @@ pub(crate) fn fetch_github_repositories(
                     true,
                 )
             })?;
-        let mut repositories = Vec::new();
-        for page in 1..=100 {
-            let url = format!("{endpoint}?per_page=100&sort=updated&page={page}");
-            let response = client
-                .get(&url)
-                .header("Accept", "application/vnd.github+json")
-                .header("Authorization", format!("Bearer {token}"))
-                .header("X-GitHub-Api-Version", "2022-11-28")
-                .header("User-Agent", "Loom")
-                .send()
-                .await
-                .map_err(|error| {
-                    LoomError::new(
-                        ErrorCode::ProviderAuthentication,
-                        format!("could not list GitHub repositories: {error}"),
-                        true,
-                    )
-                })?;
-            let status = response.status();
-            if !status.is_success() {
-                return Err(LoomError::new(
+        let mut url = url::Url::parse(endpoint).map_err(|error| {
+            LoomError::new(
+                ErrorCode::Internal,
+                format!("could not build the GitHub search URL: {error}"),
+                false,
+            )
+        })?;
+        url.query_pairs_mut()
+            .append_pair("q", &format!("{query} in:name,description"))
+            .append_pair("per_page", "50");
+        let response = client
+            .get(url)
+            .header("Accept", "application/vnd.github+json")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "Loom")
+            .send()
+            .await
+            .map_err(|error| {
+                LoomError::new(
                     ErrorCode::ProviderAuthentication,
-                    format!(
-                        "could not list GitHub repositories (HTTP {})",
-                        status.as_u16()
-                    ),
+                    format!("could not search GitHub repositories: {error}"),
                     true,
-                ));
-            }
-            let page_repositories: Vec<GitHubApiRepository> =
-                response.json().await.map_err(|error| {
-                    LoomError::new(
-                        ErrorCode::ProviderInvalidResponse,
-                        format!("GitHub returned an invalid repository list: {error}"),
-                        false,
-                    )
-                })?;
-            let page_len = page_repositories.len();
-            repositories.extend(
-                page_repositories
-                    .into_iter()
-                    .map(|repository| GitHubRepository {
-                        full_name: repository.full_name,
-                        description: repository.description,
-                        clone_url: repository.clone_url,
-                        private: repository.private,
-                        default_branch: repository.default_branch,
-                    }),
-            );
-            if page_len < 100 {
-                break;
-            }
+                )
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(LoomError::new(
+                ErrorCode::ProviderAuthentication,
+                format!(
+                    "could not search GitHub repositories (HTTP {})",
+                    status.as_u16()
+                ),
+                true,
+            ));
         }
+        let payload: GitHubSearchResponse = response.json().await.map_err(|error| {
+            LoomError::new(
+                ErrorCode::ProviderInvalidResponse,
+                format!("GitHub returned an invalid repository search: {error}"),
+                false,
+            )
+        })?;
+        let mut repositories = payload
+            .items
+            .into_iter()
+            .map(|repository| GitHubRepository {
+                full_name: repository.full_name,
+                description: repository.description,
+                clone_url: repository.clone_url,
+                private: repository.private,
+                default_branch: repository.default_branch,
+            })
+            .collect::<Vec<_>>();
         repositories.sort_by(|left, right| left.full_name.cmp(&right.full_name));
+        repositories.dedup_by(|left, right| left.full_name == right.full_name);
         Ok(repositories)
     })
 }
@@ -497,6 +513,22 @@ pub(crate) fn repository_display_name(source: &str) -> Result<String> {
         .unwrap_or(parsed.host_str().unwrap_or("repository"))
         .trim_end_matches(".git");
     Ok(name.to_owned())
+}
+
+/// Extracts `owner/name` from a GitHub clone URL. Returns `None` for URLs that
+/// are not recognizable GitHub repository URLs.
+pub(crate) fn github_repository_full_name(clone_url: &str) -> Option<String> {
+    let url = url::Url::parse(clone_url).ok()?;
+    if url.host_str() != Some("github.com") {
+        return None;
+    }
+    let mut segments = url.path_segments()?;
+    let owner = segments.next()?.to_owned();
+    let name = segments.next()?.trim_end_matches(".git").to_owned();
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(format!("{owner}/{name}"))
 }
 
 pub(crate) fn github_copilot_credentials() -> Result<Arc<FileCredentialStore>> {

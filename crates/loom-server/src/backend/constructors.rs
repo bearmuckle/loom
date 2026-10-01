@@ -221,6 +221,9 @@ impl InProcessBackend {
             },
             |persistence| persistence.path().with_extension("session-roots"),
         );
+        // Repository mirrors cached on this node live next to the session roots
+        // so they survive process restarts and can seed later session clones.
+        let clone_cache_base = session_root_base.with_extension("clone-cache");
         let mut supported_capabilities = vec![
             Capability::CreateAgentSession,
             Capability::ReadAgentSession,
@@ -285,7 +288,7 @@ impl InProcessBackend {
             last_feed_pruned_sequence: AtomicU64::new(0),
             feed_bytes_since_prune: AtomicUsize::new(0),
             session_filesystem_service: SessionFilesystemService::new(),
-            repository_service: RepositoryService::new(),
+            repository_service: RepositoryService::new(clone_cache_base),
             process_service: ProcessService::new(),
             terminals: TerminalManager::new(),
             resource_monitor: Mutex::new(ResourceMonitor::default()),

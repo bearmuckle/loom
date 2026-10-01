@@ -37,6 +37,7 @@ fn m5_session_projections_reconnect_and_archive_authoritatively() {
             source: root.display().to_string(),
             path: "repo".to_owned(),
             revision: None,
+            reuse_local: false,
         },
     )));
     assert!(matches!(

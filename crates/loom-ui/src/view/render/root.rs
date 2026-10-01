@@ -221,12 +221,13 @@ impl Render for LoomView {
             dialog.choice == SessionSourceChoice::GitHub && dialog.filter_subscription.is_none()
         }) {
             let filter = cx.new(|cx| {
-                InputState::new(window, cx).placeholder("Filter by repository name or description")
+                InputState::new(window, cx)
+                    .placeholder("Search GitHub repositories (2+ characters)")
             });
             filter.update(cx, |state, cx| state.focus(window, cx));
-            let subscription = cx.subscribe(&filter, |_, _, event: &InputEvent, cx| {
+            let subscription = cx.subscribe(&filter, |view, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
-                    cx.notify();
+                    view.on_repository_search_changed(cx);
                 }
             });
             self.repository_filter_input = Some(filter);

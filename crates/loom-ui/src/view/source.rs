@@ -1,5 +1,9 @@
 use super::*;
 
+/// Debounce window before a repository search is sent, so typing does not
+/// issue a request per keystroke against the rate-limited GitHub search API.
+const REPOSITORY_SEARCH_DEBOUNCE_MS: u64 = 250;
+
 impl LoomView {
     pub(crate) fn begin_source_dialog(
         &mut self,
@@ -27,6 +31,10 @@ impl LoomView {
         self.source_path_input = None;
         self.repository_filter_input = None;
         self.pending_source_path = None;
+        self.cloned_repositories = Vec::new();
+        self.cloned_repositories_loading = false;
+        self.repository_search_generation = self.repository_search_generation.wrapping_add(1);
+        self.repository_search_query.clear();
         if choice == SessionSourceChoice::LocalDirectory {
             self.pending_source_path = self
                 .local_current_directory
@@ -34,7 +42,7 @@ impl LoomView {
                 .map(|directory| directory.display().to_string());
         }
         if choice == SessionSourceChoice::GitHub {
-            self.load_github_repositories(cx);
+            self.load_cloned_repositories(cx);
         }
         cx.notify();
     }
@@ -49,15 +57,12 @@ impl LoomView {
         if let Some(dialog) = &mut self.source_dialog {
             dialog.choice = choice;
             dialog.error = None;
-            if choice == SessionSourceChoice::GitHub && dialog.repositories.is_empty() {
-                dialog.repositories_loading = true;
-            }
         }
         if choice == SessionSourceChoice::LocalDirectory {
             self.prefill_source_directory_if_empty(cx);
         }
-        if choice == SessionSourceChoice::GitHub {
-            self.load_github_repositories(cx);
+        if choice == SessionSourceChoice::GitHub && self.cloned_repositories.is_empty() {
+            self.load_cloned_repositories(cx);
         }
         cx.notify();
     }
@@ -125,9 +130,9 @@ impl LoomView {
         .detach();
     }
 
-    pub(crate) fn load_github_repositories(&mut self, cx: &mut Context<Self>) {
-        let node_id = self
-            .source_dialog
+    /// The worker node the source dialog targets.
+    fn source_node_id(&self) -> Option<String> {
+        self.source_dialog
             .as_ref()
             .map(|dialog| match dialog.purpose {
                 SessionSourceDialogPurpose::StartSession => self.default_backend_node_id.clone(),
@@ -136,19 +141,109 @@ impl LoomView {
                     .get(&self.active_session.id)
                     .cloned()
                     .unwrap_or_else(|| self.default_backend_node_id.clone()),
-            });
-        let Some(node_id) = node_id else {
+            })
+    }
+
+    /// Loads the repositories already cloned on the worker node so the picker
+    /// can offer an existing clone without any search.
+    pub(crate) fn load_cloned_repositories(&mut self, cx: &mut Context<Self>) {
+        let Some(node_id) = self.source_node_id() else {
             return;
         };
+        self.cloned_repositories_loading = true;
+        self.dispatch_to_node(
+            cx,
+            node_id,
+            ClientRequest::Repository(RepositoryRequest::ListClonedRepositories),
+            |view, response, _| {
+                view.cloned_repositories_loading = false;
+                if let Ok(ServerResponse::Repository(RepositoryResponse::ClonedRepositories {
+                    repositories,
+                })) = response.result
+                {
+                    view.cloned_repositories = repositories;
+                }
+            },
+        );
+    }
+
+    /// Handles a repository filter change. Queries shorter than the minimum are
+    /// cleared locally and never reach the worker, and searches are debounced.
+    pub(crate) fn on_repository_search_changed(&mut self, cx: &mut Context<Self>) {
+        let query = self
+            .repository_filter_input
+            .as_ref()
+            .map(|input| input.read(cx).value().trim().to_owned())
+            .unwrap_or_default();
+        self.repository_search_generation = self.repository_search_generation.wrapping_add(1);
+        let generation = self.repository_search_generation;
+        if query.chars().count() < GITHUB_REPOSITORY_QUERY_MIN_CHARS {
+            self.repository_search_query.clear();
+            if let Some(dialog) = &mut self.source_dialog {
+                dialog.repositories.clear();
+                dialog.repositories_loading = false;
+                dialog.error = None;
+            }
+            cx.notify();
+            return;
+        }
+        if query == self.repository_search_query {
+            return;
+        }
+        cx.spawn(async move |view, cx| {
+            #[cfg(target_family = "wasm")]
+            {
+                let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+                    if let Some(window) = web_sys::window() {
+                        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                            &resolve,
+                            REPOSITORY_SEARCH_DEBOUNCE_MS as i32,
+                        );
+                    }
+                });
+                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+            }
+            #[cfg(not(target_family = "wasm"))]
+            {
+                cx.background_spawn(async {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        REPOSITORY_SEARCH_DEBOUNCE_MS,
+                    ));
+                })
+                .await;
+            }
+            view.update(cx, |view, cx| {
+                if view.repository_search_generation == generation {
+                    view.search_github_repositories(query, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Issues a GitHub repository search. The worker validates the minimum
+    /// length and the GitHub API performs the filtering.
+    pub(crate) fn search_github_repositories(&mut self, query: String, cx: &mut Context<Self>) {
+        let Some(node_id) = self.source_node_id() else {
+            return;
+        };
+        self.repository_search_generation = self.repository_search_generation.wrapping_add(1);
+        let generation = self.repository_search_generation;
+        self.repository_search_query = query.clone();
         if let Some(dialog) = &mut self.source_dialog {
             dialog.repositories_loading = true;
             dialog.error = None;
         }
+        cx.notify();
         self.dispatch_to_node(
             cx,
             node_id,
-            ClientRequest::Repository(RepositoryRequest::ListGitHubRepositories),
-            |view, response, _| {
+            ClientRequest::Repository(RepositoryRequest::SearchGitHubRepositories { query }),
+            move |view, response, _| {
+                if view.repository_search_generation != generation {
+                    return;
+                }
                 if let Some(dialog) = &mut view.source_dialog {
                     dialog.repositories_loading = false;
                     match response.result {
@@ -161,7 +256,7 @@ impl LoomView {
                         Err(error) => dialog.error = Some(error.message),
                         Ok(response) => {
                             dialog.error = Some(
-                                unexpected_response("GitHub repository list", response).message,
+                                unexpected_response("GitHub repository search", response).message,
                             )
                         }
                     }
@@ -195,18 +290,34 @@ impl LoomView {
                 }
             }
             SessionSourceChoice::GitHub => {
-                let selected_repository = dialog.selected_repository.as_deref();
-                let Some(repository) = dialog
+                let selected = dialog.selected_repository.as_deref();
+                let cached = selected.and_then(|full_name| {
+                    self.cloned_repositories
+                        .iter()
+                        .find(|repository| repository.full_name == full_name)
+                });
+                let source = if let Some(repository) = cached {
+                    GitHubSource {
+                        full_name: repository.full_name.clone(),
+                        clone_url: repository.clone_url.clone(),
+                        reuse_local: true,
+                    }
+                } else if let Some(repository) = dialog
                     .repositories
                     .iter()
-                    .find(|repository| selected_repository == Some(repository.full_name.as_str()))
-                    .cloned()
-                else {
+                    .find(|repository| selected == Some(repository.full_name.as_str()))
+                {
+                    GitHubSource {
+                        full_name: repository.full_name.clone(),
+                        clone_url: repository.clone_url.clone(),
+                        reuse_local: false,
+                    }
+                } else {
                     self.source_dialog = Some(dialog);
                     self.record_status("Choose a GitHub repository");
                     return;
                 };
-                Some(SessionCreationSource::GitHub(repository))
+                Some(SessionCreationSource::GitHub(source))
             }
         };
         self.source_dialog = None;
@@ -282,16 +393,16 @@ impl LoomView {
                     },
                 );
             }
-            SessionCreationSource::GitHub(repository) => {
-                let path =
-                    source_mount_path("repositories", &repository.full_name, &existing_mounts);
+            SessionCreationSource::GitHub(source) => {
+                let path = source_mount_path("repositories", &source.full_name, &existing_mounts);
                 self.dispatch(
                     cx,
                     ClientRequest::Repository(RepositoryRequest::AttachSessionRepository {
                         session_id,
-                        source: repository.clone_url,
+                        source: source.clone_url,
                         path,
                         revision: None,
+                        reuse_local: source.reuse_local,
                     }),
                     move |view, response, cx| match response.result {
                         Ok(ServerResponse::Repository(

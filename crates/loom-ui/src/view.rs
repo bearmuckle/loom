@@ -49,8 +49,9 @@ use loom_protocol::GitHubCopilotLoginStatus;
 use loom_protocol::{
     AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent, AgentRunSnapshot,
     AgentRunSnapshotProjection, AgentRunState, CURRENT_PROTOCOL_VERSION, ClientRequest,
-    ContextRequest, ContextResponse, EventsRequest, EventsResponse, FileActivityOperation,
-    FilesystemRequest, FilesystemResponse, GitDiffLineKind, GitFileStatusKind, GitHubRepository,
+    ClonedRepository, ContextRequest, ContextResponse, EventsRequest, EventsResponse,
+    FileActivityOperation, FilesystemRequest, FilesystemResponse,
+    GITHUB_REPOSITORY_QUERY_MIN_CHARS, GitDiffLineKind, GitFileStatusKind, GitHubRepository,
     GitRepositoryStatus, MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, ProjectChildControlAction,
     ProjectRequest, ProjectResponse, ProviderRequest, ProviderResponse, RepositoryRequest,
     RepositoryResponse, RequestEnvelope, ResponseEnvelope, RunRequest, RunResponse, ServerEvent,
@@ -544,6 +545,14 @@ pub(crate) struct LoomView {
     rename_input_state: Option<Entity<InputState>>,
     source_path_input: Option<Entity<InputState>>,
     repository_filter_input: Option<Entity<InputState>>,
+    /// Repositories already cloned on the active worker node, shown in the
+    /// source dialog without requiring a search.
+    cloned_repositories: Vec<ClonedRepository>,
+    cloned_repositories_loading: bool,
+    /// Monotonic token that invalidates stale repository search responses.
+    repository_search_generation: u64,
+    /// The query text of the most recently issued search.
+    repository_search_query: String,
     pending_source_path: Option<String>,
     pub(crate) composer_focus_handle: FocusHandle,
     pub(crate) session_state: AgentSessionState,
@@ -1216,9 +1225,16 @@ fn local_source_available(
         }
 }
 
+pub(crate) struct GitHubSource {
+    pub full_name: String,
+    pub clone_url: String,
+    /// Reuse the worker node's cached clone instead of cloning again.
+    pub reuse_local: bool,
+}
+
 pub(crate) enum SessionCreationSource {
     LocalDirectory(String),
-    GitHub(GitHubRepository),
+    GitHub(GitHubSource),
 }
 
 fn session_name_for_source(source: &SessionCreationSource) -> String {
@@ -1226,8 +1242,8 @@ fn session_name_for_source(source: &SessionCreationSource) -> String {
         SessionCreationSource::LocalDirectory(path) => Path::new(path)
             .file_name()
             .map(|name| name.to_string_lossy().into_owned()),
-        SessionCreationSource::GitHub(repository) => {
-            repository.full_name.rsplit('/').next().map(str::to_owned)
+        SessionCreationSource::GitHub(source) => {
+            source.full_name.rsplit('/').next().map(str::to_owned)
         }
     };
     name.filter(|name| !name.trim().is_empty())
@@ -1392,6 +1408,10 @@ impl LoomView {
             rename_input_state: None,
             source_path_input: None,
             repository_filter_input: None,
+            cloned_repositories: Vec::new(),
+            cloned_repositories_loading: false,
+            repository_search_generation: 0,
+            repository_search_query: String::new(),
             pending_source_path: None,
             composer_focus_handle: focus_handle,
             session_state: active_session.state,

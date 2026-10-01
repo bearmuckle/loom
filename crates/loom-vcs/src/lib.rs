@@ -74,6 +74,69 @@ impl GitService {
             Repository::clone(source.as_ref(), destination)
                 .map_err(|error| git_error("could not clone repository", error))?
         };
+        Self::checkout_cloned_revision(&repository, revision)?;
+        Self::open(destination)
+    }
+
+    /// Clones a working checkout from a local repository (typically a node's
+    /// cached mirror) without any network access, then points `origin` back at
+    /// the canonical `origin_url` so pushes and pulls still target the host.
+    pub fn clone_from_local(
+        source: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+        revision: Option<&str>,
+        origin_url: &str,
+    ) -> Result<Self> {
+        let destination = destination.as_ref();
+        if destination.exists() {
+            return Err(LoomError::conflict(format!(
+                "repository checkout destination '{}' already exists",
+                destination.display()
+            )));
+        }
+        let source = source.as_ref().to_str().ok_or_else(|| {
+            LoomError::invalid_request("local repository mirror path is not valid UTF-8")
+        })?;
+        let repository = Repository::clone(source, destination)
+            .map_err(|error| git_error("could not clone local repository cache", error))?;
+        set_origin_url(&repository, origin_url)?;
+        Self::checkout_cloned_revision(&repository, revision)?;
+        Self::open(destination)
+    }
+
+    /// Creates a bare mirror of a local checkout at `mirror`, used as the node
+    /// cache that later sessions can clone from. The mirror's `origin` points
+    /// at `origin_url` so its identity matches the remote repository.
+    pub fn create_mirror(
+        source: impl AsRef<Path>,
+        mirror: impl AsRef<Path>,
+        origin_url: &str,
+    ) -> Result<()> {
+        let mirror = mirror.as_ref();
+        if mirror.exists() {
+            return Ok(());
+        }
+        if let Some(parent) = mirror.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::WorkspaceAccessDenied,
+                    format!("could not create repository mirror parent: {error}"),
+                    false,
+                )
+            })?;
+        }
+        let source = source.as_ref().to_str().ok_or_else(|| {
+            LoomError::invalid_request("repository checkout path is not valid UTF-8")
+        })?;
+        let mut builder = RepoBuilder::new();
+        builder.bare(true);
+        let repository = builder
+            .clone(source, mirror)
+            .map_err(|error| git_error("could not create repository mirror", error))?;
+        set_origin_url(&repository, origin_url)
+    }
+
+    fn checkout_cloned_revision(repository: &Repository, revision: Option<&str>) -> Result<()> {
         if let Some(revision) = revision {
             let object = repository
                 .revparse_single(revision)
@@ -94,7 +157,7 @@ impl GitService {
                 .set_head_detached(commit.id())
                 .map_err(|error| git_error("could not set detached repository head", error))?;
         }
-        Self::open(destination)
+        Ok(())
     }
 
     pub fn init(root: impl Into<PathBuf>) -> Result<Self> {
@@ -1376,6 +1439,17 @@ fn with_worktree_setup_cleanup(original: LoomError, cleanup: Result<()>) -> Loom
 
 fn git_error(operation: &str, error: git2::Error) -> LoomError {
     LoomError::new(ErrorCode::Vcs, format!("{operation}: {error}"), false)
+}
+
+/// Points the `origin` remote at `origin_url`, creating it if the repository
+/// was cloned from a local mirror and has no `origin` yet.
+fn set_origin_url(repository: &Repository, origin_url: &str) -> Result<()> {
+    let result = if repository.find_remote("origin").is_ok() {
+        repository.remote_set_url("origin", origin_url)
+    } else {
+        repository.remote("origin", origin_url).map(|_| ())
+    };
+    result.map_err(|error| git_error("could not set repository origin", error))
 }
 
 #[cfg(test)]

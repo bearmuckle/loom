@@ -1171,6 +1171,7 @@ fn code_child_completion_wakes_a_finished_manager() {
                     source: source.display().to_string(),
                     path: "repo".to_owned(),
                     revision: None,
+                    reuse_local: false,
                 },
             )))
             .result,

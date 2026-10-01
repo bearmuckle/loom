@@ -55,8 +55,13 @@ impl InProcessConnection {
             ));
         }
         if GitService::open(source_path).is_ok() {
-            let repository =
-                self.attach_session_repository(session_id, source, relative_path.clone(), None)?;
+            let repository = self.attach_session_repository(
+                session_id,
+                source,
+                relative_path.clone(),
+                None,
+                false,
+            )?;
             return Ok(ServerResponse::Filesystem(
                 FilesystemResponse::SessionDirectoryImported {
                     path: relative_path,

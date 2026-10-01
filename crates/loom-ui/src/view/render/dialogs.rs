@@ -99,29 +99,64 @@ impl LoomView {
         };
         let phone = layout.phone;
         let is_start = dialog.purpose == SessionSourceDialogPurpose::StartSession;
+        let selected_is_cached = dialog.choice == SessionSourceChoice::GitHub
+            && dialog.selected_repository.as_deref().is_some_and(|name| {
+                self.cloned_repositories
+                    .iter()
+                    .any(|repository| repository.full_name == name)
+            });
         let selected_repo = dialog.selected_repository.as_deref();
         let repository_query = self
             .repository_filter_input
             .as_ref()
             .map(|input| input.read(cx).value().to_string())
-            .unwrap_or_default()
-            .trim()
-            .to_lowercase();
-        let mut repository_rows = div().mt_2().flex().flex_col().gap_1();
-        let mut filtered_repository_count = 0;
-        for repository in &dialog.repositories {
-            let searchable = format!(
-                "{} {}",
-                repository.full_name,
-                repository.description.as_deref().unwrap_or_default()
-            )
-            .to_lowercase();
-            if !searchable.contains(&repository_query) {
-                continue;
-            }
-            filtered_repository_count += 1;
+            .unwrap_or_default();
+        let repository_query = repository_query.trim().to_owned();
+        let query_ready = repository_query.chars().count() >= GITHUB_REPOSITORY_QUERY_MIN_CHARS;
+        let cloned_names = self
+            .cloned_repositories
+            .iter()
+            .map(|repository| repository.full_name.as_str())
+            .collect::<Vec<_>>();
+
+        let mut cloned_rows = div().flex().flex_col().gap_1();
+        for repository in &self.cloned_repositories {
             let name = repository.full_name.clone();
             let selected = selected_repo == Some(name.as_str());
+            let subtitle = cloned_repository_subtitle(repository);
+            cloned_rows = cloned_rows.child(
+                div()
+                    .id(format!("cloned-repository-{name}"))
+                    .p_2()
+                    .rounded_sm()
+                    .bg(if selected {
+                        rgb(0x263b58)
+                    } else {
+                        rgb(0x171c25)
+                    })
+                    .border_1()
+                    .border_color(if selected {
+                        rgb(0x2563eb)
+                    } else {
+                        rgb(0x1f6b4d)
+                    })
+                    .cursor_pointer()
+                    .child(div().text_sm().child(name.clone()))
+                    .child(div().text_xs().text_color(rgb(0x8f98a6)).child(subtitle))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(dialog) = &mut this.source_dialog {
+                            dialog.selected_repository = Some(name.clone());
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let mut repository_rows = div().flex().flex_col().gap_1();
+        for repository in &dialog.repositories {
+            let name = repository.full_name.clone();
+            let selected = selected_repo == Some(name.as_str());
+            let already_cloned = cloned_names.contains(&name.as_str());
             repository_rows = repository_rows.child(
                 div()
                     .id(format!("github-repository-{name}"))
@@ -135,11 +170,32 @@ impl LoomView {
                     .border_1()
                     .border_color(if selected {
                         rgb(0x2563eb)
+                    } else if already_cloned {
+                        rgb(0x1f6b4d)
                     } else {
                         rgb(0x293244)
                     })
                     .cursor_pointer()
-                    .child(div().text_sm().child(name.clone()))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_sm().child(name.clone()))
+                            .when(already_cloned, |row| {
+                                row.child(
+                                    div()
+                                        .rounded_sm()
+                                        .px_2()
+                                        .bg(rgb(0x10291f))
+                                        .border_1()
+                                        .border_color(rgb(0x1f6b4d))
+                                        .text_xs()
+                                        .text_color(rgb(0x34d399))
+                                        .child("cloned here"),
+                                )
+                            }),
+                    )
                     .child(div().text_xs().text_color(rgb(0x8f98a6)).child(
                         repository.description.clone().unwrap_or_else(|| {
                             if repository.private {
@@ -230,17 +286,91 @@ impl LoomView {
                     )
                 });
         } else if dialog.choice == SessionSourceChoice::GitHub {
-            dialog_body = if dialog.repositories_loading {
-                dialog_body.child(
+            let mut github_body = div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
                     div()
+                        .text_xs()
+                        .text_color(rgb(0x7f8b9c))
+                        .child("ON THIS NODE"),
+                )
+                .when(!self.cloned_repositories.is_empty(), |row| {
+                    row.child(
+                        div()
+                            .rounded_sm()
+                            .px_2()
+                            .bg(rgb(0x10291f))
+                            .border_1()
+                            .border_color(rgb(0x1f6b4d))
+                            .text_xs()
+                            .text_color(rgb(0x34d399))
+                            .child(format!("{} clones", self.cloned_repositories.len())),
+                    )
+                });
+            github_body = if self.cloned_repositories_loading && self.cloned_repositories.is_empty()
+            {
+                github_body.child(
+                    div()
+                        .mt_2()
                         .text_sm()
                         .text_color(rgb(0x8f98a6))
-                        .child("Loading repositories…"),
+                        .child("Loading cached repositories…"),
+                )
+            } else if self.cloned_repositories.is_empty() {
+                github_body.child(div().mt_2().text_xs().text_color(rgb(0x8f98a6)).child(
+                    "No repositories are cloned on this worker yet. Search below to add one.",
+                ))
+            } else {
+                github_body.child(div().mt_2().child(cloned_rows))
+            };
+            github_body = github_body.child(
+                div()
+                    .mt_3()
+                    .mb_1()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(rgb(0x5c6572))
+                    .child(div().flex_1().h(px(1.)).bg(rgb(0x232c39)))
+                    .child("Find another repository")
+                    .child(div().flex_1().h(px(1.)).bg(rgb(0x232c39))),
+            );
+            github_body = github_body.child(
+                KitInput::new(
+                    self.repository_filter_input
+                        .as_ref()
+                        .expect("repository filter initialized before rendering"),
+                )
+                .id("github-repository-filter")
+                .small()
+                .into_any_element(),
+            );
+            github_body = if !query_ready {
+                github_body.child(
+                    div()
+                        .mt_1()
+                        .text_xs()
+                        .text_color(rgb(0x8f98a6))
+                        .child(format!(
+                            "Type at least {GITHUB_REPOSITORY_QUERY_MIN_CHARS} characters to search GitHub."
+                        )),
+                )
+            } else if dialog.repositories_loading {
+                github_body.child(
+                    div()
+                        .mt_2()
+                        .text_sm()
+                        .text_color(rgb(0x8f98a6))
+                        .child("Searching GitHub…"),
                 )
             } else if let Some(error) = &dialog.error {
-                dialog_body
+                github_body
                     .child(
                         div()
+                            .mt_2()
                             .text_sm()
                             .text_color(rgb(0xfca5a5))
                             .child(error.clone()),
@@ -262,39 +392,23 @@ impl LoomView {
                             })),
                     )
             } else if dialog.repositories.is_empty() {
-                dialog_body.child(
+                github_body.child(
                     div()
+                        .mt_2()
                         .text_sm()
                         .text_color(rgb(0x8f98a6))
-                        .child("No repositories found."),
+                        .child(format!("No repositories match \"{repository_query}\".")),
                 )
             } else {
-                dialog_body
-                    .child(
-                        KitInput::new(
-                            self.repository_filter_input
-                                .as_ref()
-                                .expect("repository filter initialized before rendering"),
-                        )
-                        .id("github-repository-filter")
-                        .small()
-                        .into_any_element(),
-                    )
-                    .child(if filtered_repository_count == 0 {
-                        div()
-                            .mt_2()
-                            .text_sm()
-                            .text_color(rgb(0x8f98a6))
-                            .child("No repositories match this filter.")
-                            .into_any_element()
-                    } else {
-                        div()
-                            .max_h(px(280.))
-                            .overflow_y_scrollbar()
-                            .child(repository_rows)
-                            .into_any_element()
-                    })
+                github_body.child(
+                    div()
+                        .mt_2()
+                        .max_h(px(240.))
+                        .overflow_y_scrollbar()
+                        .child(repository_rows),
+                )
             };
+            dialog_body = github_body;
         } else {
             dialog_body = dialog_body
                 .text_sm()
@@ -404,7 +518,13 @@ impl LoomView {
                     .child(
                         Button::new("confirm-session-source")
                             .label(if is_start {
-                                "Create project"
+                                if selected_is_cached {
+                                    "Start from existing clone"
+                                } else {
+                                    "Create project"
+                                }
+                            } else if selected_is_cached {
+                                "Add existing clone"
                             } else {
                                 "Add to session"
                             })
@@ -1445,4 +1565,19 @@ impl LoomView {
         }
         body.into_any_element()
     }
+}
+
+/// Subtitle for a repository already cloned on the worker node, e.g.
+/// `main · cloned 3m ago`.
+fn cloned_repository_subtitle(repository: &ClonedRepository) -> String {
+    let mut parts = Vec::new();
+    if let Some(branch) = &repository.branch {
+        parts.push(branch.clone());
+    }
+    let now = Timestamp::now().as_unix_millis();
+    parts.push(format!(
+        "cloned {}",
+        relative_time(repository.last_used_at.as_unix_millis(), now)
+    ));
+    parts.join(" · ")
 }
