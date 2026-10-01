@@ -4486,6 +4486,7 @@ dependencies = [
  "open",
  "serde_json",
  "tokio",
+ "ttf-parser",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",

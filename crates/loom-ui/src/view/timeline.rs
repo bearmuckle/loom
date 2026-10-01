@@ -67,8 +67,7 @@ impl TimelineView {
                             div()
                                 .w(px(14.))
                                 .flex_shrink_0()
-                                .text_color(marker_color)
-                                .child(status.marker()),
+                                .child(Icon::new(status.icon()).small().text_color(marker_color)),
                         )
                         .child(div().flex_1().min_w(px(0.)).child(step.clone())),
                 );

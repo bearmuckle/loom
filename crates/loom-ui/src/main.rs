@@ -217,6 +217,22 @@ fn start_browser_client(cx: &mut App) {
     }
 }
 
+/// The font faces embedded in the browser build.
+///
+/// The web platform starts with an empty font database, and gpui only hands
+/// emoji and CJK to the browser canvas fallback. Every other glyph must come
+/// from these faces: Noto Sans for the UI text and Noto Sans Symbols 2 for the
+/// geometric marks gpui-base renders as markdown list bullets. Native builds
+/// use the system font fallback instead.
+#[cfg(any(target_family = "wasm", test))]
+const BUNDLED_FONTS: [&[u8]; 5] = [
+    include_bytes!("../assets/fonts/NotoSans-Regular.ttf"),
+    include_bytes!("../assets/fonts/NotoSans-Bold.ttf"),
+    include_bytes!("../assets/fonts/NotoSans-Italic.ttf"),
+    include_bytes!("../assets/fonts/NotoSans-BoldItalic.ttf"),
+    include_bytes!("../assets/fonts/NotoSansSymbols2-Regular.ttf"),
+];
+
 #[cfg(target_family = "wasm")]
 #[wasm_bindgen::prelude::wasm_bindgen(start)]
 pub fn start() {
@@ -231,24 +247,43 @@ pub fn start() {
         // Sans faces used by the native Linux system-font fallback so browser
         // text has the same family and weight variants.
         cx.text_system()
-            .add_fonts(vec![
-                std::borrow::Cow::Borrowed(
-                    include_bytes!("../assets/fonts/NotoSans-Regular.ttf").as_slice(),
-                ),
-                std::borrow::Cow::Borrowed(
-                    include_bytes!("../assets/fonts/NotoSans-Bold.ttf").as_slice(),
-                ),
-                std::borrow::Cow::Borrowed(
-                    include_bytes!("../assets/fonts/NotoSans-Italic.ttf").as_slice(),
-                ),
-                std::borrow::Cow::Borrowed(
-                    include_bytes!("../assets/fonts/NotoSans-BoldItalic.ttf").as_slice(),
-                ),
-            ])
+            .add_fonts(
+                BUNDLED_FONTS
+                    .iter()
+                    .map(|bytes| std::borrow::Cow::Borrowed(*bytes))
+                    .collect(),
+            )
             .expect("failed to load embedded font");
         gpui_kit::init(cx);
         crate::theme::apply_theme(gpui_kit::WindowAppearance::Dark, cx);
         start_browser_client(cx);
     });
     APPLICATION.with(|slot| *slot.borrow_mut() = Some(application));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BUNDLED_FONTS;
+
+    /// The glyphs gpui-base's markdown renderer emits for list items
+    /// (`gpui_base::text::utils`). The wasm text system cannot fall back to a
+    /// browser font for these, so at least one bundled face must cover them.
+    const MARKDOWN_BULLETS: [char; 5] = ['•', '◦', '▪', '‣', '⁃'];
+
+    #[test]
+    fn bundled_fonts_cover_rendered_markdown_bullets() {
+        for bullet in MARKDOWN_BULLETS {
+            assert!(
+                BUNDLED_FONTS.iter().any(|bytes| covers(bytes, bullet)),
+                "no bundled font covers the markdown bullet {bullet:?}, \
+                 so it renders blank in wasm"
+            );
+        }
+    }
+
+    fn covers(bytes: &[u8], character: char) -> bool {
+        ttf_parser::Face::parse(bytes, 0)
+            .map(|face| face.glyph_index(character).is_some())
+            .unwrap_or(false)
+    }
 }
