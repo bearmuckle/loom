@@ -105,6 +105,13 @@ struct GitHubApiRepository {
     default_branch: String,
 }
 
+#[derive(Deserialize)]
+struct GitHubApiUser {
+    login: String,
+    id: u64,
+    name: Option<String>,
+}
+
 pub use auth::{AuthSession, AuthTokenStore, AuthorizationScope, IssuedToken};
 pub use remote::{
     RemoteServer, RemoteServerConfig, RunningRemoteServer, WebSocketConnection, WebSocketTransport,

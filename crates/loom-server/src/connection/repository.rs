@@ -161,6 +161,12 @@ impl InProcessConnection {
             ));
         }
         let service = GitService::open(&destination)?;
+        if let Err(error) = self.attribute_attached_checkout(&service, &source) {
+            log::warn!(
+                "[loom-server] could not configure the commit identity for {source_name}: {}",
+                error.message
+            );
+        }
         let status = service.status()?;
         self.cache_clone_for_reuse(&source, &destination, status.branch.as_deref());
         let repository = SessionRepository {
@@ -183,6 +189,47 @@ impl InProcessConnection {
         filesystem.mark_state_dirty()?;
         log::info!("repository {source_name} attached to session {session_id}");
         Ok(repository)
+    }
+
+    /// Attributes commits created in a newly attached checkout to the user.
+    ///
+    /// A cloned repository carries no local `user.name`/`user.email`, so Git
+    /// falls back to whatever the worker host provides. That is how an agent
+    /// commit ends up authored by a generic account (observed as `Agent`) that
+    /// deployment providers such as Vercel cannot match to a GitHub user.
+    ///
+    /// Local imports already know the identity the contributor uses, so copy
+    /// it; a hosted clone instead uses the authenticated GitHub account's
+    /// verified noreply address.
+    fn attribute_attached_checkout(&self, service: &GitService, source: &str) -> Result<()> {
+        let source_identity = match GitService::open(source) {
+            Ok(repository) => repository.configured_identity()?,
+            Err(_) => None,
+        };
+        let source_is_github = github_repository_full_name(source).is_some();
+        let account_identity = if source_is_github {
+            match self.backend.providers.github_account_token() {
+                Ok(token) => match github_account_identity(&token) {
+                    Ok(identity) => Some(identity),
+                    Err(error) => {
+                        log::warn!(
+                            "[loom-server] could not resolve the GitHub account identity: {}",
+                            error.message
+                        );
+                        None
+                    }
+                },
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        if let Some((name, email)) =
+            resolve_attached_identity(source_identity, source_is_github, account_identity)
+        {
+            service.set_identity(&name, &email)?;
+        }
+        Ok(())
     }
 
     /// Caches a freshly cloned GitHub checkout as a node mirror so later
