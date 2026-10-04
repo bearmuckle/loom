@@ -1631,6 +1631,51 @@ mod tests {
     }
 
     #[test]
+    fn rate_limited_responses_keep_their_code_and_retry_hint_with_a_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || -> std::result::Result<(), String> {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            read_request_headers(&mut stream)?;
+            let body = r#"{"error":{"message":"Rate limit reached","type":"rate_limit_error"}}"#;
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 12\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .map_err(|error| error.to_string())?;
+            stream.flush().map_err(|error| error.to_string())
+        });
+        let mut provider = OpenAiCompatibleProvider::new(
+            format!("http://{address}/v1/chat/completions"),
+            "rate-limit-key",
+            ModelId::new("fixture/model"),
+        );
+        let request = ModelRequest {
+            model: ModelId::new("fixture/model"),
+            messages: vec![ModelMessage::new(MessageRole::User, "hello")],
+            tools: Vec::new(),
+            options: Default::default(),
+        };
+        let error = provider
+            .stream(&request, &CancellationToken::new(), &mut |_| {
+                Ok(StreamFlow::Continue)
+            })
+            .expect_err("a 429 with a body must fail");
+        // The status-derived code and retryability must survive the body; the
+        // explanation and `Retry-After` are appended for diagnostics.
+        assert_eq!(error.code, ErrorCode::ProviderRateLimited);
+        assert!(error.retryable);
+        assert!(error.message.contains("Rate limit reached"));
+        assert!(error.message.contains("retry after 12"));
+        server
+            .join()
+            .expect("fixture server thread panicked")
+            .expect("fixture server failed");
+    }
+
+    #[test]
     fn openai_compatible_provider_works_against_a_local_fixture() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
