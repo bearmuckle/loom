@@ -443,8 +443,6 @@ impl ClientRequest {
                 | Self::Run(RunRequest::ResumeAgentRun { .. })
                 | Self::Run(RunRequest::RetryAgentFromCheckpoint { .. })
                 | Self::Session(SessionRequest::ForkAgentSession { .. })
-                | Self::Provider(ProviderRequest::ConfigureGitHubCopilot { .. })
-                | Self::Provider(ProviderRequest::ConfigureGitHubRepository { .. })
                 | Self::Provider(ProviderRequest::ConfigureGitHubWriteAccess { .. })
                 | Self::Run(RunRequest::AttachRunEvidence { .. })
         )
@@ -814,6 +812,33 @@ mod run_message_protocol_tests {
             }
         });
         assert!(decode_request(raw_request.to_string().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn secret_bearing_provider_requests_are_not_retryable_mutations() {
+        // Requests that carry a raw credential must not enter the durable
+        // idempotency journal, which persists the full request payload.
+        let configure_copilot = ClientRequest::Provider(ProviderRequest::ConfigureGitHubCopilot {
+            access_token: "gho_copilot_secret".to_owned(),
+        });
+        assert!(!configure_copilot.is_retryable_mutation());
+
+        let configure_repository =
+            ClientRequest::Provider(ProviderRequest::ConfigureGitHubRepository {
+                access_token: "gho_repository_secret".to_owned(),
+            });
+        assert!(!configure_repository.is_retryable_mutation());
+
+        let configure_api_key = ClientRequest::Provider(ProviderRequest::ConfigureApiKeyProvider {
+            provider_id: ProviderId::new("openai"),
+            api_key: "sk-secret".to_owned(),
+        });
+        assert!(!configure_api_key.is_retryable_mutation());
+
+        // A non-secret toggle may remain a retryable mutation.
+        let write_access =
+            ClientRequest::Provider(ProviderRequest::ConfigureGitHubWriteAccess { enabled: true });
+        assert!(write_access.is_retryable_mutation());
     }
 
     #[test]

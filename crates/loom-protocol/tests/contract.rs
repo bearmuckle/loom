@@ -195,7 +195,9 @@ fn browser_repository_login_round_trips_without_access_tokens() {
         configure.request.required_capability(),
         Some(Capability::ConfigureProviders)
     );
-    assert!(configure.request.is_retryable_mutation());
+    // This fallback request carries a raw access token, so it must not enter
+    // the durable idempotency journal that persists the full request payload.
+    assert!(!configure.request.is_retryable_mutation());
     assert_eq!(
         decode_request(&encode_request(&configure).unwrap()).unwrap(),
         configure

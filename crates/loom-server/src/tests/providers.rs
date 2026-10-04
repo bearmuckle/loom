@@ -83,6 +83,64 @@ fn api_key_provider_configuration_is_backend_scoped_and_recovers_without_persist
 }
 
 #[test]
+fn github_access_tokens_are_not_persisted_in_sqlite() {
+    let root = std::env::temp_dir().join(format!("loom-github-token-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("backend.sqlite");
+    let copilot_secret = "gho_copilot_idempotency_secret";
+    let repository_secret = "gho_repository_idempotency_secret";
+
+    let backend = InProcessBackend::new_persistent(&path).unwrap();
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+
+    for request in [
+        ClientRequest::Provider(ProviderRequest::ConfigureGitHubCopilot {
+            access_token: copilot_secret.to_owned(),
+        }),
+        ClientRequest::Provider(ProviderRequest::ConfigureGitHubRepository {
+            access_token: repository_secret.to_owned(),
+        }),
+    ] {
+        let response = connection.request(RequestEnvelope::new(request));
+        assert!(matches!(
+            response.result,
+            Ok(ServerResponse::Provider(
+                ProviderResponse::ProviderConfigured
+            ))
+        ));
+    }
+    drop(connection);
+    drop(backend);
+
+    // The durable idempotency journal must not carry the raw access token.
+    let persistence = FilePersistence::open(&path).unwrap();
+    for record in persistence.load_idempotency_records().unwrap().values() {
+        let request = record.request.to_string();
+        assert!(!request.contains(copilot_secret));
+        assert!(!request.contains(repository_secret));
+    }
+    drop(persistence);
+
+    // No part of the SQLite database, including the WAL, may contain it either.
+    let mut database = fs::read(&path).unwrap();
+    let wal = PathBuf::from(format!("{}-wal", path.display()));
+    if let Ok(bytes) = fs::read(&wal) {
+        database.extend(bytes);
+    }
+    for secret in [copilot_secret, repository_secret] {
+        assert!(
+            !database
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()),
+            "raw GitHub access token must not be persisted in SQLite"
+        );
+    }
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn github_write_access_is_opt_in_and_round_trips() {
     let backend = InProcessBackend::new();
     let connection = backend.connect();
