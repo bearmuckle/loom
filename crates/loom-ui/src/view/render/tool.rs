@@ -690,6 +690,9 @@ impl LoomView {
         parent: &Entity<LoomView>,
     ) -> gpui_kit::AnyElement {
         match item {
+            // The user's message sits on the trailing edge in a tinted bubble so
+            // the back-and-forth with the agent reads at a glance. The role row
+            // mirrors the agent's leading accent bar and label.
             TimelineItem::User(text) => div()
                 .w_full()
                 .px_3()
@@ -697,18 +700,25 @@ impl LoomView {
                 .flex()
                 .flex_col()
                 .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(div().w(px(3.)).h(px(13.)).rounded_full().bg(rgb(0x60a5fa)))
-                        .child(div().text_xs().text_color(rgb(0xbfdbfe)).child("You")),
+                    Bubble::new()
+                        .alignment(MessageAlignment::End)
+                        .with_variant(BubbleVariant::Tinted)
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .gap_2()
+                                .child(div().text_xs().text_color(rgb(0xbfdbfe)).child("You"))
+                                .child(div().w(px(3.)).h(px(13.)).rounded_full().bg(rgb(0x60a5fa))),
+                        )
+                        .child(div().mt_1().child(render_timeline_text(
+                            format!("transcript-user-{index}"),
+                            text.clone(),
+                            0xf3f4f6,
+                        ))),
                 )
-                .child(div().mt_1().child(render_timeline_text(
-                    format!("transcript-user-{index}"),
-                    text.clone(),
-                    0xf3f4f6,
-                )))
                 .into_any(),
             TimelineItem::Assistant(turn) => self.render_assistant_turn(turn, index, parent),
             TimelineItem::System(note) => {
