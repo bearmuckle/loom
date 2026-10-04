@@ -262,8 +262,10 @@ impl LoomView {
                 {
                     let promise = js_sys::Promise::new(&mut |resolve, _reject| {
                         if let Some(window) = web_sys::window() {
+                            // Poll promptly in the browser so a dropped socket
+                            // is noticed while the client is otherwise idle.
                             let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                                &resolve, 10_000,
+                                &resolve, 3_000,
                             );
                         }
                     });
@@ -462,6 +464,13 @@ impl LoomView {
                         .insert(node.status.node_id.clone(), worker_node_display_name(node));
                 }
                 view.worker_node_polls_scheduled.remove(&id);
+                #[cfg(target_family = "wasm")]
+                {
+                    view.detect_browser_connection_loss(cx);
+                    if !view.connected {
+                        return;
+                    }
+                }
                 view.schedule_worker_node_poll(cx);
                 if recovered {
                     view.reload_sessions(cx);

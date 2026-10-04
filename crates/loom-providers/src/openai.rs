@@ -391,6 +391,12 @@ async fn send_openai_request_async(
         .map_err(|error| normalize_transport_error(provider, &error.to_string()))?;
     let status = response.status();
     if !status.is_success() {
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned);
         let detail = response.text().await.unwrap_or_default();
         let detail = detail
             .replace("Bearer ", "****** ")
@@ -398,17 +404,18 @@ async fn send_openai_request_async(
             .chars()
             .take(512)
             .collect::<String>();
-        if detail.trim().is_empty() {
-            return Err(normalize_provider_error(provider, status.as_u16()));
+        // Keep the status-derived code and retryability — a 429 is
+        // `ProviderRateLimited` and a 5xx is `ProviderUnavailable` — even when
+        // the provider sends an explanation body, and append the redacted
+        // detail and retry hint for diagnostics.
+        let mut error = normalize_provider_error(provider, status.as_u16());
+        if let Some(retry_after) = retry_after {
+            error.message = format!("{}; retry after {retry_after}", error.message);
         }
-        return Err(LoomError::new(
-            ErrorCode::ProviderInvalidResponse,
-            format!(
-                "{provider} rejected the request (HTTP {}): {detail}",
-                status.as_u16()
-            ),
-            false,
-        ));
+        if !detail.trim().is_empty() {
+            error.message = format!("{}: {detail}", error.message);
+        }
+        return Err(error);
     }
     let event_stream = response
         .headers()

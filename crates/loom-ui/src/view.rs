@@ -590,6 +590,10 @@ pub(crate) struct LoomView {
     #[cfg(target_family = "wasm")]
     browser_window_initialized: bool,
     browser_startup_error: Option<String>,
+    /// Set when the browser transport is known to be closed so the disconnected
+    /// screen can offer a reconnect instead of a settings prompt. A plain field
+    /// (not `cfg(wasm)`) so its copy can be unit-tested on native builds.
+    browser_connection_lost: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -762,6 +766,45 @@ fn session_status_pill(
         AgentSessionState::Completed => SessionStatusPill::new("Done", 0x86efac, 0x24543d),
         AgentSessionState::Failed => SessionStatusPill::new("Failed", 0xfca5a5, 0x542936),
         AgentSessionState::Cancelled => SessionStatusPill::new("Cancelled", 0xb7c0d0, 0x20242c),
+    }
+}
+
+/// Copy for the browser's disconnected screen, which differs depending on
+/// whether the client never connected or lost a connection it once had.
+///
+/// Compiled on native test builds so the copy is covered without a browser.
+#[cfg(any(target_family = "wasm", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DisconnectedScreen {
+    pub(crate) heading: &'static str,
+    pub(crate) detail: String,
+    pub(crate) sidebar: &'static str,
+    pub(crate) empty: &'static str,
+    pub(crate) footer: &'static str,
+    pub(crate) reconnect: bool,
+}
+
+#[cfg(any(target_family = "wasm", test))]
+pub(crate) fn disconnected_screen(connection_lost: Option<&str>) -> DisconnectedScreen {
+    match connection_lost {
+        Some(reason) => DisconnectedScreen {
+            heading: "Connection lost",
+            detail: format!(
+                "The worker connection closed ({reason}). Reconnect to reload projects and sessions."
+            ),
+            sidebar: "Reconnect to load projects.",
+            empty: "Reconnect to reload your projects and sessions.",
+            footer: "Disconnected  ·  connection lost",
+            reconnect: true,
+        },
+        None => DisconnectedScreen {
+            heading: "No worker connected",
+            detail: "Connect a worker in Settings to begin.".to_owned(),
+            sidebar: "Connect a worker to load projects.",
+            empty: "Connect a worker to create a project.",
+            footer: "Not connected  ·  Connect a worker in Settings",
+            reconnect: false,
+        },
     }
 }
 
@@ -1443,10 +1486,17 @@ impl LoomView {
             node_input_state: None,
             run_poll_scheduled: false,
             browser_startup_error: None,
+            browser_connection_lost: None,
         }
     }
 
     fn is_connected(&self) -> bool {
+        // A recorded lost browser connection always means "not connected", on
+        // any platform, and reading the field keeps it live on native builds
+        // where the reconnect screen is compiled out.
+        if self.browser_connection_lost.is_some() {
+            return false;
+        }
         #[cfg(target_family = "wasm")]
         {
             self.connected

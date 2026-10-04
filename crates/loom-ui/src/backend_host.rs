@@ -108,6 +108,16 @@ impl BackendWorker {
         self.secure_for_secrets
     }
 
+    /// The reason the underlying transport is closed, if known.
+    ///
+    /// The browser returns the socket's close reason so the view can show a
+    /// reconnect screen. Native transports manage their own lifecycle and
+    /// report availability through worker-node status instead.
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn connection_closed_reason(&self) -> Option<String> {
+        self.connection.closed_reason()
+    }
+
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn submit(&self, request: RequestEnvelope) -> PendingResponse {
         let request_id = request.request_id;

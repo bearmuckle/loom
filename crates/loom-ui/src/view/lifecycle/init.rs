@@ -371,6 +371,7 @@ impl LoomView {
             node_input_state: None,
             run_poll_scheduled: false,
             browser_startup_error: None,
+            browser_connection_lost: None,
         };
         if discover_models {
             view.refresh_models();
@@ -587,6 +588,7 @@ impl LoomView {
             browser_model: options.model().cloned(),
             browser_window_initialized: true,
             browser_startup_error: startup_error,
+            browser_connection_lost: None,
         }
     }
 
@@ -843,6 +845,7 @@ impl LoomView {
             browser_model: options.model().cloned(),
             browser_window_initialized: false,
             browser_startup_error: None,
+            browser_connection_lost: None,
         };
         cleanup_guard.disarm();
         Ok(view)
@@ -871,6 +874,8 @@ impl LoomView {
             };
             if let Err(error) = view.update(cx, |view, cx| {
                 apply(view, response, cx);
+                #[cfg(target_family = "wasm")]
+                view.detect_browser_connection_loss(cx);
                 cx.notify();
             }) {
                 log::warn!("[loom-ui] applying a backend response failed: {error}");
@@ -909,6 +914,8 @@ impl LoomView {
             };
             if let Err(error) = view.update(cx, |view, cx| {
                 apply(view, response, cx);
+                #[cfg(target_family = "wasm")]
+                view.detect_browser_connection_loss(cx);
                 cx.notify();
             }) {
                 log::warn!("[loom-ui] applying a backend response failed: {error}");
@@ -1283,6 +1290,79 @@ impl LoomView {
                 }
                 cx.notify();
             })
+        })
+        .detach();
+    }
+
+    /// Detects a closed browser transport and swaps the live workspace for a
+    /// reconnect screen. Safe to call after any request and on each poll, so a
+    /// dropped socket is never mistaken for a working connection.
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn detect_browser_connection_loss(&mut self, cx: &mut Context<Self>) {
+        if !self.connected {
+            return;
+        }
+        if let Some(reason) = self.backend.connection_closed_reason() {
+            self.on_browser_connection_lost(reason, cx);
+        }
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn on_browser_connection_lost(&mut self, reason: String, cx: &mut Context<Self>) {
+        if !self.connected {
+            return;
+        }
+        self.connected = false;
+        self.browser_connection_lost = Some(reason);
+        self.run_poll_scheduled = false;
+        self.project_poll_scheduled = false;
+        self.worker_node_polls_scheduled.clear();
+        log::warn!("[loom-ui] worker connection lost; showing the reconnect screen");
+        cx.notify();
+    }
+
+    /// Reconnects the browser client to the saved worker by re-running the same
+    /// bootstrap as a first connect, so projects, sessions, and models reload
+    /// from the backend instead of from client state that may be stale.
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn reconnect_browser(&mut self, cx: &mut Context<Self>) {
+        let options = match BrowserOptions::from_location() {
+            Ok(options) if options.is_configured() && !options.demo() => options,
+            Ok(_) => {
+                self.browser_connection_lost = None;
+                self.open_settings_from_menu(cx);
+                self.record_status("Enter a worker URL and access token to reconnect");
+                cx.notify();
+                return;
+            }
+            Err(error) => {
+                self.record_status(format!("Could not read saved worker settings: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        let focus_handle = self.composer_focus_handle.clone();
+        let view = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let result = LoomView::try_new_browser(&options, focus_handle).await;
+            view.update(cx, |view, cx| match result {
+                Ok(mut initialized) => {
+                    let active_session = initialized.active_session.clone();
+                    initialized.settings_open = false;
+                    initialized.browser_window_initialized = false;
+                    *view = initialized;
+                    view.reload_sessions(cx);
+                    if !view.sessions.is_empty() {
+                        view.select_session(active_session, cx);
+                    }
+                }
+                Err(error) => {
+                    view.connected = false;
+                    view.browser_connection_lost = Some(error.to_string());
+                    view.record_status(format!("Reconnect failed: {error}"));
+                    cx.notify();
+                }
+            });
         })
         .detach();
     }

@@ -21,6 +21,10 @@ impl InProcessConnection {
                 self.backend
                     .providers
                     .configure_github_copilot(access_token)?;
+                // Do not add this secret-bearing request to the durable
+                // idempotency journal. Persist only the resulting provider
+                // config, which contains an opaque credential reference.
+                self.backend.persist_state()?;
                 Ok(ServerResponse::Provider(
                     ProviderResponse::ProviderConfigured,
                 ))
@@ -31,6 +35,9 @@ impl InProcessConnection {
                 self.backend
                     .providers
                     .configure_github_repository(access_token)?;
+                // The token lives in the credential store; keep the durable
+                // idempotency journal free of the raw access token.
+                self.backend.persist_state()?;
                 Ok(ServerResponse::Provider(
                     ProviderResponse::ProviderConfigured,
                 ))
