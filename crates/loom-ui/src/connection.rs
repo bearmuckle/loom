@@ -207,6 +207,19 @@ impl ClientConnection {
         }
     }
 
+    /// The reason the transport is known to be closed, if any.
+    ///
+    /// The browser transport reports the close so the view can replace a
+    /// silently-dead workspace with a reconnect screen instead of failing
+    /// every later request. Native transports manage their own lifecycle.
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn closed_reason(&self) -> Option<String> {
+        match self {
+            Self::Disconnected => Some("no worker is connected".to_owned()),
+            Self::Browser(connection) => connection.closed_reason(),
+        }
+    }
+
     /// Sends a request and blocks the calling thread for its response.
     ///
     /// Only used natively, where callers either run this on a dedicated
@@ -400,7 +413,7 @@ async fn request_with_timeout(
             false,
         )
     })?;
-    window
+    let timeout_handle = window
         .set_timeout_with_callback_and_timeout_and_arguments_0(
             timeout_callback.as_ref().unchecked_ref(),
             15_000,
@@ -412,7 +425,6 @@ async fn request_with_timeout(
                 false,
             )
         })?;
-    timeout_callback.forget();
     let mut request = request;
     let mut timeout_receiver = Box::pin(timeout_receiver);
     let result = std::future::poll_fn(|cx| {
@@ -425,6 +437,10 @@ async fn request_with_timeout(
         Poll::Pending
     })
     .await;
+    // Cancel the pending timer so its callback — and the closure that backs it
+    // — is released. The timeout fires only for slow requests, so previously
+    // every answered request leaked one JS function object.
+    let _ = window.clear_timeout_with_handle(timeout_handle);
     result.ok_or_else(|| {
         LoomError::new(
             ErrorCode::DeadlineExceeded,

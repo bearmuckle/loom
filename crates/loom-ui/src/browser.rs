@@ -374,6 +374,15 @@ impl BrowserConnection {
         self.secure_for_secrets
     }
 
+    /// The reason this connection is closed, if it has been closed.
+    ///
+    /// The browser transport is single-use: once `onclose`/`onerror` fires the
+    /// socket cannot be reopened, so the view replaces it with a reconnect
+    /// screen instead of silently failing every later request.
+    pub(crate) fn closed_reason(&self) -> Option<String> {
+        self.state.borrow().closed.clone()
+    }
+
     /// Sends a request and awaits its matching response. Requests issued
     /// before the socket finishes opening are queued and flushed on open.
     pub(crate) async fn request(&self, request: RequestEnvelope) -> ResponseEnvelope {

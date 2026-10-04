@@ -81,6 +81,7 @@ impl LoomView {
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
         let layout = responsive_layout(window.bounds().size.width);
+        let screen = disconnected_screen(self.browser_connection_lost.as_deref());
         div()
             .size_full()
             .relative()
@@ -126,7 +127,7 @@ impl LoomView {
                                         .border_color(rgb(0x293244))
                                         .text_sm()
                                         .text_color(rgb(0x64748b))
-                                        .child("Connect a worker to load projects."),
+                                        .child(screen.sidebar),
                                 )
                                 .child(
                                     div()
@@ -166,21 +167,37 @@ impl LoomView {
                                     .border_b_1()
                                     .border_color(rgb(0x30343f))
                                     .child(
-                                        div().flex().flex_col().child("No worker connected").child(
+                                        div().flex().flex_col().child(screen.heading).child(
                                             div()
                                                 .text_xs()
                                                 .text_color(rgb(0x8f98a6))
-                                                .child("Connect a worker in Settings to begin."),
+                                                .child(screen.detail),
                                         ),
                                     )
                                     .child(
-                                        Button::new("disconnected-open-settings")
-                                            .icon(Icon::new(IconName::Settings))
-                                            .ghost()
-                                            .xsmall()
-                                            .on_click(cx.listener(|view, _, _, cx| {
-                                                view.open_settings_from_menu(cx);
-                                            })),
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .when(screen.reconnect, |row| {
+                                                row.child(
+                                                    Button::new("disconnected-reconnect")
+                                                        .label("Reconnect")
+                                                        .small()
+                                                        .on_click(cx.listener(|view, _, _, cx| {
+                                                            view.reconnect_browser(cx);
+                                                        })),
+                                                )
+                                            })
+                                            .child(
+                                                Button::new("disconnected-open-settings")
+                                                    .icon(Icon::new(IconName::Settings))
+                                                    .ghost()
+                                                    .xsmall()
+                                                    .on_click(cx.listener(|view, _, _, cx| {
+                                                        view.open_settings_from_menu(cx);
+                                                    })),
+                                            ),
                                     ),
                             )
                             .child(div().flex_1().flex().items_center().justify_center())
@@ -199,7 +216,7 @@ impl LoomView {
                                             .border_color(rgb(0x293244))
                                             .text_sm()
                                             .text_color(rgb(0x64748b))
-                                            .child("Connect a worker to create a project."),
+                                            .child(screen.empty),
                                     ),
                             )
                             .when(self.settings_open, |element| {
@@ -219,10 +236,12 @@ impl LoomView {
                     .border_color(rgb(0x30343f))
                     .text_xs()
                     .text_color(rgb(0x8f98a6))
-                    .child("Not connected  ·  Connect a worker in Settings"),
+                    .child(screen.footer),
             )
             .when(
-                !self.settings_open && !self.welcome_dialog_dismissed,
+                !self.settings_open
+                    && !self.welcome_dialog_dismissed
+                    && self.browser_connection_lost.is_none(),
                 |element| {
                     element.child(
                     Dialog::new(cx)
