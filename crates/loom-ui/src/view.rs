@@ -10,6 +10,7 @@ use std::{
 use gpui_kit::TestSupportExt as _;
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::base::{Disableable, Selectable, TextSelectionLayer};
+use gpui_kit::component::bubble::{Bubble, BubbleVariant};
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants};
 // Only the wasm disconnected screen still uses the dialog component.
 #[cfg(target_family = "wasm")]
@@ -24,6 +25,7 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{
     Icon, IconName, IndexPath, Sizable, h_resizable,
     menu::{DropdownMenu, PopupMenu, PopupMenuItem},
+    message::MessageAlignment,
     resizable_panel,
     select::{SearchableVec, Select, SelectEvent, SelectState},
     switch::Switch,
