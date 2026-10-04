@@ -49,6 +49,34 @@ without the field remain readable, and the setting needs no separate SQLite
 schema change; the delegated-task table already persists queued work. A
 project may have at most fifty queued or active delegated tasks.
 
+## Operational storage
+
+Native UI clients use one user-level database at `$LOOM_STATE_DIR/loom/state.db`
+(or the platform state-directory fallback), so workspaces and sessions remain
+available regardless of the startup folder. Durable state uses typed, indexed
+tables for workspaces, sessions, runs, transcripts, activities, filesystem
+metadata and history, checkpoints, provider state, usage, policies, worker-node
+configuration, and idempotency records. A session filesystem root is managed
+separately from the workspace record and remains associated with its owning
+session across backend restarts. Access tokens and repository/worktree contents
+are not part of workspace configuration.
+
+Workspace configuration is keyed by workspace ID and contains worker WebSocket
+URLs, a monotonically increasing revision, and the session-card CPU pulse
+threshold (default 5%). Browser clients keep only the bootstrap worker URL and
+bearer token in origin-scoped `localStorage`, then fetch the full workspace
+configuration from the backend. Because browser scripts can read
+`localStorage`, deployments must trust scripts served from the same origin; the
+bootstrap token is never sent to peer nodes as part of config distribution.
+Native clients store each connected peer's access token separately in the
+operating system credential store, scoped to the workspace ID and peer URL.
+Configured peers are reconnected at startup when their matching credential is
+available; peers without one remain offline until reauthenticated, and removing
+a peer also deletes its local credential. There is no plaintext-file fallback:
+if the OS store is unavailable, the peer remains connected for the current
+session only and the UI warns that it will not reconnect after restart. Linux
+uses Secret Service, which requires an available user session/keyring.
+
 ## Transactions and incremental writes
 
 The backend uses one SQLite database with WAL journaling and `synchronous = FULL`. Persistent backend instances take an advisory owner lock, and graceful shutdown drains active run workers before final persistence and lock release.

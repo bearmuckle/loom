@@ -1,7 +1,8 @@
 # Contributing
 
-Thanks for taking an interest in Loom. The project is experimental, so APIs,
-features, and architecture may change as the design develops.
+Thanks for taking an interest in Loom. The project is under active development
+and pre-1.0, so APIs, features, and architecture may change as the design
+develops.
 
 ## Before opening a pull request
 

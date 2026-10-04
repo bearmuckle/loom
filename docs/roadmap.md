@@ -4,11 +4,11 @@ Each milestone should end with a demonstrable vertical slice. Avoid building
 an entire layer in isolation before proving the end-to-end path.
 
 > **Storage note.** Backend state lives in a single SQLite database with a
-> single baseline schema (currently version 2) and no migration ladder; a
-> database written by any other revision is rejected unchanged and must be wiped
-> explicitly. Per-run project-agent grants are one versioned JSON payload
-> (`run_runtime_config.project_grants`) and delegated-task grants are
-> `delegated_tasks.permissions`. See [durable storage](storage.md) and
+> typed schema (currently version 4, with an in-place migration ladder from
+> version 2); a database written by a newer or unknown revision is rejected
+> unchanged and must be wiped explicitly. Per-run project-agent grants are one
+> versioned JSON payload (`run_runtime_config.project_grants`) and
+> delegated-task grants are `delegated_tasks.permissions`. See
 > [the storage design](storage-design.md).
 
 ## Milestones
