@@ -208,6 +208,48 @@ impl GitService {
         &self.root
     }
 
+    /// The repository's effective commit identity (`user.name`/`user.email`),
+    /// including any inherited global or system configuration.
+    ///
+    /// Returns `None` when either half is unset or blank, because Git cannot
+    /// create a commit without both.
+    pub fn configured_identity(&self) -> Result<Option<(String, String)>> {
+        let repository = self.repository()?;
+        let name = repository
+            .config()
+            .and_then(|config| config.get_string("user.name"))
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let email = repository
+            .config()
+            .and_then(|config| config.get_string("user.email"))
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        Ok(match (name, email) {
+            (Some(name), Some(email)) => Some((name, email)),
+            _ => None,
+        })
+    }
+
+    /// Sets the repository-local commit identity so commits created in this
+    /// checkout are attributed to `name`/`email` instead of whatever the host
+    /// environment happens to provide.
+    pub fn set_identity(&self, name: &str, email: &str) -> Result<()> {
+        if name.trim().is_empty() || email.trim().is_empty() {
+            return Err(LoomError::invalid_request(
+                "commit identity name and email must not be empty",
+            ));
+        }
+        let repository = self.repository()?;
+        let mut config = repository
+            .config()
+            .map_err(|error| git_error("could not read Git configuration", error))?;
+        config
+            .set_str("user.name", name)
+            .and_then(|()| config.set_str("user.email", email))
+            .map_err(|error| git_error("could not set the repository commit identity", error))
+    }
+
     pub fn status(&self) -> Result<GitRepositoryStatus> {
         let repository = self.repository()?;
         let branch = repository
@@ -2187,6 +2229,44 @@ mod tests {
         assert_eq!(
             git.validate_path("nested\\file.txt").unwrap(),
             "nested/file.txt"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn set_identity_configures_the_repository_commit_author() {
+        let root =
+            std::env::temp_dir().join(format!("loom-git-identity-{}", AgentSessionId::new()));
+        fs::create_dir_all(&root).unwrap();
+        let git = GitService::init(&root).unwrap();
+
+        git.set_identity("Loom Author", "author@example.test")
+            .unwrap();
+        assert_eq!(
+            git.configured_identity().unwrap(),
+            Some(("Loom Author".to_owned(), "author@example.test".to_owned()))
+        );
+
+        // The identity is written to the local config, so it survives reopen.
+        let reopened = GitService::open(&root).unwrap();
+        assert_eq!(
+            reopened.configured_identity().unwrap(),
+            Some(("Loom Author".to_owned(), "author@example.test".to_owned()))
+        );
+
+        // A blank half is not a usable identity.
+        run(&root, &["config", "user.name", "   "]);
+        assert_eq!(git.configured_identity().unwrap(), None);
+
+        assert_eq!(
+            git.set_identity("", "author@example.test")
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            git.set_identity("author", "  ").unwrap_err().code,
+            ErrorCode::InvalidRequest
         );
         fs::remove_dir_all(root).unwrap();
     }

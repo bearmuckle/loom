@@ -185,6 +185,75 @@ fn github_repository_search_filters_accessible_repositories_by_rank() {
 }
 
 #[test]
+fn github_account_identity_uses_the_verified_noreply_address() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        respond_http(
+            stream,
+            "200 OK",
+            &serde_json::json!({
+                "login": "bjornharrtell",
+                "id": 141030,
+                "name": "Björn Harrtell"
+            })
+            .to_string(),
+        );
+    });
+
+    let identity =
+        github_account_identity_at("fixture-token", &format!("http://{address}/user")).unwrap();
+    server.join().unwrap();
+
+    assert_eq!(
+        identity,
+        GitHubAccountIdentity {
+            name: "Björn Harrtell".to_owned(),
+            email: "141030+bjornharrtell@users.noreply.github.com".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn github_account_identity_falls_back_to_the_login() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        respond_http(
+            stream,
+            "200 OK",
+            &serde_json::json!({ "login": "octocat", "id": 1, "name": null }).to_string(),
+        );
+    });
+
+    let identity =
+        github_account_identity_at("fixture-token", &format!("http://{address}/user")).unwrap();
+    server.join().unwrap();
+
+    assert_eq!(identity.name, "octocat");
+    assert_eq!(identity.email, "1+octocat@users.noreply.github.com");
+}
+
+#[test]
+fn github_account_identity_reports_status_and_transport_failures() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        respond_http(stream, "401 Unauthorized", "{}");
+    });
+    let error =
+        github_account_identity_at("fixture-token", &format!("http://{address}/user")).unwrap_err();
+    server.join().unwrap();
+    assert_eq!(error.code, ErrorCode::ProviderAuthentication);
+
+    let error = github_account_identity_at("fixture-token", "http://127.0.0.1:1/user").unwrap_err();
+    assert_eq!(error.code, ErrorCode::ProviderAuthentication);
+}
+
+#[test]
 fn github_search_needle_normalizes_references_and_urls() {
     use crate::util::github_search_needle;
 
@@ -307,6 +376,18 @@ fn importing_a_local_git_directory_attaches_it_as_a_repository() {
             }
         ))
     ));
+
+    // The imported checkout keeps the contributor identity of the source so
+    // commits made by an agent are attributed to them, not the worker host.
+    let filesystem = backend.restore_session_filesystem(session.id).unwrap();
+    let checkout = filesystem.directory_path("imported").unwrap();
+    assert_eq!(
+        GitService::open(&checkout)
+            .unwrap()
+            .configured_identity()
+            .unwrap(),
+        Some(("Loom Test".to_owned(), "loom@example.test".to_owned()))
+    );
 
     let _ = fs::remove_dir_all(&source);
 }

@@ -160,6 +160,100 @@ pub(crate) fn search_github_repositories_at(
     })
 }
 
+/// The commit identity Loom attributes its commits to, derived from the
+/// authenticated GitHub account's verified `users.noreply.github.com` address.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GitHubAccountIdentity {
+    pub(crate) name: String,
+    pub(crate) email: String,
+}
+
+/// Fetches the identity of the authenticated GitHub account.
+pub(crate) fn github_account_identity(token: &str) -> Result<GitHubAccountIdentity> {
+    github_account_identity_at(token, "https://api.github.com/user")
+}
+
+/// Chooses the commit identity for a newly attached checkout.
+///
+/// The source repository's own identity wins because a local import already
+/// knows how the contributor signs commits. A hosted GitHub checkout has no
+/// source identity to copy, so it uses the authenticated account instead.
+/// Anything else keeps the host-provided identity.
+pub(crate) fn resolve_attached_identity(
+    source_identity: Option<(String, String)>,
+    source_is_github: bool,
+    account_identity: Option<GitHubAccountIdentity>,
+) -> Option<(String, String)> {
+    if source_identity.is_some() {
+        return source_identity;
+    }
+    if source_is_github {
+        return account_identity.map(|identity| (identity.name, identity.email));
+    }
+    None
+}
+
+/// Fetches the authenticated account identity from an explicit endpoint,
+/// extracted so tests can point it at a local fixture server.
+pub(crate) fn github_account_identity_at(
+    token: &str,
+    endpoint: &str,
+) -> Result<GitHubAccountIdentity> {
+    run_github_async(async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|error| {
+                LoomError::new(
+                    ErrorCode::Internal,
+                    format!("could not start the GitHub client: {error}"),
+                    true,
+                )
+            })?;
+        let response = client
+            .get(endpoint)
+            .header("Accept", "application/vnd.github+json")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "Loom")
+            .send()
+            .await
+            .map_err(|error| {
+                LoomError::new(
+                    ErrorCode::ProviderAuthentication,
+                    format!("could not read the GitHub account: {error}"),
+                    true,
+                )
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(LoomError::new(
+                ErrorCode::ProviderAuthentication,
+                format!(
+                    "could not read the GitHub account (HTTP {})",
+                    status.as_u16()
+                ),
+                true,
+            ));
+        }
+        let account: GitHubApiUser = response.json().await.map_err(|error| {
+            LoomError::new(
+                ErrorCode::ProviderInvalidResponse,
+                format!("GitHub returned an invalid account: {error}"),
+                false,
+            )
+        })?;
+        let name = account
+            .name
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| account.login.clone());
+        Ok(GitHubAccountIdentity {
+            name,
+            email: format!("{}+{}@users.noreply.github.com", account.id, account.login),
+        })
+    })
+}
+
 /// Normalizes a picker query for local matching.
 ///
 /// A pasted GitHub URL (or an `owner/name` reference) is reduced to the
@@ -1398,6 +1492,32 @@ mod tests {
         ));
         assert!(!worker_node_url_is_safe("wss://worker.example#fragment"));
         assert!(!worker_node_url_is_safe(""));
+    }
+
+    #[test]
+    fn attached_identity_prefers_source_then_the_github_account() {
+        let account = GitHubAccountIdentity {
+            name: "Björn Harrtell".to_owned(),
+            email: "141030+bjornharrtell@users.noreply.github.com".to_owned(),
+        };
+        // A local import keeps the contributor identity.
+        assert_eq!(
+            resolve_attached_identity(
+                Some(("Local Author".to_owned(), "local@example.test".to_owned())),
+                false,
+                None,
+            ),
+            Some(("Local Author".to_owned(), "local@example.test".to_owned()))
+        );
+        // A hosted GitHub checkout uses the authenticated account.
+        assert_eq!(
+            resolve_attached_identity(None, true, Some(account.clone())),
+            Some((account.name.clone(), account.email.clone()))
+        );
+        // Without a resolvable account there is nothing to override.
+        assert_eq!(resolve_attached_identity(None, true, None), None);
+        // A non-GitHub host never borrows the GitHub identity.
+        assert_eq!(resolve_attached_identity(None, false, Some(account)), None);
     }
 
     #[test]
