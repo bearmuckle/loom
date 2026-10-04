@@ -1,41 +1,39 @@
 # Loom
 
-> Loom is early experimental software. Interfaces and behavior may change. It
-> is not suitable for production or sensitive workloads.
+Loom is a remote-first coding-agent environment. Its Rust backend manages agent
+sessions, workspace state, tool execution, and model integrations. The GPUI
+client runs natively or in a browser and can connect to a local or remote
+backend.
 
-Loom is an experimental remote-first coding-agent environment. Its Rust
-backend manages agent sessions, workspace state, tool execution, and model
-integrations. The GPUI client runs natively or in a browser and can connect to
-a local or remote backend.
+Loom is under active development. It is usable today, but it has not reached
+1.0, so interfaces, configuration, protocol, and on-disk state may still change
+between releases. Tagged GitHub releases include native UI client binaries for Linux x86_64, macOS arm64 (Apple silicon),
+and Windows x86_64. CI builds and tests on Linux; other operating systems and
+browsers are not yet documented as supported targets.
 
-The current project is a developer preview, not a supported general-purpose
-product. It is under active development; behavior and configuration may change
-between commits. Tagged GitHub releases include native UI client binaries for
-Linux x86_64, macOS x86_64 and arm64, and Windows x86_64. These preview builds
-have no compatibility guarantees. CI currently builds on Linux; other
-operating systems and browsers have not been documented as supported targets.
+## What is included
 
-## Current capabilities and limitations
+Loom provides a native client, a browser client, a deterministic demo mode,
+persistent sessions, approval-gated agent tools, workspace and diff review, and
+a standalone WebSocket backend. Provider support includes a deterministic
+provider, OpenAI, DeepSeek, OpenAI-compatible and Ollama adapters, and GitHub
+Copilot login. Projects can coordinate delegated child agents on isolated
+worktrees.
 
-The repository currently includes a native client, a browser client, a
-deterministic demo mode, persistent sessions, approval-gated agent tools,
-workspace and diff review, and a standalone WebSocket backend. Provider code
-includes a deterministic provider, OpenAI-compatible and Ollama adapters, and
-GitHub Copilot login.
-
-The browser client is still a development surface. Browser `WebSocket` clients
-cannot set authorization headers, so remote browser connections carry the bearer
-token in a `loom.bearer.<token>` WebSocket subprotocol instead of the connection
-URL, keeping it out of browser history and infrastructure logs. Use short-lived,
-narrowly scoped credentials and a trusted TLS deployment boundary. The
-standalone backend speaks plain `ws://` and must not be exposed directly to an
-untrusted network. See the [security and trust model](docs/security.md).
+## Current limitations
 
 Loom does not provide OS-level process sandboxing or a complete multi-user
-identity system. A session filesystem root is a path ownership boundary, not
-a sandbox for commands. The SQLite database is not an encrypted credential
-vault. Do not use Loom with sensitive workloads or treat it as a hardened
-multi-user service.
+identity system. A session filesystem root is a path ownership boundary, not a
+sandbox for commands. The SQLite database is not an encrypted credential vault.
+Review the [security and trust model](docs/security.md) before using Loom with
+sensitive data or exposing it beyond a trusted boundary.
+
+The browser client cannot set authorization headers on a `WebSocket`, so remote
+browser connections carry the bearer token in a `loom.bearer.<token>`
+subprotocol instead of the connection URL, keeping it out of browser history
+and infrastructure logs. Use short-lived, narrowly scoped credentials and a
+trusted TLS deployment boundary. The standalone backend speaks plain `ws://`
+and must not be exposed directly to an untrusted network.
 
 ## Why Loom
 
@@ -83,6 +81,21 @@ Pushes to `main` also publish the browser client to
 https://bearmuckle.github.io/loom/ through GitHub Pages. Add `?demo=true` to
 the URL to open the deterministic demo without a backend.
 
+## Providers
+
+Configure the official OpenAI provider by entering an API key for the selected
+worker in the Providers dialog. OpenAI models can then be discovered and
+selected for agent runs. The default model is `gpt-6-luna`; override it with
+`LOOM_OPENAI_MODEL`. The official DeepSeek provider is configured the same way;
+its default model is `deepseek-flash`, overridable with `LOOM_DEEPSEEK_MODEL`.
+For an OpenAI-compatible gateway, configure
+`LOOM_OPENAI_ENDPOINT`, `LOOM_API_KEY`, and `LOOM_MODEL`. API keys entered in
+the dialog are stored in a credential file next
+to that backend's SQLite database, separately for each backend installation.
+GitHub Copilot login is available in the UI. Treat provider credentials as
+sensitive; they are used by the backend, and backend state storage is not an
+encrypted secret vault.
+
 ## Development checks
 
 Run the full Rust check suite locally:
@@ -99,19 +112,6 @@ git config core.hooksPath .githooks
 
 The hook runs `cargo fmt --all -- --check`. CI also runs Clippy, tests, and
 build checks.
-
-Configure the official OpenAI provider by entering an API key for the selected
-worker in the Providers dialog. OpenAI models can then be discovered and
-selected for agent runs. The default model is `gpt-6-luna`; override it with
-`LOOM_OPENAI_MODEL`. The official DeepSeek provider is configured the same way;
-its default model is `deepseek-flash`, overridable with `LOOM_DEEPSEEK_MODEL`.
-For an OpenAI-compatible gateway, configure
-`LOOM_OPENAI_ENDPOINT`, `LOOM_API_KEY`, and `LOOM_MODEL`. API keys entered in
-the dialog are stored in a credential file next
-to that backend's SQLite database, separately for each backend installation.
-GitHub Copilot login is available in the UI. Treat provider credentials as
-sensitive; they are used by the backend, and backend state storage is not an
-encrypted secret vault.
 
 ## Contributing
 

@@ -1,8 +1,7 @@
 # Task-level quality gate
 
 This document defines the representative agent-task fixtures and the measured
-thresholds that guard user-facing execution quality. It resolves finding B5 in
-[the implementation audit](audit.md).
+thresholds that guard user-facing execution quality.
 
 ## Running the gate
 
