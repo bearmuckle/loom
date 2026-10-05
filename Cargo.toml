@@ -60,7 +60,7 @@ git2 = { version = "0.21.0", features = ["https", "ssh"] }
 portable-pty = "0.9.0"
 subtle = "2.6.1"
 tiktoken-rs = "0.12.0"
-gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "9c369db6f9b0f3754fdf5d2e4027acb1f68b1146" }
+gpui-kit = "0.7.1"
 open = "5.4.4"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 uuid = { version = "1.26.1", features = ["serde", "v4", "v7"] }
@@ -88,14 +88,9 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 ignore = "0.4.33"
 globset = "0.4.20"
 regex = "1.13.1"
-scraper = "0.24.0"
+scraper = "0.27.0"
 url = "2.5.8"
 libc = "0.2"
-sysinfo = "0.31.4"
+sysinfo = "0.39.6"
 ttf-parser = "0.25"
-keyring = { version = "3.6.3", default-features = false, features = [
-    "apple-native",
-    "windows-native",
-    "sync-secret-service",
-    "crypto-rust",
-] }
+keyring = { version = "4.2.0", default-features = false, features = ["v1"] }
