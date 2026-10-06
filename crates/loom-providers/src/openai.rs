@@ -410,6 +410,7 @@ async fn send_openai_request_async(
         // detail and retry hint for diagnostics.
         let mut error = normalize_provider_error(provider, status.as_u16());
         if let Some(retry_after) = retry_after {
+            error = error.with_retry_after(parse_retry_after(&retry_after));
             error.message = format!("{}; retry after {retry_after}", error.message);
         }
         if !detail.trim().is_empty() {
