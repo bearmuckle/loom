@@ -156,34 +156,27 @@ impl LoomView {
                             .flex_col()
                             .overflow_hidden()
                             .child(
-                                div()
-                                    .w_full()
-                                    .px_3()
-                                    .py_2()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .bg(rgb(0x14161a))
-                                    .border_b_1()
-                                    .border_color(rgb(0x30343f))
+                                disconnected_header(layout)
                                     .child(
-                                        div().flex().flex_col().child(screen.heading).child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgb(0x8f98a6))
-                                                .child(screen.detail),
-                                        ),
+                                        disconnected_header_copy(layout)
+                                            .child(screen.heading)
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(0x8f98a6))
+                                                    .child(screen.detail),
+                                            ),
                                     )
                                     .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
+                                        disconnected_header_actions()
                                             .when(screen.reconnect, |row| {
                                                 row.child(
                                                     Button::new("disconnected-reconnect")
                                                         .label("Reconnect")
                                                         .small()
+                                                        .when(layout.phone, |button| {
+                                                            button.h(layout.control_size())
+                                                        })
                                                         .on_click(cx.listener(|view, _, _, cx| {
                                                             view.reconnect_browser(cx);
                                                         })),
@@ -193,7 +186,13 @@ impl LoomView {
                                                 Button::new("disconnected-open-settings")
                                                     .icon(Icon::new(IconName::Settings))
                                                     .ghost()
-                                                    .xsmall()
+                                                    .when(layout.phone, |button| {
+                                                        button
+                                                            .large()
+                                                            .h(layout.control_size())
+                                                            .w(layout.control_size())
+                                                    })
+                                                    .when(!layout.phone, |button| button.xsmall())
                                                     .on_click(cx.listener(|view, _, _, cx| {
                                                         view.open_settings_from_menu(cx);
                                                     })),
@@ -224,20 +223,7 @@ impl LoomView {
                             }),
                     ),
             )
-            .child(
-                div()
-                    .h(px(24.))
-                    .w_full()
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .bg(rgb(0x1b1d24))
-                    .border_t_1()
-                    .border_color(rgb(0x30343f))
-                    .text_xs()
-                    .text_color(rgb(0x8f98a6))
-                    .child(screen.footer),
-            )
+            .child(disconnected_footer(layout).child(screen.footer))
             .when(
                 !self.settings_open
                     && !self.welcome_dialog_dismissed

@@ -2,6 +2,7 @@
 
 use super::*;
 
+mod disconnected_screen_render_tests;
 mod display_helper_tests;
 mod lifecycle_source_action_tests;
 mod local_source_path_tests;

@@ -197,6 +197,70 @@ pub(crate) fn session_header_actions() -> gpui_kit::Div {
     div().flex().flex_shrink_0().items_center().gap_1()
 }
 
+/// The header row of the browser disconnected screen: the heading and
+/// connection reason beside the reconnect controls.
+///
+/// A phone cannot fit all of that on one row, so the copy takes the full width
+/// and the controls move to their own row instead of flowing off the screen. A
+/// wider layout keeps the single row the screen has always drawn.
+#[cfg(any(target_family = "wasm", test))]
+pub(crate) fn disconnected_header(layout: ResponsiveLayout) -> gpui_kit::Div {
+    div()
+        .w_full()
+        .px_3()
+        .py_2()
+        .flex()
+        .gap_2()
+        .bg(rgb(0x14161a))
+        .border_b_1()
+        .border_color(rgb(0x30343f))
+        .when(layout.phone, |element| element.flex_col().items_start())
+        .when(!layout.phone, |element| {
+            element.items_center().justify_between()
+        })
+}
+
+/// The heading and connection reason inside the disconnected header.
+///
+/// It is allowed to shrink to nothing so a long close reason wraps inside its
+/// own column on a wide layout rather than pushing the reconnect controls past
+/// the right edge. On a phone it owns the full width of its row.
+#[cfg(any(target_family = "wasm", test))]
+pub(crate) fn disconnected_header_copy(layout: ResponsiveLayout) -> gpui_kit::Div {
+    div()
+        .flex()
+        .flex_col()
+        .min_w(px(0.))
+        .when(layout.phone, |element| element.w_full())
+        .when(!layout.phone, |element| element.flex_1())
+}
+
+/// The reconnect controls inside the disconnected header. They keep their
+/// intrinsic size so the copy beside them shrinks instead.
+#[cfg(any(target_family = "wasm", test))]
+pub(crate) fn disconnected_header_actions() -> gpui_kit::Div {
+    div().flex().flex_shrink_0().items_center().gap_2()
+}
+
+/// The status bar of the browser disconnected screen. It keeps a minimum height
+/// rather than a fixed one so a status line that wraps grows the bar instead of
+/// spilling outside it on a phone.
+#[cfg(any(target_family = "wasm", test))]
+pub(crate) fn disconnected_footer(layout: ResponsiveLayout) -> gpui_kit::Div {
+    div()
+        .min_h(px(24.))
+        .w_full()
+        .px_3()
+        .flex()
+        .items_center()
+        .bg(rgb(0x1b1d24))
+        .border_t_1()
+        .border_color(rgb(0x30343f))
+        .text_xs()
+        .text_color(rgb(0x8f98a6))
+        .when(layout.phone, |element| element.py_1())
+}
+
 pub(crate) fn empty_session_snapshot(workspace_id: WorkspaceId) -> AgentSessionSnapshot {
     let now = loom_core::Timestamp::now();
     AgentSessionSnapshot {
