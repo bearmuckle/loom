@@ -116,6 +116,8 @@ impl LoomView {
         self.timeline.clear();
         self.plan = None;
         self.plan_collapsed = false;
+        self.review.clear_unread(InspectorTab::Changes);
+        self.review.clear_unread(InspectorTab::Plan);
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
         self.transcript_before_ordinal = None;
         self.transcript_loaded_ordinals.clear();

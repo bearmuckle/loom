@@ -165,6 +165,7 @@ impl LoomView {
             ServerEvent::Agent { event } => self.consume_agent_event(event),
             ServerEvent::SessionFilesystemChanged { change } => {
                 self.record_status(format!("Workspace {:?}: {}", change.kind, change.path));
+                self.review.mark_changes_unread();
             }
             ServerEvent::Terminal { .. } | ServerEvent::Task { .. } => {}
             ServerEvent::ProviderHealthChanged {
@@ -192,6 +193,7 @@ impl LoomView {
                     // A plan belongs to one run, so a new run starts without one.
                     self.plan = None;
                     self.plan_collapsed = false;
+                    self.review.clear_unread(InspectorTab::Plan);
                 }
                 self.context_inspection = None;
                 self.active_run = Some(snapshot.clone());
@@ -206,6 +208,7 @@ impl LoomView {
                     .collect::<Vec<_>>();
                 self.plan = Some(PlanState::new(steps));
                 self.plan_collapsed = false;
+                self.review.mark_plan_unread();
             }
             AgentEvent::UserMessage {
                 run_id,
@@ -234,6 +237,7 @@ impl LoomView {
             AgentEvent::StepStarted { index, .. } => {
                 if let Some(plan) = self.plan.as_mut() {
                     plan.active = Some(*index);
+                    self.review.mark_plan_unread();
                 }
             }
             AgentEvent::StepCompleted { index, .. } => {
@@ -242,6 +246,7 @@ impl LoomView {
                     if plan.active == Some(*index) {
                         plan.active = None;
                     }
+                    self.review.mark_plan_unread();
                 }
             }
             AgentEvent::ContextInspected { inspection, .. } => {
@@ -455,7 +460,7 @@ impl LoomView {
         }
     }
 
-    /// Seeds the pinned plan from a run snapshot when the event stream has not
+    /// Seeds the active plan from a run snapshot when the event stream has not
     /// already established one. Progress comes from the backend so a reopened
     /// session keeps its completed and active markers.
     pub(crate) fn seed_plan_from_projection(&mut self, projection: &AgentRunSnapshotProjection) {
@@ -470,6 +475,9 @@ impl LoomView {
                 .collect(),
             &projection.plan_progress,
         );
+        if self.plan.is_some() {
+            self.review.mark_plan_unread();
+        }
     }
 
     pub(crate) fn apply_run_projection(&mut self, projection: AgentRunSnapshotProjection) {

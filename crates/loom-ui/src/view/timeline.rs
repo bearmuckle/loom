@@ -32,140 +32,6 @@ impl TimelineView {
             self.scroller.update(cx, |state, cx| state.remeasure(cx));
         }
     }
-
-    /// The pinned plan banner shown above the transcript.
-    ///
-    /// A plan is run-scoped progress rather than a conversation message, so it
-    /// stays out of the scrolling timeline while remaining visible as the user
-    /// reads the conversation. The header collapses the step list.
-    fn render_plan_banner(&self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
-        let parent = self.parent.read(cx);
-        let plan = parent.plan.as_ref().filter(|plan| !plan.is_empty())?;
-        let collapsed = parent.plan_collapsed;
-        let total = plan.total();
-        let done = plan.done_count();
-
-        let mut steps = Vec::new();
-        if !collapsed {
-            for (index, step) in plan.steps.iter().enumerate() {
-                let status = plan.status(index as u32);
-                let (text_color, marker_color) = match status {
-                    PlanStepStatus::Done => (rgb(0x9ad7bd), rgb(0x86efac)),
-                    PlanStepStatus::Active => (rgb(0xf3f4f6), rgb(0x93c5fd)),
-                    PlanStepStatus::Pending => (rgb(0x8f98a6), rgb(0x64748b)),
-                };
-                steps.push(
-                    div()
-                        .id(("plan-step", index))
-                        .test_support()
-                        .flex()
-                        .items_start()
-                        .gap_2()
-                        .text_size(gpui_kit::rems(12.5 / BASE_FONT_SIZE))
-                        .text_color(text_color)
-                        .child(
-                            div()
-                                .w(px(14.))
-                                .flex_shrink_0()
-                                .child(Icon::new(status.icon()).small().text_color(marker_color)),
-                        )
-                        .child(div().flex_1().min_w(px(0.)).child(step.clone())),
-                );
-            }
-        }
-
-        let parent_for_toggle = self.parent.clone();
-        Some(
-            div()
-                .w_full()
-                .flex()
-                .justify_center()
-                .px_3()
-                .pt_3()
-                .child(
-                    div()
-                        .id("plan-banner")
-                        .test_support()
-                        .w_full()
-                        .max_w(TIMELINE_CONTENT_MAX_WIDTH)
-                        .flex_shrink_0()
-                        .px_3()
-                        .py_2()
-                        .rounded_lg()
-                        .bg(rgb(0x181c26))
-                        .border_1()
-                        .border_color(rgb(0x293244))
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_size(gpui_kit::rems(11.5 / BASE_FONT_SIZE))
-                                        .text_color(rgb(0x93c5fd))
-                                        .child("Plan"),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(gpui_kit::rems(11.5 / BASE_FONT_SIZE))
-                                        .text_color(rgb(0x8f98a6))
-                                        .child(format!("{done} / {total}")),
-                                )
-                                .child(div().flex_1())
-                                .child(
-                                    Button::new("toggle-plan-banner")
-                                        .icon(Icon::new(if collapsed {
-                                            IconName::ChevronDown
-                                        } else {
-                                            IconName::ChevronUp
-                                        }))
-                                        .ghost()
-                                        .xsmall()
-                                        .tooltip(if collapsed {
-                                            "Expand plan"
-                                        } else {
-                                            "Collapse plan"
-                                        })
-                                        .on_click(move |_, _, cx| {
-                                            parent_for_toggle.update(cx, |view, cx| {
-                                                view.plan_collapsed = !view.plan_collapsed;
-                                                cx.notify();
-                                            });
-                                        }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .h(px(4.))
-                                .rounded_full()
-                                .bg(rgb(0x293244))
-                                .child(
-                                    div()
-                                        .h_full()
-                                        .rounded_full()
-                                        .w(gpui_kit::relative(plan.fraction()))
-                                        .bg(rgb(0x60a5fa)),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id("plan-banner-steps")
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .max_h(px(220.))
-                                .overflow_y_scroll()
-                                .children(steps),
-                        ),
-                )
-                .into_any_element(),
-        )
-    }
 }
 
 impl Render for TimelineView {
@@ -198,8 +64,7 @@ impl Render for TimelineView {
             (item_count, session_changed, timeline_revision)
         };
         self.sync_list(item_count, timeline_revision, session_changed, cx);
-        let plan_banner = self.render_plan_banner(cx);
-        let body = if item_count == 0 {
+        if item_count == 0 {
             div()
                 .size_full()
                 .p_6()
@@ -330,12 +195,6 @@ impl Render for TimelineView {
                 .relative()
                 .child(content)
                 .into_any_element()
-        };
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .when_some(plan_banner, |element, banner| element.child(banner))
-            .child(div().flex_1().min_h(px(0.)).child(body))
+        }
     }
 }

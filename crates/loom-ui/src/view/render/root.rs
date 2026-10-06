@@ -498,27 +498,43 @@ impl Render for LoomView {
                                 }
                             }),
                             ))
-                            .child(
-                                Button::new("toggle-review-sidebar")
-                            .icon(Icon::new(if self.review.open {
-                                IconName::PanelRightClose
-                            } else {
-                                IconName::PanelRightOpen
-                            }))
-                            .ghost()
-                            .when(layout.phone, |button| {
-                                button
-                                    .large()
-                                    .h(layout.control_size())
-                                    .w(layout.control_size())
-                            })
-                            .when(!layout.phone, |button| button.small())
-                            .accessibility_label("Toggle side panel")
-                            .when(self.review.open, |button| button.secondary())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_review_pane(cx);
-                            })),
-                            ),
+                            .child({
+                                let toggle = Button::new("toggle-review-sidebar")
+                                    .icon(Icon::new(if self.review.open {
+                                        IconName::PanelRightClose
+                                    } else {
+                                        IconName::PanelRightOpen
+                                    }))
+                                    .ghost()
+                                    .when(layout.phone, |button| {
+                                        button
+                                            .large()
+                                            .h(layout.control_size())
+                                            .w(layout.control_size())
+                                    })
+                                    .when(!layout.phone, |button| button.small())
+                                    .accessibility_label("Toggle side panel")
+                                    .when(self.review.open, |button| button.secondary())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_review_pane(cx);
+                                    }));
+                                div()
+                                    .relative()
+                                    .when(self.review.has_unread(), |element| {
+                                        element.child(
+                                            div()
+                                                .id("review-unread-dot")
+                                                .test_support()
+                                                .absolute()
+                                                .top(px(1.))
+                                                .right(px(1.))
+                                                .w(px(6.))
+                                                .h(px(6.))
+                                                .child(Badge::new().dot()),
+                                        )
+                                    })
+                                    .child(toggle)
+                            }),
                     ),
             )
             .child(

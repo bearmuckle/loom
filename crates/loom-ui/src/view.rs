@@ -23,7 +23,9 @@ use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerStat
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{
-    Icon, IconName, IndexPath, Sizable, h_resizable,
+    Icon, IconName, IndexPath, Sizable,
+    badge::Badge,
+    h_resizable,
     menu::{DropdownMenu, PopupMenu, PopupMenuItem},
     message::MessageAlignment,
     resizable_panel,
@@ -517,10 +519,10 @@ pub(crate) struct LoomView {
     transcript_loading: bool,
     transcript_generation: u64,
     timeline_view: Option<Entity<TimelineView>>,
-    /// The active run's plan progress. Rendered once as a banner pinned above
-    /// the transcript and summarised in the inspector, never as a timeline row.
+    /// The active run's plan progress. Rendered in full in the inspector's Plan
+    /// tab and summarised in the Agent tab, never as a timeline row.
     pub(crate) plan: Option<PlanState>,
-    /// Whether the pinned plan banner is collapsed to its header.
+    /// Whether the Plan tab's checklist is collapsed to its header.
     pub(crate) plan_collapsed: bool,
     pub(crate) activity_records: BTreeMap<ActivityId, AgentActivityRecord>,
     pub(crate) expanded_tools: BTreeSet<ToolCallId>,

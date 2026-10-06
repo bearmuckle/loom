@@ -147,6 +147,7 @@ impl LoomView {
                     view.project_snapshot_stale = true;
                     view.review.open = true;
                     view.review.tab = InspectorTab::Changes;
+                    view.review.clear_unread(InspectorTab::Changes);
                     view.review.selected_file = None;
                     view.review.selected_path = Some(format!(
                         "{} · diff from {}",
@@ -205,6 +206,7 @@ impl LoomView {
                     view.project_snapshot_stale = true;
                     view.review.open = true;
                     view.review.tab = InspectorTab::Changes;
+                    view.review.clear_unread(InspectorTab::Changes);
                     view.review.selected_file = None;
                     view.review.selected_path = Some(format!(
                         "{} · diff from {}",

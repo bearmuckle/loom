@@ -146,8 +146,7 @@ impl LoomView {
 }
 
 /// A single-line plan summary for the Run card: completed count, the active
-/// step, and a mini progress bar. The full checklist lives in the transcript's
-/// pinned plan banner.
+/// step, and a mini progress bar. The full checklist lives in the Plan tab.
 fn plan_summary_line(plan: &PlanState) -> impl IntoElement {
     let detail = if let Some(step) = plan.active_step() {
         format!("active: {step}")
