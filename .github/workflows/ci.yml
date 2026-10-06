@@ -57,7 +57,14 @@ jobs:
             libfontconfig1-dev \
             pkg-config \
             libxkbcommon-dev \
-            libxkbcommon-x11-dev
+            libxkbcommon-x11-dev \
+            fonts-dejavu-core \
+            mesa-vulkan-drivers \
+            libgl1-mesa-dri
+          # The visual render tests capture real frames through GPUI's headless
+          # wgpu renderer. The runner has no GPU, so Mesa's lavapipe (Vulkan)
+          # and llvmpipe (GL) software adapters stand in; fonts-dejavu-core
+          # gives the real text system a deterministic font.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -88,6 +95,8 @@ jobs:
           fi
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run headless visual render tests
+        run: cargo test -p loom-ui --features visual-tests --locked --bins visual_render_tests
       - name: Run tests
         if: github.event_name == 'push'
         run: cargo test --workspace --locked --lib --bins --tests
