@@ -64,7 +64,7 @@ gpui-kit = "0.7.1"
 open = "5.4.4"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 uuid = { version = "1.26.1", features = ["serde", "v4", "v7"] }
-axum = { version = "0.8.9", features = ["ws"] }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "ws"] }
 futures-util = "0.3.34"
 sha2 = "0.11.0"
 flate2 = "1.1.9"
@@ -88,9 +88,9 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 ignore = "0.4.33"
 globset = "0.4.20"
 regex = "1.13.1"
-scraper = "0.27.0"
+scraper = { version = "0.27.0", default-features = false, features = ["errors"] }
 url = "2.5.8"
 libc = "0.2"
-sysinfo = "0.39.6"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 ttf-parser = "0.25"
 keyring = { version = "4.2.0", default-features = false, features = ["v1"] }
