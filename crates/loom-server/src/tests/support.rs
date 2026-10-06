@@ -645,7 +645,11 @@ pub(super) fn dependency_failure_blocks_child_and_releases_manager_wait_once(
         "wait_for_project_children"
     ));
     let prerequisite_stream = if prerequisite_fails {
-        model.respond_with_failure(prerequisite_turn, 500, "scripted prerequisite failure");
+        // Use a non-retryable status so the failed prerequisite settles
+        // promptly. A retryable 5xx would be retried by the provider layer,
+        // and this scripted endpoint only serves one response per turn.
+        // Retryable-5xx retry behavior is covered in the provider tests.
+        model.respond_with_failure(prerequisite_turn, 400, "scripted prerequisite failure");
         None
     } else {
         let stream = hold_scripted_model_stream_until_cancelled(prerequisite_turn);
