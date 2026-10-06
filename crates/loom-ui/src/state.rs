@@ -22,17 +22,25 @@ use crate::MAX_TIMELINE_OUTPUT;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InspectorTab {
     Changes,
+    Plan,
     Agent,
     Context,
     Files,
 }
 
 impl InspectorTab {
-    pub(crate) const ALL: [Self; 4] = [Self::Changes, Self::Agent, Self::Context, Self::Files];
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Changes,
+        Self::Plan,
+        Self::Agent,
+        Self::Context,
+        Self::Files,
+    ];
 
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Changes => "Changes",
+            Self::Plan => "Plan",
             Self::Agent => "Agent",
             Self::Context => "Context",
             Self::Files => "Files",
@@ -133,10 +141,22 @@ impl AgentMode {
     }
 }
 
+/// Which inspector tabs hold content the user has not looked at yet.
+///
+/// The pane toggle shows a dot while either marker is set; each tab shows its
+/// own indicator until that tab is viewed. Content that arrives while the pane
+/// is already open on the relevant tab counts as viewed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UnreadState {
+    pub(crate) changes: bool,
+    pub(crate) plan: bool,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ReviewState {
     pub(crate) open: bool,
     pub(crate) tab: InspectorTab,
+    pub(crate) unread: UnreadState,
     pub(crate) changes: Vec<SessionFilesystemChange>,
     pub(crate) vcs: Option<GitRepositoryStatus>,
     pub(crate) repositories_loaded: bool,
@@ -218,6 +238,39 @@ impl ReviewState {
         self.rebuild_rows();
         true
     }
+
+    /// Whether the given tab is currently displayed in an open pane.
+    fn is_viewing(&self, tab: InspectorTab) -> bool {
+        self.open && self.tab == tab
+    }
+
+    /// Marks the Changes tab unread unless it is already being viewed.
+    pub(crate) fn mark_changes_unread(&mut self) {
+        if !self.is_viewing(InspectorTab::Changes) {
+            self.unread.changes = true;
+        }
+    }
+
+    /// Marks the Plan tab unread unless it is already being viewed.
+    pub(crate) fn mark_plan_unread(&mut self) {
+        if !self.is_viewing(InspectorTab::Plan) {
+            self.unread.plan = true;
+        }
+    }
+
+    /// Clears the unread marker for a tab that is now being viewed.
+    pub(crate) fn clear_unread(&mut self, tab: InspectorTab) {
+        match tab {
+            InspectorTab::Changes => self.unread.changes = false,
+            InspectorTab::Plan => self.unread.plan = false,
+            InspectorTab::Agent | InspectorTab::Context | InspectorTab::Files => {}
+        }
+    }
+
+    /// Whether any inspector tab has unviewed content, for the pane toggle dot.
+    pub(crate) fn has_unread(&self) -> bool {
+        self.unread.changes || self.unread.plan
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -271,6 +324,7 @@ impl Default for ReviewState {
         Self {
             open: false,
             tab: InspectorTab::Changes,
+            unread: UnreadState::default(),
             changes: Vec::new(),
             vcs: None,
             repositories_loaded: false,
@@ -307,8 +361,8 @@ pub(crate) enum TimelineItem {
 /// Live progress for the active run's plan.
 ///
 /// A plan is run-scoped status rather than a conversation message, so it is
-/// kept out of the timeline and rendered once as a banner pinned above the
-/// transcript, with a compact summary in the inspector.
+/// kept out of the timeline and rendered in full in the inspector's Plan tab,
+/// with a compact summary in the Agent tab's Run card.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct PlanState {
     pub(crate) steps: Vec<String>,
@@ -697,11 +751,42 @@ mod tests {
     fn inspector_tabs_report_stable_labels_and_indexes() {
         assert_eq!(
             InspectorTab::ALL.map(InspectorTab::label),
-            ["Changes", "Agent", "Context", "Files"]
+            ["Changes", "Plan", "Agent", "Context", "Files"]
         );
         for (index, tab) in InspectorTab::ALL.into_iter().enumerate() {
             assert_eq!(tab.index(), index);
         }
+    }
+
+    #[test]
+    fn unread_markers_track_viewed_tabs() {
+        let mut review = ReviewState::default();
+        assert!(!review.has_unread());
+
+        review.mark_changes_unread();
+        review.mark_plan_unread();
+        assert!(review.has_unread());
+
+        review.clear_unread(InspectorTab::Changes);
+        assert!(!review.unread.changes);
+        assert!(review.unread.plan);
+        assert!(review.has_unread());
+
+        // Content that arrives while its tab is already displayed counts as
+        // viewed, so it does not re-mark the tab unread.
+        review.open = true;
+        review.tab = InspectorTab::Plan;
+        review.clear_unread(InspectorTab::Plan);
+        review.mark_plan_unread();
+        assert!(!review.unread.plan);
+
+        // A tab that is not currently displayed still becomes unread.
+        review.mark_changes_unread();
+        assert!(review.unread.changes);
+
+        // Clearing an unrelated tab leaves the remaining markers alone.
+        review.clear_unread(InspectorTab::Files);
+        assert!(review.unread.changes);
     }
 
     #[test]

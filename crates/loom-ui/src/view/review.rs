@@ -44,6 +44,9 @@ impl LoomView {
                             .filter(|change| seen.insert(change.path.clone()))
                             .take(MAX_REVIEW_CHANGES)
                             .collect();
+                        if !view.review.changes.is_empty() {
+                            view.review.mark_changes_unread();
+                        }
                         if truncated {
                             view.record_status(
                                 "Workspace review is showing the most recent changes".to_owned(),
@@ -97,7 +100,12 @@ impl LoomView {
                                     match response.result {
                                         Ok(ServerResponse::Repository(
                                             RepositoryResponse::VcsStatus(status),
-                                        )) => view.review.vcs = Some(status),
+                                        )) => {
+                                            if !status.files.is_empty() {
+                                                view.review.mark_changes_unread();
+                                            }
+                                            view.review.vcs = Some(status)
+                                        }
                                         Err(error) => {
                                             view.review.vcs = None;
                                             view.record_status(format!(
@@ -135,6 +143,10 @@ impl LoomView {
     pub(crate) fn toggle_review_pane(&mut self, cx: &mut Context<Self>) {
         self.review.open = !self.review.open;
         if self.review.open {
+            // Opening the pane shows the selected tab, so its content is now
+            // viewed.
+            let tab = self.review.tab;
+            self.review.clear_unread(tab);
             self.refresh_review(cx);
             self.refresh_usage(cx);
             self.refresh_context(cx);
@@ -148,8 +160,10 @@ impl LoomView {
             return;
         }
         self.review.tab = tab;
+        // Viewing a tab clears its unread marker.
+        self.review.clear_unread(tab);
         match tab {
-            InspectorTab::Changes => {}
+            InspectorTab::Changes | InspectorTab::Plan => {}
             InspectorTab::Agent | InspectorTab::Context => self.refresh_usage(cx),
             InspectorTab::Files => {
                 if !self.review.files.loaded {
@@ -362,6 +376,7 @@ impl LoomView {
                         });
                         view.review.open = true;
                         view.review.tab = InspectorTab::Changes;
+                        view.review.clear_unread(InspectorTab::Changes);
                         view.review.loading_diff = false;
                     }
                     Err(error) => {

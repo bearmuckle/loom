@@ -4089,13 +4089,13 @@ fn plan_progress_tracks_steps_and_resets_with_a_new_run(cx: &mut TestAppContext)
 }
 
 #[gpui_kit::test]
-fn plan_renders_as_pinned_banner_and_inspector_summary(cx: &mut TestAppContext) {
+fn plan_renders_in_inspector_tab_and_agent_summary(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
         let mut view = LoomView::new_for_test(cx.focus_handle());
         view.sessions = vec![view.active_session.clone()];
         view.review.open = true;
-        view.review.tab = InspectorTab::Agent;
+        view.review.tab = InspectorTab::Plan;
         view.active_run_id = Some(RunId::new());
         view.plan = Some(crate::state::PlanState {
             steps: vec!["Inspect".to_owned(), "Edit".to_owned()],
@@ -4111,17 +4111,143 @@ fn plan_renders_as_pinned_banner_and_inspector_summary(cx: &mut TestAppContext) 
     cx.update_window(handle.into(), |view, window, cx| {
         let view = view.downcast::<LoomView>().unwrap();
         window.render_frame(cx);
-        assert!(window.find("plan-banner").visible());
+        // The full checklist lives in the inspector, not above the transcript.
+        assert!(window.try_find("plan-banner").is_none());
+        assert!(window.find("plan-checklist").visible());
         assert!(window.find(("plan-step", 0usize)).visible());
-        assert!(window.find("run-plan-summary").visible());
+        assert!(window.find(("plan-step", 1usize)).visible());
 
-        window.click("toggle-plan-banner", cx);
+        window.click("toggle-plan", cx);
         window.render_frame(cx);
         view.update(cx, |view, _| assert!(view.plan_collapsed));
-        assert!(window.find("plan-banner").visible());
+        // The collapsed header stays; only the step list is hidden.
+        assert!(window.find("toggle-plan").visible());
         assert!(window.try_find(("plan-step", 0usize)).is_none());
     })
     .unwrap();
+
+    // The Agent tab keeps the compact Run-card summary.
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.review.open = true;
+        view.review.tab = InspectorTab::Agent;
+        view.active_run_id = Some(RunId::new());
+        view.plan = Some(crate::state::PlanState {
+            steps: vec!["Inspect".to_owned(), "Edit".to_owned()],
+            completed: BTreeSet::from([0]),
+            active: Some(1),
+        });
+        view.timeline = vec![TimelineItem::User("do the work".to_owned())];
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("run-plan-summary").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn unread_markers_follow_changes_and_plan_events(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        assert!(!view.review.has_unread());
+
+        let run_id = RunId::new();
+        view.consume_agent_event(&loom_protocol::AgentEvent::PlanProposed {
+            run_id,
+            plan: loom_protocol::AgentPlan {
+                steps: vec![loom_protocol::AgentPlanStep {
+                    id: "one".to_owned(),
+                    description: "First".to_owned(),
+                }],
+            },
+        });
+        assert!(view.review.unread.plan);
+
+        view.consume_event(&loom_protocol::ServerEvent::SessionFilesystemChanged {
+            change: SessionFilesystemChange {
+                sequence: loom_core::EventSequence::new(1),
+                session_id: view.active_session.id,
+                path: "src/lib.rs".to_owned(),
+                kind: WorkspaceChangeKind::Modified,
+                revision: None,
+            },
+        });
+        assert!(view.review.unread.changes);
+
+        // Content that arrives while its tab is already displayed is viewed,
+        // so it does not re-mark that tab.
+        view.review.open = true;
+        view.review.tab = InspectorTab::Plan;
+        view.review.clear_unread(InspectorTab::Plan);
+        view.consume_agent_event(&loom_protocol::AgentEvent::StepStarted {
+            run_id,
+            step_id: loom_core::StepId::new(),
+            index: 0,
+        });
+        assert!(!view.review.unread.plan);
+
+        // A tab that is not displayed stays unread as new content arrives.
+        view.consume_event(&loom_protocol::ServerEvent::SessionFilesystemChanged {
+            change: SessionFilesystemChange {
+                sequence: loom_core::EventSequence::new(2),
+                session_id: view.active_session.id,
+                path: "src/main.rs".to_owned(),
+                kind: WorkspaceChangeKind::Modified,
+                revision: None,
+            },
+        });
+        assert!(view.review.unread.changes);
+    });
+}
+
+#[gpui_kit::test]
+fn unread_indicators_mark_and_clear_when_viewed(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.review.open = false;
+        view.review.unread.changes = true;
+        view.review.unread.plan = true;
+        view
+    });
+    cx.update_window(handle.into(), |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        window.render_frame(cx);
+        // The closed pane's toggle icon carries the unread dot; the tabs are
+        // not rendered until the pane opens.
+        assert!(window.find("review-unread-dot").visible());
+        assert!(window.try_find(("tab-unread", 0usize)).is_none());
+        assert!(window.try_find(("tab-unread", 1usize)).is_none());
+
+        // Opening the pane views the selected Changes tab, clearing only it.
+        window.click("toggle-review-sidebar", cx);
+        view.update(cx, |view, _| {
+            assert!(view.review.open);
+            assert!(!view.review.unread.changes);
+            assert!(view.review.unread.plan);
+        });
+        window.render_frame(cx);
+        // The pane dot persists because the plan is still unread.
+        assert!(window.find("review-unread-dot").visible());
+        assert!(window.try_find(("tab-unread", 0usize)).is_none());
+        assert!(window.find(("tab-unread", 1usize)).visible());
+
+        // Selecting the Plan tab clears the plan marker and the pane dot.
+        view.update(cx, |view, cx| {
+            view.select_inspector_tab(InspectorTab::Plan, cx);
+        });
+        window.render_frame(cx);
+        view.update(cx, |view, _| assert!(!view.review.has_unread()));
+        assert!(window.try_find("review-unread-dot").is_none());
+        assert!(window.try_find(("tab-unread", 1usize)).is_none());
+    })
+    .unwrap();
+    cx.run_until_parked();
 }
 
 #[gpui_kit::test]

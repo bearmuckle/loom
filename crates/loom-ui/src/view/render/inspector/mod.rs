@@ -23,6 +23,7 @@ mod agent;
 mod changes;
 mod context;
 mod files;
+mod plan;
 
 impl LoomView {
     pub(crate) fn render_inspector(
@@ -100,6 +101,7 @@ impl LoomView {
             .child(self.render_inspector_tabs(cx));
         let content = match self.review.tab {
             InspectorTab::Changes => self.render_inspector_changes(window, cx).into_any_element(),
+            InspectorTab::Plan => self.render_inspector_plan(window, cx).into_any_element(),
             InspectorTab::Agent => self.render_inspector_agent(window, cx).into_any_element(),
             InspectorTab::Context => self.render_inspector_context(window, cx).into_any_element(),
             InspectorTab::Files => self.render_inspector_files(window, cx).into_any_element(),
@@ -149,29 +151,49 @@ impl LoomView {
                     }
                 })
                 .children(InspectorTab::ALL.into_iter().map(|tab| {
-                    let badge = match tab {
+                    let count = match tab {
                         InspectorTab::Changes if changed_files > 0 => {
                             Some(changed_files.to_string())
                         }
                         InspectorTab::Agent if pending_attention > 0 => Some("•".to_owned()),
-                        InspectorTab::Agent => self
+                        InspectorTab::Plan => self
                             .plan
                             .as_ref()
                             .filter(|plan| !plan.is_empty())
                             .map(|plan| format!("{}/{}", plan.done_count(), plan.total())),
                         _ => None,
                     };
+                    let unread = match tab {
+                        InspectorTab::Changes => self.review.unread.changes,
+                        InspectorTab::Plan => self.review.unread.plan,
+                        InspectorTab::Agent | InspectorTab::Context | InspectorTab::Files => false,
+                    };
                     let mut item = Tab::new().label(tab.label());
-                    if let Some(badge) = badge {
-                        item = item.suffix(
-                            div()
-                                .px_1()
-                                .rounded_full()
-                                .bg(rgb(0x293244))
-                                .text_xs()
-                                .text_color(rgb(0x93c5fd))
-                                .child(badge),
-                        );
+                    if count.is_some() || unread {
+                        let mut suffix = div().flex().items_center().gap_1();
+                        if let Some(count) = count {
+                            suffix = suffix.child(
+                                div()
+                                    .px_1()
+                                    .rounded_full()
+                                    .bg(rgb(0x293244))
+                                    .text_xs()
+                                    .text_color(rgb(0x93c5fd))
+                                    .child(count),
+                            );
+                        }
+                        if unread {
+                            suffix = suffix.child(
+                                div()
+                                    .id(("tab-unread", tab.index()))
+                                    .test_support()
+                                    .flex_shrink_0()
+                                    .w(px(6.))
+                                    .h(px(6.))
+                                    .child(Badge::new().dot()),
+                            );
+                        }
+                        item = item.suffix(suffix);
                     }
                     item
                 })),
@@ -243,6 +265,10 @@ impl LoomView {
                     )
                 })
                 .unwrap_or_else(|| "VCS unavailable".to_owned()),
+            InspectorTab::Plan => match self.plan.as_ref().filter(|plan| !plan.is_empty()) {
+                Some(plan) => format!("{} / {} steps", plan.done_count(), plan.total()),
+                None => "No plan".to_owned(),
+            },
             InspectorTab::Agent => session_status_label(self.session_state).to_owned(),
             InspectorTab::Context => self
                 .context_inspection
