@@ -574,41 +574,60 @@ impl LoomView {
                     .overflow_y_scroll()
                     // Keep the form readable when the pane is much wider than
                     // a phone instead of stretching controls edge to edge.
-                    .child(div().w_full().max_w(px(640.)).child(form)),
+                    .child(
+                        div()
+                            .id("source-dialog-form")
+                            .test_support()
+                            .w_full()
+                            .max_w(px(640.))
+                            .child(form),
+                    ),
             )
             .child(
+                // Keep the actions under the form instead of pinning them to
+                // the window's lower-right corner: the footer shares the same
+                // centered max-width container as the body on desktop.
                 div()
                     .flex()
-                    .gap_2()
-                    .p_3()
+                    .justify_center()
                     .border_t_1()
                     .border_color(rgb(0x242833))
-                    .when(phone, |element| element.w_full())
-                    .when(!phone, |element| element.justify_end())
+                    .when(phone, |element| element.p_3())
+                    .when(!phone, |element| element.px_6().py_3())
                     .child(
-                        div().when(phone, |element| element.flex_1()).child(
-                            Button::new("cancel-session-source")
-                                .label("Cancel")
-                                .when(phone, |button| button.w_full().h(px(44.)))
-                                .when(!phone, |button| button.small())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.source_dialog = None;
-                                    cx.notify();
-                                })),
-                        ),
-                    )
-                    .child(
-                        div().when(phone, |element| element.flex_1()).child(
-                            Button::new("confirm-session-source")
-                                .label(confirm_label)
-                                .primary()
-                                .when(phone, |button| button.w_full().h(px(44.)))
-                                .when(!phone, |button| button.small())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.confirm_source_dialog(cx);
-                                    cx.notify();
-                                })),
-                        ),
+                        div()
+                            .id("source-dialog-actions")
+                            .test_support()
+                            .flex()
+                            .w_full()
+                            .max_w(px(640.))
+                            .gap_2()
+                            .when(!phone, |element| element.justify_end())
+                            .child(
+                                div().when(phone, |element| element.flex_1()).child(
+                                    Button::new("cancel-session-source")
+                                        .label("Cancel")
+                                        .when(phone, |button| button.w_full().h(px(44.)))
+                                        .when(!phone, |button| button.small())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.source_dialog = None;
+                                            cx.notify();
+                                        })),
+                                ),
+                            )
+                            .child(
+                                div().when(phone, |element| element.flex_1()).child(
+                                    Button::new("confirm-session-source")
+                                        .label(confirm_label)
+                                        .primary()
+                                        .when(phone, |button| button.w_full().h(px(44.)))
+                                        .when(!phone, |button| button.small())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.confirm_source_dialog(cx);
+                                            cx.notify();
+                                        })),
+                                ),
+                            ),
                     ),
             )
             .into_any_element()
