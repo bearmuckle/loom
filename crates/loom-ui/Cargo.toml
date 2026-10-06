@@ -13,6 +13,12 @@ path = "src/main.rs"
 [package.metadata.cargo-machete]
 ignored = ["getrandom"] # Enables wasm_js for transitive browser dependencies.
 
+[features]
+# Opt-in pixel capture through GPUI's headless renderer. It needs a Vulkan or
+# GL adapter (Mesa's lavapipe works on headless CI), so it stays out of the
+# default test run; see `src/view/tests/visual_render_tests.rs`.
+visual-tests = []
+
 [dependencies]
 gpui-kit.workspace = true
 loom-core.workspace = true

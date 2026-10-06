@@ -21,5 +21,7 @@ mod session_run_action_tests;
 mod state_toggle_tests;
 mod transcript_action_tests;
 mod transcript_paging_tests;
+#[cfg(feature = "visual-tests")]
+mod visual_render_tests;
 mod worker_failure_tests;
 mod worker_node_tests;
