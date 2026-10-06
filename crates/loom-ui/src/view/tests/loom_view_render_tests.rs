@@ -1088,6 +1088,15 @@ fn phone_source_dialog_stacks_choices_and_keeps_actions_visible(cx: &mut TestApp
         // list inside the scrollable body is longer than the window.
         assert!(window.find("cancel-session-source").visible());
         assert!(window.find("confirm-session-source").visible());
+        // Phone keeps the full-width, 44px-tall stacked actions.
+        assert_eq!(
+            window.find("cancel-session-source").bounds().size.height,
+            px(44.)
+        );
+        assert_eq!(
+            window.find("confirm-session-source").bounds().size.height,
+            px(44.)
+        );
         // The pane sits above the window chrome, so its controls receive
         // clicks rather than the content behind them.
         window.click("cancel-session-source", cx);
@@ -1149,6 +1158,57 @@ fn desktop_source_dialog_renders_as_a_pane(cx: &mut TestAppContext) {
         assert!(window.find("close-source-dialog").visible());
         assert!(window.find("confirm-session-source").visible());
         assert!(window.find("source-dialog-pane").bounds().right() <= window.viewport_size().width);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn desktop_source_dialog_actions_align_with_the_centered_form(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.begin_source_dialog(SessionSourceDialogPurpose::StartSession, cx);
+            view
+        });
+        gpui_kit::component::Root::new(view, window, cx)
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let pane = window.find("source-dialog-pane").bounds();
+        let form = window.find("source-dialog-form").bounds();
+        let actions = window.find("source-dialog-actions").bounds();
+        let cancel = window.find("cancel-session-source").bounds();
+        let confirm = window.find("confirm-session-source").bounds();
+
+        // The action row shares the form's centered max-width container, so on
+        // a wide window it stays under the form instead of spanning the pane.
+        assert_eq!(
+            actions.left(),
+            form.left(),
+            "actions {actions:?} vs form {form:?}"
+        );
+        assert_eq!(
+            actions.right(),
+            form.right(),
+            "actions {actions:?} vs form {form:?}"
+        );
+        assert!(form.size.width <= px(640.));
+        assert!(form.left() > px(200.), "form not centered: {form:?}");
+        // The form is centered within the pane.
+        assert_eq!(form.center().x, pane.center().x);
+
+        // The buttons are right-aligned inside that container, leaving a wide
+        // margin to the pane edge rather than sitting in the corner.
+        assert!(confirm.right() <= form.right() + px(1.));
+        assert!(confirm.right() >= form.right() - px(1.));
+        assert!(confirm.left() >= form.left() - px(1.));
+        assert!(cancel.right() <= confirm.left());
+        assert!(
+            pane.right() - confirm.right() >= px(150.),
+            "confirm pinned to the pane edge: {confirm:?} pane {pane:?}"
+        );
     })
     .unwrap();
 }
