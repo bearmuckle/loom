@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -84,6 +84,12 @@ pub struct LoomError {
     pub code: ErrorCode,
     pub message: String,
     pub retryable: bool,
+    /// An explicit delay hint for a retry, such as a `Retry-After` header.
+    ///
+    /// Transient transport metadata; it is never serialized so persisted and
+    /// protocol errors keep their existing shape.
+    #[serde(default, skip)]
+    pub retry_after: Option<Duration>,
 }
 
 impl LoomError {
@@ -92,7 +98,14 @@ impl LoomError {
             code,
             message: message.into(),
             retryable,
+            retry_after: None,
         }
+    }
+
+    /// Attaches a server-provided delay hint used by the provider retry loop.
+    pub fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
+        self.retry_after = retry_after;
+        self
     }
 
     pub fn invalid_request(message: impl Into<String>) -> Self {

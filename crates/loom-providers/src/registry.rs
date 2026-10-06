@@ -959,19 +959,28 @@ impl ModelProvider for AccountingProvider {
         let mut usage = TokenUsage::default();
         let result = {
             let usage = &mut usage;
-            self.inner.stream(request, cancel, &mut |event| {
-                if let ModelStreamEvent::Usage { usage: event_usage } = &event {
-                    usage.input_tokens =
-                        usage.input_tokens.saturating_add(event_usage.input_tokens);
-                    usage.output_tokens = usage
-                        .output_tokens
-                        .saturating_add(event_usage.output_tokens);
-                    usage.cached_input_tokens = usage
-                        .cached_input_tokens
-                        .saturating_add(event_usage.cached_input_tokens);
-                }
-                sink.emit(event)
-            })
+            // Retry at the pre-body boundary: a transient failure before the
+            // provider emits its first event is retried without the caller
+            // observing (or the ledger counting) the discarded attempt.
+            stream_with_retry(
+                self.inner.as_mut(),
+                request,
+                cancel,
+                &mut |event| {
+                    if let ModelStreamEvent::Usage { usage: event_usage } = &event {
+                        usage.input_tokens =
+                            usage.input_tokens.saturating_add(event_usage.input_tokens);
+                        usage.output_tokens = usage
+                            .output_tokens
+                            .saturating_add(event_usage.output_tokens);
+                        usage.cached_input_tokens = usage
+                            .cached_input_tokens
+                            .saturating_add(event_usage.cached_input_tokens);
+                    }
+                    sink.emit(event)
+                },
+                RetryPolicy::default(),
+            )
         };
         let cost_micros = cost_for_usage(
             &usage,

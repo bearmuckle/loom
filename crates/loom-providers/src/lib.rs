@@ -34,6 +34,7 @@ mod http;
 mod openai;
 mod registry;
 mod response;
+mod retry;
 
 pub use credential::*;
 pub use deterministic::*;
@@ -43,6 +44,7 @@ pub use http::*;
 pub use openai::*;
 pub use registry::*;
 pub use response::*;
+pub use retry::*;
 
 const GITHUB_OAUTH_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 /// The GitHub CLI OAuth app's public client id. A device flow against it
@@ -73,7 +75,7 @@ mod tests {
         io::{Read, Write},
         net::{TcpListener, TcpStream},
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use loom_model::CollectingSink;
@@ -613,6 +615,25 @@ mod tests {
             Ok(())
         });
         (format!("http://{address}/v1/chat/completions"), server)
+    }
+
+    /// Accepts one connection, failing instead of blocking past `deadline`.
+    fn accept_before(
+        listener: &TcpListener,
+        deadline: Instant,
+    ) -> std::result::Result<TcpStream, String> {
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => return Ok(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err("timed out waiting for a provider connection".to_owned());
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
     }
 
     fn read_request_headers(stream: &mut TcpStream) -> std::result::Result<String, String> {
@@ -1669,6 +1690,8 @@ mod tests {
         assert!(error.retryable);
         assert!(error.message.contains("Rate limit reached"));
         assert!(error.message.contains("retry after 12"));
+        // The hint is also carried structurally so the retry loop can honor it.
+        assert_eq!(error.retry_after, Some(Duration::from_secs(12)));
         server
             .join()
             .expect("fixture server thread panicked")
@@ -1721,6 +1744,68 @@ mod tests {
             .expect("fixture server failed");
         let redacted_error = normalize_transport_error("fixture", "Bearer raw-key-never-in-events");
         assert!(!redacted_error.message.contains("raw-key-never-in-events"));
+    }
+
+    #[test]
+    fn openai_compatible_provider_retries_transient_failures_before_the_first_event() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || -> std::result::Result<usize, String> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let body = concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let mut served = 0;
+            while served < 3 {
+                let mut stream = accept_before(&listener, deadline)?;
+                read_request_headers(&mut stream)?;
+                if served < 2 {
+                    let error = r#"{"error":{"message":"try again"}}"#;
+                    let response = format!(
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}",
+                        error.len()
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .map_err(|error| error.to_string())?;
+                    stream.flush().map_err(|error| error.to_string())?;
+                } else {
+                    write_response(&mut stream, "text/event-stream", body)?;
+                }
+                served += 1;
+            }
+            Ok(served)
+        });
+        let mut provider = OpenAiCompatibleProvider::new(
+            format!("http://{address}/v1/chat/completions"),
+            "",
+            ModelId::new("fixture/model"),
+        );
+        let request = ModelRequest {
+            model: ModelId::new("fixture/model"),
+            messages: vec![ModelMessage::new(MessageRole::User, "hello")],
+            tools: Vec::new(),
+            options: Default::default(),
+        };
+        let mut sink = CollectingSink::default();
+        stream_with_retry(
+            &mut provider,
+            &request,
+            &CancellationToken::new(),
+            &mut sink,
+            RetryPolicy {
+                max_retries: 5,
+                base_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            },
+        )
+        .unwrap_or_else(|error| panic!("retry wrapper failed: {error:?}"));
+        assert_eq!(server.join().unwrap().unwrap(), 3);
+        assert!(sink.events.iter().any(|event| {
+            matches!(event, ModelStreamEvent::TextDelta { text } if text == "recovered")
+        }));
     }
 
     #[test]
