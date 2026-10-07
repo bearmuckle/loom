@@ -165,7 +165,14 @@ impl LoomView {
             ServerEvent::Agent { event } => self.consume_agent_event(event),
             ServerEvent::SessionFilesystemChanged { change } => {
                 self.record_status(format!("Workspace {:?}: {}", change.kind, change.path));
-                self.review.mark_changes_unread();
+                // The Changes tab renders a fetched snapshot, so a change newer
+                // than that snapshot is unviewed content even while the tab is
+                // displayed. `consume_event` has no `Context`, so it cannot
+                // refetch the snapshot; the user refreshes by re-selecting the
+                // tab.
+                if self.review.changes_newer_than_snapshot(change.sequence) {
+                    self.review.mark_changes_unread_from_event();
+                }
             }
             ServerEvent::Terminal { .. } | ServerEvent::Task { .. } => {}
             ServerEvent::ProviderHealthChanged {

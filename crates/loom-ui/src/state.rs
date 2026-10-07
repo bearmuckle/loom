@@ -4,11 +4,13 @@
 //! stays authoritative.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::{ListAlignment, ListState, px};
 use loom_core::{
-    AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, ToolCallId, UsageSnapshot,
+    AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, EventSequence, ToolCallId,
+    UsageSnapshot,
 };
 use loom_model::ProviderUsageSummary;
 use loom_protocol::{
@@ -144,8 +146,14 @@ impl AgentMode {
 /// Which inspector tabs hold content the user has not looked at yet.
 ///
 /// The pane toggle shows a dot while either marker is set; each tab shows its
-/// own indicator until that tab is viewed. Content that arrives while the pane
-/// is already open on the relevant tab counts as viewed.
+/// own indicator until that tab is viewed. The two markers track different
+/// kinds of content:
+///
+/// * Plan is a live view fed by agent events, so viewing the tab counts as
+///   viewing everything that has arrived.
+/// * Changes is a fetched snapshot. A fetch is only new content when it differs
+///   from the snapshot the user last looked at, and a change event newer than
+///   the fetched snapshot stays unviewed until the user refreshes the tab.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct UnreadState {
     pub(crate) changes: bool,
@@ -157,6 +165,11 @@ pub(crate) struct ReviewState {
     pub(crate) open: bool,
     pub(crate) tab: InspectorTab,
     pub(crate) unread: UnreadState,
+    /// Normalised content key of the review snapshot the user last looked at.
+    ///
+    /// It is what lets a fetched payload be compared with the content the user
+    /// has already seen, so an unchanged refresh does not mark the tab again.
+    changes_seen_key: Option<String>,
     pub(crate) changes: Vec<SessionFilesystemChange>,
     pub(crate) vcs: Option<GitRepositoryStatus>,
     pub(crate) repositories_loaded: bool,
@@ -244,11 +257,107 @@ impl ReviewState {
         self.open && self.tab == tab
     }
 
-    /// Marks the Changes tab unread unless it is already being viewed.
+    /// The normalised content key of the fetched review snapshot.
+    ///
+    /// The key covers only what the Changes tab renders: the fetched changes
+    /// and, when present, the VCS status. `GitRepositoryStatus::captured_at` is
+    /// deliberately excluded because it changes on every fetch, so including it
+    /// would make an unchanged refresh look like new content. Fields within one
+    /// record are separated by a unit separator so a path cannot fabricate
+    /// another field. A `String` builder is used instead of a `DefaultHasher`
+    /// because the key is deterministic, cannot collide, and reads directly in
+    /// test failures.
+    fn changes_content_key(&self) -> String {
+        if self.changes.is_empty() && self.vcs.is_none() {
+            return String::new();
+        }
+        let mut key = String::new();
+        for change in &self.changes {
+            let _ = writeln!(
+                key,
+                "change\u{1f}{}\u{1f}{:?}\u{1f}{:?}\u{1f}{}",
+                change.path,
+                change.kind,
+                change.revision,
+                change.sequence.value()
+            );
+        }
+        if let Some(vcs) = &self.vcs {
+            let _ = writeln!(
+                key,
+                "vcs\u{1f}{}\u{1f}{:?}\u{1f}{:?}\u{1f}{}\u{1f}{:?}",
+                vcs.root, vcs.branch, vcs.head, vcs.clean, vcs.conflicts
+            );
+            for file in &vcs.files {
+                let _ = writeln!(
+                    key,
+                    "vcs-file\u{1f}{}\u{1f}{:?}\u{1f}{:?}\u{1f}{:?}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                    file.path,
+                    file.original_path,
+                    file.index,
+                    file.worktree,
+                    file.conflicted,
+                    file.index_additions,
+                    file.index_deletions,
+                    file.worktree_additions,
+                    file.worktree_deletions
+                );
+            }
+        }
+        key
+    }
+
+    /// Applies the fetched Changes snapshot to the unread marker.
+    ///
+    /// The Changes tab renders a fetched snapshot instead of a live view, so
+    /// its marker tracks content rather than a viewing gate: viewing the tab
+    /// records the snapshot the user is looking at, an empty snapshot clears a
+    /// stale marker, and only content that differs from the recorded snapshot
+    /// marks the tab. A `SessionFilesystemChanged` event uses
+    /// [`Self::mark_changes_unread_from_event`] instead, because the rendered
+    /// list is a snapshot that the event may be newer than.
     pub(crate) fn mark_changes_unread(&mut self) {
-        if !self.is_viewing(InspectorTab::Changes) {
+        let key = self.changes_content_key();
+        if self.is_viewing(InspectorTab::Changes) {
+            self.changes_seen_key = Some(key);
+            self.unread.changes = false;
+            return;
+        }
+        if key.is_empty() {
+            self.unread.changes = false;
+            return;
+        }
+        if self.changes_seen_key.as_deref() != Some(key.as_str()) {
             self.unread.changes = true;
         }
+    }
+
+    /// Whether a change event reports content newer than the fetched snapshot.
+    ///
+    /// With nothing fetched the snapshot is empty, so any event is newer.
+    pub(crate) fn changes_newer_than_snapshot(&self, sequence: EventSequence) -> bool {
+        match self.changes.iter().map(|change| change.sequence).max() {
+            Some(newest) => sequence > newest,
+            None => true,
+        }
+    }
+
+    /// Marks the Changes tab for a change event newer than the snapshot.
+    ///
+    /// The event path intentionally skips the `is_viewing` gate used for
+    /// fetched payloads: the tab is showing a snapshot, so a change the
+    /// snapshot does not contain is unviewed even while the tab is displayed.
+    pub(crate) fn mark_changes_unread_from_event(&mut self) {
+        self.unread.changes = true;
+    }
+
+    /// Forgets the fetched Changes snapshot, e.g. when the session changes.
+    ///
+    /// Another session's content must not be treated as already viewed, so the
+    /// recorded key is dropped along with the marker.
+    pub(crate) fn reset_changes_unread(&mut self) {
+        self.unread.changes = false;
+        self.changes_seen_key = None;
     }
 
     /// Marks the Plan tab unread unless it is already being viewed.
@@ -259,9 +368,15 @@ impl ReviewState {
     }
 
     /// Clears the unread marker for a tab that is now being viewed.
+    ///
+    /// Viewing the Changes tab also records the snapshot it is showing, so the
+    /// same content does not mark the tab again.
     pub(crate) fn clear_unread(&mut self, tab: InspectorTab) {
         match tab {
-            InspectorTab::Changes => self.unread.changes = false,
+            InspectorTab::Changes => {
+                self.unread.changes = false;
+                self.changes_seen_key = Some(self.changes_content_key());
+            }
             InspectorTab::Plan => self.unread.plan = false,
             InspectorTab::Agent | InspectorTab::Context | InspectorTab::Files => {}
         }
@@ -325,6 +440,7 @@ impl Default for ReviewState {
             open: false,
             tab: InspectorTab::Changes,
             unread: UnreadState::default(),
+            changes_seen_key: None,
             changes: Vec::new(),
             vcs: None,
             repositories_loaded: false,
@@ -745,7 +861,41 @@ pub(crate) fn session_state_for_run(state: AgentRunState) -> AgentSessionState {
 mod tests {
     use super::*;
     use loom_core::ToolCallId;
-    use loom_protocol::{GitDiffHunk, GitDiffLineKind};
+    use loom_protocol::{
+        GitDiffHunk, GitDiffLineKind, GitFileStatus, GitFileStatusKind, WorkspaceChangeKind,
+    };
+
+    fn review_change(sequence: u64) -> SessionFilesystemChange {
+        SessionFilesystemChange {
+            sequence: EventSequence::new(sequence),
+            session_id: loom_core::AgentSessionId::new(),
+            path: format!("src/file-{}.rs", sequence % 2),
+            kind: WorkspaceChangeKind::Modified,
+            revision: Some(format!("rev-{sequence}")),
+        }
+    }
+
+    fn vcs_status(captured_at: u64) -> GitRepositoryStatus {
+        GitRepositoryStatus {
+            root: "/workspace".to_owned(),
+            branch: Some("main".to_owned()),
+            head: Some("abc123".to_owned()),
+            files: vec![GitFileStatus {
+                path: "src/lib.rs".to_owned(),
+                original_path: None,
+                index: GitFileStatusKind::Modified,
+                worktree: GitFileStatusKind::Modified,
+                conflicted: false,
+                index_additions: 1,
+                index_deletions: 0,
+                worktree_additions: 2,
+                worktree_deletions: 1,
+            }],
+            conflicts: Vec::new(),
+            clean: false,
+            captured_at: loom_core::Timestamp::from_unix_millis(captured_at),
+        }
+    }
 
     #[test]
     fn inspector_tabs_report_stable_labels_and_indexes() {
@@ -763,6 +913,11 @@ mod tests {
         let mut review = ReviewState::default();
         assert!(!review.has_unread());
 
+        // An empty review payload has nothing to look at, so it never marks.
+        review.mark_changes_unread();
+        assert!(!review.unread.changes);
+
+        review.changes = vec![review_change(1)];
         review.mark_changes_unread();
         review.mark_plan_unread();
         assert!(review.has_unread());
@@ -780,12 +935,135 @@ mod tests {
         review.mark_plan_unread();
         assert!(!review.unread.plan);
 
-        // A tab that is not currently displayed still becomes unread.
+        // A tab that is not currently displayed becomes unread once its
+        // content differs from the snapshot that was viewed.
+        review.changes.push(review_change(3));
         review.mark_changes_unread();
         assert!(review.unread.changes);
 
         // Clearing an unrelated tab leaves the remaining markers alone.
         review.clear_unread(InspectorTab::Files);
+        assert!(review.unread.changes);
+    }
+
+    /// The P1 rule: a refresh that fetches the content the user already looked
+    /// at must not re-mark the tab, while changed content must.
+    #[test]
+    fn fetched_review_content_only_marks_when_it_differs_from_the_seen_snapshot() {
+        let mut review = ReviewState {
+            open: true,
+            tab: InspectorTab::Changes,
+            changes: vec![review_change(4)],
+            ..ReviewState::default()
+        };
+        // Viewing the tab records the snapshot it shows.
+        review.mark_changes_unread();
+        assert!(!review.unread.changes);
+
+        // The pane moves to the Plan tab and the same snapshot is fetched
+        // again; identical content is not new.
+        review.tab = InspectorTab::Plan;
+        review.mark_changes_unread();
+        assert!(!review.unread.changes);
+
+        // Changed content is new again, even for the same path.
+        review.changes = vec![review_change(6)];
+        review.mark_changes_unread();
+        assert!(review.unread.changes);
+
+        // A longer snapshot is a different key as well.
+        review.clear_unread(InspectorTab::Changes);
+        review.changes.push(review_change(9));
+        review.mark_changes_unread();
+        assert!(review.unread.changes);
+    }
+
+    #[test]
+    fn a_vcs_status_that_only_moved_its_capture_time_does_not_mark() {
+        let mut review = ReviewState {
+            open: true,
+            tab: InspectorTab::Changes,
+            vcs: Some(vcs_status(1)),
+            ..ReviewState::default()
+        };
+        review.mark_changes_unread();
+        assert!(!review.unread.changes);
+
+        // `captured_at` changes on every fetch, so it is excluded from the key.
+        review.tab = InspectorTab::Plan;
+        review.vcs = Some(vcs_status(2));
+        review.mark_changes_unread();
+        assert!(!review.unread.changes);
+
+        // A real status change still marks.
+        let mut status = vcs_status(3);
+        status.files[0].worktree = GitFileStatusKind::Deleted;
+        review.vcs = Some(status);
+        review.mark_changes_unread();
+        assert!(review.unread.changes);
+    }
+
+    #[test]
+    fn empty_review_content_neither_marks_nor_keeps_a_stale_marker() {
+        let mut review = ReviewState::default();
+        review.unread.changes = true;
+        review.mark_changes_unread();
+        assert!(!review.unread.changes);
+
+        // A stale marker is dropped even when the tab is not displayed.
+        review.open = true;
+        review.tab = InspectorTab::Plan;
+        review.unread.changes = true;
+        review.mark_changes_unread();
+        assert!(!review.unread.changes);
+    }
+
+    #[test]
+    fn change_events_are_newer_only_than_the_fetched_snapshot() {
+        let mut review = ReviewState::default();
+        // Nothing fetched yet: the snapshot is empty, so any event is newer.
+        assert!(review.changes_newer_than_snapshot(EventSequence::new(1)));
+
+        review.changes = vec![review_change(5), review_change(3)];
+        assert!(!review.changes_newer_than_snapshot(EventSequence::new(4)));
+        assert!(!review.changes_newer_than_snapshot(EventSequence::new(5)));
+        assert!(review.changes_newer_than_snapshot(EventSequence::new(6)));
+    }
+
+    #[test]
+    fn a_change_event_marks_even_while_the_changes_tab_is_displayed() {
+        let mut review = ReviewState {
+            open: true,
+            tab: InspectorTab::Changes,
+            changes: vec![review_change(2)],
+            ..ReviewState::default()
+        };
+        review.mark_changes_unread();
+        assert!(!review.unread.changes);
+
+        // The event path bypasses the viewing gate: the tab renders a snapshot
+        // that does not contain the new change yet.
+        review.mark_changes_unread_from_event();
+        assert!(review.unread.changes);
+    }
+
+    #[test]
+    fn switching_sessions_forgets_the_seen_review_snapshot() {
+        let mut review = ReviewState {
+            open: true,
+            tab: InspectorTab::Changes,
+            changes: vec![review_change(2)],
+            ..ReviewState::default()
+        };
+        review.mark_changes_unread();
+        assert!(!review.unread.changes);
+
+        review.reset_changes_unread();
+        assert!(!review.unread.changes);
+
+        // Another session's identical-looking content is not already viewed.
+        review.open = false;
+        review.mark_changes_unread();
         assert!(review.unread.changes);
     }
 
