@@ -495,6 +495,18 @@ pub(crate) fn timeline_items_from_messages(
                 MessageRole::User if message.name.as_deref() == Some("loom_project_message") => {
                     project_boundary = true;
                 }
+                // A completion guard is also orchestration traffic, but it
+                // starts a fresh assistant reply rather than continuing one.
+                MessageRole::User
+                    if message.name.as_deref() == Some("loom_project_completion_guard") =>
+                {
+                    project_boundary = true;
+                }
+                // Resuming an output-truncated turn is the same assistant
+                // answer, so hide the scaffolding prompt without starting a new
+                // turn: the continuation text merges into the turn above.
+                MessageRole::User
+                    if message.name.as_deref() == Some("loom_output_limit_continuation") => {}
                 MessageRole::User => timeline.push(TimelineItem::User(message.content)),
                 MessageRole::Assistant => {
                     let reasoning = message
