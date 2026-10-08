@@ -193,6 +193,12 @@ pub fn estimate_message_tokens(message: &ModelMessage) -> u64 {
 
 fn estimate_message_tokens_with_model(model: &ModelId, message: &ModelMessage) -> u64 {
     let mut tokens = estimate_text_tokens(model, &message.content) + 3;
+    // Thinking providers round-trip `reasoning_content` on assistant turns, so
+    // it occupies context and must be budgeted. Omitting it let compaction and
+    // the final budget check undercount thinking-mode requests.
+    if let Some(reasoning) = &message.reasoning_content {
+        tokens = tokens.saturating_add(estimate_text_tokens(model, reasoning));
+    }
     if let Some(name) = &message.name {
         tokens = tokens.saturating_add(estimate_text_tokens(model, name) + 1);
     }
@@ -308,4 +314,25 @@ pub struct ProviderUsageRecord {
     pub usage: TokenUsage,
     pub cost_micros: u64,
     pub recorded_at: Timestamp,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MessageRole;
+
+    #[test]
+    fn reasoning_content_counts_toward_the_message_budget() {
+        let mut message = ModelMessage::new(MessageRole::Assistant, "answer");
+        let base = estimate_message_tokens(&message);
+        message.reasoning_content = Some("thinking ".repeat(200));
+        let with_reasoning = estimate_message_tokens(&message);
+        assert!(
+            with_reasoning > base,
+            "reasoning_content must be budgeted: {with_reasoning} vs {base}"
+        );
+        // Empty reasoning (echoed onto turns that produced none) adds nothing.
+        message.reasoning_content = Some(String::new());
+        assert_eq!(estimate_message_tokens(&message), base);
+    }
 }

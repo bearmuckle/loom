@@ -123,6 +123,65 @@ fn restored_project_message_stays_out_of_the_transcript() {
 }
 
 #[test]
+fn output_limit_continuation_merges_into_the_agent_turn() {
+    let mut continuation = ModelMessage::new(
+        MessageRole::User,
+        "Your previous response was cut off because it reached the output token limit.",
+    );
+    continuation.name = Some("loom_output_limit_continuation".to_owned());
+    let timeline = timeline_items_from_messages(
+        vec![
+            (
+                0,
+                0,
+                ModelMessage::new(MessageRole::Assistant, "first half"),
+            ),
+            (1, 1, continuation),
+            (
+                2,
+                2,
+                ModelMessage::new(MessageRole::Assistant, "second half"),
+            ),
+        ],
+        Vec::new(),
+    );
+    assert_eq!(timeline.len(), 1, "the continuation prompt is not rendered");
+    let TimelineItem::Assistant(turn) = &timeline[0] else {
+        panic!("expected a single merged agent turn; got {timeline:?}");
+    };
+    assert_eq!(
+        turn.parts,
+        vec![AssistantPart::Text("first half\n\nsecond half".to_owned())]
+    );
+}
+
+#[test]
+fn project_completion_guard_stays_out_of_the_transcript() {
+    let mut guard = ModelMessage::new(
+        MessageRole::User,
+        "Project completion is blocked: integrate the child worktree.",
+    );
+    guard.name = Some("loom_project_completion_guard".to_owned());
+    let timeline = timeline_items_from_messages(
+        vec![
+            (0, 0, ModelMessage::new(MessageRole::Assistant, "before")),
+            (1, 1, guard),
+            (2, 2, ModelMessage::new(MessageRole::Assistant, "after")),
+        ],
+        Vec::new(),
+    );
+    assert_eq!(timeline.len(), 2, "the completion guard is not rendered");
+    let TimelineItem::Assistant(before) = &timeline[0] else {
+        panic!("expected a leading agent entry; got {timeline:?}");
+    };
+    assert_eq!(before.parts, vec![AssistantPart::Text("before".to_owned())]);
+    let TimelineItem::Assistant(after) = &timeline[1] else {
+        panic!("expected a reply entry; got {timeline:?}");
+    };
+    assert_eq!(after.parts, vec![AssistantPart::Text("after".to_owned())]);
+}
+
+#[test]
 fn restored_project_message_splits_adjacent_agent_turns() {
     let timeline = timeline_items_from_messages(
         vec![
