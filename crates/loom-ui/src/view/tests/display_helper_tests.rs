@@ -477,6 +477,55 @@ fn github_tools_get_readable_titles_and_no_json_detail() {
     );
     assert_eq!(tool_detail(&call), None);
 
+    call.arguments = json!({"repository": "owner/name", "state": "open"});
+    assert_eq!(
+        tool_title("github_list_issues", &call.arguments),
+        "List issues in owner/name"
+    );
+    assert_eq!(tool_detail(&call), None);
+
+    call.arguments = json!({"repository": "owner/name", "number": 42});
+    assert_eq!(
+        tool_title("github_get_issue", &call.arguments),
+        "Read owner/name#42"
+    );
+    assert_eq!(
+        tool_title("github_get_comments", &call.arguments),
+        "Read comments on owner/name#42"
+    );
+    assert_eq!(
+        tool_title("github_update_issue", &call.arguments),
+        "Update owner/name#42"
+    );
+    assert_eq!(
+        tool_title("github_comment", &call.arguments),
+        "Comment on owner/name#42"
+    );
+    assert_eq!(
+        tool_title("github_update_pull_request", &call.arguments),
+        "Update owner/name#42"
+    );
+    assert_eq!(
+        tool_title("github_mark_pull_request_ready_for_review", &call.arguments),
+        "Mark owner/name#42 ready for review"
+    );
+    assert_eq!(
+        tool_title("github_add_labels", &call.arguments),
+        "Label owner/name#42"
+    );
+    assert_eq!(
+        tool_title("github_remove_labels", &call.arguments),
+        "Remove labels from owner/name#42"
+    );
+    assert_eq!(tool_detail(&call), None);
+
+    call.arguments = json!({"repository": "owner/name", "title": "Bug"});
+    assert_eq!(
+        tool_title("github_create_issue", &call.arguments),
+        "Open issue in owner/name"
+    );
+    assert_eq!(tool_detail(&call), None);
+
     assert_eq!(
         tool_title("github_get_pull_request", &json!({})),
         "Read pull request"
@@ -484,6 +533,10 @@ fn github_tools_get_readable_titles_and_no_json_detail() {
     assert_eq!(
         tool_group_label("github_create_pull_request", 2),
         "Opened 2 pull requests"
+    );
+    assert_eq!(
+        tool_group_label("github_create_issue", 2),
+        "Opened 2 issues"
     );
 }
 
