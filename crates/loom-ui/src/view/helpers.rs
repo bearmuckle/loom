@@ -1316,6 +1316,16 @@ pub(crate) fn tool_icon(name: &str) -> AssetIconName {
         "github_get_pull_request" => AssetIconName::GitBranch,
         "github_create_pull_request" => AssetIconName::GitMerge,
         "github_push_branch" => AssetIconName::ArrowUp,
+        "github_list_issues" => AssetIconName::List,
+        "github_get_issue" => AssetIconName::FileText,
+        "github_get_comments" => AssetIconName::MessageSquare,
+        "github_create_issue" => AssetIconName::List,
+        "github_update_issue" => AssetIconName::Pencil,
+        "github_comment" => AssetIconName::MessageSquare,
+        "github_update_pull_request" => AssetIconName::Pencil,
+        "github_mark_pull_request_ready_for_review" => AssetIconName::Check,
+        "github_add_labels" => AssetIconName::List,
+        "github_remove_labels" => AssetIconName::List,
         "web_search" => AssetIconName::Globe,
         "run_command" => AssetIconName::SquareTerminal,
         "propose_plan" => AssetIconName::ListChecks,
@@ -1344,6 +1354,18 @@ pub(crate) fn tool_group_label(name: &str, count: usize) -> String {
         "github_get_pull_request" => format!("Read {count} pull requests"),
         "github_create_pull_request" => format!("Opened {count} pull requests"),
         "github_push_branch" => format!("Pushed {count} branches"),
+        "github_list_issues" => format!("Listed issues {count} times"),
+        "github_get_issue" => format!("Read {count} issues"),
+        "github_get_comments" => format!("Read comments {count} times"),
+        "github_create_issue" => format!("Opened {count} issues"),
+        "github_update_issue" => format!("Updated {count} issues"),
+        "github_comment" => format!("Commented {count} times"),
+        "github_update_pull_request" => format!("Updated {count} pull requests"),
+        "github_mark_pull_request_ready_for_review" => {
+            format!("Marked {count} pull requests ready")
+        }
+        "github_add_labels" => format!("Labeled {count} times"),
+        "github_remove_labels" => format!("Unlabeled {count} times"),
         "run_command" => format!("Ran {count} commands"),
         "web_search" => format!("Searched the web {count} times"),
         "propose_plan" => format!("Proposed {count} plans"),
@@ -1375,6 +1397,16 @@ pub(crate) fn tool_usage_label(name: &str) -> &str {
         "github_get_pull_request" => "Read PR",
         "github_create_pull_request" => "Open PR",
         "github_push_branch" => "Push",
+        "github_list_issues" => "List issues",
+        "github_get_issue" => "Read issue",
+        "github_get_comments" => "Read comments",
+        "github_create_issue" => "Open issue",
+        "github_update_issue" => "Update issue",
+        "github_comment" => "Comment",
+        "github_update_pull_request" => "Update PR",
+        "github_mark_pull_request_ready_for_review" => "Ready PR",
+        "github_add_labels" => "Label",
+        "github_remove_labels" => "Unlabel",
         "run_command" => "Run",
         "web_search" => "Web search",
         "propose_plan" => "Plan",
@@ -1654,7 +1686,17 @@ pub(crate) fn tool_detail(call: &loom_model::ToolCall) -> Option<String> {
         | "github_list_pull_requests"
         | "github_get_pull_request"
         | "github_create_pull_request"
-        | "github_push_branch" => None,
+        | "github_push_branch"
+        | "github_list_issues"
+        | "github_get_issue"
+        | "github_get_comments"
+        | "github_create_issue"
+        | "github_update_issue"
+        | "github_comment"
+        | "github_update_pull_request"
+        | "github_mark_pull_request_ready_for_review"
+        | "github_add_labels"
+        | "github_remove_labels" => None,
         _ => match &call.arguments {
             serde_json::Value::Null => None,
             serde_json::Value::Object(map) if map.is_empty() => None,
@@ -1968,7 +2010,55 @@ pub(crate) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
             (None, Some(branch)) => format!("Push {branch}"),
             (None, None) => "Push branch".to_owned(),
         },
+        "github_list_issues" => string_argument(arguments, "repository").map_or_else(
+            || "List issues".to_owned(),
+            |repository| format!("List issues in {repository}"),
+        ),
+        "github_get_issue" => github_number_title(arguments, "Read"),
+        "github_get_comments" => {
+            let repository = string_argument(arguments, "repository");
+            let number = arguments.get("number").and_then(serde_json::Value::as_u64);
+            match (repository, number) {
+                (Some(repository), Some(number)) => {
+                    format!("Read comments on {repository}#{number}")
+                }
+                (Some(repository), None) => format!("Read comments in {repository}"),
+                _ => "Read comments".to_owned(),
+            }
+        }
+        "github_create_issue" => string_argument(arguments, "repository").map_or_else(
+            || "Open issue".to_owned(),
+            |repository| format!("Open issue in {repository}"),
+        ),
+        "github_update_issue" => github_number_title(arguments, "Update"),
+        "github_comment" => github_number_title(arguments, "Comment on"),
+        "github_update_pull_request" => github_number_title(arguments, "Update"),
+        "github_mark_pull_request_ready_for_review" => {
+            let repository = string_argument(arguments, "repository");
+            let number = arguments.get("number").and_then(serde_json::Value::as_u64);
+            match (repository, number) {
+                (Some(repository), Some(number)) => {
+                    format!("Mark {repository}#{number} ready for review")
+                }
+                (Some(repository), None) => format!("Mark pull request in {repository} ready"),
+                _ => "Mark pull request ready for review".to_owned(),
+            }
+        }
+        "github_add_labels" => github_number_title(arguments, "Label"),
+        "github_remove_labels" => github_number_title(arguments, "Remove labels from"),
         other => other.to_owned(),
+    }
+}
+
+/// Renders `verb owner/name#number`, degrading gracefully when either field is
+/// missing from the arguments.
+fn github_number_title(arguments: &serde_json::Value, verb: &str) -> String {
+    let repository = string_argument(arguments, "repository");
+    let number = arguments.get("number").and_then(serde_json::Value::as_u64);
+    match (repository, number) {
+        (Some(repository), Some(number)) => format!("{verb} {repository}#{number}"),
+        (Some(repository), None) => format!("{verb} {repository}"),
+        _ => verb.to_owned(),
     }
 }
 
