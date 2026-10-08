@@ -370,11 +370,13 @@ impl LoomView {
             self.transcript_messages
                 .insert(*ordinal, (*timeline_ordinal, message.clone()));
         }
-        let insertion_index = self.transcript_insertion_index();
         let before_len = self.timeline.len();
         if before_ordinal.is_none() {
             // The first page is authoritative for the message portion of the
-            // transcript, so rebuild it from the loaded messages.
+            // transcript, so rebuild it from the loaded messages. Compute the
+            // insertion index after the retain: dropping the message portion can
+            // empty the timeline, and an index derived from the pre-retain
+            // first row would be out of bounds for the splice below.
             self.timeline
                 .retain(|item| !matches!(item, TimelineItem::User(_) | TimelineItem::Assistant(_)));
             let ordered_items = timeline_items_from_messages(
@@ -386,6 +388,7 @@ impl LoomView {
                     .collect(),
                 self.activity_records.values().cloned().collect(),
             );
+            let insertion_index = self.transcript_insertion_index();
             self.timeline
                 .splice(insertion_index..insertion_index, ordered_items);
         } else {
@@ -393,6 +396,7 @@ impl LoomView {
             // those rows and prepend them so turns streamed since the request
             // (which are not in the page) are not discarded.
             let ordered_items = timeline_items_from_messages(messages, Vec::new());
+            let insertion_index = self.transcript_insertion_index();
             self.timeline
                 .splice(insertion_index..insertion_index, ordered_items);
             self.transcript_prepend_count = self

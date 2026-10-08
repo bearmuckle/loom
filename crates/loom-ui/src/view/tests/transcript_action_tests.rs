@@ -52,6 +52,36 @@ fn older_transcript_pages_prepend_without_discarding_live_turns(cx: &mut TestApp
 }
 
 #[gpui_kit::test]
+fn first_transcript_page_replaces_the_task_row_without_panicking(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        let run_id = loom_core::RunId::new();
+        view.active_run_id = Some(run_id);
+        // A selected session starts with the task row and no transcript page, so
+        // the first page's retain empties the message portion before the splice.
+        let task = "restore the original task".to_owned();
+        view.session_task_cache
+            .insert(view.active_session.id, task.clone());
+        view.timeline = vec![TimelineItem::User(task.clone())];
+        view.apply_transcript_page(
+            run_id,
+            None,
+            vec![(0, 0, ModelMessage::new(MessageRole::User, task.clone()))],
+            None,
+            false,
+        );
+        assert!(matches!(
+            view.timeline.first(),
+            Some(TimelineItem::User(text)) if text == &task
+        ));
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
+}
+
+#[gpui_kit::test]
 fn autoload_older_transcript_respects_loading_and_history_state(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
