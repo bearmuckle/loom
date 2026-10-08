@@ -5,11 +5,11 @@ use super::{
     about_protocol, about_version_label, activity_output, change_kind_label, command_line,
     command_purpose, commands_matching, completion_for_value, composer_height, disconnected_screen,
     endpoint_host, endpoint_label, format_bytes, format_duration, format_percentage,
-    humanize_tool_output, is_redundant_completion_summary, relative_time, replace_command_token,
-    replace_last_token, rgb, run_state_color, run_state_label, session_is_active,
-    session_status_pill, source_mount_path, tool_detail, tool_failure_count, tool_group_label,
-    tool_group_status, tool_needs_attention, tool_part_from_activity, tool_status, tool_title,
-    tool_title_for_activity, tool_usage_label, tool_usage_summary,
+    has_block_markdown, humanize_tool_output, is_redundant_completion_summary, relative_time,
+    replace_command_token, replace_last_token, rgb, run_state_color, run_state_label,
+    session_is_active, session_status_pill, source_mount_path, tool_detail, tool_failure_count,
+    tool_group_label, tool_group_status, tool_needs_attention, tool_part_from_activity,
+    tool_status, tool_title, tool_title_for_activity, tool_usage_label, tool_usage_summary,
 };
 use loom_core::{ActivityId, AgentSessionState, ProtocolVersion, RunId, Timestamp};
 use loom_model::{ModelId, ToolCall};
@@ -766,4 +766,16 @@ fn disconnected_screen_copy_distinguishes_first_connect_from_connection_loss() {
         "Reconnect to reload your projects and sessions."
     );
     assert_eq!(lost.footer, "Disconnected  ·  connection lost");
+}
+
+#[test]
+fn block_markdown_is_detected_for_definite_bubble_widths() {
+    assert!(has_block_markdown("1. first\n2. second"));
+    assert!(has_block_markdown("3) third"));
+    assert!(has_block_markdown("- bullet"));
+    assert!(has_block_markdown("```\ncode\n```"));
+    assert!(has_block_markdown("| a | b |\n| - | - |"));
+    assert!(!has_block_markdown("Run the tests"));
+    assert!(!has_block_markdown("Release 2.0 shipped"));
+    assert!(!has_block_markdown("inline **bold** only"));
 }
