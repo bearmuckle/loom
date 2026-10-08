@@ -1178,6 +1178,32 @@ pub(crate) fn render_timeline_text(id: String, text: String, color: u32) -> gpui
     }
 }
 
+/// Whether text contains block-level Markdown whose intrinsic width collapses
+/// inside a content-sized container (lists, fenced code, tables). A list body
+/// uses `flex_1`, which contributes nothing to a parent's max-content width, so
+/// a right-aligned chat bubble sized to its content shrinks to the item marker
+/// and character-wraps. Callers give such a container a definite width.
+pub(crate) fn has_block_markdown(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("- ")
+            || line.starts_with("* ")
+            || line.starts_with("+ ")
+            || line.starts_with("```")
+            || line.starts_with("~~~")
+            || line.starts_with('|')
+            || ordered_list_marker(line)
+    })
+}
+
+fn ordered_list_marker(line: &str) -> bool {
+    let digits = line
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    digits > 0 && (line[digits..].starts_with(". ") || line[digits..].starts_with(") "))
+}
+
 /// A monospace code block with a line-number gutter and horizontal scrolling.
 pub(crate) fn render_code_block(
     id: impl Into<gpui_kit::ElementId>,
