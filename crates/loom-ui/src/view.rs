@@ -518,6 +518,9 @@ pub(crate) struct LoomView {
     transcript_has_older: bool,
     transcript_loading: bool,
     transcript_generation: u64,
+    /// Rows added at the head by an older-page load, consumed by the timeline's
+    /// virtual list so it can prepend them without jumping the scroll anchor.
+    transcript_prepend_count: usize,
     timeline_view: Option<Entity<TimelineView>>,
     /// The active run's plan progress. Rendered in full in the inspector's Plan
     /// tab and summarised in the Agent tab, never as a timeline row.
@@ -1427,6 +1430,7 @@ impl LoomView {
             transcript_has_older: false,
             transcript_loading: false,
             transcript_generation: 0,
+            transcript_prepend_count: 0,
             timeline_view: None,
             plan: None,
             plan_collapsed: false,

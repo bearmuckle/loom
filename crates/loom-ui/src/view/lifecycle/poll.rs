@@ -227,10 +227,17 @@ impl LoomView {
             })
             .await;
             view.update(cx, |view, cx| {
-                if view.run_should_poll() {
-                    view.poll_run_once(cx);
-                } else {
+                if !view.run_should_poll() {
                     view.run_poll_scheduled = false;
+                } else if view.transcript_loading {
+                    // A transcript page rebuild replaces the message portion of
+                    // the timeline. Defer draining the event stream until the
+                    // page has been applied, or events consumed in the meantime
+                    // are discarded and the view looks sparse.
+                    view.run_poll_scheduled = false;
+                    view.schedule_run_poll(cx);
+                } else {
+                    view.poll_run_once(cx);
                 }
             })
             .ok();

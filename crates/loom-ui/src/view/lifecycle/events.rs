@@ -196,6 +196,7 @@ impl LoomView {
                     self.transcript_messages.clear();
                     self.transcript_has_older = false;
                     self.transcript_loading = false;
+                    self.transcript_prepend_count = 0;
                     self.activity_records.clear();
                     // A plan belongs to one run, so a new run starts without one.
                     self.plan = None;
