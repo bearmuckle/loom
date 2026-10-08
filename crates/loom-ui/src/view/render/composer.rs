@@ -88,7 +88,7 @@ impl LoomView {
                         .text_color(rgb(0x8f98a6))
                         .mb_2()
                         .child(format!(
-                            "Context ≈ {} / {budget} · {} reserved for output{fallback}",
+                            "Context ~ {} / {budget} · {} reserved for output{fallback}",
                             inspection.included_tokens, inspection.budget.reserved_output_tokens
                         )),
                 )
@@ -242,7 +242,7 @@ impl LoomView {
                                                     .w(layout.control_size())
                                             })
                                             .when(!layout.phone, |button| button.small())
-                                            .tooltip("Send (↵)")
+                                            .tooltip("Send (Enter)")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.submit_composer(cx);
                                             })),

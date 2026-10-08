@@ -56,7 +56,7 @@ impl LoomView {
                     if !text.trim().is_empty() {
                         let mut display = text.clone();
                         if turn.streaming && part_index + 1 == turn.parts.len() {
-                            display.push('▍');
+                            display.push('▮');
                         }
                         body = body.child(render_timeline_text(
                             format!("transcript-assistant-{index}-{part_index}"),
@@ -138,11 +138,7 @@ impl LoomView {
                             .items_center()
                             .gap_2()
                             .text_xs()
-                            .child(div().text_color(rgb(0x64748b)).child(if expanded {
-                                "⌄"
-                            } else {
-                                "›"
-                            }))
+                            .child(disclosure_chevron(expanded, rgb(0x64748b)))
                             .child(div().text_color(rgb(0x94a3b8)).child("Reasoning"))
                             .when(!expanded, |element| {
                                 element.child(
@@ -244,11 +240,7 @@ impl LoomView {
                                     .flex_shrink_0()
                                     .text_color(status_color),
                             )
-                            .child(div().text_color(rgb(0x64748b)).child(if expanded {
-                                "⌄"
-                            } else {
-                                "›"
-                            }))
+                            .child(disclosure_chevron(expanded, rgb(0x64748b)))
                             .child(
                                 div()
                                     .flex_1()
@@ -402,11 +394,7 @@ impl LoomView {
                                     .flex_shrink_0()
                                     .text_color(status_color),
                             )
-                            .child(div().text_color(rgb(0x64748b)).child(if expanded {
-                                "⌄"
-                            } else {
-                                "›"
-                            }))
+                            .child(disclosure_chevron(expanded, rgb(0x64748b)))
                             .child(
                                 div()
                                     .flex_1()
@@ -547,15 +535,11 @@ impl LoomView {
                             )
                             .child(
                                 div()
-                                    .w(px(10.))
+                                    .w(px(12.))
                                     .flex_shrink_0()
                                     .text_color(rgb(0x64748b))
-                                    .child(if !expandable {
-                                        ""
-                                    } else if expanded {
-                                        "⌄"
-                                    } else {
-                                        "›"
+                                    .when(expandable, |element| {
+                                        element.child(disclosure_chevron(expanded, rgb(0x64748b)))
                                     }),
                             )
                             .child(

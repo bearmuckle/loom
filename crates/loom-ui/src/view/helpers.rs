@@ -1304,6 +1304,24 @@ pub(crate) fn tool_output_language(part: &ToolPart) -> Language {
     }
 }
 
+/// The chevron for a collapsible row: pointing down when expanded and right
+/// when collapsed.
+///
+/// Drawn as an SVG icon rather than the Unicode down-arrowhead/angle glyphs
+/// those rows used to show. The browser build has no system font fallback for
+/// geometric symbols, and the bundled faces do not cover the down-arrowhead,
+/// so the browser client rendered it blank.
+pub(crate) fn disclosure_chevron(expanded: bool, color: Rgba) -> Icon {
+    Icon::new(if expanded {
+        AssetIconName::ChevronDown
+    } else {
+        AssetIconName::ChevronRight
+    })
+    .size_3()
+    .flex_shrink_0()
+    .text_color(color)
+}
+
 /// The icon shown for a tool, by tool name.
 pub(crate) fn tool_icon(name: &str) -> AssetIconName {
     match name {
@@ -1954,7 +1972,7 @@ pub(crate) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
             string_argument(arguments, "base"),
         ) {
             (Some(repository), Some(head), Some(base)) => {
-                format!("Open {head} → {base} in {repository}")
+                format!("Open {head} -> {base} in {repository}")
             }
             (Some(repository), _, _) => format!("Open pull request in {repository}"),
             _ => "Open pull request".to_owned(),

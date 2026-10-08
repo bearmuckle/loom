@@ -466,7 +466,7 @@ fn github_tools_get_readable_titles_and_no_json_detail() {
         json!({"repository": "owner/name", "title": "Fix", "head": "fix", "base": "main"});
     assert_eq!(
         tool_title("github_create_pull_request", &call.arguments),
-        "Open fix → main in owner/name"
+        "Open fix -> main in owner/name"
     );
     assert_eq!(tool_detail(&call), None);
 

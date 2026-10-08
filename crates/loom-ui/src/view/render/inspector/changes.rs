@@ -114,7 +114,7 @@ impl LoomView {
                                     .child(
                                         div()
                                             .text_color(rgb(0xfca5a5))
-                                            .child(format!("−{deletions}")),
+                                            .child(format!("-{deletions}")),
                                     ),
                             ),
                     ),
@@ -501,7 +501,7 @@ impl LoomView {
                 let (added, removed) = self.hunk_change_summary(index);
                 let mut header = format!("@@ -{old_start},{old_lines} +{new_start},{new_lines} @@");
                 if added > 0 || removed > 0 {
-                    header.push_str(&format!("  +{added} −{removed}"));
+                    header.push_str(&format!("  +{added} -{removed}"));
                 }
                 let collapsed = self
                     .review
@@ -522,7 +522,7 @@ impl LoomView {
             ReviewRow::Line(line) => {
                 let (marker, background, foreground) = match line.kind {
                     GitDiffLineKind::Added => ("+", 0x24543d, 0xbbf7d0),
-                    GitDiffLineKind::Removed => ("−", 0x542936, 0xfecaca),
+                    GitDiffLineKind::Removed => ("-", 0x542936, 0xfecaca),
                     GitDiffLineKind::Context => (" ", 0x17191f, 0xcbd5e1),
                 };
                 let language = self.diff_language();
@@ -715,7 +715,7 @@ fn counts(additions: u32, deletions: u32) -> impl IntoElement {
             element.child(
                 div()
                     .text_color(rgb(0xfca5a5))
-                    .child(format!("−{deletions}")),
+                    .child(format!("-{deletions}")),
             )
         })
 }

@@ -273,7 +273,7 @@ impl LoomView {
             InspectorTab::Context => self
                 .context_inspection
                 .as_ref()
-                .map(|inspection| format!("≈ {} tokens", format_tokens(inspection.included_tokens)))
+                .map(|inspection| format!("~ {} tokens", format_tokens(inspection.included_tokens)))
                 .unwrap_or_else(|| "No inspection yet".to_owned()),
             InspectorTab::Files => {
                 if self.review.files.loaded {
