@@ -1297,7 +1297,7 @@ impl LoomView {
                                 .gap_2()
                                 .child(
                                     Button::new("font-scale-decrease")
-                                        .label("−")
+                                        .label("-")
                                         .small()
                                         .disabled(self.font_scale_percent <= MIN_FONT_SCALE_PERCENT)
                                         .on_click(cx.listener(|this, _, window, cx| {

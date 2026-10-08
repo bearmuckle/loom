@@ -107,11 +107,9 @@ impl LoomView {
             let label = entry.item().label.to_string();
             let depth = entry.depth();
             let is_root = entry.is_root();
-            let tree_indicator = if entry.is_folder() {
-                if entry.is_expanded() { "⌄" } else { "›" }
-            } else {
-                " "
-            };
+            let tree_indicator = entry
+                .is_folder()
+                .then(|| disclosure_chevron(entry.is_expanded(), rgb(0x8f98a6)));
             let node_indicator = is_root.then(|| {
                 view.read(app)
                     .render_session_node_indicator(session.id, index)
@@ -164,9 +162,9 @@ impl LoomView {
                         .gap_2()
                         .child(
                             div()
-                                .w(px(if layout.phone { 16. } else { 10. }))
-                                .text_color(rgb(0x8f98a6))
-                                .child(tree_indicator),
+                                .w(px(if layout.phone { 16. } else { 12. }))
+                                .flex_shrink_0()
+                                .when_some(tree_indicator, |element, icon| element.child(icon)),
                         )
                         .child(Icon::new(icon).size_4().text_color(icon_color))
                         .child(
