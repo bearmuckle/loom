@@ -126,6 +126,7 @@ impl LoomView {
         self.transcript_messages.clear();
         self.transcript_has_older = false;
         self.transcript_loading = false;
+        self.transcript_prepend_count = 0;
         self.activity_records.clear();
         self.expanded_tools.clear();
         self.expanded_tool_usage.clear();

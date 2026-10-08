@@ -366,27 +366,51 @@ impl LoomView {
             self.transcript_messages.clear();
         }
         let messages = unseen_transcript_messages(messages, &mut self.transcript_loaded_ordinals);
-        for (ordinal, timeline_ordinal, message) in messages {
+        for (ordinal, timeline_ordinal, message) in &messages {
             self.transcript_messages
-                .insert(ordinal, (timeline_ordinal, message));
+                .insert(*ordinal, (*timeline_ordinal, message.clone()));
         }
-        self.timeline
-            .retain(|item| !matches!(item, TimelineItem::User(_) | TimelineItem::Assistant(_)));
-        let ordered_items = timeline_items_from_messages(
-            self.transcript_messages
-                .iter()
-                .map(|(ordinal, (timeline_ordinal, message))| {
-                    (*ordinal, *timeline_ordinal, message.clone())
-                })
-                .collect(),
-            self.activity_records.values().cloned().collect(),
-        );
         let insertion_index = self.transcript_insertion_index();
-        self.timeline
-            .splice(insertion_index..insertion_index, ordered_items);
+        let before_len = self.timeline.len();
+        if before_ordinal.is_none() {
+            // The first page is authoritative for the message portion of the
+            // transcript, so rebuild it from the loaded messages.
+            self.timeline
+                .retain(|item| !matches!(item, TimelineItem::User(_) | TimelineItem::Assistant(_)));
+            let ordered_items = timeline_items_from_messages(
+                self.transcript_messages
+                    .iter()
+                    .map(|(ordinal, (timeline_ordinal, message))| {
+                        (*ordinal, *timeline_ordinal, message.clone())
+                    })
+                    .collect(),
+                self.activity_records.values().cloned().collect(),
+            );
+            self.timeline
+                .splice(insertion_index..insertion_index, ordered_items);
+        } else {
+            // Older pages only add content ahead of what is loaded. Build just
+            // those rows and prepend them so turns streamed since the request
+            // (which are not in the page) are not discarded.
+            let ordered_items = timeline_items_from_messages(messages, Vec::new());
+            self.timeline
+                .splice(insertion_index..insertion_index, ordered_items);
+            self.transcript_prepend_count = self
+                .transcript_prepend_count
+                .saturating_add(self.timeline.len().saturating_sub(before_len));
+        }
         self.transcript_before_ordinal = next_before;
         self.transcript_has_older = has_older;
         self.ensure_session_task_message(self.active_session.id);
+    }
+
+    /// Automatically request the next older transcript page when the reader has
+    /// scrolled up to the oldest loaded row.
+    pub(crate) fn autoload_older_transcript(&mut self, cx: &mut Context<Self>) {
+        if !self.transcript_has_older || self.transcript_loading {
+            return;
+        }
+        self.begin_transcript_page(self.transcript_before_ordinal, cx);
     }
 
     pub(crate) fn transcript_insertion_index(&self) -> usize {
