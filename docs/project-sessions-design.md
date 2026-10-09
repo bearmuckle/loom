@@ -297,8 +297,10 @@ record commit but before notification persistence.
    and retain messages for blocked or inactive recipients until resume.
 4. **Implemented:** add run-granted `send_project_agent_message` and
    `list_project_children` tools. A child reports to its parent; a parent
-   identifies a child by its delegated task ID. Terminal recipients are
-   rejected because they have no current resume path.
+   identifies a child by its delegated task ID. A completed recipient that
+   ended its turn still accepts durable messages and is woken through the
+   inbox; failed, cancelled, and archived recipients are rejected because they
+   have no current resume path.
 5. **Implemented:** return progress, completion, questions, and blockers to the
    manager and allow it to answer, redirect, continue a paused child, retry its
    failed tool step, or cancel it. Retry repeats only the failed tool step; it

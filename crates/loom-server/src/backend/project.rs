@@ -374,12 +374,14 @@ impl InProcessBackend {
                 ProjectResponse::ProjectAgentMessageAccepted(message),
             ));
         }
+        // A completed agent has only ended its current turn: its run can be
+        // woken and resumed through the durable project inbox, so a durable
+        // report from a child is still accepted and delivered. Failed,
+        // cancelled, and archived recipients have no resume path, so a message
+        // to them would be stranded.
         if matches!(
             target.state,
-            AgentSessionState::Completed
-                | AgentSessionState::Failed
-                | AgentSessionState::Cancelled
-                | AgentSessionState::Archived
+            AgentSessionState::Failed | AgentSessionState::Cancelled | AgentSessionState::Archived
         ) {
             return Err(LoomError::new(
                 ErrorCode::InvalidState,
@@ -390,9 +392,7 @@ impl InProcessBackend {
         if target_task.as_ref().is_some_and(|task| {
             matches!(
                 task.status,
-                loom_core::DelegatedTaskStatus::Completed
-                    | loom_core::DelegatedTaskStatus::Failed
-                    | loom_core::DelegatedTaskStatus::Cancelled
+                loom_core::DelegatedTaskStatus::Failed | loom_core::DelegatedTaskStatus::Cancelled
             )
         }) {
             return Err(LoomError::new(
