@@ -781,6 +781,156 @@ fn project_manager_tool_creates_an_idempotent_non_code_child() {
 }
 
 #[test]
+fn a_child_report_reaches_a_completed_project_manager() {
+    let temp = std::env::temp_dir().join(format!(
+        "loom-completed-manager-report-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&temp).unwrap();
+    let backend = InProcessBackend::new_persistent(temp.join("state.sqlite")).unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Completed manager report".into(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let root = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Manager".into(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    let project_id = ProjectId::from_uuid(*root.as_uuid());
+
+    // Create the child durably without scheduling a run so its report is the
+    // only thing that can move the manager.
+    let child_id = AgentSessionId::new();
+    let created_at = Timestamp::now();
+    let child = AgentSessionSnapshot {
+        id: child_id,
+        workspace_id: workspace.id,
+        name: "reporter".to_owned(),
+        state: AgentSessionState::Idle,
+        created_at,
+        updated_at: created_at,
+    };
+    let task = loom_core::DelegatedTaskRecord {
+        task_id: loom_core::TaskId::new(),
+        project_id,
+        requester_session_id: root,
+        target_session_id: child_id,
+        child_name: child.name.clone(),
+        intent: "Report a finding to the manager".to_owned(),
+        model_id: "deterministic/demo".to_owned(),
+        context_references: vec![],
+        dependencies: vec![],
+        code_change: false,
+        permissions: loom_core::ProjectAgentPermissions::default(),
+        status: loom_core::DelegatedTaskStatus::Queued,
+        created_at,
+        updated_at: created_at,
+    };
+    // Register the child in the session manager so a later durable state write
+    // does not prune it from the session catalog.
+    let (_, created_event) = backend
+        .sessions()
+        .unwrap()
+        .create_in_workspace_with_id(workspace.id, child_id, child.name.clone())
+        .unwrap();
+    backend.journal().unwrap().append_session(created_event);
+    let persistence = backend.persistence.as_ref().unwrap();
+    persistence
+        .create_project_child(
+            RequestId::new(),
+            &child,
+            backend.sessions().unwrap().next_sequence().next(),
+            &task,
+        )
+        .unwrap();
+
+    // The manager ended its turn while the child kept working. Its run is still
+    // resumable through the durable inbox, so the child's report must be
+    // accepted instead of being stranded with an InvalidState rejection.
+    backend
+        .sessions()
+        .unwrap()
+        .transition(root, AgentSessionState::Completed)
+        .unwrap();
+    backend.persist_state().unwrap();
+
+    let accepted = backend
+        .accept_project_agent_message(
+            RequestId::new(),
+            child_id,
+            true,
+            false,
+            loom_core::AgentMessageDraft {
+                project_id,
+                task_id: Some(task.task_id),
+                sender_session_id: child_id,
+                target_session_id: root,
+                kind: loom_core::AgentMessageKind::Result,
+                body: "Found the failing boundary.".to_owned(),
+            },
+        )
+        .expect("a completed manager must accept a durable child report");
+    assert!(matches!(
+        accepted,
+        ServerResponse::Project(ProjectResponse::ProjectAgentMessageAccepted(_))
+    ));
+    let root_inbox = persistence
+        .list_agent_messages(project_id, root, 0, 10)
+        .unwrap();
+    assert_eq!(root_inbox.len(), 1);
+    assert_eq!(root_inbox[0].sender_session_id, child_id);
+
+    // A cancelled manager has no resume path, so its report is still refused.
+    backend
+        .sessions()
+        .unwrap()
+        .transition(root, AgentSessionState::Cancelled)
+        .unwrap();
+    backend.persist_state().unwrap();
+    let rejected = backend.accept_project_agent_message(
+        RequestId::new(),
+        child_id,
+        true,
+        false,
+        loom_core::AgentMessageDraft {
+            project_id,
+            task_id: Some(task.task_id),
+            sender_session_id: child_id,
+            target_session_id: root,
+            kind: loom_core::AgentMessageKind::Result,
+            body: "This must not be accepted.".to_owned(),
+        },
+    );
+    assert!(matches!(
+        rejected,
+        Err(error) if error.code == ErrorCode::InvalidState
+    ));
+
+    drop(connection);
+    backend.shutdown().unwrap();
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
 fn user_direction_reaches_a_parked_project_manager() {
     let temp = std::env::temp_dir().join(format!(
         "loom-project-manager-direction-e2e-{}",
@@ -1111,6 +1261,152 @@ fn child_completion_wakes_a_finished_manager() {
         "the woken manager should see the child result"
     );
     model.respond_with_text(woken, "Thanks, I have the child result.");
+    assert_eq!(
+        await_settled_run(&connection, root_run_id).state,
+        AgentRunState::Completed
+    );
+
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    drop(model);
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn child_report_wakes_a_completed_manager_with_its_message() {
+    let temp = std::env::temp_dir().join(format!(
+        "loom-child-report-wake-e2e-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&temp).unwrap();
+    let persistence_path = temp.join("state.sqlite");
+    let mut model = ScriptedOpenAiEndpoint::start();
+    let model_endpoint = model.endpoint.clone();
+    let model_id = ModelId::new("fixture/child-report-wake");
+    let backend = InProcessBackend::with_provider_registry_persistent(
+        scripted_project_provider_registry(&model_endpoint, model_id.clone()),
+        &persistence_path,
+    )
+    .unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Child report wake e2e".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let root = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Manager".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    let root_run_id = match connection
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::StartSessionAgentRun {
+                session_id: root,
+                task: "Delegate a bounded task and continue with me meanwhile.".to_owned(),
+                model: model_id.clone(),
+                system_instructions: None,
+                repository_instructions: None,
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
+        response => panic!("unexpected run response: {response:?}"),
+    };
+    let project_id = ProjectId::from_uuid(*root.as_uuid());
+    let persistence = backend.persistence.as_ref().unwrap();
+
+    // Turn one delegates a non-code child, turn two ends the manager's turn.
+    let root_delegate = model.next_for_manager();
+    model.respond_with_tool(
+        root_delegate,
+        "delegate_project_task",
+        serde_json::json!({
+            "child_name": "worker",
+            "intent": "Do a short piece of work and report back.",
+            "model_id": model_id,
+        }),
+    );
+    let root_reply = model.next_for_manager();
+    model.respond_with_text(root_reply, "Delegated. Continuing with you now.");
+    assert_eq!(
+        await_settled_run(&connection, root_run_id).state,
+        AgentRunState::Completed
+    );
+
+    let child_task = persistence
+        .list_project_tasks(project_id)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.child_name == "worker")
+        .expect("delegation should create the worker task");
+    let child_run_id = persistence
+        .load_latest_run_summary_for_session(child_task.target_session_id)
+        .unwrap()
+        .expect("child should have a durable run")
+        .snapshot
+        .id;
+
+    // The child reports its result as a durable project message and then
+    // finishes. This must be accepted even though the manager already ended.
+    let child_report_turn = model.next_for_child();
+    model.respond_with_tool(
+        child_report_turn,
+        "send_project_agent_message",
+        serde_json::json!({
+            "target_session_id": root,
+            "task_id": child_task.task_id,
+            "kind": "result",
+            "body": "worker: the real report body.",
+        }),
+    );
+    let child_finish_turn = model.next_for_child();
+    model.respond_with_text(child_finish_turn, "Report delivered.");
+    assert_eq!(
+        await_settled_run(&connection, child_run_id).state,
+        AgentRunState::Completed
+    );
+
+    let woken = model.next_for_manager();
+    let messages = woken.request["messages"].as_array().unwrap();
+    assert!(
+        messages.iter().any(|message| {
+            message["name"] == "loom_project_message"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("worker: the real report body."))
+        }),
+        "the woken manager should see the child's own report message"
+    );
+    assert!(
+        !messages.iter().any(|message| {
+            message["name"] == "loom_project_message"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("[Project notification]"))
+        }),
+        "the child's own report should suppress the synthesized notification"
+    );
+    model.respond_with_text(woken, "Thanks, I have the report.");
     assert_eq!(
         await_settled_run(&connection, root_run_id).state,
         AgentRunState::Completed
