@@ -161,8 +161,48 @@ pub struct UiOptions {
     pub reset_state: bool,
 }
 
+/// The version reported by `--version`: the release version stamped at build
+/// time, plus the revision when one was stamped.
+pub fn build_version_label() -> String {
+    version_label(
+        option_env!("LOOM_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
+        option_env!("LOOM_GIT_REVISION").unwrap_or("unknown"),
+    )
+}
+
+/// Joins a version and revision the way the client's About pane does, omitting
+/// an absent revision.
+fn version_label(version: &str, revision: &str) -> String {
+    let revision = revision.trim();
+    if revision.is_empty() || revision == "unknown" {
+        version.to_owned()
+    } else {
+        format!("{version} · {revision}")
+    }
+}
+
+/// The usage text printed by `--help`.
+fn usage_text() -> String {
+    "Usage: loom-ui [--project PATH] [--task DESCRIPTION] [--model ID] [--endpoint URL] \
+     [--remote URL] [--reset-state] [--demo]\n\
+     \n\
+     Options:\n\
+     \x20 --project PATH        open this directory as the workspace\n\
+     \x20 --task DESCRIPTION    initial task description\n\
+     \x20 --model ID            model id to use\n\
+     \x20 --endpoint URL        OpenAI-compatible endpoint\n\
+     \x20 --remote URL          connect to a Loom worker instead of a local backend\n\
+     \x20 --reset-state         wipe an incompatible local state database\n\
+     \x20 --demo                use the deterministic demo provider\n\
+     \x20 -h, --help            print this help and exit\n\
+     \x20 -V, --version         print the version and exit"
+        .to_owned()
+}
+
 impl UiOptions {
-    pub fn parse<I>(args: I) -> Result<Self, LoomError>
+    /// Parses the command line. `Ok(None)` means `--help` or `--version` already
+    /// printed what was asked for and the process should exit successfully.
+    pub fn parse<I>(args: I) -> Result<Option<Self>, LoomError>
     where
         I: IntoIterator<Item = String>,
     {
@@ -239,9 +279,12 @@ impl UiOptions {
                     reset_state = true;
                 }
                 "--help" | "-h" => {
-                    return Err(LoomError::invalid_request(
-                        "usage: loom-ui [--project PATH] [--task DESCRIPTION] [--model ID] [--endpoint URL] [--remote URL] [--reset-state] [--demo]",
-                    ));
+                    println!("{}", usage_text());
+                    return Ok(None);
+                }
+                "--version" | "-V" => {
+                    println!("loom-ui {}", build_version_label());
+                    return Ok(None);
                 }
                 unknown => {
                     return Err(LoomError::invalid_request(format!(
@@ -250,7 +293,7 @@ impl UiOptions {
                 }
             }
         }
-        Ok(Self {
+        Ok(Some(Self {
             project,
             task,
             demo,
@@ -260,7 +303,7 @@ impl UiOptions {
             remote,
             token,
             reset_state,
-        })
+        }))
     }
 }
 
@@ -467,7 +510,8 @@ mod tests {
             "ws://127.0.0.1:8080/ws".to_owned(),
             "--reset-state".to_owned(),
         ])
-        .unwrap();
+        .unwrap()
+        .expect("arguments describe a runnable client");
         assert_eq!(options.project, Some(PathBuf::from("/tmp/project")));
         assert_eq!(options.task, "fix the agent flow");
         assert_eq!(options.model.as_str(), "gpt-4o-mini");
@@ -493,7 +537,7 @@ mod tests {
             vec!["--remote"],
             vec!["--remote", "  "],
             vec!["--unknown"],
-            vec!["--help"],
+            vec!["-x"],
         ] {
             let result = UiOptions::parse(
                 std::iter::once("loom-ui".to_owned())
@@ -502,16 +546,44 @@ mod tests {
             assert!(result.is_err(), "accepted arguments: {args:?}");
             assert_eq!(result.unwrap_err().code, ErrorCode::InvalidRequest);
         }
-        let demo = UiOptions::parse(["loom-ui".to_owned(), "--demo".to_owned()]).unwrap();
+        let demo = UiOptions::parse(["loom-ui".to_owned(), "--demo".to_owned()])
+            .unwrap()
+            .expect("demo arguments describe a runnable client");
         assert!(demo.demo);
         assert_eq!(demo.model.as_str(), "deterministic/demo");
+    }
+
+    #[test]
+    fn ui_options_help_and_version_print_and_stop_argument_parsing() {
+        for args in [
+            vec!["--help"],
+            vec!["-h", "--unknown"],
+            vec!["--version"],
+            vec!["-V", "--project"],
+        ] {
+            let result = UiOptions::parse(
+                std::iter::once("loom-ui".to_owned())
+                    .chain(args.iter().copied().map(str::to_owned)),
+            );
+            assert!(
+                result.unwrap().is_none(),
+                "expected printed output for {args:?}"
+            );
+        }
+        assert!(!build_version_label().is_empty());
+        assert!(usage_text().contains("--remote URL"));
+        assert_eq!(version_label("v0.8.1", "a1b2c3d"), "v0.8.1 · a1b2c3d");
+        assert_eq!(version_label("0.1.0", "unknown"), "0.1.0");
+        assert_eq!(version_label("0.1.0", "   "), "0.1.0");
     }
 
     #[test]
     fn workspace_preparation_validates_and_initializes_a_repository() {
         let root = env::temp_dir().join(format!("loom-ui-platform-{}", WorkspaceId::new()));
         fs::create_dir_all(&root).unwrap();
-        let mut options = UiOptions::parse(["loom-ui".to_owned()]).unwrap();
+        let mut options = UiOptions::parse(["loom-ui".to_owned()])
+            .unwrap()
+            .expect("no arguments describe a runnable client");
         options.project = Some(root.clone());
         let (resolved, demo) = prepare_workspace(&options).unwrap();
         assert_eq!(resolved, fs::canonicalize(&root).unwrap());
@@ -585,7 +657,9 @@ mod tests {
 
     #[test]
     fn workspace_preparation_defaults_to_the_process_directory_unless_it_is_internal() {
-        let options = UiOptions::parse(["loom-ui".to_owned()]).unwrap();
+        let options = UiOptions::parse(["loom-ui".to_owned()])
+            .unwrap()
+            .expect("no arguments describe a runnable client");
         let (root, demo) = prepare_workspace(&options).unwrap();
         assert!(!demo);
         let current = fs::canonicalize(env::current_dir().unwrap()).unwrap();

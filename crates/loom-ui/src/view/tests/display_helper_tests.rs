@@ -1,15 +1,16 @@
 use super::{
     AboutBackend, AboutLink, AgentActivityData, AgentActivityRecord, AgentActivityStatus,
     CompletionKind, FileActivityOperation, LOOM_REPOSITORY_URL, ToolPart, ToolPartStatus,
-    about_backend, about_backend_label, about_git_revision, about_links, about_platform_label,
-    about_protocol, about_version_label, activity_output, change_kind_label, command_line,
-    command_purpose, commands_matching, completion_for_value, composer_height, disconnected_screen,
-    endpoint_host, endpoint_label, format_bytes, format_duration, format_percentage,
-    has_block_markdown, humanize_tool_output, is_redundant_completion_summary, relative_time,
-    replace_command_token, replace_last_token, rgb, run_state_color, run_state_label,
-    session_is_active, session_status_pill, source_mount_path, tool_detail, tool_failure_count,
-    tool_group_label, tool_group_status, tool_needs_attention, tool_part_from_activity,
-    tool_status, tool_title, tool_title_for_activity, tool_usage_label, tool_usage_summary,
+    about_backend, about_backend_label, about_build_version, about_git_revision, about_links,
+    about_platform_label, about_protocol, about_version_label, activity_output, change_kind_label,
+    command_line, command_purpose, commands_matching, completion_for_value, composer_height,
+    disconnected_screen, endpoint_host, endpoint_label, format_bytes, format_duration,
+    format_percentage, has_block_markdown, humanize_tool_output, is_redundant_completion_summary,
+    relative_time, replace_command_token, replace_last_token, rgb, run_state_color,
+    run_state_label, session_is_active, session_status_pill, source_mount_path, tool_detail,
+    tool_failure_count, tool_group_label, tool_group_status, tool_needs_attention,
+    tool_part_from_activity, tool_status, tool_title, tool_title_for_activity, tool_usage_label,
+    tool_usage_summary,
 };
 use loom_core::{ActivityId, AgentSessionState, ProtocolVersion, RunId, Timestamp};
 use loom_model::{ModelId, ToolCall};
@@ -759,6 +760,11 @@ fn version_and_platform_labels_handle_missing_build_metadata() {
         "macos aarch64 · browser"
     );
     assert!(!about_git_revision().is_empty());
+    assert_eq!(
+        about_version_label(about_build_version(), "unknown"),
+        about_build_version()
+    );
+    assert!(!about_build_version().is_empty());
 }
 
 #[test]

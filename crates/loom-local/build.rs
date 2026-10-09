@@ -1,15 +1,16 @@
-//! Stamps the release version and the client's git revision into the binary for
-//! `--version` and the Settings → About pane. The script must never fail the
-//! build: a packaged crate, a shallow checkout, or a machine without git all
-//! fall back to the crate version and the literal `unknown`.
+//! Stamps the release version and git revision into the binary so
+//! `loom-ui --version` reports the tag and revision a release was built from
+//! instead of the workspace version. The script must never fail the build: a
+//! packaged crate or a machine without git falls back to the crate version and
+//! the literal `unknown`.
 
 use std::process::Command;
 
 fn main() {
     // Precedence: an explicit `LOOM_BUILD_VERSION` (CI or packaging override),
-    // then the crate version Cargo knows about. Releases are tagged `v0.8.x`
-    // while the workspace version stays `0.1.0`, so the stamped value is what a
-    // released binary must report.
+    // then the crate version. Releases are tagged `v0.8.x` while the workspace
+    // version stays `0.1.0`, so the stamped value is what a released binary
+    // must report.
     let version = std::env::var("LOOM_BUILD_VERSION")
         .ok()
         .map(|value| value.trim().to_owned())
@@ -29,11 +30,9 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_owned());
     println!("cargo:rustc-env=LOOM_GIT_REVISION={revision}");
 
-    // Deliberately no `rerun-if-changed` directive for `.git`: when the path is
-    // absent (packaged crate, worktree without a real `.git`) Cargo would rerun
-    // this script — and rebuild the crate — on every invocation. Relying on
-    // Cargo's default (rerun only when a file in this package changes) keeps
-    // rebuilds incremental while still picking up a moved checkout.
+    // Deliberately no `rerun-if-changed` directive for `.git`, so Cargo's
+    // default (rerun only when a file in this package changes) keeps rebuilds
+    // incremental while still picking up a moved checkout.
 }
 
 /// The short revision of the current checkout, or `None` when git is missing,
