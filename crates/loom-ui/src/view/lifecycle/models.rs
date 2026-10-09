@@ -143,13 +143,6 @@ impl LoomView {
                         if active_node_id == Some(node_id.as_str()) {
                             view.models = models;
                             view.model_catalog_node_id = Some(node_id.clone());
-                            view.record_status(format!(
-                                "Loaded available models for {}",
-                                view.node_names
-                                    .get(&node_id)
-                                    .map(String::as_str)
-                                    .unwrap_or(node_id.as_str())
-                            ));
                         }
                     }
                     Err(error) => {
@@ -189,14 +182,5 @@ impl LoomView {
             self.models = models;
             self.model_catalog_node_id = Some(node_id);
         }
-        self.record_status(format!(
-            "Loaded {} available model{}",
-            self.default_models.len(),
-            if self.default_models.len() == 1 {
-                ""
-            } else {
-                "s"
-            }
-        ));
     }
 }

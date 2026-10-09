@@ -9,6 +9,20 @@ pub(crate) const ERROR_CARD_SURFACE: u32 = 0x171c25;
 pub(crate) const ERROR_CARD_FOREGROUND: u32 = 0xe5e7eb;
 pub(crate) const ERROR_CARD_ACCENT: u32 = 0xfca5a5;
 
+/// The window rem base. GPUI's text, spacing, and sizing utilities are all
+/// rem-based, so this single value sets the UI's density. It stays close to
+/// Zed's compact feel while leaving room for the user's font-scale setting.
+///
+/// The effective default is 5% larger than the compact base of 14, so the
+/// Appearance control's 100% renders what previously was 105%.
+pub(crate) const BASE_FONT_SIZE: f32 = 14.7;
+
+/// The monospace size used for code, diffs, and commands.
+pub(crate) const MONO_FONT_SIZE: f32 = 12.6;
+
+/// The body size for conversation text in the timeline.
+pub(crate) const CONVERSATION_FONT_SIZE: f32 = 13.65;
+
 /// Alpha-blends `tint` over `base`, used to derive tinted status surfaces from
 /// the active palette instead of hardcoding a second set of colors.
 fn blend(base: Rgba, tint: Rgba, amount: f32) -> Rgba {
@@ -329,7 +343,9 @@ fn catppuccin_theme(name: &str, mode: ThemeMode, p: Catppuccin) -> Rc<ThemeConfi
     c.info_active = Some(hex(p.lavender));
     c.info_foreground = Some(hex(p.on_accent));
     c.info_hover = Some(hex(p.pink));
-    c.input = Some(hex(p.surface1));
+    // A restrained input/border tone keeps fields and composer outlines subtle
+    // instead of drawing a second, stronger border color across the window.
+    c.input = Some(hex(p.surface0));
     c.link = Some(hex(p.blue));
     c.link_active = Some(hex(p.sapphire));
     c.link_hover = Some(hex(p.sky));
@@ -404,6 +420,15 @@ fn catppuccin_theme(name: &str, mode: ThemeMode, p: Catppuccin) -> Rc<ThemeConfi
     Rc::new(ThemeConfig {
         name: name.into(),
         mode,
+        // Compact, Zed-like density: a smaller base and monospace size, a
+        // tight corner radius, and no drop shadows on controls. The view sets
+        // the window rem size from `BASE_FONT_SIZE`, so these sizes keep the
+        // component library and the hand-rolled chrome in step.
+        font_size: Some(BASE_FONT_SIZE),
+        mono_font_size: Some(MONO_FONT_SIZE),
+        radius: Some(4),
+        radius_lg: Some(6),
+        shadow: Some(false),
         colors: c,
         ..Default::default()
     })

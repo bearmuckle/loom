@@ -674,7 +674,11 @@ fn run_state_colors_and_activity_classification_are_distinct() {
     assert_eq!(run_state_color(AgentRunState::Executing), rgb(0x93c5fd));
     assert_eq!(run_state_color(AgentRunState::Failed), rgb(0xfca5a5));
     assert!(session_is_active(AgentSessionState::Executing));
-    assert!(session_is_active(AgentSessionState::NeedsInput));
+    assert!(session_is_active(AgentSessionState::Planning));
+    assert!(!session_is_active(AgentSessionState::NeedsInput));
+    assert!(!session_is_active(AgentSessionState::AwaitingApproval));
+    assert!(!session_is_active(AgentSessionState::Queued));
+    assert!(!session_is_active(AgentSessionState::Completed));
     assert!(!session_is_active(AgentSessionState::Idle));
     assert!(!session_is_active(AgentSessionState::Archived));
 }

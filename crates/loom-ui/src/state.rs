@@ -9,8 +9,7 @@ use std::fmt::Write as _;
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::{ListAlignment, ListState, px};
 use loom_core::{
-    AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, EventSequence, ToolCallId,
-    UsageSnapshot,
+    AgentSessionSnapshot, AgentSessionState, EventSequence, ToolCallId, UsageSnapshot,
 };
 use loom_model::ProviderUsageSummary;
 use loom_protocol::{
@@ -96,14 +95,6 @@ pub(crate) struct FilesState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AgentMode {
-    Ask,
-    Edit,
-    Agent,
-    AutoApprove,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ThemeChoice {
     System,
     Light,
@@ -118,27 +109,6 @@ impl ThemeChoice {
             Self::System => "System",
             Self::Light => "Light",
             Self::Dark => "Dark",
-        }
-    }
-}
-
-impl AgentMode {
-    pub(crate) const ALL: [Self; 4] = [Self::Ask, Self::Edit, Self::Agent, Self::AutoApprove];
-
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::Ask => "Ask",
-            Self::Edit => "Edit",
-            Self::Agent => "Agent",
-            Self::AutoApprove => "Auto approve",
-        }
-    }
-
-    pub(crate) fn approval_policy(self, auto_approve_actions: bool) -> ApprovalPolicy {
-        match self {
-            Self::AutoApprove => ApprovalPolicy::auto_approve(),
-            Self::Edit | Self::Agent if auto_approve_actions => ApprovalPolicy::auto_approve(),
-            Self::Ask | Self::Edit | Self::Agent => ApprovalPolicy::default(),
         }
     }
 }
@@ -814,19 +784,6 @@ pub(crate) fn bounded(value: &str) -> String {
     bounded_to(value, MAX_TIMELINE_OUTPUT)
 }
 
-pub(crate) fn session_title_from_task(task: &str) -> String {
-    let normalized = task.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut title = normalized.chars().take(56).collect::<String>();
-    if normalized.chars().count() > 56 {
-        title.push('…');
-    }
-    if title.is_empty() {
-        "New session".to_owned()
-    } else {
-        title
-    }
-}
-
 pub(crate) fn bounded_to(value: &str, limit: usize) -> String {
     if value.len() <= limit {
         return value.to_owned();
@@ -1223,34 +1180,6 @@ mod tests {
         let value = bounded_to("abcdef", 3);
         assert_eq!(value, "abc\n...[output truncated]");
         assert!(bounded_to("😀😀", 4).starts_with('😀'));
-    }
-
-    #[test]
-    fn agent_and_edit_modes_default_to_safe_auto_approval() {
-        assert_eq!(
-            AgentMode::Agent.approval_policy(true),
-            ApprovalPolicy::auto_approve()
-        );
-        assert_eq!(
-            AgentMode::Edit.approval_policy(true),
-            ApprovalPolicy::auto_approve()
-        );
-        assert_eq!(
-            AgentMode::Agent.approval_policy(false),
-            ApprovalPolicy::default()
-        );
-        assert_eq!(
-            AgentMode::Edit.approval_policy(false),
-            ApprovalPolicy::default()
-        );
-        assert_eq!(
-            AgentMode::Ask.approval_policy(true),
-            ApprovalPolicy::default()
-        );
-        assert_eq!(
-            AgentMode::AutoApprove.approval_policy(false),
-            ApprovalPolicy::auto_approve()
-        );
     }
 
     fn tool(id: ToolCallId, name: &str, status: ToolPartStatus) -> ToolPart {
