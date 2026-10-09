@@ -46,6 +46,18 @@ assets = [
   ["../../LICENSES.md", "usr/share/doc/loom-ui/", "644"],
 ]
 
+# The Linux release jobs do not share a glibc floor: x86_64 is built on
+# `ubuntu-22.04` (glibc 2.35) while aarch64 uses the arm64 runner image (glibc
+# 2.39, measured). One `depends` string cannot be right for both: `2.35`
+# understates aarch64, so dpkg would install a package whose binary then fails at
+# startup, while `2.39` would refuse to install on the x86_64 build platform
+# itself. The variant restates `name` because cargo-deb otherwise appends the
+# variant name to the package name, which would change the documented install
+# command and give the two architectures different package names.
+[package.metadata.deb.variants.aarch64]
+name = "loom-ui"
+depends = "libc6 (>= 2.39), libgcc-s1, libssl3, zlib1g, libxcb1, libxcb-xkb1, libxkbcommon0, libxkbcommon-x11-0"
+
 [features]
 # Opt-in pixel capture through GPUI's headless renderer. It needs a Vulkan or
 # GL adapter (Mesa's lavapipe works on headless CI), so it stays out of the
