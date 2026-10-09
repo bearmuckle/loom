@@ -1,0 +1,21 @@
+[Desktop Entry]
+# Shared by the AppImage and the .deb: linuxdeploy validates that `Exec` names
+# the executable it is given and that `Icon` matches the icon file, and
+# cargo-deb installs the same three values from `Cargo.toml`.
+#
+# NOTE: `StartupWMClass` has not been confirmed against a real desktop session.
+# It must be checked with a running client (`xprop WM_CLASS`, or
+# `gdbus call --session -d org.gnome.Shell -o /org/gnome/Shell -m
+# org.gnome.Shell.Eval 'global.get_window_actors().map(a => a.meta_window.get_wm_class())'`)
+# and corrected here if gpui reports a different class, otherwise taskbars and
+# docks may show a duplicate or generic launcher entry.
+Type=Application
+Name=Loom
+GenericName=Coding Agent Workspace
+Comment=Remote-first coding-agent workspace and orchestration client
+Exec=loom-ui
+Icon=loom-ui
+Terminal=false
+Categories=Development;IDE;
+StartupWMClass=loom-ui
+StartupNotify=true
