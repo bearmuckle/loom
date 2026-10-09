@@ -165,6 +165,8 @@ fn session_event_snapshot_resync_keeps_the_conversation(cx: &mut TestAppContext)
             remote: None,
             token: None,
             reset_state: false,
+            ca: None,
+            allow_insecure_remote: false,
         };
         let mut view = LoomView::initialize_from_connection(
             &options,
