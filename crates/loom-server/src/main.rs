@@ -327,7 +327,11 @@ async fn start(
         allow_insecure_remote: options.allow_insecure_remote,
         ..RemoteServerConfig::default()
     };
-    if let Some(warning) = bind_exposure_warning(config.bind_addr, tls_configured) {
+    if let Some(warning) = bind_exposure_warning(
+        config.bind_addr,
+        tls_configured,
+        options.allow_insecure_remote,
+    ) {
         log::warn!("{warning}");
     }
     let remote = RemoteServer::new(backend.clone(), auth, config)
@@ -346,8 +350,14 @@ async fn start(
 /// without TLS. The listener then speaks plain `ws://` with a single shared
 /// bearer token, which the library only allows because the operator passed
 /// `--allow-insecure-remote`; this warns loudly so it cannot happen quietly.
-fn bind_exposure_warning(bind: SocketAddr, tls_configured: bool) -> Option<String> {
-    if bind.ip().is_loopback() || tls_configured {
+/// Without that opt-in the bind is refused, so there is nothing to warn about
+/// and the message must not claim a flag that was never given.
+fn bind_exposure_warning(
+    bind: SocketAddr,
+    tls_configured: bool,
+    allow_insecure_remote: bool,
+) -> Option<String> {
+    if bind.ip().is_loopback() || tls_configured || !allow_insecure_remote {
         return None;
     }
     Some(format!(
@@ -729,16 +739,32 @@ mod tests {
     fn bind_exposure_warning_flags_plaintext_non_loopback_addresses_only() {
         for local in ["127.0.0.1:8765", "[::1]:8765"] {
             let address = local.parse().unwrap();
-            assert_eq!(bind_exposure_warning(address, false), None, "{local}");
-            assert_eq!(bind_exposure_warning(address, true), None, "{local}");
+            assert_eq!(
+                bind_exposure_warning(address, false, false),
+                None,
+                "{local}"
+            );
+            assert_eq!(bind_exposure_warning(address, false, true), None, "{local}");
+            assert_eq!(bind_exposure_warning(address, true, false), None, "{local}");
         }
         for exposed in ["0.0.0.0:8765", "192.0.2.10:8765", "[::]:8765"] {
             let address = exposed.parse().unwrap();
-            let warning = bind_exposure_warning(address, false)
+            // The library refuses this bind, so no warning is emitted and the
+            // message never claims the opt-in was given when it was not.
+            assert_eq!(
+                bind_exposure_warning(address, false, false),
+                None,
+                "{exposed}"
+            );
+            let warning = bind_exposure_warning(address, false, true)
                 .unwrap_or_else(|| panic!("{exposed} should warn"));
             assert!(warning.contains("without TLS"), "{warning}");
             assert!(warning.contains("--allow-insecure-remote"), "{warning}");
-            assert_eq!(bind_exposure_warning(address, true), None, "{exposed}");
+            assert_eq!(
+                bind_exposure_warning(address, true, true),
+                None,
+                "{exposed}"
+            );
         }
     }
 

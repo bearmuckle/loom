@@ -78,10 +78,18 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
   CMD curl -fsS http://127.0.0.1:8765/health || exit 1
 
 # Serving requires a bearer token, so the default command fails closed: mount one
-# at /etc/loom/token, or override `CMD` with `--token ...`. The bind address is
-# only the container's own network namespace -- the server speaks plain `ws://`
-# with one shared token, so publish it to trusted peers only.
+# at /etc/loom/token, or override `CMD` with `--token ...`.
+#
+# `--bind 0.0.0.0` inside the container's own network namespace is what makes
+# `-p` reach the backend, and the server refuses a non-loopback plaintext bind
+# unless TLS is configured or the operator opts in, so the default command passes
+# `--allow-insecure-remote`. That accepts the single shared bearer token and
+# every protocol frame travelling unencrypted between this container and its
+# clients: publish the port only to trusted peers, or override `CMD` with
+# `--tls-cert`/`--tls-key` to serve `wss://` instead. The HEALTHCHECK below
+# probes plain HTTP, so a TLS override needs it overridden too.
 ENTRYPOINT ["loom-server"]
 CMD ["--bind", "0.0.0.0:8765", \
+     "--allow-insecure-remote", \
      "--token-file", "/etc/loom/token", \
      "--persistence", "/var/lib/loom/loom.db"]
