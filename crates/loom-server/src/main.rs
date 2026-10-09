@@ -2,9 +2,10 @@
 //!
 //! It serves the remote JSON WebSocket backend so native clients and browser
 //! clients can use one Loom worker, or so a backend can be kept out of the
-//! desktop client process entirely. The transport is plain `ws://` guarded by a
-//! single bearer token, so the default bind address is loopback; see
-//! `SECURITY.md` before exposing it further.
+//! desktop client process entirely. The transport carries a single bearer token,
+//! so it defaults to a loopback bind; publishing it further requires either TLS
+//! (`--tls-cert` with `--tls-key`) or an explicit `--allow-insecure-remote`
+//! opt-in. See `SECURITY.md` before exposing it further.
 
 use std::{
     env, fs,
@@ -17,7 +18,7 @@ use std::{
 use loom_core::{ErrorCode, LoomError};
 use loom_server::{
     AuthTokenStore, AuthorizationScope, InProcessBackend, RemoteServer, RemoteServerConfig,
-    RunningRemoteServer,
+    RunningRemoteServer, ServerTlsConfig,
 };
 
 /// The bind address used when `--bind` is not supplied.
@@ -59,6 +60,9 @@ struct ServerOptions {
     token: Option<String>,
     token_file: Option<PathBuf>,
     persistence: Option<PathBuf>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    allow_insecure_remote: bool,
 }
 
 impl Default for ServerOptions {
@@ -68,6 +72,9 @@ impl Default for ServerOptions {
             token: None,
             token_file: None,
             persistence: None,
+            tls_cert: None,
+            tls_key: None,
+            allow_insecure_remote: false,
         }
     }
 }
@@ -104,6 +111,13 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
                 options.persistence =
                     Some(PathBuf::from(required_value(&mut args, "--persistence")?));
             }
+            "--tls-cert" => {
+                options.tls_cert = Some(PathBuf::from(required_value(&mut args, "--tls-cert")?));
+            }
+            "--tls-key" => {
+                options.tls_key = Some(PathBuf::from(required_value(&mut args, "--tls-key")?));
+            }
+            "--allow-insecure-remote" => options.allow_insecure_remote = true,
             "--help" | "-h" => return Ok(ParsedArgs::Help),
             "--version" | "-V" => return Ok(ParsedArgs::Version),
             value if value.starts_with("--bind=") => {
@@ -117,6 +131,12 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
             }
             value if value.starts_with("--persistence=") => {
                 options.persistence = Some(PathBuf::from(&value["--persistence=".len()..]));
+            }
+            value if value.starts_with("--tls-cert=") => {
+                options.tls_cert = Some(PathBuf::from(&value["--tls-cert=".len()..]));
+            }
+            value if value.starts_with("--tls-key=") => {
+                options.tls_key = Some(PathBuf::from(&value["--tls-key=".len()..]));
             }
             unknown => {
                 return Err(LoomError::invalid_request(format!(
@@ -179,10 +199,29 @@ fn resolve_token(options: &ServerOptions) -> Result<String, LoomError> {
     }
 }
 
+/// Resolves the optional TLS material. `--tls-cert` and `--tls-key` only mean
+/// something together, so supplying one without the other is an error rather
+/// than a silently plaintext listener.
+fn resolve_tls(options: &ServerOptions) -> Result<Option<ServerTlsConfig>, LoomError> {
+    match (&options.tls_cert, &options.tls_key) {
+        (Some(certificate), Some(private_key)) => {
+            ServerTlsConfig::from_pem_files(certificate, private_key).map(Some)
+        }
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(LoomError::invalid_request(
+            "--tls-cert requires the matching --tls-key; supply both or neither",
+        )),
+        (None, Some(_)) => Err(LoomError::invalid_request(
+            "--tls-key requires the matching --tls-cert; supply both or neither",
+        )),
+    }
+}
+
 fn help_text() -> String {
     format!(
         "Usage: loom-server [--bind <addr>] [--token <token> | --token-file <path>] \
-         [--persistence <path>]\n\
+         [--persistence <path>] [--tls-cert <pem> --tls-key <pem>] \
+         [--allow-insecure-remote]\n\
          \n\
          A standalone Loom backend that serves the remote WebSocket protocol.\n\
          \n\
@@ -191,11 +230,17 @@ fn help_text() -> String {
          \x20 --token <token>       bearer token clients must present\n\
          \x20 --token-file <path>   file whose trimmed contents are the bearer token\n\
          \x20 --persistence <path>  keep state in the database at this path\n\
+         \x20 --tls-cert <pem>      serve wss:// with this PEM certificate chain\n\
+         \x20 --tls-key <pem>       PEM private key matching --tls-cert\n\
+         \x20 --allow-insecure-remote\n\
+         \x20                        allow a plaintext ws:// bind beyond loopback\n\
          \x20 -h, --help            print this help and exit\n\
          \x20 -V, --version         print the version and exit\n\
          \n\
          Exactly one of --token and --token-file is required. Without --persistence \
-         the backend keeps its state in memory for the lifetime of the process."
+         the backend keeps its state in memory for the lifetime of the process. A bind \
+         address that is not loopback needs TLS; --allow-insecure-remote accepts the \
+         risk of sending the bearer token and all traffic in plaintext instead."
     )
 }
 
@@ -248,14 +293,15 @@ struct RunningServer {
 }
 
 impl RunningServer {
-    /// The `ws://` URL clients connect to.
+    /// The WebSocket URL clients connect to, using the scheme the listener
+    /// serves (`ws://` or `wss://`).
     fn websocket_url(&self) -> &str {
         self.remote.websocket_url()
     }
 
-    /// The plain HTTP URL of the unauthenticated health endpoint.
+    /// The health endpoint URL of the listener.
     fn health_url(&self) -> String {
-        format!("http://{}/health", self.remote.local_addr())
+        self.remote.health_url()
     }
 
     /// Stops accepting connections and shuts the backend down.
@@ -271,13 +317,17 @@ async fn start(
     backend: Arc<InProcessBackend>,
 ) -> Result<RunningServer, LoomError> {
     let token = resolve_token(options)?;
+    let tls = resolve_tls(options)?;
+    let tls_configured = tls.is_some();
     let auth = Arc::new(AuthTokenStore::new());
     let _issued = auth.insert(token, AuthorizationScope::all())?;
     let config = RemoteServerConfig {
         bind_addr: options.bind,
+        tls,
+        allow_insecure_remote: options.allow_insecure_remote,
         ..RemoteServerConfig::default()
     };
-    if let Some(warning) = bind_exposure_warning(config.bind_addr) {
+    if let Some(warning) = bind_exposure_warning(config.bind_addr, tls_configured) {
         log::warn!("{warning}");
     }
     let remote = RemoteServer::new(backend.clone(), auth, config)
@@ -292,16 +342,18 @@ async fn start(
     Ok(server)
 }
 
-/// A warning when `--bind` publishes the backend beyond the local machine. The
-/// backend speaks plain `ws://` with a single shared bearer token, so it is not
-/// safe to expose to an untrusted network; this warns without refusing to run.
-fn bind_exposure_warning(bind: SocketAddr) -> Option<String> {
-    if bind.ip().is_loopback() {
+/// A warning when `--bind` publishes the backend beyond the local machine
+/// without TLS. The listener then speaks plain `ws://` with a single shared
+/// bearer token, which the library only allows because the operator passed
+/// `--allow-insecure-remote`; this warns loudly so it cannot happen quietly.
+fn bind_exposure_warning(bind: SocketAddr, tls_configured: bool) -> Option<String> {
+    if bind.ip().is_loopback() || tls_configured {
         return None;
     }
     Some(format!(
-        "loom-server is bound to {bind}, which is not a loopback address; the standalone \
-         backend speaks plain ws:// and must not be exposed to an untrusted network"
+        "loom-server is bound to {bind} without TLS: because --allow-insecure-remote was given, \
+         the bearer token and every protocol frame are sent in plaintext; do not expose this \
+         listener to an untrusted network"
     ))
 }
 
@@ -379,7 +431,7 @@ mod tests {
 
     use super::{
         ParsedArgs, ServerOptions, bind_exposure_warning, build_version, help_text, parse_args,
-        resolve_token, run, serve, start, version_label, version_text,
+        resolve_tls, resolve_token, run, serve, start, version_label, version_text,
     };
 
     fn arguments<'a>(values: &'a [&str]) -> impl Iterator<Item = String> + 'a {
@@ -412,6 +464,9 @@ mod tests {
         assert_eq!(defaults.token, None);
         assert_eq!(defaults.token_file, None);
         assert_eq!(defaults.persistence, None);
+        assert_eq!(defaults.tls_cert, None);
+        assert_eq!(defaults.tls_key, None);
+        assert!(!defaults.allow_insecure_remote);
 
         let spaced = serve_options(&[
             "--bind",
@@ -420,6 +475,11 @@ mod tests {
             "spaced-token",
             "--persistence",
             "/tmp/loom.db",
+            "--tls-cert",
+            "/tmp/cert.pem",
+            "--tls-key",
+            "/tmp/key.pem",
+            "--allow-insecure-remote",
         ]);
         assert_eq!(spaced.bind.to_string(), "127.0.0.1:9000");
         assert_eq!(spaced.token.as_deref(), Some("spaced-token"));
@@ -427,11 +487,16 @@ mod tests {
             spaced.persistence.as_deref(),
             Some(Path::new("/tmp/loom.db"))
         );
+        assert_eq!(spaced.tls_cert.as_deref(), Some(Path::new("/tmp/cert.pem")));
+        assert_eq!(spaced.tls_key.as_deref(), Some(Path::new("/tmp/key.pem")));
+        assert!(spaced.allow_insecure_remote);
 
         let equals = serve_options(&[
             "--bind=0.0.0.0:9",
             "--token-file=/tmp/token",
             "--persistence=/tmp/other.db",
+            "--tls-cert=/tmp/other-cert.pem",
+            "--tls-key=/tmp/other-key.pem",
         ]);
         assert_eq!(equals.bind.to_string(), "0.0.0.0:9");
         assert_eq!(equals.token, None);
@@ -440,11 +505,27 @@ mod tests {
             equals.persistence.as_deref(),
             Some(Path::new("/tmp/other.db"))
         );
+        assert_eq!(
+            equals.tls_cert.as_deref(),
+            Some(Path::new("/tmp/other-cert.pem"))
+        );
+        assert_eq!(
+            equals.tls_key.as_deref(),
+            Some(Path::new("/tmp/other-key.pem"))
+        );
+        assert!(!equals.allow_insecure_remote);
     }
 
     #[test]
     fn parser_rejects_missing_values_invalid_binds_and_unknown_arguments() {
-        for flag in ["--bind", "--token", "--token-file", "--persistence"] {
+        for flag in [
+            "--bind",
+            "--token",
+            "--token-file",
+            "--persistence",
+            "--tls-cert",
+            "--tls-key",
+        ] {
             let error = parse_error(&[flag]);
             assert!(
                 error.message.contains("requires a value"),
@@ -479,10 +560,98 @@ mod tests {
         run(arguments(&["-V"])).unwrap();
         let help = help_text();
         assert!(help.contains("--token-file <path>"));
+        assert!(help.contains("--tls-cert <pem>"));
+        assert!(help.contains("--tls-key <pem>"));
+        assert!(help.contains("--allow-insecure-remote"));
         assert!(help.contains("127.0.0.1:8765"));
         assert!(version_text().starts_with("loom-server "));
         assert!(version_text().contains(build_version()));
         assert!(!build_version().is_empty());
+    }
+
+    #[test]
+    fn tls_resolution_requires_the_certificate_and_key_together() {
+        assert!(resolve_tls(&ServerOptions::default()).unwrap().is_none());
+        let only_certificate = ServerOptions {
+            tls_cert: Some(temporary_path("cert.pem")),
+            ..ServerOptions::default()
+        };
+        assert!(
+            resolve_tls(&only_certificate)
+                .unwrap_err()
+                .message
+                .contains("--tls-key")
+        );
+        let only_key = ServerOptions {
+            tls_key: Some(temporary_path("key.pem")),
+            ..ServerOptions::default()
+        };
+        assert!(
+            resolve_tls(&only_key)
+                .unwrap_err()
+                .message
+                .contains("--tls-cert")
+        );
+        let missing_files = ServerOptions {
+            tls_cert: Some(temporary_path("absent-cert.pem")),
+            tls_key: Some(temporary_path("absent-key.pem")),
+            ..ServerOptions::default()
+        };
+        assert!(
+            resolve_tls(&missing_files)
+                .unwrap_err()
+                .message
+                .contains("could not read the TLS certificate file")
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_server_can_serve_tls_with_a_certificate_and_key() {
+        let fixture = |name: &str| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("tls")
+                .join(name)
+        };
+        let options = ServerOptions {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: Some("tls-server-token".to_owned()),
+            tls_cert: Some(fixture("server-cert.pem")),
+            tls_key: Some(fixture("server-key.pem")),
+            ..ServerOptions::default()
+        };
+        let server = start(&options, InProcessBackend::new()).await.unwrap();
+        assert!(server.websocket_url().starts_with("wss://127.0.0.1:"));
+        assert_eq!(
+            server.health_url(),
+            format!("https://{}/health", server.remote.local_addr())
+        );
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn standalone_server_refuses_a_plaintext_non_loopback_bind_without_the_flag() {
+        let options = ServerOptions {
+            bind: "0.0.0.0:0".parse().unwrap(),
+            token: Some("exposed-token".to_owned()),
+            ..ServerOptions::default()
+        };
+        let error = start(&options, InProcessBackend::new())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, loom_core::ErrorCode::InvalidRequest);
+        assert!(error.message.contains("TLS"), "{error}");
+
+        let opted_in = ServerOptions {
+            allow_insecure_remote: true,
+            ..options
+        };
+        let server = start(&opted_in, InProcessBackend::new()).await.unwrap();
+        assert!(!server.remote.tls_enabled());
+        assert!(server.websocket_url().starts_with("ws://0.0.0.0:"));
+        server.stop().await.unwrap();
     }
 
     #[test]
@@ -557,18 +726,19 @@ mod tests {
     }
 
     #[test]
-    fn bind_exposure_warning_flags_non_loopback_addresses_only() {
+    fn bind_exposure_warning_flags_plaintext_non_loopback_addresses_only() {
         for local in ["127.0.0.1:8765", "[::1]:8765"] {
-            assert_eq!(
-                bind_exposure_warning(local.parse().unwrap()),
-                None,
-                "{local}"
-            );
+            let address = local.parse().unwrap();
+            assert_eq!(bind_exposure_warning(address, false), None, "{local}");
+            assert_eq!(bind_exposure_warning(address, true), None, "{local}");
         }
         for exposed in ["0.0.0.0:8765", "192.0.2.10:8765", "[::]:8765"] {
-            let warning = bind_exposure_warning(exposed.parse().unwrap())
+            let address = exposed.parse().unwrap();
+            let warning = bind_exposure_warning(address, false)
                 .unwrap_or_else(|| panic!("{exposed} should warn"));
-            assert!(warning.contains("not a loopback address"), "{warning}");
+            assert!(warning.contains("without TLS"), "{warning}");
+            assert!(warning.contains("--allow-insecure-remote"), "{warning}");
+            assert_eq!(bind_exposure_warning(address, true), None, "{exposed}");
         }
     }
 
@@ -598,8 +768,7 @@ mod tests {
         let options = ServerOptions {
             bind: "127.0.0.1:0".parse().unwrap(),
             token: Some("server-test-token".to_owned()),
-            token_file: None,
-            persistence: None,
+            ..ServerOptions::default()
         };
         let server = start(&options, InProcessBackend::new()).await.unwrap();
         assert!(server.websocket_url().starts_with("ws://127.0.0.1:"));

@@ -15,7 +15,7 @@ use loom_protocol::{
 };
 use loom_server::{
     AuthTokenStore, AuthorizationScope, InProcessBackend, RemoteServer, RemoteServerConfig,
-    WebSocketConnection, WebSocketTransport,
+    ServerTlsConfig, WEBSOCKET_TLS_SUPPORTED, WebSocketConnection, WebSocketTransport,
 };
 use tokio_tungstenite::{
     connect_async,
@@ -23,6 +23,13 @@ use tokio_tungstenite::{
 };
 
 mod support;
+
+/// Test-only TLS fixtures: a CA and a leaf for `127.0.0.1`/`localhost` that stay
+/// valid until 2126. They exist so the end-to-end TLS test runs without network
+/// access or a real certificate authority, and they protect nothing.
+const TEST_CERT_PEM: &[u8] = include_bytes!("fixtures/tls/server-cert.pem");
+const TEST_KEY_PEM: &[u8] = include_bytes!("fixtures/tls/server-key.pem");
+const TEST_CA_PEM: &[u8] = include_bytes!("fixtures/tls/ca-cert.pem");
 
 async fn server() -> (
     Arc<InProcessBackend>,
@@ -959,6 +966,81 @@ async fn duplicate_mutation_request_ids_are_idempotent() {
     let events = events(&mut reconnected, snapshot.id, None).await;
     assert_eq!(events.len(), 1);
     server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn tls_end_to_end_handshake_succeeds_with_the_ca_and_fails_without_it() {
+    const { assert!(WEBSOCKET_TLS_SUPPORTED) };
+    let backend = InProcessBackend::new();
+    let auth = Arc::new(AuthTokenStore::new());
+    let token = auth
+        .insert("tls-test-token", AuthorizationScope::all())
+        .unwrap();
+    let server = RemoteServer::new(
+        backend,
+        auth,
+        RemoteServerConfig {
+            tls: Some(ServerTlsConfig::from_pem(TEST_CERT_PEM, TEST_KEY_PEM)),
+            ..RemoteServerConfig::local_ephemeral()
+        },
+    )
+    .bind()
+    .await
+    .unwrap();
+    assert!(server.tls_enabled());
+    assert!(
+        server.websocket_url().starts_with("wss://127.0.0.1:"),
+        "{}",
+        server.websocket_url()
+    );
+    assert!(server.health_url().starts_with("https://"));
+
+    // The same endpoint is rejected when the CA that issued its certificate is
+    // not trusted, with an actionable TLS message rather than a DNS hint.
+    let untrusted = match WebSocketTransport::new(server.websocket_url(), token.token.clone())
+        .connect()
+        .await
+    {
+        Ok(_) => panic!("a worker certificate from an untrusted CA was accepted"),
+        Err(error) => error,
+    };
+    assert!(untrusted.message.contains("TLS handshake"), "{untrusted}");
+    assert!(untrusted.message.contains("certificate"), "{untrusted}");
+    assert!(
+        !untrusted
+            .message
+            .contains("check the URL and network access"),
+        "{untrusted}"
+    );
+
+    // Trusting the issuing CA in addition to the OS roots completes the
+    // handshake and a real protocol request.
+    let mut connection = WebSocketTransport::new(server.websocket_url(), token.token.clone())
+        .with_ca_certificate_pem(TEST_CA_PEM)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    negotiate(&mut connection).await;
+    let workspace_id = create_workspace(&mut connection).await;
+    let session = session(&mut connection, workspace_id).await;
+    assert_eq!(session.workspace_id, workspace_id);
+
+    drop(connection);
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn plaintext_remote_endpoints_require_the_insecure_opt_in() {
+    let error = match WebSocketTransport::new("ws://worker.example:8765/ws", "remote-test-token")
+        .connect()
+        .await
+    {
+        Ok(_) => panic!("a plaintext remote endpoint was accepted without an opt-in"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, ErrorCode::InvalidRequest);
+    assert!(error.message.contains("--allow-insecure-remote"), "{error}");
 }
 
 #[tokio::test]

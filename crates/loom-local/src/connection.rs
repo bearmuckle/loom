@@ -75,6 +75,32 @@ impl LocalConnection {
     }
 }
 
+/// Settings the launcher passes to the native remote transport.
+///
+/// `ca_certificate` is added to the OS trust roots rather than replacing them,
+/// and `allow_insecure_remote` is the only way to reach a plaintext `ws://`
+/// worker that is not on the local machine. Both are operator decisions, so
+/// neither has a silent default.
+#[derive(Clone, Debug, Default)]
+pub struct RemoteConnectionOptions {
+    /// PEM file whose certificates are trusted in addition to the OS roots.
+    pub ca_certificate: Option<PathBuf>,
+    /// Explicit opt-in that permits plaintext `ws://` to a non-loopback host.
+    pub allow_insecure_remote: bool,
+}
+
+impl RemoteConnectionOptions {
+    /// Builds the transport for one endpoint.
+    fn transport(&self, url: &str, token: &str) -> Result<loom_server::WebSocketTransport> {
+        let transport = loom_server::WebSocketTransport::new(url, token)
+            .with_insecure_remote_allowed(self.allow_insecure_remote);
+        match self.ca_certificate.as_deref() {
+            Some(certificate) => transport.with_ca_certificate_file(certificate),
+            None => Ok(transport),
+        }
+    }
+}
+
 /// A blocking WebSocket connection to a remote worker.
 #[derive(Clone)]
 pub struct RemoteConnection {
@@ -84,7 +110,13 @@ pub struct RemoteConnection {
 }
 
 impl RemoteConnection {
-    pub fn connect(url: &str, token: &str, secure_for_secrets: bool) -> Result<Self> {
+    pub fn connect(
+        url: &str,
+        token: &str,
+        secure_for_secrets: bool,
+        options: &RemoteConnectionOptions,
+    ) -> Result<Self> {
+        let transport = options.transport(url, token)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -96,11 +128,7 @@ impl RemoteConnection {
                 )
             })?;
         let connection = runtime.block_on(async {
-            tokio::time::timeout(
-                Duration::from_secs(15),
-                loom_server::WebSocketTransport::new(url, token).connect(),
-            )
-            .await
+            tokio::time::timeout(Duration::from_secs(15), transport.connect()).await
         });
         let connection = match connection {
             Ok(result) => result?,

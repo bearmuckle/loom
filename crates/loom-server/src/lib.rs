@@ -121,7 +121,8 @@ struct GitHubApiUser {
 
 pub use auth::{AuthSession, AuthTokenStore, AuthorizationScope, IssuedToken};
 pub use remote::{
-    RemoteServer, RemoteServerConfig, RunningRemoteServer, WebSocketConnection, WebSocketTransport,
+    RemoteServer, RemoteServerConfig, RunningRemoteServer, ServerTlsConfig,
+    WEBSOCKET_TLS_SUPPORTED, WebSocketConnection, WebSocketTransport,
 };
 
 const DEFAULT_EVENT_RETENTION: usize = 4096;

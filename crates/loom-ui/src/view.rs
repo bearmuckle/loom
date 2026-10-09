@@ -269,7 +269,21 @@ use log::info;
 
 use helpers::*;
 #[cfg(not(target_family = "wasm"))]
-use loom_local::{PeerCredentialStore, UiOptions, backend_persistence_path, prepare_workspace};
+use loom_local::{
+    PeerCredentialStore, RemoteConnectionOptions, UiOptions, backend_persistence_path,
+    prepare_workspace,
+};
+
+/// The native remote transport settings implied by the launcher options: the
+/// additional CA to trust for `wss://`, and whether plaintext `ws://` beyond
+/// loopback was explicitly allowed.
+#[cfg(not(target_family = "wasm"))]
+fn remote_connection_options(options: &UiOptions) -> RemoteConnectionOptions {
+    RemoteConnectionOptions {
+        ca_certificate: options.ca.clone(),
+        allow_insecure_remote: options.allow_insecure_remote,
+    }
+}
 
 #[cfg(target_family = "wasm")]
 use futures_channel::oneshot;
@@ -409,6 +423,10 @@ pub(crate) struct LoomView {
     /// browser client, `None` for the in-process and demo backends. Only the URL
     /// is stored; the access token is never part of view state.
     backend_endpoint: Option<String>,
+    /// TLS and plaintext-opt-in settings applied to every native remote
+    /// connection this view opens, including later worker-node reconnects.
+    #[cfg(not(target_family = "wasm"))]
+    remote_options: RemoteConnectionOptions,
     /// Whether this view is the browser client. A plain field rather than `cfg!`
     /// so the About pane can render and be tested in the browser configuration
     /// on native builds too.
@@ -1424,6 +1442,8 @@ impl LoomView {
             owned_backend: None,
             server_protocol_version: None,
             backend_endpoint: None,
+            #[cfg(not(target_family = "wasm"))]
+            remote_options: RemoteConnectionOptions::default(),
             browser_client: false,
             default_backend_node_id: node_id.clone(),
             node_backends,

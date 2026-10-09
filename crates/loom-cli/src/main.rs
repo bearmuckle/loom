@@ -185,6 +185,7 @@ struct CliOptions {
     token: Option<String>,
     login_provider: Option<String>,
     reset_state: bool,
+    allow_insecure_remote: bool,
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOptions>, LoomError> {
@@ -205,6 +206,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
         token: None,
         login_provider: None,
         reset_state: false,
+        allow_insecure_remote: false,
     };
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -218,6 +220,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
             "--serve" => options.serve = true,
             "--m4-demo" => options.m4_demo = true,
             "--reset-state" => options.reset_state = true,
+            "--allow-insecure-remote" => options.allow_insecure_remote = true,
             "--bind" => {
                 options.bind = required_value(&mut args, "--bind")?
                     .parse()
@@ -241,7 +244,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
                      [--root <path>] [--manual-approval] [--m3-demo] \
                      [--persistence <path>] [--reset-state] \
                      [--serve --bind <addr> --token <token>] \
-                     [--m4-demo] [--login github-copilot]"
+                     [--m4-demo] [--login github-copilot] \
+                     [--allow-insecure-remote]"
                 );
                 println!("Add --m2-demo to exercise workspace, terminal, and task APIs.");
                 println!(
@@ -254,6 +258,11 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
                 println!(
                     "Use --serve with an explicit bearer --token to expose the standalone \
                      WebSocket backend."
+                );
+                println!(
+                    "A --serve --bind address that is not loopback needs --allow-insecure-remote to \
+                     accept sending the bearer token in plaintext, because this shell serves \
+                     plain ws:// only."
                 );
                 println!("Use --m4-demo to exercise a second reconnecting remote client.");
                 println!("Use --login github-copilot to authenticate GitHub Copilot.");
@@ -357,6 +366,7 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
     let _issued = auth.insert(token, AuthorizationScope::all())?;
     let config = RemoteServerConfig {
         bind_addr: options.bind,
+        allow_insecure_remote: options.allow_insecure_remote,
         ..RemoteServerConfig::default()
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1577,6 +1587,7 @@ mod tests {
             token: None,
             login_provider: None,
             reset_state: false,
+            allow_insecure_remote: false,
         };
         let run_id = start_run(&connection, session.id, &options).unwrap();
         stream_run(&connection, session.id, run_id, false).unwrap();
@@ -1604,6 +1615,7 @@ mod tests {
             token: None,
             login_provider: None,
             reset_state: false,
+            allow_insecure_remote: false,
         };
 
         let result = run_m4_demo(options);
@@ -1634,6 +1646,7 @@ mod tests {
             token: None,
             login_provider: None,
             reset_state: false,
+            allow_insecure_remote: false,
         };
         let run_id = start_run(&connection, session.id, &options).unwrap();
         stream_run(&connection, session.id, run_id, false).unwrap();
@@ -1692,6 +1705,7 @@ mod tests {
                 "--serve",
                 "--m4-demo",
                 "--reset-state",
+                "--allow-insecure-remote",
                 "--bind",
                 "127.0.0.1:9000",
                 "--token",
@@ -1713,6 +1727,7 @@ mod tests {
             assert!(options.serve);
             assert!(options.m4_demo);
             assert!(options.reset_state);
+            assert!(options.allow_insecure_remote);
             assert_eq!(options.bind.to_string(), "127.0.0.1:9000");
             assert_eq!(options.token.as_deref(), Some("tok"));
             assert_eq!(options.login_provider.as_deref(), Some("github-copilot"));
@@ -1755,6 +1770,7 @@ mod tests {
             assert_eq!(options.name, "M1 demo");
             assert_eq!(options.model, ModelId::new("deterministic/demo"));
             assert!(!options.serve);
+            assert!(!options.allow_insecure_remote);
             assert!(parse(&["--help"]).unwrap().is_none());
             assert!(parse(&["-h"]).unwrap().is_none());
         }
