@@ -23,6 +23,7 @@ gpui_kit::assets::icon_assets!(
         Ellipsis,
         ExternalLink,
         FileText,
+        Folder,
         FolderOpen,
         GitBranch,
         GitMerge,

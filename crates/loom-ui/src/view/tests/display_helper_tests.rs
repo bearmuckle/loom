@@ -1,15 +1,16 @@
 use super::{
     AboutBackend, AboutLink, AgentActivityData, AgentActivityRecord, AgentActivityStatus,
     CompletionKind, FileActivityOperation, LOOM_REPOSITORY_URL, ToolPart, ToolPartStatus,
-    about_backend, about_backend_label, about_git_revision, about_links, about_platform_label,
-    about_protocol, about_version_label, activity_output, change_kind_label, command_line,
-    command_purpose, commands_matching, completion_for_value, composer_height, disconnected_screen,
-    endpoint_host, endpoint_label, format_bytes, format_duration, format_percentage,
-    humanize_tool_output, is_redundant_completion_summary, relative_time, replace_command_token,
-    replace_last_token, rgb, run_state_color, run_state_label, session_is_active,
-    session_status_pill, source_mount_path, tool_detail, tool_failure_count, tool_group_label,
-    tool_group_status, tool_needs_attention, tool_part_from_activity, tool_status, tool_title,
-    tool_title_for_activity, tool_usage_label, tool_usage_summary,
+    about_backend, about_backend_label, about_build_version, about_git_revision, about_links,
+    about_platform_label, about_protocol, about_version_label, activity_output, change_kind_label,
+    command_line, command_purpose, commands_matching, completion_for_value, composer_height,
+    disconnected_screen, endpoint_host, endpoint_label, format_bytes, format_duration,
+    format_percentage, has_block_markdown, humanize_tool_output, is_redundant_completion_summary,
+    relative_time, replace_command_token, replace_last_token, rgb, run_state_color,
+    run_state_label, session_is_active, session_status_pill, source_mount_path, tool_detail,
+    tool_failure_count, tool_group_label, tool_group_status, tool_needs_attention,
+    tool_part_from_activity, tool_status, tool_title, tool_title_for_activity, tool_usage_label,
+    tool_usage_summary,
 };
 use loom_core::{ActivityId, AgentSessionState, ProtocolVersion, RunId, Timestamp};
 use loom_model::{ModelId, ToolCall};
@@ -466,7 +467,7 @@ fn github_tools_get_readable_titles_and_no_json_detail() {
         json!({"repository": "owner/name", "title": "Fix", "head": "fix", "base": "main"});
     assert_eq!(
         tool_title("github_create_pull_request", &call.arguments),
-        "Open fix → main in owner/name"
+        "Open fix -> main in owner/name"
     );
     assert_eq!(tool_detail(&call), None);
 
@@ -477,6 +478,55 @@ fn github_tools_get_readable_titles_and_no_json_detail() {
     );
     assert_eq!(tool_detail(&call), None);
 
+    call.arguments = json!({"repository": "owner/name", "state": "open"});
+    assert_eq!(
+        tool_title("github_list_issues", &call.arguments),
+        "List issues in owner/name"
+    );
+    assert_eq!(tool_detail(&call), None);
+
+    call.arguments = json!({"repository": "owner/name", "number": 42});
+    assert_eq!(
+        tool_title("github_get_issue", &call.arguments),
+        "Read owner/name#42"
+    );
+    assert_eq!(
+        tool_title("github_get_comments", &call.arguments),
+        "Read comments on owner/name#42"
+    );
+    assert_eq!(
+        tool_title("github_update_issue", &call.arguments),
+        "Update owner/name#42"
+    );
+    assert_eq!(
+        tool_title("github_comment", &call.arguments),
+        "Comment on owner/name#42"
+    );
+    assert_eq!(
+        tool_title("github_update_pull_request", &call.arguments),
+        "Update owner/name#42"
+    );
+    assert_eq!(
+        tool_title("github_mark_pull_request_ready_for_review", &call.arguments),
+        "Mark owner/name#42 ready for review"
+    );
+    assert_eq!(
+        tool_title("github_add_labels", &call.arguments),
+        "Label owner/name#42"
+    );
+    assert_eq!(
+        tool_title("github_remove_labels", &call.arguments),
+        "Remove labels from owner/name#42"
+    );
+    assert_eq!(tool_detail(&call), None);
+
+    call.arguments = json!({"repository": "owner/name", "title": "Bug"});
+    assert_eq!(
+        tool_title("github_create_issue", &call.arguments),
+        "Open issue in owner/name"
+    );
+    assert_eq!(tool_detail(&call), None);
+
     assert_eq!(
         tool_title("github_get_pull_request", &json!({})),
         "Read pull request"
@@ -484,6 +534,10 @@ fn github_tools_get_readable_titles_and_no_json_detail() {
     assert_eq!(
         tool_group_label("github_create_pull_request", 2),
         "Opened 2 pull requests"
+    );
+    assert_eq!(
+        tool_group_label("github_create_issue", 2),
+        "Opened 2 issues"
     );
 }
 
@@ -621,7 +675,11 @@ fn run_state_colors_and_activity_classification_are_distinct() {
     assert_eq!(run_state_color(AgentRunState::Executing), rgb(0x93c5fd));
     assert_eq!(run_state_color(AgentRunState::Failed), rgb(0xfca5a5));
     assert!(session_is_active(AgentSessionState::Executing));
-    assert!(session_is_active(AgentSessionState::NeedsInput));
+    assert!(session_is_active(AgentSessionState::Planning));
+    assert!(!session_is_active(AgentSessionState::NeedsInput));
+    assert!(!session_is_active(AgentSessionState::AwaitingApproval));
+    assert!(!session_is_active(AgentSessionState::Queued));
+    assert!(!session_is_active(AgentSessionState::Completed));
     assert!(!session_is_active(AgentSessionState::Idle));
     assert!(!session_is_active(AgentSessionState::Archived));
 }
@@ -702,6 +760,11 @@ fn version_and_platform_labels_handle_missing_build_metadata() {
         "macos aarch64 · browser"
     );
     assert!(!about_git_revision().is_empty());
+    assert_eq!(
+        about_version_label(about_build_version(), "unknown"),
+        about_build_version()
+    );
+    assert!(!about_build_version().is_empty());
 }
 
 #[test]
@@ -766,4 +829,16 @@ fn disconnected_screen_copy_distinguishes_first_connect_from_connection_loss() {
         "Reconnect to reload your projects and sessions."
     );
     assert_eq!(lost.footer, "Disconnected  ·  connection lost");
+}
+
+#[test]
+fn block_markdown_is_detected_for_definite_bubble_widths() {
+    assert!(has_block_markdown("1. first\n2. second"));
+    assert!(has_block_markdown("3) third"));
+    assert!(has_block_markdown("- bullet"));
+    assert!(has_block_markdown("```\ncode\n```"));
+    assert!(has_block_markdown("| a | b |\n| - | - |"));
+    assert!(!has_block_markdown("Run the tests"));
+    assert!(!has_block_markdown("Release 2.0 shipped"));
+    assert!(!has_block_markdown("inline **bold** only"));
 }

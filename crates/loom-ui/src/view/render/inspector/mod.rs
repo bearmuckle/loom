@@ -2,9 +2,9 @@ use super::*;
 
 /// Compact typography for inspector cards. Sizes are logical pixels converted
 /// through the app's rem base so user font scaling still applies.
-const CARD_TITLE_FONT_SIZE: f32 = 11.5;
-const CARD_LABEL_FONT_SIZE: f32 = 11.5;
-const CARD_VALUE_FONT_SIZE: f32 = 13.;
+const CARD_TITLE_FONT_SIZE: f32 = 11.;
+const CARD_LABEL_FONT_SIZE: f32 = 10.5;
+const CARD_VALUE_FONT_SIZE: f32 = 12.;
 
 fn card_title_font() -> gpui_kit::Rems {
     gpui_kit::rems(CARD_TITLE_FONT_SIZE / BASE_FONT_SIZE)
@@ -273,7 +273,7 @@ impl LoomView {
             InspectorTab::Context => self
                 .context_inspection
                 .as_ref()
-                .map(|inspection| format!("≈ {} tokens", format_tokens(inspection.included_tokens)))
+                .map(|inspection| format!("~ {} tokens", format_tokens(inspection.included_tokens)))
                 .unwrap_or_else(|| "No inspection yet".to_owned()),
             InspectorTab::Files => {
                 if self.review.files.loaded {

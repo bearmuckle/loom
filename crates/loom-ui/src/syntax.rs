@@ -517,7 +517,7 @@ pub(crate) fn looks_like_patch(text: &str) -> bool {
     })
 }
 
-/// A compact, human-readable label for a patch, e.g. `+14 −3`.
+/// A compact, human-readable label for a patch, e.g. `+14 -3`.
 pub(crate) fn patch_summary(text: &str) -> Option<String> {
     if !looks_like_patch(text) {
         return None;
@@ -531,7 +531,7 @@ pub(crate) fn patch_summary(text: &str) -> Option<String> {
             _ => {}
         }
     }
-    Some(format!("+{added} −{removed}"))
+    Some(format!("+{added} -{removed}"))
 }
 
 const RUST_KEYWORDS: &[&str] = &[
@@ -878,7 +878,7 @@ mod tests {
         assert_eq!(classify_diff_line("-del"), DiffLineKind::Removed);
         assert_eq!(classify_diff_line(" ctx"), DiffLineKind::Context);
         assert!(looks_like_patch(patch));
-        assert_eq!(patch_summary(patch).as_deref(), Some("+1 −1"));
+        assert_eq!(patch_summary(patch).as_deref(), Some("+1 -1"));
         assert_eq!(patch_summary("hello"), None);
     }
 }

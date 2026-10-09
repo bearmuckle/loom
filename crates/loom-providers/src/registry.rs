@@ -327,7 +327,10 @@ impl ProviderRegistry {
 
     /// Stores a repository-scoped GitHub token obtained from the GitHub CLI
     /// OAuth app device flow. This token authorizes clone, push, and pull
-    /// requests on the worker, which has no ambient Git credentials.
+    /// requests on the worker, which has no ambient Git credentials. The device
+    /// login requests the `workflow` scope alongside `repo`, because GitHub
+    /// rejects a push that creates or updates `.github/workflows/**` from a
+    /// credential that lacks it.
     pub fn configure_github_repository(&self, access_token: String) -> Result<()> {
         if access_token.trim().is_empty() {
             return Err(LoomError::invalid_request(

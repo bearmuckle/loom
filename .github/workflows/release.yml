@@ -5,39 +5,131 @@ on:
     tags:
       - "v*"
 
+# Least privilege: each job grants itself only what it publishes or attests.
 permissions:
   contents: read
 
+env:
+  CARGO_INCREMENTAL: "0"
+  # Both binaries stamp `--version` from these values: the tag is what a released
+  # binary must report, and the revision is the commit it was built from. The
+  # stamping build scripts re-run when they change, so the stamps survive a
+  # restored `target/` cache.
+  LOOM_BUILD_VERSION: ${{ github.ref_name }}
+
 jobs:
+  verify:
+    name: Verify workspace
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # The same native packages as `.github/workflows/ci.yml`: the GPUI client
+      # links them, and the visual render test below needs a software Vulkan
+      # adapter because the runner has no GPU.
+      - name: Install native UI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libdbus-1-dev \
+            libxcb1-dev \
+            libfontconfig1-dev \
+            pkg-config \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            fonts-dejavu-core \
+            mesa-vulkan-drivers \
+            libgl1-mesa-dri
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run headless visual render tests
+        run: cargo test -p loom-ui --features visual-tests --locked --bins visual_render_tests
+      - name: Run tests
+        run: cargo test --workspace --locked --lib --bins --tests
+
   build:
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    # This job may run alongside `verify`, but nothing it produces is published
+    # before the checks pass: `publish` and `container` both need `verify`.
+    permissions:
+      contents: read
+      # SLSA build provenance is signed with a short-lived OIDC identity and the
+      # attestation is attached to this repository.
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
         include:
+          # ubuntu-22.04 keeps the glibc floor of the Linux artifacts at 2.35,
+          # which is what the AppImages and the `.deb` packages target.
           - name: linux-x86_64
             os: ubuntu-22.04
+            rust_targets: x86_64-unknown-linux-gnu
             target: x86_64-unknown-linux-gnu
+            bin_dir: target/x86_64-unknown-linux-gnu/release
+            exe: ""
+            appimage_arch: x86_64
+            deb_variant: ""
             archive: tar.gz
-          - name: macos-aarch64
+          # The current GitHub-hosted arm64 label. Its glibc is newer than the
+          # x86_64 job's, so the arm64 artifacts need a newer distribution than
+          # the x86_64 ones; there is no 22.04 arm64 runner image to match them.
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            rust_targets: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-gnu
+            bin_dir: target/aarch64-unknown-linux-gnu/release
+            exe: ""
+            appimage_arch: aarch64
+            # Selects `[package.metadata.deb.variants.aarch64]`, which declares
+            # this runner image's newer glibc floor.
+            deb_variant: aarch64
+            archive: tar.gz
+          # macOS ships one universal binary per package: both slices are built
+          # on macos-14 (itself arm64) and combined with `lipo`.
+          - name: macos-universal
             os: macos-14
-            target: aarch64-apple-darwin
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+            target: ""
+            bin_dir: target/universal/release
+            exe: ""
+            appimage_arch: ""
             archive: tar.gz
+            universal: true
           - name: windows-x86_64
             os: windows-latest
+            rust_targets: x86_64-pc-windows-msvc
             target: x86_64-pc-windows-msvc
+            bin_dir: target/x86_64-pc-windows-msvc/release
+            exe: .exe
+            appimage_arch: ""
             archive: zip
-    env:
-      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
-      - name: Install native UI dependencies
+          targets: ${{ matrix.rust_targets }}
+      # On top of the client's native packages, `git2` builds its own libgit2
+      # (no distribution ships the version range libgit2-sys accepts for a
+      # system libgit2), so the build needs a C toolchain, CMake and OpenSSL.
+      # `patchelf` and `file` are what linuxdeploy and appimagetool use.
+      - name: Install native dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
@@ -47,34 +139,248 @@ jobs:
             libfontconfig1-dev \
             pkg-config \
             libxkbcommon-dev \
-            libxkbcommon-x11-dev
+            libxkbcommon-x11-dev \
+            build-essential \
+            cmake \
+            libssl-dev \
+            zlib1g-dev \
+            file \
+            patchelf
+      - uses: taiki-e/install-action@cargo-deb
+        if: runner.os == 'Linux'
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: Build native UI client
-        run: cargo build --release --locked --package loom-ui --target ${{ matrix.target }}
-      - name: Package release archive
+      - name: Stamp the git revision
+        shell: bash
+        run: echo "LOOM_GIT_REVISION=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_ENV"
+      - name: Build client and server
+        if: ${{ !matrix.universal }}
+        run: cargo build --release --locked --package loom-ui --package loom-server --target ${{ matrix.target }}
+      - name: Build client and server (apple silicon slice)
+        if: matrix.universal
+        run: cargo build --release --locked --package loom-ui --package loom-server --target aarch64-apple-darwin
+      - name: Build client and server (intel slice)
+        if: matrix.universal
+        run: cargo build --release --locked --package loom-ui --package loom-server --target x86_64-apple-darwin
+      - name: Combine the macOS slices
+        if: matrix.universal
         shell: bash
         run: |
+          set -euo pipefail
+          mkdir -p target/universal/release
+          for bin in loom-ui loom-server; do
+            lipo -create \
+              "target/aarch64-apple-darwin/release/$bin" \
+              "target/x86_64-apple-darwin/release/$bin" \
+              -output "target/universal/release/$bin"
+            archs="$(lipo -archs "target/universal/release/$bin")"
+            echo "$bin: $archs"
+            # A universal archive must not silently lose a slice.
+            case "$archs" in
+              *x86_64*arm64* | *arm64*x86_64*) ;;
+              *) echo "$bin is not universal: $archs" >&2; exit 1 ;;
+            esac
+          done
+      - name: Verify the binaries report the release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          for bin in loom-ui loom-server; do
+            reported="$("${{ matrix.bin_dir }}/$bin${{ matrix.exe }}" --version)"
+            echo "$bin --version: $reported"
+            case "$reported" in
+              *"$GITHUB_REF_NAME"*) ;;
+              *) echo "$bin does not report $GITHUB_REF_NAME: $reported" >&2; exit 1 ;;
+            esac
+          done
+      - name: Package release archives
+        shell: bash
+        run: |
+          set -euo pipefail
           mkdir -p dist
-          if [[ "${{ matrix.archive }}" == "zip" ]]; then
-            7z a "dist/loom-ui-${GITHUB_REF_NAME}-${{ matrix.name }}.zip" \
-              "target/${{ matrix.target }}/release/loom-ui.exe" LICENSE-AGPL LICENSES.md
-          else
-            tar -czf "dist/loom-ui-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz" \
-              -C "target/${{ matrix.target }}/release" loom-ui \
-              -C "$GITHUB_WORKSPACE" LICENSE-AGPL LICENSES.md
+          for bin in loom-ui loom-server; do
+            if [ "${{ matrix.archive }}" = "zip" ]; then
+              7z a "dist/$bin-$GITHUB_REF_NAME-${{ matrix.name }}.zip" \
+                "${{ matrix.bin_dir }}/$bin${{ matrix.exe }}" LICENSE-AGPL LICENSES.md
+            else
+              tar -czf "dist/$bin-$GITHUB_REF_NAME-${{ matrix.name }}.tar.gz" \
+                -C "${{ matrix.bin_dir }}" "$bin${{ matrix.exe }}" \
+                -C "$GITHUB_WORKSPACE" LICENSE-AGPL LICENSES.md
+            fi
+          done
+          ls -l dist
+      - name: Build AppImage
+        if: runner.os == 'Linux'
+        env:
+          ARCH: ${{ matrix.appimage_arch }}
+          TARGET: ${{ matrix.target }}
+        run: packaging/build-appimage.sh dist
+      - name: Build .deb package
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          deb_args=""
+          if [ -n "${{ matrix.deb_variant }}" ]; then
+            deb_args="--variant ${{ matrix.deb_variant }}"
           fi
+          # `$deb_args` is deliberately unquoted: it is empty or exactly one
+          # option, and it must word-split.
+          cargo deb --package loom-ui --no-build --target "${{ matrix.target }}" \
+            --deb-version "${GITHUB_REF_NAME#v}" $deb_args
+          # cargo-deb writes the package next to the target directory it used.
+          deb="$(find target -name '*.deb' -print -quit)"
+          cp "$deb" dist/
+      - name: Check the .deb package
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          deb="$(find dist -name '*.deb' -print -quit)"
+          dpkg-deb --info "$deb"
+          for asset in usr/bin/loom-ui \
+            usr/share/applications/loom-ui.desktop \
+            usr/share/icons/hicolor/512x512/apps/loom-ui.png; do
+            dpkg-deb --contents "$deb" | grep -q "$asset" \
+              || { echo "$deb is missing $asset" >&2; exit 1; }
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.name }}
           path: dist/*
           if-no-files-found: error
+      # Attested from the job that built the files, so the provenance names the
+      # workflow run that produced these exact digests.
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+
+  sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-sbom
+        run: cargo install cargo-sbom --locked
+      - name: Generate a CycloneDX SBOM from Cargo.lock
+        run: |
+          mkdir -p dist
+          cargo sbom --output-format cyclonedx-json > "dist/loom-$GITHUB_REF_NAME.cdx.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-sbom
+          path: dist/*
+          if-no-files-found: error
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+
+  container:
+    name: Publish server image
+    runs-on: ubuntu-latest
+    needs: verify
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/loom-server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the server image
+        run: |
+          docker buildx build --load \
+            --build-arg "LOOM_BUILD_VERSION=$GITHUB_REF_NAME" \
+            --build-arg "LOOM_GIT_REVISION=$(git rev-parse --short=12 HEAD)" \
+            --tag loom-server:ci .
+      - name: Smoke test the image
+        run: |
+          set -euo pipefail
+          docker run --rm loom-server:ci --version
+          docker run --rm loom-server:ci --help
+          docker run -d --name loom-server-smoke loom-server:ci \
+            --bind 0.0.0.0:8765 --allow-insecure-remote \
+            --token smoke-test-token --persistence /var/lib/loom/loom.db
+          status=starting
+          for _ in $(seq 1 30); do
+            status="$(docker inspect -f '{{.State.Health.Status}}' loom-server-smoke)"
+            [ "$status" = healthy ] && break
+            sleep 2
+          done
+          docker logs loom-server-smoke
+          test "$status" = healthy
+          docker exec loom-server-smoke curl -fsS http://127.0.0.1:8765/health
+          docker rm -f loom-server-smoke
+      - name: Smoke test the image over TLS
+        run: |
+          set -euo pipefail
+          # The default command above serves plaintext under the documented
+          # opt-in; self-contained TLS is the alternative it points at, and a
+          # regression there would otherwise surface only at a user's first
+          # deployment. The certificate is self-signed and exists only for this
+          # probe.
+          mkdir -p tls
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout tls/key.pem -out tls/cert.pem -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+          chmod 644 tls/cert.pem tls/key.pem
+          # No `--allow-insecure-remote`: a non-loopback bind is allowed here
+          # precisely because TLS is configured.
+          docker run -d --name loom-server-tls -v "$PWD/tls:/tls:ro" loom-server:ci \
+            --bind 0.0.0.0:8765 --token smoke-test-token \
+            --tls-cert /tls/cert.pem --tls-key /tls/key.pem
+          served=""
+          for _ in $(seq 1 30); do
+            if docker exec loom-server-tls curl -fsSk https://127.0.0.1:8765/health >/dev/null 2>&1; then
+              served=yes
+              break
+            fi
+            sleep 2
+          done
+          docker logs loom-server-tls
+          test -n "$served"
+          # `-k` because the probe certificate is self-signed. Answering at all
+          # proves the listener completed a TLS handshake and served over it.
+          docker exec loom-server-tls curl -fsSk https://127.0.0.1:8765/health
+          docker rm -f loom-server-tls
+      - name: Log in to the container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push the image tagged with the release tag and `latest`
+        id: push
+        run: |
+          set -euo pipefail
+          # The image was built and smoke tested above, so this reuses the build
+          # cache and only publishes it.
+          docker buildx build --push \
+            --build-arg "LOOM_BUILD_VERSION=$GITHUB_REF_NAME" \
+            --build-arg "LOOM_GIT_REVISION=$(git rev-parse --short=12 HEAD)" \
+            --tag "$IMAGE:$GITHUB_REF_NAME" \
+            --tag "$IMAGE:latest" \
+            --metadata-file "$RUNNER_TEMP/image.json" .
+          digest="$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/image.json")"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/loom-server
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
 
   publish:
     name: Publish GitHub release
-    needs: build
+    # Nothing is published unless the tagged tree passes the workspace checks and
+    # every build succeeded.
+    needs: [verify, build, sbom]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -84,9 +390,175 @@ jobs:
           pattern: release-*
           path: release-assets
           merge-multiple: true
-      - name: Create release with generated changelog
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd release-assets
+          ls -l
+          # Written to a temporary path so the manifest never lists itself.
+          sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS"
+          mv "$RUNNER_TEMP/SHA256SUMS" .
+          cat SHA256SUMS
+      - name: Compose the release notes
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG_NAME: ${{ github.ref_name }}
-        run: gh release create "$TAG_NAME" release-assets/* --title "$TAG_NAME" --generate-notes
+        run: |
+          set -euo pipefail
+          # The generated changelog is appended to the installation and
+          # verification instructions rather than replacing them.
+          cat > release-notes.md <<'NOTES'
+          Native Loom releases contain the `loom-ui` desktop client and the
+          standalone `loom-server` backend for Linux (x86_64 and aarch64), macOS
+          (one universal binary) and Windows (x86_64), plus Linux AppImages and
+          `.deb` packages of the client and a server container image.
+
+          ## Verify what you downloaded
+
+          `SHA256SUMS` covers every file attached to this release, and every
+          artifact also carries signed SLSA build provenance from the workflow
+          run that produced it:
+
+          ```sh
+          # Check the artifacts against the manifest.
+          sha256sum -c SHA256SUMS
+
+          # Check provenance (needs the GitHub CLI, authenticated).
+          gh attestation verify loom-ui-${{ github.ref_name }}-linux-x86_64.tar.gz \
+            --repo ${{ github.repository }}
+          ```
+
+          `loom-${{ github.ref_name }}.cdx.json` is a CycloneDX SBOM of the
+          workspace dependencies at the tagged revision.
+
+          ## Linux client
+
+          Unpack the tarball, mark the binary executable, and run it:
+
+          ```sh
+          tar -xzf loom-ui-${{ github.ref_name }}-linux-x86_64.tar.gz
+          chmod +x loom-ui
+          ./loom-ui --version
+          ./loom-ui
+          ```
+
+          The `.deb` installs the binary, a desktop entry and the icon:
+
+          ```sh
+          sudo apt install ./loom-ui_*.deb
+          loom-ui
+          ```
+
+          The AppImage is self-contained, needs no installation, and does need
+          the executable bit:
+
+          ```sh
+          chmod +x loom-ui-${{ github.ref_name }}-x86_64.AppImage
+          ./loom-ui-${{ github.ref_name }}-x86_64.AppImage
+          ```
+
+          Running an AppImage normally needs FUSE (the `libfuse2` package on
+          Debian and Ubuntu). Without it, use the image's extract-and-run path:
+          `./loom-ui-${{ github.ref_name }}-x86_64.AppImage --appimage-extract-and-run`.
+
+          ## macOS client
+
+          The macOS archive holds one universal binary that runs natively on
+          Apple silicon and on Intel. It is not notarized, so macOS quarantines a
+          downloaded archive; clear the attribute after unpacking:
+
+          ```sh
+          tar -xzf loom-ui-${{ github.ref_name }}-macos-universal.tar.gz
+          xattr -d com.apple.quarantine loom-ui
+          ./loom-ui --version
+          ```
+
+          ## Windows client
+
+          Unpack `loom-ui-${{ github.ref_name }}-windows-x86_64.zip` and run
+          `loom-ui.exe`. The executable is not code signed, so SmartScreen warns
+          about it on first run.
+
+          ## Standalone server
+
+          `loom-server` is the backend the client embeds, as a separate process.
+          Its archives unpack the same way as the client's:
+
+          ```sh
+          tar -xzf loom-server-${{ github.ref_name }}-linux-x86_64.tar.gz
+          chmod +x loom-server
+          ./loom-server --version
+          ```
+
+          Serving needs a bearer token, and without `--persistence` the backend
+          keeps its state in memory only:
+
+          ```sh
+          ./loom-server --bind 127.0.0.1:8765 --token-file /path/to/token \
+            --persistence /var/lib/loom/loom.db
+          ```
+
+          The server refuses a bind that is not loopback unless it serves TLS or
+          the operator opts in to plaintext, and its unauthenticated `GET /health`
+          endpoint answers `ok`. To serve `wss://`, pass a certificate chain and
+          its key:
+
+          ```sh
+          ./loom-server --bind 0.0.0.0:8765 \
+            --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem \
+            --token-file /path/to/token
+          ```
+
+          A plaintext listener beyond loopback needs an explicit opt-in, which
+          logs what it accepts:
+
+          ```sh
+          ./loom-server --bind 0.0.0.0:8765 --allow-insecure-remote \
+            --token-file /path/to/token
+          ```
+
+          A client connecting to a worker with a private or self-signed CA adds
+          that CA to its OS trust roots with `--ca /path/to/ca.pem` (or
+          `LOOM_TLS_CA`). Verification is never disabled.
+
+          A container image is published for the same tag:
+
+          ```sh
+          docker pull ghcr.io/${{ github.repository_owner }}/loom-server:${{ github.ref_name }}
+          printf 'choose-a-long-random-token' > token
+          docker run --rm -p 127.0.0.1:8765:8765 \
+            -v "$PWD/token:/etc/loom/token:ro" \
+            ghcr.io/${{ github.repository_owner }}/loom-server:${{ github.ref_name }}
+          ```
+
+          The image's default command binds `0.0.0.0:8765` inside the container
+          with `--allow-insecure-remote`, because that is what makes a published
+          port reachable. Publish it only to trusted peers, or pass your own TLS
+          material: `-v "$PWD/tls:/tls:ro"` and a `CMD` override of
+          `--tls-cert /tls/cert.pem --tls-key /tls/key.pem` without the opt-in.
+          The image's `HEALTHCHECK` probes plain HTTP, so a TLS override needs its
+          own probe over HTTPS.
+
+          ## Known gaps
+
+          - `packaging/loom.desktop` sets `StartupWMClass=loom-ui`, which has not
+            been confirmed against a real desktop session. If a taskbar or dock
+            shows a second entry for the client, that value is the one to correct.
+          - No macOS notarization, no Windows code signing, and no `.rpm`
+            packages.
+          - The Linux client needs a working Vulkan or OpenGL driver; installing
+            a package such as `mesa-vulkan-drivers` covers Mesa-based systems.
+
+          ## What changed
+          NOTES
+          gh api "repos/${{ github.repository }}/releases/generate-notes" \
+            -f "tag_name=$GITHUB_REF_NAME" --jq .body >> release-notes.md
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md

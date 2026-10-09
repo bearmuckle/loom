@@ -1,27 +1,12 @@
 use super::*;
 
 impl LoomView {
-    /// Loads the review projections through the connection worker.
-    pub(crate) fn refresh_review(&mut self, cx: &mut Context<Self>) {
-        self.review.repositories_loaded = false;
-        self.dispatch(
-            cx,
-            ClientRequest::Filesystem(FilesystemRequest::ListSessionDirectories {
-                session_id: self.active_session.id,
-            }),
-            |view, response, _| match response.result {
-                Ok(ServerResponse::Filesystem(FilesystemResponse::SessionDirectories {
-                    directories,
-                })) => {
-                    view.session_directories = directories;
-                }
-                Err(error) => view.record_backend_error("list session directories", error),
-                Ok(response) => view.record_backend_error(
-                    "list session directories",
-                    unexpected_response("session directory list", response),
-                ),
-            },
-        );
+    /// Requests the session change list that backs the Changes tab snapshot.
+    ///
+    /// The request passes no `after_sequence`, so the tab always renders the
+    /// whole session history; [`ReviewState::mark_changes_unread`] then decides
+    /// whether that payload is content the user has not looked at yet.
+    pub(crate) fn refresh_review_changes(&mut self, cx: &mut Context<Self>) {
         let session_id = self.active_session.id;
         self.dispatch(
             cx,
@@ -44,9 +29,9 @@ impl LoomView {
                             .filter(|change| seen.insert(change.path.clone()))
                             .take(MAX_REVIEW_CHANGES)
                             .collect();
-                        if !view.review.changes.is_empty() {
-                            view.review.mark_changes_unread();
-                        }
+                        // The stored snapshot decides whether the payload is
+                        // content the user has not looked at yet.
+                        view.review.mark_changes_unread();
                         if truncated {
                             view.record_status(
                                 "Workspace review is showing the most recent changes".to_owned(),
@@ -61,6 +46,30 @@ impl LoomView {
                 }
             },
         );
+    }
+
+    /// Loads the review projections through the connection worker.
+    pub(crate) fn refresh_review(&mut self, cx: &mut Context<Self>) {
+        self.review.repositories_loaded = false;
+        self.dispatch(
+            cx,
+            ClientRequest::Filesystem(FilesystemRequest::ListSessionDirectories {
+                session_id: self.active_session.id,
+            }),
+            |view, response, _| match response.result {
+                Ok(ServerResponse::Filesystem(FilesystemResponse::SessionDirectories {
+                    directories,
+                })) => {
+                    view.session_directories = directories;
+                }
+                Err(error) => view.record_backend_error("list session directories", error),
+                Ok(response) => view.record_backend_error(
+                    "list session directories",
+                    unexpected_response("session directory list", response),
+                ),
+            },
+        );
+        self.refresh_review_changes(cx);
         let session_id = self.active_session.id;
         self.dispatch(
             cx,
@@ -101,10 +110,10 @@ impl LoomView {
                                         Ok(ServerResponse::Repository(
                                             RepositoryResponse::VcsStatus(status),
                                         )) => {
-                                            if !status.files.is_empty() {
-                                                view.review.mark_changes_unread();
-                                            }
-                                            view.review.vcs = Some(status)
+                                            // Store the status before marking: the
+                                            // content key covers the stored snapshot.
+                                            view.review.vcs = Some(status);
+                                            view.review.mark_changes_unread();
                                         }
                                         Err(error) => {
                                             view.review.vcs = None;
@@ -157,6 +166,24 @@ impl LoomView {
     /// Switches the inspector tab, loading the tab's data on first view.
     pub(crate) fn select_inspector_tab(&mut self, tab: InspectorTab, cx: &mut Context<Self>) {
         if self.review.tab == tab {
+            // Selecting the displayed tab refreshes it. That is the only way
+            // the Changes snapshot picks up content that arrived after it was
+            // fetched, and it clears the marker for content now shown here.
+            self.review.clear_unread(tab);
+            match tab {
+                InspectorTab::Changes => self.refresh_review_changes(cx),
+                InspectorTab::Agent | InspectorTab::Context => self.refresh_usage(cx),
+                InspectorTab::Files => {
+                    if !self.review.files.loaded {
+                        self.load_inspector_files(cx);
+                    }
+                }
+                InspectorTab::Plan => {}
+            }
+            if tab == InspectorTab::Context {
+                self.refresh_context(cx);
+            }
+            cx.notify();
             return;
         }
         self.review.tab = tab;

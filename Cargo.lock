@@ -4445,6 +4445,7 @@ name = "loom-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "env_logger",
  "futures-util",
  "log",
  "loom-agent",
@@ -4460,12 +4461,16 @@ dependencies = [
  "loom-vcs",
  "loom-workspace",
  "reqwest",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "subtle",
  "sysinfo 0.39.6",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite 0.30.0",
  "url",
  "uuid",
@@ -6798,6 +6803,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -8135,7 +8141,11 @@ checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
 dependencies = [
  "futures-util",
  "log",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
  "tungstenite 0.30.0",
 ]
 
@@ -8402,6 +8412,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.10.3",
+ "rustls",
+ "rustls-pki-types",
  "sha1 0.11.0",
  "thiserror 2.0.21",
 ]

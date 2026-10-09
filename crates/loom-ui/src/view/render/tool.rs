@@ -56,7 +56,7 @@ impl LoomView {
                     if !text.trim().is_empty() {
                         let mut display = text.clone();
                         if turn.streaming && part_index + 1 == turn.parts.len() {
-                            display.push('▍');
+                            display.push('▮');
                         }
                         body = body.child(render_timeline_text(
                             format!("transcript-assistant-{index}-{part_index}"),
@@ -138,11 +138,7 @@ impl LoomView {
                             .items_center()
                             .gap_2()
                             .text_xs()
-                            .child(div().text_color(rgb(0x64748b)).child(if expanded {
-                                "⌄"
-                            } else {
-                                "›"
-                            }))
+                            .child(disclosure_chevron(expanded, rgb(0x64748b)))
                             .child(div().text_color(rgb(0x94a3b8)).child("Reasoning"))
                             .when(!expanded, |element| {
                                 element.child(
@@ -244,11 +240,7 @@ impl LoomView {
                                     .flex_shrink_0()
                                     .text_color(status_color),
                             )
-                            .child(div().text_color(rgb(0x64748b)).child(if expanded {
-                                "⌄"
-                            } else {
-                                "›"
-                            }))
+                            .child(disclosure_chevron(expanded, rgb(0x64748b)))
                             .child(
                                 div()
                                     .flex_1()
@@ -402,11 +394,7 @@ impl LoomView {
                                     .flex_shrink_0()
                                     .text_color(status_color),
                             )
-                            .child(div().text_color(rgb(0x64748b)).child(if expanded {
-                                "⌄"
-                            } else {
-                                "›"
-                            }))
+                            .child(disclosure_chevron(expanded, rgb(0x64748b)))
                             .child(
                                 div()
                                     .flex_1()
@@ -547,15 +535,11 @@ impl LoomView {
                             )
                             .child(
                                 div()
-                                    .w(px(10.))
+                                    .w(px(12.))
                                     .flex_shrink_0()
                                     .text_color(rgb(0x64748b))
-                                    .child(if !expandable {
-                                        ""
-                                    } else if expanded {
-                                        "⌄"
-                                    } else {
-                                        "›"
+                                    .when(expandable, |element| {
+                                        element.child(disclosure_chevron(expanded, rgb(0x64748b)))
                                     }),
                             )
                             .child(
@@ -693,33 +677,45 @@ impl LoomView {
             // The user's message sits on the trailing edge in a tinted bubble so
             // the back-and-forth with the agent reads at a glance. The role row
             // mirrors the agent's leading accent bar and label.
-            TimelineItem::User(text) => div()
-                .w_full()
-                .px_3()
-                .py_2()
-                .flex()
-                .flex_col()
-                .child(
-                    Bubble::new()
-                        .alignment(MessageAlignment::End)
-                        .with_variant(BubbleVariant::Tinted)
-                        .child(
-                            div()
-                                .w_full()
-                                .flex()
-                                .items_center()
-                                .justify_end()
-                                .gap_2()
-                                .child(div().text_xs().text_color(rgb(0xbfdbfe)).child("You"))
-                                .child(div().w(px(3.)).h(px(13.)).rounded_full().bg(rgb(0x60a5fa))),
-                        )
-                        .child(div().mt_1().child(render_timeline_text(
-                            format!("transcript-user-{index}"),
-                            text.clone(),
-                            0xf3f4f6,
-                        ))),
-                )
-                .into_any(),
+            TimelineItem::User(text) => {
+                // Block Markdown (a numbered list, fenced code, a table) sizes
+                // itself to its minimum width, so a content-sized bubble
+                // collapses to a one-character column. Give those bubbles a
+                // definite width and keep short messages content-sized.
+                let mut bubble = Bubble::new()
+                    .alignment(MessageAlignment::End)
+                    .with_variant(BubbleVariant::Secondary);
+                if has_block_markdown(text) {
+                    bubble = bubble.w_full().content(BubbleContent::new().w_full());
+                }
+                div()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        bubble
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_end()
+                                    .gap_2()
+                                    .child(div().text_xs().text_color(rgb(0xbfdbfe)).child("You"))
+                                    .child(
+                                        div().w(px(3.)).h(px(13.)).rounded_full().bg(rgb(0x60a5fa)),
+                                    ),
+                            )
+                            .child(div().mt_1().child(render_timeline_text(
+                                format!("transcript-user-{index}"),
+                                text.clone(),
+                                0xf3f4f6,
+                            ))),
+                    )
+                    .into_any()
+            }
             TimelineItem::Assistant(turn) => self.render_assistant_turn(turn, index, parent),
             TimelineItem::System(note) => {
                 let (surface, accent) = match note.tone {

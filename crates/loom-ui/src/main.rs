@@ -57,7 +57,9 @@ pub(crate) const MAX_REVIEW_DIFF: usize = 48 * 1024;
 fn main() {
     init_logging();
     let options = match UiOptions::parse(std::env::args()) {
-        Ok(options) => options,
+        Ok(Some(options)) => options,
+        // `--help` and `--version` printed what was asked for; exit 0.
+        Ok(None) => return,
         Err(error) => {
             error!("could not parse Loom UI arguments: {error}");
             std::process::exit(1);
@@ -264,6 +266,9 @@ pub fn start() {
 #[cfg(test)]
 mod tests {
     use super::BUNDLED_FONTS;
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::path::Path;
 
     /// The glyphs gpui-base's markdown renderer emits for list items
     /// (`gpui_base::text::utils`). The wasm text system cannot fall back to a
@@ -279,6 +284,59 @@ mod tests {
                  so it renders blank in wasm"
             );
         }
+    }
+
+    /// Every non-emoji glyph the client renders must be covered by a bundled
+    /// face.
+    ///
+    /// The browser build adds only the fonts in `BUNDLED_FONTS` and hands just
+    /// emoji and CJK to the browser canvas; every other glyph has to shape from
+    /// an embedded face or it renders blank. Native, by contrast, falls back to
+    /// the system fonts, so a glyph only the native client can find looks fine
+    /// locally and disappears in the browser. Scanning the crate source catches
+    /// those before they ship.
+    #[test]
+    fn bundled_fonts_cover_every_glyph_the_client_draws() {
+        let mut glyphs = BTreeSet::new();
+        source_glyphs(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut glyphs,
+        );
+        for character in glyphs {
+            if uses_browser_fallback(character) {
+                continue;
+            }
+            assert!(
+                BUNDLED_FONTS.iter().any(|bytes| covers(bytes, character)),
+                "no bundled font covers {character:?} (U+{:04X}), so it renders \
+                 blank in the browser",
+                character as u32
+            );
+        }
+    }
+
+    /// Collects every non-ASCII character in every Rust source file under
+    /// `root`, recursively.
+    fn source_glyphs(root: &Path, glyphs: &mut BTreeSet<char>) {
+        for entry in fs::read_dir(root).expect("read client source directory") {
+            let path = entry.expect("read client source entry").path();
+            if path.is_dir() {
+                source_glyphs(&path, glyphs);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                let source = fs::read_to_string(&path).expect("read client source");
+                glyphs.extend(source.chars().filter(|character| !character.is_ascii()));
+            }
+        }
+    }
+
+    /// Whether gpui hands the character to the browser canvas instead of the
+    /// embedded text system, so an embedded face need not cover it.
+    fn uses_browser_fallback(character: char) -> bool {
+        let codepoint = character as u32;
+        (0x1F000..=0x1FAFF).contains(&codepoint)
+            || codepoint == 0x200D
+            || codepoint == 0x20E3
+            || (0xFE00..=0xFE0F).contains(&codepoint)
     }
 
     fn covers(bytes: &[u8], character: char) -> bool {

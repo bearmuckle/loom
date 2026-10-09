@@ -40,13 +40,13 @@ impl ResponsiveLayout {
         if self.phone {
             PHONE_TOUCH_TARGET
         } else {
-            px(30.)
+            px(24.)
         }
     }
 
     /// The vertical padding for a navigation list row.
     pub(crate) fn nav_row_padding(self) -> Pixels {
-        if self.phone { px(14.) } else { px(8.) }
+        if self.phone { px(16.) } else { px(8.) }
     }
 
     /// The font size for navigation list labels.
@@ -167,15 +167,15 @@ pub(crate) fn run_state_color(state: AgentRunState) -> gpui_kit::Rgba {
     }
 }
 
-/// Whether a session state represents work in progress.
+/// Whether a session state represents work actually in progress.
+///
+/// Waiting states (approval, input, queued, paused) are excluded so the sidebar
+/// activity light only animates while an agent is running, not while it is
+/// blocked or already finished.
 pub(crate) fn session_is_active(state: AgentSessionState) -> bool {
     matches!(
         state,
-        AgentSessionState::Planning
-            | AgentSessionState::Executing
-            | AgentSessionState::AwaitingApproval
-            | AgentSessionState::NeedsInput
-            | AgentSessionState::Evaluating
+        AgentSessionState::Planning | AgentSessionState::Executing | AgentSessionState::Evaluating
     )
 }
 
@@ -323,25 +323,6 @@ pub(crate) fn format_worker_node_resources(resources: &WorkerNodeResources) -> S
     )
 }
 
-pub(crate) fn worker_node_for_id<'a>(
-    nodes: &'a [WorkerNodeEntry],
-    node_id: Option<&str>,
-) -> Option<&'a WorkerNodeEntry> {
-    let node_id = node_id?;
-    nodes.iter().find(|node| node.status.node_id == node_id)
-}
-
-pub(crate) fn worker_node_name_for_id(
-    nodes: &[WorkerNodeEntry],
-    node_names: &BTreeMap<String, String>,
-    node_id: Option<&str>,
-) -> String {
-    worker_node_for_id(nodes, node_id)
-        .map(worker_node_display_name)
-        .or_else(|| node_id.and_then(|node_id| node_names.get(node_id).cloned()))
-        .unwrap_or_else(|| "Worker node unavailable".to_owned())
-}
-
 pub(crate) fn worker_node_display_name(node: &WorkerNodeEntry) -> String {
     let role = if node.is_local {
         "Local backend"
@@ -349,42 +330,6 @@ pub(crate) fn worker_node_display_name(node: &WorkerNodeEntry) -> String {
         "External worker"
     };
     format!("{role} · {}", node.status.name)
-}
-
-pub(crate) fn format_session_resource_percentages(status: Option<&WorkerNodeStatus>) -> String {
-    let resources = status.map(|status| &status.resources);
-    format!(
-        "CPU {} · RAM {}",
-        format_percentage(resources.and_then(|resources| resources.cpu_usage_percent)),
-        format_percentage(resources.and_then(|resources| resources.memory_usage_percent)),
-    )
-}
-
-pub(crate) fn session_owner_status<'a>(
-    nodes: &'a [WorkerNodeEntry],
-    session_node_ids: &BTreeMap<AgentSessionId, String>,
-    session_id: AgentSessionId,
-) -> Option<&'a WorkerNodeEntry> {
-    worker_node_for_id(nodes, session_node_ids.get(&session_id).map(String::as_str))
-}
-
-pub(crate) fn session_node_pulse(
-    status: Option<&WorkerNodeStatus>,
-    threshold_percent: u8,
-) -> Option<(Duration, f32)> {
-    let cpu_percent = status
-        .filter(|status| status.online)
-        .and_then(|status| status.resources.cpu_usage_percent)
-        .filter(|percent| *percent <= 100)?;
-    let threshold_percent = threshold_percent.min(100);
-    if cpu_percent <= threshold_percent {
-        return None;
-    }
-    let load_above_threshold = f32::from(cpu_percent - threshold_percent)
-        / f32::from(100_u8.saturating_sub(threshold_percent).max(1));
-    let period_ms = 2_600_u64 - (load_above_threshold * 800.) as u64;
-    let amplitude = 0.35 + load_above_threshold * 0.8;
-    Some((Duration::from_millis(period_ms), amplitude))
 }
 
 pub(crate) fn next_severe_load_streak(current: u8, resources: &WorkerNodeResources) -> u8 {
@@ -405,19 +350,6 @@ pub(crate) fn adjusted_project_agent_concurrency(current: u8, delta: i8) -> u8 {
         i16::from(loom_protocol::MIN_PROJECT_AGENT_CONCURRENCY),
         i16::from(loom_protocol::MAX_PROJECT_AGENT_CONCURRENCY),
     ) as u8
-}
-
-pub(crate) fn session_node_indicator_state(
-    status: Option<&WorkerNodeStatus>,
-    severe_load_streak: u8,
-) -> SessionNodeIndicatorState {
-    match status {
-        Some(status) if status.online && severe_load_streak >= 3 => {
-            SessionNodeIndicatorState::Severe
-        }
-        Some(status) if status.online => SessionNodeIndicatorState::Online,
-        _ => SessionNodeIndicatorState::Offline,
-    }
 }
 
 #[cfg(test)]
@@ -495,6 +427,18 @@ pub(crate) fn timeline_items_from_messages(
                 MessageRole::User if message.name.as_deref() == Some("loom_project_message") => {
                     project_boundary = true;
                 }
+                // A completion guard is also orchestration traffic, but it
+                // starts a fresh assistant reply rather than continuing one.
+                MessageRole::User
+                    if message.name.as_deref() == Some("loom_project_completion_guard") =>
+                {
+                    project_boundary = true;
+                }
+                // Resuming an output-truncated turn is the same assistant
+                // answer, so hide the scaffolding prompt without starting a new
+                // turn: the continuation text merges into the turn above.
+                MessageRole::User
+                    if message.name.as_deref() == Some("loom_output_limit_continuation") => {}
                 MessageRole::User => timeline.push(TimelineItem::User(message.content)),
                 MessageRole::Assistant => {
                     let reasoning = message
@@ -967,6 +911,13 @@ pub(crate) fn about_git_revision() -> &'static str {
     option_env!("LOOM_GIT_REVISION").unwrap_or("unknown")
 }
 
+/// The release version stamped by `build.rs`, or the crate version when the
+/// build did not stamp one. Releases are tagged `v0.8.x` while the workspace
+/// version is `0.1.0`, so the stamped value is what a released binary reports.
+pub(crate) fn about_build_version() -> &'static str {
+    option_env!("LOOM_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
 /// The Version row: the crate version, plus the revision when one was stamped.
 pub(crate) fn about_version_label(version: &str, revision: &str) -> String {
     let revision = revision.trim();
@@ -1178,6 +1129,32 @@ pub(crate) fn render_timeline_text(id: String, text: String, color: u32) -> gpui
     }
 }
 
+/// Whether text contains block-level Markdown whose intrinsic width collapses
+/// inside a content-sized container (lists, fenced code, tables). A list body
+/// uses `flex_1`, which contributes nothing to a parent's max-content width, so
+/// a right-aligned chat bubble sized to its content shrinks to the item marker
+/// and character-wraps. Callers give such a container a definite width.
+pub(crate) fn has_block_markdown(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("- ")
+            || line.starts_with("* ")
+            || line.starts_with("+ ")
+            || line.starts_with("```")
+            || line.starts_with("~~~")
+            || line.starts_with('|')
+            || ordered_list_marker(line)
+    })
+}
+
+fn ordered_list_marker(line: &str) -> bool {
+    let digits = line
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    digits > 0 && (line[digits..].starts_with(". ") || line[digits..].starts_with(") "))
+}
+
 /// A monospace code block with a line-number gutter and horizontal scrolling.
 pub(crate) fn render_code_block(
     id: impl Into<gpui_kit::ElementId>,
@@ -1266,6 +1243,24 @@ pub(crate) fn tool_output_language(part: &ToolPart) -> Language {
     }
 }
 
+/// The chevron for a collapsible row: pointing down when expanded and right
+/// when collapsed.
+///
+/// Drawn as an SVG icon rather than the Unicode down-arrowhead/angle glyphs
+/// those rows used to show. The browser build has no system font fallback for
+/// geometric symbols, and the bundled faces do not cover the down-arrowhead,
+/// so the browser client rendered it blank.
+pub(crate) fn disclosure_chevron(expanded: bool, color: Rgba) -> Icon {
+    Icon::new(if expanded {
+        AssetIconName::ChevronDown
+    } else {
+        AssetIconName::ChevronRight
+    })
+    .size_3()
+    .flex_shrink_0()
+    .text_color(color)
+}
+
 /// The icon shown for a tool, by tool name.
 pub(crate) fn tool_icon(name: &str) -> AssetIconName {
     match name {
@@ -1278,6 +1273,16 @@ pub(crate) fn tool_icon(name: &str) -> AssetIconName {
         "github_get_pull_request" => AssetIconName::GitBranch,
         "github_create_pull_request" => AssetIconName::GitMerge,
         "github_push_branch" => AssetIconName::ArrowUp,
+        "github_list_issues" => AssetIconName::List,
+        "github_get_issue" => AssetIconName::FileText,
+        "github_get_comments" => AssetIconName::MessageSquare,
+        "github_create_issue" => AssetIconName::List,
+        "github_update_issue" => AssetIconName::Pencil,
+        "github_comment" => AssetIconName::MessageSquare,
+        "github_update_pull_request" => AssetIconName::Pencil,
+        "github_mark_pull_request_ready_for_review" => AssetIconName::Check,
+        "github_add_labels" => AssetIconName::List,
+        "github_remove_labels" => AssetIconName::List,
         "web_search" => AssetIconName::Globe,
         "run_command" => AssetIconName::SquareTerminal,
         "propose_plan" => AssetIconName::ListChecks,
@@ -1306,6 +1311,18 @@ pub(crate) fn tool_group_label(name: &str, count: usize) -> String {
         "github_get_pull_request" => format!("Read {count} pull requests"),
         "github_create_pull_request" => format!("Opened {count} pull requests"),
         "github_push_branch" => format!("Pushed {count} branches"),
+        "github_list_issues" => format!("Listed issues {count} times"),
+        "github_get_issue" => format!("Read {count} issues"),
+        "github_get_comments" => format!("Read comments {count} times"),
+        "github_create_issue" => format!("Opened {count} issues"),
+        "github_update_issue" => format!("Updated {count} issues"),
+        "github_comment" => format!("Commented {count} times"),
+        "github_update_pull_request" => format!("Updated {count} pull requests"),
+        "github_mark_pull_request_ready_for_review" => {
+            format!("Marked {count} pull requests ready")
+        }
+        "github_add_labels" => format!("Labeled {count} times"),
+        "github_remove_labels" => format!("Unlabeled {count} times"),
         "run_command" => format!("Ran {count} commands"),
         "web_search" => format!("Searched the web {count} times"),
         "propose_plan" => format!("Proposed {count} plans"),
@@ -1337,6 +1354,16 @@ pub(crate) fn tool_usage_label(name: &str) -> &str {
         "github_get_pull_request" => "Read PR",
         "github_create_pull_request" => "Open PR",
         "github_push_branch" => "Push",
+        "github_list_issues" => "List issues",
+        "github_get_issue" => "Read issue",
+        "github_get_comments" => "Read comments",
+        "github_create_issue" => "Open issue",
+        "github_update_issue" => "Update issue",
+        "github_comment" => "Comment",
+        "github_update_pull_request" => "Update PR",
+        "github_mark_pull_request_ready_for_review" => "Ready PR",
+        "github_add_labels" => "Label",
+        "github_remove_labels" => "Unlabel",
         "run_command" => "Run",
         "web_search" => "Web search",
         "propose_plan" => "Plan",
@@ -1616,7 +1643,17 @@ pub(crate) fn tool_detail(call: &loom_model::ToolCall) -> Option<String> {
         | "github_list_pull_requests"
         | "github_get_pull_request"
         | "github_create_pull_request"
-        | "github_push_branch" => None,
+        | "github_push_branch"
+        | "github_list_issues"
+        | "github_get_issue"
+        | "github_get_comments"
+        | "github_create_issue"
+        | "github_update_issue"
+        | "github_comment"
+        | "github_update_pull_request"
+        | "github_mark_pull_request_ready_for_review"
+        | "github_add_labels"
+        | "github_remove_labels" => None,
         _ => match &call.arguments {
             serde_json::Value::Null => None,
             serde_json::Value::Object(map) if map.is_empty() => None,
@@ -1916,7 +1953,7 @@ pub(crate) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
             string_argument(arguments, "base"),
         ) {
             (Some(repository), Some(head), Some(base)) => {
-                format!("Open {head} → {base} in {repository}")
+                format!("Open {head} -> {base} in {repository}")
             }
             (Some(repository), _, _) => format!("Open pull request in {repository}"),
             _ => "Open pull request".to_owned(),
@@ -1930,7 +1967,55 @@ pub(crate) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
             (None, Some(branch)) => format!("Push {branch}"),
             (None, None) => "Push branch".to_owned(),
         },
+        "github_list_issues" => string_argument(arguments, "repository").map_or_else(
+            || "List issues".to_owned(),
+            |repository| format!("List issues in {repository}"),
+        ),
+        "github_get_issue" => github_number_title(arguments, "Read"),
+        "github_get_comments" => {
+            let repository = string_argument(arguments, "repository");
+            let number = arguments.get("number").and_then(serde_json::Value::as_u64);
+            match (repository, number) {
+                (Some(repository), Some(number)) => {
+                    format!("Read comments on {repository}#{number}")
+                }
+                (Some(repository), None) => format!("Read comments in {repository}"),
+                _ => "Read comments".to_owned(),
+            }
+        }
+        "github_create_issue" => string_argument(arguments, "repository").map_or_else(
+            || "Open issue".to_owned(),
+            |repository| format!("Open issue in {repository}"),
+        ),
+        "github_update_issue" => github_number_title(arguments, "Update"),
+        "github_comment" => github_number_title(arguments, "Comment on"),
+        "github_update_pull_request" => github_number_title(arguments, "Update"),
+        "github_mark_pull_request_ready_for_review" => {
+            let repository = string_argument(arguments, "repository");
+            let number = arguments.get("number").and_then(serde_json::Value::as_u64);
+            match (repository, number) {
+                (Some(repository), Some(number)) => {
+                    format!("Mark {repository}#{number} ready for review")
+                }
+                (Some(repository), None) => format!("Mark pull request in {repository} ready"),
+                _ => "Mark pull request ready for review".to_owned(),
+            }
+        }
+        "github_add_labels" => github_number_title(arguments, "Label"),
+        "github_remove_labels" => github_number_title(arguments, "Remove labels from"),
         other => other.to_owned(),
+    }
+}
+
+/// Renders `verb owner/name#number`, degrading gracefully when either field is
+/// missing from the arguments.
+fn github_number_title(arguments: &serde_json::Value, verb: &str) -> String {
+    let repository = string_argument(arguments, "repository");
+    let number = arguments.get("number").and_then(serde_json::Value::as_u64);
+    match (repository, number) {
+        (Some(repository), Some(number)) => format!("{verb} {repository}#{number}"),
+        (Some(repository), None) => format!("{verb} {repository}"),
+        _ => verb.to_owned(),
     }
 }
 

@@ -1,21 +1,37 @@
 use super::*;
 
-/// User-supplied system instructions with the server-owned built-in tool
-/// guidance appended. The guidance is derived from the tools actually
-/// advertised this step, so it stays consistent with the request without being
-/// persisted or duplicated into the stored transcript prefix.
-pub(crate) fn system_instructions_with_tool_guidance(
+/// Loom-owned tone and behavior block sent with every model request, whether or
+/// not a client supplied its own system instructions. It is composed per step,
+/// so it is never persisted or duplicated into the stored transcript prefix or
+/// the run configuration.
+pub(crate) const GENERAL_AGENT_INSTRUCTIONS: &str = r#"General agent instructions:
+- Be concise and factual. No small talk, no emojis, no "hope this helps", no apologies.
+- Use a neutral, technical tone. Keep the language simple; avoid jargon.
+- Prefer bullet points and short paragraphs.
+- If uncertain, say "Unknown" and list what you would need to confirm.
+- Do not anthropomorphize; no feelings, opinions, or motivations.
+- When giving steps, use numbered lists.
+- When proposing code, include only the minimal code needed and explain assumptions briefly."#;
+
+/// User-supplied system instructions followed by the server-owned built-in
+/// blocks: the general agent instructions and the tool guidance derived from the
+/// tools actually advertised this step. The built-in blocks are composed in a
+/// stable order and separated by a blank line, so they stay consistent with the
+/// request without being persisted or duplicated into the stored transcript
+/// prefix. The result is never empty.
+pub(crate) fn system_instructions_with_builtin_guidance(
     system_instructions: Option<&str>,
     tools: &[loom_model::ToolDefinition],
-) -> Option<String> {
-    let system_instructions = system_instructions.filter(|text| !text.trim().is_empty());
-    match (system_instructions, loom_tools::tool_guidance(tools)) {
-        (Some(system_instructions), Some(guidance)) => {
-            Some(format!("{system_instructions}\n\n{guidance}"))
-        }
-        (Some(system_instructions), None) => Some(system_instructions.to_owned()),
-        (None, guidance) => guidance,
+) -> String {
+    let mut blocks = Vec::with_capacity(3);
+    if let Some(system_instructions) = system_instructions.filter(|text| !text.trim().is_empty()) {
+        blocks.push(system_instructions.to_owned());
     }
+    blocks.push(GENERAL_AGENT_INSTRUCTIONS.to_owned());
+    if let Some(guidance) = loom_tools::tool_guidance(tools) {
+        blocks.push(guidance);
+    }
+    blocks.join("\n\n")
 }
 
 impl AgentRuntime {
@@ -941,7 +957,7 @@ impl AgentRuntime {
         } else {
             Vec::new()
         };
-        let system_instructions = system_instructions_with_tool_guidance(
+        let system_instructions = system_instructions_with_builtin_guidance(
             self.task.system_instructions.as_deref(),
             &tools,
         );
@@ -966,7 +982,7 @@ impl AgentRuntime {
         };
         let assembly = ContextAssembler::assemble_with_counter(
             &ContextInput {
-                system_instructions,
+                system_instructions: Some(system_instructions),
                 repository_instructions: self.task.repository_instructions.clone(),
                 task: self.task.task.clone(),
                 conversation: conversation[boundary..].to_vec(),

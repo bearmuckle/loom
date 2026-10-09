@@ -67,32 +67,6 @@ impl LoomView {
                 element.child(self.render_status_banner(&banner, cx))
             })
             .child(self.render_run_status())
-            .when_some(self.context_inspection.as_ref(), |element, inspection| {
-                let budget = inspection.budget.effective_input_tokens.map_or_else(
-                    || "unknown budget".to_owned(),
-                    |limit| format!("{limit} input tokens"),
-                );
-                let fallback = if inspection
-                    .items
-                    .iter()
-                    .any(|item| item.label.contains("fallback"))
-                {
-                    " · model limit unknown; conservative estimate"
-                } else {
-                    ""
-                };
-                element.child(
-                    div()
-                        .id("context-usage")
-                        .text_xs()
-                        .text_color(rgb(0x8f98a6))
-                        .mb_2()
-                        .child(format!(
-                            "Context ≈ {} / {budget} · {} reserved for output{fallback}",
-                            inspection.included_tokens, inspection.budget.reserved_output_tokens
-                        )),
-                )
-            })
             .when_some(self.composer_completion.clone(), |element, completion| {
                 element.child(
                     div()
@@ -189,7 +163,6 @@ impl LoomView {
                                     // row instead of dropping onto a mostly empty
                                     // second row.
                                     .when(layout.phone, |element| element.flex_1())
-                                    .child(self.render_agent_mode_picker(layout.phone))
                                     .child(self.render_model_picker(layout.phone, cx))
                                     .child(
                                         Button::new("open-command-palette")
@@ -242,7 +215,7 @@ impl LoomView {
                                                     .w(layout.control_size())
                                             })
                                             .when(!layout.phone, |button| button.small())
-                                            .tooltip("Send (↵)")
+                                            .tooltip("Send (Enter)")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.submit_composer(cx);
                                             })),

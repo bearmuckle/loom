@@ -17,6 +17,7 @@ impl TimelineView {
         item_count: usize,
         timeline_revision: (usize, usize),
         session_changed: bool,
+        prepend_count: usize,
         cx: &mut Context<Self>,
     ) {
         let content_changed = self.timeline_revision != timeline_revision;
@@ -26,8 +27,14 @@ impl TimelineView {
             self.scroller
                 .update(cx, |state, cx| state.reset(item_count, cx));
         } else if item_count > current {
-            self.scroller
-                .update(cx, |state, cx| state.append(item_count - current, cx));
+            let added = item_count - current;
+            self.scroller.update(cx, |state, cx| {
+                if prepend_count > 0 {
+                    state.prepend(added, cx);
+                } else {
+                    state.append(added, cx);
+                }
+            });
         } else if content_changed {
             self.scroller.update(cx, |state, cx| state.remeasure(cx));
         }
@@ -45,7 +52,7 @@ impl Render for TimelineView {
             self.scroller_subscription = Some(cx.observe(&scroller, |_, _, cx| cx.notify()));
         }
 
-        let (item_count, session_changed, timeline_revision) = {
+        let (item_count, session_changed, timeline_revision, prepend_count) = {
             let parent_state = self.parent.read(cx);
             let item_count = parent_state.timeline.len();
             let session_id = parent_state.active_session.id;
@@ -61,9 +68,24 @@ impl Render for TimelineView {
                     .map(|item| format!("{item:?}").len())
                     .unwrap_or_default(),
             );
-            (item_count, session_changed, timeline_revision)
+            (
+                item_count,
+                session_changed,
+                timeline_revision,
+                parent_state.transcript_prepend_count,
+            )
         };
-        self.sync_list(item_count, timeline_revision, session_changed, cx);
+        self.sync_list(
+            item_count,
+            timeline_revision,
+            session_changed,
+            prepend_count,
+            cx,
+        );
+        if prepend_count > 0 {
+            self.parent
+                .update(cx, |view, _| view.transcript_prepend_count = 0);
+        }
         if item_count == 0 {
             div()
                 .size_full()
@@ -82,18 +104,18 @@ impl Render for TimelineView {
                                 .bg(rgb(0x171c25))
                                 .border_1()
                                 .border_color(rgb(0x293244))
-                                .text_size(gpui_kit::rems(14. / BASE_FONT_SIZE))
+                                .text_size(gpui_kit::rems(13. / BASE_FONT_SIZE))
                                 .text_color(rgb(0xb7c0d0))
                                 .child(
                                     div()
-                                        .text_size(gpui_kit::rems(16. / BASE_FONT_SIZE))
+                                        .text_size(gpui_kit::rems(15. / BASE_FONT_SIZE))
                                         .text_color(rgb(0xf3f4f6))
                                         .child("Ready when you are"),
                                 )
                                 .child(
                                     div()
                                         .mt_1()
-                                        .text_size(gpui_kit::rems(14. / BASE_FONT_SIZE))
+                                        .text_size(gpui_kit::rems(13. / BASE_FONT_SIZE))
                                         .text_color(rgb(0x8f98a6))
                                         .child("Describe a task below and Loom will keep the work, decisions, and results together."),
                                 )
@@ -102,7 +124,7 @@ impl Render for TimelineView {
                                         .mt_3()
                                         .flex()
                                         .gap_3()
-                                        .text_size(gpui_kit::rems(13. / BASE_FONT_SIZE))
+                                        .text_size(gpui_kit::rems(12. / BASE_FONT_SIZE))
                                         .text_color(rgb(0x64748b))
                                         .child("/ commands")
                                         .child("@ files")
@@ -115,15 +137,13 @@ impl Render for TimelineView {
                 )
                 .into_any_element()
         } else {
-            let (transcript_has_older, transcript_loading) = {
-                let parent_state = self.parent.read(cx);
-                (
-                    parent_state.transcript_has_older,
-                    parent_state.transcript_loading,
-                )
-            };
-            let parent = self.parent.clone();
-            let parent_for_rows = parent.clone();
+            // Load older pages automatically once the reader scrolls up to the
+            // oldest loaded row, instead of surfacing a manual button. The row
+            // renderer only runs for visible rows, so index 0 marks the top.
+            let scrolled_up = self.scroller.read(cx).is_scrolled_up();
+            let transcript_has_older = self.parent.read(cx).transcript_has_older;
+            let autoload_older = transcript_has_older && scrolled_up;
+            let parent_for_rows = self.parent.clone();
             let row_style = gpui_kit::StyleRefinement {
                 padding: gpui_kit::EdgesRefinement {
                     top: Some(px(0.).into()),
@@ -137,6 +157,12 @@ impl Render for TimelineView {
                 "timeline-scroller",
                 self.scroller.clone(),
                 move |index, _window, cx| {
+                    if index == 0 && autoload_older {
+                        let parent = parent_for_rows.clone();
+                        cx.defer(move |cx| {
+                            parent.update(cx, |view, cx| view.autoload_older_transcript(cx));
+                        });
+                    }
                     let view = parent_for_rows.read(cx);
                     let item = &view.timeline[index];
                     div()
@@ -155,45 +181,10 @@ impl Render for TimelineView {
             .with_row_style(row_style)
             .with_jump_button_label("Jump to latest")
             .with_bottom_fade(gpui_kit::Hsla::from(rgb(0x111318)));
-            // Only surface paging once we know there is more history. The
-            // automatic first-page load on session select reuses
-            // `transcript_loading` but must not flash a "Loading older messages"
-            // control.
-            let content = if transcript_has_older {
-                let parent_for_page = parent.clone();
-                div()
-                    .size_full()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div().w_full().flex().justify_center().p_2().child(
-                            Button::new("load-older-transcript")
-                                .label(if transcript_loading {
-                                    "Loading older messages…"
-                                } else {
-                                    "Load older messages"
-                                })
-                                .small()
-                                .disabled(transcript_loading)
-                                .on_click(move |_, _, cx| {
-                                    parent_for_page.update(cx, |view, cx| {
-                                        view.begin_transcript_page(
-                                            view.transcript_before_ordinal,
-                                            cx,
-                                        );
-                                    });
-                                }),
-                        ),
-                    )
-                    .child(div().flex_1().min_h_0().child(timeline))
-                    .into_any()
-            } else {
-                timeline.into_any_element()
-            };
             div()
                 .size_full()
                 .relative()
-                .child(content)
+                .child(timeline)
                 .into_any_element()
         }
     }

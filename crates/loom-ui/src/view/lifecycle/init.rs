@@ -21,7 +21,11 @@ impl LoomView {
             let token = options.token.as_deref().ok_or_else(|| {
                 LoomError::invalid_request("remote connections require LOOM_TOKEN to be set")
             })?;
-            let connection = ClientConnection::remote(remote_url.clone(), token.to_owned())?;
+            let connection = ClientConnection::remote(
+                remote_url.clone(),
+                token.to_owned(),
+                &remote_connection_options(options),
+            )?;
             remote_cleanup_guard = Some(ConnectionCleanupGuard::new(connection.clone()));
             info!("remote transport connected; negotiating protocol");
             server_protocol_version = Some(negotiate(&connection)?.protocol_version);
@@ -228,6 +232,7 @@ impl LoomView {
             owned_backend: None,
             server_protocol_version,
             backend_endpoint,
+            remote_options: remote_connection_options(options),
             browser_client: false,
             default_backend_node_id: default_backend_node_id.clone(),
             node_backends,
@@ -260,7 +265,6 @@ impl LoomView {
             context_inspection: None,
             default_model: model.clone(),
             session_models: BTreeMap::new(),
-            agent_mode: AgentMode::Agent,
             auto_approve_actions: true,
             session_auto_approve_actions: BTreeMap::new(),
             session_task_cache: BTreeMap::new(),
@@ -288,8 +292,6 @@ impl LoomView {
             default_model_select_value: None,
             model_select_choices: BTreeMap::new(),
             default_model_select_choices: BTreeMap::new(),
-            agent_mode_select: None,
-            agent_mode_select_subscription: None,
             settings_open: false,
             settings_section: SettingsSection::Agents,
             providers: Vec::new(),
@@ -310,6 +312,7 @@ impl LoomView {
             transcript_has_older: false,
             transcript_loading: false,
             transcript_generation: 0,
+            transcript_prepend_count: 0,
             timeline_view: None,
             plan: None,
             plan_collapsed: false,
@@ -381,6 +384,9 @@ impl LoomView {
         if has_session {
             view.load_session(active_session);
         }
+        // Cover every project so delegated sub-tasks nest in the sidebar tree
+        // from the first frame, not just the active project's.
+        view.refresh_project_snapshots();
         info!("initial session state loaded");
         if let Some(guard) = &mut remote_cleanup_guard {
             guard.disarm();
@@ -456,7 +462,6 @@ impl LoomView {
                 ModelId::new("default")
             },
             session_models: BTreeMap::new(),
-            agent_mode: AgentMode::Agent,
             auto_approve_actions: true,
             session_auto_approve_actions: BTreeMap::new(),
             session_task_cache: BTreeMap::new(),
@@ -493,8 +498,6 @@ impl LoomView {
             default_model_select_value: None,
             model_select_choices: BTreeMap::new(),
             default_model_select_choices: BTreeMap::new(),
-            agent_mode_select: None,
-            agent_mode_select_subscription: None,
             settings_open: options.is_configured(),
             settings_section: SettingsSection::Agents,
             providers: Vec::new(),
@@ -524,6 +527,7 @@ impl LoomView {
             transcript_has_older: false,
             transcript_loading: false,
             transcript_generation: 0,
+            transcript_prepend_count: 0,
             timeline_view: None,
             plan: None,
             plan_collapsed: false,
@@ -731,7 +735,6 @@ impl LoomView {
             context_inspection: None,
             default_model: model.clone(),
             session_models: BTreeMap::new(),
-            agent_mode: AgentMode::Agent,
             auto_approve_actions: true,
             session_auto_approve_actions: BTreeMap::new(),
             session_task_cache: BTreeMap::new(),
@@ -759,8 +762,6 @@ impl LoomView {
             default_model_select_value: None,
             model_select_choices: BTreeMap::new(),
             default_model_select_choices: BTreeMap::new(),
-            agent_mode_select: None,
-            agent_mode_select_subscription: None,
             settings_open: false,
             settings_section: SettingsSection::Agents,
             providers: Vec::new(),
@@ -781,6 +782,7 @@ impl LoomView {
             transcript_has_older: false,
             transcript_loading: false,
             transcript_generation: 0,
+            transcript_prepend_count: 0,
             timeline_view: None,
             plan: None,
             plan_collapsed: false,
@@ -996,6 +998,7 @@ impl LoomView {
             return;
         };
         let workspace_id = self.workspace_id;
+        let remote_options = self.remote_options.clone();
         let submitted_value = value;
         let node_url = url.clone();
         let connect_url = url.clone();
@@ -1004,7 +1007,7 @@ impl LoomView {
             let result = cx
                 .background_spawn(async move {
                     let connection =
-                        ClientConnection::remote(connect_url, token.clone())
+                        ClientConnection::remote(connect_url, token.clone(), &remote_options)
                         .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
                     if let Err(error) = negotiate(&connection).map(|_| ()) {
                         let cleanup_failed = connection.close().is_err();

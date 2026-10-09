@@ -89,6 +89,28 @@ impl Frame {
         hasher.finish()
     }
 
+    /// The longest run of light pixels on any row in the right half of the
+    /// frame, used to measure a right-aligned surface such as a chat bubble.
+    fn widest_light_run_right_half(&self) -> u32 {
+        let mut widest = 0;
+        for y in 0..self.height {
+            let mut run = 0;
+            for x in self.width / 2..self.width {
+                let offset = ((y * self.width + x) * 4) as usize;
+                let sum = u32::from(self.rgba[offset])
+                    + u32::from(self.rgba[offset + 1])
+                    + u32::from(self.rgba[offset + 2]);
+                if sum > 300 {
+                    run += 1;
+                    widest = widest.max(run);
+                } else {
+                    run = 0;
+                }
+            }
+        }
+        widest
+    }
+
     /// GPUI renders at the platform scale factor, so only the aspect ratio of
     /// the logical window is fixed.
     fn has_aspect_ratio(&self, logical_width: u32, logical_height: u32) -> bool {
@@ -272,6 +294,31 @@ fn missing_icon_assets_change_the_frame() {
         real.fingerprint(),
         blank.fingerprint(),
         "replacing every icon with an empty SVG must change the frame"
+    );
+}
+
+#[test]
+fn numbered_list_user_bubble_does_not_collapse() {
+    let plain = capture(|view| {
+        view.sessions = vec![view.active_session.clone()];
+        view.timeline = vec![TimelineItem::User("Run the tests".to_owned())];
+    });
+    let list = capture(|view| {
+        view.sessions = vec![view.active_session.clone()];
+        view.timeline = vec![TimelineItem::User(
+            "1. First item that is reasonably long\n2. Second item that is also reasonably long to wrap"
+                .to_owned(),
+        )];
+    });
+    let list_width = list.widest_light_run_right_half();
+    let plain_width = plain.widest_light_run_right_half();
+    assert!(
+        list_width > 700,
+        "the numbered-list bubble collapsed to {list_width}px"
+    );
+    assert!(
+        plain_width < list_width,
+        "a short message stays content-sized ({plain_width}px) while a list takes a definite width ({list_width}px)"
     );
 }
 

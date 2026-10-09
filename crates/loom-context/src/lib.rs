@@ -8,6 +8,12 @@ pub use loom_protocol::{
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_OUTPUT_RESERVE: u64 = 1_024;
+/// Upper bound for the default output reserve when a model does not advertise a
+/// completion cap. A 1,024-token reserve is too small for thinking models: they
+/// can spend the whole budget on reasoning and return `finish_reason=length`
+/// before emitting anything usable. Deriving the reserve from the context window
+/// keeps a useful completion budget without starving the input.
+const MAX_DEFAULT_OUTPUT_RESERVE: u64 = 8_192;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContextAssembly {
@@ -228,25 +234,68 @@ impl ContextAssembler {
                 Ok(())
             })();
             if let Err(error) = outcome {
-                if total_tokens > limit {
-                    return Err(error);
+                if total_tokens <= limit {
+                    // Headroom is a preference. Do not reject a valid request
+                    // just because its newest exchange cannot be compacted
+                    // further.
+                    conversation = input.conversation.clone();
+                    start = 0;
+                    compacted = false;
+                    pinned_user = input
+                        .latest_user_message
+                        .as_ref()
+                        .map(|text| ModelMessage::new(MessageRole::User, text));
+                    summary = prior.map(|text| ContextSummary {
+                        text: text.to_owned(),
+                        source_message_count: 0,
+                        projection_version: 0,
+                        source_digest: String::new(),
+                        created_at: Timestamp::now(),
+                    });
+                } else {
+                    // The request no longer fits even after the preferred
+                    // compaction. Force a full compaction: fold the whole
+                    // conversation into the bounded summary and keep only the
+                    // instructions plus the latest user direction. The model
+                    // can re-read sources for detail; the run no longer fails.
+                    let full_start = input.conversation.len();
+                    let excerpts = compact_messages(&input.conversation);
+                    let text = match prior {
+                        Some(previous) => {
+                            format!("{}\n{}", bounded_excerpt(previous, 2_048), excerpts.text)
+                        }
+                        None => excerpts.text,
+                    };
+                    let summary_budget = (limit.saturating_sub(required) / 4).clamp(16, 1_024);
+                    let text =
+                        fit_text(&text, summary_budget, |text| count(&summary_message(text)));
+                    let pinned_extra = input
+                        .conversation
+                        .iter()
+                        .rposition(|message| message.role == MessageRole::User)
+                        .map(|index| input.conversation[index].clone());
+                    let candidate = required
+                        .saturating_add(count(&summary_message(&text)))
+                        .saturating_add(pinned_extra.as_ref().map_or(0, &count));
+                    if text.is_empty()
+                        || count(&summary_message(&text)) > summary_budget
+                        || candidate > limit
+                    {
+                        return Err(error);
+                    }
+                    start = full_start;
+                    compacted = true;
+                    if let Some(message) = pinned_extra {
+                        pinned_user = Some(message);
+                    }
+                    summary = Some(ContextSummary {
+                        text,
+                        source_message_count: start,
+                        projection_version: 0,
+                        source_digest: String::new(),
+                        created_at: Timestamp::now(),
+                    });
                 }
-                // Headroom is a preference. Do not reject a valid request just
-                // because its newest exchange cannot be compacted further.
-                conversation = input.conversation.clone();
-                start = 0;
-                compacted = false;
-                pinned_user = input
-                    .latest_user_message
-                    .as_ref()
-                    .map(|text| ModelMessage::new(MessageRole::User, text));
-                summary = prior.map(|text| ContextSummary {
-                    text: text.to_owned(),
-                    source_message_count: 0,
-                    projection_version: 0,
-                    source_digest: String::new(),
-                    created_at: Timestamp::now(),
-                });
             }
         }
         if let Some(summary) = &summary {
@@ -340,7 +389,7 @@ pub fn output_reserve(options: &ContextAssemblyOptions) -> u64 {
         options
             .context_window
             .map_or(DEFAULT_OUTPUT_RESERVE, |window| {
-                (window / 4).clamp(1, DEFAULT_OUTPUT_RESERVE)
+                (window / 4).clamp(1, MAX_DEFAULT_OUTPUT_RESERVE)
             })
     })
 }
@@ -533,7 +582,16 @@ mod tests {
         };
         assert_eq!(output_reserve_for_model(&options, Some(8_192)), 8_192);
         assert_eq!(output_reserve_for_model(&options, Some(64_000)), 31_999);
-        assert_eq!(output_reserve_for_model(&options, None), 1_024);
+        // Without an advertised cap the reserve scales with the window instead
+        // of collapsing to the 1,024-token unknown-model floor, which is too
+        // small for thinking models that spend output on reasoning.
+        assert_eq!(output_reserve_for_model(&options, None), 8_000);
+        assert!(output_reserve_for_model(&options, None) > DEFAULT_OUTPUT_RESERVE);
+        // A model with no known window still uses the conservative default.
+        assert_eq!(
+            output_reserve_for_model(&ContextAssemblyOptions::default(), None),
+            DEFAULT_OUTPUT_RESERVE
+        );
 
         let requested = ContextAssemblyOptions {
             reserved_output_tokens: Some(16_000),
@@ -774,5 +832,51 @@ mod tests {
         assert!(assembly.inspection.compacted);
         assert_eq!(assembly.messages.last(), input.conversation.last());
         assert!(assembly.inspection.within_budget());
+    }
+
+    #[test]
+    fn forces_a_full_compaction_when_the_newest_exchange_leaves_no_summary_room() {
+        // The newest exchange nearly fills the budget, so the preferred
+        // compaction cannot also fit a summary. Instead of failing the request,
+        // the assembler folds everything into the summary.
+        let input = ContextInput {
+            task: "Task".to_owned(),
+            conversation: vec![
+                ModelMessage::new(MessageRole::Assistant, "o".repeat(20)),
+                ModelMessage::new(MessageRole::Assistant, "n".repeat(978)),
+            ],
+            ..Default::default()
+        };
+        let count = |message: &ModelMessage| message.content.len() as u64 + 1;
+        let assembly =
+            ContextAssembler::assemble_with_counter(&input, &options(1000), count).unwrap();
+        assert!(assembly.inspection.compacted);
+        assert!(assembly.inspection.within_budget());
+        let summary = assembly.inspection.summary.expect("forced summary");
+        assert_eq!(summary.source_message_count, input.conversation.len());
+        assert!(
+            assembly
+                .messages
+                .iter()
+                .all(|message| message.role != MessageRole::Assistant),
+            "the oversized conversation is folded into the summary"
+        );
+        assert!(assembly.inspection.omitted_tokens > 0);
+    }
+
+    #[test]
+    fn full_compaction_still_fails_when_instructions_leave_no_summary_room() {
+        // The task alone nearly fills the budget, so even folding the whole
+        // conversation into a summary cannot fit. The request fails cleanly
+        // instead of returning an over-budget prompt.
+        let input = ContextInput {
+            task: "t".repeat(89),
+            conversation: vec![ModelMessage::new(MessageRole::Assistant, "x".repeat(500))],
+            ..Default::default()
+        };
+        let count = |message: &ModelMessage| message.content.len() as u64 + 1;
+        let error =
+            ContextAssembler::assemble_with_counter(&input, &options(100), count).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ContextLimitExceeded);
     }
 }

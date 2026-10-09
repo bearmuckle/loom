@@ -1297,7 +1297,7 @@ impl LoomView {
                                 .gap_2()
                                 .child(
                                     Button::new("font-scale-decrease")
-                                        .label("−")
+                                        .label("-")
                                         .small()
                                         .disabled(self.font_scale_percent <= MIN_FONT_SCALE_PERCENT)
                                         .on_click(cx.listener(|this, _, window, cx| {
@@ -1372,7 +1372,7 @@ impl LoomView {
                     self.browser_client,
                     self.backend_endpoint.as_deref(),
                 );
-                let version = about_version_label(env!("CARGO_PKG_VERSION"), about_git_revision());
+                let version = about_version_label(about_build_version(), about_git_revision());
                 let platform = about_platform_label(
                     std::env::consts::OS,
                     std::env::consts::ARCH,

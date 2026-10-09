@@ -70,6 +70,16 @@ pub enum ToolKind {
     GitHubGetPullRequest,
     GitHubCreatePullRequest,
     GitHubPushBranch,
+    GitHubListIssues,
+    GitHubGetIssue,
+    GitHubGetComments,
+    GitHubCreateIssue,
+    GitHubUpdateIssue,
+    GitHubComment,
+    GitHubUpdatePullRequest,
+    GitHubMarkPullRequestReadyForReview,
+    GitHubAddLabels,
+    GitHubRemoveLabels,
 }
 
 impl ToolKind {
@@ -88,6 +98,18 @@ impl ToolKind {
             "github_get_pull_request" => Some(Self::GitHubGetPullRequest),
             "github_create_pull_request" => Some(Self::GitHubCreatePullRequest),
             "github_push_branch" => Some(Self::GitHubPushBranch),
+            "github_list_issues" => Some(Self::GitHubListIssues),
+            "github_get_issue" => Some(Self::GitHubGetIssue),
+            "github_get_comments" => Some(Self::GitHubGetComments),
+            "github_create_issue" => Some(Self::GitHubCreateIssue),
+            "github_update_issue" => Some(Self::GitHubUpdateIssue),
+            "github_comment" => Some(Self::GitHubComment),
+            "github_update_pull_request" => Some(Self::GitHubUpdatePullRequest),
+            "github_mark_pull_request_ready_for_review" => {
+                Some(Self::GitHubMarkPullRequestReadyForReview)
+            }
+            "github_add_labels" => Some(Self::GitHubAddLabels),
+            "github_remove_labels" => Some(Self::GitHubRemoveLabels),
             _ => None,
         }
     }
@@ -107,6 +129,18 @@ impl ToolKind {
             Self::GitHubGetPullRequest => "github_get_pull_request",
             Self::GitHubCreatePullRequest => "github_create_pull_request",
             Self::GitHubPushBranch => "github_push_branch",
+            Self::GitHubListIssues => "github_list_issues",
+            Self::GitHubGetIssue => "github_get_issue",
+            Self::GitHubGetComments => "github_get_comments",
+            Self::GitHubCreateIssue => "github_create_issue",
+            Self::GitHubUpdateIssue => "github_update_issue",
+            Self::GitHubComment => "github_comment",
+            Self::GitHubUpdatePullRequest => "github_update_pull_request",
+            Self::GitHubMarkPullRequestReadyForReview => {
+                "github_mark_pull_request_ready_for_review"
+            }
+            Self::GitHubAddLabels => "github_add_labels",
+            Self::GitHubRemoveLabels => "github_remove_labels",
         }
     }
 
@@ -120,6 +154,16 @@ impl ToolKind {
                 | Self::GitHubGetPullRequest
                 | Self::GitHubCreatePullRequest
                 | Self::GitHubPushBranch
+                | Self::GitHubListIssues
+                | Self::GitHubGetIssue
+                | Self::GitHubGetComments
+                | Self::GitHubCreateIssue
+                | Self::GitHubUpdateIssue
+                | Self::GitHubComment
+                | Self::GitHubUpdatePullRequest
+                | Self::GitHubMarkPullRequestReadyForReview
+                | Self::GitHubAddLabels
+                | Self::GitHubRemoveLabels
         )
     }
 
@@ -131,10 +175,21 @@ impl ToolKind {
             | Self::Glob
             | Self::ProposePlan
             | Self::AskUser => ActionKind::Read,
-            Self::WebSearch | Self::GitHubListPullRequests | Self::GitHubGetPullRequest => {
-                ActionKind::Network
-            }
-            Self::GitHubCreatePullRequest | Self::GitHubPushBranch => ActionKind::Write,
+            Self::WebSearch
+            | Self::GitHubListPullRequests
+            | Self::GitHubGetPullRequest
+            | Self::GitHubListIssues
+            | Self::GitHubGetIssue
+            | Self::GitHubGetComments => ActionKind::Network,
+            Self::GitHubCreatePullRequest
+            | Self::GitHubPushBranch
+            | Self::GitHubCreateIssue
+            | Self::GitHubUpdateIssue
+            | Self::GitHubComment
+            | Self::GitHubUpdatePullRequest
+            | Self::GitHubMarkPullRequestReadyForReview
+            | Self::GitHubAddLabels
+            | Self::GitHubRemoveLabels => ActionKind::Write,
             Self::ApplyPatch => ActionKind::Write,
             Self::RunCommand => ActionKind::Command,
         }
@@ -196,6 +251,10 @@ const GITHUB_NOT_CONNECTED: &str =
     "GitHub is not connected; connect a GitHub account in Loom settings";
 const GITHUB_WRITE_DISABLED: &str =
     "GitHub write access is disabled; enable writes and pull requests in Loom settings";
+const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com";
+/// Cap on how many comments or issues a single read pulls back, keeping the
+/// response bounded like the other list tools.
+const GITHUB_PAGE_SIZE: usize = 100;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WebSearchRequest {
@@ -338,6 +397,7 @@ pub struct ToolExecutor {
     web_search_provider: Option<Arc<dyn WebSearchProvider>>,
     github_token: Option<String>,
     github_write_enabled: bool,
+    github_api_base: String,
     extension: Option<Arc<dyn ToolExtension>>,
 }
 
@@ -356,6 +416,7 @@ impl ToolExecutor {
             web_search_provider: None,
             github_token: None,
             github_write_enabled: false,
+            github_api_base: DEFAULT_GITHUB_API_BASE.to_owned(),
             extension: None,
         }
     }
@@ -394,14 +455,26 @@ impl ToolExecutor {
         let github_connected = self.github_token.is_some();
         // Advertise only the GitHub tools this session can actually use. Every
         // GitHub tool needs a connected account; the push tool additionally
-        // requires the opt-in write grant. Pull request creation stays
-        // advertised once connected (with its existing write approval) and is
-        // refused at execution time when the grant is missing.
+        // requires the opt-in write grant. Creating and updating issues, pull
+        // requests, comments, and labels stay advertised once connected (with
+        // their existing write approval) and are refused at execution time when
+        // the grant is missing.
         definitions.retain(|definition| match ToolKind::from_name(&definition.name) {
-            Some(ToolKind::GitHubListPullRequests | ToolKind::GitHubGetPullRequest) => {
-                github_connected
-            }
-            Some(ToolKind::GitHubCreatePullRequest) => github_connected,
+            Some(
+                ToolKind::GitHubListPullRequests
+                | ToolKind::GitHubGetPullRequest
+                | ToolKind::GitHubListIssues
+                | ToolKind::GitHubGetIssue
+                | ToolKind::GitHubGetComments
+                | ToolKind::GitHubCreatePullRequest
+                | ToolKind::GitHubCreateIssue
+                | ToolKind::GitHubUpdateIssue
+                | ToolKind::GitHubComment
+                | ToolKind::GitHubUpdatePullRequest
+                | ToolKind::GitHubMarkPullRequestReadyForReview
+                | ToolKind::GitHubAddLabels
+                | ToolKind::GitHubRemoveLabels,
+            ) => github_connected,
             Some(ToolKind::GitHubPushBranch) => github_connected && self.github_write_enabled,
             _ => true,
         });
@@ -508,6 +581,18 @@ impl ToolExecutor {
             ToolKind::GitHubGetPullRequest => self.github_get_pull_request(call),
             ToolKind::GitHubCreatePullRequest => self.github_create_pull_request(call),
             ToolKind::GitHubPushBranch => self.github_push_branch(call),
+            ToolKind::GitHubListIssues => self.github_list_issues(call),
+            ToolKind::GitHubGetIssue => self.github_get_issue(call),
+            ToolKind::GitHubGetComments => self.github_get_comments(call),
+            ToolKind::GitHubCreateIssue => self.github_create_issue(call),
+            ToolKind::GitHubUpdateIssue => self.github_update_issue(call),
+            ToolKind::GitHubComment => self.github_comment(call),
+            ToolKind::GitHubUpdatePullRequest => self.github_update_pull_request(call),
+            ToolKind::GitHubMarkPullRequestReadyForReview => {
+                self.github_mark_pull_request_ready_for_review(call)
+            }
+            ToolKind::GitHubAddLabels => self.github_add_labels(call),
+            ToolKind::GitHubRemoveLabels => self.github_remove_labels(call),
         }
     }
 
@@ -1032,8 +1117,34 @@ impl ToolExecutor {
             Ok(value) => value,
             Err(error) => return ToolResult::failure(call, error),
         };
+        let comments = match self.github_api(
+            "GET",
+            &arguments.repository,
+            &format!(
+                "issues/{}/comments?per_page={GITHUB_PAGE_SIZE}",
+                arguments.number
+            ),
+            None,
+        ) {
+            Ok(value) => value,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let review_comments = match self.github_api(
+            "GET",
+            &arguments.repository,
+            &format!(
+                "pulls/{}/comments?per_page={GITHUB_PAGE_SIZE}",
+                arguments.number
+            ),
+            None,
+        ) {
+            Ok(value) => value,
+            Err(error) => return ToolResult::failure(call, error),
+        };
         let result = serde_json::json!({
             "pull_request": pull_request,
+            "comments": comments,
+            "review_comments": review_comments,
             "check_runs": check_runs,
             "commit_status": commit_status,
         });
@@ -1065,6 +1176,310 @@ impl ToolExecutor {
             Ok(value) => ToolResult::success(call, self.limit_output(value.to_string())),
             Err(error) => ToolResult::failure(call, error),
         }
+    }
+
+    fn github_list_issues(&self, call: &ToolCall) -> ToolResult {
+        let arguments: GitHubListIssuesArguments = match parse_arguments(call) {
+            Ok(arguments) => arguments,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let state = arguments.state.as_deref().unwrap_or("open");
+        if !matches!(state, "open" | "closed" | "all") {
+            return ToolResult::failure(call, "state must be open, closed, or all");
+        }
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("state", state);
+        query.append_pair("per_page", &GITHUB_PAGE_SIZE.to_string());
+        if let Some(labels) = arguments
+            .labels
+            .as_ref()
+            .filter(|labels| !labels.is_empty())
+        {
+            query.append_pair("labels", &labels.join(","));
+        }
+        let path = format!("issues?{}", query.finish());
+        match self.github_api("GET", &arguments.repository, &path, None) {
+            Ok(value) => {
+                // The issues endpoint also returns pull requests; drop them so
+                // the caller only sees issues.
+                let issues = value
+                    .as_array()
+                    .map(|issues| {
+                        issues
+                            .iter()
+                            .filter(|issue| issue.get("pull_request").is_none())
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                ToolResult::success(
+                    call,
+                    self.limit_output(serde_json::Value::Array(issues).to_string()),
+                )
+            }
+            Err(error) => ToolResult::failure(call, error),
+        }
+    }
+
+    fn github_get_issue(&self, call: &ToolCall) -> ToolResult {
+        let arguments: GitHubIssueArguments = match parse_arguments(call) {
+            Ok(arguments) => arguments,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let issue = match self.github_api(
+            "GET",
+            &arguments.repository,
+            &format!("issues/{}", arguments.number),
+            None,
+        ) {
+            Ok(value) => value,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let comments = match self.github_api(
+            "GET",
+            &arguments.repository,
+            &format!(
+                "issues/{}/comments?per_page={GITHUB_PAGE_SIZE}",
+                arguments.number
+            ),
+            None,
+        ) {
+            Ok(value) => value,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let result = serde_json::json!({ "issue": issue, "comments": comments });
+        ToolResult::success(call, self.limit_output(result.to_string()))
+    }
+
+    fn github_get_comments(&self, call: &ToolCall) -> ToolResult {
+        let arguments: GitHubIssueArguments = match parse_arguments(call) {
+            Ok(arguments) => arguments,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        match self.github_api(
+            "GET",
+            &arguments.repository,
+            &format!(
+                "issues/{}/comments?per_page={GITHUB_PAGE_SIZE}",
+                arguments.number
+            ),
+            None,
+        ) {
+            Ok(value) => ToolResult::success(call, self.limit_output(value.to_string())),
+            Err(error) => ToolResult::failure(call, error),
+        }
+    }
+
+    fn github_create_issue(&self, call: &ToolCall) -> ToolResult {
+        if !self.github_write_enabled {
+            return ToolResult::failure(call, GITHUB_WRITE_DISABLED);
+        }
+        let arguments: GitHubCreateIssueArguments = match parse_arguments(call) {
+            Ok(arguments) => arguments,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        if arguments.title.trim().is_empty() {
+            return ToolResult::failure(call, "title must not be empty");
+        }
+        let mut body = serde_json::Map::new();
+        body.insert("title".to_owned(), serde_json::json!(arguments.title));
+        if let Some(text) = arguments.body {
+            body.insert("body".to_owned(), serde_json::json!(text));
+        }
+        if let Some(labels) = arguments.labels.filter(|labels| !labels.is_empty()) {
+            body.insert("labels".to_owned(), serde_json::json!(labels));
+        }
+        match self.github_api(
+            "POST",
+            &arguments.repository,
+            "issues",
+            Some(serde_json::Value::Object(body)),
+        ) {
+            Ok(value) => ToolResult::success(call, self.limit_output(value.to_string())),
+            Err(error) => ToolResult::failure(call, error),
+        }
+    }
+
+    fn github_update_issue(&self, call: &ToolCall) -> ToolResult {
+        if !self.github_write_enabled {
+            return ToolResult::failure(call, GITHUB_WRITE_DISABLED);
+        }
+        let arguments: GitHubUpdateIssueArguments = match parse_arguments(call) {
+            Ok(arguments) => arguments,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let mut body = serde_json::Map::new();
+        if let Some(title) = arguments.title {
+            if title.trim().is_empty() {
+                return ToolResult::failure(call, "title must not be empty");
+            }
+            body.insert("title".to_owned(), serde_json::json!(title));
+        }
+        if let Some(text) = arguments.body {
+            body.insert("body".to_owned(), serde_json::json!(text));
+        }
+        if let Some(state) = arguments.state {
+            if !matches!(state.as_str(), "open" | "closed") {
+                return ToolResult::failure(call, "state must be open or closed");
+            }
+            body.insert("state".to_owned(), serde_json::json!(state));
+        }
+        if let Some(labels) = arguments.labels {
+            body.insert("labels".to_owned(), serde_json::json!(labels));
+        }
+        if body.is_empty() {
+            return ToolResult::failure(
+                call,
+                "provide at least one of title, body, state, or labels",
+            );
+        }
+        match self.github_api(
+            "PATCH",
+            &arguments.repository,
+            &format!("issues/{}", arguments.number),
+            Some(serde_json::Value::Object(body)),
+        ) {
+            Ok(value) => ToolResult::success(call, self.limit_output(value.to_string())),
+            Err(error) => ToolResult::failure(call, error),
+        }
+    }
+
+    fn github_comment(&self, call: &ToolCall) -> ToolResult {
+        if !self.github_write_enabled {
+            return ToolResult::failure(call, GITHUB_WRITE_DISABLED);
+        }
+        let arguments: GitHubCommentArguments = match parse_arguments(call) {
+            Ok(arguments) => arguments,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        if arguments.body.trim().is_empty() {
+            return ToolResult::failure(call, "body must not be empty");
+        }
+        let body = serde_json::json!({ "body": arguments.body });
+        match self.github_api(
+            "POST",
+            &arguments.repository,
+            &format!("issues/{}/comments", arguments.number),
+            Some(body),
+        ) {
+            Ok(value) => ToolResult::success(call, self.limit_output(value.to_string())),
+            Err(error) => ToolResult::failure(call, error),
+        }
+    }
+
+    fn github_update_pull_request(&self, call: &ToolCall) -> ToolResult {
+        if !self.github_write_enabled {
+            return ToolResult::failure(call, GITHUB_WRITE_DISABLED);
+        }
+        let arguments: GitHubUpdatePullRequestArguments = match parse_arguments(call) {
+            Ok(arguments) => arguments,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let mut body = serde_json::Map::new();
+        if let Some(title) = arguments.title {
+            if title.trim().is_empty() {
+                return ToolResult::failure(call, "title must not be empty");
+            }
+            body.insert("title".to_owned(), serde_json::json!(title));
+        }
+        if let Some(text) = arguments.body {
+            body.insert("body".to_owned(), serde_json::json!(text));
+        }
+        if let Some(base) = arguments.base {
+            if base.trim().is_empty() {
+                return ToolResult::failure(call, "base must not be empty");
+            }
+            body.insert("base".to_owned(), serde_json::json!(base));
+        }
+        if let Some(state) = arguments.state {
+            if !matches!(state.as_str(), "open" | "closed") {
+                return ToolResult::failure(call, "state must be open or closed");
+            }
+            body.insert("state".to_owned(), serde_json::json!(state));
+        }
+        if body.is_empty() {
+            return ToolResult::failure(
+                call,
+                "provide at least one of title, body, base, or state",
+            );
+        }
+        match self.github_api(
+            "PATCH",
+            &arguments.repository,
+            &format!("pulls/{}", arguments.number),
+            Some(serde_json::Value::Object(body)),
+        ) {
+            Ok(value) => ToolResult::success(call, self.limit_output(value.to_string())),
+            Err(error) => ToolResult::failure(call, error),
+        }
+    }
+
+    fn github_mark_pull_request_ready_for_review(&self, call: &ToolCall) -> ToolResult {
+        if !self.github_write_enabled {
+            return ToolResult::failure(call, GITHUB_WRITE_DISABLED);
+        }
+        let arguments: GitHubPullRequestArguments = match parse_arguments(call) {
+            Ok(arguments) => arguments,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        match self.github_api(
+            "POST",
+            &arguments.repository,
+            &format!("pulls/{}/ready_for_review", arguments.number),
+            Some(serde_json::json!({})),
+        ) {
+            Ok(value) => ToolResult::success(call, self.limit_output(value.to_string())),
+            Err(error) => ToolResult::failure(call, error),
+        }
+    }
+
+    fn github_add_labels(&self, call: &ToolCall) -> ToolResult {
+        if !self.github_write_enabled {
+            return ToolResult::failure(call, GITHUB_WRITE_DISABLED);
+        }
+        let arguments: GitHubLabelsArguments = match parse_arguments(call) {
+            Ok(arguments) => arguments,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let labels = match normalize_github_labels(&arguments.labels) {
+            Ok(labels) => labels,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let body = serde_json::json!({ "labels": labels });
+        match self.github_api(
+            "POST",
+            &arguments.repository,
+            &format!("issues/{}/labels", arguments.number),
+            Some(body),
+        ) {
+            Ok(value) => ToolResult::success(call, self.limit_output(value.to_string())),
+            Err(error) => ToolResult::failure(call, error),
+        }
+    }
+
+    fn github_remove_labels(&self, call: &ToolCall) -> ToolResult {
+        if !self.github_write_enabled {
+            return ToolResult::failure(call, GITHUB_WRITE_DISABLED);
+        }
+        let arguments: GitHubLabelsArguments = match parse_arguments(call) {
+            Ok(arguments) => arguments,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let labels = match normalize_github_labels(&arguments.labels) {
+            Ok(labels) => labels,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        for label in &labels {
+            let path = format!(
+                "issues/{}/labels/{}",
+                arguments.number,
+                encode_github_path_segment(label)
+            );
+            if let Err(error) = self.github_api("DELETE", &arguments.repository, &path, None) {
+                return ToolResult::failure(call, error);
+            }
+        }
+        ToolResult::success(call, format!("Removed {} label(s).", labels.len()))
     }
 
     fn github_push_branch(&self, call: &ToolCall) -> ToolResult {
@@ -1158,7 +1573,10 @@ impl ToolExecutor {
         if !valid_github_repository(repository) {
             return Err("repository must be in owner/name format".to_owned());
         }
-        let url = format!("https://api.github.com/repos/{repository}/{path}");
+        let url = format!(
+            "{}/repos/{repository}/{path}",
+            self.github_api_base.trim_end_matches('/')
+        );
         let (status, body) = run_async(async {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(15))
@@ -1168,7 +1586,11 @@ impl ToolExecutor {
                 "GET" => client.get(&url),
                 "POST" => client
                     .post(&url)
-                    .json(&body.unwrap_or(serde_json::Value::Null)),
+                    .json(&body.unwrap_or_else(|| serde_json::json!({}))),
+                "PATCH" => client
+                    .patch(&url)
+                    .json(&body.unwrap_or_else(|| serde_json::json!({}))),
+                "DELETE" => client.delete(&url),
                 _ => return Err("unsupported GitHub API method".to_owned()),
             };
             let response = request
@@ -1191,6 +1613,11 @@ impl ToolExecutor {
                 "GitHub API returned HTTP {status}: {}",
                 truncate_text(&body, 1024)
             ));
+        }
+        // Some write endpoints (for example, removing a label) answer 204 with
+        // an empty body, which is a success but not valid JSON.
+        if body.trim().is_empty() {
+            return Ok(serde_json::Value::Null);
         }
         serde_json::from_str(&body)
             .map_err(|error| format!("GitHub returned an invalid response: {error}"))
@@ -1646,6 +2073,92 @@ struct GitHubPushBranchArguments {
     path: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct GitHubListIssuesArguments {
+    repository: String,
+    state: Option<String>,
+    labels: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubIssueArguments {
+    repository: String,
+    number: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubCreateIssueArguments {
+    repository: String,
+    title: String,
+    body: Option<String>,
+    labels: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubUpdateIssueArguments {
+    repository: String,
+    number: u64,
+    title: Option<String>,
+    body: Option<String>,
+    state: Option<String>,
+    labels: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubCommentArguments {
+    repository: String,
+    number: u64,
+    body: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubUpdatePullRequestArguments {
+    repository: String,
+    number: u64,
+    title: Option<String>,
+    body: Option<String>,
+    base: Option<String>,
+    state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubLabelsArguments {
+    repository: String,
+    number: u64,
+    labels: Vec<String>,
+}
+
+/// Trims and rejects empty labels so a blank name never reaches the API as a
+/// silent no-op or a confusing 404.
+fn normalize_github_labels(labels: &[String]) -> std::result::Result<Vec<String>, String> {
+    if labels.is_empty() {
+        return Err("labels must not be empty".to_owned());
+    }
+    let mut normalized = Vec::with_capacity(labels.len());
+    for label in labels {
+        let trimmed = label.trim();
+        if trimmed.is_empty() {
+            return Err("labels must not contain empty names".to_owned());
+        }
+        normalized.push(trimmed.to_owned());
+    }
+    Ok(normalized)
+}
+
+/// Percent-encodes a value for use as a single URL path segment. Label names
+/// may contain spaces or slashes, which must not split the path.
+fn encode_github_path_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 enum PushRemote {
     /// A GitHub remote whose `owner/name` must match the requested repository.
     GitHub(String),
@@ -1887,6 +2400,150 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "additionalProperties": false
             }),
         },
+        ToolDefinition {
+            name: ToolKind::GitHubListIssues.name().to_owned(),
+            description: "List issues for a GitHub repository, optionally filtered by state and labels. Pull requests are excluded from the result. Requires a connected GitHub account and approval for network access.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repository": {"type": "string", "description": "Repository in owner/name format."},
+                    "state": {"type": "string", "enum": ["open", "closed", "all"]},
+                    "labels": {"type": "array", "items": {"type": "string"}, "description": "Only issues carrying all of these labels."}
+                },
+                "required": ["repository"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: ToolKind::GitHubGetIssue.name().to_owned(),
+            description: "Read an issue's details, labels, state, and conversation comments by number. Requires a connected GitHub account and approval for network access.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repository": {"type": "string", "description": "Repository in owner/name format."},
+                    "number": {"type": "integer", "minimum": 1}
+                },
+                "required": ["repository", "number"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: ToolKind::GitHubGetComments.name().to_owned(),
+            description: "Read the conversation comments on an issue or pull request by number; issues and pull requests share this endpoint. Requires a connected GitHub account and approval for network access.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repository": {"type": "string", "description": "Repository in owner/name format."},
+                    "number": {"type": "integer", "minimum": 1}
+                },
+                "required": ["repository", "number"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: ToolKind::GitHubCreateIssue.name().to_owned(),
+            description: "Create an issue in a GitHub repository, optionally with labels. Returns the created issue, including its number and URL. Requires explicit write approval.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repository": {"type": "string", "description": "Repository in owner/name format."},
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "labels": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["repository", "title"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: ToolKind::GitHubUpdateIssue.name().to_owned(),
+            description: "Update an issue's title, body, state, or labels by number. Provide at least one field; when both title and body are given they are applied in a single request. Requires explicit write approval.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repository": {"type": "string", "description": "Repository in owner/name format."},
+                    "number": {"type": "integer", "minimum": 1},
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "state": {"type": "string", "enum": ["open", "closed"]},
+                    "labels": {"type": "array", "items": {"type": "string"}, "description": "Replaces the issue's labels when present."}
+                },
+                "required": ["repository", "number"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: ToolKind::GitHubComment.name().to_owned(),
+            description: "Post a conversation comment on an issue or pull request by number. Requires explicit write approval.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repository": {"type": "string", "description": "Repository in owner/name format."},
+                    "number": {"type": "integer", "minimum": 1},
+                    "body": {"type": "string"}
+                },
+                "required": ["repository", "number", "body"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: ToolKind::GitHubUpdatePullRequest.name().to_owned(),
+            description: "Update a pull request's title, body, base branch, or state (open/closed) by number. Provide at least one field; when both title and body are given they are applied in a single request. Requires explicit write approval.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repository": {"type": "string", "description": "Repository in owner/name format."},
+                    "number": {"type": "integer", "minimum": 1},
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "base": {"type": "string", "description": "Target branch."},
+                    "state": {"type": "string", "enum": ["open", "closed"]}
+                },
+                "required": ["repository", "number"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: ToolKind::GitHubMarkPullRequestReadyForReview.name().to_owned(),
+            description: "Mark a draft pull request ready for review by number. Requires explicit write approval.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repository": {"type": "string", "description": "Repository in owner/name format."},
+                    "number": {"type": "integer", "minimum": 1}
+                },
+                "required": ["repository", "number"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: ToolKind::GitHubAddLabels.name().to_owned(),
+            description: "Add labels to an issue or pull request by number; labels are created if they do not exist. Requires explicit write approval.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repository": {"type": "string", "description": "Repository in owner/name format."},
+                    "number": {"type": "integer", "minimum": 1},
+                    "labels": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["repository", "number", "labels"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: ToolKind::GitHubRemoveLabels.name().to_owned(),
+            description: "Remove labels from an issue or pull request by number. Requires explicit write approval.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repository": {"type": "string", "description": "Repository in owner/name format."},
+                    "number": {"type": "integer", "minimum": 1},
+                    "labels": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["repository", "number", "labels"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -2125,11 +2782,12 @@ fn truncate_text(value: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         fs,
         io::{Read, Write},
         net::TcpListener,
         path::PathBuf,
-        sync::Arc,
+        sync::{Arc, Mutex},
         thread,
     };
 
@@ -2781,16 +3439,26 @@ mod tests {
             .unwrap()
             .with_github_token(Some("test-token".to_owned()));
         let advertised = names(&read_only);
-        assert!(
-            advertised
-                .iter()
-                .any(|name| name == "github_list_pull_requests")
-        );
-        assert!(
-            advertised
-                .iter()
-                .any(|name| name == "github_create_pull_request")
-        );
+        for name in [
+            "github_list_pull_requests",
+            "github_get_pull_request",
+            "github_create_pull_request",
+            "github_list_issues",
+            "github_get_issue",
+            "github_get_comments",
+            "github_create_issue",
+            "github_update_issue",
+            "github_comment",
+            "github_update_pull_request",
+            "github_mark_pull_request_ready_for_review",
+            "github_add_labels",
+            "github_remove_labels",
+        ] {
+            assert!(
+                advertised.iter().any(|candidate| candidate == name),
+                "{name}"
+            );
+        }
         assert!(!advertised.iter().any(|name| name == "github_push_branch"));
 
         let read_write = read_only.with_github_write_access(true);
@@ -2870,6 +3538,34 @@ mod tests {
                     "head": "head",
                     "base": "base"
                 }),
+            ),
+            (
+                "github_create_issue",
+                serde_json::json!({"repository": "owner/name", "title": "title"}),
+            ),
+            (
+                "github_update_issue",
+                serde_json::json!({"repository": "owner/name", "number": 1, "state": "closed"}),
+            ),
+            (
+                "github_comment",
+                serde_json::json!({"repository": "owner/name", "number": 1, "body": "note"}),
+            ),
+            (
+                "github_update_pull_request",
+                serde_json::json!({"repository": "owner/name", "number": 1, "body": "note"}),
+            ),
+            (
+                "github_mark_pull_request_ready_for_review",
+                serde_json::json!({"repository": "owner/name", "number": 1}),
+            ),
+            (
+                "github_add_labels",
+                serde_json::json!({"repository": "owner/name", "number": 1, "labels": ["bug"]}),
+            ),
+            (
+                "github_remove_labels",
+                serde_json::json!({"repository": "owner/name", "number": 1, "labels": ["bug"]}),
             ),
         ] {
             let result = executor.execute(&call(name, arguments));
@@ -2974,6 +3670,400 @@ mod tests {
 
         fs::remove_dir_all(root).unwrap();
     }
+
+    struct MockResponse {
+        status: u16,
+        body: String,
+    }
+
+    impl MockResponse {
+        fn json(body: serde_json::Value) -> Self {
+            Self {
+                status: 200,
+                body: body.to_string(),
+            }
+        }
+
+        fn body(status: u16, body: &str) -> Self {
+            Self {
+                status,
+                body: body.to_owned(),
+            }
+        }
+
+        fn status(status: u16) -> Self {
+            Self {
+                status,
+                body: String::new(),
+            }
+        }
+    }
+
+    /// A tiny blocking HTTP server for GitHub API tests. It answers each request
+    /// in order from a scripted queue and records the raw request so tests can
+    /// assert on the method, path, and JSON body.
+    struct MockGitHub {
+        base: String,
+        requests: Arc<Mutex<Vec<(String, String, String)>>>,
+    }
+
+    impl MockGitHub {
+        fn start(responses: Vec<MockResponse>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&requests);
+            let responses = Arc::new(Mutex::new(VecDeque::from(responses)));
+            // The listener lives until the test process ends; the harness kills
+            // the blocked accept loop at exit.
+            thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    let request = read_http_request(&mut stream);
+                    recorded.lock().unwrap().push(request);
+                    let response = responses
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or(MockResponse::body(200, "{}"));
+                    write_http_response(&mut stream, &response);
+                }
+            });
+            Self {
+                base: format!("http://{address}"),
+                requests,
+            }
+        }
+
+        fn requests(&self) -> Vec<(String, String, String)> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> (String, String, String) {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let mut header_end = None;
+        while header_end.is_none() {
+            let read = stream.read(&mut chunk).unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            header_end = buffer
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4);
+        }
+        let header_end = header_end.unwrap_or(buffer.len());
+        let headers = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+        let mut lines = headers.lines();
+        let request_line = lines.next().unwrap_or_default();
+        let mut request_parts = request_line.split_whitespace();
+        let method = request_parts.next().unwrap_or_default().to_owned();
+        let path = request_parts.next().unwrap_or_default().to_owned();
+        let content_length = lines
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = buffer.get(header_end..).unwrap_or_default().to_vec();
+        while body.len() < content_length {
+            let read = stream.read(&mut chunk).unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..read]);
+        }
+        body.truncate(content_length);
+        (method, path, String::from_utf8_lossy(&body).to_string())
+    }
+
+    fn write_http_response(stream: &mut std::net::TcpStream, response: &MockResponse) {
+        let reason = match response.status {
+            201 => "Created",
+            204 => "No Content",
+            404 => "Not Found",
+            _ => "OK",
+        };
+        let head = format!(
+            "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response.status,
+            response.body.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(response.body.as_bytes()).unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn github_executor(root: &Path, mock: &MockGitHub) -> ToolExecutor {
+        let mut executor = ToolExecutor::new(root)
+            .unwrap()
+            .with_github_token(Some("test-token".to_owned()))
+            .with_github_write_access(true);
+        executor.github_api_base = mock.base.clone();
+        executor
+    }
+
+    #[test]
+    fn github_list_issues_filters_pull_requests_and_labels() {
+        let root = workspace();
+        let mock = MockGitHub::start(vec![MockResponse::json(serde_json::json!([
+            {"number": 3, "title": "Real issue", "state": "closed"},
+            {"number": 4, "title": "A PR", "state": "closed", "pull_request": {"url": "x"}}
+        ]))]);
+        let executor = github_executor(&root, &mock);
+        let result = executor.execute(&call(
+            "github_list_issues",
+            serde_json::json!({"repository": "owner/name", "state": "closed", "labels": ["bug"]}),
+        ));
+        assert!(result.success, "{}", result.output);
+        let issues: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(issues.as_array().unwrap().len(), 1);
+        assert_eq!(issues[0]["number"], 3);
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "GET");
+        assert_eq!(
+            requests[0].1,
+            "/repos/owner/name/issues?state=closed&per_page=100&labels=bug"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_create_issue_posts_title_body_and_labels() {
+        let root = workspace();
+        let mock = MockGitHub::start(vec![MockResponse::body(
+            201,
+            r#"{"number": 7, "html_url": "https://github.com/owner/name/issues/7", "state": "open"}"#,
+        )]);
+        let executor = github_executor(&root, &mock);
+        let result = executor.execute(&call(
+            "github_create_issue",
+            serde_json::json!({
+                "repository": "owner/name",
+                "title": "Gap",
+                "body": "Details",
+                "labels": ["bug"]
+            }),
+        ));
+        assert!(result.success, "{}", result.output);
+        let created: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(created["number"], 7);
+        let requests = mock.requests();
+        assert_eq!(requests[0].0, "POST");
+        assert_eq!(requests[0].1, "/repos/owner/name/issues");
+        let body: serde_json::Value = serde_json::from_str(&requests[0].2).unwrap();
+        assert_eq!(body["title"], "Gap");
+        assert_eq!(body["body"], "Details");
+        assert_eq!(body["labels"], serde_json::json!(["bug"]));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_update_issue_uses_one_patch_and_validates_fields() {
+        let root = workspace();
+        let mock = MockGitHub::start(vec![MockResponse::json(
+            serde_json::json!({"number": 5, "state": "closed"}),
+        )]);
+        let executor = github_executor(&root, &mock);
+        let result = executor.execute(&call(
+            "github_update_issue",
+            serde_json::json!({
+                "repository": "owner/name",
+                "number": 5,
+                "title": "Corrected",
+                "body": "Reworked",
+                "state": "closed",
+                "labels": ["fixed"]
+            }),
+        ));
+        assert!(result.success, "{}", result.output);
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, "PATCH");
+        assert_eq!(requests[0].1, "/repos/owner/name/issues/5");
+        let body: serde_json::Value = serde_json::from_str(&requests[0].2).unwrap();
+        assert_eq!(body["title"], "Corrected");
+        assert_eq!(body["body"], "Reworked");
+        assert_eq!(body["state"], "closed");
+        assert_eq!(body["labels"], serde_json::json!(["fixed"]));
+
+        let empty = executor.execute(&call(
+            "github_update_issue",
+            serde_json::json!({"repository": "owner/name", "number": 5}),
+        ));
+        assert!(!empty.success);
+        assert!(empty.output.contains("at least one"));
+        let bad_state = executor.execute(&call(
+            "github_update_issue",
+            serde_json::json!({"repository": "owner/name", "number": 5, "state": "all"}),
+        ));
+        assert!(!bad_state.success);
+        assert!(bad_state.output.contains("open or closed"));
+        assert_eq!(mock.requests().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_comment_and_get_comments_share_the_issue_endpoint() {
+        let root = workspace();
+        let mock = MockGitHub::start(vec![
+            MockResponse::body(201, r#"{"id": 1, "body": "ack"}"#),
+            MockResponse::json(serde_json::json!([{"id": 1, "body": "ack"}])),
+        ]);
+        let executor = github_executor(&root, &mock);
+        let posted = executor.execute(&call(
+            "github_comment",
+            serde_json::json!({"repository": "owner/name", "number": 9, "body": "ack"}),
+        ));
+        assert!(posted.success, "{}", posted.output);
+        let read = executor.execute(&call(
+            "github_get_comments",
+            serde_json::json!({"repository": "owner/name", "number": 9}),
+        ));
+        assert!(read.success, "{}", read.output);
+        let requests = mock.requests();
+        assert_eq!(requests[0].0, "POST");
+        assert_eq!(requests[0].1, "/repos/owner/name/issues/9/comments");
+        assert_eq!(requests[1].0, "GET");
+        assert_eq!(
+            requests[1].1,
+            "/repos/owner/name/issues/9/comments?per_page=100"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_get_issue_folds_in_comments() {
+        let root = workspace();
+        let mock = MockGitHub::start(vec![
+            MockResponse::json(serde_json::json!({"number": 2, "title": "Issue"})),
+            MockResponse::json(serde_json::json!([{"id": 11, "body": "feedback"}])),
+        ]);
+        let executor = github_executor(&root, &mock);
+        let result = executor.execute(&call(
+            "github_get_issue",
+            serde_json::json!({"repository": "owner/name", "number": 2}),
+        ));
+        assert!(result.success, "{}", result.output);
+        let value: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(value["issue"]["number"], 2);
+        assert_eq!(value["comments"][0]["body"], "feedback");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_update_pull_request_and_mark_ready() {
+        let root = workspace();
+        let mock = MockGitHub::start(vec![
+            MockResponse::json(serde_json::json!({"number": 9, "body": "new"})),
+            MockResponse::json(serde_json::json!({"number": 9, "draft": false})),
+        ]);
+        let executor = github_executor(&root, &mock);
+        let updated = executor.execute(&call(
+            "github_update_pull_request",
+            serde_json::json!({
+                "repository": "owner/name",
+                "number": 9,
+                "title": "Better",
+                "body": "Design",
+                "base": "main",
+                "state": "open"
+            }),
+        ));
+        assert!(updated.success, "{}", updated.output);
+        let ready = executor.execute(&call(
+            "github_mark_pull_request_ready_for_review",
+            serde_json::json!({"repository": "owner/name", "number": 9}),
+        ));
+        assert!(ready.success, "{}", ready.output);
+        let requests = mock.requests();
+        assert_eq!(requests[0].0, "PATCH");
+        assert_eq!(requests[0].1, "/repos/owner/name/pulls/9");
+        let body: serde_json::Value = serde_json::from_str(&requests[0].2).unwrap();
+        assert_eq!(body["title"], "Better");
+        assert_eq!(body["body"], "Design");
+        assert_eq!(body["base"], "main");
+        assert_eq!(body["state"], "open");
+        assert_eq!(requests[1].0, "POST");
+        assert_eq!(requests[1].1, "/repos/owner/name/pulls/9/ready_for_review");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_get_pull_request_includes_comments_and_status() {
+        let root = workspace();
+        let mock = MockGitHub::start(vec![
+            MockResponse::json(serde_json::json!({"number": 9, "head": {"sha": "abc123"}})),
+            MockResponse::json(serde_json::json!({"check_runs": []})),
+            MockResponse::json(serde_json::json!({"state": "success"})),
+            MockResponse::json(serde_json::json!([{"id": 1, "body": "conversation"}])),
+            MockResponse::json(serde_json::json!([{"id": 2, "body": "inline"}])),
+        ]);
+        let executor = github_executor(&root, &mock);
+        let result = executor.execute(&call(
+            "github_get_pull_request",
+            serde_json::json!({"repository": "owner/name", "number": 9}),
+        ));
+        assert!(result.success, "{}", result.output);
+        let value: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(value["comments"][0]["body"], "conversation");
+        assert_eq!(value["review_comments"][0]["body"], "inline");
+        assert_eq!(value["check_runs"], serde_json::json!({"check_runs": []}));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_label_tools_add_and_remove() {
+        let root = workspace();
+        let mock = MockGitHub::start(vec![
+            MockResponse::json(serde_json::json!([{"name": "bug"}])),
+            MockResponse::status(204),
+            MockResponse::status(204),
+        ]);
+        let executor = github_executor(&root, &mock);
+        let added = executor.execute(&call(
+            "github_add_labels",
+            serde_json::json!({"repository": "owner/name", "number": 3, "labels": ["bug"]}),
+        ));
+        assert!(added.success, "{}", added.output);
+        let removed = executor.execute(&call(
+            "github_remove_labels",
+            serde_json::json!({
+                "repository": "owner/name",
+                "number": 3,
+                "labels": ["needs triage", "area/ui"]
+            }),
+        ));
+        assert!(removed.success, "{}", removed.output);
+        let requests = mock.requests();
+        assert_eq!(requests[0].0, "POST");
+        assert_eq!(requests[0].1, "/repos/owner/name/issues/3/labels");
+        assert_eq!(requests[1].0, "DELETE");
+        assert_eq!(
+            requests[1].1,
+            "/repos/owner/name/issues/3/labels/needs%20triage"
+        );
+        assert_eq!(requests[2].0, "DELETE");
+        assert_eq!(requests[2].1, "/repos/owner/name/issues/3/labels/area%2Fui");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_api_reports_http_errors() {
+        let root = workspace();
+        let mock = MockGitHub::start(vec![MockResponse::body(404, r#"{"message":"Not Found"}"#)]);
+        let executor = github_executor(&root, &mock);
+        let result = executor.execute(&call(
+            "github_get_issue",
+            serde_json::json!({"repository": "owner/name", "number": 404}),
+        ));
+        assert!(!result.success);
+        assert!(result.output.contains("HTTP 404"), "{}", result.output);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -3073,5 +4163,19 @@ mod helper_tests {
         assert!(github_repository_from_remote("https://gitlab.com/owner/name.git").is_none());
         assert!(github_repository_from_remote("https://github.com/owner").is_none());
         assert!(github_repository_from_remote("git@example.com:owner/name.git").is_none());
+    }
+
+    #[test]
+    fn github_label_helpers_trim_and_encode() {
+        assert_eq!(
+            normalize_github_labels(&[" bug ".to_owned(), "area/ui".to_owned()]).unwrap(),
+            vec!["bug".to_owned(), "area/ui".to_owned()]
+        );
+        assert!(normalize_github_labels(&[]).is_err());
+        assert!(normalize_github_labels(&["   ".to_owned()]).is_err());
+        assert_eq!(encode_github_path_segment("bug"), "bug");
+        assert_eq!(encode_github_path_segment("needs triage"), "needs%20triage");
+        assert_eq!(encode_github_path_segment("area/ui"), "area%2Fui");
+        assert_eq!(encode_github_path_segment("café"), "caf%C3%A9");
     }
 }

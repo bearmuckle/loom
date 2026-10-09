@@ -237,10 +237,17 @@ impl LoomView {
             })
             .await;
             view.update(cx, |view, cx| {
-                if view.run_should_poll() {
-                    view.poll_run_once(cx);
-                } else {
+                if !view.run_should_poll() {
                     view.run_poll_scheduled = false;
+                } else if view.transcript_loading {
+                    // A transcript page rebuild replaces the message portion of
+                    // the timeline. Defer draining the event stream until the
+                    // page has been applied, or events consumed in the meantime
+                    // are discarded and the view looks sparse.
+                    view.run_poll_scheduled = false;
+                    view.schedule_run_poll(cx);
+                } else {
+                    view.poll_run_once(cx);
                 }
             })
             .ok();
@@ -321,6 +328,7 @@ impl LoomView {
             return;
         }
         let workspace_id = self.workspace_id;
+        let remote_options = self.remote_options.clone();
         for (id, url) in candidates {
             if worker_url_embeds_credential(&url) {
                 self.set_worker_node_connection_failure(
@@ -335,6 +343,7 @@ impl LoomView {
                 node.connection_detail = None;
             }
             let candidate_url = url.clone();
+            let remote_options = remote_options.clone();
             cx.spawn(async move |view, cx| {
                 let result = cx
                     .background_spawn(async move {
@@ -356,8 +365,9 @@ impl LoomView {
                                 return Err((WorkerConnectionStage::CredentialRead, error, false));
                             }
                         };
-                        let connection = ClientConnection::remote(candidate_url.clone(), token)
-                            .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
+                        let connection =
+                            ClientConnection::remote(candidate_url.clone(), token, &remote_options)
+                                .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
                         if let Err(error) = negotiate(&connection).map(|_| ()) {
                             let cleanup_failed = connection.close().is_err();
                             return Err((

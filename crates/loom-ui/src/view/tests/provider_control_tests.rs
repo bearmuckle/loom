@@ -8,9 +8,7 @@ fn provider_model_and_mode_controls_update_state(cx: &mut TestAppContext) {
     let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
         let mut view = LoomView::new_for_test(cx.focus_handle());
         view.sync_model_select_states(window, cx);
-        view.sync_agent_mode_select_state(window, cx);
         assert!(view.model_select.is_some());
-        assert!(view.agent_mode_select.is_some());
 
         view.select_model(ModelId::new("deterministic/demo"), cx);
         assert_eq!(view.model, ModelId::new("deterministic/demo"));
@@ -20,7 +18,6 @@ fn provider_model_and_mode_controls_update_state(cx: &mut TestAppContext) {
         assert_eq!(view.default_model, ModelId::new("deterministic/demo"));
         view.select_default_model(ModelId::new("missing/model"), cx);
 
-        view.select_agent_mode(AgentMode::Edit, cx);
         view.toggle_auto_approve_actions(cx);
         view.observe_system_appearance(window, cx);
         view.observe_system_appearance(window, cx);

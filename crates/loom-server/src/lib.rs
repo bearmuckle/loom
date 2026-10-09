@@ -1,3 +1,10 @@
+//! The Loom backend: the in-process backend that native clients and protocol
+//! tests drive directly, plus the remote WebSocket server and the standalone
+//! `loom-server` executable that serves it.
+//!
+//! `crates/loom-server/src/main.rs` is the operator-facing binary; the library
+//! API used by the desktop client lives behind the re-exports below.
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -114,7 +121,8 @@ struct GitHubApiUser {
 
 pub use auth::{AuthSession, AuthTokenStore, AuthorizationScope, IssuedToken};
 pub use remote::{
-    RemoteServer, RemoteServerConfig, RunningRemoteServer, WebSocketConnection, WebSocketTransport,
+    RemoteServer, RemoteServerConfig, RunningRemoteServer, ServerTlsConfig,
+    WEBSOCKET_TLS_SUPPORTED, WebSocketConnection, WebSocketTransport,
 };
 
 const DEFAULT_EVENT_RETENTION: usize = 4096;

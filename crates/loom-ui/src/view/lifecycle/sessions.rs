@@ -35,6 +35,39 @@ impl LoomView {
         Ok(())
     }
 
+    /// Loads the project snapshot for every session not already covered by a
+    /// known project, synchronously for the startup bootstrap.
+    ///
+    /// The active session's project is loaded by `load_session`; without this,
+    /// every other project's delegated sub-tasks have no parent record at first
+    /// paint and render as top-level sessions until their project is visited.
+    /// One request is issued per project: a fetched snapshot covers all of its
+    /// agent sessions.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn refresh_project_snapshots(&mut self) {
+        let mut attempted = BTreeSet::new();
+        while let Some(session_id) =
+            uncovered_session_ids(&self.sessions, &self.project_tree_snapshots)
+                .into_iter()
+                .find(|session_id| !attempted.contains(session_id))
+        {
+            attempted.insert(session_id);
+            let response = self
+                .connection
+                .request(RequestEnvelope::new(ClientRequest::Project(
+                    ProjectRequest::GetProjectSnapshotForSession { session_id },
+                )));
+            let Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(snapshot))) =
+                response.result
+            else {
+                continue;
+            };
+            self.project_tree_snapshots
+                .retain(|known| known.project_id != snapshot.project_id);
+            self.project_tree_snapshots.push(snapshot);
+        }
+    }
+
     /// Reloads sessions from every connected node while keeping their owners.
     pub(crate) fn reload_sessions(&mut self, cx: &mut Context<Self>) {
         let workspace_id = self.workspace_id;
@@ -105,6 +138,7 @@ impl LoomView {
                     view.active_session = active.clone();
                     view.session_state = active.state;
                 }
+                view.refresh_missing_project_snapshots(cx);
                 cx.notify();
             })
             .ok();
@@ -120,7 +154,9 @@ impl LoomView {
         self.optimistic_messages.clear();
         self.plan = None;
         self.plan_collapsed = false;
-        self.review.clear_unread(InspectorTab::Changes);
+        // A different session's review content must not count as already
+        // viewed, so the Changes marker and its recorded snapshot both go.
+        self.review.reset_changes_unread();
         self.review.clear_unread(InspectorTab::Plan);
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
         self.transcript_before_ordinal = None;
@@ -128,6 +164,7 @@ impl LoomView {
         self.transcript_messages.clear();
         self.transcript_has_older = false;
         self.transcript_loading = false;
+        self.transcript_prepend_count = 0;
         self.activity_records.clear();
         self.expanded_tools.clear();
         self.expanded_tool_usage.clear();

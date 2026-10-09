@@ -43,10 +43,26 @@ workspaces, and sessions; an unrestricted grant is an explicit deployment
 choice rather than an implicit network default.
 
 The service binds to `127.0.0.1` by default. Binding a non-loopback address
-requires an explicit `--bind` choice and a token. TLS termination is expected
-to be supplied by the deployment boundary for remote use; the current
-standalone listener is plain WebSocket (`ws://`) and must not be exposed
-directly to an untrusted network.
+requires an explicit `--bind` choice and a token. The server can also terminate
+TLS itself: `--tls-cert` and `--tls-key` are required together and make the
+listener serve `wss://`, with `/health` over TLS as well. Without TLS, the bind
+refuses a non-loopback address unless the operator passes
+`--allow-insecure-remote`, which logs a warning naming the flag that permitted
+the listener. That refusal is a deliberate compatibility change: a plaintext
+remote listener, and a native client sending its token to one, now need either
+TLS or that explicit opt-in. Loopback is always allowed without either. A
+listener that is plaintext because of the opt-in carries the bearer token and
+every protocol frame in the clear and must not be exposed directly to an
+untrusted network; TLS termination may still be supplied by an external
+deployment boundary instead of by the server itself.
+
+A client connecting to a `wss://` worker whose certificate is issued by a
+private or self-signed CA adds that CA to its OS trust roots with
+`--ca /path/to/ca.pem` or the `LOOM_TLS_CA` environment variable. The addition
+is additive: certificate verification is never disabled, and there is
+deliberately no accept-any-certificate option. The client likewise refuses
+plaintext `ws://` to a non-loopback worker unless it is given
+`--allow-insecure-remote`.
 
 ## Agent permissions
 

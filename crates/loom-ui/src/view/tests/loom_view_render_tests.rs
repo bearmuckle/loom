@@ -203,6 +203,8 @@ fn startup_rejects_credential_bearing_remote_urls_and_missing_tokens(cx: &mut Te
             remote: Some(remote.to_owned()),
             token: token.map(str::to_owned),
             reset_state: false,
+            ca: None,
+            allow_insecure_remote: false,
         };
         let error = match LoomView::try_new(
             &options("ws://user:secret@worker.example", Some("token")),
@@ -241,6 +243,8 @@ fn startup_rejects_credential_bearing_remote_urls_and_missing_tokens(cx: &mut Te
             remote: None,
             token: None,
             reset_state: false,
+            ca: None,
+            allow_insecure_remote: false,
         };
         let error = match LoomView::try_new(&local_options, cx.focus_handle()) {
             Err(error) => error,
@@ -267,6 +271,8 @@ fn connection_bootstrap_creates_and_attaches_a_local_workspace_session(cx: &mut 
             remote: None,
             token: None,
             reset_state: false,
+            ca: None,
+            allow_insecure_remote: false,
         };
         let workspace_root =
             std::env::temp_dir().join(format!("loom-ui-bootstrap-{}", uuid::Uuid::new_v4()));
@@ -365,9 +371,16 @@ fn nested_project_tree_selects_grandchild_session_by_click(cx: &mut TestAppConte
     let view = rendered_view.borrow().as_ref().unwrap().clone();
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
-        for index in 0usize..3 {
-            assert!(window.find(("session-tree-root", index)).visible());
-        }
+        // Projects with sub-agents start collapsed.
+        assert!(window.find(("session-tree-root", 0usize)).visible());
+        assert!(window.try_find(("session-tree-root", 1usize)).is_none());
+        // Expanding the project, then its agent, reveals the grandchild.
+        window.click(("session-tree-root", 0usize), cx);
+        window.render_frame(cx);
+        assert!(window.find(("session-tree-root", 1usize)).visible());
+        window.click(("session-tree-root", 1usize), cx);
+        window.render_frame(cx);
+        assert!(window.find(("session-tree-root", 2usize)).visible());
         window.click(("session-tree-root", 2usize), cx);
         assert_eq!(view.read(cx).active_session.name, "Worker");
     })
@@ -382,6 +395,13 @@ fn phone_drawer_selects_session_and_closes_the_drawer(cx: &mut TestAppContext) {
     let handle = cx.open_window(size(px(390.), px(844.)), move |window, cx| {
         let view = cx.new(|cx| {
             let mut view = nested_project_view(cx.focus_handle());
+            // Select the nested agent so the collapsed tree auto-expands its path.
+            view.active_session = view
+                .sessions
+                .iter()
+                .find(|session| session.name == "Worker")
+                .cloned()
+                .expect("nested project has a Worker session");
             view.session_drawer_open = true;
             view
         });
@@ -1083,7 +1103,7 @@ fn phone_source_dialog_stacks_choices_and_keeps_actions_visible(cx: &mut TestApp
         let pane = window.find("source-dialog-pane").bounds();
         assert_eq!(pane.size.width, viewport.width);
         // The pane fills the central area below the window title bar.
-        assert_eq!(pane.size.height, viewport.height - px(30.));
+        assert_eq!(pane.size.height, viewport.height - px(26.));
         // The actions stay pinned and reachable even though the repository
         // list inside the scrollable body is longer than the window.
         assert!(window.find("cancel-session-source").visible());
@@ -4202,6 +4222,132 @@ fn unread_markers_follow_changes_and_plan_events(cx: &mut TestAppContext) {
         });
         assert!(view.review.unread.changes);
     });
+}
+
+/// The Changes tab renders a fetched snapshot, so a change event is unviewed
+/// content exactly when the snapshot does not already contain it - even while
+/// the tab is displayed.
+#[gpui_kit::test]
+fn change_events_are_compared_with_the_fetched_changes_snapshot(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.review.open = true;
+        view.review.tab = InspectorTab::Changes;
+        // The snapshot the tab renders already covers sequence 4.
+        view.review.changes = vec![SessionFilesystemChange {
+            sequence: loom_core::EventSequence::new(4),
+            session_id: view.active_session.id,
+            path: "src/lib.rs".to_owned(),
+            kind: WorkspaceChangeKind::Modified,
+            revision: None,
+        }];
+        view.review.clear_unread(InspectorTab::Changes);
+        assert!(!view.review.unread.changes);
+
+        // An event the fetched snapshot already covers is ignored.
+        view.consume_event(&loom_protocol::ServerEvent::SessionFilesystemChanged {
+            change: SessionFilesystemChange {
+                sequence: loom_core::EventSequence::new(4),
+                session_id: view.active_session.id,
+                path: "src/lib.rs".to_owned(),
+                kind: WorkspaceChangeKind::Modified,
+                revision: None,
+            },
+        });
+        assert!(!view.review.unread.changes);
+
+        // A newer change marks even though the tab is displayed, because the
+        // list the user sees is still the older snapshot.
+        view.consume_event(&loom_protocol::ServerEvent::SessionFilesystemChanged {
+            change: SessionFilesystemChange {
+                sequence: loom_core::EventSequence::new(5),
+                session_id: view.active_session.id,
+                path: "src/main.rs".to_owned(),
+                kind: WorkspaceChangeKind::Modified,
+                revision: None,
+            },
+        });
+        assert!(view.review.unread.changes);
+        view
+    });
+    cx.update_window(handle.into(), |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        window.render_frame(cx);
+        view.update(cx, |view, _| {
+            assert!(view.review.open && view.review.tab == InspectorTab::Changes);
+        });
+        assert!(window.find(("tab-unread", 0usize)).visible());
+    })
+    .unwrap();
+}
+
+/// Selecting the tab that is already displayed is the user's way of picking up
+/// review content that arrived after the snapshot was fetched.
+#[gpui_kit::test]
+async fn reselecting_the_displayed_changes_tab_refreshes_its_snapshot(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.review.open = true;
+        view.review.tab = InspectorTab::Changes;
+        view.review.unread.changes = true;
+        view.review.changes = vec![SessionFilesystemChange {
+            sequence: loom_core::EventSequence::new(9),
+            session_id: view.active_session.id,
+            path: "src/lib.rs".to_owned(),
+            kind: WorkspaceChangeKind::Modified,
+            revision: None,
+        }];
+
+        view.select_inspector_tab(InspectorTab::Changes, cx);
+        // The marker clears immediately and the stale snapshot stays on
+        // screen until the refreshed payload arrives.
+        assert!(!view.review.unread.changes);
+        assert!(view.review.open);
+        assert_eq!(view.review.tab, InspectorTab::Changes);
+        assert_eq!(view.review.changes.len(), 1);
+        view
+    });
+    // The refresh was really dispatched: an early return would never reach the
+    // backend, while this test's backend does not know the synthetic session,
+    // so the answered request is recorded as a status banner.
+    cx.wait_for(handle.into(), Duration::from_secs(5), |window, cx| {
+        window.root::<LoomView>().flatten().is_some_and(|view| {
+            view.read(cx).status_banner.as_ref().is_some_and(|note| {
+                note.heading
+                    .as_deref()
+                    .is_some_and(|heading| heading.starts_with("workspace review refresh"))
+            })
+        })
+    })
+    .await;
+}
+
+/// Re-selecting whichever tab is displayed refreshes that tab's data instead
+/// of returning early, so the Changes snapshot can pick up content that
+/// arrived after it was fetched.
+#[gpui_kit::test]
+fn reselecting_a_displayed_tab_refreshes_that_tab(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.review.open = true;
+        for tab in InspectorTab::ALL {
+            view.review.tab = tab;
+            // The first call views the tab, the second re-selects it.
+            view.select_inspector_tab(tab, cx);
+            view.select_inspector_tab(tab, cx);
+            assert_eq!(view.review.tab, tab);
+            assert!(!view.review.has_unread());
+        }
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
 }
 
 #[gpui_kit::test]

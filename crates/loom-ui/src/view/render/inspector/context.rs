@@ -30,7 +30,7 @@ impl LoomView {
                 let mut budget = div().flex().flex_col().gap_2().child(info_row(
                     "Context",
                     format!(
-                        "≈ {} / {}",
+                        "~ {} / {}",
                         format_tokens(inspection.included_tokens),
                         budget_text
                     ),

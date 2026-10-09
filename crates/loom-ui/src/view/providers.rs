@@ -597,39 +597,6 @@ impl LoomView {
         }
     }
 
-    pub(crate) fn sync_agent_mode_select_state(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.agent_mode_select.is_some() {
-            return;
-        }
-        let items = AgentMode::ALL
-            .into_iter()
-            .map(|mode| mode.label().to_owned())
-            .collect::<Vec<_>>();
-        let selected_index = items
-            .iter()
-            .position(|item| item == self.agent_mode.label())
-            .map(|row| IndexPath::default().row(row));
-        let state =
-            cx.new(|cx| SelectState::new(SearchableVec::new(items), selected_index, window, cx));
-        self.agent_mode_select_subscription = Some(cx.subscribe(
-            &state,
-            |view, _, event: &SelectEvent<SearchableVec<String>>, cx| {
-                if let SelectEvent::Confirm(Some(label)) = event
-                    && let Some(mode) = AgentMode::ALL
-                        .into_iter()
-                        .find(|mode| mode.label() == label)
-                {
-                    view.select_agent_mode(mode, cx);
-                }
-            },
-        ));
-        self.agent_mode_select = Some(state);
-    }
-
     pub(crate) fn select_model(&mut self, model: ModelId, cx: &mut Context<Self>) {
         let node_id = self
             .session_node_ids
@@ -663,50 +630,17 @@ impl LoomView {
         cx.notify();
     }
 
-    pub(crate) fn select_agent_mode(&mut self, mode: AgentMode, cx: &mut Context<Self>) {
-        if self.approval_settings_request_in_flight {
-            return;
-        }
-        let session_id = self.active_session.id;
-        let policy = mode.approval_policy(self.auto_approve_actions);
-        self.approval_settings_request_in_flight = true;
-        self.dispatch(
-            cx,
-            ClientRequest::Session(SessionRequest::SetSessionApprovalPolicy {
-                session_id,
-                policy,
-                auto_approve_actions: Some(self.auto_approve_actions),
-            }),
-            move |view, response, _| {
-                if view.active_session.id != session_id {
-                    return;
-                }
-                view.approval_settings_request_in_flight = false;
-                match response.result {
-                    Ok(ServerResponse::Session(SessionResponse::ApprovalPolicy(_))) => {
-                        view.agent_mode = mode;
-                        view.session_auto_approve_actions
-                            .insert(session_id, view.auto_approve_actions);
-                        view.record_status(format!("{} mode enabled", mode.label()));
-                    }
-                    Err(error) => view.record_backend_error("set approval mode", error),
-                    Ok(response) => view.record_backend_error(
-                        "set approval mode",
-                        unexpected_response("approval policy", response),
-                    ),
-                }
-            },
-        );
-        cx.notify();
-    }
-
     pub(crate) fn toggle_auto_approve_actions(&mut self, cx: &mut Context<Self>) {
         if self.approval_settings_request_in_flight || !self.is_connected() {
             return;
         }
         let session_id = self.active_session.id;
         let auto_approve_actions = !self.auto_approve_actions;
-        let policy = self.agent_mode.approval_policy(auto_approve_actions);
+        let policy = if auto_approve_actions {
+            loom_core::ApprovalPolicy::auto_approve()
+        } else {
+            loom_core::ApprovalPolicy::default()
+        };
         self.approval_settings_request_in_flight = true;
         self.dispatch(
             cx,
