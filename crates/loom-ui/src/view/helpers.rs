@@ -1281,6 +1281,7 @@ pub(crate) fn tool_icon(name: &str) -> AssetIconName {
         "github_comment" => AssetIconName::MessageSquare,
         "github_update_pull_request" => AssetIconName::Pencil,
         "github_mark_pull_request_ready_for_review" => AssetIconName::Check,
+        "github_convert_pull_request_to_draft" => AssetIconName::Pencil,
         "github_add_labels" => AssetIconName::List,
         "github_remove_labels" => AssetIconName::List,
         "web_search" => AssetIconName::Globe,
@@ -1320,6 +1321,9 @@ pub(crate) fn tool_group_label(name: &str, count: usize) -> String {
         "github_update_pull_request" => format!("Updated {count} pull requests"),
         "github_mark_pull_request_ready_for_review" => {
             format!("Marked {count} pull requests ready")
+        }
+        "github_convert_pull_request_to_draft" => {
+            format!("Converted {count} pull requests to draft")
         }
         "github_add_labels" => format!("Labeled {count} times"),
         "github_remove_labels" => format!("Unlabeled {count} times"),
@@ -1362,6 +1366,7 @@ pub(crate) fn tool_usage_label(name: &str) -> &str {
         "github_comment" => "Comment",
         "github_update_pull_request" => "Update PR",
         "github_mark_pull_request_ready_for_review" => "Ready PR",
+        "github_convert_pull_request_to_draft" => "Draft PR",
         "github_add_labels" => "Label",
         "github_remove_labels" => "Unlabel",
         "run_command" => "Run",
@@ -1652,6 +1657,7 @@ pub(crate) fn tool_detail(call: &loom_model::ToolCall) -> Option<String> {
         | "github_comment"
         | "github_update_pull_request"
         | "github_mark_pull_request_ready_for_review"
+        | "github_convert_pull_request_to_draft"
         | "github_add_labels"
         | "github_remove_labels" => None,
         _ => match &call.arguments {
@@ -1999,6 +2005,19 @@ pub(crate) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
                 }
                 (Some(repository), None) => format!("Mark pull request in {repository} ready"),
                 _ => "Mark pull request ready for review".to_owned(),
+            }
+        }
+        "github_convert_pull_request_to_draft" => {
+            let repository = string_argument(arguments, "repository");
+            let number = arguments.get("number").and_then(serde_json::Value::as_u64);
+            match (repository, number) {
+                (Some(repository), Some(number)) => {
+                    format!("Convert {repository}#{number} to draft")
+                }
+                (Some(repository), None) => {
+                    format!("Convert pull request in {repository} to draft")
+                }
+                _ => "Convert pull request to draft".to_owned(),
             }
         }
         "github_add_labels" => github_number_title(arguments, "Label"),
