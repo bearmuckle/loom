@@ -1990,29 +1990,41 @@ mod tests {
     #[test]
     fn request_system_instructions_include_builtin_tool_guidance() {
         let all = loom_tools::tool_definitions();
-        let guidance_only =
-            super::steps::system_instructions_with_tool_guidance(None, &all).expect("guidance");
+        let guidance_only = super::steps::system_instructions_with_builtin_guidance(None, &all);
+        assert!(guidance_only.starts_with("General agent instructions:"));
+        assert!(guidance_only.contains("Be concise and factual."));
         assert!(guidance_only.contains("search_text"));
         assert!(guidance_only.contains("propose_plan"));
         assert!(guidance_only.contains("ask_user"));
 
         let combined =
-            super::steps::system_instructions_with_tool_guidance(Some("Be concise."), &all)
-                .expect("combined");
+            super::steps::system_instructions_with_builtin_guidance(Some("Be concise."), &all);
         assert!(combined.starts_with("Be concise."));
-        assert!(combined.contains("search_text"));
+        let general = combined
+            .find("General agent instructions:")
+            .expect("general block");
+        let tools = combined.find("search_text").expect("tool guidance");
+        assert!(
+            general < tools,
+            "general instructions precede tool guidance"
+        );
 
+        // The general block is composed even without client instructions or
+        // advertised tools, and the client text always comes first.
         assert_eq!(
-            super::steps::system_instructions_with_tool_guidance(Some("Be concise."), &[]),
-            Some("Be concise.".to_owned())
+            super::steps::system_instructions_with_builtin_guidance(Some("Be concise."), &[]),
+            format!(
+                "Be concise.\n\n{}",
+                super::steps::GENERAL_AGENT_INSTRUCTIONS
+            )
         );
         assert_eq!(
-            super::steps::system_instructions_with_tool_guidance(None, &[]),
-            None
+            super::steps::system_instructions_with_builtin_guidance(None, &[]),
+            super::steps::GENERAL_AGENT_INSTRUCTIONS
         );
         assert_eq!(
-            super::steps::system_instructions_with_tool_guidance(Some("   "), &[]),
-            None
+            super::steps::system_instructions_with_builtin_guidance(Some("   "), &[]),
+            super::steps::GENERAL_AGENT_INSTRUCTIONS
         );
     }
 
@@ -2024,9 +2036,69 @@ mod tests {
         assert!(request.tools.iter().any(|tool| tool.name == "search_text"));
         assert!(request.messages.iter().any(|message| {
             message.role == MessageRole::System
+                && message.content.contains("General agent instructions:")
                 && message.content.contains("search_text")
                 && message.content.contains("run_command")
         }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn model_request_puts_client_instructions_before_the_general_block() {
+        let root = workspace();
+        let mut runtime = context_runtime(&root);
+        runtime.task.system_instructions = Some("Client instructions.".to_owned());
+        let (request, _) = runtime.model_request().unwrap();
+        let system = request
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::System)
+            .expect("system instructions message");
+        assert!(system.content.starts_with("Client instructions.\n\n"));
+        assert!(system.content.contains("General agent instructions:"));
+        assert!(system.content.contains("search_text"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn model_request_includes_the_general_block_without_tools() {
+        let root = workspace();
+        let descriptor = loom_model::ModelDescriptor {
+            id: ModelId::new("guidance/demo"),
+            provider: loom_model::ProviderId::new("guidance"),
+            display_name: "Guidance test model".to_owned(),
+            context_window: Some(8_192),
+            max_input_tokens: Some(4_096),
+            max_output_tokens: Some(1_024),
+            capabilities: loom_model::ModelCapabilities {
+                streaming: true,
+                tool_calling: false,
+                vision: false,
+                json_mode: false,
+            },
+        };
+        let runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            AgentTask::new("Answer without tools", descriptor.id.clone()).unwrap(),
+            Box::new(PlanThenCompleteProvider {
+                descriptor,
+                cursor: 0,
+            }),
+            ToolExecutor::new(&root).unwrap(),
+        );
+
+        let (request, _) = runtime.model_request().unwrap();
+        assert!(request.tools.is_empty());
+        assert!(request.messages.iter().any(|message| {
+            message.role == MessageRole::System
+                && message.content.starts_with("General agent instructions:")
+        }));
+        assert!(
+            !request
+                .messages
+                .iter()
+                .any(|message| message.content.contains("search_text"))
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2260,6 +2332,11 @@ mod tests {
         let digest = inspection.summary.as_ref().unwrap().source_digest.clone();
         runtime.context_checkpoint = inspection.summary.clone();
         runtime.context_inspection = Some(inspection);
+        // The general agent instructions are part of every request, so give the
+        // restored run room for the saved summary plus that block. The checkpoint
+        // must then be reused as-is instead of being recomputed by a new
+        // compaction pass that the old, tighter budget would trigger.
+        runtime.options.context.max_input_tokens = Some(6_000);
         let state = runtime.export_state();
         let mut legacy = serde_json::to_value(&state).unwrap();
         legacy
