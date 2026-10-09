@@ -47,10 +47,20 @@ pub use response::*;
 pub use retry::*;
 
 const GITHUB_OAUTH_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
+/// The Copilot login only performs Copilot model calls, so it asks for no
+/// scope that would let the resulting credential write to a repository.
+const GITHUB_COPILOT_OAUTH_SCOPE: &str = "read:user repo";
 /// The GitHub CLI OAuth app's public client id. A device flow against it
 /// yields a repository-scoped user token for clone, push, and pull requests,
 /// unlike the Copilot app token, which is limited to Copilot model access.
 const GITHUB_REPOSITORY_OAUTH_CLIENT_ID: &str = "178c6fc778ccc68e1d6a";
+/// `workflow` is a separate grant from `repo`: GitHub refuses to create or
+/// update anything under `.github/workflows/` unless the pushed credential
+/// carries it, so a credential without it can push every other file in a
+/// change and still be rejected wholesale for the workflow file. Requesting it
+/// here is what makes a CI change pushable; an already stored credential has to
+/// be renewed by repeating the device login.
+const GITHUB_REPOSITORY_OAUTH_SCOPE: &str = "read:user repo workflow";
 const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const GITHUB_COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
@@ -615,6 +625,57 @@ mod tests {
             Ok(())
         });
         (format!("http://{address}/v1/chat/completions"), server)
+    }
+
+    /// Serves one GitHub device-authorization request against a local fixture
+    /// and returns the endpoint plus a handle yielding the received request.
+    fn serve_device_authorization() -> (
+        String,
+        thread::JoinHandle<std::result::Result<String, String>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let request = read_request_with_body(&mut stream)?;
+            write_response(
+                &mut stream,
+                "application/json",
+                concat!(
+                    r#"{"device_code":"device-code","user_code":"ABCD-1234","#,
+                    r#""verification_uri":"https://github.com/login/device","#,
+                    r#""expires_in":900,"interval":5}"#
+                ),
+            )?;
+            Ok(request)
+        });
+        (format!("http://{address}/login/device/code"), server)
+    }
+
+    /// Reads a request up to and including its `Content-Length` body, so a
+    /// fixture can assert on the JSON the client sent rather than on headers
+    /// alone.
+    fn read_request_with_body(stream: &mut TcpStream) -> std::result::Result<String, String> {
+        let headers = read_request_headers(stream)?;
+        let body_length = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .unwrap_or_default();
+        let Some(body_start) = headers.find("\r\n\r\n").map(|position| position + 4) else {
+            return Ok(headers);
+        };
+        let mut request = headers.into_bytes();
+        let mut chunk = [0_u8; 1024];
+        while request.len() - body_start < body_length {
+            let read = stream.read(&mut chunk).map_err(|error| error.to_string())?;
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+        }
+        String::from_utf8(request).map_err(|error| error.to_string())
     }
 
     /// Accepts one connection, failing instead of blocking past `deadline`.
@@ -1458,9 +1519,45 @@ mod tests {
     fn github_repository_authenticator_uses_the_cli_app() {
         let repository = GitHubCopilotAuthenticator::repository();
         assert_eq!(repository.client_id, GITHUB_REPOSITORY_OAUTH_CLIENT_ID);
+        assert_eq!(repository.scope, GITHUB_REPOSITORY_OAUTH_SCOPE);
         assert_eq!(
             GitHubCopilotAuthenticator::default().client_id,
             GITHUB_OAUTH_CLIENT_ID
+        );
+        assert_eq!(
+            GitHubCopilotAuthenticator::default().scope,
+            GITHUB_COPILOT_OAUTH_SCOPE
+        );
+    }
+
+    #[test]
+    fn github_repository_login_requests_the_workflow_scope() {
+        let (repository_endpoint, repository_server) = serve_device_authorization();
+        let device = GitHubCopilotAuthenticator::repository()
+            .with_device_code_url(repository_endpoint)
+            .begin()
+            .unwrap();
+        assert_eq!(device.user_code, "ABCD-1234");
+        assert_eq!(device.expires_in, 900);
+        let request = repository_server.join().unwrap().unwrap();
+        assert!(
+            request.contains(r#""scope":"read:user repo workflow""#),
+            "repository login must request workflow, got: {request}"
+        );
+
+        let (copilot_endpoint, copilot_server) = serve_device_authorization();
+        GitHubCopilotAuthenticator::default()
+            .with_device_code_url(copilot_endpoint)
+            .begin()
+            .unwrap();
+        let request = copilot_server.join().unwrap().unwrap();
+        assert!(
+            request.contains(r#""scope":"read:user repo""#),
+            "Copilot login must keep its repository-read scopes, got: {request}"
+        );
+        assert!(
+            !request.contains("workflow"),
+            "the Copilot login must not request workflow, got: {request}"
         );
     }
 
