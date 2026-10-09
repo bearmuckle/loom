@@ -248,6 +248,7 @@ fn project_child_worktree_can_be_reviewed_fast_forwarded_and_cleaned_up() {
         parent_git.status().unwrap().head,
         integrated.integrated_revision
     );
+    assert_eq!(completion_guard.completion_blocker(), None);
 
     let cleanup = connection.request(RequestEnvelope::new(ClientRequest::Project(
         ProjectRequest::CleanupProjectChildWorktree {
@@ -344,6 +345,26 @@ fn project_child_integrates_a_merge_over_an_advanced_parent() {
     assert_eq!(parents.len(), 3, "expected a two-parent merge commit");
     assert!(parents.contains(&parent_advanced.as_str()));
     assert!(parents.contains(&child_revision.as_str()));
+
+    // The guard's intent is that the reviewed result is contained in what was
+    // integrated. A merge records the merge commit rather than the child
+    // revision, so a merge integration must still satisfy `completion_blocker`.
+    let completion_guard = ProjectAgentTools {
+        backend: Arc::downgrade(&fixture.backend),
+        session_id: fixture.root_id,
+        project_id: fixture.project_id,
+        model_id: ModelId::new("deterministic/demo"),
+        can_delegate: false,
+        can_delegate_code: false,
+        can_message: false,
+        can_branch_message: false,
+        can_inspect_children: false,
+        can_wait_children: false,
+        can_control_children: false,
+        can_review_children: false,
+        can_integrate_children: false,
+    };
+    assert_eq!(completion_guard.completion_blocker(), None);
     fixture.shutdown();
 }
 
