@@ -1,0 +1,47 @@
+# Sample systemd unit for the standalone `loom-server` backend.
+#
+# Install it as `/etc/systemd/system/loom-server.service`, adjust `ExecStart` to
+# the path the unpacked binary lives at, then:
+#
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now loom-server
+#
+# The unit runs as a dedicated non-root user. Create that account and the token
+# file first, then point `--token-file` at it:
+#
+#   sudo useradd --system --home-dir /var/lib/loom --create-home \
+#     --shell /usr/sbin/nologin loom
+#   sudo install -d -o loom -g loom -m 700 /etc/loom
+#   sudo sh -c 'head -c 32 /dev/urandom | base64 > /etc/loom/token'
+#   sudo chown loom:loom /etc/loom/token
+#   sudo chmod 600 /etc/loom/token
+#
+# `--token-file` is used instead of `--token` so the bearer token does not
+# appear on the command line, where any local user could read it from `/proc`.
+#
+# This unit serves plain `ws://` on loopback. For a remote deployment, add
+# `--tls-cert /path/to/cert.pem --tls-key /path/to/key.pem` to `ExecStart` and
+# bind a non-loopback address; the server refuses that bind without TLS unless
+# `--allow-insecure-remote` opts in to sending the token and all traffic in the
+# clear. The TLS key must be readable by the `loom` user, so give it that
+# ownership rather than leaving it root-only.
+[Unit]
+Description=Loom standalone backend
+Documentation=https://github.com/bearmuckle/loom
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=loom
+Group=loom
+ExecStart=/usr/local/bin/loom-server --bind 127.0.0.1:8765 \
+  --token-file /etc/loom/token --persistence /var/lib/loom/loom.db
+Restart=on-failure
+RestartSec=5
+StateDirectory=loom
+WorkingDirectory=/var/lib/loom
+Environment=RUST_LOG=loom_server=info
+
+[Install]
+WantedBy=multi-user.target

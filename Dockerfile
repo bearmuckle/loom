@@ -5,8 +5,10 @@
 #   docker run --rm loom-server --version
 #
 # The backend is AGPL-3.0-only, so the license texts ship inside the image.
-# `loom-server` speaks plain `ws://` guarded by a single bearer token; see
-# SECURITY.md before publishing its port anywhere untrusted.
+# `loom-server` is guarded by a single bearer token, and this image's default
+# command publishes a plaintext `ws://` port with the explicit
+# `--allow-insecure-remote` opt-in; see SECURITY.md before publishing its port
+# anywhere untrusted.
 
 FROM rust:1.98-bookworm AS builder
 
