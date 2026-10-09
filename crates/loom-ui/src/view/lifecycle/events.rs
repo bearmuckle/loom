@@ -25,12 +25,11 @@ impl LoomView {
                     stream_epoch,
                 }) => {
                     self.reset_projection();
-                    self.after_sequence = after_sequence;
                     self.event_stream_epoch = stream_epoch;
-                    for event in events {
-                        self.after_sequence = Some(event.sequence);
-                        self.consume_event(&event.event);
-                    }
+                    // The projection is empty again, so the whole batch is
+                    // applied; the cursor never ends below the cursor this
+                    // request was made with.
+                    self.apply_event_batch(events, after_sequence);
                     if let Some(projection) = fallback.as_ref() {
                         self.seed_plan_from_projection(projection);
                     }
@@ -98,11 +97,12 @@ impl LoomView {
         fallback: Option<AgentRunSnapshotProjection>,
     ) {
         self.reset_projection();
-        self.after_sequence = Some(latest_sequence);
-        for event in events {
-            self.after_sequence = Some(event.sequence);
-            self.consume_event(&event.event);
-        }
+        // A snapshot's window is not necessarily the whole conversation, so
+        // the events are applied in full and the cursor is raised to the
+        // snapshot's head afterwards instead of being adopted before them.
+        // Anything older than the window is recovered by the durable rebuild
+        // this snapshot triggered.
+        self.apply_event_batch(events, Some(latest_sequence));
         if let Some(projection) = fallback.as_ref() {
             self.seed_plan_from_projection(projection);
         }
@@ -111,6 +111,44 @@ impl LoomView {
         {
             self.apply_run_projection(projection);
         }
+    }
+
+    /// Applies a batch of journaled events in sequence order.
+    ///
+    /// The per-event global sequence makes application idempotent: an event
+    /// whose sequence is not greater than the cursor has already been applied,
+    /// so a re-delivered or overlapping batch is a no-op. `floor` is a sequence
+    /// the cursor must not end below (a snapshot's `latest_sequence`, or the
+    /// cursor the request was made with), so the cursor is always the maximum
+    /// of where it was, the floor, and the applied events, and never moves
+    /// backwards.
+    ///
+    /// A caller that rebuilds from scratch must reset the projection first,
+    /// which clears the cursor so every event in the batch is applied.
+    pub(crate) fn apply_event_batch(
+        &mut self,
+        events: impl IntoIterator<Item = loom_protocol::ServerEventEnvelope>,
+        floor: Option<EventSequence>,
+    ) -> usize {
+        let mut applied = 0;
+        for event in events {
+            if self
+                .after_sequence
+                .is_some_and(|applied_through| event.sequence <= applied_through)
+            {
+                continue;
+            }
+            self.after_sequence = Some(event.sequence);
+            self.consume_event(&event.event);
+            applied += 1;
+        }
+        if let Some(floor) = floor {
+            self.after_sequence = Some(
+                self.after_sequence
+                    .map_or(floor, |current| current.max(floor)),
+            );
+        }
+        applied
     }
 
     pub(crate) fn consume_event(&mut self, event: &ServerEvent) {
