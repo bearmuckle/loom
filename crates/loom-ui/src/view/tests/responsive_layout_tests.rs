@@ -16,7 +16,7 @@ fn wide_windows_keep_full_navigation_panels() {
     let layout = responsive_layout(px(960.));
     assert!(!layout.phone);
     assert_eq!(layout.sidebar_width, FULL_SIDEBAR_WIDTH);
-    assert_eq!(layout.review_width, px(430.));
+    assert_eq!(layout.review_width, px(420.));
     let wide_layout = responsive_layout(px(1400.));
     assert_eq!(wide_layout.review_width, FULL_REVIEW_WIDTH);
 }

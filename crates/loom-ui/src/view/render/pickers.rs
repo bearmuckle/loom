@@ -48,32 +48,6 @@ impl LoomView {
         picker
     }
 
-    pub(crate) fn render_agent_mode_picker(&self, phone: bool) -> impl IntoElement {
-        let mut picker = div()
-            .flex()
-            .items_center()
-            .when(phone, |element| element.h(px(44.)));
-        if let Some(state) = &self.agent_mode_select {
-            picker = picker.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .rounded_md()
-                    .hover(|style| style.bg(rgb(0x293244)))
-                    .child(
-                        Select::new(state)
-                            .id("agent-mode-select")
-                            .max_w(if phone { px(100.) } else { px(140.) })
-                            .small()
-                            .appearance(false)
-                            .accessibility_label("Agent mode")
-                            .placeholder("Select agent mode"),
-                    ),
-            );
-        }
-        picker
-    }
-
     #[cfg(target_family = "wasm")]
     pub(crate) fn render_disconnected(
         &self,

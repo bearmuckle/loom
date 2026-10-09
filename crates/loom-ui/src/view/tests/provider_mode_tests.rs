@@ -12,15 +12,6 @@ fn agent_modes_and_provider_selection(cx: &mut TestAppContext) {
         view.providers_node_id = Some("test-node".to_owned());
         view.copy_github_login_value("ABCD".to_owned(), "device code", cx);
 
-        for mode in [
-            AgentMode::Ask,
-            AgentMode::Edit,
-            AgentMode::Agent,
-            AgentMode::AutoApprove,
-        ] {
-            view.select_agent_mode(mode, cx);
-            view.sync_agent_mode_select_state(window, cx);
-        }
         view.toggle_auto_approve_actions(cx);
         view.toggle_auto_approve_actions(cx);
         view.sync_model_select_states(window, cx);

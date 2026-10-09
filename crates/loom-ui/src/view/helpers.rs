@@ -40,13 +40,13 @@ impl ResponsiveLayout {
         if self.phone {
             PHONE_TOUCH_TARGET
         } else {
-            px(30.)
+            px(24.)
         }
     }
 
     /// The vertical padding for a navigation list row.
     pub(crate) fn nav_row_padding(self) -> Pixels {
-        if self.phone { px(14.) } else { px(8.) }
+        if self.phone { px(16.) } else { px(8.) }
     }
 
     /// The font size for navigation list labels.
@@ -167,15 +167,15 @@ pub(crate) fn run_state_color(state: AgentRunState) -> gpui_kit::Rgba {
     }
 }
 
-/// Whether a session state represents work in progress.
+/// Whether a session state represents work actually in progress.
+///
+/// Waiting states (approval, input, queued, paused) are excluded so the sidebar
+/// activity light only animates while an agent is running, not while it is
+/// blocked or already finished.
 pub(crate) fn session_is_active(state: AgentSessionState) -> bool {
     matches!(
         state,
-        AgentSessionState::Planning
-            | AgentSessionState::Executing
-            | AgentSessionState::AwaitingApproval
-            | AgentSessionState::NeedsInput
-            | AgentSessionState::Evaluating
+        AgentSessionState::Planning | AgentSessionState::Executing | AgentSessionState::Evaluating
     )
 }
 
@@ -323,25 +323,6 @@ pub(crate) fn format_worker_node_resources(resources: &WorkerNodeResources) -> S
     )
 }
 
-pub(crate) fn worker_node_for_id<'a>(
-    nodes: &'a [WorkerNodeEntry],
-    node_id: Option<&str>,
-) -> Option<&'a WorkerNodeEntry> {
-    let node_id = node_id?;
-    nodes.iter().find(|node| node.status.node_id == node_id)
-}
-
-pub(crate) fn worker_node_name_for_id(
-    nodes: &[WorkerNodeEntry],
-    node_names: &BTreeMap<String, String>,
-    node_id: Option<&str>,
-) -> String {
-    worker_node_for_id(nodes, node_id)
-        .map(worker_node_display_name)
-        .or_else(|| node_id.and_then(|node_id| node_names.get(node_id).cloned()))
-        .unwrap_or_else(|| "Worker node unavailable".to_owned())
-}
-
 pub(crate) fn worker_node_display_name(node: &WorkerNodeEntry) -> String {
     let role = if node.is_local {
         "Local backend"
@@ -349,42 +330,6 @@ pub(crate) fn worker_node_display_name(node: &WorkerNodeEntry) -> String {
         "External worker"
     };
     format!("{role} · {}", node.status.name)
-}
-
-pub(crate) fn format_session_resource_percentages(status: Option<&WorkerNodeStatus>) -> String {
-    let resources = status.map(|status| &status.resources);
-    format!(
-        "CPU {} · RAM {}",
-        format_percentage(resources.and_then(|resources| resources.cpu_usage_percent)),
-        format_percentage(resources.and_then(|resources| resources.memory_usage_percent)),
-    )
-}
-
-pub(crate) fn session_owner_status<'a>(
-    nodes: &'a [WorkerNodeEntry],
-    session_node_ids: &BTreeMap<AgentSessionId, String>,
-    session_id: AgentSessionId,
-) -> Option<&'a WorkerNodeEntry> {
-    worker_node_for_id(nodes, session_node_ids.get(&session_id).map(String::as_str))
-}
-
-pub(crate) fn session_node_pulse(
-    status: Option<&WorkerNodeStatus>,
-    threshold_percent: u8,
-) -> Option<(Duration, f32)> {
-    let cpu_percent = status
-        .filter(|status| status.online)
-        .and_then(|status| status.resources.cpu_usage_percent)
-        .filter(|percent| *percent <= 100)?;
-    let threshold_percent = threshold_percent.min(100);
-    if cpu_percent <= threshold_percent {
-        return None;
-    }
-    let load_above_threshold = f32::from(cpu_percent - threshold_percent)
-        / f32::from(100_u8.saturating_sub(threshold_percent).max(1));
-    let period_ms = 2_600_u64 - (load_above_threshold * 800.) as u64;
-    let amplitude = 0.35 + load_above_threshold * 0.8;
-    Some((Duration::from_millis(period_ms), amplitude))
 }
 
 pub(crate) fn next_severe_load_streak(current: u8, resources: &WorkerNodeResources) -> u8 {
@@ -405,19 +350,6 @@ pub(crate) fn adjusted_project_agent_concurrency(current: u8, delta: i8) -> u8 {
         i16::from(loom_protocol::MIN_PROJECT_AGENT_CONCURRENCY),
         i16::from(loom_protocol::MAX_PROJECT_AGENT_CONCURRENCY),
     ) as u8
-}
-
-pub(crate) fn session_node_indicator_state(
-    status: Option<&WorkerNodeStatus>,
-    severe_load_streak: u8,
-) -> SessionNodeIndicatorState {
-    match status {
-        Some(status) if status.online && severe_load_streak >= 3 => {
-            SessionNodeIndicatorState::Severe
-        }
-        Some(status) if status.online => SessionNodeIndicatorState::Online,
-        _ => SessionNodeIndicatorState::Offline,
-    }
 }
 
 #[cfg(test)]

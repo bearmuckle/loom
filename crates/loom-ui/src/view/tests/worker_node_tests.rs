@@ -1,18 +1,16 @@
 use super::{
-    ACTIVE_BACKEND_NODE_ENTRY_ID, SessionNodeIndicatorState, SessionSourceChoice,
-    SessionSourceDialogPurpose, SessionTreeNode, WorkerConnectionStage, WorkerConnectionState,
-    WorkerNodeEntry, adjusted_cpu_pulse_threshold, adjusted_project_agent_concurrency,
-    assigned_node_id, connection_placeholder, filter_session_tree, format_percentage,
-    format_session_resource_percentages, format_worker_node_resources, initial_worker_nodes,
+    ACTIVE_BACKEND_NODE_ENTRY_ID, SessionSourceChoice, SessionSourceDialogPurpose, SessionTreeNode,
+    WorkerConnectionStage, WorkerConnectionState, WorkerNodeEntry, adjusted_cpu_pulse_threshold,
+    adjusted_project_agent_concurrency, assigned_node_id, connection_placeholder,
+    filter_session_tree, format_percentage, format_worker_node_resources, initial_worker_nodes,
     local_source_available, mark_worker_connection_failed, merge_node_sessions,
     next_severe_load_streak, order_session_nodes, project_child_control_actions,
     project_session_list_projection, project_session_list_projection_for_projects,
     project_snapshot_has_unloaded_agent_sessions, remove_worker_node_entry, safe_worker_url_label,
-    session_id_for_request, session_list_projection, session_node_indicator_state,
-    session_node_pulse, session_owner_status, session_status_pill, session_tree_descendant_count,
-    source_choice_is_allowed, source_dialog_initial_state,
-    transition_worker_connection_to_connecting, update_worker_node_status, validate_model_for_node,
-    worker_connection_failure_detail, worker_node_display_name, worker_node_name_for_id,
+    session_id_for_request, session_list_projection, session_status_pill,
+    session_tree_descendant_count, source_choice_is_allowed, source_dialog_initial_state,
+    transition_worker_connection_to_connecting, uncovered_session_ids, update_worker_node_status,
+    validate_model_for_node, worker_connection_failure_detail, worker_node_display_name,
     worker_url_embeds_credential,
 };
 use loom_core::{
@@ -486,6 +484,100 @@ fn project_session_list_projects_nested_children_and_selects_them() {
 }
 
 #[test]
+fn uncovered_session_ids_skip_sessions_captured_by_a_known_project() {
+    let root = AgentSessionId::new();
+    let child = AgentSessionId::new();
+    let other_root = AgentSessionId::new();
+    let other_child = AgentSessionId::new();
+    let sessions = vec![
+        session(root, "Project"),
+        session(child, "Agent"),
+        session(other_root, "Other project"),
+        session(other_child, "Other agent"),
+    ];
+    let project_id = loom_core::ProjectId::from_uuid(*root.as_uuid());
+    let agent = |session_id, parent| loom_core::ProjectAgentRecord {
+        session_id,
+        project_id,
+        parent_session_id: parent,
+        depth: 1,
+        state: AgentSessionState::Idle,
+        task_summary: None,
+        output_cursor: EventSequence::default(),
+        updated_at: Timestamp::from_unix_millis(1),
+    };
+    let project = loom_core::ProjectSnapshot {
+        project_id,
+        root_session_id: root,
+        agents: vec![agent(root, None), agent(child, Some(root))],
+        tasks: Vec::new(),
+        worktrees: Vec::new(),
+    };
+
+    // A fetched project covers its root and every delegated agent, so only the
+    // still-unknown project's sessions are reported.
+    assert_eq!(
+        uncovered_session_ids(&sessions, std::slice::from_ref(&project)),
+        vec![other_root, other_child]
+    );
+    assert_eq!(
+        uncovered_session_ids(&sessions, &[]),
+        vec![root, child, other_root, other_child]
+    );
+}
+
+#[test]
+fn project_order_uses_creation_time_not_recent_activity() {
+    let older = AgentSessionId::new();
+    let newer = AgentSessionId::new();
+    let stamp = Timestamp::from_unix_millis;
+    let snapshot = |id, name: &str, created, updated| AgentSessionSnapshot {
+        id,
+        workspace_id: WorkspaceId::new(),
+        name: name.to_owned(),
+        state: AgentSessionState::Idle,
+        created_at: stamp(created),
+        updated_at: stamp(updated),
+    };
+    // The backend returns sessions by most-recent activity, so the older
+    // project arrives first because it was touched last.
+    let sessions = vec![
+        snapshot(older, "Older", 1, 999),
+        snapshot(newer, "Newer", 2, 5),
+    ];
+    let project = |id: AgentSessionId| {
+        let project_id = loom_core::ProjectId::from_uuid(*id.as_uuid());
+        loom_core::ProjectSnapshot {
+            project_id,
+            root_session_id: id,
+            agents: vec![loom_core::ProjectAgentRecord {
+                session_id: id,
+                project_id,
+                parent_session_id: None,
+                depth: 1,
+                state: AgentSessionState::Idle,
+                task_summary: None,
+                output_cursor: EventSequence::default(),
+                updated_at: stamp(1),
+            }],
+            tasks: Vec::new(),
+            worktrees: Vec::new(),
+        }
+    };
+    let (older_project, newer_project) = (project(older), project(newer));
+
+    let projection = project_session_list_projection_for_projects(
+        &sessions,
+        newer,
+        vec![&older_project, &newer_project],
+    );
+
+    // Newest project first, regardless of which was updated most recently.
+    assert_eq!(projection.tree[0].session_id, newer);
+    assert_eq!(projection.tree[1].session_id, older);
+}
+
+#[test]
 fn project_filter_keeps_matching_projects_whole_and_matches_descendants() {
     let root_id = AgentSessionId::new();
     let child_id = AgentSessionId::new();
@@ -788,29 +880,8 @@ fn refreshed_worker_status_replaces_initial_unavailable_percentages() {
 }
 
 #[test]
-fn session_status_uses_the_assigned_node_not_the_active_backend() {
-    let mut active_backend = node(ACTIVE_BACKEND_NODE_ENTRY_ID, true);
-    active_backend.status.resources.cpu_usage_percent = Some(22);
-    active_backend.status.resources.memory_usage_percent = Some(38);
-
-    let mut peer = node(1, false);
-    peer.status.resources.cpu_usage_percent = Some(99);
-    peer.status.resources.memory_usage_percent = Some(97);
-    let nodes = vec![active_backend, peer];
+fn session_snapshot_request_targets_its_session() {
     let session_id = AgentSessionId::new();
-    let owners = BTreeMap::from([(session_id, "node-1".to_owned())]);
-
-    let owner = session_owner_status(&nodes, &owners, session_id).unwrap();
-    assert_eq!(worker_node_display_name(owner), "External worker · Node 1");
-    assert_eq!(
-        format_session_resource_percentages(Some(&owner.status)),
-        "CPU 99% · RAM 97%"
-    );
-    let node_names = BTreeMap::from([("node-1".to_owned(), "External worker · Node 1".to_owned())]);
-    assert_eq!(
-        worker_node_name_for_id(&nodes[..1], &node_names, Some("node-1")),
-        "External worker · Node 1"
-    );
     assert_eq!(
         session_id_for_request(
             &ClientRequest::Session(SessionRequest::GetAgentSessionSnapshot { session_id }),
@@ -1197,28 +1268,6 @@ fn model_selection_uses_the_chosen_workers_catalog() {
 }
 
 #[test]
-fn assigned_node_status_drives_dot_pulse_speed_and_intensity() {
-    let mut low_load = node(1, false).status;
-    low_load.resources.cpu_usage_percent = Some(6);
-    low_load.resources.memory_usage_percent = Some(10);
-    let mut high_load = low_load.clone();
-    high_load.resources.cpu_usage_percent = Some(80);
-    high_load.resources.memory_usage_percent = Some(60);
-    let unknown_load = node(2, false).status;
-
-    let (low_period, low_amplitude) = session_node_pulse(Some(&low_load), 5).unwrap();
-    let (high_period, high_amplitude) = session_node_pulse(Some(&high_load), 5).unwrap();
-
-    assert!(high_period < low_period);
-    assert!(high_amplitude > low_amplitude);
-    assert_eq!(session_node_pulse(Some(&unknown_load), 5), None);
-    assert_eq!(session_node_pulse(None, 5), None);
-    assert_eq!(session_node_pulse(Some(&low_load), 6), None);
-    high_load.online = false;
-    assert_eq!(session_node_pulse(Some(&high_load), 5), None);
-}
-
-#[test]
 fn pulse_threshold_adjustment_is_bounded_and_uses_five_percent_by_default() {
     assert_eq!(
         loom_protocol::WorkspaceConfig::default().cpu_pulse_threshold_percent,
@@ -1249,23 +1298,16 @@ fn project_agent_concurrency_adjustment_is_bounded() {
 }
 
 #[test]
-fn severe_load_red_requires_three_consecutive_dual_threshold_samples() {
+fn severe_load_streak_requires_three_consecutive_dual_threshold_samples() {
     let mut status = node(1, false).status;
     status.resources.cpu_usage_percent = Some(91);
     status.resources.memory_usage_percent = Some(91);
 
     let first = next_severe_load_streak(0, &status.resources);
     let second = next_severe_load_streak(first, &status.resources);
-    assert_eq!(
-        session_node_indicator_state(Some(&status), second),
-        SessionNodeIndicatorState::Online
-    );
+    assert_eq!(second, 2);
     let third = next_severe_load_streak(second, &status.resources);
     assert_eq!(third, 3);
-    assert_eq!(
-        session_node_indicator_state(Some(&status), third),
-        SessionNodeIndicatorState::Severe
-    );
     assert_eq!(next_severe_load_streak(u8::MAX, &status.resources), u8::MAX);
 
     status.resources.cpu_usage_percent = Some(90);
@@ -1273,12 +1315,6 @@ fn severe_load_red_requires_three_consecutive_dual_threshold_samples() {
     status.resources.cpu_usage_percent = Some(91);
     status.resources.memory_usage_percent = None;
     assert_eq!(next_severe_load_streak(third, &status.resources), 0);
-    status.resources.memory_usage_percent = Some(91);
-    status.online = false;
-    assert_eq!(
-        session_node_indicator_state(Some(&status), third),
-        SessionNodeIndicatorState::Offline
-    );
 }
 
 #[test]

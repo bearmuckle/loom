@@ -75,17 +75,16 @@ use crate::{
     MAX_REVIEW_CHANGES, MAX_REVIEW_DIFF,
     connection::{BackendWorker, ClientConnection, ConnectionCleanupGuard},
     state::{
-        AgentMode, AssistantPart, AssistantTurn, EvidenceText, FilesState, GitHubLoginKind,
-        GitHubLoginState, InspectorTab, PlanState, PlanStepStatus, RenameDialogState, ReviewRow,
-        ReviewState, SystemNote, SystemTone, ThemeChoice, TimelineItem, ToolPart, ToolPartStatus,
-        UsageState, bounded, bounded_to, finish_assistant_turn, has_tool_part,
-        push_assistant_evidence, push_assistant_reasoning, push_assistant_text,
-        session_state_for_run, session_title_from_task, upsert_tool_part,
+        AssistantPart, AssistantTurn, EvidenceText, FilesState, GitHubLoginKind, GitHubLoginState,
+        InspectorTab, PlanState, PlanStepStatus, RenameDialogState, ReviewRow, ReviewState,
+        SystemNote, SystemTone, ThemeChoice, TimelineItem, ToolPart, ToolPartStatus, UsageState,
+        bounded, bounded_to, finish_assistant_turn, has_tool_part, push_assistant_evidence,
+        push_assistant_reasoning, push_assistant_text, session_state_for_run, upsert_tool_part,
     },
     syntax::{self, Language},
     theme::{
-        ERROR_CARD_ACCENT, ERROR_CARD_FOREGROUND, ERROR_CARD_SURFACE, change_color, mono_font,
-        mono_size, rgb,
+        BASE_FONT_SIZE, CONVERSATION_FONT_SIZE, ERROR_CARD_ACCENT, ERROR_CARD_FOREGROUND,
+        ERROR_CARD_SURFACE, change_color, mono_font, mono_size, rgb,
     },
 };
 
@@ -106,15 +105,11 @@ use crate::connection::{redact_secret, unexpected_response};
 
 const COMPACT_LAYOUT_WIDTH: Pixels = px(960.);
 const PHONE_LAYOUT_WIDTH: Pixels = px(700.);
-const COMPACT_SIDEBAR_WIDTH: Pixels = px(200.);
-const FULL_SIDEBAR_WIDTH: Pixels = px(250.);
-const COMPACT_REVIEW_WIDTH: Pixels = px(440.);
-const FULL_REVIEW_WIDTH: Pixels = px(600.);
-const TIMELINE_CONTENT_MAX_WIDTH: Pixels = px(760.);
-// GPUI's text utilities use rems; native display scaling and browser zoom
-// are applied when the window converts them to pixels.
-const BASE_FONT_SIZE: f32 = 17.;
-const CONVERSATION_FONT_SIZE: f32 = 15.;
+const COMPACT_SIDEBAR_WIDTH: Pixels = px(210.);
+const FULL_SIDEBAR_WIDTH: Pixels = px(260.);
+const COMPACT_REVIEW_WIDTH: Pixels = px(400.);
+const FULL_REVIEW_WIDTH: Pixels = px(540.);
+const TIMELINE_CONTENT_MAX_WIDTH: Pixels = px(680.);
 const DEFAULT_FONT_SCALE_PERCENT: u16 = 100;
 const MIN_FONT_SCALE_PERCENT: u16 = 75;
 const MAX_FONT_SCALE_PERCENT: u16 = 150;
@@ -320,13 +315,6 @@ async fn browser_delay(duration: Duration) -> Result<(), LoomError> {
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SessionNodeIndicatorState {
-    Offline,
-    Online,
-    Severe,
-}
-
 type TranscriptMessage = (u64, u64, ModelMessage);
 type TranscriptPage = (Vec<TranscriptMessage>, Option<u64>, bool);
 
@@ -464,7 +452,6 @@ pub(crate) struct LoomView {
     pub(crate) model: ModelId,
     pub(crate) default_model: ModelId,
     pub(crate) session_models: BTreeMap<AgentSessionId, ModelId>,
-    pub(crate) agent_mode: AgentMode,
     pub(crate) auto_approve_actions: bool,
     session_auto_approve_actions: BTreeMap<AgentSessionId, bool>,
     pub(crate) session_task_cache: BTreeMap<AgentSessionId, String>,
@@ -492,8 +479,6 @@ pub(crate) struct LoomView {
     default_model_select_value: Option<String>,
     model_select_choices: BTreeMap<String, ModelId>,
     default_model_select_choices: BTreeMap<String, ModelId>,
-    agent_mode_select: Option<Entity<ModelSelectState>>,
-    agent_mode_select_subscription: Option<Subscription>,
     pub(crate) settings_open: bool,
     settings_section: SettingsSection,
     pub(crate) providers: Vec<ProviderSummary>,
@@ -676,9 +661,9 @@ fn session_tree_item(node: &SessionTreeNode) -> TreeItem {
         .iter()
         .map(session_tree_item)
         .collect::<Vec<_>>();
-    TreeItem::new(node.session_id.to_string(), node.label.clone())
-        .children(children)
-        .expanded(!node.children.is_empty())
+    // Projects with sub-agents start collapsed; only the active session's
+    // ancestor chain is expanded automatically (see `set_selected_item`).
+    TreeItem::new(node.session_id.to_string(), node.label.clone()).children(children)
 }
 
 fn find_session_tree_item<'a>(items: &'a [TreeItem], session_id: &str) -> Option<&'a TreeItem> {
@@ -703,6 +688,18 @@ fn session_tree_descendant_count(node: &SessionTreeNode) -> usize {
             .sum::<usize>()
 }
 
+/// Whether a project node or any of its descendant agents has work in flight.
+fn session_subtree_is_active(
+    node: &SessionTreeNode,
+    active_sessions: &BTreeSet<AgentSessionId>,
+) -> bool {
+    active_sessions.contains(&node.session_id)
+        || node
+            .children
+            .iter()
+            .any(|child| session_subtree_is_active(child, active_sessions))
+}
+
 /// Whether a project node or any of its descendants matches the lowercased
 /// filter. Projects are kept whole, so a child match keeps its root.
 fn session_tree_matches(node: &SessionTreeNode, filter: &str) -> bool {
@@ -722,6 +719,7 @@ fn filter_session_tree(tree: Vec<SessionTreeNode>, filter: &str) -> Vec<SessionT
 
 /// A compact status label with theme-resolved foreground and background colors
 /// for a project child row.
+#[derive(Clone, Copy)]
 struct SessionStatusPill {
     label: &'static str,
     foreground: u32,
@@ -772,6 +770,45 @@ fn session_status_pill(
         AgentSessionState::Failed => SessionStatusPill::new("Failed", 0xfca5a5, 0x542936),
         AgentSessionState::Cancelled => SessionStatusPill::new("Cancelled", 0xb7c0d0, 0x20242c),
     }
+}
+
+/// A typing-dots task activity light for a project sidebar row: three dots that
+/// bounce in sequence. It is only rendered while work is in flight.
+fn task_activity_indicator(index: usize, status: SessionStatusPill) -> gpui_kit::AnyElement {
+    let color = rgb(status.foreground);
+    let dot = |dot_index: usize, offset: f32| {
+        div()
+            .relative()
+            .w(px(4.))
+            .h(px(4.))
+            .rounded_full()
+            .bg(color)
+            .with_animation(
+                ("sidebar-task-activity", index * 3 + dot_index),
+                Animation::new(Duration::from_millis(1_200))
+                    .repeat_synced()
+                    .with_max_fps(24.),
+                move |element, progress| {
+                    let phase = (progress - offset).rem_euclid(1.0);
+                    let bump = if phase < 0.6 {
+                        (std::f32::consts::PI * phase / 0.6).sin()
+                    } else {
+                        0.0
+                    };
+                    element.opacity(0.3 + 0.7 * bump).top(px(-2.5 * bump))
+                },
+            )
+    };
+    div()
+        .h(px(12.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap(px(2.))
+        .child(dot(0, 0.0))
+        .child(dot(1, 0.15))
+        .child(dot(2, 0.3))
+        .into_any_element()
 }
 
 /// Copy for the browser's disconnected screen, which differs depending on
@@ -1019,11 +1056,21 @@ fn project_session_list_projection_for_projects(
             });
         }
     }
+    // Order projects by creation time (newest first), with the incoming list
+    // position only breaking ties. The backend lists sessions by `updated_at`,
+    // so ordering by position would make a busy project jump to the top; the
+    // creation time keeps the tree stable as sessions are updated.
+    let created_at = sessions
+        .iter()
+        .map(|session| (session.id, session.created_at.as_unix_millis()))
+        .collect::<BTreeMap<_, _>>();
     tree.sort_by_key(|node| {
-        sessions
+        let created = created_at.get(&node.session_id).copied().unwrap_or(0);
+        let position = sessions
             .iter()
             .position(|session| session.id == node.session_id)
-            .unwrap_or(usize::MAX)
+            .unwrap_or(usize::MAX);
+        (std::cmp::Reverse(created), position)
     });
     session_list_projection_from_tree(tree, active_session_id)
 }
@@ -1147,6 +1194,25 @@ fn project_snapshot_has_unloaded_agent_sessions(
             .iter()
             .any(|session| session.id == agent.session_id)
     })
+}
+
+/// Session ids not covered by any known project snapshot, in list order.
+///
+/// A project snapshot covers its root and every delegated agent, so fetching
+/// the project for the first uncovered session also covers its siblings.
+fn uncovered_session_ids(
+    sessions: &[AgentSessionSnapshot],
+    projects: &[loom_core::ProjectSnapshot],
+) -> Vec<AgentSessionId> {
+    let covered = projects
+        .iter()
+        .flat_map(|project| project.agents.iter().map(|agent| agent.session_id))
+        .collect::<BTreeSet<_>>();
+    sessions
+        .iter()
+        .filter(|session| !covered.contains(&session.id))
+        .map(|session| session.id)
+        .collect()
 }
 
 fn workspace_feed_event_sequence(event: &WorkspaceFeedEvent) -> EventSequence {
@@ -1383,7 +1449,6 @@ impl LoomView {
             context_inspection: None,
             default_model: model.clone(),
             session_models: BTreeMap::new(),
-            agent_mode: AgentMode::Agent,
             auto_approve_actions: true,
             session_auto_approve_actions: BTreeMap::new(),
             session_task_cache: BTreeMap::new(),
@@ -1408,8 +1473,6 @@ impl LoomView {
             default_model_select_value: None,
             model_select_choices: BTreeMap::new(),
             default_model_select_choices: BTreeMap::new(),
-            agent_mode_select: None,
-            agent_mode_select_subscription: None,
             settings_open: false,
             settings_section: SettingsSection::Agents,
             providers: Vec::new(),

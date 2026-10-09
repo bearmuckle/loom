@@ -52,22 +52,14 @@ impl LoomView {
             }
         }
         self.sending_message = true;
-        let session_title = if self.active_run_id.is_none() {
+        if self.active_run_id.is_none() {
+            // Remember the task for transcript ordering and the Agent card, but
+            // never rename the session from its first prompt. A project keeps
+            // the name it was created with (its folder or repository), and a
+            // session is renamed only through the explicit rename action.
             self.session_task_cache
                 .insert(self.active_session.id, message.clone());
-            let title = session_title_from_task(&message);
-            self.active_session.name = title.clone();
-            if let Some(session) = self
-                .sessions
-                .iter_mut()
-                .find(|session| session.id == self.active_session.id)
-            {
-                session.name = title;
-            }
-            Some(self.active_session.name.clone())
-        } else {
-            None
-        };
+        }
         let request = if let Some(run_id) = self.active_run_id {
             let Some(run) = self.active_run.as_ref().filter(|run| run.id == run_id) else {
                 self.sending_message = false;
@@ -108,26 +100,10 @@ impl LoomView {
             })
         };
         self.timeline.push(TimelineItem::User(message));
-        let session_id = self.active_session.id;
-        let rename_request = session_title.map(|title| {
-            backend.submit(RequestEnvelope::new(ClientRequest::Session(
-                SessionRequest::RenameAgentSession {
-                    session_id,
-                    name: title,
-                },
-            )))
-        });
         let run_request = backend.submit(RequestEnvelope::new(request));
         cx.spawn(async move |view, cx| {
             let response = cx
-                .background_spawn(async move {
-                    // The worker executes both requests in order; the rename is
-                    // cosmetic, so its outcome does not gate the run.
-                    if let Some(rename_request) = rename_request {
-                        let _ = rename_request.wait().await;
-                    }
-                    run_request.wait().await
-                })
+                .background_spawn(async move { run_request.wait().await })
                 .await;
             view.update(cx, |view, cx| view.finish_send_response(response, cx))
                 .ok();

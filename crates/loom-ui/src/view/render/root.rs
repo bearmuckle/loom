@@ -237,7 +237,6 @@ impl Render for LoomView {
         }
         self.schedule_worker_node_poll(cx);
         self.sync_model_select_states(window, cx);
-        self.sync_agent_mode_select_state(window, cx);
         self.schedule_run_poll(cx);
         self.schedule_project_poll(cx);
         let view = cx.entity();
@@ -641,7 +640,7 @@ impl Render for LoomView {
             .when(!cfg!(target_family = "wasm"), |element| {
                 element.child(
                     div()
-                        .h(px(30.))
+                        .h(px(26.))
                         .w_full()
                         .px_3()
                         .flex()
@@ -684,8 +683,8 @@ impl Render for LoomView {
                             div().flex().items_center().gap_1().ml_2().child(
                                 div()
                                     .id("window-close")
-                                    .w(px(22.))
-                                    .h(px(22.))
+                                    .w(px(20.))
+                                    .h(px(20.))
                                     .flex()
                                     .items_center()
                                     .justify_center()

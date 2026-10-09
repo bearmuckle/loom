@@ -104,18 +104,18 @@ impl Render for TimelineView {
                                 .bg(rgb(0x171c25))
                                 .border_1()
                                 .border_color(rgb(0x293244))
-                                .text_size(gpui_kit::rems(14. / BASE_FONT_SIZE))
+                                .text_size(gpui_kit::rems(13. / BASE_FONT_SIZE))
                                 .text_color(rgb(0xb7c0d0))
                                 .child(
                                     div()
-                                        .text_size(gpui_kit::rems(16. / BASE_FONT_SIZE))
+                                        .text_size(gpui_kit::rems(15. / BASE_FONT_SIZE))
                                         .text_color(rgb(0xf3f4f6))
                                         .child("Ready when you are"),
                                 )
                                 .child(
                                     div()
                                         .mt_1()
-                                        .text_size(gpui_kit::rems(14. / BASE_FONT_SIZE))
+                                        .text_size(gpui_kit::rems(13. / BASE_FONT_SIZE))
                                         .text_color(rgb(0x8f98a6))
                                         .child("Describe a task below and Loom will keep the work, decisions, and results together."),
                                 )
@@ -124,7 +124,7 @@ impl Render for TimelineView {
                                         .mt_3()
                                         .flex()
                                         .gap_3()
-                                        .text_size(gpui_kit::rems(13. / BASE_FONT_SIZE))
+                                        .text_size(gpui_kit::rems(12. / BASE_FONT_SIZE))
                                         .text_color(rgb(0x64748b))
                                         .child("/ commands")
                                         .child("@ files")

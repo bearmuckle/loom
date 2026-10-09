@@ -54,6 +54,64 @@ impl LoomView {
         .detach();
     }
 
+    /// Loads project snapshots for sessions not covered by a known project, so
+    /// the sidebar nests delegated sub-tasks even for projects the user has not
+    /// opened yet.
+    ///
+    /// Requests are issued one project at a time: a returned snapshot covers all
+    /// of its agent sessions, and sessions that become covered are skipped.
+    pub(crate) fn refresh_missing_project_snapshots(&mut self, cx: &mut Context<Self>) {
+        let pending = uncovered_session_ids(&self.sessions, &self.project_tree_snapshots)
+            .into_iter()
+            .filter_map(|session_id| {
+                self.session_node_ids
+                    .get(&session_id)
+                    .map(|node_id| (session_id, node_id.clone()))
+            })
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return;
+        }
+        cx.spawn(async move |view, cx| {
+            for (session_id, node_id) in pending {
+                let already_covered = view
+                    .update(cx, |view, _| {
+                        !uncovered_session_ids(&view.sessions, &view.project_tree_snapshots)
+                            .contains(&session_id)
+                    })
+                    .unwrap_or(true);
+                if already_covered {
+                    continue;
+                }
+                let backend = view
+                    .update(cx, |view, _| view.node_backends.get(&node_id).cloned())
+                    .ok()
+                    .flatten();
+                let Some(backend) = backend else {
+                    continue;
+                };
+                let request = backend.submit(RequestEnvelope::new(ClientRequest::Project(
+                    ProjectRequest::GetProjectSnapshotForSession { session_id },
+                )));
+                let response = cx
+                    .background_spawn(async move { request.wait().await })
+                    .await;
+                view.update(cx, |view, cx| {
+                    if let Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(snapshot))) =
+                        response.result
+                    {
+                        view.project_tree_snapshots
+                            .retain(|known| known.project_id != snapshot.project_id);
+                        view.project_tree_snapshots.push(snapshot);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     pub(crate) fn project_root_is_active(&self) -> bool {
         self.project_snapshot
             .as_ref()

@@ -684,7 +684,7 @@ impl LoomView {
                 // definite width and keep short messages content-sized.
                 let mut bubble = Bubble::new()
                     .alignment(MessageAlignment::End)
-                    .with_variant(BubbleVariant::Tinted);
+                    .with_variant(BubbleVariant::Secondary);
                 if has_block_markdown(text) {
                     bubble = bubble.w_full().content(BubbleContent::new().w_full());
                 }

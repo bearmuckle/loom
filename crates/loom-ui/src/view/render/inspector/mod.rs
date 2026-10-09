@@ -2,9 +2,9 @@ use super::*;
 
 /// Compact typography for inspector cards. Sizes are logical pixels converted
 /// through the app's rem base so user font scaling still applies.
-const CARD_TITLE_FONT_SIZE: f32 = 11.5;
-const CARD_LABEL_FONT_SIZE: f32 = 11.5;
-const CARD_VALUE_FONT_SIZE: f32 = 13.;
+const CARD_TITLE_FONT_SIZE: f32 = 11.;
+const CARD_LABEL_FONT_SIZE: f32 = 10.5;
+const CARD_VALUE_FONT_SIZE: f32 = 12.;
 
 fn card_title_font() -> gpui_kit::Rems {
     gpui_kit::rems(CARD_TITLE_FONT_SIZE / BASE_FONT_SIZE)

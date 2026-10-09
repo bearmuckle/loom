@@ -365,9 +365,16 @@ fn nested_project_tree_selects_grandchild_session_by_click(cx: &mut TestAppConte
     let view = rendered_view.borrow().as_ref().unwrap().clone();
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
-        for index in 0usize..3 {
-            assert!(window.find(("session-tree-root", index)).visible());
-        }
+        // Projects with sub-agents start collapsed.
+        assert!(window.find(("session-tree-root", 0usize)).visible());
+        assert!(window.try_find(("session-tree-root", 1usize)).is_none());
+        // Expanding the project, then its agent, reveals the grandchild.
+        window.click(("session-tree-root", 0usize), cx);
+        window.render_frame(cx);
+        assert!(window.find(("session-tree-root", 1usize)).visible());
+        window.click(("session-tree-root", 1usize), cx);
+        window.render_frame(cx);
+        assert!(window.find(("session-tree-root", 2usize)).visible());
         window.click(("session-tree-root", 2usize), cx);
         assert_eq!(view.read(cx).active_session.name, "Worker");
     })
@@ -382,6 +389,13 @@ fn phone_drawer_selects_session_and_closes_the_drawer(cx: &mut TestAppContext) {
     let handle = cx.open_window(size(px(390.), px(844.)), move |window, cx| {
         let view = cx.new(|cx| {
             let mut view = nested_project_view(cx.focus_handle());
+            // Select the nested agent so the collapsed tree auto-expands its path.
+            view.active_session = view
+                .sessions
+                .iter()
+                .find(|session| session.name == "Worker")
+                .cloned()
+                .expect("nested project has a Worker session");
             view.session_drawer_open = true;
             view
         });
@@ -1083,7 +1097,7 @@ fn phone_source_dialog_stacks_choices_and_keeps_actions_visible(cx: &mut TestApp
         let pane = window.find("source-dialog-pane").bounds();
         assert_eq!(pane.size.width, viewport.width);
         // The pane fills the central area below the window title bar.
-        assert_eq!(pane.size.height, viewport.height - px(30.));
+        assert_eq!(pane.size.height, viewport.height - px(26.));
         // The actions stay pinned and reachable even though the repository
         // list inside the scrollable body is longer than the window.
         assert!(window.find("cancel-session-source").visible());
