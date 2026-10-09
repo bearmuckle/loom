@@ -306,6 +306,7 @@ impl LoomView {
             return;
         }
         let workspace_id = self.workspace_id;
+        let remote_options = self.remote_options.clone();
         for (id, url) in candidates {
             if worker_url_embeds_credential(&url) {
                 self.set_worker_node_connection_failure(
@@ -320,6 +321,7 @@ impl LoomView {
                 node.connection_detail = None;
             }
             let candidate_url = url.clone();
+            let remote_options = remote_options.clone();
             cx.spawn(async move |view, cx| {
                 let result = cx
                     .background_spawn(async move {
@@ -341,8 +343,9 @@ impl LoomView {
                                 return Err((WorkerConnectionStage::CredentialRead, error, false));
                             }
                         };
-                        let connection = ClientConnection::remote(candidate_url.clone(), token)
-                            .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
+                        let connection =
+                            ClientConnection::remote(candidate_url.clone(), token, &remote_options)
+                                .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
                         if let Err(error) = negotiate(&connection).map(|_| ()) {
                             let cleanup_failed = connection.close().is_err();
                             return Err((

@@ -66,7 +66,11 @@ pub(crate) fn remote_url_is_secure_for_secrets(url: &str) -> bool {
         return false;
     }
     if scheme == "wss" {
-        return true;
+        // Answer for the transport rather than for the URL: the native client
+        // negotiates TLS with rustls over the OS roots plus any configured CA,
+        // and the browser hands it to the platform WebSocket, so a `wss://`
+        // endpoint really is encrypted.
+        return native_transport_tls_supported();
     }
     let host = if let Some(bracketed_host) = authority.strip_prefix('[') {
         bracketed_host.split(']').next().unwrap_or_default()
@@ -79,6 +83,22 @@ pub(crate) fn remote_url_is_secure_for_secrets(url: &str) -> bool {
         || host
             .parse::<std::net::IpAddr>()
             .is_ok_and(|address| address.is_loopback())
+}
+
+/// Whether this build's WebSocket transport can negotiate TLS itself.
+///
+/// Reported instead of trusting the URL scheme so the answer tracks what the
+/// transport can do. Native builds re-export the backend transport's capability;
+/// the browser only ever uses the platform `WebSocket`, which always supports
+/// `wss://`.
+#[cfg(not(target_family = "wasm"))]
+fn native_transport_tls_supported() -> bool {
+    loom_local::WEBSOCKET_TLS_SUPPORTED
+}
+
+#[cfg(target_family = "wasm")]
+fn native_transport_tls_supported() -> bool {
+    true
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -163,12 +183,17 @@ impl Drop for ConnectionCleanupGuard {
 
 impl ClientConnection {
     #[cfg(not(target_family = "wasm"))]
-    pub(crate) fn remote(url: String, token: String) -> Result<Self, LoomError> {
+    pub(crate) fn remote(
+        url: String,
+        token: String,
+        options: &loom_local::RemoteConnectionOptions,
+    ) -> Result<Self, LoomError> {
         let secure_for_secrets = remote_url_is_secure_for_secrets(&url);
         Ok(Self::Remote(loom_local::RemoteConnection::connect(
             &url,
             &token,
             secure_for_secrets,
+            options,
         )?))
     }
 
@@ -987,7 +1012,10 @@ mod tests {
 
     #[test]
     fn provider_secrets_require_tls_or_loopback_transport() {
-        assert!(remote_url_is_secure_for_secrets("wss://worker.example/ws"));
+        assert_eq!(
+            remote_url_is_secure_for_secrets("wss://worker.example/ws"),
+            super::native_transport_tls_supported()
+        );
         assert!(remote_url_is_secure_for_secrets("ws://localhost:8080/ws"));
         assert!(remote_url_is_secure_for_secrets("ws://127.0.0.1:8080/ws"));
         assert!(remote_url_is_secure_for_secrets("ws://[::1]:8080/ws"));
@@ -1169,7 +1197,11 @@ mod tests {
         let invalid_url = cx
             .background_executor
             .spawn(async {
-                ClientConnection::remote("not a websocket URL".to_owned(), "test-token".to_owned())
+                ClientConnection::remote(
+                    "not a websocket URL".to_owned(),
+                    "test-token".to_owned(),
+                    &loom_local::RemoteConnectionOptions::default(),
+                )
             })
             .await;
         assert!(matches!(
@@ -1180,7 +1212,11 @@ mod tests {
         let connected_status = cx
             .background_executor
             .spawn(async move {
-                let connection = ClientConnection::remote(url, token.token)?;
+                let connection = ClientConnection::remote(
+                    url,
+                    token.token,
+                    &loom_local::RemoteConnectionOptions::default(),
+                )?;
                 negotiate(&connection)?;
                 let status = worker_node_status(&connection)?;
                 connection.close()?;

@@ -911,6 +911,13 @@ pub(crate) fn about_git_revision() -> &'static str {
     option_env!("LOOM_GIT_REVISION").unwrap_or("unknown")
 }
 
+/// The release version stamped by `build.rs`, or the crate version when the
+/// build did not stamp one. Releases are tagged `v0.8.x` while the workspace
+/// version is `0.1.0`, so the stamped value is what a released binary reports.
+pub(crate) fn about_build_version() -> &'static str {
+    option_env!("LOOM_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
 /// The Version row: the crate version, plus the revision when one was stamped.
 pub(crate) fn about_version_label(version: &str, revision: &str) -> String {
     let revision = revision.trim();

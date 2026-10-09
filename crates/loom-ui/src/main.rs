@@ -57,7 +57,9 @@ pub(crate) const MAX_REVIEW_DIFF: usize = 48 * 1024;
 fn main() {
     init_logging();
     let options = match UiOptions::parse(std::env::args()) {
-        Ok(options) => options,
+        Ok(Some(options)) => options,
+        // `--help` and `--version` printed what was asked for; exit 0.
+        Ok(None) => return,
         Err(error) => {
             error!("could not parse Loom UI arguments: {error}");
             std::process::exit(1);

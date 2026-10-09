@@ -21,7 +21,11 @@ impl LoomView {
             let token = options.token.as_deref().ok_or_else(|| {
                 LoomError::invalid_request("remote connections require LOOM_TOKEN to be set")
             })?;
-            let connection = ClientConnection::remote(remote_url.clone(), token.to_owned())?;
+            let connection = ClientConnection::remote(
+                remote_url.clone(),
+                token.to_owned(),
+                &remote_connection_options(options),
+            )?;
             remote_cleanup_guard = Some(ConnectionCleanupGuard::new(connection.clone()));
             info!("remote transport connected; negotiating protocol");
             server_protocol_version = Some(negotiate(&connection)?.protocol_version);
@@ -228,6 +232,7 @@ impl LoomView {
             owned_backend: None,
             server_protocol_version,
             backend_endpoint,
+            remote_options: remote_connection_options(options),
             browser_client: false,
             default_backend_node_id: default_backend_node_id.clone(),
             node_backends,
@@ -993,6 +998,7 @@ impl LoomView {
             return;
         };
         let workspace_id = self.workspace_id;
+        let remote_options = self.remote_options.clone();
         let submitted_value = value;
         let node_url = url.clone();
         let connect_url = url.clone();
@@ -1001,7 +1007,7 @@ impl LoomView {
             let result = cx
                 .background_spawn(async move {
                     let connection =
-                        ClientConnection::remote(connect_url, token.clone())
+                        ClientConnection::remote(connect_url, token.clone(), &remote_options)
                         .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
                     if let Err(error) = negotiate(&connection).map(|_| ()) {
                         let cleanup_failed = connection.close().is_err();

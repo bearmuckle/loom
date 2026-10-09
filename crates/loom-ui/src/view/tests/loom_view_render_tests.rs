@@ -203,6 +203,8 @@ fn startup_rejects_credential_bearing_remote_urls_and_missing_tokens(cx: &mut Te
             remote: Some(remote.to_owned()),
             token: token.map(str::to_owned),
             reset_state: false,
+            ca: None,
+            allow_insecure_remote: false,
         };
         let error = match LoomView::try_new(
             &options("ws://user:secret@worker.example", Some("token")),
@@ -241,6 +243,8 @@ fn startup_rejects_credential_bearing_remote_urls_and_missing_tokens(cx: &mut Te
             remote: None,
             token: None,
             reset_state: false,
+            ca: None,
+            allow_insecure_remote: false,
         };
         let error = match LoomView::try_new(&local_options, cx.focus_handle()) {
             Err(error) => error,
@@ -267,6 +271,8 @@ fn connection_bootstrap_creates_and_attaches_a_local_workspace_session(cx: &mut 
             remote: None,
             token: None,
             reset_state: false,
+            ca: None,
+            allow_insecure_remote: false,
         };
         let workspace_root =
             std::env::temp_dir().join(format!("loom-ui-bootstrap-{}", uuid::Uuid::new_v4()));

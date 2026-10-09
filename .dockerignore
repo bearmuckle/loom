@@ -1,0 +1,9 @@
+# The Rust build directory is large and container builds never input it; leaving
+# it out keeps the build context small even after a local workspace build.
+target/
+# The build stamps the revision from `LOOM_GIT_REVISION` (see the Dockerfile), so
+# history is not an input either.
+.git/
+# Packaging output and coverage reports are generated, never inputs.
+dist/
+lcov.info

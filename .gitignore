@@ -1,4 +1,6 @@
 /target/
 /crates/loom-ui/dist/
+# Release archives, AppImages and packages written by the release workflow.
+/dist/
 
 lcov.info

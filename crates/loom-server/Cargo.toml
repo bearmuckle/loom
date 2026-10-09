@@ -1,10 +1,14 @@
 [package]
 name = "loom-server"
-description = "In-process Loom backend used by native clients and protocol tests."
+description = "Loom backend library, including the standalone loom-server WebSocket worker."
 version.workspace = true
 edition.workspace = true
 license = "AGPL-3.0-only"
 rust-version.workspace = true
+
+[[bin]]
+name = "loom-server"
+path = "src/main.rs"
 
 [[bench]]
 name = "server_restore"
@@ -26,11 +30,16 @@ loom-workspace.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 log.workspace = true
+env_logger.workspace = true
 axum.workspace = true
 futures-util.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+rustls-pemfile.workspace = true
 uuid.workspace = true
 subtle.workspace = true
 url.workspace = true

@@ -21,7 +21,13 @@ use sha2::{Digest, Sha256};
 
 mod connection;
 
-pub use connection::{LocalConnection, OwnedBackend, RemoteConnection};
+pub use connection::{LocalConnection, OwnedBackend, RemoteConnection, RemoteConnectionOptions};
+
+/// Whether the native WebSocket transport can negotiate TLS (`wss://`).
+///
+/// Clients re-export this capability so they report what the transport can
+/// really do instead of trusting a URL scheme.
+pub use loom_server::WEBSOCKET_TLS_SUPPORTED;
 
 const PEER_CREDENTIAL_SERVICE: &str = "com.bearmuckle.loom.worker-peer";
 
@@ -159,10 +165,61 @@ pub struct UiOptions {
     pub remote: Option<String>,
     pub token: Option<String>,
     pub reset_state: bool,
+    /// PEM file whose certificates are trusted in addition to the OS roots for
+    /// `wss://` workers. `--ca` overrides the `LOOM_TLS_CA` environment
+    /// variable.
+    pub ca: Option<PathBuf>,
+    /// Explicit opt-in that permits plaintext `ws://` to a non-loopback worker.
+    pub allow_insecure_remote: bool,
+}
+
+/// The version reported by `--version`: the release version stamped at build
+/// time, plus the revision when one was stamped.
+pub fn build_version_label() -> String {
+    version_label(
+        option_env!("LOOM_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
+        option_env!("LOOM_GIT_REVISION").unwrap_or("unknown"),
+    )
+}
+
+/// Joins a version and revision the way the client's About pane does, omitting
+/// an absent revision.
+fn version_label(version: &str, revision: &str) -> String {
+    let revision = revision.trim();
+    if revision.is_empty() || revision == "unknown" {
+        version.to_owned()
+    } else {
+        format!("{version} · {revision}")
+    }
+}
+
+/// The usage text printed by `--help`.
+fn usage_text() -> String {
+    "Usage: loom-ui [--project PATH] [--task DESCRIPTION] [--model ID] [--endpoint URL] \
+     [--remote URL] [--ca PATH] [--allow-insecure-remote] [--reset-state] [--demo]\n\
+     \n\
+     Options:\n\
+     \x20 --project PATH        open this directory as the workspace\n\
+     \x20 --task DESCRIPTION    initial task description\n\
+     \x20 --model ID            model id to use\n\
+     \x20 --endpoint URL        OpenAI-compatible endpoint\n\
+     \x20 --remote URL          connect to a Loom worker instead of a local backend\n\
+     \x20 --ca PATH             PEM file of additional trusted CAs for wss:// workers\n\
+     \x20 --allow-insecure-remote\n\
+     \x20                       allow plaintext ws:// to a non-loopback worker\n\
+     \x20 --reset-state         wipe an incompatible local state database\n\
+     \x20 --demo                use the deterministic demo provider\n\
+     \x20 -h, --help            print this help and exit\n\
+     \x20 -V, --version         print the version and exit\n\
+     \n\
+     LOOM_TLS_CA names the same PEM file as --ca when the flag is not given."
+        .to_owned()
 }
 
 impl UiOptions {
-    pub fn parse<I>(args: I) -> Result<Self, LoomError>
+    /// Parses the command line. `Ok(None)` means `--help` or `--version` already
+    /// printed what was asked for and the process should exit successfully.
+    pub fn parse<I>(args: I) -> Result<Option<Self>, LoomError>
     where
         I: IntoIterator<Item = String>,
     {
@@ -177,6 +234,8 @@ impl UiOptions {
         let mut remote = env::var("LOOM_REMOTE_URL").ok();
         let token = env::var("LOOM_TOKEN").ok();
         let mut reset_state = false;
+        let mut ca = env::var_os("LOOM_TLS_CA").map(PathBuf::from);
+        let mut allow_insecure_remote = false;
         let mut args = args.into_iter().skip(1);
         while let Some(argument) = args.next() {
             match argument.as_str() {
@@ -235,13 +294,30 @@ impl UiOptions {
                     demo = true;
                     model = ModelId::new("deterministic/demo");
                 }
+                "--ca" => {
+                    let value = args.next().ok_or_else(|| {
+                        LoomError::invalid_request("--ca requires a PEM file path")
+                    })?;
+                    if value.trim().is_empty() {
+                        return Err(LoomError::invalid_request(
+                            "--ca requires a non-empty PEM file path",
+                        ));
+                    }
+                    ca = Some(PathBuf::from(value));
+                }
+                "--allow-insecure-remote" => {
+                    allow_insecure_remote = true;
+                }
                 "--reset-state" => {
                     reset_state = true;
                 }
                 "--help" | "-h" => {
-                    return Err(LoomError::invalid_request(
-                        "usage: loom-ui [--project PATH] [--task DESCRIPTION] [--model ID] [--endpoint URL] [--remote URL] [--reset-state] [--demo]",
-                    ));
+                    println!("{}", usage_text());
+                    return Ok(None);
+                }
+                "--version" | "-V" => {
+                    println!("loom-ui {}", build_version_label());
+                    return Ok(None);
                 }
                 unknown => {
                     return Err(LoomError::invalid_request(format!(
@@ -250,7 +326,7 @@ impl UiOptions {
                 }
             }
         }
-        Ok(Self {
+        Ok(Some(Self {
             project,
             task,
             demo,
@@ -260,7 +336,9 @@ impl UiOptions {
             remote,
             token,
             reset_state,
-        })
+            ca,
+            allow_insecure_remote,
+        }))
     }
 }
 
@@ -465,9 +543,13 @@ mod tests {
             "http://127.0.0.1:8000/v1/chat/completions".to_owned(),
             "--remote".to_owned(),
             "ws://127.0.0.1:8080/ws".to_owned(),
+            "--ca".to_owned(),
+            "/tmp/loom-ca.pem".to_owned(),
+            "--allow-insecure-remote".to_owned(),
             "--reset-state".to_owned(),
         ])
-        .unwrap();
+        .unwrap()
+        .expect("arguments describe a runnable client");
         assert_eq!(options.project, Some(PathBuf::from("/tmp/project")));
         assert_eq!(options.task, "fix the agent flow");
         assert_eq!(options.model.as_str(), "gpt-4o-mini");
@@ -476,6 +558,8 @@ mod tests {
             Some("http://127.0.0.1:8000/v1/chat/completions")
         );
         assert_eq!(options.remote.as_deref(), Some("ws://127.0.0.1:8080/ws"));
+        assert_eq!(options.ca.as_deref(), Some(Path::new("/tmp/loom-ca.pem")));
+        assert!(options.allow_insecure_remote);
         assert!(options.reset_state);
         assert!(!options.demo);
     }
@@ -492,8 +576,10 @@ mod tests {
             vec!["--endpoint", "  "],
             vec!["--remote"],
             vec!["--remote", "  "],
+            vec!["--ca"],
+            vec!["--ca", "  "],
             vec!["--unknown"],
-            vec!["--help"],
+            vec!["-x"],
         ] {
             let result = UiOptions::parse(
                 std::iter::once("loom-ui".to_owned())
@@ -502,16 +588,66 @@ mod tests {
             assert!(result.is_err(), "accepted arguments: {args:?}");
             assert_eq!(result.unwrap_err().code, ErrorCode::InvalidRequest);
         }
-        let demo = UiOptions::parse(["loom-ui".to_owned(), "--demo".to_owned()]).unwrap();
+        let demo = UiOptions::parse(["loom-ui".to_owned(), "--demo".to_owned()])
+            .unwrap()
+            .expect("demo arguments describe a runnable client");
         assert!(demo.demo);
         assert_eq!(demo.model.as_str(), "deterministic/demo");
+        assert_eq!(demo.ca, None);
+        assert!(!demo.allow_insecure_remote);
+    }
+
+    #[test]
+    fn ui_options_defaults_and_environment_supply_the_tls_ca() {
+        let defaults = UiOptions::parse(["loom-ui".to_owned()])
+            .unwrap()
+            .expect("no arguments describe a runnable client");
+        assert_eq!(defaults.ca, None);
+        assert!(!defaults.allow_insecure_remote);
+
+        let options = UiOptions::parse([
+            "loom-ui".to_owned(),
+            "--ca".to_owned(),
+            "/tmp/flag-ca.pem".to_owned(),
+        ])
+        .unwrap()
+        .expect("a CA path describes a runnable client");
+        assert_eq!(options.ca.as_deref(), Some(Path::new("/tmp/flag-ca.pem")));
+    }
+
+    #[test]
+    fn ui_options_help_and_version_print_and_stop_argument_parsing() {
+        for args in [
+            vec!["--help"],
+            vec!["-h", "--unknown"],
+            vec!["--version"],
+            vec!["-V", "--project"],
+        ] {
+            let result = UiOptions::parse(
+                std::iter::once("loom-ui".to_owned())
+                    .chain(args.iter().copied().map(str::to_owned)),
+            );
+            assert!(
+                result.unwrap().is_none(),
+                "expected printed output for {args:?}"
+            );
+        }
+        assert!(!build_version_label().is_empty());
+        assert!(usage_text().contains("--remote URL"));
+        assert!(usage_text().contains("--ca PATH"));
+        assert!(usage_text().contains("--allow-insecure-remote"));
+        assert_eq!(version_label("v0.8.1", "a1b2c3d"), "v0.8.1 · a1b2c3d");
+        assert_eq!(version_label("0.1.0", "unknown"), "0.1.0");
+        assert_eq!(version_label("0.1.0", "   "), "0.1.0");
     }
 
     #[test]
     fn workspace_preparation_validates_and_initializes_a_repository() {
         let root = env::temp_dir().join(format!("loom-ui-platform-{}", WorkspaceId::new()));
         fs::create_dir_all(&root).unwrap();
-        let mut options = UiOptions::parse(["loom-ui".to_owned()]).unwrap();
+        let mut options = UiOptions::parse(["loom-ui".to_owned()])
+            .unwrap()
+            .expect("no arguments describe a runnable client");
         options.project = Some(root.clone());
         let (resolved, demo) = prepare_workspace(&options).unwrap();
         assert_eq!(resolved, fs::canonicalize(&root).unwrap());
@@ -585,7 +721,9 @@ mod tests {
 
     #[test]
     fn workspace_preparation_defaults_to_the_process_directory_unless_it_is_internal() {
-        let options = UiOptions::parse(["loom-ui".to_owned()]).unwrap();
+        let options = UiOptions::parse(["loom-ui".to_owned()])
+            .unwrap()
+            .expect("no arguments describe a runnable client");
         let (root, demo) = prepare_workspace(&options).unwrap();
         assert!(!demo);
         let current = fs::canonicalize(env::current_dir().unwrap()).unwrap();
@@ -602,6 +740,34 @@ mod tests {
             backend_persistence_path(),
             state_root().join("loom").join("state.db")
         );
+    }
+
+    #[test]
+    fn remote_connection_rejects_unusable_ca_files_before_connecting() {
+        let options = RemoteConnectionOptions {
+            ca_certificate: Some(PathBuf::from("/nonexistent/loom-ca.pem")),
+            allow_insecure_remote: false,
+        };
+        let error = RemoteConnection::connect("wss://worker.example/ws", "token", false, &options)
+            .err()
+            .expect("a missing CA file must be rejected");
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(
+            error.message.contains("could not read the TLS CA file"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn remote_connection_defers_the_plaintext_guard_to_the_transport() {
+        let options = RemoteConnectionOptions::default();
+        let error =
+            RemoteConnection::connect("ws://worker.example:8765/ws", "token", false, &options)
+                .err()
+                .expect("a plaintext remote endpoint must be refused");
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains("--allow-insecure-remote"), "{error}");
+        const { assert!(super::WEBSOCKET_TLS_SUPPORTED) };
     }
 
     #[test]
