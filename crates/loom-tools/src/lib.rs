@@ -78,6 +78,7 @@ pub enum ToolKind {
     GitHubComment,
     GitHubUpdatePullRequest,
     GitHubMarkPullRequestReadyForReview,
+    GitHubConvertPullRequestToDraft,
     GitHubAddLabels,
     GitHubRemoveLabels,
 }
@@ -108,6 +109,7 @@ impl ToolKind {
             "github_mark_pull_request_ready_for_review" => {
                 Some(Self::GitHubMarkPullRequestReadyForReview)
             }
+            "github_convert_pull_request_to_draft" => Some(Self::GitHubConvertPullRequestToDraft),
             "github_add_labels" => Some(Self::GitHubAddLabels),
             "github_remove_labels" => Some(Self::GitHubRemoveLabels),
             _ => None,
@@ -139,6 +141,7 @@ impl ToolKind {
             Self::GitHubMarkPullRequestReadyForReview => {
                 "github_mark_pull_request_ready_for_review"
             }
+            Self::GitHubConvertPullRequestToDraft => "github_convert_pull_request_to_draft",
             Self::GitHubAddLabels => "github_add_labels",
             Self::GitHubRemoveLabels => "github_remove_labels",
         }
@@ -162,6 +165,7 @@ impl ToolKind {
                 | Self::GitHubComment
                 | Self::GitHubUpdatePullRequest
                 | Self::GitHubMarkPullRequestReadyForReview
+                | Self::GitHubConvertPullRequestToDraft
                 | Self::GitHubAddLabels
                 | Self::GitHubRemoveLabels
         )
@@ -188,6 +192,7 @@ impl ToolKind {
             | Self::GitHubComment
             | Self::GitHubUpdatePullRequest
             | Self::GitHubMarkPullRequestReadyForReview
+            | Self::GitHubConvertPullRequestToDraft
             | Self::GitHubAddLabels
             | Self::GitHubRemoveLabels => ActionKind::Write,
             Self::ApplyPatch => ActionKind::Write,
@@ -252,9 +257,31 @@ const GITHUB_NOT_CONNECTED: &str =
 const GITHUB_WRITE_DISABLED: &str =
     "GitHub write access is disabled; enable writes and pull requests in Loom settings";
 const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com";
+const GITHUB_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Cap on how many comments or issues a single read pulls back, keeping the
 /// response bounded like the other list tools.
 const GITHUB_PAGE_SIZE: usize = 100;
+/// Operation names and documents for the pull request draft-state calls. GitHub
+/// exposes draft state only through these two GraphQL mutations, so there is no
+/// REST route for either direction.
+const GITHUB_DRAFT_STATE_OPERATION: &str = "PullRequestDraftState";
+const GITHUB_DRAFT_STATE_QUERY: &str = concat!(
+    "query PullRequestDraftState($owner: String!, $name: String!, $number: Int!) { ",
+    "repository(owner: $owner, name: $name) { ",
+    "pullRequest(number: $number) { id isDraft url } } }"
+);
+const GITHUB_MARK_READY_OPERATION: &str = "markPullRequestReadyForReview";
+const GITHUB_MARK_READY_MUTATION: &str = concat!(
+    "mutation MarkPullRequestReadyForReview($pullRequestId: ID!) { ",
+    "markPullRequestReadyForReview(input: {pullRequestId: $pullRequestId}) { ",
+    "pullRequest { id isDraft url } } }"
+);
+const GITHUB_CONVERT_TO_DRAFT_OPERATION: &str = "convertPullRequestToDraft";
+const GITHUB_CONVERT_TO_DRAFT_MUTATION: &str = concat!(
+    "mutation ConvertPullRequestToDraft($pullRequestId: ID!) { ",
+    "convertPullRequestToDraft(input: {pullRequestId: $pullRequestId}) { ",
+    "pullRequest { id isDraft url } } }"
+);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WebSearchRequest {
@@ -472,6 +499,7 @@ impl ToolExecutor {
                 | ToolKind::GitHubComment
                 | ToolKind::GitHubUpdatePullRequest
                 | ToolKind::GitHubMarkPullRequestReadyForReview
+                | ToolKind::GitHubConvertPullRequestToDraft
                 | ToolKind::GitHubAddLabels
                 | ToolKind::GitHubRemoveLabels,
             ) => github_connected,
@@ -589,7 +617,10 @@ impl ToolExecutor {
             ToolKind::GitHubComment => self.github_comment(call),
             ToolKind::GitHubUpdatePullRequest => self.github_update_pull_request(call),
             ToolKind::GitHubMarkPullRequestReadyForReview => {
-                self.github_mark_pull_request_ready_for_review(call)
+                self.github_set_pull_request_draft_state(call, false)
+            }
+            ToolKind::GitHubConvertPullRequestToDraft => {
+                self.github_set_pull_request_draft_state(call, true)
             }
             ToolKind::GitHubAddLabels => self.github_add_labels(call),
             ToolKind::GitHubRemoveLabels => self.github_remove_labels(call),
@@ -1414,7 +1445,14 @@ impl ToolExecutor {
         }
     }
 
-    fn github_mark_pull_request_ready_for_review(&self, call: &ToolCall) -> ToolResult {
+    /// Marks a draft pull request ready for review (`draft = false`) or
+    /// converts a pull request back to a draft (`draft = true`).
+    ///
+    /// GitHub models both directions with one `isDraft` flag and two GraphQL
+    /// mutations, so the two tools share this implementation: look the pull
+    /// request up, skip the mutation when it is already in the requested
+    /// state, and otherwise issue the matching mutation.
+    fn github_set_pull_request_draft_state(&self, call: &ToolCall, draft: bool) -> ToolResult {
         if !self.github_write_enabled {
             return ToolResult::failure(call, GITHUB_WRITE_DISABLED);
         }
@@ -1422,15 +1460,101 @@ impl ToolExecutor {
             Ok(arguments) => arguments,
             Err(error) => return ToolResult::failure(call, error),
         };
-        match self.github_api(
-            "POST",
-            &arguments.repository,
-            &format!("pulls/{}/ready_for_review", arguments.number),
-            Some(serde_json::json!({})),
-        ) {
-            Ok(value) => ToolResult::success(call, self.limit_output(value.to_string())),
-            Err(error) => ToolResult::failure(call, error),
+        let repository = arguments.repository.as_str();
+        if !valid_github_repository(repository) {
+            return ToolResult::failure(call, "repository must be in owner/name format");
         }
+        let (owner, name) = repository
+            .split_once('/')
+            .unwrap_or((repository, repository));
+        let number = arguments.number;
+        let lookup = match self.github_graphql(
+            GITHUB_DRAFT_STATE_OPERATION,
+            GITHUB_DRAFT_STATE_QUERY,
+            serde_json::json!({ "owner": owner, "name": name, "number": number }),
+        ) {
+            Ok(lookup) => lookup,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let Some(repository_node) = lookup
+            .pointer("/data/repository")
+            .filter(|node| !node.is_null())
+        else {
+            return ToolResult::failure(
+                call,
+                format!("GitHub repository {repository} was not found"),
+            );
+        };
+        let Some(pull_request) = repository_node
+            .get("pullRequest")
+            .filter(|node| !node.is_null())
+        else {
+            return ToolResult::failure(
+                call,
+                format!("pull request {repository}#{number} was not found"),
+            );
+        };
+        let Some(node_id) = pull_request.get("id").and_then(serde_json::Value::as_str) else {
+            return ToolResult::failure(
+                call,
+                format!(
+                    "GitHub pull request {repository}#{number} response did not include its node id"
+                ),
+            );
+        };
+        let Some(is_draft) = pull_request
+            .get("isDraft")
+            .and_then(serde_json::Value::as_bool)
+        else {
+            return ToolResult::failure(
+                call,
+                format!(
+                    "GitHub pull request {repository}#{number} response did not include its draft state"
+                ),
+            );
+        };
+        let url = github_pull_request_url(pull_request);
+        if is_draft == draft {
+            let message = if draft {
+                format!("Pull request {repository}#{number} is already a draft.")
+            } else {
+                format!("Pull request {repository}#{number} is already ready for review.")
+            };
+            let result =
+                github_draft_state_result(repository, number, is_draft, &url, false, message);
+            return ToolResult::success(call, self.limit_output(result.to_string()));
+        }
+        let (operation, mutation) = if draft {
+            (
+                GITHUB_CONVERT_TO_DRAFT_OPERATION,
+                GITHUB_CONVERT_TO_DRAFT_MUTATION,
+            )
+        } else {
+            (GITHUB_MARK_READY_OPERATION, GITHUB_MARK_READY_MUTATION)
+        };
+        let response = match self.github_graphql(
+            operation,
+            mutation,
+            serde_json::json!({ "pullRequestId": node_id }),
+        ) {
+            Ok(response) => response,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        // The mutation echoes the updated pull request; fall back to the
+        // requested state when the payload does not carry it.
+        let updated = response.pointer(&format!("/data/{operation}/pullRequest"));
+        let is_draft = updated
+            .and_then(|node| node.get("isDraft"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(draft);
+        let url = updated.map_or(url, github_pull_request_url);
+        let message = if draft {
+            format!("Pull request {repository}#{number} was converted to a draft.")
+        } else {
+            format!("Pull request {repository}#{number} was marked ready for review.")
+        };
+        let result = github_draft_state_result(repository, number, is_draft, &url, true, message);
+        ToolResult::success(call, self.limit_output(result.to_string()))
     }
 
     fn github_add_labels(&self, call: &ToolCall) -> ToolResult {
@@ -1577,40 +1701,11 @@ impl ToolExecutor {
             "{}/repos/{repository}/{path}",
             self.github_api_base.trim_end_matches('/')
         );
-        let (status, body) = run_async(async {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(15))
-                .build()
-                .map_err(|error| format!("GitHub request failed: {error}"))?;
-            let request = match method {
-                "GET" => client.get(&url),
-                "POST" => client
-                    .post(&url)
-                    .json(&body.unwrap_or_else(|| serde_json::json!({}))),
-                "PATCH" => client
-                    .patch(&url)
-                    .json(&body.unwrap_or_else(|| serde_json::json!({}))),
-                "DELETE" => client.delete(&url),
-                _ => return Err("unsupported GitHub API method".to_owned()),
-            };
-            let response = request
-                .header("Accept", "application/vnd.github+json")
-                .header("Authorization", format!("Bearer {token}"))
-                .header("X-GitHub-Api-Version", "2022-11-28")
-                .header("User-Agent", "Loom")
-                .send()
-                .await
-                .map_err(|error| format!("GitHub request failed: {error}"))?;
-            let status = response.status().as_u16();
-            let text = response
-                .text()
-                .await
-                .map_err(|error| format!("GitHub request failed: {error}"))?;
-            Ok::<_, String>((status, text))
-        })?;
+        let request = format!("{method} /repos/{repository}/{path}");
+        let (status, body) = github_request(&request, method, &url, token, body)?;
         if status >= 400 {
             return Err(format!(
-                "GitHub API returned HTTP {status}: {}",
+                "GitHub API returned HTTP {status} for {request}: {}",
                 truncate_text(&body, 1024)
             ));
         }
@@ -1621,6 +1716,48 @@ impl ToolExecutor {
         }
         serde_json::from_str(&body)
             .map_err(|error| format!("GitHub returned an invalid response: {error}"))
+    }
+
+    /// Runs one GitHub GraphQL operation and returns the parsed response
+    /// envelope so callers can read `data`.
+    ///
+    /// Draft state is exposed only through the `markPullRequestReadyForReview`
+    /// and `convertPullRequestToDraft` mutations, so this is the sibling
+    /// transport for the REST `github_api` helper. GitHub reports
+    /// GraphQL failures as HTTP 200 with an `errors` array, so those messages
+    /// take precedence over the status code.
+    fn github_graphql(
+        &self,
+        operation: &str,
+        query: &str,
+        variables: serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let token = self
+            .github_token
+            .as_deref()
+            .ok_or_else(|| GITHUB_NOT_CONNECTED.to_owned())?;
+        let url = format!("{}/graphql", self.github_api_base.trim_end_matches('/'));
+        let body = serde_json::json!({ "query": query, "variables": variables });
+        let request = format!("POST /graphql (GraphQL {operation})");
+        let (status, body) = github_request(&request, "POST", &url, token, Some(body))?;
+        let parsed = serde_json::from_str::<serde_json::Value>(&body);
+        if let Ok(value) = &parsed
+            && let Some(messages) = github_graphql_errors(value)
+        {
+            return Err(format!(
+                "GitHub GraphQL {operation} failed: {}",
+                truncate_text(&messages, 1024)
+            ));
+        }
+        if status >= 400 {
+            return Err(format!(
+                "GitHub GraphQL {operation} returned HTTP {status}: {}",
+                truncate_text(&body, 1024)
+            ));
+        }
+        parsed.map_err(|error| {
+            format!("GitHub GraphQL {operation} returned an invalid response: {error}")
+        })
     }
 
     fn resolve_relative(&self, relative: &str) -> std::result::Result<PathBuf, String> {
@@ -2042,6 +2179,102 @@ fn valid_github_repository(repository: &str) -> bool {
             part.bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
         })
+}
+
+/// Performs one GitHub HTTP request and returns its status and raw body.
+///
+/// The REST and GraphQL helpers share this transport so the client, the
+/// authentication headers, and the timeout live in one place. `request` names
+/// the call in every failure, which is what makes a rejected or invented route
+/// distinguishable from a genuinely missing resource.
+fn github_request(
+    request: &str,
+    method: &str,
+    url: &str,
+    token: &str,
+    body: Option<serde_json::Value>,
+) -> std::result::Result<(u16, String), String> {
+    if !matches!(method, "GET" | "POST" | "PATCH" | "DELETE") {
+        return Err(format!(
+            "unsupported GitHub API method {method} for {request}"
+        ));
+    }
+    run_async(async {
+        let client = reqwest::Client::builder()
+            .timeout(GITHUB_REQUEST_TIMEOUT)
+            .build()
+            .map_err(|error| format!("GitHub request failed for {request}: {error}"))?;
+        let payload = body.unwrap_or_else(|| serde_json::json!({}));
+        let outgoing = match method {
+            "GET" => client.get(url),
+            "POST" => client.post(url).json(&payload),
+            "PATCH" => client.patch(url).json(&payload),
+            _ => client.delete(url),
+        };
+        let response = outgoing
+            .header("Accept", "application/vnd.github+json")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "Loom")
+            .send()
+            .await
+            .map_err(|error| format!("GitHub request failed for {request}: {error}"))?;
+        let status = response.status().as_u16();
+        let text = response
+            .text()
+            .await
+            .map_err(|error| format!("GitHub request failed for {request}: {error}"))?;
+        Ok::<_, String>((status, text))
+    })
+}
+
+/// Joins the `errors` array of a GraphQL response into one message. GitHub
+/// answers a failed GraphQL operation with HTTP 200, so this array is the only
+/// failure signal for those responses.
+fn github_graphql_errors(value: &serde_json::Value) -> Option<String> {
+    let errors = value.get("errors")?.as_array()?;
+    if errors.is_empty() {
+        return None;
+    }
+    Some(
+        errors
+            .iter()
+            .map(|error| {
+                error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or_else(|| error.to_string(), str::to_owned)
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
+/// Reads the `url` field of a pull request node, which is optional here.
+fn github_pull_request_url(node: &serde_json::Value) -> String {
+    node.get("url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Bounded result payload shared by the two pull request draft-state tools.
+fn github_draft_state_result(
+    repository: &str,
+    number: u64,
+    draft: bool,
+    url: &str,
+    changed: bool,
+    message: String,
+) -> serde_json::Value {
+    serde_json::json!({
+        "repository": repository,
+        "number": number,
+        "draft": draft,
+        "url": url,
+        "changed": changed,
+        "message": message,
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -2505,7 +2738,20 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolKind::GitHubMarkPullRequestReadyForReview.name().to_owned(),
-            description: "Mark a draft pull request ready for review by number. Requires explicit write approval.".to_owned(),
+            description: "Mark a draft pull request ready for review by number. GitHub exposes draft state only through the GraphQL `markPullRequestReadyForReview` mutation, so this tool uses GraphQL rather than REST. Requires explicit write approval.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repository": {"type": "string", "description": "Repository in owner/name format."},
+                    "number": {"type": "integer", "minimum": 1}
+                },
+                "required": ["repository", "number"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: ToolKind::GitHubConvertPullRequestToDraft.name().to_owned(),
+            description: "Convert a pull request back to a draft by number, for example while reworking it. GitHub exposes draft state only through the GraphQL `convertPullRequestToDraft` mutation, so this tool uses GraphQL rather than REST. Requires explicit write approval.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -3451,6 +3697,7 @@ mod tests {
             "github_comment",
             "github_update_pull_request",
             "github_mark_pull_request_ready_for_review",
+            "github_convert_pull_request_to_draft",
             "github_add_labels",
             "github_remove_labels",
         ] {
@@ -3557,6 +3804,10 @@ mod tests {
             ),
             (
                 "github_mark_pull_request_ready_for_review",
+                serde_json::json!({"repository": "owner/name", "number": 1}),
+            ),
+            (
+                "github_convert_pull_request_to_draft",
                 serde_json::json!({"repository": "owner/name", "number": 1}),
             ),
             (
@@ -3954,12 +4205,39 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A pull request node as returned by the draft-state look-up.
+    fn draft_state_node(draft: bool) -> serde_json::Value {
+        serde_json::json!({
+            "id": "PR_node_9",
+            "isDraft": draft,
+            "url": "https://github.com/owner/name/pull/9"
+        })
+    }
+
+    /// A draft-state look-up response for the mock GraphQL endpoint.
+    fn draft_state_lookup(draft: bool) -> MockResponse {
+        MockResponse::json(serde_json::json!({
+            "data": {"repository": {"pullRequest": draft_state_node(draft)}}
+        }))
+    }
+
+    /// A draft-state mutation response keyed by the mutation field name.
+    fn draft_state_mutation(operation: &str, draft: bool) -> MockResponse {
+        let mut data = serde_json::Map::new();
+        data.insert(
+            operation.to_owned(),
+            serde_json::json!({"pullRequest": draft_state_node(draft)}),
+        );
+        MockResponse::json(serde_json::json!({"data": serde_json::Value::Object(data)}))
+    }
+
     #[test]
     fn github_update_pull_request_and_mark_ready() {
         let root = workspace();
         let mock = MockGitHub::start(vec![
             MockResponse::json(serde_json::json!({"number": 9, "body": "new"})),
-            MockResponse::json(serde_json::json!({"number": 9, "draft": false})),
+            draft_state_lookup(true),
+            draft_state_mutation("markPullRequestReadyForReview", false),
         ]);
         let executor = github_executor(&root, &mock);
         let updated = executor.execute(&call(
@@ -3979,6 +4257,17 @@ mod tests {
             serde_json::json!({"repository": "owner/name", "number": 9}),
         ));
         assert!(ready.success, "{}", ready.output);
+        let result: serde_json::Value = serde_json::from_str(&ready.output).unwrap();
+        assert_eq!(result["repository"], "owner/name");
+        assert_eq!(result["number"], 9);
+        assert_eq!(result["draft"], false);
+        assert_eq!(result["changed"], true);
+        assert_eq!(result["url"], "https://github.com/owner/name/pull/9");
+        assert_eq!(
+            result["message"],
+            "Pull request owner/name#9 was marked ready for review."
+        );
+
         let requests = mock.requests();
         assert_eq!(requests[0].0, "PATCH");
         assert_eq!(requests[0].1, "/repos/owner/name/pulls/9");
@@ -3987,8 +4276,267 @@ mod tests {
         assert_eq!(body["body"], "Design");
         assert_eq!(body["base"], "main");
         assert_eq!(body["state"], "open");
+
+        // Draft state is GraphQL-only: the look-up and the mutation are both
+        // POST /graphql, and the invented REST route is never called.
+        assert_eq!(requests.len(), 3);
         assert_eq!(requests[1].0, "POST");
-        assert_eq!(requests[1].1, "/repos/owner/name/pulls/9/ready_for_review");
+        assert_eq!(requests[1].1, "/graphql");
+        let lookup: serde_json::Value = serde_json::from_str(&requests[1].2).unwrap();
+        let query = lookup["query"].as_str().unwrap();
+        assert!(query.contains("PullRequestDraftState"), "{query}");
+        assert!(query.contains("pullRequest(number: $number)"), "{query}");
+        assert_eq!(lookup["variables"]["owner"], "owner");
+        assert_eq!(lookup["variables"]["name"], "name");
+        assert_eq!(lookup["variables"]["number"], 9);
+        assert_eq!(requests[2].0, "POST");
+        assert_eq!(requests[2].1, "/graphql");
+        let mutation: serde_json::Value = serde_json::from_str(&requests[2].2).unwrap();
+        let query = mutation["query"].as_str().unwrap();
+        assert!(query.contains("markPullRequestReadyForReview"), "{query}");
+        assert_eq!(mutation["variables"]["pullRequestId"], "PR_node_9");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_convert_pull_request_to_draft_uses_the_graphql_mutation() {
+        let root = workspace();
+        let mock = MockGitHub::start(vec![
+            draft_state_lookup(false),
+            draft_state_mutation("convertPullRequestToDraft", true),
+        ]);
+        let executor = github_executor(&root, &mock);
+        let result = executor.execute(&call(
+            "github_convert_pull_request_to_draft",
+            serde_json::json!({"repository": "owner/name", "number": 9}),
+        ));
+        assert!(result.success, "{}", result.output);
+        let value: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(value["repository"], "owner/name");
+        assert_eq!(value["number"], 9);
+        assert_eq!(value["draft"], true);
+        assert_eq!(value["changed"], true);
+        assert_eq!(value["url"], "https://github.com/owner/name/pull/9");
+        assert_eq!(
+            value["message"],
+            "Pull request owner/name#9 was converted to a draft."
+        );
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].0, "POST");
+        assert_eq!(requests[0].1, "/graphql");
+        assert_eq!(requests[1].0, "POST");
+        assert_eq!(requests[1].1, "/graphql");
+        let lookup: serde_json::Value = serde_json::from_str(&requests[0].2).unwrap();
+        assert_eq!(lookup["variables"]["number"], 9);
+        let mutation: serde_json::Value = serde_json::from_str(&requests[1].2).unwrap();
+        let query = mutation["query"].as_str().unwrap();
+        assert!(query.contains("convertPullRequestToDraft"), "{query}");
+        assert_eq!(mutation["variables"]["pullRequestId"], "PR_node_9");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_draft_state_tools_skip_the_mutation_when_already_settled() {
+        let root = workspace();
+
+        let ready_mock = MockGitHub::start(vec![draft_state_lookup(false)]);
+        let ready_executor = github_executor(&root, &ready_mock);
+        let already_ready = ready_executor.execute(&call(
+            "github_mark_pull_request_ready_for_review",
+            serde_json::json!({"repository": "owner/name", "number": 9}),
+        ));
+        assert!(already_ready.success, "{}", already_ready.output);
+        let value: serde_json::Value = serde_json::from_str(&already_ready.output).unwrap();
+        assert_eq!(value["draft"], false);
+        assert_eq!(value["changed"], false);
+        assert_eq!(
+            value["message"],
+            "Pull request owner/name#9 is already ready for review."
+        );
+        let requests = ready_mock.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1, "/graphql");
+
+        let draft_mock = MockGitHub::start(vec![draft_state_lookup(true)]);
+        let draft_executor = github_executor(&root, &draft_mock);
+        let already_draft = draft_executor.execute(&call(
+            "github_convert_pull_request_to_draft",
+            serde_json::json!({"repository": "owner/name", "number": 9}),
+        ));
+        assert!(already_draft.success, "{}", already_draft.output);
+        let value: serde_json::Value = serde_json::from_str(&already_draft.output).unwrap();
+        assert_eq!(value["draft"], true);
+        assert_eq!(value["changed"], false);
+        assert_eq!(
+            value["message"],
+            "Pull request owner/name#9 is already a draft."
+        );
+        assert_eq!(draft_mock.requests().len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_draft_state_tools_report_graphql_errors() {
+        let root = workspace();
+        let mock = MockGitHub::start(vec![
+            draft_state_lookup(true),
+            MockResponse::json(serde_json::json!({
+                "data": serde_json::Value::Null,
+                "errors": [{"message": "Resource not accessible by integration"}]
+            })),
+        ]);
+        let executor = github_executor(&root, &mock);
+        let result = executor.execute(&call(
+            "github_mark_pull_request_ready_for_review",
+            serde_json::json!({"repository": "owner/name", "number": 9}),
+        ));
+        assert!(!result.success);
+        assert!(
+            result.output.contains(
+                "GitHub GraphQL markPullRequestReadyForReview failed: Resource not accessible by integration"
+            ),
+            "{}",
+            result.output
+        );
+        assert_eq!(mock.requests().len(), 2);
+
+        let lookup_mock = MockGitHub::start(vec![MockResponse::json(serde_json::json!({
+            "data": serde_json::Value::Null,
+            "errors": [{"message": "Something is broken"}]
+        }))]);
+        let lookup_executor = github_executor(&root, &lookup_mock);
+        let failed = lookup_executor.execute(&call(
+            "github_convert_pull_request_to_draft",
+            serde_json::json!({"repository": "owner/name", "number": 9}),
+        ));
+        assert!(!failed.success);
+        assert!(
+            failed
+                .output
+                .contains("GitHub GraphQL PullRequestDraftState failed: Something is broken"),
+            "{}",
+            failed.output
+        );
+        assert_eq!(lookup_mock.requests().len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_draft_state_tools_report_graphql_transport_and_http_errors() {
+        let root = workspace();
+        let mock = MockGitHub::start(vec![MockResponse::body(404, r#"{"message":"Not Found"}"#)]);
+        let executor = github_executor(&root, &mock);
+        let http_error = executor.execute(&call(
+            "github_mark_pull_request_ready_for_review",
+            serde_json::json!({"repository": "owner/name", "number": 9}),
+        ));
+        assert!(!http_error.success);
+        assert!(
+            http_error
+                .output
+                .contains("GitHub GraphQL PullRequestDraftState returned HTTP 404"),
+            "{}",
+            http_error.output
+        );
+
+        let empty_mock = MockGitHub::start(vec![MockResponse::status(200)]);
+        let empty_executor = github_executor(&root, &empty_mock);
+        let empty = empty_executor.execute(&call(
+            "github_convert_pull_request_to_draft",
+            serde_json::json!({"repository": "owner/name", "number": 9}),
+        ));
+        assert!(!empty.success);
+        assert!(
+            empty
+                .output
+                .contains("GitHub GraphQL PullRequestDraftState returned an invalid response"),
+            "{}",
+            empty.output
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_draft_state_tools_report_missing_repository_and_pull_request() {
+        let root = workspace();
+        let mock = MockGitHub::start(vec![
+            MockResponse::json(serde_json::json!({"data": {"repository": null}})),
+            MockResponse::json(serde_json::json!({"data": {"repository": {"pullRequest": null}}})),
+            MockResponse::json(serde_json::json!({
+                "data": {"repository": {"pullRequest": {"isDraft": true}}}
+            })),
+            MockResponse::json(serde_json::json!({
+                "data": {"repository": {"pullRequest": {"id": "PR_node_9"}}}
+            })),
+        ]);
+        let executor = github_executor(&root, &mock);
+
+        let missing_repository = executor.execute(&call(
+            "github_mark_pull_request_ready_for_review",
+            serde_json::json!({"repository": "owner/name", "number": 9}),
+        ));
+        assert!(!missing_repository.success);
+        assert!(
+            missing_repository
+                .output
+                .contains("GitHub repository owner/name was not found"),
+            "{}",
+            missing_repository.output
+        );
+
+        let missing_pull_request = executor.execute(&call(
+            "github_mark_pull_request_ready_for_review",
+            serde_json::json!({"repository": "owner/name", "number": 9}),
+        ));
+        assert!(!missing_pull_request.success);
+        assert!(
+            missing_pull_request
+                .output
+                .contains("pull request owner/name#9 was not found"),
+            "{}",
+            missing_pull_request.output
+        );
+
+        let missing_id = executor.execute(&call(
+            "github_mark_pull_request_ready_for_review",
+            serde_json::json!({"repository": "owner/name", "number": 9}),
+        ));
+        assert!(!missing_id.success);
+        assert!(
+            missing_id.output.contains("did not include its node id"),
+            "{}",
+            missing_id.output
+        );
+
+        let missing_draft_state = executor.execute(&call(
+            "github_convert_pull_request_to_draft",
+            serde_json::json!({"repository": "owner/name", "number": 9}),
+        ));
+        assert!(!missing_draft_state.success);
+        assert!(
+            missing_draft_state
+                .output
+                .contains("did not include its draft state"),
+            "{}",
+            missing_draft_state.output
+        );
+
+        let invalid_repository = executor.execute(&call(
+            "github_convert_pull_request_to_draft",
+            serde_json::json!({"repository": "owner", "number": 9}),
+        ));
+        assert!(!invalid_repository.success);
+        assert!(
+            invalid_repository.output.contains("owner/name format"),
+            "{}",
+            invalid_repository.output
+        );
+        assert_eq!(mock.requests().len(), 4);
+
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4062,6 +4610,15 @@ mod tests {
         ));
         assert!(!result.success);
         assert!(result.output.contains("HTTP 404"), "{}", result.output);
+        // An invented or missing route must be distinguishable from a missing
+        // resource, so the error names the request that failed.
+        assert!(
+            result
+                .output
+                .contains("for GET /repos/owner/name/issues/404"),
+            "{}",
+            result.output
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }
@@ -4094,6 +4651,65 @@ mod helper_tests {
         ));
         assert!(domain_is_allowed("not a url", &[]));
         assert!(!domain_is_allowed("not a url", &["example.com".to_owned()]));
+    }
+
+    #[test]
+    fn graphql_error_messages_are_flattened() {
+        assert_eq!(
+            github_graphql_errors(&serde_json::json!({
+                "errors": [{"message": "boom"}, {"message": "bang"}]
+            })),
+            Some("boom; bang".to_owned())
+        );
+        // An error entry without a message still says something useful.
+        assert_eq!(
+            github_graphql_errors(&serde_json::json!({"errors": [{"path": ["x"]}]})),
+            Some(r#"{"path":["x"]}"#.to_owned())
+        );
+        assert_eq!(
+            github_graphql_errors(&serde_json::json!({"errors": []})),
+            None
+        );
+        assert_eq!(
+            github_graphql_errors(&serde_json::json!({"data": {}})),
+            None
+        );
+        assert_eq!(github_graphql_errors(&serde_json::json!("nope")), None);
+    }
+
+    #[test]
+    fn github_requests_name_the_request_that_failed() {
+        let unsupported = github_request(
+            "PUT /repos/owner/name/pulls/9",
+            "PUT",
+            "http://127.0.0.1:1/repos/owner/name/pulls/9",
+            "test-token",
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            unsupported
+                .contains("unsupported GitHub API method PUT for PUT /repos/owner/name/pulls/9"),
+            "{unsupported}"
+        );
+
+        // A closed port makes the transport itself fail; the message still
+        // names the request instead of only the underlying error.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let unreachable = github_request(
+            "GET /repos/owner/name/issues/1",
+            "GET",
+            &format!("http://{address}/repos/owner/name/issues/1"),
+            "test-token",
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            unreachable.contains("GitHub request failed for GET /repos/owner/name/issues/1"),
+            "{unreachable}"
+        );
     }
 
     #[test]

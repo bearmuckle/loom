@@ -8,10 +8,11 @@ use super::{
     format_percentage, has_block_markdown, humanize_tool_output, is_redundant_completion_summary,
     relative_time, replace_command_token, replace_last_token, rgb, run_state_color,
     run_state_label, session_is_active, session_status_pill, source_mount_path, tool_detail,
-    tool_failure_count, tool_group_label, tool_group_status, tool_needs_attention,
+    tool_failure_count, tool_group_label, tool_group_status, tool_icon, tool_needs_attention,
     tool_part_from_activity, tool_status, tool_title, tool_title_for_activity, tool_usage_label,
     tool_usage_summary,
 };
+use gpui_kit::assets::IconName as AssetIconName;
 use loom_core::{ActivityId, AgentSessionState, ProtocolVersion, RunId, Timestamp};
 use loom_model::{ModelId, ToolCall};
 use loom_protocol::{AgentActivityKind, AgentRunState, ToolResult};
@@ -511,6 +512,10 @@ fn github_tools_get_readable_titles_and_no_json_detail() {
         "Mark owner/name#42 ready for review"
     );
     assert_eq!(
+        tool_title("github_convert_pull_request_to_draft", &call.arguments),
+        "Convert owner/name#42 to draft"
+    );
+    assert_eq!(
         tool_title("github_add_labels", &call.arguments),
         "Label owner/name#42"
     );
@@ -538,6 +543,35 @@ fn github_tools_get_readable_titles_and_no_json_detail() {
     assert_eq!(
         tool_group_label("github_create_issue", 2),
         "Opened 2 issues"
+    );
+
+    // Converting to draft mirrors the mark-ready tool: the arguments are
+    // summarized in the title, so there is no JSON detail left to reveal.
+    call.name = "github_convert_pull_request_to_draft".to_owned();
+    call.arguments = json!({"repository": "owner/name", "number": 42});
+    assert_eq!(tool_detail(&call), None);
+    assert_eq!(
+        tool_title(
+            "github_convert_pull_request_to_draft",
+            &json!({"repository": "owner/name"})
+        ),
+        "Convert pull request in owner/name to draft"
+    );
+    assert_eq!(
+        tool_title("github_convert_pull_request_to_draft", &json!({})),
+        "Convert pull request to draft"
+    );
+    assert_eq!(
+        tool_group_label("github_convert_pull_request_to_draft", 2),
+        "Converted 2 pull requests to draft"
+    );
+    assert_eq!(
+        tool_usage_label("github_convert_pull_request_to_draft"),
+        "Draft PR"
+    );
+    assert_eq!(
+        tool_icon("github_convert_pull_request_to_draft"),
+        AssetIconName::Pencil
     );
 }
 
