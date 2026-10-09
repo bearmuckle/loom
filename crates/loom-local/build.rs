@@ -30,9 +30,16 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_owned());
     println!("cargo:rustc-env=LOOM_GIT_REVISION={revision}");
 
-    // Deliberately no `rerun-if-changed` directive for `.git`, so Cargo's
-    // default (rerun only when a file in this package changes) keeps rebuilds
-    // incremental while still picking up a moved checkout.
+    // Re-stamp when an override changes. Without this Cargo reuses the cached
+    // result of this script, so restoring a cached `target/` directory (the
+    // release workflow does) would leave the binary stamped for an earlier
+    // build and a release would report the workspace version.
+    println!("cargo:rerun-if-env-changed=LOOM_BUILD_VERSION");
+    println!("cargo:rerun-if-env-changed=LOOM_GIT_REVISION");
+
+    // Still no `rerun-if-changed` directive for `.git`: when the path is absent
+    // (packaged crate, worktree without a real `.git`) Cargo would rerun this
+    // script — and rebuild the crate — on every invocation.
 }
 
 /// The short revision of the current checkout, or `None` when git is missing,
