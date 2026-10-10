@@ -340,7 +340,7 @@ impl ToolExtension for ProjectAgentTools {
                             }
                         }
                         if result_revision != worktree.base_revision
-                            && worktree.integrated_revision.as_deref() != Some(result_revision)
+                            && !self.reviewed_result_is_integrated(&worktree, result_revision)
                         {
                             return Some(format!(
                                 "completed code child task {} ({}) has a reviewed result that still needs integration",
@@ -368,6 +368,35 @@ impl ToolExtension for ProjectAgentTools {
 }
 
 impl ProjectAgentTools {
+    /// Returns true when the reviewed child result is contained in the parent
+    /// revision recorded for the child's integration.
+    ///
+    /// Integration records the parent revision after integration, not
+    /// necessarily the child revision: a fast-forward records the child
+    /// revision, while a merge records the merge commit and the "already
+    /// present" path records the parent HEAD. The guard's intent is that the
+    /// reviewed revision is contained in what was integrated, so ancestry
+    /// rather than equality decides the outcome.
+    fn reviewed_result_is_integrated(
+        &self,
+        worktree: &ProjectWorktreeRecord,
+        result_revision: &str,
+    ) -> bool {
+        let Some(integrated_revision) = worktree.integrated_revision.as_deref() else {
+            return false;
+        };
+        if integrated_revision == result_revision {
+            return true;
+        }
+        let Some(connection) = self.connection() else {
+            return false;
+        };
+        connection
+            .session_git(worktree.parent_session_id, worktree.parent_repository_id)
+            .and_then(|git| git.is_ancestor_revision(result_revision, integrated_revision))
+            .unwrap_or(false)
+    }
+
     pub(crate) fn load_wait_child_tasks(
         &self,
         task_ids: &[loom_core::TaskId],
