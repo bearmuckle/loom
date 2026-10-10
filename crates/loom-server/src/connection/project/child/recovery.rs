@@ -11,6 +11,30 @@ impl InProcessConnection {
         Ok(())
     }
 
+    /// Finishes a pending cancellation cascade for one project, if any.
+    ///
+    /// Startup recovery ([`Self::recover_pending_project_cancellation_cascades`])
+    /// is the only other path, so a long-running backend that hit the pause
+    /// would otherwise never clear the intent. Callers must not hold the project
+    /// admission lock because [`Self::apply_project_cancellation_cascade`]
+    /// acquires it.
+    pub(crate) fn recover_project_cancellation_cascade(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<bool> {
+        let Some(persistence) = self.backend.persistence.as_ref() else {
+            return Ok(false);
+        };
+        let mut recovered = false;
+        for cascade in persistence.list_pending_project_cancellation_cascades()? {
+            if cascade.project_id == project_id {
+                self.apply_project_cancellation_cascade(&cascade)?;
+                recovered = true;
+            }
+        }
+        Ok(recovered)
+    }
+
     pub(crate) fn apply_project_cancellation_cascade(
         &self,
         cascade: &ProjectCancellationCascadeRecord,

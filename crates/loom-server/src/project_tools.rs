@@ -766,29 +766,47 @@ impl ProjectAgentTools {
             Ok(sessions) => sessions,
             Err(error) => return ToolResult::failure(call, error.message),
         };
-        let mut children = project
+        let mut children = Vec::new();
+        for agent in project
             .agents
             .iter()
             .filter(|agent| agent.parent_session_id == Some(self.session_id))
-            .map(|agent| {
-                let task = tasks
-                    .iter()
-                    .find(|task| task.target_session_id == agent.session_id);
-                let name = sessions
-                    .get(agent.session_id)
-                    .map(|session| session.name.clone())
-                    .unwrap_or_default();
-                serde_json::json!({
-                    "session_id": agent.session_id,
-                    "name": name,
-                    "state": agent.state,
-                    "task_summary": agent.task_summary.as_ref().map(|summary| summary.chars().take(256).collect::<String>()),
-                    "task_id": task.map(|task| task.task_id),
-                    "task_status": task.map(|task| task.status),
-                    "updated_at": agent.updated_at,
-                })
-            })
-            .collect::<Vec<_>>();
+        {
+            let task = tasks
+                .iter()
+                .find(|task| task.target_session_id == agent.session_id);
+            let name = sessions
+                .get(agent.session_id)
+                .map(|session| session.name.clone())
+                .unwrap_or_default();
+            // The durable run summary carries the failure reason captured when
+            // the child run failed, so the parent can tell an interrupted child
+            // apart from one that produced nothing usable.
+            let run = match persistence.load_latest_run_summary_for_session(agent.session_id) {
+                Ok(run) => run,
+                Err(error) => return ToolResult::failure(call, error.message),
+            };
+            let worktree = match task {
+                Some(task) => match persistence.load_project_worktree_by_task(task.task_id) {
+                    Ok(worktree) => worktree,
+                    Err(error) => return ToolResult::failure(call, error.message),
+                },
+                None => None,
+            };
+            children.push(serde_json::json!({
+                "session_id": agent.session_id,
+                "name": name,
+                "state": agent.state,
+                "task_summary": agent.task_summary.as_ref().map(|summary| summary.chars().take(256).collect::<String>()),
+                "task_id": task.map(|task| task.task_id),
+                "task_status": task.map(|task| task.status),
+                "run_state": run.as_ref().map(|summary| summary.snapshot.state),
+                "run_summary": run.as_ref().and_then(|summary| summary.snapshot.summary.as_ref()).map(|summary| summary.chars().take(256).collect::<String>()),
+                "worktree_status": worktree.as_ref().map(|worktree| worktree.status),
+                "result_revision": worktree.as_ref().and_then(|worktree| worktree.result_revision.clone()),
+                "updated_at": agent.updated_at,
+            }));
+        }
         children.sort_by(|left, right| {
             right["updated_at"]
                 .as_u64()
@@ -836,7 +854,8 @@ impl ProjectAgentTools {
                     "task_id": task.task_id,
                     "status": task.status,
                     "child_session_id": task.target_session_id,
-                    "run_state": run.map(|snapshot| snapshot.state),
+                    "run_state": run.as_ref().map(|snapshot| snapshot.state),
+                    "run_summary": run.as_ref().and_then(|snapshot| snapshot.summary.clone()),
                 }))
                 .unwrap_or_else(|error| {
                     format!("could not encode project child control result: {error}")
@@ -865,12 +884,44 @@ impl ProjectAgentTools {
             self.session_id,
             arguments.task_id,
         ) {
-            Ok(response @ ServerResponse::Project(ProjectResponse::ProjectChildReview { .. })) => {
+            Ok(ServerResponse::Project(ProjectResponse::ProjectChildReview {
+                worktree,
+                status,
+                diff,
+            })) => {
+                // Include the durable run state and summary so a failed child's
+                // reason is visible alongside its retained (uncommitted) work.
+                let run = connection
+                    .backend
+                    .persistence
+                    .as_ref()
+                    .and_then(|persistence| {
+                        persistence
+                            .load_delegated_task(worktree.task_id)
+                            .ok()
+                            .flatten()
+                            .and_then(|task| {
+                                persistence
+                                    .load_latest_run_summary_for_session(task.target_session_id)
+                                    .ok()
+                                    .flatten()
+                            })
+                    });
+                let output = serde_json::json!({
+                    "type": "project_child_review",
+                    "data": {
+                        "worktree": worktree,
+                        "status": status,
+                        "diff": diff,
+                        "run_state": run.as_ref().map(|summary| summary.snapshot.state),
+                        "run_summary": run.as_ref().and_then(|summary| summary.snapshot.summary.clone()),
+                    }
+                });
                 ToolResult {
                     tool_call_id: call.id,
                     name: call.name.clone(),
                     success: true,
-                    output: serde_json::to_string(&response)
+                    output: serde_json::to_string(&output)
                         .unwrap_or_else(|error| format!("could not encode child review: {error}")),
                 }
             }

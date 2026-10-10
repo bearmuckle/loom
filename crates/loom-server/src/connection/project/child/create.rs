@@ -252,7 +252,7 @@ impl InProcessConnection {
             ));
         }
         let admission = self.backend.admissions.project(project_id)?;
-        let admission_guard = admission.lock().map_err(|_| {
+        let mut admission_guard = admission.lock().map_err(|_| {
             LoomError::new(
                 ErrorCode::Internal,
                 "project scheduling lock was poisoned",
@@ -260,11 +260,43 @@ impl InProcessConnection {
             )
         })?;
         if persistence.has_pending_project_cancellation_cascade(project_id)? {
-            return Err(LoomError::new(
-                ErrorCode::RecoveryRequired,
-                "project child creation is paused until its pending cancellation cascade is recovered",
-                true,
-            ));
+            // Recovery re-acquires the project admission lock, so release it
+            // first. This closes the gap where a cancellation aborted after
+            // persisting its intent and nothing would clear it until restart.
+            drop(admission_guard);
+            if let Err(error) = self.recover_project_cancellation_cascade(project_id) {
+                log::warn!(
+                    "project {project_id} child creation could not recover its pending cancellation cascade: {}",
+                    error.message
+                );
+            }
+            admission_guard = admission.lock().map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Internal,
+                    "project scheduling lock was poisoned",
+                    true,
+                )
+            })?;
+            if persistence.has_pending_project_cancellation_cascade(project_id)? {
+                let root_task_id = persistence
+                    .list_pending_project_cancellation_cascades()?
+                    .into_iter()
+                    .find(|cascade| cascade.project_id == project_id)
+                    .map(|cascade| cascade.root_task_id);
+                let detail = match root_task_id {
+                    Some(root_task_id) => {
+                        format!("project {project_id} (root task {root_task_id})")
+                    }
+                    None => format!("project {project_id}"),
+                };
+                return Err(LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    format!(
+                        "child creation is paused until the pending cancellation cascade for {detail} is recovered; recovery was attempted and also runs at backend startup"
+                    ),
+                    true,
+                ));
+            }
         }
         let parent_snapshot = self.backend.sessions()?.get(parent_session_id)?;
         let workspace_admission = self
@@ -355,14 +387,22 @@ impl InProcessConnection {
                 .unwrap_or_default();
             let exactly_one_repository = repositories.len() == 1;
             let mut checkout = None;
+            let mut checkout_blocker = None;
             if let Some((parent_repository_id, _)) = repositories.into_iter().next() {
                 let parent_git = self.session_git(parent_session_id, parent_repository_id)?;
                 let parent_status = parent_git.status()?;
-                if parent_status.clean
-                    && parent_status.branch.is_some()
-                    && let Some(base_revision) = parent_status.head.clone()
-                {
-                    checkout = Some((parent_repository_id, base_revision));
+                match (
+                    parent_status.branch.as_deref(),
+                    parent_status.head.as_deref(),
+                    parent_status.clean,
+                ) {
+                    (Some(_), Some(base_revision), true) => {
+                        checkout = Some((parent_repository_id, base_revision.to_owned()));
+                    }
+                    _ if exactly_one_repository => {
+                        checkout_blocker = Some(parent_checkout_blocker(&parent_status));
+                    }
+                    _ => {}
                 }
             }
             match checkout {
@@ -396,10 +436,10 @@ impl InProcessConnection {
                     precreated_child_filesystem = Some(child_filesystem);
                 }
                 None if task.code_change => {
-                    return Err(if exactly_one_repository {
-                        LoomError::conflict(
-                            "code tasks require a clean parent checkout on a local branch",
-                        )
+                    return Err(if let Some(reason) = checkout_blocker {
+                        LoomError::conflict(format!(
+                            "code tasks require a clean parent checkout on a local branch, but {reason}; commit, stash, or check out a local branch and retry"
+                        ))
                     } else {
                         LoomError::invalid_request(
                             "code tasks currently require exactly one Git repository attached to the parent session",
@@ -539,5 +579,37 @@ impl InProcessConnection {
                 child,
             },
         ))
+    }
+}
+
+/// Explains why a single parent checkout cannot host a delegated code child,
+/// naming the concrete cause and any blocking paths instead of repeating only
+/// that the checkout is not clean.
+fn parent_checkout_blocker(status: &loom_vcs::GitRepositoryStatus) -> String {
+    if status.branch.is_none() || status.head.is_none() {
+        return "the parent checkout has no commit to base a child on (its branch is unborn or has no HEAD)"
+            .to_owned();
+    }
+    let mut paths = status
+        .files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    const MAX_NAMED_PATHS: usize = 20;
+    let shown = paths
+        .iter()
+        .take(MAX_NAMED_PATHS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = paths.len().saturating_sub(MAX_NAMED_PATHS);
+    if remaining > 0 {
+        format!(
+            "the parent checkout has staged, modified, or untracked files: {shown} and {remaining} more"
+        )
+    } else {
+        format!("the parent checkout has staged, modified, or untracked files: {shown}")
     }
 }
