@@ -9,6 +9,8 @@ pub enum ControlResponse {
     Capabilities(NegotiationResult),
 
     WorkerNodeStatus(WorkerNodeStatus),
+
+    ArchiveRetentionPolicy(ArchiveRetentionPolicy),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -122,6 +124,8 @@ pub enum SessionResponse {
     AgentSessionRenamed(AgentSessionSnapshot),
 
     AgentSessionArchived(AgentSessionSnapshot),
+
+    AgentSessionDeleted { session_id: AgentSessionId },
 
     ApprovalPolicy(loom_core::ApprovalPolicy),
 }

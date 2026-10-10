@@ -6,16 +6,16 @@ use loom_core::{
 use loom_model::{ModelId, ToolCall};
 use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, AgentEvent,
-    AgentPlanStep, AgentRunSnapshot, AgentRunState, CURRENT_PROTOCOL_VERSION, ClientFrame,
-    ClientRequest, ContextAssemblyOptions, ControlRequest, ControlResponse, FileActivityOperation,
-    FilesystemRequest, FilesystemResponse, GitHubCopilotLoginStatus, ProviderRequest,
-    ProviderResponse, RequestEnvelope, ResponseEnvelope, RunRequest, RunResponse, ServerEvent,
-    ServerEventEnvelope, ServerFrame, ServerResponse, SessionFilesystemSnapshot, SessionRequest,
-    TaskKind, TaskRequest, TaskResponse, TaskSpec, ToolResult, WorkerNodeResources,
-    WorkerNodeStatus, WorkspaceConfig, WorkspaceEdit, WorkspaceRecord, WorkspaceRequest,
-    WorkspaceResponse, decode_client_frame, decode_event, decode_request, decode_response,
-    decode_server_frame, encode_client_frame, encode_event, encode_request, encode_response,
-    encode_server_frame,
+    AgentPlanStep, AgentRunSnapshot, AgentRunState, ArchiveRetentionPolicy,
+    CURRENT_PROTOCOL_VERSION, ClientFrame, ClientRequest, ContextAssemblyOptions, ControlRequest,
+    ControlResponse, FileActivityOperation, FilesystemRequest, FilesystemResponse,
+    GitHubCopilotLoginStatus, ProviderRequest, ProviderResponse, RequestEnvelope, ResponseEnvelope,
+    RunRequest, RunResponse, ServerEvent, ServerEventEnvelope, ServerFrame, ServerResponse,
+    SessionFilesystemSnapshot, SessionRequest, SessionResponse, TaskKind, TaskRequest,
+    TaskResponse, TaskSpec, ToolResult, WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig,
+    WorkspaceEdit, WorkspaceRecord, WorkspaceRequest, WorkspaceResponse, decode_client_frame,
+    decode_event, decode_request, decode_response, decode_server_frame, encode_client_frame,
+    encode_event, encode_request, encode_response, encode_server_frame,
 };
 
 #[test]
@@ -483,6 +483,67 @@ fn m3_run_options_provider_and_context_contracts_round_trip() {
     assert_eq!(
         decode_response(&encode_response(&response).unwrap()).unwrap(),
         response
+    );
+}
+
+#[test]
+fn archived_session_deletion_and_retention_policy_contracts_round_trip() {
+    let session_id = AgentSessionId::new();
+    let delete_request =
+        RequestEnvelope::new(ClientRequest::Session(SessionRequest::DeleteAgentSession {
+            session_id,
+            force: true,
+        }));
+    assert_eq!(
+        delete_request.request.required_capability(),
+        Some(Capability::DeleteAgentSession)
+    );
+    // Deletion is journaled as a retryable mutation so a reconnect cannot
+    // apply the request twice.
+    assert!(delete_request.request.is_retryable_mutation());
+    assert_eq!(
+        decode_request(&encode_request(&delete_request).unwrap()).unwrap(),
+        delete_request
+    );
+
+    let policy_request = RequestEnvelope::new(ClientRequest::Control(
+        ControlRequest::GetArchiveRetentionPolicy,
+    ));
+    assert_eq!(
+        policy_request.request.required_capability(),
+        Some(Capability::ReadWorkerNodeStatus)
+    );
+    assert!(!policy_request.request.is_retryable_mutation());
+    assert_eq!(
+        decode_request(&encode_request(&policy_request).unwrap()).unwrap(),
+        policy_request
+    );
+
+    let deleted = ResponseEnvelope::success(
+        loom_core::RequestId::new(),
+        ServerResponse::Session(SessionResponse::AgentSessionDeleted { session_id }),
+    );
+    assert_eq!(
+        decode_response(&encode_response(&deleted).unwrap()).unwrap(),
+        deleted
+    );
+
+    let policy = ResponseEnvelope::success(
+        loom_core::RequestId::new(),
+        ServerResponse::Control(ControlResponse::ArchiveRetentionPolicy(
+            ArchiveRetentionPolicy {
+                retention_ms: Some(86_400_000),
+                force_discard_worktrees: true,
+            },
+        )),
+    );
+    assert_eq!(
+        decode_response(&encode_response(&policy).unwrap()).unwrap(),
+        policy
+    );
+    assert_eq!(
+        serde_json::from_str::<ArchiveRetentionPolicy>("{}").unwrap(),
+        ArchiveRetentionPolicy::disabled()
     );
 }
 
