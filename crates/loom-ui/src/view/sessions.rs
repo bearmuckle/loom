@@ -285,6 +285,7 @@ impl LoomView {
             .project_tree_snapshots
             .iter()
             .chain(self.project_snapshot.iter())
+            .chain(self.archived_sessions.projects.iter())
         {
             if project.root_session_id == archived_id {
                 for agent in &project.agents {
@@ -314,6 +315,22 @@ impl LoomView {
                 .retain(|worktree| !removed.contains(&worktree.child_session_id));
         };
         self.project_tree_snapshots.retain_mut(|project| {
+            if removed.contains(&project.root_session_id) {
+                return false;
+            }
+            prune(project);
+            true
+        });
+        // The archived-session surface keeps its own copy of the entries and the
+        // project snapshots it groups them by, so a cascade that removed whole
+        // projects cannot leave stale rows behind there.
+        self.archived_sessions
+            .entries
+            .retain(|entry| !removed.contains(&entry.session.id));
+        self.archived_sessions
+            .force
+            .retain(|session_id| !removed.contains(session_id));
+        self.archived_sessions.projects.retain_mut(|project| {
             if removed.contains(&project.root_session_id) {
                 return false;
             }

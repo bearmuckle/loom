@@ -2,6 +2,7 @@
 
 use super::*;
 
+mod archived_session_tests;
 mod disconnected_screen_render_tests;
 mod display_helper_tests;
 mod event_resync_tests;

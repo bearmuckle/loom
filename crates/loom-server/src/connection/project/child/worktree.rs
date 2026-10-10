@@ -513,34 +513,16 @@ impl InProcessConnection {
 
         worktree.status = ProjectWorktreeStatus::CleanupPending;
         self.save_project_worktree_state(&worktree)?;
-        let parent_git =
-            self.session_git(worktree.parent_session_id, worktree.parent_repository_id)?;
-        let child_filesystem = self.session_filesystem(worktree.child_session_id)?;
-        let destination = child_filesystem
-            .root()
-            .join(checked_session_relative_path(&worktree.relative_path)?);
         let force = disposition == ProjectWorktreeCleanupDisposition::DiscardChanges;
-        let removal = parent_git.remove_linked_worktree(&worktree.worktree_name, force);
-        if let Err(error) = removal {
-            let already_removed = error.code == ErrorCode::NotFound
-                && !destination.exists()
-                && worktree.status == ProjectWorktreeStatus::CleanupPending;
-            if !already_removed {
-                worktree.error = Some(error.message.clone());
-                worktree.updated_at = Timestamp::now();
-                self.save_project_worktree_state(&worktree)?;
-                return Err(error);
-            }
+        if let Err(error) = self
+            .backend
+            .remove_project_worktree_checkout(&worktree, force)
+        {
+            worktree.error = Some(error.message.clone());
+            worktree.updated_at = Timestamp::now();
+            self.save_project_worktree_state(&worktree)?;
+            return Err(error);
         }
-        self.backend
-            .session_repositories()?
-            .entry(worktree.child_session_id)
-            .or_default()
-            .remove(&worktree.child_repository_id);
-        self.backend
-            .session_vcs()?
-            .remove(&(worktree.child_session_id, worktree.child_repository_id));
-        child_filesystem.mark_state_dirty()?;
         worktree.status = ProjectWorktreeStatus::Removed;
         worktree.error = None;
         worktree.updated_at = Timestamp::now();

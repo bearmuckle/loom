@@ -32,6 +32,39 @@ struct RepositoryCache {
     records: BTreeMap<String, CachedRepositoryRecord>,
 }
 
+impl InProcessBackend {
+    /// Opens (and caches) the Git service of one attached session repository.
+    ///
+    /// Restoring the session filesystem first is deliberate: it also loads the
+    /// session's durable repository records, so the lookup below sees a
+    /// lazily restored session too.
+    pub(crate) fn session_git(
+        &self,
+        session_id: AgentSessionId,
+        repository_id: RepositoryId,
+    ) -> Result<GitService> {
+        if let Some(service) = self
+            .session_vcs()?
+            .get(&(session_id, repository_id))
+            .cloned()
+        {
+            return Ok(service);
+        }
+        let filesystem = self.restore_session_filesystem(session_id)?;
+        let repository = self
+            .session_repositories()?
+            .get(&session_id)
+            .and_then(|repositories| repositories.get(&repository_id))
+            .cloned()
+            .ok_or_else(|| LoomError::not_found("session repository", repository_id))?;
+        let path = filesystem.directory_path(&repository.path)?;
+        let service = GitService::open(path)?;
+        self.session_vcs()?
+            .insert((session_id, repository_id), service.clone());
+        Ok(service)
+    }
+}
+
 impl RepositoryService {
     pub(crate) fn new(clone_cache_base: PathBuf) -> Self {
         Self {

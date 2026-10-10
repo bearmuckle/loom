@@ -251,6 +251,18 @@ impl InProcessConnection {
 }
 
 impl InProcessConnection {
+    /// Permanently removes archived agent sessions and their stored history.
+    ///
+    /// The backend owns the deletion, because the retention sweep performs the
+    /// same work without a connection; this wrapper only forwards the request.
+    pub(crate) fn delete_archived_session(
+        &self,
+        session_id: AgentSessionId,
+        force: bool,
+    ) -> Result<ServerResponse> {
+        self.backend.delete_archived_session(session_id, force)
+    }
+
     pub(crate) fn session_snapshot_projection(
         &self,
         session_id: AgentSessionId,

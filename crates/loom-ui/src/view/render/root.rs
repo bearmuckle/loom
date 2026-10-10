@@ -615,6 +615,9 @@ impl Render for LoomView {
             })
             .when(self.source_dialog.is_some(), |element| {
                 element.child(self.render_source_dialog(layout, cx))
+            })
+            .when(self.archived_sessions.open, |element| {
+                element.child(self.render_archived_sessions(layout, cx))
             }),
             ),
                 resizable_panel()

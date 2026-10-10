@@ -55,8 +55,8 @@ use loom_protocol::GitHubCopilotLoginStatus;
 use loom_protocol::{
     AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent, AgentRunSnapshot,
     AgentRunSnapshotProjection, AgentRunState, CURRENT_PROTOCOL_VERSION, ClientRequest,
-    ClonedRepository, ContextRequest, ContextResponse, EventsRequest, EventsResponse,
-    FileActivityOperation, FilesystemRequest, FilesystemResponse,
+    ClonedRepository, ContextRequest, ContextResponse, ControlRequest, ControlResponse,
+    EventsRequest, EventsResponse, FileActivityOperation, FilesystemRequest, FilesystemResponse,
     GITHUB_REPOSITORY_QUERY_MIN_CHARS, GitDiffLineKind, GitFileStatusKind, GitHubRepository,
     GitRepositoryStatus, MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, ProjectChildControlAction,
     ProjectRequest, ProjectResponse, ProviderRequest, ProviderResponse, RepositoryRequest,
@@ -194,6 +194,12 @@ const COMMANDS: &[CommandSpec] = &[
         shortcut: Some("esc"),
     },
     CommandSpec {
+        name: "archived",
+        title: "Archived sessions",
+        description: "Review and delete archived sessions",
+        shortcut: None,
+    },
+    CommandSpec {
         name: "providers",
         title: "Providers",
         description: "Connect and configure model providers",
@@ -266,6 +272,7 @@ use crate::{
 #[cfg(not(target_family = "wasm"))]
 use log::info;
 
+use archive::ArchivedSessionsState;
 use helpers::*;
 #[cfg(not(target_family = "wasm"))]
 use loom_local::{
@@ -553,6 +560,9 @@ pub(crate) struct LoomView {
     pub(crate) approval_request_in_flight: bool,
     approval_settings_request_in_flight: bool,
     pub(crate) archive_request_in_flight: bool,
+    /// The archived-sessions management surface: whether it is open, what it
+    /// loaded, and the user's force choice per row.
+    pub(crate) archived_sessions: ArchivedSessionsState,
     pub(crate) pending_approval: Option<ToolCall>,
     pub(crate) pending_input: Option<String>,
     composer_input: Option<Entity<TextareaState>>,
@@ -1539,6 +1549,7 @@ impl LoomView {
             approval_request_in_flight: false,
             approval_settings_request_in_flight: false,
             archive_request_in_flight: false,
+            archived_sessions: ArchivedSessionsState::default(),
             pending_approval: None,
             pending_input: None,
             composer_input: None,
@@ -1662,6 +1673,7 @@ impl LoomView {
     }
 }
 
+mod archive;
 mod composer;
 mod helpers;
 mod lifecycle;

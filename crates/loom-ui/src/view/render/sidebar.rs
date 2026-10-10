@@ -23,6 +23,31 @@ impl LoomView {
             .into_any_element()
     }
 
+    /// Opens the archived-session management surface. The icon sits beside the
+    /// new-project action because the surface manages sessions, not settings.
+    pub(crate) fn render_archived_sessions_button(
+        &self,
+        layout: ResponsiveLayout,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        Button::new("archived-sessions")
+            .icon(Icon::new(AssetIconName::Archive))
+            .ghost()
+            .when(layout.phone, |button| {
+                button
+                    .large()
+                    .h(layout.control_size())
+                    .w(layout.control_size())
+            })
+            .when(!layout.phone, |button| button.small())
+            .accessibility_label("Archived sessions")
+            .tooltip("Archived sessions")
+            .on_click(cx.listener(|view, _, _, cx| {
+                view.open_archived_sessions(cx);
+            }))
+            .into_any_element()
+    }
+
     pub(crate) fn render_session_list(
         &mut self,
         layout: ResponsiveLayout,
@@ -565,6 +590,7 @@ impl LoomView {
                             .items_center()
                             .gap_1()
                             .child(self.render_new_session_button(view, layout, cx))
+                            .child(self.render_archived_sessions_button(layout, cx))
                             .child(
                                 Button::new("settings-button")
                                     .icon(Icon::new(IconName::Settings))

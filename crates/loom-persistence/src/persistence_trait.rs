@@ -82,6 +82,8 @@ impl<T: CatalogRepository + ?Sized> CatalogRepository for Arc<T> {
 }
 
 pub trait SessionRepository: Send + Sync {
+    /// Permanently removes sessions and everything they own in one transaction.
+    fn delete_sessions(&self, session_ids: &BTreeSet<AgentSessionId>) -> Result<usize>;
     fn load_latest_run_summary_for_session(
         &self,
         session_id: AgentSessionId,
@@ -96,6 +98,9 @@ pub trait SessionRepository: Send + Sync {
 }
 
 impl SessionRepository for FilePersistence {
+    fn delete_sessions(&self, session_ids: &BTreeSet<AgentSessionId>) -> Result<usize> {
+        FilePersistence::delete_sessions(self, session_ids)
+    }
     fn load_latest_run_summary_for_session(
         &self,
         session_id: AgentSessionId,
@@ -118,6 +123,9 @@ impl SessionRepository for FilePersistence {
 }
 
 impl<T: SessionRepository + ?Sized> SessionRepository for Arc<T> {
+    fn delete_sessions(&self, session_ids: &BTreeSet<AgentSessionId>) -> Result<usize> {
+        (**self).delete_sessions(session_ids)
+    }
     fn load_latest_run_summary_for_session(
         &self,
         session_id: AgentSessionId,

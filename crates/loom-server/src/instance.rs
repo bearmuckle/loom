@@ -13,6 +13,7 @@ use std::{
 };
 
 use loom_core::{ErrorCode, LoomError};
+use loom_protocol::ArchiveRetentionPolicy;
 
 use crate::AuthTokenStore;
 
@@ -38,6 +39,9 @@ pub struct InstanceOptions {
     /// `--reset-state`: wipe an incompatible durable database instead of
     /// failing.
     pub reset_state: bool,
+    /// `--archive-retention`: when an archived session or project tree may be
+    /// discarded automatically. Retention is disabled by default.
+    pub archive_retention: ArchiveRetentionPolicy,
 }
 
 impl InstanceOptions {
@@ -49,6 +53,7 @@ impl InstanceOptions {
             token: None,
             token_file: None,
             reset_state: false,
+            archive_retention: ArchiveRetentionPolicy::disabled(),
         }
     }
 }
