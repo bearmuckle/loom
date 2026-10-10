@@ -114,15 +114,50 @@ chmod +x loom-server
 ./loom-server --version
 ```
 
-Serving needs a bearer token, and without `--persistence` the backend keeps its
-state in memory only. `--token-file` reads the trimmed contents of a file
-instead of taking the token on the command line, where other local users could
-read it through `/proc`:
+Neither `--persistence` nor a token is required. Without `--persistence`, a
+bind address with a stable port keeps durable state in
+`<state-dir>/<instance-name or bind-key>/state.db`. An explicit `--persistence`
+path still wins over that default. `<state-dir>` is `LOOM_STATE_DIR` used
+verbatim, else `$XDG_STATE_HOME`, else `$HOME/.local/state`, else a directory in
+the system temp folder, with a `loom` subdirectory appended in every case. The
+bind key is the bind address with `:` replaced by `_`, so `127.0.0.1:8765`
+becomes `127.0.0.1_8765`:
 
 ```sh
-./loom-server --bind 127.0.0.1:8765 --token-file /path/to/token \
-  --persistence /var/lib/loom/loom.db
+./loom-server --bind 127.0.0.1:8765
 ```
+
+The instance directory is created with mode `0700` and holds the database, the
+token, and the files derived from the database path: the credential file, the
+session roots, the cached clone mirrors, and the owner lock. `--instance-name`
+pins one directory for a host-aliased bind, so `0.0.0.0:8765` and
+`127.0.0.1:8765` can share it:
+
+```sh
+./loom-server --bind 0.0.0.0:8765 --allow-insecure-remote \
+  --instance-name loom-server
+```
+
+A bind port of 0 has no stable identity: the backend stays in memory and the
+default token file falls back to `<state-dir>/token`.
+
+Without `--token` or `--token-file` the server reads `<instance-dir>/token` and,
+when that file is missing or empty, generates a `loom-<uuid>` token there. The
+file is written atomically with mode `0600`. The path is always logged, a
+generated token is logged as a warning, and the value itself is printed only
+when stdout is a terminal, so it does not land in `journald` or `docker logs`:
+
+```sh
+./loom-server --bind 127.0.0.1:8765
+# log line: Reusing the bearer token in '<instance-dir>/token'
+```
+
+`--token` and `--token-file` remain explicit, mutually exclusive overrides.
+`--token-file` reads the trimmed contents of a file instead of taking the token
+on the command line, where other local users could read it through `/proc`.
+`--reset-state` wipes an incompatible state database instead of refusing to
+start; an instance with no durable database has nothing to reset and rejects
+the flag.
 
 The unauthenticated `GET /health` endpoint answers `ok`. A bind address that is
 not loopback is refused unless the listener serves TLS or the operator opts in
@@ -131,8 +166,7 @@ listener serve `wss://`, with `/health` over TLS as well:
 
 ```sh
 ./loom-server --bind 0.0.0.0:8765 \
-  --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem \
-  --token-file /path/to/token
+  --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
 ```
 
 `--allow-insecure-remote` accepts the risk of a plaintext listener instead: the
@@ -146,25 +180,31 @@ self-signed certificate, the client adds that CA to its OS trust roots with
 `--ca /path/to/ca.pem` (or `LOOM_TLS_CA`); the addition is additive and
 certificate verification is never disabled.
 
+`loom --serve` resolves the same defaults through the same resolver and also
+accepts `--instance-name` and `--token-file`, so an explicit token is no longer
+necessary there either.
+
 `packaging/loom-server.service` is a sample systemd unit that runs the server
-as a non-root user with `--token-file` and `--persistence`, restarts it on
-failure, and starts it after the network is up.
+as a non-root user with `LOOM_STATE_DIR=/var/lib/loom`, restarts it on failure,
+and starts it after the network is up.
 
 A container image is published for the same tag:
 
 ```sh
 docker pull ghcr.io/<owner>/loom-server:<tag>
-printf 'choose-a-long-random-token' > token
 docker run --rm -p 127.0.0.1:8765:8765 \
-  -v "$PWD/token:/etc/loom/token:ro" \
   ghcr.io/<owner>/loom-server:<tag>
 ```
 
 The image's default command binds `0.0.0.0:8765` inside the container with
-`--allow-insecure-remote`, because that is what makes a published port
-reachable. Publish it only to trusted peers, or pass your own TLS material with
-`--tls-cert` and `--tls-key` and drop the opt-in. The image's `HEALTHCHECK`
-probes plain HTTP, so a TLS override needs its own probe over HTTPS.
+`--allow-insecure-remote` and pins `--instance-name loom-server` below
+`LOOM_STATE_DIR=/var/lib/loom`, because that is what makes a published port
+reachable. The first start generates the token in that instance directory, so
+`docker exec <container> cat /var/lib/loom/loom/loom-server/token` reads it, or
+set a fixed value with `--token` or `--token-file` instead. Publish the port
+only to trusted peers, or pass your own TLS material with `--tls-cert` and
+`--tls-key` and drop the opt-in. The image's `HEALTHCHECK` probes plain HTTP, so
+a TLS override needs its own probe over HTTPS.
 
 ## Providers
 

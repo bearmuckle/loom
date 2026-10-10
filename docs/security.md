@@ -23,7 +23,12 @@ connection is never implicitly trusted.
   raw API keys are resolved in memory for a provider call and are not
   serialized in the event journal, health errors, or protocol responses.
 - The SQLite state database is durable application state, not an encrypted
-  secret vault. Deployments must place it and any credential store under the
+  secret vault. The standalone server keeps one instance directory per bind
+  address, created owner-only (mode 0700), which defaults to
+  `<state-dir>/<instance-name or bind-key>` and holds the database, the
+  default token file (mode 0600), and the files derived from the database path:
+  the credential file, the session roots, the cached clone mirrors, and the
+  owner lock. Deployments must place it and any credential store under the
   backend user's protected data directory and use filesystem permissions
   appropriate to the deployment.
 - Provide cancellation and resource limits for processes, streams, model
@@ -40,13 +45,20 @@ Issued-token debug output is redacted, authentication failures do not echo the
 supplied token, and authorization headers are not copied into protocol events. Revocation is checked on every request, including requests
 from an already-upgraded WebSocket. Token grants can restrict capabilities,
 workspaces, and sessions; an unrestricted grant is an explicit deployment
-choice rather than an implicit network default.
+choice rather than an implicit network default. Without `--token` or
+`--token-file` the standalone server keeps its bearer token in
+`<instance-dir>/token`: it generates a `loom-<uuid>` value there on first start,
+writes it with mode 0600, and reuses it on later starts. The path is always
+logged, generation is logged as a warning, and the value itself is printed only
+when stdout is a terminal, so it is not captured by `journald` or container
+logs.
 
 The service binds to `127.0.0.1` by default. Binding a non-loopback address
-requires an explicit `--bind` choice and a token. The server can also terminate
-TLS itself: `--tls-cert` and `--tls-key` are required together and make the
-listener serve `wss://`, with `/health` over TLS as well. Without TLS, the bind
-refuses a non-loopback address unless the operator passes
+requires an explicit `--bind` choice; the bearer token defaults to the instance
+token described above, and `--token` or `--token-file` override it. The server
+can also terminate TLS itself: `--tls-cert` and `--tls-key` are required
+together and make the listener serve `wss://`, with `/health` over TLS as well.
+Without TLS, the bind refuses a non-loopback address unless the operator passes
 `--allow-insecure-remote`, which logs a warning naming the flag that permitted
 the listener. That refusal is a deliberate compatibility change: a plaintext
 remote listener, and a native client sending its token to one, now need either

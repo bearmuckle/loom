@@ -42,20 +42,7 @@ impl FileCredentialStore {
     }
 
     pub fn default_path() -> PathBuf {
-        std::env::var_os("LOOM_CONFIG_DIR")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("XDG_CONFIG_HOME")
-                    .map(PathBuf::from)
-                    .map(|path| path.join("loom"))
-            })
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .map(|path| path.join(".config").join("loom"))
-            })
-            .unwrap_or_else(|| PathBuf::from(".loom"))
-            .join("credentials.json")
+        loom_core::config_dir().join("credentials.json")
     }
 
     pub fn insert(
@@ -257,5 +244,91 @@ impl CredentialStore for InMemoryCredentialStore {
             })?
             .insert(reference.as_str().to_owned(), secret);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Environment variable that makes a child process of this test write the
+    /// resolved default path to the file it names.
+    const PROBE_DESTINATION: &str = "LOOM_DEFAULT_CREDENTIAL_PATH_PROBE";
+
+    /// The configuration precedence is process-wide, so the default path is
+    /// resolved in a child process with a controlled environment instead of by
+    /// mutating this test process.
+    const PROBE_TEST: &str = "credential_path_probe_writes_the_default_path";
+
+    #[test]
+    fn credential_path_probe_writes_the_default_path() {
+        // In a normal test run this test has nothing to do; only the child
+        // process spawned by `default_path_follows_the_shared_config_precedence`
+        // has the probe destination set.
+        let Some(destination) = std::env::var_os(PROBE_DESTINATION) else {
+            return;
+        };
+        fs::write(
+            destination,
+            FileCredentialStore::default_path().display().to_string(),
+        )
+        .expect("could not write the probed credential path");
+    }
+
+    #[test]
+    fn default_path_follows_the_shared_config_precedence() {
+        let probe = |environment: &[(&str, &str)]| -> PathBuf {
+            let destination = std::env::temp_dir().join(format!(
+                "loom-credential-path-probe-{}",
+                loom_core::RunId::new()
+            ));
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("the test binary path is known"),
+            )
+            .arg(PROBE_TEST)
+            .env_clear()
+            .env(PROBE_DESTINATION, &destination)
+            .envs(environment.iter().copied())
+            // `env_clear` drops the parent's LLVM profile settings, so a child
+            // running under `cargo llvm-cov` writes its own profile data next to
+            // its working directory; keep that out of the source tree.
+            .current_dir(std::env::temp_dir())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("could not run the probe as a child process");
+            assert!(status.success(), "probe exited with {status}");
+            let reported = fs::read_to_string(&destination)
+                .expect("the probe did not write the resolved path");
+            fs::remove_file(&destination).unwrap();
+            PathBuf::from(reported)
+        };
+
+        // `LOOM_CONFIG_DIR` is used verbatim, and the fallbacks match the
+        // shared helper in `loom-core`.
+        assert_eq!(
+            probe(&[("LOOM_CONFIG_DIR", "/probe/loom-config")]),
+            PathBuf::from("/probe/loom-config/credentials.json")
+        );
+        assert_eq!(
+            probe(&[("XDG_CONFIG_HOME", "/probe/xdg")]),
+            PathBuf::from("/probe/xdg/loom/credentials.json")
+        );
+        assert_eq!(
+            probe(&[("HOME", "/probe/home")]),
+            PathBuf::from("/probe/home/.config/loom/credentials.json")
+        );
+        assert_eq!(probe(&[]), PathBuf::from(".loom/credentials.json"));
+
+        assert_eq!(
+            FileCredentialStore::default_path(),
+            loom_core::config_dir().join("credentials.json")
+        );
+        assert_eq!(
+            FileCredentialStore::default_path()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("credentials.json")
+        );
     }
 }

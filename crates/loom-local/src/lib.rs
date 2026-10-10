@@ -419,11 +419,13 @@ fn default_project_root(
 /// Loom's own state directory, canonicalized when it already exists so it can
 /// be compared against canonical working directories.
 fn canonical_state_directory() -> PathBuf {
-    let directory = state_root().join("loom");
+    let directory = loom_core::state_dir();
     if let Ok(canonical) = fs::canonicalize(&directory) {
         return canonical;
     }
-    let root = state_root();
+    // The state directory does not exist yet, so canonicalize the state root
+    // instead and name the `loom` subdirectory the shared helper appends.
+    let root = loom_core::state_root();
     let root = fs::canonicalize(&root).unwrap_or(root);
     root.join("loom")
 }
@@ -481,17 +483,7 @@ pub fn prepare_workspace(options: &UiOptions) -> Result<(PathBuf, bool), LoomErr
 }
 
 pub fn backend_persistence_path() -> PathBuf {
-    state_root().join("loom").join("state.db")
-}
-
-fn state_root() -> PathBuf {
-    env::var_os("LOOM_STATE_DIR")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("XDG_STATE_HOME").map(PathBuf::from))
-        .or_else(|| {
-            env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("state"))
-        })
-        .unwrap_or_else(|| env::temp_dir().join("loom-state"))
+    loom_core::state_dir().join("state.db")
 }
 
 /// Public device-code payload for a GitHub sign-in.
@@ -738,7 +730,7 @@ mod tests {
     fn persistence_is_shared_across_workspaces() {
         assert_eq!(
             backend_persistence_path(),
-            state_root().join("loom").join("state.db")
+            loom_core::state_dir().join("state.db")
         );
     }
 

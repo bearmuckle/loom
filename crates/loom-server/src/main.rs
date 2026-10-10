@@ -8,7 +8,7 @@
 //! opt-in. See `SECURITY.md` before exposing it further.
 
 use std::{
-    env, fs,
+    env,
     future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -17,8 +17,8 @@ use std::{
 
 use loom_core::{ErrorCode, LoomError};
 use loom_server::{
-    AuthTokenStore, AuthorizationScope, InProcessBackend, RemoteServer, RemoteServerConfig,
-    RunningRemoteServer, ServerTlsConfig,
+    AuthTokenStore, AuthorizationScope, InProcessBackend, Instance, InstanceOptions, RemoteServer,
+    RemoteServerConfig, RunningRemoteServer, ServerTlsConfig,
 };
 
 /// The bind address used when `--bind` is not supplied.
@@ -57,9 +57,11 @@ enum ParsedArgs {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ServerOptions {
     bind: SocketAddr,
+    instance_name: Option<String>,
     token: Option<String>,
     token_file: Option<PathBuf>,
     persistence: Option<PathBuf>,
+    reset_state: bool,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     allow_insecure_remote: bool,
@@ -69,12 +71,28 @@ impl Default for ServerOptions {
     fn default() -> Self {
         Self {
             bind: DEFAULT_BIND.parse().expect("valid default bind address"),
+            instance_name: None,
             token: None,
             token_file: None,
             persistence: None,
+            reset_state: false,
             tls_cert: None,
             tls_key: None,
             allow_insecure_remote: false,
+        }
+    }
+}
+
+impl ServerOptions {
+    /// The settings [`Instance`] applies its defaults to.
+    fn instance_options(&self) -> InstanceOptions {
+        InstanceOptions {
+            bind: self.bind,
+            instance_name: self.instance_name.clone(),
+            persistence: self.persistence.clone(),
+            token: self.token.clone(),
+            token_file: self.token_file.clone(),
+            reset_state: self.reset_state,
         }
     }
 }
@@ -103,6 +121,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
         match argument.as_str() {
             "--bind" => options.bind = parse_bind(required_value(&mut args, "--bind")?)?,
             "--token" => options.token = Some(required_value(&mut args, "--token")?),
+            "--instance-name" => {
+                options.instance_name = Some(required_value(&mut args, "--instance-name")?);
+            }
             "--token-file" => {
                 options.token_file =
                     Some(PathBuf::from(required_value(&mut args, "--token-file")?));
@@ -111,6 +132,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
                 options.persistence =
                     Some(PathBuf::from(required_value(&mut args, "--persistence")?));
             }
+            "--reset-state" => options.reset_state = true,
             "--tls-cert" => {
                 options.tls_cert = Some(PathBuf::from(required_value(&mut args, "--tls-cert")?));
             }
@@ -122,6 +144,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
             "--version" | "-V" => return Ok(ParsedArgs::Version),
             value if value.starts_with("--bind=") => {
                 options.bind = parse_bind(value["--bind=".len()..].to_owned())?;
+            }
+            value if value.starts_with("--instance-name=") => {
+                options.instance_name = Some(value["--instance-name=".len()..].to_owned());
             }
             value if value.starts_with("--token-file=") => {
                 options.token_file = Some(PathBuf::from(&value["--token-file=".len()..]));
@@ -162,43 +187,6 @@ fn parse_bind(value: String) -> Result<SocketAddr, LoomError> {
     })
 }
 
-/// Resolves the single bearer token the server accepts. Exactly one of
-/// `--token` and `--token-file` must be supplied, and the result must not be
-/// empty.
-fn resolve_token(options: &ServerOptions) -> Result<String, LoomError> {
-    match (&options.token, &options.token_file) {
-        (Some(_), Some(_)) => Err(LoomError::invalid_request(
-            "--token and --token-file are mutually exclusive; provide exactly one",
-        )),
-        (None, None) => Err(LoomError::invalid_request(
-            "provide a client bearer token with --token or --token-file",
-        )),
-        (Some(token), None) => {
-            let token = token.trim();
-            if token.is_empty() {
-                return Err(LoomError::invalid_request("--token must not be empty"));
-            }
-            Ok(token.to_owned())
-        }
-        (None, Some(path)) => {
-            let contents = fs::read_to_string(path).map_err(|error| {
-                LoomError::invalid_request(format!(
-                    "could not read token file '{}': {error}",
-                    path.display()
-                ))
-            })?;
-            let token = contents.trim();
-            if token.is_empty() {
-                return Err(LoomError::invalid_request(format!(
-                    "token file '{}' is empty",
-                    path.display()
-                )));
-            }
-            Ok(token.to_owned())
-        }
-    }
-}
-
 /// Resolves the optional TLS material. `--tls-cert` and `--tls-key` only mean
 /// something together, so supplying one without the other is an error rather
 /// than a silently plaintext listener.
@@ -219,17 +207,22 @@ fn resolve_tls(options: &ServerOptions) -> Result<Option<ServerTlsConfig>, LoomE
 
 fn help_text() -> String {
     format!(
-        "Usage: loom-server [--bind <addr>] [--token <token> | --token-file <path>] \
-         [--persistence <path>] [--tls-cert <pem> --tls-key <pem>] \
+        "Usage: loom-server [--bind <addr>] [--instance-name <name>] \
+         [--token <token> | --token-file <path>] [--persistence <path>] \
+         [--reset-state] [--tls-cert <pem> --tls-key <pem>] \
          [--allow-insecure-remote]\n\
          \n\
          A standalone Loom backend that serves the remote WebSocket protocol.\n\
          \n\
          Options:\n\
          \x20 --bind <addr>         address to listen on (default {DEFAULT_BIND})\n\
+         \x20 --instance-name <name>\n\
+         \x20                        pin this instance's directory instead of naming it \
+         after --bind\n\
          \x20 --token <token>       bearer token clients must present\n\
          \x20 --token-file <path>   file whose trimmed contents are the bearer token\n\
          \x20 --persistence <path>  keep state in the database at this path\n\
+         \x20 --reset-state         wipe an incompatible state database and start empty\n\
          \x20 --tls-cert <pem>      serve wss:// with this PEM certificate chain\n\
          \x20 --tls-key <pem>       PEM private key matching --tls-cert\n\
          \x20 --allow-insecure-remote\n\
@@ -237,10 +230,19 @@ fn help_text() -> String {
          \x20 -h, --help            print this help and exit\n\
          \x20 -V, --version         print the version and exit\n\
          \n\
-         Exactly one of --token and --token-file is required. Without --persistence \
-         the backend keeps its state in memory for the lifetime of the process. A bind \
-         address that is not loopback needs TLS; --allow-insecure-remote accepts the \
-         risk of sending the bearer token and all traffic in plaintext instead."
+         Without --persistence this server keeps its durable state in \
+         <state-dir>/<instance-name or bind-key>/state.db, where <state-dir> follows \
+         LOOM_STATE_DIR, then $XDG_STATE_HOME, then $HOME/.local/state, plus a loom \
+         subdirectory; the directory is created with mode 0700. A bind port of 0 has no \
+         stable identity and keeps its state in memory.\n\
+         \n\
+         Without --token or --token-file this server reads <instance-dir>/token and \
+         generates a loom-<uuid> token there when it is missing, written with mode 0600 \
+         like the credential store. The path is always logged; the value is printed only \
+         when stdout is a terminal.\n\
+         \n\
+         A bind address that is not loopback needs TLS; --allow-insecure-remote accepts \
+         the risk of sending the bearer token and all traffic in plaintext instead."
     )
 }
 
@@ -275,8 +277,8 @@ fn version_label(version: &str, revision: &str) -> String {
     }
 }
 
-/// Opens the backend the operator asked for: a `--persistence` path selects the
-/// durable backend, and without one the backend keeps its state in memory. This
+/// Opens the backend the operator asked for: the path [`Instance`] resolved, or
+/// the in-memory backend when this instance has no durable database. This
 /// mirrors the standalone server mode of the native `loom` shell.
 fn build_backend(persistence: Option<&Path>) -> Result<Arc<InProcessBackend>, LoomError> {
     match persistence {
@@ -315,12 +317,12 @@ impl RunningServer {
 async fn start(
     options: &ServerOptions,
     backend: Arc<InProcessBackend>,
+    instance: &Instance,
 ) -> Result<RunningServer, LoomError> {
-    let token = resolve_token(options)?;
     let tls = resolve_tls(options)?;
     let tls_configured = tls.is_some();
     let auth = Arc::new(AuthTokenStore::new());
-    let _issued = auth.insert(token, AuthorizationScope::all())?;
+    let _issued = auth.insert(instance.token().token(), AuthorizationScope::all())?;
     let config = RemoteServerConfig {
         bind_addr: options.bind,
         tls,
@@ -388,11 +390,42 @@ async fn serve(
     options: ServerOptions,
     shutdown: impl Future<Output = Result<(), LoomError>>,
 ) -> Result<(), LoomError> {
-    let backend = build_backend(options.persistence.as_deref())?;
-    let server = start(&options, backend).await?;
+    serve_in(options, &loom_core::state_dir(), shutdown).await
+}
+
+/// [`serve`] with the state directory injected, so a test can drive the whole
+/// lifecycle without writing into the operator's real state directory.
+async fn serve_in(
+    options: ServerOptions,
+    state_directory: &Path,
+    shutdown: impl Future<Output = Result<(), LoomError>>,
+) -> Result<(), LoomError> {
+    let instance = prepare_instance(&options, state_directory)?;
+    let backend = build_backend(instance.state_db())?;
+    let server = start(&options, backend, &instance).await?;
     shutdown.await?;
     log::info!("Shutting down loom-server");
     server.stop().await
+}
+
+/// Resolves this instance's paths and bearer token, reporting both so an
+/// operator can see which database and token this start used. The token value
+/// itself is printed only when stdout is a terminal, so it does not land in
+/// journald or `docker logs`.
+fn prepare_instance(
+    options: &ServerOptions,
+    state_directory: &Path,
+) -> Result<Instance, LoomError> {
+    let instance = Instance::prepare(&options.instance_options(), state_directory)?;
+    if let Some(directory) = instance.layout().directory() {
+        log::info!("Instance directory: {}", directory.display());
+    }
+    if let Some(path) = instance.state_db() {
+        log::info!("State database: {}", path.display());
+    }
+    instance.token().log_source();
+    instance.token().print_generated();
+    Ok(instance)
 }
 
 /// Resolves once the process receives SIGINT, or SIGTERM on unix, so systemd
@@ -437,11 +470,11 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use loom_server::InProcessBackend;
+    use loom_server::{InProcessBackend, Instance, TokenSource};
 
     use super::{
         ParsedArgs, ServerOptions, bind_exposure_warning, build_version, help_text, parse_args,
-        resolve_tls, resolve_token, run, serve, start, version_label, version_text,
+        prepare_instance, resolve_tls, run, serve_in, start, version_label, version_text,
     };
 
     fn arguments<'a>(values: &'a [&str]) -> impl Iterator<Item = String> + 'a {
@@ -467,13 +500,28 @@ mod tests {
         std::env::temp_dir().join(format!("loom-server-{label}-{}", loom_core::RunId::new()))
     }
 
+    fn temporary_directory(label: &str) -> PathBuf {
+        let path = temporary_path(&format!("dir-{label}"));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    /// The instance a test server runs as. Callers always pass a bind address
+    /// with an ephemeral port or an explicit token, so resolving it below the
+    /// temp directory writes nothing into the operator's real state directory.
+    fn instance(options: &ServerOptions) -> Instance {
+        prepare_instance(options, &std::env::temp_dir()).unwrap()
+    }
+
     #[test]
     fn parser_keeps_defaults_and_accepts_spaced_and_equals_values() {
         let defaults = serve_options(&[]);
         assert_eq!(defaults.bind.to_string(), "127.0.0.1:8765");
+        assert_eq!(defaults.instance_name, None);
         assert_eq!(defaults.token, None);
         assert_eq!(defaults.token_file, None);
         assert_eq!(defaults.persistence, None);
+        assert!(!defaults.reset_state);
         assert_eq!(defaults.tls_cert, None);
         assert_eq!(defaults.tls_key, None);
         assert!(!defaults.allow_insecure_remote);
@@ -481,10 +529,13 @@ mod tests {
         let spaced = serve_options(&[
             "--bind",
             "127.0.0.1:9000",
+            "--instance-name",
+            "worker",
             "--token",
             "spaced-token",
             "--persistence",
             "/tmp/loom.db",
+            "--reset-state",
             "--tls-cert",
             "/tmp/cert.pem",
             "--tls-key",
@@ -492,6 +543,8 @@ mod tests {
             "--allow-insecure-remote",
         ]);
         assert_eq!(spaced.bind.to_string(), "127.0.0.1:9000");
+        assert_eq!(spaced.instance_name.as_deref(), Some("worker"));
+        assert!(spaced.reset_state);
         assert_eq!(spaced.token.as_deref(), Some("spaced-token"));
         assert_eq!(
             spaced.persistence.as_deref(),
@@ -503,12 +556,14 @@ mod tests {
 
         let equals = serve_options(&[
             "--bind=0.0.0.0:9",
+            "--instance-name=pinned",
             "--token-file=/tmp/token",
             "--persistence=/tmp/other.db",
             "--tls-cert=/tmp/other-cert.pem",
             "--tls-key=/tmp/other-key.pem",
         ]);
         assert_eq!(equals.bind.to_string(), "0.0.0.0:9");
+        assert_eq!(equals.instance_name.as_deref(), Some("pinned"));
         assert_eq!(equals.token, None);
         assert_eq!(equals.token_file.as_deref(), Some(Path::new("/tmp/token")));
         assert_eq!(
@@ -530,6 +585,7 @@ mod tests {
     fn parser_rejects_missing_values_invalid_binds_and_unknown_arguments() {
         for flag in [
             "--bind",
+            "--instance-name",
             "--token",
             "--token-file",
             "--persistence",
@@ -569,6 +625,8 @@ mod tests {
         run(arguments(&["--help"])).unwrap();
         run(arguments(&["-V"])).unwrap();
         let help = help_text();
+        assert!(help.contains("--instance-name <name>"));
+        assert!(help.contains("--reset-state"));
         assert!(help.contains("--token-file <path>"));
         assert!(help.contains("--tls-cert <pem>"));
         assert!(help.contains("--tls-key <pem>"));
@@ -631,7 +689,9 @@ mod tests {
             tls_key: Some(fixture("server-key.pem")),
             ..ServerOptions::default()
         };
-        let server = start(&options, InProcessBackend::new()).await.unwrap();
+        let server = start(&options, InProcessBackend::new(), &instance(&options))
+            .await
+            .unwrap();
         assert!(server.websocket_url().starts_with("wss://127.0.0.1:"));
         assert_eq!(
             server.health_url(),
@@ -647,7 +707,7 @@ mod tests {
             token: Some("exposed-token".to_owned()),
             ..ServerOptions::default()
         };
-        let error = start(&options, InProcessBackend::new())
+        let error = start(&options, InProcessBackend::new(), &instance(&options))
             .await
             .err()
             .unwrap();
@@ -658,7 +718,9 @@ mod tests {
             allow_insecure_remote: true,
             ..options
         };
-        let server = start(&opted_in, InProcessBackend::new()).await.unwrap();
+        let server = start(&opted_in, InProcessBackend::new(), &instance(&opted_in))
+            .await
+            .unwrap();
         assert!(!server.remote.tls_enabled());
         assert!(server.websocket_url().starts_with("ws://0.0.0.0:"));
         server.stop().await.unwrap();
@@ -674,65 +736,169 @@ mod tests {
     }
 
     #[test]
-    fn token_resolution_requires_exactly_one_source() {
-        let neither = resolve_token(&ServerOptions::default()).unwrap_err();
-        assert!(neither.message.contains("--token or --token-file"));
+    fn token_resolution_honours_the_explicit_flags() {
+        let state = temporary_directory("flag-token");
+        let flagged =
+            prepare_instance(&serve_options(&["--token", "  flag-token  "]), &state).unwrap();
+        assert_eq!(flagged.token().token(), "flag-token");
+        assert_eq!(flagged.token().source(), &TokenSource::Flag);
+        assert_eq!(flagged.token().printable(), None);
 
-        let spaced = ServerOptions {
-            token: Some("  flag-token  ".to_owned()),
-            ..ServerOptions::default()
-        };
-        assert_eq!(resolve_token(&spaced).unwrap(), "flag-token");
+        let path = state.join("mounted-token");
+        std::fs::write(&path, "  file-secret\n").unwrap();
+        let served = prepare_instance(
+            &serve_options(&["--token-file", path.to_str().unwrap()]),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(served.token().token(), "file-secret");
+        assert_eq!(served.token().source(), &TokenSource::File(path.clone()));
 
-        let both = ServerOptions {
-            token: Some("flag-token".to_owned()),
-            token_file: Some(temporary_path("both.token")),
-            ..ServerOptions::default()
-        };
+        let both = serve_options(&["--token", "flag-token", "--token-file", "/tmp/other"]);
+        let error = prepare_instance(&both, &state).unwrap_err();
+        assert!(error.message.contains("mutually exclusive"), "{error}");
+
+        let empty = serve_options(&["--token", "   "]);
+        let error = prepare_instance(&empty, &state).unwrap_err();
+        assert!(error.message.contains("must not be empty"), "{error}");
+
+        // An operator-named token file is never created for: a missing file is
+        // reported as unreadable, and its directory is left to the deployment,
+        // which may not even be writable by the user running the server.
+        let deployment = state.join("deployment");
+        let named_token = deployment.join("token");
+        let missing = serve_options(&["--token-file", named_token.to_str().unwrap()]);
+        let error = prepare_instance(&missing, &state).unwrap_err();
         assert!(
-            resolve_token(&both)
-                .unwrap_err()
-                .message
-                .contains("mutually exclusive")
+            error.message.contains("could not read token file"),
+            "{error}"
         );
-
-        let empty = ServerOptions {
-            token: Some("   ".to_owned()),
-            ..ServerOptions::default()
-        };
         assert!(
-            resolve_token(&empty)
-                .unwrap_err()
-                .message
-                .contains("must not be empty")
+            !deployment.exists(),
+            "an operator-named token directory must not be created"
         );
+        std::fs::remove_dir_all(&state).ok();
     }
 
     #[test]
-    fn token_resolution_reads_and_trims_the_token_file() {
-        let path = temporary_path("token");
-        std::fs::write(&path, "  file-secret\n").unwrap();
-        let options = ServerOptions {
-            token_file: Some(path.clone()),
-            ..ServerOptions::default()
-        };
-        assert_eq!(resolve_token(&options).unwrap(), "file-secret");
+    fn defaulted_start_uses_the_instance_directory_for_state_and_token() {
+        let state = temporary_directory("defaults");
+        let directory = state.join("127.0.0.1_8765");
+        let options = serve_options(&["--bind", "127.0.0.1:8765"]);
 
-        std::fs::write(&path, "\n   \n").unwrap();
-        assert!(
-            resolve_token(&options)
-                .unwrap_err()
-                .message
-                .contains("is empty")
+        let first = prepare_instance(&options, &state).unwrap();
+        assert_eq!(first.layout().directory(), Some(directory.as_path()));
+        assert_eq!(first.state_db(), Some(directory.join("state.db").as_path()));
+        assert_eq!(first.layout().token_file(), directory.join("token"));
+        assert!(matches!(
+            first.token().source(),
+            TokenSource::GeneratedFile(path) if path == &directory.join("token")
+        ));
+        assert_eq!(first.token().printable(), Some(first.token().token()));
+
+        // A second start on the same bind reuses the database and the token.
+        let second = prepare_instance(&options, &state).unwrap();
+        assert_eq!(second.state_db(), first.state_db());
+        assert!(matches!(
+            second.token().source(),
+            TokenSource::ReusedFile(_)
+        ));
+        assert_eq!(second.token().token(), first.token().token());
+
+        // A different port or host is a different instance.
+        let other_port =
+            prepare_instance(&serve_options(&["--bind", "127.0.0.1:8766"]), &state).unwrap();
+        assert_ne!(other_port.state_db(), first.state_db());
+        let other_host =
+            prepare_instance(&serve_options(&["--bind", "0.0.0.0:8765"]), &state).unwrap();
+        assert_ne!(other_host.state_db(), first.state_db());
+
+        // --instance-name pins one directory for a host-aliased bind.
+        let pinned = prepare_instance(
+            &serve_options(&["--bind", "0.0.0.0:8765", "--instance-name", "worker"]),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(
+            pinned.layout().directory(),
+            Some(state.join("worker").as_path())
+        );
+        assert_eq!(
+            pinned.state_db(),
+            Some(state.join("worker").join("state.db").as_path())
         );
 
-        std::fs::remove_file(&path).unwrap();
-        assert!(
-            resolve_token(&options)
-                .unwrap_err()
-                .message
-                .contains("could not read token file")
+        // An explicit --persistence still wins over the default.
+        let explicit = prepare_instance(
+            &serve_options(&[
+                "--bind",
+                "127.0.0.1:8765",
+                "--persistence",
+                "/tmp/explicit-loom.db",
+            ]),
+            &state,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit.state_db(),
+            Some(Path::new("/tmp/explicit-loom.db"))
         );
+        std::fs::remove_dir_all(&state).ok();
+    }
+
+    #[tokio::test]
+    async fn serve_in_keeps_an_ephemeral_port_in_memory_and_generates_a_token() {
+        let state = temporary_directory("ephemeral");
+        serve_in(serve_options(&["--bind", "127.0.0.1:0"]), &state, async {
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let token = std::fs::read_to_string(state.join("token")).unwrap();
+        assert!(token.trim().starts_with("loom-"), "{token}");
+        // An OS-assigned port has no stable identity, so no instance directory
+        // is created and the backend stays in memory.
+        assert!(!state.join("127.0.0.1_0").exists());
+        std::fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn reset_state_wipes_a_defaulted_database_and_needs_one_to_wipe() {
+        let state = temporary_directory("reset");
+        let database = state.join("127.0.0.1_8765").join("state.db");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        std::fs::write(
+            &database,
+            br#"{"schema_version":1,"state":{"broken":true}}"#,
+        )
+        .unwrap();
+
+        // Without --reset-state the incompatible database is reported with the
+        // flag that recovers from it, and it is left alone.
+        let error =
+            prepare_instance(&serve_options(&["--bind", "127.0.0.1:8765"]), &state).unwrap_err();
+        assert!(error.message.contains("--reset-state"), "{error}");
+        assert!(database.exists());
+
+        let reset = prepare_instance(
+            &serve_options(&["--bind", "127.0.0.1:8765", "--reset-state"]),
+            &state,
+        )
+        .unwrap();
+        assert!(!database.exists(), "--reset-state wipes the database");
+        assert!(matches!(
+            reset.token().source(),
+            TokenSource::GeneratedFile(_)
+        ));
+
+        // An in-memory instance has nothing to reset.
+        let error = prepare_instance(
+            &serve_options(&["--bind", "127.0.0.1:0", "--reset-state"]),
+            &state,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("--reset-state"), "{error}");
+        std::fs::remove_dir_all(&state).ok();
     }
 
     #[test]
@@ -796,7 +962,9 @@ mod tests {
             token: Some("server-test-token".to_owned()),
             ..ServerOptions::default()
         };
-        let server = start(&options, InProcessBackend::new()).await.unwrap();
+        let server = start(&options, InProcessBackend::new(), &instance(&options))
+            .await
+            .unwrap();
         assert!(server.websocket_url().starts_with("ws://127.0.0.1:"));
         assert!(server.websocket_url().ends_with("/ws"));
         assert_eq!(
@@ -813,16 +981,19 @@ mod tests {
 
     #[tokio::test]
     async fn serve_opens_the_in_memory_backend_and_stops_on_shutdown() {
+        let state = temporary_directory("in-memory");
         let options = ServerOptions {
             bind: "127.0.0.1:0".parse().unwrap(),
             token: Some("in-memory-token".to_owned()),
             ..ServerOptions::default()
         };
-        serve(options, async { Ok(()) }).await.unwrap();
+        serve_in(options, &state, async { Ok(()) }).await.unwrap();
+        std::fs::remove_dir_all(&state).ok();
     }
 
     #[tokio::test]
     async fn serve_opens_a_persistent_backend_at_the_requested_path() {
+        let state = temporary_directory("persistent");
         let path = temporary_path("state.db");
         let options = ServerOptions {
             bind: "127.0.0.1:0".parse().unwrap(),
@@ -830,7 +1001,7 @@ mod tests {
             persistence: Some(path.clone()),
             ..ServerOptions::default()
         };
-        serve(options, async { Ok(()) }).await.unwrap();
+        serve_in(options, &state, async { Ok(()) }).await.unwrap();
         assert!(
             path.exists(),
             "the persistent backend should create {path:?}"
@@ -838,6 +1009,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("credentials.json")).ok();
         std::fs::remove_file(path.with_extension("session-roots")).ok();
+        std::fs::remove_dir_all(&state).ok();
     }
 
     #[test]
