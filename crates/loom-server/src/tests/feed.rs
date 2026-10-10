@@ -141,6 +141,53 @@ fn worker_feed_capture_and_acknowledgement_are_session_scoped() {
 }
 
 #[test]
+fn concurrent_server_event_appends_keep_the_pending_feed_ordered() {
+    // Sequence allocation and insertion must happen under a single journal
+    // lock. If a producer could release the lock between allocating a sequence
+    // and appending the event, another producer could insert a higher sequence
+    // first, leaving `pending_events` non-monotonic. That is exactly the state
+    // the persistence feed validation rejects with "event feed sequences are
+    // invalid", so this guards the invariant under concurrent appends.
+    let sessions = (0..4).map(|_| AgentSessionId::new()).collect::<Vec<_>>();
+    let journal = Arc::new(Mutex::new(EventJournal::default()));
+    let mut workers = Vec::new();
+    for session_id in &sessions {
+        for _ in 0..2 {
+            let journal = Arc::clone(&journal);
+            let session_id = *session_id;
+            workers.push(thread::spawn(move || {
+                for _ in 0..250 {
+                    journal.lock().unwrap().append_server_event(
+                        CURRENT_PROTOCOL_VERSION,
+                        session_id,
+                        ServerEvent::AgentSessionArchived { session_id },
+                    );
+                }
+            }));
+        }
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+
+    let journal = journal.lock().unwrap();
+    let sequences = journal
+        .pending_events
+        .iter()
+        .map(|event| event.sequence.value())
+        .collect::<Vec<_>>();
+    assert_eq!(sequences.len(), 2000);
+    assert!(
+        sequences.windows(2).all(|pair| pair[0] < pair[1]),
+        "pending feed sequences must be strictly increasing: {sequences:?}"
+    );
+    assert_eq!(
+        journal.next_sequence.value(),
+        sequences.last().copied().unwrap()
+    );
+}
+
+#[test]
 fn streamed_message_fragments_batch_until_the_time_threshold() {
     let (endpoint, first_delta, release_second, second_delta, finish) =
         gated_model_endpoint("first");

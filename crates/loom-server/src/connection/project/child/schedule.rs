@@ -211,13 +211,11 @@ impl InProcessConnection {
             )?
             && let Some(updated_task) = persistence.load_delegated_task(task.task_id)?
         {
-            let sequence = self.backend.journal()?.next();
-            self.backend.journal()?.append_event(ServerEventEnvelope {
-                protocol_version: CURRENT_PROTOCOL_VERSION,
-                sequence,
-                session_id: updated_task.requester_session_id,
-                event: ServerEvent::ProjectTaskUpdated { task: updated_task },
-            });
+            self.backend.journal()?.append_server_event(
+                CURRENT_PROTOCOL_VERSION,
+                updated_task.requester_session_id,
+                ServerEvent::ProjectTaskUpdated { task: updated_task },
+            );
         }
 
         let wait_id = current_wait.wait_id.to_string();
@@ -265,13 +263,11 @@ impl InProcessConnection {
                 let Some(updated_task) = persistence.load_delegated_task(task.task_id)? else {
                     return Err(LoomError::not_found("delegated task", task.task_id));
                 };
-                let sequence = self.backend.journal()?.next();
-                self.backend.journal()?.append_event(ServerEventEnvelope {
-                    protocol_version: CURRENT_PROTOCOL_VERSION,
-                    sequence,
-                    session_id: updated_task.requester_session_id,
-                    event: ServerEvent::ProjectTaskUpdated { task: updated_task },
-                });
+                self.backend.journal()?.append_server_event(
+                    CURRENT_PROTOCOL_VERSION,
+                    updated_task.requester_session_id,
+                    ServerEvent::ProjectTaskUpdated { task: updated_task },
+                );
             }
             return Err(error);
         }

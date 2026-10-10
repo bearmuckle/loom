@@ -146,13 +146,7 @@ impl InProcessConnection {
                     .collect::<Vec<_>>();
                 let mut journal = self.backend.journal()?;
                 for event in history {
-                    let sequence = journal.next();
-                    journal.append_event(ServerEventEnvelope {
-                        protocol_version: event.protocol_version,
-                        sequence,
-                        session_id: target_id,
-                        event: event.event,
-                    });
+                    journal.append_server_event(event.protocol_version, target_id, event.event);
                 }
                 Ok(ServerResponse::Session(
                     SessionResponse::AgentSessionForked(snapshot),

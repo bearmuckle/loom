@@ -51,13 +51,11 @@ impl InProcessBackend {
                             return Err(LoomError::not_found("delegated task", task.task_id));
                         };
                         *task = updated_task;
-                        let sequence = self.journal()?.next();
-                        self.journal()?.append_event(ServerEventEnvelope {
-                            protocol_version: CURRENT_PROTOCOL_VERSION,
-                            sequence,
-                            session_id: task.requester_session_id,
-                            event: ServerEvent::ProjectTaskUpdated { task: task.clone() },
-                        });
+                        self.journal()?.append_server_event(
+                            CURRENT_PROTOCOL_VERSION,
+                            task.requester_session_id,
+                            ServerEvent::ProjectTaskUpdated { task: task.clone() },
+                        );
                     }
                 }
             }
@@ -88,13 +86,11 @@ impl InProcessBackend {
                     *task = persistence
                         .load_delegated_task(task.task_id)?
                         .ok_or_else(|| LoomError::not_found("delegated task", task.task_id))?;
-                    let sequence = self.journal()?.next();
-                    self.journal()?.append_event(ServerEventEnvelope {
-                        protocol_version: CURRENT_PROTOCOL_VERSION,
-                        sequence,
-                        session_id: task.requester_session_id,
-                        event: ServerEvent::ProjectTaskUpdated { task: task.clone() },
-                    });
+                    self.journal()?.append_server_event(
+                        CURRENT_PROTOCOL_VERSION,
+                        task.requester_session_id,
+                        ServerEvent::ProjectTaskUpdated { task: task.clone() },
+                    );
                 }
             }
             connection.reconcile_project_child_integrations(project_id)?;
@@ -126,13 +122,11 @@ impl InProcessBackend {
         let task = persistence
             .load_delegated_task(task.task_id)?
             .ok_or_else(|| LoomError::not_found("delegated task", task.task_id))?;
-        let sequence = self.journal()?.next();
-        self.journal()?.append_event(ServerEventEnvelope {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
-            sequence,
-            session_id: task.requester_session_id,
-            event: ServerEvent::ProjectTaskUpdated { task },
-        });
+        self.journal()?.append_server_event(
+            CURRENT_PROTOCOL_VERSION,
+            task.requester_session_id,
+            ServerEvent::ProjectTaskUpdated { task },
+        );
         Ok(())
     }
 
@@ -402,25 +396,21 @@ impl InProcessBackend {
             ));
         }
         let message = persistence.accept_agent_message(request_id, &draft)?;
-        let sequence = self.journal()?.next();
-        self.journal()?.append_event(ServerEventEnvelope {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
-            sequence,
-            session_id: draft.target_session_id,
-            event: ServerEvent::ProjectAgentMessageAccepted {
+        self.journal()?.append_server_event(
+            CURRENT_PROTOCOL_VERSION,
+            draft.target_session_id,
+            ServerEvent::ProjectAgentMessageAccepted {
                 message: message.clone(),
             },
-        });
+        );
         if !branch_route && draft.target_session_id != project.root_session_id {
-            let sequence = self.journal()?.next();
-            self.journal()?.append_event(ServerEventEnvelope {
-                protocol_version: CURRENT_PROTOCOL_VERSION,
-                sequence,
-                session_id: project.root_session_id,
-                event: ServerEvent::ProjectAgentMessageAccepted {
+            self.journal()?.append_server_event(
+                CURRENT_PROTOCOL_VERSION,
+                project.root_session_id,
+                ServerEvent::ProjectAgentMessageAccepted {
                     message: message.clone(),
                 },
-            });
+            );
         }
         Ok(ServerResponse::Project(
             ProjectResponse::ProjectAgentMessageAccepted(message),

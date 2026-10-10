@@ -533,15 +533,13 @@ impl InProcessConnection {
         worktree.error = None;
         worktree.updated_at = Timestamp::now();
         persistence.save_project_worktree(&worktree)?;
-        let sequence = self.backend.journal()?.next();
-        self.backend.journal()?.append_event(ServerEventEnvelope {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
-            sequence,
-            session_id: worktree.parent_session_id,
-            event: ServerEvent::ProjectChildWorktreeUpdated {
+        self.backend.journal()?.append_server_event(
+            CURRENT_PROTOCOL_VERSION,
+            worktree.parent_session_id,
+            ServerEvent::ProjectChildWorktreeUpdated {
                 worktree: worktree.clone(),
             },
-        });
+        );
         Ok(ServerResponse::Project(
             ProjectResponse::ProjectChildWorktreeUpdated(worktree),
         ))
@@ -559,15 +557,13 @@ impl InProcessConnection {
             )
         })?;
         persistence.save_project_worktree(worktree)?;
-        let sequence = self.backend.journal()?.next();
-        self.backend.journal()?.append_event(ServerEventEnvelope {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
-            sequence,
-            session_id: worktree.parent_session_id,
-            event: ServerEvent::ProjectChildWorktreeUpdated {
+        self.backend.journal()?.append_server_event(
+            CURRENT_PROTOCOL_VERSION,
+            worktree.parent_session_id,
+            ServerEvent::ProjectChildWorktreeUpdated {
                 worktree: worktree.clone(),
             },
-        });
+        );
         Ok(())
     }
 
