@@ -43,6 +43,10 @@ const MAX_INTERACTION_PROMPT_BYTES: usize = 65_536;
 /// How many times a single output-token truncation is resumed before the run
 /// gives up. Each resume costs a model turn, so keep it small.
 const MAX_OUTPUT_TRUNCATION_RETRIES: u32 = 3;
+/// How many consecutive tool calls whose argument payload could not be decoded
+/// are answered with a tool error before the run gives up. Each answered call
+/// costs a model turn to resend, so keep it small.
+const MAX_INVALID_TOOL_CALL_RETRIES: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentTask {
@@ -325,6 +329,10 @@ pub struct AgentRuntime {
     /// step that produces a tool call or a normal completion so the bound only
     /// applies to a single truncated turn.
     output_truncation_retries: u32,
+    /// Consecutive tool calls whose argument payload could not be decoded and
+    /// were answered with a tool error. Reset by a decodable tool call so the
+    /// bound only applies to a run of undecodable calls.
+    invalid_tool_call_retries: u32,
     control: RunControl,
     observer: Option<AgentEventObserver>,
     flush_offset: usize,
@@ -589,6 +597,99 @@ mod tests {
             sink.emit(ModelStreamEvent::Completed {
                 reason: loom_model::FinishReason::Length,
             })?;
+            Ok(())
+        }
+    }
+
+    /// The reason a provider reports when one tool call's argument payload could
+    /// not be decoded.
+    const UNDECODABLE_REASON: &str = "tool 'write_file' arguments are 27920 bytes and were not valid \
+         JSON: unexpected end of input (the payload looks truncated and was cut off)";
+
+    /// Emits one undecodable tool call, then completes normally.
+    struct UndecodableThenCompleteProvider {
+        descriptor: loom_model::ModelDescriptor,
+        cursor: usize,
+    }
+
+    impl ModelProvider for UndecodableThenCompleteProvider {
+        fn descriptor(&self) -> &loom_model::ModelDescriptor {
+            &self.descriptor
+        }
+
+        fn stream(
+            &mut self,
+            _request: &ModelRequest,
+            cancel: &CancellationToken,
+            sink: &mut dyn loom_model::ModelStreamSink,
+        ) -> Result<()> {
+            let events = if self.cursor == 0 {
+                vec![
+                    ModelStreamEvent::InvalidToolCall {
+                        name: "write_file".to_owned(),
+                        reason: UNDECODABLE_REASON.to_owned(),
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: loom_model::FinishReason::ToolCall,
+                    },
+                ]
+            } else {
+                vec![
+                    ModelStreamEvent::TextDelta {
+                        text: "The call was resent with valid arguments.".to_owned(),
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: loom_model::FinishReason::Stop,
+                    },
+                ]
+            };
+            self.cursor = self.cursor.saturating_add(1);
+            for event in events {
+                cancel.check()?;
+                if sink.emit(event)? == StreamFlow::Stop {
+                    break;
+                }
+            }
+            Ok(())
+        }
+
+        fn reset(&mut self) {
+            self.cursor = 0;
+        }
+    }
+
+    /// Emits an undecodable tool call on every turn.
+    struct AlwaysUndecodableProvider {
+        descriptor: loom_model::ModelDescriptor,
+        calls: Arc<Mutex<u8>>,
+    }
+
+    impl ModelProvider for AlwaysUndecodableProvider {
+        fn descriptor(&self) -> &loom_model::ModelDescriptor {
+            &self.descriptor
+        }
+
+        fn stream(
+            &mut self,
+            _request: &ModelRequest,
+            _cancel: &CancellationToken,
+            sink: &mut dyn loom_model::ModelStreamSink,
+        ) -> Result<()> {
+            *self.calls.lock().unwrap() += 1;
+            let events = [
+                ModelStreamEvent::InvalidToolCall {
+                    name: "write_file".to_owned(),
+                    reason: UNDECODABLE_REASON.to_owned(),
+                },
+                ModelStreamEvent::Completed {
+                    reason: loom_model::FinishReason::ToolCall,
+                },
+            ];
+            for event in events {
+                if sink.emit(event)? == StreamFlow::Stop {
+                    break;
+                }
+            }
             Ok(())
         }
     }
@@ -2271,6 +2372,82 @@ mod tests {
             summary.contains("output token limit"),
             "unexpected summary: {summary}"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn undecodable_tool_call_is_answered_in_turn_and_recovered() {
+        let root = workspace();
+        let descriptor = truncating_descriptor();
+        let mut runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            AgentTask::new("Resend an undecodable call", descriptor.id.clone()).unwrap(),
+            Box::new(UndecodableThenCompleteProvider {
+                descriptor,
+                cursor: 0,
+            }),
+            ToolExecutor::new(&root).unwrap(),
+        );
+
+        let events = runtime.start().unwrap();
+
+        assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+        let (name, output) = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolCallCompleted { result, .. } if !result.success => {
+                    Some((result.name.clone(), result.output.clone()))
+                }
+                _ => None,
+            })
+            .expect("the undecodable call must be answered with a failed tool result");
+        assert_eq!(name, "write_file");
+        assert!(
+            output.contains("write_file") && output.contains(UNDECODABLE_REASON),
+            "unexpected tool error: {output}"
+        );
+        assert!(runtime.export_state().messages.iter().any(|message| {
+            message.role == MessageRole::Tool
+                && message.tool_call_id.is_some()
+                && message.content == output
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_undecodable_calls_fail_and_stay_retryable() {
+        let root = workspace();
+        let calls = Arc::new(Mutex::new(0));
+        let descriptor = truncating_descriptor();
+        let mut runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            AgentTask::new("Never decode a tool call", descriptor.id.clone()).unwrap(),
+            Box::new(AlwaysUndecodableProvider {
+                descriptor,
+                calls: Arc::clone(&calls),
+            }),
+            ToolExecutor::new(&root).unwrap(),
+        );
+
+        runtime.start().unwrap();
+
+        assert_eq!(runtime.snapshot().state, AgentRunState::Failed);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            u8::try_from(MAX_INVALID_TOOL_CALL_RETRIES + 1).unwrap()
+        );
+        let summary = runtime.snapshot().summary.unwrap_or_default();
+        assert!(
+            summary.contains("write_file"),
+            "unexpected summary: {summary}"
+        );
+        assert!(
+            summary.contains("27920 bytes"),
+            "unexpected summary: {summary}"
+        );
+        runtime
+            .retry_entry()
+            .expect("a failed undecodable call must remain retryable");
         fs::remove_dir_all(root).unwrap();
     }
 

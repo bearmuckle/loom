@@ -48,7 +48,8 @@ impl TaskMeasurement {
 
 /// The scripted tasks used by the quality gate. Each fixture is a small but
 /// representative slice of real work: exploration, a mutating edit followed by
-/// validation, and a failed tool call that the agent must recover from.
+/// validation, a failed tool call that the agent must recover from, and a tool
+/// call whose arguments could not be decoded that the agent must resend.
 fn fixtures() -> Vec<(&'static str, Vec<Vec<ModelStreamEvent>>)> {
     let tool_call = |name: &str, arguments: serde_json::Value| ModelStreamEvent::ToolCallDelta {
         call: ToolCall {
@@ -134,6 +135,34 @@ fn fixtures() -> Vec<(&'static str, Vec<Vec<ModelStreamEvent>>)> {
                     tool_turn(),
                 ],
                 vec![text("The file is now created.\n"), stop_turn()],
+            ],
+        ),
+        (
+            "recover_from_undecodable_call",
+            vec![
+                vec![
+                    text("I'll create the file.\n"),
+                    ModelStreamEvent::InvalidToolCall {
+                        name: "apply_patch".to_owned(),
+                        reason: "tool 'apply_patch' arguments are 27920 bytes and were not valid \
+                                 JSON: unexpected end of input (the payload looks truncated and \
+                                 was cut off)"
+                            .to_owned(),
+                    },
+                    tool_call(
+                        "apply_patch",
+                        serde_json::json!({
+                            "path": "undecodable.txt",
+                            "old_text": "",
+                            "new_text": "recovered\n",
+                        }),
+                    ),
+                    tool_turn(),
+                ],
+                vec![
+                    text("The file was created after resending the call.\n"),
+                    stop_turn(),
+                ],
             ],
         ),
     ]
