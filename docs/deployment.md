@@ -148,6 +148,32 @@ docker run -d --name loom-server --restart unless-stopped \
   ghcr.io/<owner>/loom-server:<tag> --token-file /run/secrets/loom-token
 ```
 
+## Archived sessions and retention
+
+Archived sessions stay in durable state until they are deleted. Deleting an
+archived session removes its database rows, its filesystem root, and its linked
+worktrees; deleting an archived project root removes every descendant session of
+that project in one operation. A linked worktree with changes or a lock refuses
+deletion unless the caller forces it. The clone cache beside the session roots
+is shared and is never deleted with a session.
+
+`--archive-retention <duration>`, or `LOOM_ARCHIVE_RETENTION`, automatically
+deletes archived projects once they are older than the duration, measured from
+the archive time. It is disabled by default, so an absent or zero value never
+auto-deletes. A duration is `<n><unit>` with unit `ms`, `s`, `m`, `h`, `d`, or
+`w`; a bare integer means seconds, and `off` and `never` mean disabled:
+
+```sh
+./loom-server --bind 127.0.0.1:8765 --archive-retention 14d
+```
+
+The sweep runs at startup and every 15 minutes. It only considers a fully
+archived project tree: a descendant that is not archived or a child task that is
+not terminal skips the project. `--archive-retention-force-discard`, or
+`LOOM_ARCHIVE_RETENTION_FORCE_DISCARD` (default off), lets the sweep discard
+dirty or locked worktrees; without it, the sweep skips such a project, logs the
+reason, and retries later.
+
 ## Network policy
 
 The intended egress for the backend account is DNS, the configured model
