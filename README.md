@@ -141,6 +141,14 @@ pins one directory for a host-aliased bind, so `0.0.0.0:8765` and
 A bind port of 0 has no stable identity: the backend stays in memory and the
 default token file falls back to `<state-dir>/token`.
 
+Archived sessions stay in that durable state until they are deleted. Deleting
+an archived session removes its database rows, its filesystem root, and its
+linked worktrees; deleting an archived project root removes every descendant
+session of that project in one operation. A linked worktree with changes or a
+lock refuses the deletion unless the caller asks for it to be forced. The
+node-level clone cache beside the session roots is shared and is never deleted
+with a session.
+
 Without `--token` or `--token-file` the server reads `<instance-dir>/token` and,
 when that file is missing or empty, generates a `loom-<uuid>` token there. The
 file is written atomically with mode `0600`. The path is always logged, a
@@ -158,6 +166,23 @@ on the command line, where other local users could read it through `/proc`.
 `--reset-state` wipes an incompatible state database instead of refusing to
 start; an instance with no durable database has nothing to reset and rejects
 the flag.
+
+`--archive-retention <duration>`, or `LOOM_ARCHIVE_RETENTION`, deletes archived
+projects automatically once they are older than the duration, measured from
+the archive time. Retention is disabled by default, so an absent or zero value
+never auto-deletes. A duration is `<n><unit>` with unit `ms`, `s`, `m`, `h`,
+`d`, or `w`; a bare integer means seconds, and `off` and `never` mean disabled:
+
+```sh
+./loom-server --bind 127.0.0.1:8765 --archive-retention 14d
+```
+
+The sweep runs at startup and periodically. It only considers a fully archived
+project tree: a descendant that is not archived or a child task that is not
+terminal skips the project. `--archive-retention-force-discard`, or
+`LOOM_ARCHIVE_RETENTION_FORCE_DISCARD` (default off), lets the sweep discard
+dirty or locked worktrees; without it, the sweep skips such a project, logs
+the reason, and retries later.
 
 The unauthenticated `GET /health` endpoint answers `ok`. A bind address that is
 not loopback is refused unless the listener serves TLS or the operator opts in
