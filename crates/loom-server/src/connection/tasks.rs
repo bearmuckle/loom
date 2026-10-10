@@ -58,13 +58,11 @@ impl InProcessConnection {
             *task = persistence
                 .load_delegated_task(task.task_id)?
                 .ok_or_else(|| LoomError::not_found("delegated task", task.task_id))?;
-            let sequence = self.backend.journal()?.next();
-            self.backend.journal()?.append_event(ServerEventEnvelope {
-                protocol_version: CURRENT_PROTOCOL_VERSION,
-                sequence,
-                session_id: task.requester_session_id,
-                event: ServerEvent::ProjectTaskUpdated { task: task.clone() },
-            });
+            self.backend.journal()?.append_server_event(
+                CURRENT_PROTOCOL_VERSION,
+                task.requester_session_id,
+                ServerEvent::ProjectTaskUpdated { task: task.clone() },
+            );
         }
         Ok(())
     }
@@ -153,13 +151,11 @@ impl InProcessConnection {
                 *task = persistence
                     .load_delegated_task(task.task_id)?
                     .ok_or_else(|| LoomError::not_found("delegated task", task.task_id))?;
-                let sequence = self.backend.journal()?.next();
-                self.backend.journal()?.append_event(ServerEventEnvelope {
-                    protocol_version: CURRENT_PROTOCOL_VERSION,
-                    sequence,
-                    session_id: task.requester_session_id,
-                    event: ServerEvent::ProjectTaskUpdated { task: task.clone() },
-                });
+                self.backend.journal()?.append_server_event(
+                    CURRENT_PROTOCOL_VERSION,
+                    task.requester_session_id,
+                    ServerEvent::ProjectTaskUpdated { task: task.clone() },
+                );
             }
             return Ok(());
         }
@@ -267,13 +263,11 @@ impl InProcessConnection {
         *task = persistence
             .load_delegated_task(task.task_id)?
             .ok_or_else(|| LoomError::not_found("delegated task", task.task_id))?;
-        let sequence = self.backend.journal()?.next();
-        self.backend.journal()?.append_event(ServerEventEnvelope {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
-            sequence,
-            session_id: task.requester_session_id,
-            event: ServerEvent::ProjectTaskUpdated { task: task.clone() },
-        });
+        self.backend.journal()?.append_server_event(
+            CURRENT_PROTOCOL_VERSION,
+            task.requester_session_id,
+            ServerEvent::ProjectTaskUpdated { task: task.clone() },
+        );
 
         let result = self.start_run_with_options(StartRunInput {
             session_id: task.target_session_id,
@@ -311,13 +305,11 @@ impl InProcessConnection {
                 *task = persistence
                     .load_delegated_task(task.task_id)?
                     .ok_or_else(|| LoomError::not_found("delegated task", task.task_id))?;
-                let sequence = self.backend.journal()?.next();
-                self.backend.journal()?.append_event(ServerEventEnvelope {
-                    protocol_version: CURRENT_PROTOCOL_VERSION,
-                    sequence,
-                    session_id: task.requester_session_id,
-                    event: ServerEvent::ProjectTaskUpdated { task: task.clone() },
-                });
+                self.backend.journal()?.append_server_event(
+                    CURRENT_PROTOCOL_VERSION,
+                    task.requester_session_id,
+                    ServerEvent::ProjectTaskUpdated { task: task.clone() },
+                );
                 Ok(())
             }
         }

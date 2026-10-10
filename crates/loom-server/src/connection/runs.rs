@@ -724,13 +724,11 @@ impl InProcessConnection {
             )?
             && let Some(updated_task) = persistence.load_delegated_task(task.task_id)?
         {
-            let sequence = self.backend.journal()?.next();
-            self.backend.journal()?.append_event(ServerEventEnvelope {
-                protocol_version: CURRENT_PROTOCOL_VERSION,
-                sequence,
-                session_id: task.requester_session_id,
-                event: ServerEvent::ProjectTaskUpdated { task: updated_task },
-            });
+            self.backend.journal()?.append_server_event(
+                CURRENT_PROTOCOL_VERSION,
+                task.requester_session_id,
+                ServerEvent::ProjectTaskUpdated { task: updated_task },
+            );
         }
         Ok(response)
     }
@@ -897,13 +895,11 @@ impl InProcessConnection {
         let Some(updated_task) = persistence.load_delegated_task(task.task_id)? else {
             return Ok(());
         };
-        let sequence = self.backend.journal()?.next();
-        self.backend.journal()?.append_event(ServerEventEnvelope {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
-            sequence,
-            session_id: updated_task.requester_session_id,
-            event: ServerEvent::ProjectTaskUpdated { task: updated_task },
-        });
+        self.backend.journal()?.append_server_event(
+            CURRENT_PROTOCOL_VERSION,
+            updated_task.requester_session_id,
+            ServerEvent::ProjectTaskUpdated { task: updated_task },
+        );
         Ok(())
     }
 

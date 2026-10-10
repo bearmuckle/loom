@@ -651,7 +651,9 @@ pub(crate) fn save_feed_rows_with_limits_and_pruning(
         if sequence <= previous || sequence > next_sequence {
             return Err(LoomError::new(
                 ErrorCode::MalformedPayload,
-                "event feed sequences are invalid",
+                format!(
+                    "event feed sequences are invalid: sequence {sequence} after {previous} with cursor {next_sequence}"
+                ),
                 false,
             ));
         }
@@ -758,7 +760,9 @@ pub(crate) fn save_feed_rows_with_limits_and_pruning(
         if sequence <= previous_workspace || sequence > next_sequence {
             return Err(LoomError::new(
                 ErrorCode::MalformedPayload,
-                "workspace event feed sequences are invalid",
+                format!(
+                    "workspace event feed sequences are invalid: sequence {sequence} after {previous_workspace} with cursor {next_sequence}"
+                ),
                 false,
             ));
         }

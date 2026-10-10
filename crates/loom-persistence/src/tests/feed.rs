@@ -1017,6 +1017,62 @@ fn workspace_reconnect_feed_is_isolated_indexed_and_tracks_pruning() {
 }
 
 #[test]
+fn feed_save_diagnostics_name_the_offending_sequence() {
+    let path = std::env::temp_dir().join(format!("loom-feed-diagnostics-{}.db", Uuid::new_v4()));
+    let store = FilePersistence::open(&path).unwrap();
+    let mut manager = SessionManager::default();
+    let (snapshot, _) = manager
+        .create_in_workspace(WorkspaceId::new(), "Feed diagnostics")
+        .unwrap();
+    let sessions = manager.export_state();
+
+    let session_feed = DurableFeedState {
+        next_sequence: EventSequence::new(1),
+        retention_limit: 100,
+        events: vec![ServerEventEnvelope {
+            protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
+            sequence: EventSequence::new(2),
+            session_id: snapshot.id,
+            event: loom_model::ServerEvent::AgentSessionArchived {
+                session_id: snapshot.id,
+            },
+        }],
+        workspace_events: Vec::new(),
+    };
+    let error = store
+        .save_state_with_sessions_and_feed(&sessions, Some(&session_feed))
+        .unwrap_err();
+    assert_eq!(
+        error.message,
+        "event feed sequences are invalid: sequence 2 after 0 with cursor 1"
+    );
+
+    let workspace_feed = DurableFeedState {
+        next_sequence: EventSequence::new(1),
+        retention_limit: 100,
+        events: Vec::new(),
+        workspace_events: vec![WorkspaceEventEnvelope {
+            protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
+            sequence: EventSequence::new(2),
+            workspace_id: snapshot.workspace_id,
+            event: loom_model::WorkspaceEvent::Renamed {
+                name: "diagnostic".to_owned(),
+            },
+        }],
+    };
+    let error = store
+        .save_state_with_sessions_and_feed(&sessions, Some(&workspace_feed))
+        .unwrap_err();
+    assert_eq!(
+        error.message,
+        "workspace event feed sequences are invalid: sequence 2 after 0 with cursor 1"
+    );
+
+    drop(store);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn session_and_workspace_feed_share_the_global_payload_budget() {
     let path = std::env::temp_dir().join(format!("loom-mixed-feed-{}.db", Uuid::new_v4()));
     let store = FilePersistence::open(&path).unwrap();

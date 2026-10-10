@@ -511,24 +511,20 @@ impl InProcessConnection {
             self.ensure_project_worktree_ready(&mut worktree)?;
         }
         if was_created {
-            let sequence = self.backend.journal()?.next();
-            self.backend.journal()?.append_event(ServerEventEnvelope {
-                protocol_version: CURRENT_PROTOCOL_VERSION,
-                sequence,
-                session_id: parent_session_id,
-                event: ServerEvent::ProjectAgentCreated {
+            self.backend.journal()?.append_server_event(
+                CURRENT_PROTOCOL_VERSION,
+                parent_session_id,
+                ServerEvent::ProjectAgentCreated {
                     agent: child.clone(),
                 },
-            });
-            let sequence = self.backend.journal()?.next();
-            self.backend.journal()?.append_event(ServerEventEnvelope {
-                protocol_version: CURRENT_PROTOCOL_VERSION,
-                sequence,
-                session_id: parent_session_id,
-                event: ServerEvent::ProjectTaskUpdated {
+            );
+            self.backend.journal()?.append_server_event(
+                CURRENT_PROTOCOL_VERSION,
+                parent_session_id,
+                ServerEvent::ProjectTaskUpdated {
                     task: persisted_task.clone(),
                 },
-            });
+            );
         }
         drop(state_persist_guard);
         drop(admission_guard);

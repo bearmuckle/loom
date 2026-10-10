@@ -53,7 +53,30 @@ impl EventJournal {
         self.next_sequence
     }
 
-    pub(crate) fn append_event(&mut self, event: ServerEventEnvelope) {
+    /// Appends a server event with a newly allocated global sequence.
+    ///
+    /// The sequence is allocated and the envelope pushed while the caller holds
+    /// the journal lock, so concurrent appenders cannot interleave a lower
+    /// sequence after a higher one. Splitting allocation (`next`) from insertion
+    /// (`append_event`) across two lock acquisitions would allow that, and the
+    /// persistence layer rejects a non-monotonic pending feed.
+    pub(crate) fn append_server_event(
+        &mut self,
+        protocol_version: loom_core::ProtocolVersion,
+        session_id: AgentSessionId,
+        event: loom_protocol::ServerEvent,
+    ) -> EventSequence {
+        let sequence = self.next();
+        self.append_event(ServerEventEnvelope {
+            protocol_version,
+            sequence,
+            session_id,
+            event,
+        });
+        sequence
+    }
+
+    fn append_event(&mut self, event: ServerEventEnvelope) {
         self.events.push(event.clone());
         self.pending_events.push(event);
         Self::prune_events(&mut self.events, self.retention_limit);
