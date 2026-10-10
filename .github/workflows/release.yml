@@ -238,10 +238,15 @@ jobs:
           set -euo pipefail
           deb="$(find dist -name '*.deb' -print -quit)"
           dpkg-deb --info "$deb"
+          # Read the archive listing once and match against it. Piping
+          # `dpkg-deb --contents` into `grep -q` lets grep exit on the first
+          # match, which closes the pipe and kills tar with SIGPIPE; under
+          # `pipefail` that reports a present file as missing.
+          contents="$(dpkg-deb --contents "$deb")"
           for asset in usr/bin/loom-ui \
             usr/share/applications/loom-ui.desktop \
             usr/share/icons/hicolor/512x512/apps/loom-ui.png; do
-            dpkg-deb --contents "$deb" | grep -q "$asset" \
+            grep -Fq "$asset" <<<"$contents" \
               || { echo "$deb is missing $asset" >&2; exit 1; }
           done
       - uses: actions/upload-artifact@v4
