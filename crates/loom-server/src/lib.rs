@@ -85,6 +85,7 @@ mod instance;
 mod project_tools;
 mod remote;
 mod resource_monitor;
+mod retention;
 mod run_executor;
 mod run_handle;
 mod services;
@@ -133,6 +134,12 @@ pub use instance::{
 pub use remote::{
     RemoteServer, RemoteServerConfig, RunningRemoteServer, ServerTlsConfig,
     WEBSOCKET_TLS_SUPPORTED, WebSocketConnection, WebSocketTransport,
+};
+pub use retention::{
+    ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FLAG, ARCHIVE_RETENTION_FORCE_DISCARD_ENV,
+    ARCHIVE_RETENTION_FORCE_DISCARD_FLAG, ARCHIVE_RETENTION_SWEEP_INTERVAL, ArchiveSweepReport,
+    ArchiveSweepSkip, parse_force_discard, parse_retention_window, resolve_archive_retention,
+    run_archive_retention_sweeps, sweep_archive_retention_at_startup,
 };
 
 const DEFAULT_EVENT_RETENTION: usize = 4096;
@@ -317,6 +324,9 @@ pub struct InProcessBackend {
     request_lifecycle: RwLock<u8>,
     persistence_failed: AtomicBool,
     state_persist_gate: Mutex<()>,
+    /// Serializes session deletion with the retention sweep, so no caller ever
+    /// observes a partially deleted session.
+    archive_gate: Mutex<()>,
     #[cfg(test)]
     fail_next_state_save: AtomicBool,
     #[cfg(test)]

@@ -306,6 +306,7 @@ impl InProcessBackend {
             request_lifecycle: RwLock::new(0),
             persistence_failed: AtomicBool::new(false),
             state_persist_gate: Mutex::new(()),
+            archive_gate: Mutex::new(()),
             #[cfg(test)]
             fail_next_state_save: AtomicBool::new(false),
             #[cfg(test)]

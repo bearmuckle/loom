@@ -177,9 +177,9 @@ never auto-deletes. A duration is `<n><unit>` with unit `ms`, `s`, `m`, `h`,
 ./loom-server --bind 127.0.0.1:8765 --archive-retention 14d
 ```
 
-The sweep runs at startup and periodically. It only considers a fully archived
-project tree: a descendant that is not archived or a child task that is not
-terminal skips the project. `--archive-retention-force-discard`, or
+The sweep runs at startup and every 15 minutes while the server runs. It only
+considers a fully archived project tree: a descendant that is not archived or a
+child task that is not terminal skips the project. `--archive-retention-force-discard`, or
 `LOOM_ARCHIVE_RETENTION_FORCE_DISCARD` (default off), lets the sweep discard
 dirty or locked worktrees; without it, the sweep skips such a project, logs
 the reason, and retries later.
