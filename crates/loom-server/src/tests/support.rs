@@ -391,6 +391,27 @@ pub(super) fn integrated_worktree(fixture: &ProjectCodeChildFixture) -> ProjectW
         .expect("child worktree should be durable")
 }
 
+/// Builds the server-owned completion guard a manager consults before reporting
+/// completion, with every project capability disabled so tests exercise only
+/// the blocker evaluation.
+pub(super) fn project_completion_guard(fixture: &ProjectCodeChildFixture) -> ProjectAgentTools {
+    ProjectAgentTools {
+        backend: Arc::downgrade(&fixture.backend),
+        session_id: fixture.root_id,
+        project_id: fixture.project_id,
+        model_id: ModelId::new("deterministic/demo"),
+        can_delegate: false,
+        can_delegate_code: false,
+        can_message: false,
+        can_branch_message: false,
+        can_inspect_children: false,
+        can_wait_children: false,
+        can_control_children: false,
+        can_review_children: false,
+        can_integrate_children: false,
+    }
+}
+
 pub(super) fn dependency_failure_blocks_child_and_releases_manager_wait_once(
     prerequisite_fails: bool,
 ) {
