@@ -762,11 +762,20 @@ mod tests {
         let error = prepare_instance(&empty, &state).unwrap_err();
         assert!(error.message.contains("must not be empty"), "{error}");
 
-        let missing = serve_options(&["--token-file", "/nonexistent/loom/token"]);
+        // An operator-named token file is never created for: a missing file is
+        // reported as unreadable, and its directory is left to the deployment,
+        // which may not even be writable by the user running the server.
+        let deployment = state.join("deployment");
+        let named_token = deployment.join("token");
+        let missing = serve_options(&["--token-file", named_token.to_str().unwrap()]);
         let error = prepare_instance(&missing, &state).unwrap_err();
         assert!(
             error.message.contains("could not read token file"),
             "{error}"
+        );
+        assert!(
+            !deployment.exists(),
+            "an operator-named token directory must not be created"
         );
         std::fs::remove_dir_all(&state).ok();
     }

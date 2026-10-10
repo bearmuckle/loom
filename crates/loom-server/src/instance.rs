@@ -110,9 +110,15 @@ impl InstanceLayout {
         &self.token_file
     }
 
-    /// Creates the owner-only directories this instance writes into. The
-    /// instance directory holds transcripts, session roots, cached clones, and
-    /// credential references, so it is created with mode `0700`.
+    /// Creates the owner-only directories this instance owns below the state
+    /// directory: the instance directory when the default database uses it, and
+    /// the parent of the default token file. Both hold transcripts, session
+    /// roots, cached clones, and credential references, so they are created with
+    /// mode `0700`.
+    ///
+    /// A path the operator named with `--token-file` is deliberately left alone.
+    /// Its directory belongs to the deployment, so Loom neither creates nor
+    /// tightens it; a missing file is reported as an unreadable token instead.
     pub fn prepare_directories(&self, options: &InstanceOptions) -> Result<(), LoomError> {
         let default_database_directory = match (&options.persistence, &self.directory) {
             (None, Some(directory)) => Some(directory.clone()),
@@ -121,7 +127,7 @@ impl InstanceLayout {
         if let Some(directory) = default_database_directory.as_deref() {
             create_private_directory(directory)?;
         }
-        if options.token.is_none() {
+        if options.token.is_none() && options.token_file.is_none() {
             let parent = self.token_file.parent().ok_or_else(|| {
                 LoomError::invalid_request(format!(
                     "token file '{}' must have a parent directory",
@@ -577,6 +583,35 @@ mod tests {
         // file when the operator passed --token.
         assert_ne!(instance.state_db(), None);
         assert!(!state.join("127.0.0.1_8765").join("token").exists());
+        fs::remove_dir_all(&state).unwrap();
+    }
+
+    #[test]
+    fn an_operator_named_token_file_is_never_created_for() {
+        let state = temporary_directory("named-token");
+        let token_file = state.join("deployment").join("token");
+        let mut options = options("127.0.0.1:8765");
+        options.token_file = Some(token_file.clone());
+        let layout = InstanceLayout::resolve(&options, &state).unwrap();
+
+        // Only Loom's own instance directory is created. The directory of a
+        // file the operator named belongs to the deployment, so a missing token
+        // is reported as unreadable instead of being created here, which would
+        // also have to work when the deployment directory is not writable.
+        layout.prepare_directories(&options).unwrap();
+        assert_eq!(
+            layout.directory(),
+            Some(state.join("127.0.0.1_8765").as_path())
+        );
+        assert!(
+            !token_file.parent().unwrap().exists(),
+            "an operator-named token directory must not be created"
+        );
+        let error = resolve_token(&options, layout.token_file()).unwrap_err();
+        assert!(
+            error.message.contains("could not read token file"),
+            "{error}"
+        );
         fs::remove_dir_all(&state).unwrap();
     }
 
