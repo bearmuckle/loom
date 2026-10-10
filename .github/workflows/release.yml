@@ -270,7 +270,7 @@ jobs:
       - name: Generate a CycloneDX SBOM from Cargo.lock
         run: |
           mkdir -p dist
-          cargo sbom --output-format cyclonedx-json > "dist/loom-$GITHUB_REF_NAME.cdx.json"
+          cargo sbom --output-format cyclone_dx_json_1_6 > "dist/loom-$GITHUB_REF_NAME.cdx.json"
       - uses: actions/upload-artifact@v4
         with:
           name: release-sbom
