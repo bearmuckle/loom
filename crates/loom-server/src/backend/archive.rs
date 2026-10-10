@@ -445,16 +445,22 @@ fn retention_blocker_for_session(
             session.id, session.state
         )));
     }
-    if let Some(age) = now.checked_sub(session.updated_at.as_unix_millis()) {
-        if age >= window_ms {
-            return None;
-        }
+    // An archive time ahead of the current clock (a stepped clock, a restored
+    // snapshot) is not provably older than the window, so the session waits for
+    // a later sweep instead of being discarded as soon as it is seen.
+    let Some(age) = now.checked_sub(session.updated_at.as_unix_millis()) else {
         return Some(RetentionBlocker::inside_window(format!(
-            "session {} was archived {age} ms ago, inside the {window_ms} ms retention window",
+            "session {} has an archive time ahead of the current clock",
             session.id
         )));
+    };
+    if age >= window_ms {
+        return None;
     }
-    None
+    Some(RetentionBlocker::inside_window(format!(
+        "session {} was archived {age} ms ago, inside the {window_ms} ms retention window",
+        session.id
+    )))
 }
 
 /// Whether a delegated task has finished, so a project holding it may be
@@ -466,4 +472,54 @@ fn delegated_task_is_terminal(status: loom_core::DelegatedTaskStatus) -> bool {
             | loom_core::DelegatedTaskStatus::Failed
             | loom_core::DelegatedTaskStatus::Cancelled
     )
+}
+
+#[cfg(test)]
+mod retention_eligibility_tests {
+    use super::*;
+
+    fn archived_session(archived_at: u64) -> AgentSessionSnapshot {
+        AgentSessionSnapshot {
+            id: AgentSessionId::new(),
+            workspace_id: WorkspaceId::new(),
+            name: "Archived".to_owned(),
+            state: AgentSessionState::Archived,
+            created_at: Timestamp::from_unix_millis(archived_at),
+            updated_at: Timestamp::from_unix_millis(archived_at),
+        }
+    }
+
+    #[test]
+    fn only_an_archived_session_past_the_window_is_eligible() {
+        let now = 1_700_000_000_000u64;
+        let window_ms = 86_400_000u64;
+
+        let expired = archived_session(now - window_ms);
+        assert!(retention_blocker_for_session(&expired, now, window_ms).is_none());
+
+        let inside = archived_session(now - window_ms + 1);
+        let blocker = retention_blocker_for_session(&inside, now, window_ms)
+            .expect("a session inside the window waits");
+        assert!(blocker.reason.contains("inside the"));
+        assert!(!blocker.warning, "waiting out the window is routine");
+
+        let active = AgentSessionSnapshot {
+            state: AgentSessionState::Idle,
+            ..archived_session(now)
+        };
+        let blocker = retention_blocker_for_session(&active, now, window_ms)
+            .expect("a session that is not archived is never eligible");
+        assert!(blocker.warning);
+    }
+
+    #[test]
+    fn an_archive_time_ahead_of_the_clock_waits_instead_of_deleting() {
+        let now = 1_700_000_000_000u64;
+        let ahead = archived_session(now + 1_000);
+
+        let blocker = retention_blocker_for_session(&ahead, now, 1)
+            .expect("a future archive time is not provably older than the window");
+        assert!(blocker.reason.contains("ahead of the current clock"));
+        assert!(!blocker.warning);
+    }
 }
