@@ -78,6 +78,7 @@ use backend::{
     WorkspaceService,
 };
 mod connection;
+mod deployment;
 mod dispatch;
 mod event_journal;
 mod instance;
@@ -121,6 +122,10 @@ struct GitHubApiUser {
 }
 
 pub use auth::{AuthSession, AuthTokenStore, AuthorizationScope, IssuedToken};
+pub use deployment::{
+    DEFAULT_DEPLOYMENT_ROLE, DEPLOYMENT_ROLE_ENV, DiagnosticsSettings, EGRESS_POLICY,
+    ExecutionContext, ProcessAccount, ProcessContext, TlsState, diagnostics_lines, startup_summary,
+};
 pub use instance::{
     Instance, InstanceLayout, InstanceOptions, ResolvedToken, STATE_DB_FILE, TOKEN_FILE,
     TokenSource,

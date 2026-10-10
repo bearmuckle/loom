@@ -17,8 +17,9 @@ use std::{
 
 use loom_core::{ErrorCode, LoomError};
 use loom_server::{
-    AuthTokenStore, AuthorizationScope, InProcessBackend, Instance, InstanceOptions, RemoteServer,
-    RemoteServerConfig, RunningRemoteServer, ServerTlsConfig,
+    AuthTokenStore, AuthorizationScope, DiagnosticsSettings, InProcessBackend, Instance,
+    InstanceLayout, InstanceOptions, ProcessContext, RemoteServer, RemoteServerConfig,
+    RunningRemoteServer, ServerTlsConfig, TlsState, diagnostics_lines, startup_summary,
 };
 
 /// The bind address used when `--bind` is not supplied.
@@ -50,6 +51,8 @@ enum ParsedArgs {
     Help,
     /// `--version`/`-V`: print the version and exit successfully.
     Version,
+    /// `--diagnostics`: print the resolved deployment context and exit.
+    Diagnostics(ServerOptions),
     /// Serve the standalone backend.
     Serve(ServerOptions),
 }
@@ -109,6 +112,10 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), LoomError> {
             println!("{}", version_text());
             Ok(())
         }
+        ParsedArgs::Diagnostics(options) => {
+            println!("{}", diagnostics_report(&options)?);
+            Ok(())
+        }
         ParsedArgs::Serve(options) => serve_blocking(options),
     }
 }
@@ -117,6 +124,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), LoomError> {
 /// accepted; `--help` and `--version` short-circuit the remaining arguments.
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, LoomError> {
     let mut options = ServerOptions::default();
+    let mut diagnostics = false;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--bind" => options.bind = parse_bind(required_value(&mut args, "--bind")?)?,
@@ -133,6 +141,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
                     Some(PathBuf::from(required_value(&mut args, "--persistence")?));
             }
             "--reset-state" => options.reset_state = true,
+            "--diagnostics" => diagnostics = true,
             "--tls-cert" => {
                 options.tls_cert = Some(PathBuf::from(required_value(&mut args, "--tls-cert")?));
             }
@@ -170,7 +179,11 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
             }
         }
     }
-    Ok(ParsedArgs::Serve(options))
+    Ok(if diagnostics {
+        ParsedArgs::Diagnostics(options)
+    } else {
+        ParsedArgs::Serve(options)
+    })
 }
 
 fn required_value(
@@ -210,7 +223,7 @@ fn help_text() -> String {
         "Usage: loom-server [--bind <addr>] [--instance-name <name>] \
          [--token <token> | --token-file <path>] [--persistence <path>] \
          [--reset-state] [--tls-cert <pem> --tls-key <pem>] \
-         [--allow-insecure-remote]\n\
+         [--allow-insecure-remote] [--diagnostics]\n\
          \n\
          A standalone Loom backend that serves the remote WebSocket protocol.\n\
          \n\
@@ -227,6 +240,7 @@ fn help_text() -> String {
          \x20 --tls-key <pem>       PEM private key matching --tls-cert\n\
          \x20 --allow-insecure-remote\n\
          \x20                        allow a plaintext ws:// bind beyond loopback\n\
+         \x20 --diagnostics         print the resolved deployment context and exit\n\
          \x20 -h, --help            print this help and exit\n\
          \x20 -V, --version         print the version and exit\n\
          \n\
@@ -242,8 +256,51 @@ fn help_text() -> String {
          when stdout is a terminal.\n\
          \n\
          A bind address that is not loopback needs TLS; --allow-insecure-remote accepts \
-         the risk of sending the bearer token and all traffic in plaintext instead."
+         the risk of sending the bearer token and all traffic in plaintext instead.\n\
+         \n\
+         --diagnostics prints where agent commands would execute, as which account, which \
+         state a start would use, and the intended egress policy, without printing the \
+         token value."
     )
+}
+
+/// The deployment diagnostics report for `options`, resolved against the state
+/// directory [`loom_core::state_dir`] returns.
+fn diagnostics_report(options: &ServerOptions) -> Result<String, LoomError> {
+    diagnostics_report_in(options, &loom_core::state_dir())
+}
+
+/// [`diagnostics_report`] with the state directory injected, so a test can
+/// describe a deployment without writing into the operator's state directory.
+fn diagnostics_report_in(
+    options: &ServerOptions,
+    state_directory: &Path,
+) -> Result<String, LoomError> {
+    let instance_options = options.instance_options();
+    // Resolving the layout is the whole report: it creates no directory, opens no
+    // database, and never generates a token, so running it against a live
+    // deployment changes nothing.
+    let layout = InstanceLayout::resolve(&instance_options, state_directory)?;
+    let settings = diagnostics_settings(options, &instance_options, &layout, state_directory);
+    Ok(diagnostics_lines(&ProcessContext::detect(), &settings).join("\n"))
+}
+
+/// The facts both the diagnostics report and the startup log line describe.
+fn diagnostics_settings<'a>(
+    options: &ServerOptions,
+    instance_options: &'a InstanceOptions,
+    layout: &'a InstanceLayout,
+    state_directory: &Path,
+) -> DiagnosticsSettings<'a> {
+    DiagnosticsSettings {
+        version: version_text(),
+        options: instance_options,
+        layout,
+        state_root: loom_core::state_root(),
+        state_directory: state_directory.to_path_buf(),
+        tls: TlsState::from_flags(options.tls_cert.is_some(), options.tls_key.is_some()),
+        allow_insecure_remote: options.allow_insecure_remote,
+    }
 }
 
 /// The line printed by `--version`: the release version plus the revision when
@@ -401,6 +458,14 @@ async fn serve_in(
     shutdown: impl Future<Output = Result<(), LoomError>>,
 ) -> Result<(), LoomError> {
     let instance = prepare_instance(&options, state_directory)?;
+    let instance_options = options.instance_options();
+    let settings = diagnostics_settings(
+        &options,
+        &instance_options,
+        instance.layout(),
+        state_directory,
+    );
+    log::info!("{}", startup_summary(&ProcessContext::detect(), &settings));
     let backend = build_backend(instance.state_db())?;
     let server = start(&options, backend, &instance).await?;
     shutdown.await?;
@@ -473,8 +538,9 @@ mod tests {
     use loom_server::{InProcessBackend, Instance, TokenSource};
 
     use super::{
-        ParsedArgs, ServerOptions, bind_exposure_warning, build_version, help_text, parse_args,
-        prepare_instance, resolve_tls, run, serve_in, start, version_label, version_text,
+        ParsedArgs, ServerOptions, bind_exposure_warning, build_version, diagnostics_report_in,
+        help_text, parse_args, prepare_instance, resolve_tls, run, serve_in, start, version_label,
+        version_text,
     };
 
     fn arguments<'a>(values: &'a [&str]) -> impl Iterator<Item = String> + 'a {
@@ -631,10 +697,82 @@ mod tests {
         assert!(help.contains("--tls-cert <pem>"));
         assert!(help.contains("--tls-key <pem>"));
         assert!(help.contains("--allow-insecure-remote"));
+        assert!(help.contains("--diagnostics"));
         assert!(help.contains("127.0.0.1:8765"));
         assert!(version_text().starts_with("loom-server "));
         assert!(version_text().contains(build_version()));
         assert!(!build_version().is_empty());
+    }
+
+    #[test]
+    fn diagnostics_mode_prints_the_resolved_context_and_help_still_wins() {
+        assert_eq!(
+            parse(&["--diagnostics"]).unwrap(),
+            ParsedArgs::Diagnostics(ServerOptions::default())
+        );
+        let parsed = parse(&["--bind", "0.0.0.0:9", "--diagnostics"]).unwrap();
+        assert!(
+            matches!(parsed, ParsedArgs::Diagnostics(options) if options.bind.to_string() == "0.0.0.0:9")
+        );
+        // A flag after the mode argument is parsed too, so the report describes
+        // the deployment the operator asked about rather than the defaults.
+        let parsed = parse(&["--diagnostics", "--instance-name=worker"]).unwrap();
+        assert!(
+            matches!(parsed, ParsedArgs::Diagnostics(options) if options.instance_name.as_deref() == Some("worker"))
+        );
+        assert_eq!(
+            parse(&["--diagnostics", "--help"]).unwrap(),
+            ParsedArgs::Help
+        );
+        assert_eq!(parse(&["-h", "--diagnostics"]).unwrap(), ParsedArgs::Help);
+    }
+
+    #[test]
+    fn diagnostics_report_describes_the_deployment_without_the_token_value() {
+        let state = temporary_directory("diagnostics");
+        let directory = state.join("127.0.0.1_8765");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("token"), "top-secret-token\n").unwrap();
+
+        let report =
+            diagnostics_report_in(&serve_options(&["--bind", "127.0.0.1:8765"]), &state).unwrap();
+        assert!(report.starts_with("loom-server "), "{report}");
+        assert!(
+            report.contains("execution-context: host")
+                || report.contains("execution-context: container"),
+            "{report}"
+        );
+        assert!(report.contains("deployment-role: "), "{report}");
+        assert!(report.contains("state-persistence: durable"), "{report}");
+        assert!(
+            report.contains(&format!(
+                "state-database: {}",
+                directory.join("state.db").display()
+            )),
+            "{report}"
+        );
+        assert!(
+            report.contains("bearer-token: from the existing file"),
+            "{report}"
+        );
+        assert!(report.contains("network-egress: "), "{report}");
+        // The report is safe to paste into a bug report, and it resolves paths
+        // without creating them: `--diagnostics` never touches state.
+        assert!(!report.contains("top-secret-token"), "{report}");
+        assert!(!directory.join("state.db").exists());
+        assert!(directory.join("token").exists());
+        std::fs::remove_dir_all(&state).ok();
+    }
+
+    #[test]
+    fn diagnostics_runs_and_reports_a_refused_instance_name() {
+        run(arguments(&["--diagnostics"])).unwrap();
+        let state = temporary_directory("diagnostics-invalid");
+        let error =
+            diagnostics_report_in(&serve_options(&["--instance-name", "../escape"]), &state)
+                .unwrap_err();
+        assert_eq!(error.code, loom_core::ErrorCode::InvalidRequest);
+        std::fs::remove_dir_all(&state).ok();
     }
 
     #[test]
