@@ -649,8 +649,8 @@ impl StreamDecoder {
                 if item.get("type").and_then(serde_json::Value::as_str) != Some("function_call") {
                     return Ok(StreamFlow::Continue);
                 }
-                let call = responses_function_call(item, call_ids)?;
-                sink.emit(ModelStreamEvent::ToolCallDelta { call })
+                let event = responses_function_call(item, call_ids)?;
+                sink.emit(event)
             }
             Some("response.completed" | "response.incomplete" | "response.failed") => {
                 let response = chunk.get("response");
@@ -735,16 +735,28 @@ impl StreamDecoder {
                     false,
                 ));
             }
-            let arguments = parse_tool_arguments(&partial.arguments)?;
+            let arguments = decode_tool_arguments(&partial.name, &partial.arguments);
             saw_tool_call = true;
-            if sink.emit(ModelStreamEvent::ToolCallDelta {
-                call: ToolCall {
-                    id: ToolCallId::new(),
-                    name: partial.name,
-                    arguments,
-                },
-            })? == StreamFlow::Stop
-            {
+            let flow = match arguments {
+                Ok(arguments) => sink.emit(ModelStreamEvent::ToolCallDelta {
+                    call: ToolCall {
+                        id: ToolCallId::new(),
+                        name: partial.name,
+                        arguments,
+                    },
+                })?,
+                Err(reason) => {
+                    log::warn!(
+                        "{} streamed a tool call whose arguments could not be decoded: {reason}",
+                        self.provider
+                    );
+                    sink.emit(ModelStreamEvent::InvalidToolCall {
+                        name: partial.name,
+                        reason,
+                    })?
+                }
+            };
+            if flow == StreamFlow::Stop {
                 return Ok(());
             }
         }
@@ -761,19 +773,6 @@ impl StreamDecoder {
         sink.emit(ModelStreamEvent::Completed { reason })?;
         Ok(())
     }
-}
-
-pub fn parse_tool_arguments(arguments: &str) -> Result<serde_json::Value> {
-    if arguments.trim().is_empty() {
-        return Ok(serde_json::json!({}));
-    }
-    serde_json::from_str(arguments).map_err(|error| {
-        LoomError::new(
-            ErrorCode::ProviderInvalidResponse,
-            format!("tool arguments were not valid JSON: {error}"),
-            false,
-        )
-    })
 }
 
 pub fn finish_reason_from_str(reason: &str) -> FinishReason {
@@ -824,10 +823,17 @@ pub fn responses_usage(usage: &serde_json::Value) -> TokenUsage {
     }
 }
 
+/// Turns one Copilot Responses function call item into the event that reports
+/// it.
+///
+/// A call without a name is a malformed envelope and stays an error. Arguments
+/// that cannot be decoded are reported as `ModelStreamEvent::InvalidToolCall`
+/// so the completion continues and the runtime can ask the model to resend the
+/// call.
 pub fn responses_function_call(
     item: &serde_json::Value,
     call_ids: &mut BTreeMap<String, ToolCallId>,
-) -> Result<ToolCall> {
+) -> Result<ModelStreamEvent> {
     let name = item
         .get("name")
         .and_then(serde_json::Value::as_str)
@@ -838,30 +844,32 @@ pub fn responses_function_call(
                 false,
             )
         })?;
-    let arguments = item
+    let raw = item
         .get("arguments")
         .and_then(serde_json::Value::as_str)
-        .map(|arguments| {
-            serde_json::from_str(arguments).map_err(|error| {
-                LoomError::new(
-                    ErrorCode::ProviderInvalidResponse,
-                    format!("Copilot Responses tool arguments were invalid: {error}"),
-                    false,
-                )
-            })
-        })
-        .transpose()?
-        .unwrap_or_else(|| serde_json::json!({}));
+        .unwrap_or_default();
+    let arguments = match decode_tool_arguments(name, raw) {
+        Ok(arguments) => arguments,
+        Err(reason) => {
+            log::warn!("Copilot Responses tool call '{name}' could not be decoded: {reason}");
+            return Ok(ModelStreamEvent::InvalidToolCall {
+                name: name.to_owned(),
+                reason,
+            });
+        }
+    };
     let remote_call_id = item
         .get("call_id")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_owned();
     let id = *call_ids.entry(remote_call_id).or_default();
-    Ok(ToolCall {
-        id,
-        name: name.to_owned(),
-        arguments,
+    Ok(ModelStreamEvent::ToolCallDelta {
+        call: ToolCall {
+            id,
+            name: name.to_owned(),
+            arguments,
+        },
     })
 }
 
@@ -887,45 +895,10 @@ pub fn normalize_responses_response(
                     }
                 }
                 Some("function_call") => {
-                    let name = item
-                        .get("name")
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| {
-                            LoomError::new(
-                                ErrorCode::ProviderInvalidResponse,
-                                "Copilot Responses function call did not contain a name",
-                                false,
-                            )
-                        })?;
-                    let arguments = item
-                        .get("arguments")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|arguments| {
-                            serde_json::from_str(arguments).map_err(|error| {
-                                LoomError::new(
-                                    ErrorCode::ProviderInvalidResponse,
-                                    format!(
-                                        "Copilot Responses tool arguments were invalid: {error}"
-                                    ),
-                                    false,
-                                )
-                            })
-                        })
-                        .transpose()?
-                        .unwrap_or_else(|| serde_json::json!({}));
-                    let remote_call_id = item
-                        .get("call_id")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned();
-                    let call_id = call_ids.entry(remote_call_id).or_default().to_owned();
-                    events.push(ModelStreamEvent::ToolCallDelta {
-                        call: ToolCall {
-                            id: call_id,
-                            name: name.to_owned(),
-                            arguments,
-                        },
-                    });
+                    // The same decoder is used for the streamed and the buffered
+                    // form of a Responses body, so an undecodable call is
+                    // reported identically in both.
+                    events.push(responses_function_call(item, call_ids)?);
                 }
                 _ => {}
             }

@@ -35,6 +35,7 @@ mod openai;
 mod registry;
 mod response;
 mod retry;
+mod tool_arguments;
 
 pub use credential::*;
 pub use deterministic::*;
@@ -45,6 +46,7 @@ pub use openai::*;
 pub use registry::*;
 pub use response::*;
 pub use retry::*;
+pub use tool_arguments::*;
 
 const GITHUB_OAUTH_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 /// The Copilot login only performs Copilot model calls, so it asks for no
@@ -162,7 +164,10 @@ mod tests {
 
     #[test]
     fn provider_usage_and_status_helpers_handle_empty_and_extreme_values() {
-        assert_eq!(parse_tool_arguments("  ").unwrap(), serde_json::json!({}));
+        assert_eq!(
+            decode_tool_arguments("read_file", "  ").unwrap(),
+            serde_json::json!({})
+        );
         assert_eq!(
             finish_reason_from_str("function_call"),
             FinishReason::ToolCall
@@ -417,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_stream_decoder_emits_tool_usage_and_completion_or_rejects_bad_arguments() {
+    fn chat_stream_decoder_emits_tool_usage_and_completion_or_reports_bad_arguments() {
         let mut decoder = StreamDecoder::chat_completions("fixture".to_owned());
         let mut sink = CollectingSink::default();
         decoder
@@ -450,12 +455,31 @@ mod tests {
         let mut malformed_sink = CollectingSink::default();
         malformed
             .accept(
-                &serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read_file","arguments":"{"}}]}}]}),
+                &serde_json::json!({"choices":[{"delta":{"tool_calls":[
+                    {"index":0,"function":{"name":"read_file","arguments":"{"}},
+                    {"index":1,"function":{"name":"list_files","arguments":"{}"}}
+                ]}}]}),
                 &mut BTreeMap::new(),
                 &mut malformed_sink,
             )
             .unwrap();
-        assert!(malformed.finish(&mut malformed_sink).is_err());
+        malformed.finish(&mut malformed_sink).unwrap();
+        assert!(matches!(
+            malformed_sink.events.first(),
+            Some(ModelStreamEvent::InvalidToolCall { name, reason })
+                if name == "read_file"
+                    && reason.contains("read_file")
+                    && reason.contains("1 bytes")
+                    && reason.contains("cut off")
+        ));
+        assert!(
+            malformed_sink.events.iter().any(|event| matches!(
+                event,
+                ModelStreamEvent::ToolCallDelta { call } if call.name == "list_files"
+            )),
+            "an undecodable call must not stop the calls that follow it: {:?}",
+            malformed_sink.events
+        );
 
         let missing_name = StreamDecoder {
             tool_calls: BTreeMap::from([(0, PartialToolCall::default())]),
@@ -861,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_compatible_response_normalization_rejects_malformed_tool_arguments() {
+    fn openai_compatible_response_normalization_reports_malformed_tool_arguments() {
         let body = serde_json::json!({
             "choices": [{
                 "message": {
@@ -871,8 +895,18 @@ mod tests {
                 }
             }]
         });
-        let error = normalize_openai_response(&body).unwrap_err();
-        assert_eq!(error.code, ErrorCode::ProviderInvalidResponse);
+        let events = normalize_openai_response(&body).unwrap();
+        assert!(matches!(
+            events.first(),
+            Some(ModelStreamEvent::InvalidToolCall { name, reason })
+                if name == "read_file"
+                    && reason.contains("read_file")
+                    && reason.contains(&format!("{} bytes", "not-json".len()))
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(ModelStreamEvent::Completed { .. })
+        ));
     }
 
     #[test]
@@ -887,11 +921,7 @@ mod tests {
                 ErrorCode::ProviderInvalidResponse
             );
         }
-        for tool_call in [
-            serde_json::json!({}),
-            serde_json::json!({"function": {}}),
-            serde_json::json!({"function": {"name": "read_file", "arguments": 7}}),
-        ] {
+        for tool_call in [serde_json::json!({}), serde_json::json!({"function": {}})] {
             let body = serde_json::json!({
                 "choices": [{"message": {"tool_calls": [tool_call]}}]
             });
@@ -900,6 +930,20 @@ mod tests {
                 ErrorCode::ProviderInvalidResponse
             );
         }
+
+        // A non-object argument payload is reported per call instead of
+        // failing the completion.
+        let events = normalize_openai_response(&serde_json::json!({
+            "choices": [{"message": {"tool_calls": [
+                {"function": {"name": "read_file", "arguments": 7}}
+            ]}}]
+        }))
+        .unwrap();
+        assert!(matches!(
+            events.first(),
+            Some(ModelStreamEvent::InvalidToolCall { name, reason })
+                if name == "read_file" && reason.contains("JSON number")
+        ));
 
         let events = normalize_openai_response(&serde_json::json!({
             "choices": [{"message": {
@@ -923,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_normalization_covers_text_tool_usage_and_invalid_calls() {
+    fn responses_normalization_covers_text_tool_usage_and_reports_invalid_calls() {
         let mut call_ids = BTreeMap::new();
         let events = normalize_responses_response(
             &serde_json::json!({
@@ -952,17 +996,37 @@ mod tests {
             }
         ));
 
-        for output in [
-            serde_json::json!([{"type":"function_call"}]),
-            serde_json::json!([{"type":"function_call","name":"read_file","arguments":"invalid"}]),
-        ] {
-            assert_eq!(
-                normalize_responses_response(&serde_json::json!({"output": output}), &mut call_ids)
-                    .unwrap_err()
-                    .code,
-                ErrorCode::ProviderInvalidResponse
-            );
-        }
+        assert_eq!(
+            normalize_responses_response(
+                &serde_json::json!({"output": [{"type":"function_call"}]}),
+                &mut call_ids
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::ProviderInvalidResponse
+        );
+        let events = normalize_responses_response(
+            &serde_json::json!({"output": [
+                {"type":"function_call","name":"read_file","arguments":"invalid"},
+                {"type":"function_call","call_id":"call-2","name":"list_files","arguments":"{}"}
+            ]}),
+            &mut call_ids,
+        )
+        .unwrap();
+        assert!(matches!(
+            events.first(),
+            Some(ModelStreamEvent::InvalidToolCall { name, reason })
+                if name == "read_file"
+                    && reason.contains("read_file")
+                    && reason.contains("7 bytes")
+        ));
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                ModelStreamEvent::ToolCallDelta { call } if call.name == "list_files"
+            )),
+            "an undecodable call must not stop the calls that follow it: {events:?}"
+        );
         assert!(matches!(
             normalize_responses_response(&serde_json::json!({"status":"failed"}), &mut call_ids)
                 .unwrap()
