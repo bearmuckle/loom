@@ -303,6 +303,9 @@ pub struct InProcessBackend {
     persistence: Option<Arc<dyn Persistence>>,
     run_executor: RunExecutor,
     session_root_base: PathBuf,
+    /// Configured archive-retention policy; read through
+    /// [`InProcessBackend::archive_retention`].
+    archive_retention: Mutex<loom_protocol::ArchiveRetentionPolicy>,
     idempotency_store: IdempotencyStore,
     admissions: AdmissionService,
     self_reference: Mutex<Weak<InProcessBackend>>,

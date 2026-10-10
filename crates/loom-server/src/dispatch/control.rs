@@ -12,6 +12,11 @@ impl InProcessConnection {
                     self.worker_node_status()?,
                 )))
             }
+            ClientRequest::Control(ControlRequest::GetArchiveRetentionPolicy) => {
+                Ok(ServerResponse::Control(
+                    ControlResponse::ArchiveRetentionPolicy(self.backend.archive_retention()),
+                ))
+            }
             _ => unreachable!("request was routed to the wrong dispatch domain"),
         }
     }

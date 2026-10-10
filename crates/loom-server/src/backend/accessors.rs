@@ -160,4 +160,35 @@ impl InProcessBackend {
     pub fn event_retention(&self) -> Result<usize> {
         Ok(self.journal()?.retention_limit.max(1))
     }
+
+    /// Archive-retention policy this backend applies to archived sessions.
+    ///
+    /// The policy is stored and exposed here; the sweep that discards expired
+    /// archived sessions is wired in the retention change.
+    pub fn archive_retention(&self) -> loom_protocol::ArchiveRetentionPolicy {
+        *self
+            .archive_retention
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Sets the archive-retention policy.
+    ///
+    /// A zero retention window is normalized to `None`, which means retention
+    /// is disabled. The sweep that acts on the policy is wired in the retention
+    /// change; nothing is discarded here.
+    pub fn set_archive_retention(
+        &self,
+        policy: loom_protocol::ArchiveRetentionPolicy,
+    ) -> Result<()> {
+        let normalized = loom_protocol::ArchiveRetentionPolicy {
+            retention_ms: policy.retention_ms.filter(|retention_ms| *retention_ms > 0),
+            force_discard_worktrees: policy.force_discard_worktrees,
+        };
+        *self
+            .archive_retention
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = normalized;
+        Ok(())
+    }
 }

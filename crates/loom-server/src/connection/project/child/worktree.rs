@@ -501,34 +501,13 @@ impl InProcessConnection {
 
         worktree.status = ProjectWorktreeStatus::CleanupPending;
         self.save_project_worktree_state(&worktree)?;
-        let parent_git =
-            self.session_git(worktree.parent_session_id, worktree.parent_repository_id)?;
-        let child_filesystem = self.session_filesystem(worktree.child_session_id)?;
-        let destination = child_filesystem
-            .root()
-            .join(checked_session_relative_path(&worktree.relative_path)?);
         let force = disposition == ProjectWorktreeCleanupDisposition::DiscardChanges;
-        let removal = parent_git.remove_linked_worktree(&worktree.worktree_name, force);
-        if let Err(error) = removal {
-            let already_removed = error.code == ErrorCode::NotFound
-                && !destination.exists()
-                && worktree.status == ProjectWorktreeStatus::CleanupPending;
-            if !already_removed {
-                worktree.error = Some(error.message.clone());
-                worktree.updated_at = Timestamp::now();
-                self.save_project_worktree_state(&worktree)?;
-                return Err(error);
-            }
+        if let Err(error) = self.remove_project_worktree_checkout(&worktree, force) {
+            worktree.error = Some(error.message.clone());
+            worktree.updated_at = Timestamp::now();
+            self.save_project_worktree_state(&worktree)?;
+            return Err(error);
         }
-        self.backend
-            .session_repositories()?
-            .entry(worktree.child_session_id)
-            .or_default()
-            .remove(&worktree.child_repository_id);
-        self.backend
-            .session_vcs()?
-            .remove(&(worktree.child_session_id, worktree.child_repository_id));
-        child_filesystem.mark_state_dirty()?;
         worktree.status = ProjectWorktreeStatus::Removed;
         worktree.error = None;
         worktree.updated_at = Timestamp::now();
@@ -545,6 +524,65 @@ impl InProcessConnection {
         Ok(ServerResponse::Project(
             ProjectResponse::ProjectChildWorktreeUpdated(worktree),
         ))
+    }
+
+    /// Removes one project worktree checkout and its in-memory registrations.
+    ///
+    /// The checkout is resolved through the child session filesystem when it is
+    /// loaded and through the session root layout otherwise, because the child
+    /// session row still exists at every call site. A worktree that is locked is
+    /// refused unless `force` is true, and a registration that is already gone
+    /// with its checkout is treated as removed. Any other failure is returned to
+    /// the caller so it can abort without touching the session rows.
+    pub(crate) fn remove_project_worktree_checkout(
+        &self,
+        worktree: &ProjectWorktreeRecord,
+        force: bool,
+    ) -> Result<()> {
+        let parent_git =
+            self.session_git(worktree.parent_session_id, worktree.parent_repository_id)?;
+        let relative_path = checked_session_relative_path(&worktree.relative_path)?;
+        let child_filesystem = self
+            .backend
+            .session_filesystems()?
+            .get(&worktree.child_session_id)
+            .cloned();
+        let destination = match &child_filesystem {
+            Some(filesystem) => filesystem.root().join(&relative_path),
+            None => {
+                let child = self.backend.sessions()?.get(worktree.child_session_id)?;
+                self.backend
+                    .session_root_base
+                    .join(child.workspace_id.to_string())
+                    .join(worktree.child_session_id.to_string())
+                    .join("fs")
+                    .join(&relative_path)
+            }
+        };
+        if !force && parent_git.linked_worktree_is_locked(&worktree.worktree_name)? {
+            return Err(LoomError::invalid_state(format!(
+                "project worktree '{}' is locked; pass force only when its lock may be removed",
+                worktree.worktree_name
+            )));
+        }
+        if let Err(error) = parent_git.remove_linked_worktree(&worktree.worktree_name, force) {
+            let already_removed = error.code == ErrorCode::NotFound && !destination.exists();
+            if !already_removed {
+                return Err(error);
+            }
+        }
+        self.backend
+            .session_repositories()?
+            .entry(worktree.child_session_id)
+            .or_default()
+            .remove(&worktree.child_repository_id);
+        self.backend
+            .session_vcs()?
+            .remove(&(worktree.child_session_id, worktree.child_repository_id));
+        if let Some(filesystem) = child_filesystem {
+            filesystem.mark_state_dirty()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn save_project_worktree_state(

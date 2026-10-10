@@ -1054,6 +1054,30 @@ impl GitService {
         Self::open(registered_path)
     }
 
+    /// Reports whether a named linked worktree is locked.
+    ///
+    /// A worktree that is no longer registered is reported as unlocked so a
+    /// caller can treat a missing registration as an already removed checkout.
+    pub fn linked_worktree_is_locked(&self, worktree_name: &str) -> Result<bool> {
+        validate_worktree_name(worktree_name)?;
+        let repository = self.repository()?;
+        let worktree = match repository.find_worktree(worktree_name) {
+            Ok(worktree) => worktree,
+            Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(git_error("could not find registered Git worktree", error));
+            }
+        };
+        match worktree.is_locked() {
+            Ok(WorktreeLockStatus::Locked(_)) => Ok(true),
+            Ok(WorktreeLockStatus::Unlocked) => Ok(false),
+            Err(error) => Err(git_error(
+                "could not inspect Git worktree lock state",
+                error,
+            )),
+        }
+    }
+
     /// Removes a named linked worktree and prunes its Git metadata.
     ///
     /// A worktree with tracked, untracked, ignored, or staged changes is kept
@@ -2143,6 +2167,49 @@ mod tests {
                 .iter()
                 .any(|branch| branch.name == branch_name)
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linked_worktree_lock_state_gates_removal() {
+        let (git, root) = repository();
+        let base_commit = git.repository().unwrap().head().unwrap().target().unwrap();
+        let id = loom_core::RepositoryId::new();
+        let worktree_name = format!("child-{id}");
+        let branch_name = format!("codex/child-{id}");
+        let path = std::env::temp_dir().join(format!("loom-linked-{id}"));
+        git.create_linked_worktree(&worktree_name, &branch_name, &path, base_commit)
+            .unwrap();
+        assert!(!git.linked_worktree_is_locked(&worktree_name).unwrap());
+        assert!(
+            !git.linked_worktree_is_locked(&format!("missing-{id}"))
+                .unwrap()
+        );
+
+        git.repository()
+            .unwrap()
+            .find_worktree(&worktree_name)
+            .unwrap()
+            .lock(Some("loom test"))
+            .unwrap();
+        assert!(git.linked_worktree_is_locked(&worktree_name).unwrap());
+        assert_eq!(
+            git.remove_linked_worktree(&worktree_name, false)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        assert!(path.exists());
+
+        git.repository()
+            .unwrap()
+            .find_worktree(&worktree_name)
+            .unwrap()
+            .unlock()
+            .unwrap();
+        assert!(!git.linked_worktree_is_locked(&worktree_name).unwrap());
+        git.remove_linked_worktree(&worktree_name, false).unwrap();
+        assert!(!path.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

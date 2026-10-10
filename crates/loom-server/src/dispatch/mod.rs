@@ -34,6 +34,9 @@ impl InProcessConnection {
             ClientRequest::Control(ControlRequest::GetWorkerNodeStatus) => {
                 self.control_dispatch(request, request_id)
             }
+            ClientRequest::Control(ControlRequest::GetArchiveRetentionPolicy) => {
+                self.control_dispatch(request, request_id)
+            }
             ClientRequest::Workspace(WorkspaceRequest::CreateWorkspace { .. }) => {
                 self.workspace_dispatch(request, request_id)
             }
@@ -206,6 +209,9 @@ impl InProcessConnection {
                 self.session_dispatch(request, request_id)
             }
             ClientRequest::Session(SessionRequest::ArchiveAgentSession { .. }) => {
+                self.session_dispatch(request, request_id)
+            }
+            ClientRequest::Session(SessionRequest::DeleteAgentSession { .. }) => {
                 self.session_dispatch(request, request_id)
             }
             ClientRequest::Events(EventsRequest::GetSessionEvents { .. }) => {
