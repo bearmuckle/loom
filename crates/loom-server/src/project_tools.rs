@@ -339,13 +339,30 @@ impl ToolExtension for ProjectAgentTools {
                                 }
                             }
                         }
-                        if result_revision != worktree.base_revision
-                            && !self.reviewed_result_is_integrated(&worktree, result_revision)
-                        {
-                            return Some(format!(
-                                "completed code child task {} ({}) has a reviewed result that still needs integration",
-                                task.task_id, task.child_name
-                            ));
+                        if result_revision != worktree.base_revision {
+                            match self.reviewed_result_is_integrated(&worktree, result_revision) {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    let detail = match worktree.integrated_revision.as_deref() {
+                                        Some(integrated_revision) => format!(
+                                            "its recorded integration at {integrated_revision} does not contain the reviewed result {result_revision}"
+                                        ),
+                                        None => {
+                                            "no integration is recorded for its result".to_owned()
+                                        }
+                                    };
+                                    return Some(format!(
+                                        "completed code child task {} ({}) has a reviewed result that still needs integration: {detail}",
+                                        task.task_id, task.child_name
+                                    ));
+                                }
+                                Err(_) => {
+                                    return Some(format!(
+                                        "integration state for code child task {} ({}) could not be confirmed",
+                                        task.task_id, task.child_name
+                                    ));
+                                }
+                            }
                         }
                     }
                     Ok(None) => {
@@ -368,7 +385,7 @@ impl ToolExtension for ProjectAgentTools {
 }
 
 impl ProjectAgentTools {
-    /// Returns true when the reviewed child result is contained in the parent
+    /// Reports whether the reviewed child result is contained in the parent
     /// revision recorded for the child's integration.
     ///
     /// Integration records the parent revision after integration, not
@@ -377,24 +394,32 @@ impl ProjectAgentTools {
     /// present" path records the parent HEAD. The guard's intent is that the
     /// reviewed revision is contained in what was integrated, so ancestry
     /// rather than equality decides the outcome.
+    ///
+    /// `Ok(false)` means no integration is recorded, or the recorded revision
+    /// does not contain the result. `Err` means the parent repository could not
+    /// be inspected, so the guard can report that state instead of asserting
+    /// the result is un-integrated.
     fn reviewed_result_is_integrated(
         &self,
         worktree: &ProjectWorktreeRecord,
         result_revision: &str,
-    ) -> bool {
+    ) -> Result<bool> {
         let Some(integrated_revision) = worktree.integrated_revision.as_deref() else {
-            return false;
+            return Ok(false);
         };
         if integrated_revision == result_revision {
-            return true;
+            return Ok(true);
         }
-        let Some(connection) = self.connection() else {
-            return false;
-        };
+        let connection = self.connection().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::RecoveryRequired,
+                "project backend is no longer available",
+                true,
+            )
+        })?;
         connection
-            .session_git(worktree.parent_session_id, worktree.parent_repository_id)
-            .and_then(|git| git.is_ancestor_revision(result_revision, integrated_revision))
-            .unwrap_or(false)
+            .session_git(worktree.parent_session_id, worktree.parent_repository_id)?
+            .is_ancestor_revision(result_revision, integrated_revision)
     }
 
     pub(crate) fn load_wait_child_tasks(

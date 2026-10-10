@@ -349,22 +349,95 @@ fn project_child_integrates_a_merge_over_an_advanced_parent() {
     // The guard's intent is that the reviewed result is contained in what was
     // integrated. A merge records the merge commit rather than the child
     // revision, so a merge integration must still satisfy `completion_blocker`.
-    let completion_guard = ProjectAgentTools {
-        backend: Arc::downgrade(&fixture.backend),
-        session_id: fixture.root_id,
-        project_id: fixture.project_id,
-        model_id: ModelId::new("deterministic/demo"),
-        can_delegate: false,
-        can_delegate_code: false,
-        can_message: false,
-        can_branch_message: false,
-        can_inspect_children: false,
-        can_wait_children: false,
-        can_control_children: false,
-        can_review_children: false,
-        can_integrate_children: false,
-    };
+    let completion_guard = project_completion_guard(&fixture);
     assert_eq!(completion_guard.completion_blocker(), None);
+    fixture.shutdown();
+}
+
+#[test]
+fn project_child_completion_guard_explains_why_a_reviewed_result_is_unintegrated() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+
+    let completion_guard = project_completion_guard(&fixture);
+    let blocker = completion_guard
+        .completion_blocker()
+        .expect("an unintegrated reviewed result must block completion");
+    assert!(
+        blocker.contains("no integration is recorded"),
+        "unexpected blocker: {blocker}"
+    );
+
+    commit_file(
+        fixture.parent_git.root(),
+        "README.md",
+        "parent advanced\n",
+        "parent change",
+    );
+    let integration = fixture
+        .connection
+        .request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::IntegrateProjectChild {
+                project_id: fixture.project_id,
+                manager_session_id: fixture.root_id,
+                task_id: fixture.task_id,
+                expected_parent_revision: fixture.worktree.base_revision.clone(),
+            },
+        )));
+    let ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(integrated)) =
+        integration.result.unwrap()
+    else {
+        panic!("unexpected child integration response");
+    };
+    assert_eq!(integrated.status, ProjectWorktreeStatus::Integrated);
+    assert_eq!(completion_guard.completion_blocker(), None);
+
+    // A child that advances after integration is un-integrated again; the guard
+    // must name the stale integration rather than repeat a bare assertion.
+    commit_file(
+        &fixture.child_checkout,
+        "child2.txt",
+        "child follow-up\n",
+        "child follow-up",
+    );
+    let advanced_child_revision = review_project_code_child(&fixture);
+    assert_ne!(advanced_child_revision, child_revision);
+    let blocker = completion_guard
+        .completion_blocker()
+        .expect("a child that advanced after integration must block completion");
+    assert!(
+        blocker.contains("does not contain the reviewed result"),
+        "the blocker should name the stale integration: {blocker}"
+    );
+
+    // When the parent repository cannot be resolved the guard must report that
+    // it could not confirm integration rather than asserting the result is
+    // un-integrated.
+    fixture.backend.session_vcs().unwrap().remove(&(
+        fixture.worktree.parent_session_id,
+        fixture.worktree.parent_repository_id,
+    ));
+    fixture
+        .backend
+        .session_repositories()
+        .unwrap()
+        .get_mut(&fixture.worktree.parent_session_id)
+        .unwrap()
+        .remove(&fixture.worktree.parent_repository_id);
+    let blocker = completion_guard
+        .completion_blocker()
+        .expect("an unconfirmable integration must block completion");
+    assert!(
+        blocker.contains("could not be confirmed"),
+        "the blocker should report the unconfirmable state: {blocker}"
+    );
     fixture.shutdown();
 }
 
