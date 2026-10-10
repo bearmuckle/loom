@@ -495,13 +495,30 @@ jobs:
           ./loom-server --version
           ```
 
-          Serving needs a bearer token, and without `--persistence` the backend
-          keeps its state in memory only:
+          Neither `--persistence` nor a token is required:
 
           ```sh
-          ./loom-server --bind 127.0.0.1:8765 --token-file /path/to/token \
-            --persistence /var/lib/loom/loom.db
+          ./loom-server --bind 127.0.0.1:8765
           ```
+
+          Without `--persistence`, a bind address with a stable port keeps durable
+          state in `<state-dir>/<instance-name or bind-key>/state.db`; `<state-dir>`
+          is `LOOM_STATE_DIR`, else `$XDG_STATE_HOME`, else `$HOME/.local/state`,
+          else a directory in the system temp folder, with a `loom` subdirectory
+          appended. The bind key replaces `:` with `_`, so `127.0.0.1:8765` becomes
+          `127.0.0.1_8765`. The instance directory is created with mode `0700` and
+          holds the database, the token, and the files derived from the database
+          path. `--instance-name` pins one directory for a host-aliased bind, and a
+          bind port of 0 keeps state in memory.
+
+          Without `--token` or `--token-file` the server reads
+          `<instance-dir>/token` and, when that file is missing or empty, generates
+          a `loom-<uuid>` token there, written atomically with mode `0600`. The
+          path is always logged, generation is logged as a warning, and the value
+          is printed only when stdout is a terminal, so it does not land in
+          `journald` or `docker logs`. `--token` and `--token-file` remain
+          explicit, mutually exclusive overrides, and `--reset-state` wipes an
+          incompatible database instead of refusing to start.
 
           The server refuses a bind that is not loopback unless it serves TLS or
           the operator opts in to plaintext, and its unauthenticated `GET /health`
@@ -510,8 +527,7 @@ jobs:
 
           ```sh
           ./loom-server --bind 0.0.0.0:8765 \
-            --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem \
-            --token-file /path/to/token
+            --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
           ```
 
           A plaintext listener beyond loopback needs an explicit opt-in, which
@@ -519,7 +535,7 @@ jobs:
 
           ```sh
           ./loom-server --bind 0.0.0.0:8765 --allow-insecure-remote \
-            --token-file /path/to/token
+            --instance-name loom-server
           ```
 
           A client connecting to a worker with a private or self-signed CA adds
@@ -530,16 +546,19 @@ jobs:
 
           ```sh
           docker pull ghcr.io/${{ github.repository_owner }}/loom-server:${{ github.ref_name }}
-          printf 'choose-a-long-random-token' > token
           docker run --rm -p 127.0.0.1:8765:8765 \
-            -v "$PWD/token:/etc/loom/token:ro" \
             ghcr.io/${{ github.repository_owner }}/loom-server:${{ github.ref_name }}
           ```
 
           The image's default command binds `0.0.0.0:8765` inside the container
-          with `--allow-insecure-remote`, because that is what makes a published
-          port reachable. Publish it only to trusted peers, or pass your own TLS
-          material: `-v "$PWD/tls:/tls:ro"` and a `CMD` override of
+          with `--allow-insecure-remote` and pins `--instance-name loom-server`
+          below `LOOM_STATE_DIR=/var/lib/loom`, because that is what makes a
+          published port reachable. The first start generates the token in that
+          instance directory, so
+          `docker exec <container> cat /var/lib/loom/loom/loom-server/token` reads
+          it, or set a fixed value with `--token` or `--token-file` instead.
+          Publish the port only to trusted peers, or pass your own TLS material:
+          `-v "$PWD/tls:/tls:ro"` and a `CMD` override of
           `--tls-cert /tls/cert.pem --tls-key /tls/key.pem` without the opt-in.
           The image's `HEALTHCHECK` probes plain HTTP, so a TLS override needs its
           own probe over HTTPS.
