@@ -188,6 +188,126 @@ fn reload_sessions_loads_projects_from_each_connected_worker(cx: &mut TestAppCon
 }
 
 #[gpui_kit::test]
+fn creation_on_a_peer_uses_the_peers_own_workspace(cx: &mut TestAppContext) {
+    use crate::connection::{create_workspace, negotiate};
+
+    let view = cx.new(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        negotiate(&view.connection).unwrap();
+        let home = create_workspace(&view.connection, "Home").unwrap();
+        view.workspace_id = home.id;
+        view.workspaces = vec![home];
+
+        // A peer with its own workspace and a reachable in-process backend.
+        let peer_connection =
+            ClientConnection::InProcess(Box::new(loom_local::OwnedBackend::new().connect()));
+        negotiate(&peer_connection).unwrap();
+        create_workspace(&peer_connection, "Peer").unwrap();
+        view.node_backends.insert(
+            "peer-node".to_owned(),
+            BackendWorker::spawn(peer_connection.clone()),
+        );
+        let mut peer = worker_node(1, "peer-node", "build-01", false);
+        peer.connection = Some(peer_connection);
+        view.worker_nodes.push(peer);
+        view
+    });
+
+    view.update(cx, |view, cx| {
+        view.create_session_on_node_with_source(
+            "peer-node".to_owned(),
+            "peer project".to_owned(),
+            None,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+
+    // Refresh so the peer's workspaces are recorded, then assert creation used
+    // the peer's own workspace and never shared the home workspace with it.
+    view.update(cx, |view, cx| view.reload_sessions(cx));
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.sessions.len(), 1);
+        let home_id = view.workspace_id;
+        let session_workspace = view.sessions[0].workspace_id;
+        assert_ne!(session_workspace, home_id);
+        let peer_workspaces = view
+            .node_workspaces
+            .get("peer-node")
+            .expect("peer workspaces recorded");
+        assert_eq!(peer_workspaces.len(), 1);
+        assert_eq!(peer_workspaces[0].id, session_workspace);
+        assert!(
+            !peer_workspaces
+                .iter()
+                .any(|workspace| workspace.id == home_id),
+            "the home workspace must never be registered on a peer"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn creation_provisions_a_default_workspace_when_the_worker_has_none(cx: &mut TestAppContext) {
+    use crate::connection::{create_workspace, negotiate};
+
+    let view = cx.new(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        negotiate(&view.connection).unwrap();
+        let home = create_workspace(&view.connection, "Home").unwrap();
+        view.workspace_id = home.id;
+        view.workspaces = vec![home];
+
+        // A peer that has never had a workspace.
+        let fresh_connection =
+            ClientConnection::InProcess(Box::new(loom_local::OwnedBackend::new().connect()));
+        negotiate(&fresh_connection).unwrap();
+        view.node_backends.insert(
+            "fresh-node".to_owned(),
+            BackendWorker::spawn(fresh_connection.clone()),
+        );
+        let mut fresh = worker_node(1, "fresh-node", "fresh", false);
+        fresh.connection = Some(fresh_connection);
+        view.worker_nodes.push(fresh);
+        view
+    });
+
+    view.update(cx, |view, cx| {
+        view.create_session_on_node_with_source(
+            "fresh-node".to_owned(),
+            "fresh project".to_owned(),
+            None,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    view.update(cx, |view, cx| view.reload_sessions(cx));
+    cx.run_until_parked();
+    // Exercise config distribution to each worker's own workspace.
+    view.update(cx, |view, cx| {
+        view.persist_and_distribute_workspace_config(None, cx)
+    });
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        let view = view.read(cx);
+        let home_id = view.workspace_id;
+        assert_eq!(view.sessions.len(), 1);
+        let session_workspace = view.sessions[0].workspace_id;
+        assert_ne!(session_workspace, home_id);
+        let workspaces = view
+            .node_workspaces
+            .get("fresh-node")
+            .expect("fresh workspaces recorded");
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].name, "Default");
+        assert_eq!(workspaces[0].id, session_workspace);
+    });
+}
+
+#[gpui_kit::test]
 fn source_dialog_worker_picker_scopes_creation_to_a_worker(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {

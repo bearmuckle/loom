@@ -332,6 +332,16 @@ pub(crate) fn worker_node_display_name(node: &WorkerNodeEntry) -> String {
     format!("{role} · {}", node.status.name)
 }
 
+/// The workspace a worker creates projects in and stores settings in. A
+/// workspace belongs to exactly one worker, so this is chosen per node rather
+/// than shared across the fleet. When a worker has several, the most recently
+/// updated one wins.
+pub(crate) fn active_workspace(workspaces: &[WorkspaceRecord]) -> Option<&WorkspaceRecord> {
+    workspaces
+        .iter()
+        .max_by_key(|workspace| workspace.updated_at.as_unix_millis())
+}
+
 pub(crate) fn next_severe_load_streak(current: u8, resources: &WorkerNodeResources) -> u8 {
     match (resources.cpu_usage_percent, resources.memory_usage_percent) {
         (Some(cpu), Some(memory)) if cpu > 90 && cpu <= 100 && memory > 90 && memory <= 100 => {

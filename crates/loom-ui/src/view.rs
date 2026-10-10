@@ -92,13 +92,12 @@ use crate::{
 use crate::connection::{
     attach_session_repository, create_session_in_workspace, create_workspace,
     list_models_from_backend, list_workspace_sessions, list_workspaces, redact_secret,
-    register_workspace, unexpected_response,
+    unexpected_response,
 };
 #[cfg(target_family = "wasm")]
 use crate::connection::{
     attach_session_repository_async, create_session_in_workspace_async, create_workspace_async,
     list_models_from_backend, list_workspace_sessions_async, list_workspaces_async,
-    register_workspace_async,
 };
 #[cfg(target_family = "wasm")]
 use crate::connection::{redact_secret, unexpected_response};
@@ -443,6 +442,10 @@ pub(crate) struct LoomView {
     session_node_ids: BTreeMap<AgentSessionId, String>,
     pub(crate) workspace_id: WorkspaceId,
     workspaces: Vec<WorkspaceRecord>,
+    /// Workspaces reported by each worker node. A workspace belongs to exactly
+    /// one worker, so the client never shares one across nodes; this is used to
+    /// target creation and config at the worker's own workspace.
+    node_workspaces: BTreeMap<String, Vec<WorkspaceRecord>>,
     local_directory_sources_available: bool,
     /// Native local worker working directory used to pre-fill the New project
     /// dialog. `None` for remote and browser clients, for the demo workspace,
@@ -1454,6 +1457,7 @@ impl LoomView {
             session_node_ids: BTreeMap::new(),
             workspace_id,
             workspaces: Vec::new(),
+            node_workspaces: BTreeMap::new(),
             local_directory_sources_available: true,
             local_current_directory: None,
             sessions: Vec::new(),

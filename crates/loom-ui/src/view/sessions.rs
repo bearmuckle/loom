@@ -635,19 +635,16 @@ impl LoomView {
             cx.notify();
             return;
         };
-        let workspace_id = self.workspace_id;
-        let Some(workspace) = self
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.id == workspace_id)
-            .cloned()
-        else {
-            self.record_backend_error(
-                "create session",
-                LoomError::not_found("workspace", workspace_id),
-            );
-            cx.notify();
-            return;
+        let known_workspace = if node_id == self.default_backend_node_id {
+            self.workspaces
+                .iter()
+                .find(|workspace| workspace.id == self.workspace_id)
+                .cloned()
+        } else {
+            self.node_workspaces
+                .get(&node_id)
+                .and_then(|workspaces| active_workspace(workspaces))
+                .cloned()
         };
         let model = self.default_model.clone();
         let node_name = self
@@ -691,19 +688,14 @@ impl LoomView {
                 return;
             }
             let result = async {
-                log::info!("registering workspace before session creation");
-                let registered = backend
-                    .submit(RequestEnvelope::new(ClientRequest::Workspace(WorkspaceRequest::RegisterWorkspace{
-                        workspace: workspace.clone(),
-                    })))
-                    .wait()
-                    .await;
-                match registered.result? {
-                    ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(_)) => {}
-                    response => {
-                        return Err(unexpected_response("workspace registration", response));
-                    }
-                }
+                // A worker keeps its own workspace; the client never shares a
+                // home workspace across the fleet. Create one on demand when the
+                // worker has none yet.
+                let workspace = match known_workspace {
+                    Some(workspace) => workspace,
+                    None => resolve_or_create_workspace(&backend).await?,
+                };
+                let workspace_id = workspace.id;
                 let response = backend
                     .submit(RequestEnvelope::new(
                         ClientRequest::Workspace(WorkspaceRequest::CreateAgentSessionInWorkspace{ workspace_id, name }),
@@ -916,5 +908,38 @@ impl LoomView {
                 ),
             },
         );
+    }
+}
+
+/// Resolves the workspace a project should be created in on a worker that has
+/// none yet, creating a `Default` there. A worker with workspaces uses one of
+/// its own; the client never shares a workspace across workers.
+async fn resolve_or_create_workspace(
+    backend: &BackendWorker,
+) -> Result<WorkspaceRecord, LoomError> {
+    let listing = backend
+        .submit(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::ListWorkspaces,
+        )))
+        .wait()
+        .await;
+    let workspaces = match listing.result? {
+        ServerResponse::Workspace(WorkspaceResponse::Workspaces { workspaces }) => workspaces,
+        response => return Err(unexpected_response("workspace list", response)),
+    };
+    if let Some(workspace) = active_workspace(&workspaces) {
+        return Ok(workspace.clone());
+    }
+    let created = backend
+        .submit(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Default".to_owned(),
+            },
+        )))
+        .wait()
+        .await;
+    match created.result? {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => Ok(workspace),
+        response => Err(unexpected_response("workspace creation", response)),
     }
 }

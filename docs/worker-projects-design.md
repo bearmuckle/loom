@@ -1,8 +1,8 @@
 # Worker-scoped projects
 
-Status: implemented for worker-scoped listing, navigation, and creation; see
-[Implementation status](#implementation-status). Deferred items are called out
-below.
+Status: implemented for worker-scoped listing, navigation, creation, and
+workspace ownership; see [Implementation status](#implementation-status).
+Remaining items are called out below.
 
 Code paths below are relative to `crates/loom-ui/src/`.
 
@@ -13,7 +13,7 @@ worker picker).
 
 ## Implementation status
 
-- **Done — cross-worker listing.** `reload_sessions` now walks every workspace a
+- **Done — cross-worker listing.** `reload_sessions` walks every workspace a
   worker reports (`list_node_sessions`) instead of querying only the client's
   home `workspace_id`, so a worker that was used standalone shows its existing
   projects. Per-worker load errors are recorded and surfaced in the group
@@ -26,11 +26,53 @@ worker picker).
   picker (default worker first) whenever more than one worker is connected.
   Choosing a worker scopes local-folder availability, clone caching, GitHub
   search, and the creation target.
-- **Deferred — per-worker workspace ownership.** New projects are still created
-  in the home workspace, which is registered on the target worker; a worker's
-  own workspaces are listed for navigation but not yet used as creation
-  targets. A per-worker active-workspace map and last-used-worker persistence
-  remain open (see [Open questions](#open-questions)).
+- **Done — workspace ownership (option B).** A workspace belongs to exactly one
+  worker. New projects are created in the target worker's own workspace (a
+  `Default` is created on a worker that has none), the client no longer registers
+  the home workspace on peers, and workspace settings are written to each
+  worker's own workspace. There is no shared or federated workspace.
+- **Remaining — settings ownership and polish.** `worker_nodes` still rides in
+  `WorkspaceConfig`, concurrency is still a single fleet-wide value, and
+  last-used-worker persistence and a flat/badge fallback are open (see
+  [Open questions](#open-questions)).
+
+The workspace model itself is discussed in
+[The workspace model](#the-workspace-model).
+
+## The workspace model
+
+A **workspace** is a durable, named container for a worker's projects plus that
+worker's `WorkspaceConfig` (fleet list, CPU pulse threshold, delegated-agent
+concurrency). It is stored in one worker's database.
+
+Earlier the client picked one workspace from the home worker and treated its id
+as global, even registering that record onto every peer. With one backend that
+was invisible; with several it produced incoherent state (a peer could end up
+with two workspaces both named `Default`, and listing scope differed between
+first paint and refresh).
+
+**Chosen direction (option B):** a workspace belongs to exactly one worker.
+
+- The user-facing hierarchy is **Worker → Project**. Workspaces are an internal
+  backend container and are not exposed; a worker's workspaces are listed only
+  to find its projects, and creation targets the most recently updated one.
+- The client never registers a workspace onto another worker. `list_node_sessions`
+  returns each worker's own workspaces, and creation/`persist_and_distribute_workspace_config`
+  resolve a workspace per worker (`active_workspace` / `resolve_or_create_workspace`).
+- Multi-workspace-per-worker remains possible in the data model but is not a
+  v1 surface; it becomes a deliberate feature (with a switcher) only when there
+  is a real use case.
+
+**Rejected:** keeping a distributed singleton workspace id (hides a peer's own
+workspaces and invites duplicates), and a client-owned workspace federated
+across workers (larger change that fights "backend owns truth").
+
+The remaining settings rehoming is the natural follow-up: provider credentials
+are already per worker, `project_agent_concurrency` is really a worker resource
+policy, and `worker_nodes`, the CPU pulse threshold, theme, and last-used worker
+are client concerns. Moving `worker_nodes` out of `WorkspaceConfig` is what
+fully removes the "global workspace" fiction; until then it is written per
+worker and read from the home worker at startup.
 
 ## Problem
 
@@ -200,35 +242,37 @@ Run on build-01 · CPU 71% · RAM 12.4/64 GiB · 4 models available
 
 ### Connection and workspace resolution
 
-As shipped, a worker is listed by walking every workspace it reports rather than
-querying one global id:
+A worker is listed by walking every workspace it reports, and each worker owns
+its workspaces:
 
 1. `reload_sessions` gathers the online node backends and calls
    `list_node_sessions` per node.
 2. `list_node_sessions` calls `ListWorkspaces` on the node, then
-   `ListWorkspaceSessions` for each returned workspace and merges the results.
-   When a node reports no workspaces yet, it falls back to the home
-   `workspace_id` so a shared workspace still loads.
+   `ListWorkspaceSessions` for each returned workspace and merges the results,
+   returning the node's workspaces alongside its sessions. A node with no
+   workspace yet returns empty; one is created on demand at first creation.
 3. Each node's sessions are merged under that node's owner with
    `merge_node_sessions`; a per-node error is recorded so the group header can
-   show it instead of an ambiguous empty list.
-4. `add_worker_node` still registers the home workspace on the peer so new
-   projects can be created there.
+   show it instead of an ambiguous empty list, and the node's workspaces are
+   stored in `node_workspaces`.
+4. Creating a project resolves the target worker's own workspace
+   (`active_workspace`, or `resolve_or_create_workspace` which creates a
+   `Default` when the worker has none) and creates the session there.
+5. `persist_and_distribute_workspace_config` writes the config to the home
+   workspace and to each peer's own workspace; it no longer registers a
+   workspace onto another worker.
 
-This removes the distributed-singleton assumption for *listing*. **Deferred:**
-per-worker workspace ownership for creation (`node_workspace_ids`, an active
-workspace per worker, and last-used-worker persistence). New projects are still
-created in the home workspace, which is registered on the target worker; a
-worker's own workspaces are visible but not yet creation targets. The
-`worker_nodes` list in `WorkspaceConfig` continues to be distributed for peer
-awareness.
+This removes the distributed-singleton assumption entirely. `worker_nodes`
+still rides in the config and is read from the home worker at startup, which is
+called out as the remaining settings-ownership item.
 
 ## Data model and code changes
 
 Implemented client-side, in `crates/loom-ui`:
 
-- `LoomView`: replaced the single `session_tree` with
-  `session_trees: BTreeMap<String, Entity<TreeState>>` and
+- `LoomView`: added `node_workspaces: BTreeMap<String, Vec<WorkspaceRecord>>` (a
+  worker's own workspaces, from listing). Replaced the single `session_tree`
+  with `session_trees: BTreeMap<String, Entity<TreeState>>` and
   `session_tree_entries: BTreeMap<String, Vec<SessionTreeNode>>` keyed by node
   id, plus `collapsed_worker_nodes: BTreeSet<String>` and
   `node_session_load_errors: BTreeMap<String, String>`. `default_backend_node_id`
@@ -243,17 +287,26 @@ Implemented client-side, in `crates/loom-ui`:
   dialog purpose.
 - `order_session_nodes` was promoted out of `#[cfg(test)]` and drives the
   picker ordering.
-- `reload_sessions` / `list_node_sessions`: list every workspace per node and
-  surface per-node errors.
-- `render_session_list`: groups by worker with a collapsible header when more
-  than one worker is present, and otherwise keeps the flat single tree.
+- `reload_sessions` / `list_node_sessions`: list every workspace per node,
+  return the workspaces, and surface per-node errors.
+- `create_session_on_node_with_source` creates in the target worker's own
+  workspace; `resolve_or_create_workspace` creates a `Default` on a worker that
+  has none. It no longer registers a workspace onto the target.
+- `persist_and_distribute_workspace_config` writes config per worker
+  (`resolve_workspace_id` / `resolve_workspace_id_async`) and only closes the
+  connection for a retiring node. The client `register_workspace` helpers were
+  removed.
 - Helpers: `group_sessions_by_worker` assigns sessions to owners, keeps empty
-  groups for known workers, and preserves unknown owners.
+  groups for known workers, and preserves unknown owners; `active_workspace`
+  picks a worker's most recently updated workspace.
+- `remove_worker_node` also drops the removed node's workspaces and load error.
 
 ## Protocol and backend considerations
 
 - The core fix needs **no new protocol**: `ListWorkspaces`, `RegisterWorkspace`,
-  `SetWorkspaceConfig`, and `ListWorkspaceSessions` already exist.
+  `CreateWorkspace`, `SetWorkspaceConfigForWorkspace`, and
+  `ListWorkspaceSessions` already exist. The client no longer sends
+  `RegisterWorkspace`, but the backend keeps supporting it.
 - Optional follow-ups: a per-worker "resolve workspace" response that reports
   whether a workspace was created or reused, and a way to enumerate a worker's
   workspaces with project counts, so the group header can be rendered before
@@ -310,11 +363,21 @@ persistence.
 **Exit met:** a project can be created on any connected worker, and its sources
 are discovered on that worker.
 
-### Slice 4 — cross-worker polish (deferred)
+### Slice 4 — per-worker workspace ownership (implemented, option B)
+
+- A workspace belongs to one worker; create projects in the worker's own
+  workspace (`Default` on demand) and write config to that workspace.
+- Stop registering the home workspace onto peers.
+
+**Exit met:** a project created on a peer lives in the peer's own workspace, and
+the home workspace is never registered there.
+
+### Slice 5 — cross-worker polish (remaining)
 
 - Active-project worker badge in the canvas header; global filter spanning
-  workers with chips; per-worker workspace ownership for creation; optional
-  per-worker workspace switcher.
+  workers with chips; flat/badge fallback; per-worker workspace switcher when a
+  worker holds several workspaces; move `worker_nodes` and UI preferences out of
+  `WorkspaceConfig`.
 
 ## Verification
 
@@ -322,21 +385,20 @@ Implemented checks live in `crates/loom-ui/src/view/tests/`:
 
 - `worker_project_tests`: `group_sessions_by_worker` ordering and empty-group
   behavior; grouped sidebar render with two workers and collapse/expand;
-  `choose_source_node` switching the target and local-folder availability, plus
-  the rendered "Run on" picker.
+  `choose_source_node` switching the target and local-folder availability plus
+  the rendered "Run on" picker; `reload_sessions` loading each worker's
+  projects; creation on a peer using the peer's own workspace without receiving
+  the home workspace.
 - `worker_node_tests`: `order_session_nodes` ordering, session aggregation,
   owner routing, and `local_source_available` target rules.
 - Existing render tests continue to cover the single-worker flat list.
-
-Not yet covered by tests: a true multi-backend integration test (two live
-workers) and per-worker workspace creation.
 
 ## Open questions
 
 - Should grouped mode be remembered as a preference, and should the flat
   badge/filter fallback ship?
-- Should new projects target a worker's own workspace instead of the shared home
-  workspace, and is a per-worker workspace switcher enough?
-- Does the `worker_nodes` list still need to be distributed to peers once
-  workspaces are per-worker, or is peer awareness only a home-worker concern?
+- When a worker holds several workspaces, is a per-worker workspace switcher
+  enough, or should they group under the worker header?
+- Should `worker_nodes` move out of `WorkspaceConfig` to a client-side fleet
+  config (and `project_agent_concurrency` to a per-worker setting)?
 - Do we expose "last used worker" per client or per workspace?

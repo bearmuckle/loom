@@ -240,6 +240,7 @@ impl LoomView {
             session_node_ids,
             workspace_id,
             workspaces,
+            node_workspaces: BTreeMap::new(),
             local_directory_sources_available: options.remote.is_none(),
             local_current_directory: (options.remote.is_none()
                 && !demo_workspace
@@ -438,6 +439,7 @@ impl LoomView {
             session_node_ids: BTreeMap::new(),
             workspace_id,
             workspaces: Vec::new(),
+            node_workspaces: BTreeMap::new(),
             local_directory_sources_available: false,
             local_current_directory: None,
             sessions: if demo_mode {
@@ -717,6 +719,7 @@ impl LoomView {
             session_node_ids,
             workspace_id,
             workspaces,
+            node_workspaces: BTreeMap::new(),
             local_directory_sources_available: false,
             local_current_directory: None,
             sessions: if has_session {
