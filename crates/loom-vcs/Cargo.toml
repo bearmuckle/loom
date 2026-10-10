@@ -9,4 +9,15 @@ rust-version.workspace = true
 [dependencies]
 loom-core.workspace = true
 loom-protocol.workspace = true
+
+# libgit2 uses macOS's SecureTransport framework for HTTPS, but `git2`'s
+# `https` feature still links `openssl-sys`. The release workflow builds the
+# Intel slice by cross-compiling from the arm64 runner, where pkg-config
+# refuses to hand a native OpenSSL to a different architecture. Vendoring
+# OpenSSL lets `openssl-src` build it for whatever target cargo asks for, so
+# the universal binary no longer depends on a matching system OpenSSL.
+[target.'cfg(target_os = "macos")'.dependencies]
+git2 = { workspace = true, features = ["vendored-openssl"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
 git2.workspace = true
