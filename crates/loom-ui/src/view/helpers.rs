@@ -332,6 +332,16 @@ pub(crate) fn worker_node_display_name(node: &WorkerNodeEntry) -> String {
     format!("{role} · {}", node.status.name)
 }
 
+/// The workspace a worker creates projects in and stores settings in. A
+/// workspace belongs to exactly one worker, so this is chosen per node rather
+/// than shared across the fleet. When a worker has several, the most recently
+/// updated one wins.
+pub(crate) fn active_workspace(workspaces: &[WorkspaceRecord]) -> Option<&WorkspaceRecord> {
+    workspaces
+        .iter()
+        .max_by_key(|workspace| workspace.updated_at.as_unix_millis())
+}
+
 pub(crate) fn next_severe_load_streak(current: u8, resources: &WorkerNodeResources) -> u8 {
     match (resources.cpu_usage_percent, resources.memory_usage_percent) {
         (Some(cpu), Some(memory)) if cpu > 90 && cpu <= 100 && memory > 90 && memory <= 100 => {
@@ -352,7 +362,8 @@ pub(crate) fn adjusted_project_agent_concurrency(current: u8, delta: i8) -> u8 {
     ) as u8
 }
 
-#[cfg(test)]
+/// Order worker nodes for a "Run on" picker, keeping the default/home worker
+/// first and preserving the caller's order for the rest.
 pub(crate) fn order_session_nodes(
     mut nodes: Vec<(String, String)>,
     default_node_id: &str,
@@ -590,6 +601,38 @@ pub(crate) fn merge_node_sessions(
     }
     owners.retain(|session_id, _| sessions.iter().any(|session| session.id == *session_id));
     (sessions, owners)
+}
+
+/// Group sessions by the worker node that owns them for the sidebar's
+/// worker-grouped view.
+///
+/// Every node in `node_order` gets a group, including empty ones, so the caller
+/// can show a header for a connected worker that has no projects yet. A session
+/// with no recorded owner falls back to `default_node_id`; sessions owned by a
+/// node that is no longer configured keep their own group so they stay visible.
+pub(crate) fn group_sessions_by_worker(
+    sessions: &[AgentSessionSnapshot],
+    owners: &BTreeMap<AgentSessionId, String>,
+    node_order: &[String],
+    default_node_id: &str,
+) -> Vec<(String, Vec<AgentSessionSnapshot>)> {
+    let mut by_owner = BTreeMap::<String, Vec<AgentSessionSnapshot>>::new();
+    for session in sessions {
+        let owner = owners
+            .get(&session.id)
+            .cloned()
+            .unwrap_or_else(|| default_node_id.to_owned());
+        by_owner.entry(owner).or_default().push(session.clone());
+    }
+    let mut groups = Vec::with_capacity(node_order.len());
+    for node_id in node_order {
+        let group = by_owner.remove(node_id).unwrap_or_default();
+        groups.push((node_id.clone(), group));
+    }
+    // Removed or otherwise unknown owners come last so they never mask a known
+    // worker in the grouped list.
+    groups.extend(by_owner);
+    groups
 }
 
 pub(crate) fn session_id_for_request(

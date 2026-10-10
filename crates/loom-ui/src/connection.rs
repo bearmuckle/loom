@@ -624,36 +624,6 @@ pub(crate) async fn create_workspace_async(
 }
 
 #[cfg(not(target_family = "wasm"))]
-pub(crate) fn register_workspace(
-    connection: &ClientConnection,
-    workspace: WorkspaceRecord,
-) -> Result<(), LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
-        WorkspaceRequest::RegisterWorkspace { workspace },
-    )));
-    match response.result? {
-        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(_)) => Ok(()),
-        response => Err(unexpected_response("workspace registration", response)),
-    }
-}
-
-#[cfg(target_family = "wasm")]
-pub(crate) async fn register_workspace_async(
-    connection: &ClientConnection,
-    workspace: WorkspaceRecord,
-) -> Result<(), LoomError> {
-    let response = connection
-        .request(RequestEnvelope::new(ClientRequest::Workspace(
-            WorkspaceRequest::RegisterWorkspace { workspace },
-        )))
-        .await;
-    match response.result? {
-        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(_)) => Ok(()),
-        response => Err(unexpected_response("workspace registration", response)),
-    }
-}
-
-#[cfg(not(target_family = "wasm"))]
 pub(crate) fn list_workspace_sessions(
     connection: &ClientConnection,
     workspace_id: WorkspaceId,
@@ -984,11 +954,12 @@ pub(crate) fn unexpected_response(operation: &str, response: ServerResponse) -> 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::{
-        ClientConnection, LoomError, create_session_in_workspace, create_workspace,
-        describe_startup_connection_error, include_discovered_models, list_models,
-        list_workspace_sessions, list_workspaces, negotiate, negotiation_capabilities,
-        provider_name_for_id, redact_secret, register_workspace, remote_url_is_secure_for_secrets,
-        set_workspace_config, unexpected_response, worker_node_status, workspace_config,
+        ClientConnection, ClientRequest, LoomError, RequestEnvelope, WorkspaceRequest,
+        create_session_in_workspace, create_workspace, describe_startup_connection_error,
+        include_discovered_models, list_models, list_workspace_sessions, list_workspaces,
+        negotiate, negotiation_capabilities, provider_name_for_id, redact_secret,
+        remote_url_is_secure_for_secrets, set_workspace_config, unexpected_response,
+        worker_node_status, workspace_config,
     };
     use loom_core::{
         Capability, ErrorCode, LoomError as CoreLoomError, Timestamp, WorkspaceId, WorkspaceRecord,
@@ -1136,7 +1107,12 @@ mod tests {
             created_at: timestamp,
             updated_at: timestamp,
         };
-        register_workspace(&connection, external.clone()).unwrap();
+        let registered = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::RegisterWorkspace {
+                workspace: external.clone(),
+            },
+        )));
+        assert!(registered.result.is_ok());
         assert!(
             list_workspaces(&connection)
                 .unwrap()

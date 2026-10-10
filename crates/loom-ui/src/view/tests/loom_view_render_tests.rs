@@ -960,6 +960,7 @@ fn session_source_dialog_choices_and_close_button_work(cx: &mut TestAppContext) 
             let mut view = LoomView::new_for_test(cx.focus_handle());
             view.source_dialog = Some(SessionSourceDialog {
                 purpose: SessionSourceDialogPurpose::StartSession,
+                target_node_id: String::new(),
                 choice: SessionSourceChoice::Empty,
                 local_directory_available: true,
                 filter_subscription: None,
@@ -1050,6 +1051,7 @@ fn phone_source_dialog_stacks_choices_and_keeps_actions_visible(cx: &mut TestApp
             let mut view = LoomView::new_for_test(cx.focus_handle());
             view.source_dialog = Some(SessionSourceDialog {
                 purpose: SessionSourceDialogPurpose::StartSession,
+                target_node_id: String::new(),
                 choice: SessionSourceChoice::GitHub,
                 local_directory_available: true,
                 filter_subscription: None,
@@ -1134,6 +1136,7 @@ fn github_source_body_stacks_vertically(cx: &mut TestAppContext) {
             let mut view = LoomView::new_for_test(cx.focus_handle());
             view.source_dialog = Some(SessionSourceDialog {
                 purpose: SessionSourceDialogPurpose::StartSession,
+                target_node_id: String::new(),
                 choice: SessionSourceChoice::GitHub,
                 local_directory_available: false,
                 filter_subscription: None,
@@ -3626,6 +3629,7 @@ fn rename_and_source_dialogs_render(cx: &mut TestAppContext) {
     render_scenario(cx, |view| {
         view.source_dialog = Some(SessionSourceDialog {
             purpose: SessionSourceDialogPurpose::StartSession,
+            target_node_id: String::new(),
             choice: SessionSourceChoice::Empty,
             local_directory_available: true,
             filter_subscription: None,
@@ -3638,6 +3642,7 @@ fn rename_and_source_dialogs_render(cx: &mut TestAppContext) {
     render_scenario(cx, |view| {
         view.source_dialog = Some(SessionSourceDialog {
             purpose: SessionSourceDialogPurpose::AddToSession,
+            target_node_id: String::new(),
             choice: SessionSourceChoice::LocalDirectory,
             local_directory_available: true,
             filter_subscription: None,
@@ -3650,6 +3655,7 @@ fn rename_and_source_dialogs_render(cx: &mut TestAppContext) {
     render_scenario(cx, |view| {
         view.source_dialog = Some(SessionSourceDialog {
             purpose: SessionSourceDialogPurpose::StartSession,
+            target_node_id: String::new(),
             choice: SessionSourceChoice::GitHub,
             local_directory_available: false,
             filter_subscription: None,
@@ -3668,6 +3674,7 @@ fn rename_and_source_dialogs_render(cx: &mut TestAppContext) {
     render_scenario(cx, |view| {
         view.source_dialog = Some(SessionSourceDialog {
             purpose: SessionSourceDialogPurpose::StartSession,
+            target_node_id: String::new(),
             choice: SessionSourceChoice::GitHub,
             local_directory_available: true,
             filter_subscription: None,
@@ -3680,6 +3687,7 @@ fn rename_and_source_dialogs_render(cx: &mut TestAppContext) {
     render_scenario(cx, |view| {
         view.source_dialog = Some(SessionSourceDialog {
             purpose: SessionSourceDialogPurpose::AddToSession,
+            target_node_id: String::new(),
             choice: SessionSourceChoice::GitHub,
             local_directory_available: false,
             filter_subscription: None,
@@ -3692,6 +3700,7 @@ fn rename_and_source_dialogs_render(cx: &mut TestAppContext) {
     render_scenario(cx, |view| {
         view.source_dialog = Some(SessionSourceDialog {
             purpose: SessionSourceDialogPurpose::StartSession,
+            target_node_id: String::new(),
             choice: SessionSourceChoice::GitHub,
             local_directory_available: true,
             filter_subscription: None,
@@ -3711,6 +3720,7 @@ fn rename_and_source_dialogs_render(cx: &mut TestAppContext) {
         }];
         view.source_dialog = Some(SessionSourceDialog {
             purpose: SessionSourceDialogPurpose::StartSession,
+            target_node_id: String::new(),
             choice: SessionSourceChoice::GitHub,
             local_directory_available: true,
             filter_subscription: None,

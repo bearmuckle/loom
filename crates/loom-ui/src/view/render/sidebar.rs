@@ -35,7 +35,167 @@ impl LoomView {
             .unwrap_or_default()
             .trim()
             .to_lowercase();
-        let sessions = self.sessions.clone();
+        let node_order = self
+            .worker_nodes
+            .iter()
+            .map(|node| node.status.node_id.clone())
+            .collect::<Vec<_>>();
+        // Group sessions by their owning worker. A connected worker with no
+        // projects keeps an empty group so "no projects" is distinguishable
+        // from "failed to load"; disconnected or removed workers only stay in
+        // the list while they still own a session.
+        let mut groups = group_sessions_by_worker(
+            &self.sessions,
+            &self.session_node_ids,
+            &node_order,
+            &self.default_backend_node_id,
+        )
+        .into_iter()
+        .filter(|(node_id, sessions)| {
+            !sessions.is_empty()
+                || self.worker_nodes.iter().any(|node| {
+                    &node.status.node_id == node_id
+                        && matches!(node.connection_state, WorkerConnectionState::Connected)
+                })
+        })
+        .collect::<Vec<_>>();
+
+        let mut column = div().flex().flex_col().size_full();
+        // A single worker keeps the original flat list with no group headers.
+        if groups.len() <= 1 {
+            if let Some((node_id, sessions)) = groups.pop() {
+                column = column.child(
+                    self.render_worker_session_tree(&node_id, 0, sessions, &filter, layout, cx),
+                );
+            }
+            return column;
+        }
+        for (group_index, (node_id, sessions)) in groups.into_iter().enumerate() {
+            column =
+                column.child(self.render_worker_group_header(&node_id, group_index, layout, cx));
+            if self.collapsed_worker_nodes.contains(&node_id) {
+                continue;
+            }
+            // Keep element ids unique across the per-worker trees.
+            let row_id_base = group_index.saturating_mul(1_000_000);
+            column = column.child(self.render_worker_session_tree(
+                &node_id,
+                row_id_base,
+                sessions,
+                &filter,
+                layout,
+                cx,
+            ));
+        }
+        column
+    }
+
+    /// Renders a worker group header: status dot and name on one line, then
+    /// resources or the last load error beneath, so a long name is never
+    /// clipped. Clicking the header collapses the group.
+    fn render_worker_group_header(
+        &self,
+        node_id: &str,
+        group_index: usize,
+        layout: ResponsiveLayout,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let node = self
+            .worker_nodes
+            .iter()
+            .find(|node| node.status.node_id == node_id);
+        let name = self
+            .node_names
+            .get(node_id)
+            .cloned()
+            .or_else(|| node.map(worker_node_display_name))
+            .unwrap_or_else(|| "Removed worker".to_owned());
+        let online = node.is_some_and(|node| {
+            matches!(node.connection_state, WorkerConnectionState::Connected) && node.status.online
+        });
+        let dot_color = if online { rgb(0x34d399) } else { rgb(0x64748b) };
+        let load_error = self.node_session_load_errors.get(node_id);
+        let (subtitle, subtitle_color) = if let Some(error) = load_error {
+            (error.clone(), rgb(0xfca5a5))
+        } else if let Some(node) = node {
+            if online {
+                (
+                    format_worker_node_resources(&node.status.resources),
+                    rgb(0x64748b),
+                )
+            } else {
+                ("offline".to_owned(), rgb(0x64748b))
+            }
+        } else {
+            ("No worker is connected".to_owned(), rgb(0x64748b))
+        };
+        let collapsed = self.collapsed_worker_nodes.contains(node_id);
+        let toggle_node = node_id.to_owned();
+        div()
+            .id(("worker-group", group_index))
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .pt_3()
+            .pb_1()
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_worker_group(toggle_node.clone());
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .w(px(12.))
+                            .flex_shrink_0()
+                            .child(disclosure_chevron(!collapsed, rgb(0x8f98a6)).size(px(12.))),
+                    )
+                    .child(
+                        div()
+                            .w(px(8.))
+                            .h(px(8.))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(dot_color),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(layout.nav_row_font_size())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0xe5e7eb))
+                            .child(name),
+                    ),
+            )
+            .child(
+                div()
+                    .pl(px(21.))
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_xs()
+                    .text_color(subtitle_color)
+                    .child(subtitle),
+            )
+    }
+
+    /// Builds (or updates) one worker's session tree and renders it.
+    fn render_worker_session_tree(
+        &mut self,
+        node_id: &str,
+        row_id_base: usize,
+        sessions: Vec<AgentSessionSnapshot>,
+        filter: &str,
+        layout: ResponsiveLayout,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
         let mut tree_projects = self.project_tree_snapshots.iter().collect::<Vec<_>>();
         if let Some(active_project) = self.project_snapshot.as_ref()
             && !tree_projects
@@ -52,7 +212,7 @@ impl LoomView {
         let tree_nodes = if filter.is_empty() {
             projection.tree
         } else {
-            filter_session_tree(projection.tree, &filter)
+            filter_session_tree(projection.tree, filter)
         };
         let session_tasks = self
             .project_tree_snapshots
@@ -85,10 +245,11 @@ impl LoomView {
         let tree_items = tree_nodes.iter().map(session_tree_item).collect::<Vec<_>>();
         let selected_session_id = self.active_session.id.to_string();
         let selected_item = find_session_tree_item(&tree_items, &selected_session_id);
-        let tree = if let Some(tree) = self.session_tree.clone() {
-            if self.session_tree_entries != tree_nodes {
+        let tree = if let Some(tree) = self.session_trees.get(node_id).cloned() {
+            if self.session_tree_entries.get(node_id) != Some(&tree_nodes) {
                 tree.update(cx, |state, cx| state.set_items(tree_items.clone(), cx));
-                self.session_tree_entries = tree_nodes.clone();
+                self.session_tree_entries
+                    .insert(node_id.to_owned(), tree_nodes.clone());
             }
             let current_selected_id = tree
                 .read(cx)
@@ -99,10 +260,11 @@ impl LoomView {
             }
             tree
         } else {
-            self.session_tree_entries = tree_nodes;
+            self.session_tree_entries
+                .insert(node_id.to_owned(), tree_nodes);
             let tree = cx.new(|cx| TreeState::new(cx).items(tree_items.clone()));
             tree.update(cx, |state, cx| state.set_selected_item(selected_item, cx));
-            self.session_tree = Some(tree.clone());
+            self.session_trees.insert(node_id.to_owned(), tree.clone());
             tree
         };
 
@@ -114,13 +276,14 @@ impl LoomView {
         // menu lazily without cloning the project snapshot every frame.
         let row_project = std::rc::Rc::new(self.project_snapshot.clone());
         KitTree::new(&tree, move |index, entry, selected, _, _app| {
+            let row_index = row_id_base.saturating_add(index);
             let session_id = entry.item().id.to_string();
             let Some(session) = sessions
                 .iter()
                 .find(|session| session.id.to_string() == session_id)
                 .cloned()
             else {
-                return ListItem::new(("session-tree-root", index));
+                return ListItem::new(("session-tree-root", row_index));
             };
             let label = entry.item().label.to_string();
             let depth = entry.depth();
@@ -140,7 +303,7 @@ impl LoomView {
                 session_status_pill(session.state, session_tasks.get(&session.id).copied());
             // Project rows show a radar activity light only while the project or
             // one of its agents is working; child rows show a status chip.
-            let activity = (is_root && active).then(|| task_activity_indicator(index, status));
+            let activity = (is_root && active).then(|| task_activity_indicator(row_index, status));
             let pill = (!is_root).then_some(status);
             let root_active = is_root && active;
             let icon = if is_root {
@@ -160,7 +323,7 @@ impl LoomView {
             };
             let click_view = view.clone();
             let click_session = session.clone();
-            ListItem::new(("session-tree-root", index))
+            ListItem::new(("session-tree-root", row_index))
                 .selected(selected)
                 .mx_1()
                 .rounded_md()
@@ -244,7 +407,7 @@ impl LoomView {
                                     let menu_project = row_project.clone();
                                     let menu_view = view.clone();
                                     element.child(
-                                        Button::new(("session-tree-menu", index))
+                                        Button::new(("session-tree-menu", row_index))
                                             .icon(Icon::new(IconName::Ellipsis))
                                             .ghost()
                                             .small()
@@ -292,6 +455,13 @@ impl LoomView {
             )
         })
         .size_full()
+        .into_any_element()
+    }
+
+    pub(crate) fn toggle_worker_group(&mut self, node_id: String) {
+        if !self.collapsed_worker_nodes.remove(&node_id) {
+            self.collapsed_worker_nodes.insert(node_id);
+        }
     }
 
     pub(crate) fn render_session_sidebar(

@@ -738,17 +738,15 @@ impl LoomView {
         );
     }
 
+    /// Persists the workspace config to the home workspace and writes it to
+    /// every peer's own workspace. A workspace belongs to one worker, so no
+    /// workspace record is shared across the fleet.
     pub(crate) fn persist_and_distribute_workspace_config(
         &self,
         retiring: Option<(String, ClientConnection)>,
         cx: &mut Context<Self>,
     ) {
-        let workspace_id = self.workspace_id;
-        let workspace = self
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.id == workspace_id)
-            .cloned();
+        let home_workspace_id = self.workspace_id;
         let config = self.workspace_config.clone();
         let source = self.connection.clone();
         let peers = self
@@ -756,9 +754,14 @@ impl LoomView {
             .iter()
             .filter(|node| !node.is_local)
             .filter_map(|node| {
-                node.connection
-                    .as_ref()
-                    .map(|connection| (node.status.name.clone(), connection.clone()))
+                node.connection.as_ref().map(|connection| {
+                    let known = self
+                        .node_workspaces
+                        .get(&node.status.node_id)
+                        .and_then(|workspaces| active_workspace(workspaces))
+                        .map(|workspace| workspace.id);
+                    (node.status.name.clone(), connection.clone(), known)
+                })
             })
             .collect::<Vec<_>>();
         #[cfg(not(target_family = "wasm"))]
@@ -766,43 +769,32 @@ impl LoomView {
             let errors = cx
                 .background_spawn(async move {
                     let mut errors = Vec::new();
-                    if let Err(error) = set_workspace_config(&source, workspace_id, config.clone())
+                    if let Err(error) =
+                        set_workspace_config(&source, home_workspace_id, config.clone())
                     {
                         errors.push(("save workspace config".to_owned(), error));
                     }
-                    for (name, connection) in peers {
-                        let registration = workspace
-                            .clone()
-                            .ok_or_else(|| LoomError::not_found("workspace", workspace_id));
-                        if let Err(error) = registration
-                            .and_then(|workspace| register_workspace(&connection, workspace))
-                        {
-                            errors.push((format!("register workspace on {name}"), error));
-                            continue;
-                        }
+                    for (name, connection, known) in peers {
+                        let workspace_id = match known {
+                            Some(workspace_id) => workspace_id,
+                            None => match resolve_workspace_id(&connection) {
+                                Ok(workspace_id) => workspace_id,
+                                Err(error) => {
+                                    errors.push((format!("resolve workspace on {name}"), error));
+                                    continue;
+                                }
+                            },
+                        };
                         if let Err(error) =
                             set_workspace_config(&connection, workspace_id, config.clone())
                         {
                             errors.push((format!("distribute workspace config to {name}"), error));
                         }
                     }
-                    if let Some((name, connection)) = retiring {
-                        if let Some(workspace) = workspace.clone()
-                            && let Err(error) = register_workspace(&connection, workspace)
-                        {
-                            errors.push((format!("register workspace on {name}"), error));
-                        }
-                        if let Err(error) =
-                            set_workspace_config(&connection, workspace_id, config.clone())
-                        {
-                            errors.push((
-                                format!("remove worker node {name} from its config"),
-                                error,
-                            ));
-                        }
-                        if let Err(error) = connection.close() {
-                            errors.push((format!("close worker node {name} connection"), error));
-                        }
+                    if let Some((name, connection)) = retiring
+                        && let Err(error) = connection.close()
+                    {
+                        errors.push((format!("close worker node {name} connection"), error));
                     }
                     errors
                 })
@@ -820,19 +812,21 @@ impl LoomView {
         cx.spawn(async move |view, cx| {
             let mut errors = Vec::new();
             if let Err(error) =
-                set_workspace_config_async(&source, workspace_id, config.clone()).await
+                set_workspace_config_async(&source, home_workspace_id, config.clone()).await
             {
                 errors.push(("save workspace config".to_owned(), error));
             } else {
-                for (name, connection) in peers {
-                    let registration = match workspace.clone() {
-                        Some(workspace) => register_workspace_async(&connection, workspace).await,
-                        None => Err(LoomError::not_found("workspace", workspace_id)),
+                for (name, connection, known) in peers {
+                    let workspace_id = match known {
+                        Some(workspace_id) => workspace_id,
+                        None => match resolve_workspace_id_async(&connection).await {
+                            Ok(workspace_id) => workspace_id,
+                            Err(error) => {
+                                errors.push((format!("resolve workspace on {name}"), error));
+                                continue;
+                            }
+                        },
                     };
-                    if let Err(error) = registration {
-                        errors.push((format!("register workspace on {name}"), error));
-                        continue;
-                    }
                     if let Err(error) =
                         set_workspace_config_async(&connection, workspace_id, config.clone()).await
                     {
@@ -840,20 +834,10 @@ impl LoomView {
                     }
                 }
             }
-            if let Some((name, connection)) = retiring {
-                if let Some(workspace) = workspace
-                    && let Err(error) = register_workspace_async(&connection, workspace).await
-                {
-                    errors.push((format!("register workspace on {name}"), error));
-                }
-                if let Err(error) =
-                    set_workspace_config_async(&connection, workspace_id, config.clone()).await
-                {
-                    errors.push((format!("remove worker node {name} from its config"), error));
-                }
-                if let Err(error) = connection.close() {
-                    errors.push((format!("close worker node {name} connection"), error));
-                }
+            if let Some((name, connection)) = retiring
+                && let Err(error) = connection.close()
+            {
+                errors.push((format!("close worker node {name} connection"), error));
             }
             view.update(cx, |view, cx| {
                 for (context, error) in errors {
@@ -1055,4 +1039,27 @@ impl LoomView {
         crate::theme::apply_theme(appearance, cx);
         cx.notify();
     }
+}
+
+/// The workspace to write settings into on a peer: its most recently updated
+/// one, or a newly created `Default` when it has none. A workspace is never
+/// shared across workers, so this resolves per connection.
+#[cfg(not(target_family = "wasm"))]
+fn resolve_workspace_id(connection: &ClientConnection) -> Result<WorkspaceId, LoomError> {
+    let workspaces = list_workspaces(connection)?;
+    if let Some(workspace) = active_workspace(&workspaces) {
+        return Ok(workspace.id);
+    }
+    Ok(create_workspace(connection, "Default")?.id)
+}
+
+#[cfg(target_family = "wasm")]
+async fn resolve_workspace_id_async(
+    connection: &ClientConnection,
+) -> Result<WorkspaceId, LoomError> {
+    let workspaces = list_workspaces_async(connection).await?;
+    if let Some(workspace) = active_workspace(&workspaces) {
+        return Ok(workspace.id);
+    }
+    Ok(create_workspace_async(connection, "Default").await?.id)
 }

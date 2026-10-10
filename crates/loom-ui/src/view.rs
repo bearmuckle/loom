@@ -92,13 +92,12 @@ use crate::{
 use crate::connection::{
     attach_session_repository, create_session_in_workspace, create_workspace,
     list_models_from_backend, list_workspace_sessions, list_workspaces, redact_secret,
-    register_workspace, unexpected_response,
+    unexpected_response,
 };
 #[cfg(target_family = "wasm")]
 use crate::connection::{
     attach_session_repository_async, create_session_in_workspace_async, create_workspace_async,
     list_models_from_backend, list_workspace_sessions_async, list_workspaces_async,
-    register_workspace_async,
 };
 #[cfg(target_family = "wasm")]
 use crate::connection::{redact_secret, unexpected_response};
@@ -443,6 +442,10 @@ pub(crate) struct LoomView {
     session_node_ids: BTreeMap<AgentSessionId, String>,
     pub(crate) workspace_id: WorkspaceId,
     workspaces: Vec<WorkspaceRecord>,
+    /// Workspaces reported by each worker node. A workspace belongs to exactly
+    /// one worker, so the client never shares one across nodes; this is used to
+    /// target creation and config at the worker's own workspace.
+    node_workspaces: BTreeMap<String, Vec<WorkspaceRecord>>,
     local_directory_sources_available: bool,
     /// Native local worker working directory used to pre-fill the New project
     /// dialog. `None` for remote and browser clients, for the demo workspace,
@@ -461,8 +464,16 @@ pub(crate) struct LoomView {
     project_feed_after_sequence: Option<EventSequence>,
     project_feed_epoch: Option<String>,
     project_poll_scheduled: bool,
-    session_tree: Option<Entity<TreeState>>,
-    session_tree_entries: Vec<SessionTreeNode>,
+    /// One session tree per worker node so the sidebar can group projects by
+    /// the worker that owns them. Keyed by the backend's stable node identity.
+    session_trees: BTreeMap<String, Entity<TreeState>>,
+    /// Last rendered tree nodes per worker node, used to skip redundant updates.
+    session_tree_entries: BTreeMap<String, Vec<SessionTreeNode>>,
+    /// Worker node groups the user has collapsed in the sidebar.
+    collapsed_worker_nodes: BTreeSet<String>,
+    /// Last session-list error per worker node, so a worker that failed to load
+    /// is distinguishable from one that simply has no projects.
+    node_session_load_errors: BTreeMap<String, String>,
     pub(crate) active_session: AgentSessionSnapshot,
     pub(crate) active_run: Option<AgentRunSnapshot>,
     pub(crate) active_run_id: Option<RunId>,
@@ -1345,19 +1356,10 @@ fn source_choice_is_allowed(
     }
 }
 
-fn local_source_available(
-    purpose: SessionSourceDialogPurpose,
-    configured: bool,
-    active_node_id: Option<&str>,
-    default_node_id: &str,
-) -> bool {
-    configured
-        && match purpose {
-            SessionSourceDialogPurpose::StartSession => true,
-            SessionSourceDialogPurpose::AddToSession => {
-                active_node_id.is_none_or(|node_id| node_id == default_node_id)
-            }
-        }
+/// Local folders can only be attached by the worker that runs on this machine,
+/// so the choice is offered only when the dialog targets the local node.
+fn local_source_available(configured: bool, target_node_id: &str, default_node_id: &str) -> bool {
+    configured && target_node_id == default_node_id
 }
 
 pub(crate) struct GitHubSource {
@@ -1406,6 +1408,10 @@ fn resolve_local_source_path(entered: &str, current: Option<&Path>) -> Option<St
 
 struct SessionSourceDialog {
     purpose: SessionSourceDialogPurpose,
+    /// The worker node the dialog creates the project on, chosen with the
+    /// "Run on" picker. Resolved when the dialog opens and updated by
+    /// `choose_source_node`.
+    target_node_id: String,
     choice: SessionSourceChoice,
     local_directory_available: bool,
     filter_subscription: Option<Subscription>,
@@ -1451,6 +1457,7 @@ impl LoomView {
             session_node_ids: BTreeMap::new(),
             workspace_id,
             workspaces: Vec::new(),
+            node_workspaces: BTreeMap::new(),
             local_directory_sources_available: true,
             local_current_directory: None,
             sessions: Vec::new(),
@@ -1461,8 +1468,10 @@ impl LoomView {
             project_feed_after_sequence: None,
             project_feed_epoch: None,
             project_poll_scheduled: false,
-            session_tree: None,
-            session_tree_entries: Vec::new(),
+            session_trees: BTreeMap::new(),
+            session_tree_entries: BTreeMap::new(),
+            collapsed_worker_nodes: BTreeSet::new(),
+            node_session_load_errors: BTreeMap::new(),
             active_session: active_session.clone(),
             active_run: None,
             active_run_id: None,

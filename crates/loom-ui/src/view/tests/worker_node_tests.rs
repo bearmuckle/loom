@@ -733,35 +733,11 @@ fn source_dialog_initial_choice_tracks_purpose_and_local_availability() {
 }
 
 #[test]
-fn local_source_availability_respects_backend_and_session_ownership() {
-    use SessionSourceDialogPurpose::{AddToSession, StartSession};
-
-    assert!(local_source_available(
-        StartSession,
-        true,
-        Some("remote"),
-        "local"
-    ));
-    assert!(!local_source_available(StartSession, false, None, "local"));
-    assert!(local_source_available(AddToSession, true, None, "local"));
-    assert!(local_source_available(
-        AddToSession,
-        true,
-        Some("local"),
-        "local"
-    ));
-    assert!(!local_source_available(
-        AddToSession,
-        true,
-        Some("remote"),
-        "local"
-    ));
-    assert!(!local_source_available(
-        AddToSession,
-        false,
-        Some("local"),
-        "local"
-    ));
+fn local_source_availability_requires_the_local_target() {
+    assert!(local_source_available(true, "local", "local"));
+    assert!(!local_source_available(false, "local", "local"));
+    assert!(!local_source_available(true, "remote", "local"));
+    assert!(!local_source_available(false, "remote", "local"));
 }
 
 #[test]
