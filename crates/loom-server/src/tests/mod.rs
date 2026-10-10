@@ -48,6 +48,7 @@ mod resources;
 mod retention;
 mod runs;
 mod session;
+mod session_deletion;
 mod session_workspace;
 mod support;
 mod util;
