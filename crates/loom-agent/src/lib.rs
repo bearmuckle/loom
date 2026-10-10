@@ -2642,6 +2642,7 @@ mod tests {
         };
         let task = AgentTask::new("read two things", ModelId::new("gpt-6-luna")).unwrap();
         let mut runtime = AgentRuntime::new(AgentSessionId::new(), task, Box::new(provider), tools);
+        runtime.set_read_pool(Arc::new(crate::pool::BoundedPool::new(2)));
 
         runtime.start().unwrap();
         assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
