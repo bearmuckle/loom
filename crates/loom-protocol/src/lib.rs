@@ -75,6 +75,76 @@ pub struct WorkerNodeStatus {
     pub resources: WorkerNodeResources,
 }
 
+/// Active backend archive-retention policy, exposed read-only to clients.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArchiveRetentionPolicy {
+    /// Retention window in milliseconds; `None` or zero means retention is disabled.
+    #[serde(default)]
+    pub retention_ms: Option<u64>,
+    /// Whether an automatic sweep may discard dirty or locked worktrees.
+    #[serde(default)]
+    pub force_discard_worktrees: bool,
+}
+
+impl ArchiveRetentionPolicy {
+    /// Policy used when retention is turned off.
+    pub const fn disabled() -> Self {
+        Self {
+            retention_ms: None,
+            force_discard_worktrees: false,
+        }
+    }
+
+    /// Whether the policy keeps archived sessions alive for a retention window.
+    pub fn is_enabled(&self) -> bool {
+        self.retention_ms
+            .is_some_and(|retention_ms| retention_ms > 0)
+    }
+
+    /// Retention window, or `None` when retention is disabled.
+    pub fn retention(&self) -> Option<std::time::Duration> {
+        self.retention_ms
+            .filter(|retention_ms| *retention_ms > 0)
+            .map(std::time::Duration::from_millis)
+    }
+}
+
+#[cfg(test)]
+mod archive_retention_policy_tests {
+    use super::ArchiveRetentionPolicy;
+
+    #[test]
+    fn disabled_policy_reports_no_retention_window() {
+        let policy = ArchiveRetentionPolicy::disabled();
+        assert_eq!(policy, ArchiveRetentionPolicy::default());
+        assert!(!policy.is_enabled());
+        assert_eq!(policy.retention(), None);
+    }
+
+    #[test]
+    fn positive_retention_window_enables_the_policy() {
+        let policy = ArchiveRetentionPolicy {
+            retention_ms: Some(1_500),
+            force_discard_worktrees: true,
+        };
+        assert!(policy.is_enabled());
+        assert_eq!(
+            policy.retention(),
+            Some(std::time::Duration::from_millis(1_500))
+        );
+    }
+
+    #[test]
+    fn zero_retention_window_is_disabled() {
+        let policy = ArchiveRetentionPolicy {
+            retention_ms: Some(0),
+            force_discard_worktrees: true,
+        };
+        assert!(!policy.is_enabled());
+        assert_eq!(policy.retention(), None);
+    }
+}
+
 #[cfg(test)]
 mod worker_node_resource_tests {
     use super::WorkerNodeResources;
@@ -220,6 +290,9 @@ impl ClientRequest {
             Self::Control(ControlRequest::GetWorkerNodeStatus) => {
                 Some(Capability::ReadWorkerNodeStatus)
             }
+            Self::Control(ControlRequest::GetArchiveRetentionPolicy) => {
+                Some(Capability::ReadWorkerNodeStatus)
+            }
             Self::Workspace(WorkspaceRequest::CreateWorkspace { .. })
             | Self::Workspace(WorkspaceRequest::RegisterWorkspace { .. })
             | Self::Workspace(WorkspaceRequest::RenameWorkspace { .. }) => {
@@ -342,6 +415,9 @@ impl ClientRequest {
             | Self::Session(SessionRequest::ArchiveAgentSession { .. }) => {
                 Some(Capability::ControlAgentSession)
             }
+            Self::Session(SessionRequest::DeleteAgentSession { .. }) => {
+                Some(Capability::DeleteAgentSession)
+            }
             Self::Events(EventsRequest::GetSessionEvents { .. })
             | Self::Events(EventsRequest::GetRecentSessionEvents { .. }) => {
                 Some(Capability::SubscribeSessionEvents)
@@ -433,6 +509,7 @@ impl ClientRequest {
                 | Self::Session(SessionRequest::SetSessionApprovalPolicy { .. })
                 | Self::Session(SessionRequest::RenameAgentSession { .. })
                 | Self::Session(SessionRequest::ArchiveAgentSession { .. })
+                | Self::Session(SessionRequest::DeleteAgentSession { .. })
                 | Self::Run(RunRequest::ApproveAgentAction { .. })
                 | Self::Run(RunRequest::RejectAgentAction { .. })
                 | Self::Run(RunRequest::SendAgentMessage { .. })
