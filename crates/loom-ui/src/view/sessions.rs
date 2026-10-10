@@ -336,14 +336,11 @@ impl LoomView {
     }
 
     pub(crate) fn select_session(&mut self, session: AgentSessionSnapshot, cx: &mut Context<Self>) {
-        let backend = match self.backend_for_session(session.id) {
-            Ok(backend) => backend,
-            Err(error) => {
-                self.record_backend_error("select session", error);
-                cx.notify();
-                return;
-            }
-        };
+        if let Err(error) = self.backend_for_session(session.id) {
+            self.record_backend_error("select session", error);
+            cx.notify();
+            return;
+        }
         self.github_login = None;
         self.source_dialog = None;
         self.settings_open = false;
@@ -365,7 +362,30 @@ impl LoomView {
             self.refresh_models_for_node_async(node_id, cx);
         }
         self.ensure_session_task_message(session.id);
-        let session_id = session.id;
+        self.begin_session_data_load(session.id, cx);
+        cx.notify();
+    }
+
+    /// Requests the session's durable projection plus the events after its
+    /// cursor and applies both through [`Self::finish_async_session_load`].
+    ///
+    /// Interactive selection and poll-driven resync share this ladder, so a
+    /// resync rebuilds the conversation from durable state (the run projection
+    /// and the newest transcript page) instead of replaying whatever partial
+    /// event window the backend returned.
+    pub(crate) fn begin_session_data_load(
+        &mut self,
+        session_id: AgentSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let backend = match self.backend_for_session(session_id) {
+            Ok(backend) => backend,
+            Err(error) => {
+                self.record_backend_error("load session", error);
+                cx.notify();
+                return;
+            }
+        };
         let mut event_stream_epoch = self.event_stream_epoch.clone();
         let snapshot_request = backend.submit(RequestEnvelope::new(ClientRequest::Session(
             SessionRequest::GetAgentSessionInitialState { session_id },
@@ -453,7 +473,6 @@ impl LoomView {
             .ok();
         })
         .detach();
-        cx.notify();
     }
 
     pub(crate) fn finish_async_session_load(
@@ -503,7 +522,7 @@ impl LoomView {
             }
         };
         self.reset_projection();
-        self.after_sequence = fallback_projection
+        let fallback_latest_sequence = fallback_projection
             .as_ref()
             .map(|projection| projection.latest_sequence);
         match events_response.result {
@@ -512,10 +531,10 @@ impl LoomView {
                 stream_epoch,
             })) => {
                 self.event_stream_epoch = stream_epoch;
-                for event in events {
-                    self.after_sequence = Some(event.sequence);
-                    self.consume_event(&event.event);
-                }
+                // The projection is empty again, so the whole batch is applied
+                // and the cursor ends at the later of the batch and the
+                // projection this rebuild started from.
+                self.apply_event_batch(events, fallback_latest_sequence);
                 if let Some(run) = fallback_projection
                     .as_ref()
                     .and_then(|projection| projection.active_run.as_ref())
@@ -540,11 +559,7 @@ impl LoomView {
                 self.event_stream_epoch = stream_epoch;
                 self.active_session = session;
                 self.reset_projection();
-                self.after_sequence = Some(latest_sequence);
-                for event in events {
-                    self.after_sequence = Some(event.sequence);
-                    self.consume_event(&event.event);
-                }
+                self.apply_event_batch(events, Some(latest_sequence));
                 if let Some(run) = fallback_projection
                     .as_ref()
                     .and_then(|projection| projection.active_run.as_ref())

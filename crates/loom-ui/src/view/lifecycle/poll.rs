@@ -122,7 +122,11 @@ impl LoomView {
                     && view.project_has_live_children()
                     && !view.run_is_active()
                 {
-                    view.poll_run_once(cx);
+                    // Share the session poll's single-flight flag: a project
+                    // poll must not dispatch a second session poll while one is
+                    // already in flight, because both would apply the same
+                    // event batch.
+                    view.start_run_poll_if_idle(cx);
                 }
                 view.schedule_project_poll(cx);
             },
@@ -146,26 +150,32 @@ impl LoomView {
                         stream_epoch,
                     })) => {
                         view.event_stream_epoch = stream_epoch;
-                        for event in events {
-                            view.after_sequence = Some(event.sequence);
-                            view.consume_event(&event.event);
-                        }
+                        // Applying by sequence makes the incremental poll
+                        // idempotent: a re-delivered or overlapping batch
+                        // contributes nothing because every event at or below
+                        // the cursor has already been consumed.
+                        view.apply_event_batch(events, None);
                     }
                     Ok(ServerResponse::Events(EventsResponse::SessionEventsSnapshot {
                         session,
-                        events,
-                        latest_sequence,
                         stream_epoch,
                         ..
                     })) => {
+                        // The snapshot's window can be a partial tail of the
+                        // journal: `oldest_sequence` says how much older
+                        // history the response left out. The incremental cursor
+                        // is therefore no longer trustworthy, so rebuild the
+                        // conversation from durable state exactly like an
+                        // interactive session load (the run projection and the
+                        // events after its cursor, then the newest transcript
+                        // page) instead of replaying the tail over a cleared
+                        // projection, which used to collapse the conversation
+                        // to whatever the snapshot happened to carry.
                         view.event_stream_epoch = stream_epoch;
                         view.active_session = session;
                         view.reset_projection();
-                        view.after_sequence = Some(latest_sequence);
-                        for event in events {
-                            view.after_sequence = Some(event.sequence);
-                            view.consume_event(&event.event);
-                        }
+                        let session_id = view.active_session.id;
+                        view.begin_session_data_load(session_id, cx);
                     }
                     Err(error) => view.record_backend_error("session event stream", error),
                     Ok(response) => view.record_backend_error(
@@ -246,7 +256,19 @@ impl LoomView {
     }
 
     pub(crate) fn start_run_polling(&mut self, cx: &mut Context<Self>) {
-        if self.run_poll_scheduled || self.active_run_id.is_none() {
+        if self.active_run_id.is_none() {
+            return;
+        }
+        self.start_run_poll_if_idle(cx);
+    }
+
+    /// Dispatches one session poll unless another poll is already scheduled.
+    ///
+    /// Callers that poll outside the scheduled cadence go through this guard,
+    /// so a second, overlapping session poll cannot apply the same event batch
+    /// twice.
+    pub(crate) fn start_run_poll_if_idle(&mut self, cx: &mut Context<Self>) {
+        if self.run_poll_scheduled {
             return;
         }
         self.run_poll_scheduled = true;

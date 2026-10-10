@@ -148,6 +148,10 @@ impl LoomView {
 
     pub(crate) fn reset_projection(&mut self) {
         self.timeline.clear();
+        // The optimistic entries stood for timeline items that this reset just
+        // removed, so keeping one would silently suppress the next matching
+        // `UserMessage` event instead of showing that message.
+        self.optimistic_messages.clear();
         self.plan = None;
         self.plan_collapsed = false;
         // A different session's review content must not count as already
