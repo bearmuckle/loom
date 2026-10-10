@@ -4,6 +4,8 @@ mod error;
 mod filesystem;
 mod id;
 mod limits;
+#[cfg(not(target_family = "wasm"))]
+mod paths;
 mod policy;
 mod process;
 mod project;
@@ -32,6 +34,10 @@ pub use id::{
     TerminalId, ToolCallId, WorkspaceId,
 };
 pub use limits::{LimitKind, LimitStatus, SessionLimits, UsageSnapshot};
+#[cfg(not(target_family = "wasm"))]
+pub use paths::{
+    bind_key, config_dir, create_private_dir, instance_dir, state_dir, state_root, token_path,
+};
 pub use policy::{ActionKind, ApprovalPolicy, PolicyDecision, PolicyEvaluation};
 pub use process::{
     TaskArtifact, TaskEvent, TaskEventRecord, TaskEvidenceLink, TaskKind, TaskSnapshot, TaskSpec,

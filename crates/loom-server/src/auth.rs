@@ -189,9 +189,14 @@ impl AuthTokenStore {
         Self::default()
     }
 
+    /// Mints a new `loom-<uuid>` token value without registering it, so a
+    /// standalone server can write the same shape it would issue itself.
+    pub fn generate_token() -> String {
+        format!("loom-{}", Uuid::new_v4().simple())
+    }
+
     pub fn issue(&self, scope: AuthorizationScope) -> Result<IssuedToken> {
-        let token = format!("loom-{}", Uuid::new_v4().simple());
-        self.insert(token, scope)
+        self.insert(Self::generate_token(), scope)
     }
 
     pub fn insert(

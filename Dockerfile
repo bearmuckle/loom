@@ -70,6 +70,11 @@ COPY LICENSE-AGPL LICENSES.md /usr/share/doc/loom/
 USER loom
 WORKDIR /var/lib/loom
 
+# The server keeps its instance directory (the database, the token, and the
+# files derived from the database path) below the state root, so this is the
+# path to mount when the state must outlive the container.
+ENV LOOM_STATE_DIR=/var/lib/loom
+
 EXPOSE 8765
 
 # The backend serves an unauthenticated plain-HTTP `/health` endpoint wherever it
@@ -79,8 +84,12 @@ EXPOSE 8765
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
   CMD curl -fsS http://127.0.0.1:8765/health || exit 1
 
-# Serving requires a bearer token, so the default command fails closed: mount one
-# at /etc/loom/token, or override `CMD` with `--token ...`.
+# The default command needs no mounted token. Without `--token` or
+# `--token-file` the first start generates a `loom-<uuid>` token inside the
+# instance directory with mode 0600, logs the path, and prints the value only
+# when stdout is a terminal; override `CMD` with `--token ...` for a fixed one.
+# `--instance-name loom-server` pins one instance directory below
+# `LOOM_STATE_DIR` for this bind address.
 #
 # `--bind 0.0.0.0` inside the container's own network namespace is what makes
 # `-p` reach the backend, and the server refuses a non-loopback plaintext bind
@@ -93,5 +102,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
 ENTRYPOINT ["loom-server"]
 CMD ["--bind", "0.0.0.0:8765", \
      "--allow-insecure-remote", \
-     "--token-file", "/etc/loom/token", \
-     "--persistence", "/var/lib/loom/loom.db"]
+     "--instance-name", "loom-server"]

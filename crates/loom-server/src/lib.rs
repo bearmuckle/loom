@@ -80,6 +80,7 @@ use backend::{
 mod connection;
 mod dispatch;
 mod event_journal;
+mod instance;
 mod project_tools;
 mod remote;
 mod resource_monitor;
@@ -120,6 +121,10 @@ struct GitHubApiUser {
 }
 
 pub use auth::{AuthSession, AuthTokenStore, AuthorizationScope, IssuedToken};
+pub use instance::{
+    Instance, InstanceLayout, InstanceOptions, ResolvedToken, STATE_DB_FILE, TOKEN_FILE,
+    TokenSource,
+};
 pub use remote::{
     RemoteServer, RemoteServerConfig, RunningRemoteServer, ServerTlsConfig,
     WEBSOCKET_TLS_SUPPORTED, WebSocketConnection, WebSocketTransport,

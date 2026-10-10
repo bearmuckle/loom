@@ -25,8 +25,8 @@ use loom_providers::{
     CredentialRef, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF, GitHubCopilotAuthenticator,
 };
 use loom_server::{
-    AuthTokenStore, AuthorizationScope, InProcessBackend, InProcessConnection, RemoteServer,
-    RemoteServerConfig, WebSocketConnection, WebSocketTransport,
+    AuthTokenStore, AuthorizationScope, InProcessBackend, InProcessConnection, Instance,
+    InstanceOptions, RemoteServer, RemoteServerConfig, WebSocketConnection, WebSocketTransport,
 };
 
 /// How long the shell waits between event polls while a run is executing.
@@ -182,10 +182,28 @@ struct CliOptions {
     serve: bool,
     m4_demo: bool,
     bind: SocketAddr,
+    instance_name: Option<String>,
     token: Option<String>,
+    token_file: Option<PathBuf>,
     login_provider: Option<String>,
     reset_state: bool,
     allow_insecure_remote: bool,
+}
+
+impl CliOptions {
+    /// The settings [`Instance`] applies its defaults to when `--serve` runs, so
+    /// the standalone shell mode resolves its state directory and token exactly
+    /// like the `loom-server` binary does.
+    fn instance_options(&self) -> InstanceOptions {
+        InstanceOptions {
+            bind: self.bind,
+            instance_name: self.instance_name.clone(),
+            persistence: self.persistence.clone(),
+            token: self.token.clone(),
+            token_file: self.token_file.clone(),
+            reset_state: self.reset_state,
+        }
+    }
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOptions>, LoomError> {
@@ -203,7 +221,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
         bind: "127.0.0.1:8765"
             .parse()
             .expect("valid default bind address"),
+        instance_name: None,
         token: None,
+        token_file: None,
         login_provider: None,
         reset_state: false,
         allow_insecure_remote: false,
@@ -231,6 +251,13 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
                     })?;
             }
             "--token" => options.token = Some(required_value(&mut args, "--token")?),
+            "--token-file" => {
+                options.token_file =
+                    Some(PathBuf::from(required_value(&mut args, "--token-file")?));
+            }
+            "--instance-name" => {
+                options.instance_name = Some(required_value(&mut args, "--instance-name")?);
+            }
             "--login" => {
                 options.login_provider = Some(required_value(&mut args, "--login")?);
             }
@@ -243,7 +270,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
                     "Usage: loom [--name <name>] [--task <task>] [--model <id>] \
                      [--root <path>] [--manual-approval] [--m3-demo] \
                      [--persistence <path>] [--reset-state] \
-                     [--serve --bind <addr> --token <token>] \
+                     [--serve --bind <addr> --instance-name <name> \
+                     [--token <token> | --token-file <path>]] \
                      [--m4-demo] [--login github-copilot] \
                      [--allow-insecure-remote]"
                 );
@@ -258,6 +286,11 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
                 println!(
                     "Use --serve with an explicit bearer --token to expose the standalone \
                      WebSocket backend."
+                );
+                println!(
+                    "Without --persistence, --serve keeps its state in \
+                     <state-dir>/<instance-name or bind-key>/state.db and reads or generates \
+                     <instance-dir>/token, exactly like the loom-server binary."
                 );
                 println!(
                     "A --serve --bind address that is not loopback needs --allow-insecure-remote to \
@@ -295,6 +328,12 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
             }
             value if value.starts_with("--token=") => {
                 options.token = Some(value["--token=".len()..].to_owned());
+            }
+            value if value.starts_with("--token-file=") => {
+                options.token_file = Some(PathBuf::from(value["--token-file=".len()..].to_owned()));
+            }
+            value if value.starts_with("--instance-name=") => {
+                options.instance_name = Some(value["--instance-name=".len()..].to_owned());
             }
             value if value.starts_with("--login=") => {
                 options.login_provider = Some(value["--login=".len()..].to_owned());
@@ -350,20 +389,15 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
             "--root is only available for one-shot sessions; server sessions manage their own repositories",
         ));
     }
-    let token = options
-        .token
-        .filter(|token| !token.trim().is_empty())
-        .ok_or_else(|| LoomError::invalid_request("--serve requires a non-empty --token"))?;
-    let persistence_path = options.persistence;
-    if let Some(path) = persistence_path.as_deref() {
-        ensure_state_database(path, options.reset_state)?;
-    }
-    let backend = match persistence_path {
+    let instance = Instance::prepare(&options.instance_options(), &loom_core::state_dir())?;
+    instance.token().log_source();
+    instance.token().print_generated();
+    let backend = match instance.state_db() {
         Some(path) => InProcessBackend::new_persistent_with_github_copilot(path)?,
         None => InProcessBackend::new_with_github_copilot()?,
     };
     let auth = Arc::new(AuthTokenStore::new());
-    let _issued = auth.insert(token, AuthorizationScope::all())?;
+    let _issued = auth.insert(instance.token().token(), AuthorizationScope::all())?;
     let config = RemoteServerConfig {
         bind_addr: options.bind,
         allow_insecure_remote: options.allow_insecure_remote,
@@ -1584,7 +1618,9 @@ mod tests {
             serve: false,
             m4_demo: false,
             bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            instance_name: None,
             token: None,
+            token_file: None,
             login_provider: None,
             reset_state: false,
             allow_insecure_remote: false,
@@ -1612,7 +1648,9 @@ mod tests {
             serve: false,
             m4_demo: true,
             bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            instance_name: None,
             token: None,
+            token_file: None,
             login_provider: None,
             reset_state: false,
             allow_insecure_remote: false,
@@ -1643,7 +1681,9 @@ mod tests {
             serve: false,
             m4_demo: false,
             bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            instance_name: None,
             token: None,
+            token_file: None,
             login_provider: None,
             reset_state: false,
             allow_insecure_remote: false,
@@ -1735,6 +1775,44 @@ mod tests {
                 options.persistence.as_deref(),
                 Some(std::path::Path::new("/p"))
             );
+        }
+
+        #[test]
+        fn parse_args_maps_serve_settings_into_instance_options() {
+            let options = parse(&[
+                "--serve",
+                "--bind=127.0.0.1:9002",
+                "--instance-name",
+                "worker",
+                "--token-file",
+                "/etc/loom/token",
+                "--reset-state",
+            ])
+            .unwrap()
+            .unwrap();
+            assert_eq!(options.instance_name.as_deref(), Some("worker"));
+            assert_eq!(
+                options.token_file.as_deref(),
+                Some(std::path::Path::new("/etc/loom/token"))
+            );
+
+            // `--serve` resolves its defaults through the same settings the
+            // standalone server binary uses.
+            let instance = options.instance_options();
+            assert_eq!(instance.bind.to_string(), "127.0.0.1:9002");
+            assert_eq!(instance.instance_name.as_deref(), Some("worker"));
+            assert_eq!(
+                instance.token_file.as_deref(),
+                Some(std::path::Path::new("/etc/loom/token"))
+            );
+            assert_eq!(instance.token, None);
+            assert_eq!(instance.persistence, None);
+            assert!(instance.reset_state);
+
+            let defaults = parse(&["--serve"]).unwrap().unwrap().instance_options();
+            assert_eq!(defaults.bind.to_string(), "127.0.0.1:8765");
+            assert_eq!(defaults.instance_name, None);
+            assert_eq!(defaults.token_file, None);
         }
 
         #[test]
