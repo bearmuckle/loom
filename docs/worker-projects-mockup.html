@@ -1,0 +1,516 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loom · worker-scoped projects (mockup)</title>
+<style>
+  :root {
+    --bg: #111318;
+    --sidebar: #17191f;
+    --panel: #1b1d24;
+    --panel-2: #171c25;
+    --border: #242833;
+    --border-2: #30343f;
+    --border-3: #293244;
+    --text: #e5e7eb;
+    --text-strong: #f3f4f6;
+    --muted: #8f98a6;
+    --muted-2: #64748b;
+    --muted-3: #b7c0d0;
+    --accent: #2563eb;
+    --accent-light: #93c5fd;
+    --ok: #34d399;
+    --ok-bg: #10291f;
+    --ok-border: #1f6b4d;
+    --warn: #fcd34d;
+    --err: #fca5a5;
+    --pulse: #fbbf24;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #0b0d11;
+    color: var(--text);
+    font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* ---------- mockup chrome (not part of the product) ---------- */
+  .mock-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 10px 14px;
+    background: #0e1014;
+    border-bottom: 1px solid var(--border);
+  }
+  .mock-toolbar .mock-title {
+    font-weight: 600;
+    color: var(--text-strong);
+    margin-right: 8px;
+  }
+  .mock-toolbar .mock-title small { color: var(--muted); font-weight: 400; }
+  .seg { display: inline-flex; background: #171a20; border: 1px solid var(--border); border-radius: 7px; padding: 2px; }
+  .seg button {
+    appearance: none; border: 0; background: transparent; color: var(--muted-3);
+    padding: 5px 10px; border-radius: 5px; font-size: 12px; cursor: pointer;
+  }
+  .seg button.active { background: #263b58; color: var(--text-strong); }
+  .caption {
+    padding: 7px 14px; background: #0e1014; border-bottom: 1px solid var(--border);
+    color: var(--muted); font-size: 12px;
+  }
+  .caption b { color: var(--accent-light); font-weight: 600; }
+
+  /* ---------- app frame ---------- */
+  .stage { padding: 18px; }
+  .app {
+    position: relative;
+    display: flex;
+    height: 760px;
+    max-width: 1180px;
+    margin: 0 auto;
+    background: var(--bg);
+    border: 1px solid var(--border-2);
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,.45);
+  }
+
+  /* ---------- sidebar ---------- */
+  .sidebar {
+    width: 300px;
+    flex: 0 0 300px;
+    background: var(--sidebar);
+    border-right: 1px solid var(--border-2);
+    display: flex;
+    flex-direction: column;
+    padding: 10px;
+    gap: 8px;
+  }
+  .sidebar-head { display: flex; align-items: center; justify-content: space-between; }
+  .sidebar-head .label { color: var(--muted); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+  .head-actions { display: flex; gap: 4px; }
+  .icon-btn {
+    width: 26px; height: 26px; display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 7px; color: var(--muted-3); background: transparent; border: 0; cursor: pointer;
+  }
+  .icon-btn:hover { background: #293244; color: var(--text-strong); }
+  .icon-btn svg { width: 15px; height: 15px; }
+  .filter {
+    width: 100%; background: #0f1115; border: 1px solid var(--border-2); color: var(--text);
+    border-radius: 7px; padding: 7px 9px; font: inherit; font-size: 12.5px;
+  }
+  .filter::placeholder { color: var(--muted-2); }
+  .tree { flex: 1; overflow-y: auto; margin: 0 -2px; }
+
+  /* worker group */
+  .group { margin-bottom: 4px; }
+  .group-head {
+    display: flex; flex-direction: column; gap: 2px; padding: 6px 8px; border-radius: 7px;
+    cursor: pointer; user-select: none;
+  }
+  .group-head .line1 { display: flex; align-items: center; gap: 7px; min-width: 0; }
+  .group-head:hover { background: #1d2028; }
+  .group-head.active { background: #20242c; }
+  .group-head .name { flex: 1; min-width: 0; color: var(--text-strong); font-size: 12.5px; font-weight: 600;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* Resources sit on their own line so a long worker name is never clipped. */
+  .group-head .sub { padding-left: 26px; color: var(--muted-2); font-size: 10.5px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chev { width: 11px; color: var(--muted); transition: transform .12s ease; }
+  .chev.collapsed { transform: rotate(-90deg); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 8px; }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 0 3px rgba(52,211,153,.12); }
+  .dot.off { background: var(--muted-2); box-shadow: none; }
+  .dot.warn { background: var(--warn); box-shadow: 0 0 0 3px rgba(252,211,77,.14); }
+  .group-body { padding: 1px 0 2px 6px; }
+
+  /* project rows */
+  .row {
+    display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 7px; cursor: pointer;
+    color: var(--muted-3);
+  }
+  .row:hover { background: #1d2028; }
+  .row.selected { background: #20242c; color: var(--text-strong); }
+  .row .caret { width: 12px; flex: 0 0 12px; color: var(--muted); display: inline-flex; }
+  .row .caret svg { width: 10px; height: 10px; }
+  .row .picon { width: 15px; flex: 0 0 15px; display: inline-flex; color: #8f98a6; }
+  .row.selected .picon, .row .picon.active { color: var(--accent-light); }
+  .row .picon svg { width: 15px; height: 15px; }
+  .row .plabel { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
+  .row.child { padding-left: 30px; color: var(--muted-3); font-size: 12.5px; }
+  .row.child .dot-sm { width: 6px; height: 6px; border-radius: 50%; background: var(--pulse); box-shadow: 0 0 0 3px rgba(251,191,36,.14); }
+  .count {
+    flex: 0 0 auto; font-size: 10.5px; color: var(--muted-2); border: 1px solid var(--border-2);
+    border-radius: 999px; padding: 0 6px;
+  }
+  .row.selected .count { border-color: var(--accent); color: var(--accent-light); }
+  .worker-chip {
+    flex: 0 0 auto; font-size: 10px; color: var(--accent-light); background: #1b2b43; border: 1px solid #2b4b78;
+    border-radius: 999px; padding: 0 7px; line-height: 16px;
+  }
+  .row.offline { opacity: .55; }
+  .group-title { padding: 10px 8px 4px; color: var(--muted); font-size: 10.5px; letter-spacing: .05em; text-transform: uppercase; }
+  .empty-hint { padding: 8px; color: var(--muted-2); font-size: 11.5px; }
+
+  /* ---------- main canvas ---------- */
+  .canvas { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .canvas-head {
+    display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+    border-bottom: 1px solid var(--border); background: #13151b;
+  }
+  .canvas-head .proj { font-size: 14px; color: var(--text-strong); font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .canvas-head .meta { margin-left: auto; color: var(--muted-2); font-size: 11.5px; display: flex; gap: 12px; align-items: center; }
+  .canvas-body { flex: 1; overflow: hidden; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  .bubble { border: 1px solid var(--border); background: #15171d; border-radius: 10px; padding: 10px 12px; max-width: 560px; }
+  .bubble .who { color: var(--muted); font-size: 11px; margin-bottom: 4px; }
+  .bubble.agent { background: #141a22; border-color: #1f2b3c; }
+  .bubble .steps { color: var(--muted-3); font-size: 12.5px; }
+  .bubble code { background: #0f1115; border: 1px solid var(--border); border-radius: 4px; padding: 1px 4px; font-size: 12px; }
+  .composer {
+    margin-top: auto; border: 1px solid var(--border-2); background: #0f1115; border-radius: 10px;
+    padding: 10px 12px; color: var(--muted-2); display: flex; justify-content: space-between; align-items: center;
+  }
+  .composer .send { background: var(--accent); color: #fff; border-radius: 7px; padding: 4px 10px; font-size: 12px; }
+
+  /* ---------- new project pane ---------- */
+  .scrim {
+    position: absolute; inset: 0; background: rgba(6,8,11,.55); display: none;
+    align-items: stretch; justify-content: stretch;
+  }
+  .scrim.show { display: flex; }
+  .pane {
+    flex: 1; background: var(--bg); display: flex; flex-direction: column; border-left: 1px solid var(--border-2);
+  }
+  .pane-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; border-bottom: 1px solid var(--border); }
+  .pane-head .t { color: var(--text-strong); font-size: 14px; font-weight: 600; }
+  .pane-body { flex: 1; overflow-y: auto; padding: 20px; display: flex; justify-content: center; }
+  .form { width: 100%; max-width: 640px; display: flex; flex-direction: column; gap: 16px; }
+  .field-label { color: var(--muted); font-size: 11.5px; letter-spacing: .04em; text-transform: uppercase; margin-bottom: 8px; }
+  .hint { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+  .choices { display: flex; gap: 8px; flex-wrap: wrap; }
+  .choice {
+    border: 1px solid var(--border-2); background: #171a20; border-radius: 8px; padding: 8px 12px; cursor: pointer;
+    color: var(--muted-3); font-size: 12.5px; display: flex; align-items: center; gap: 7px;
+  }
+  .choice:not(.disabled):hover { border-color: #3b4555; }
+  .choice.selected { background: #263b58; border-color: var(--accent); color: var(--text-strong); }
+  .choice .dot { flex: 0 0 8px; }
+  .choice.disabled { opacity: .45; cursor: not-allowed; }
+  .choice .tag { font-size: 10px; color: var(--muted-2); }
+  .repo-list { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--panel-2); }
+  .repo { padding: 9px 11px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; }
+  .repo:last-child { border-bottom: 0; }
+  .repo .rname { flex: 1; color: var(--text); font-size: 12.5px; }
+  .repo .cloned { font-size: 10px; color: var(--ok); background: var(--ok-bg); border: 1px solid var(--ok-border); border-radius: 5px; padding: 0 6px; }
+  .summary {
+    display: flex; align-items: center; gap: 8px; border: 1px solid var(--border); background: #14171d;
+    border-radius: 8px; padding: 10px 12px; color: var(--muted-3); font-size: 12px;
+  }
+  .summary b { color: var(--text-strong); font-weight: 600; }
+  .pane-foot { padding: 14px 20px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; }
+  .btn { border: 1px solid var(--border-2); background: #1b1f27; color: var(--text); border-radius: 7px; padding: 7px 14px; font-size: 12.5px; cursor: pointer; }
+  .btn:hover { background: #242833; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.primary:hover { background: #1d4ed8; }
+  .btn.ghost { background: transparent; border-color: transparent; color: var(--muted-3); }
+
+  .legend {
+    max-width: 1180px; margin: 14px auto 0; padding: 12px 16px;
+    border: 1px solid var(--border); border-radius: 10px; background: #0e1014; color: var(--muted);
+    font-size: 12px; display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 6px 24px;
+  }
+  .legend b { color: var(--accent-light); }
+  @media (max-width: 900px) { .sidebar { width: 260px; flex-basis: 260px; } .legend { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+  <div class="mock-toolbar">
+    <div class="mock-title">Loom · worker-scoped projects <small>— proposed navigation mockup</small></div>
+    <div class="seg" id="viewSeg">
+      <button data-view="grouped" class="active">Group projects by worker</button>
+      <button data-view="flat">Flat + worker badges</button>
+    </div>
+    <div class="seg" id="sceneSeg">
+      <button data-scene="main" class="active">Sidebar</button>
+      <button data-scene="newproject">New project</button>
+    </div>
+  </div>
+  <div class="caption" id="caption"></div>
+
+  <div class="stage">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <span class="label">Projects</span>
+          <div class="head-actions">
+            <button class="icon-btn" title="New project" onclick="openNewProject()">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 3v10M3 8h10" stroke-linecap="round"/></svg>
+            </button>
+            <button class="icon-btn" title="Settings">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.8M8 12.6v1.8M1.6 8h1.8M12.6 8h1.8M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3" stroke-linecap="round"/></svg>
+            </button>
+          </div>
+        </div>
+        <input class="filter" placeholder="Filter projects…">
+        <div class="tree" id="tree"></div>
+      </aside>
+
+      <main class="canvas">
+        <div class="canvas-head">
+          <div class="proj">
+            <svg viewBox="0 0 16 16" fill="none" stroke="#93c5fd" stroke-width="1.3"><path d="M1.8 4.2c0-.7.5-1.2 1.2-1.2h3l1.4 1.6h6.6c.7 0 1.2.5 1.2 1.2v6.4c0 .7-.5 1.2-1.2 1.2H3c-.7 0-1.2-.5-1.2-1.2z"/></svg>
+            api-gateway
+            <span class="worker-chip" id="canvasWorkerChip">build-01</span>
+          </div>
+          <div class="meta">
+            <span>1 agent</span>
+            <span>Model · deepseek-flash</span>
+            <span style="color:var(--ok)">● Working</span>
+          </div>
+        </div>
+        <div class="canvas-body">
+          <div class="bubble"><div class="who">You</div>Add request-id propagation to the gateway and cover it with a test.</div>
+          <div class="bubble agent"><div class="who">api-gateway · manager</div>
+            <div class="steps">Reading <code>src/proxy.rs</code>, then updating the middleware chain and adding a focused test.</div>
+          </div>
+          <div class="bubble agent" style="border-color:#1f6b4d;background:#101d17"><div class="who" style="color:var(--ok)">api-gateway · child agent</div>
+            <div class="steps">Checkout isolated on worker <b>build-01</b>. No cross-worker filesystem access.</div>
+          </div>
+          <div class="composer"><span>Message api-gateway…</span><span class="send">Send</span></div>
+        </div>
+      </main>
+
+      <div class="scrim" id="scrim">
+        <div class="pane">
+          <div class="pane-head">
+            <div class="t">New project</div>
+            <button class="icon-btn" title="Close" onclick="closeNewProject()">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M4 4l8 8M12 4l-8 8" stroke-linecap="round"/></svg>
+            </button>
+          </div>
+          <div class="pane-body">
+            <div class="form">
+              <div>
+                <div class="field-label">Run on</div>
+                <div class="choices" id="workerChoices"></div>
+              </div>
+              <div>
+                <div class="field-label">What it starts with</div>
+                <div class="choices" id="sourceChoices"></div>
+                <div class="hint" id="sourceHint"></div>
+              </div>
+              <div id="sourceBody"></div>
+              <div class="summary" id="targetSummary"></div>
+            </div>
+          </div>
+          <div class="pane-foot">
+            <button class="btn" onclick="closeNewProject()">Cancel</button>
+            <button class="btn primary" id="createBtn">Create project</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="legend">
+    <div><b>Worker header</b> — status dot and name on one line, live CPU/RAM beneath so the name is never clipped; offline workers keep their projects and offer Reconnect.</div>
+    <div><b>Active worker</b> — follows the selected project; it is the default target for New project.</div>
+    <div><b>Run on</b> — the New project picker; local folder is only offered on the local worker, and clones/search run against the chosen worker.</div>
+    <div><b>Flat fallback</b> — a single list with worker chips for users who prefer it; the filter still spans workers.</div>
+  </div>
+
+  <script>
+    const workers = [
+      { id: 'local', name: 'Local backend · this machine', dot: 'ok',
+        res: 'CPU 12% · RAM 4.1/32 GiB', models: 6, local: true,
+        projects: [
+          { name: 'loom', agents: 3, live: true },
+          { name: 'scratch', agents: 0 }
+        ] },
+      { id: 'build-01', name: 'External worker · build-01', dot: 'ok',
+        res: 'CPU 71% · RAM 12.4/64 GiB', models: 4, local: false,
+        projects: [
+          { name: 'api-gateway', agents: 1, live: true, selected: true, selectedChild: true },
+          { name: 'infra-terraform', agents: 2 }
+        ] },
+      { id: 'gpu-box', name: 'External worker · gpu-box', dot: 'off',
+        res: 'offline · last seen 2h ago', models: 0, local: false, offline: true,
+        projects: [ { name: 'voice-lab', agents: 4, offline: true } ] }
+    ];
+
+    const state = { view: 'grouped', scene: 'main', paneWorker: 'build-01', paneSource: 'github' };
+    const collapsed = new Set();
+
+    const svg = {
+      chev: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6l4 4 4-4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+      folder: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M1.8 4.2c0-.7.5-1.2 1.2-1.2h3l1.4 1.6h6.6c.7 0 1.2.5 1.2 1.2v6.4c0 .7-.5 1.2-1.2 1.2H3c-.7 0-1.2-.5-1.2-1.2z"/></svg>',
+      bot: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="2.6" y="4.4" width="10.8" height="8" rx="2.2"/><path d="M5.6 8h.01M10.4 8h.01" stroke-linecap="round"/><path d="M8 4.4V2.6" stroke-linecap="round"/></svg>'
+    };
+
+    function projectRow(p, opts) {
+      const sel = p.selected ? ' selected' : '';
+      const off = p.offline ? ' offline' : '';
+      const chip = opts && opts.chip ? `<span class="worker-chip">${opts.chip}</span>` : '';
+      const count = p.agents ? `<span class="count">${p.agents}</span>` : '';
+      const caret = p.agents ? `<span class="caret" style="visibility:hidden">${svg.chev}</span>` : '';
+      return `<div class="row${sel}${off}">
+          ${caret}
+          <span class="picon${p.live ? ' active' : ''}">${svg.folder}</span>
+          <span class="plabel">${p.name}${off ? '  <span style="color:var(--muted-2)">(offline)</span>' : ''}</span>
+          ${chip}${count}
+        </div>`;
+    }
+
+    function renderGrouped() {
+      return workers.map(w => {
+        const isCollapsed = collapsed.has(w.id);
+        const head = `<div class="group-head${w.id === 'build-01' ? ' active' : ''}" onclick="toggleGroup('${w.id}')">
+            <div class="line1">
+              <span class="chev${isCollapsed ? ' collapsed' : ''}">${svg.chev}</span>
+              <span class="dot ${w.dot}"></span>
+              <span class="name">${w.name}</span>
+            </div>
+            <div class="sub">${w.res}</div>
+          </div>`;
+        let body = '';
+        if (!isCollapsed) {
+          const rows = w.projects.map(p => {
+            let row = projectRow(p);
+            if (p.selected && p.selectedChild) {
+              row += `<div class="row child"><span class="dot-sm"></span><span class="picon">${svg.bot}</span><span class="plabel">reviewer · delegated task</span></div>`;
+              row += `<div class="row child"><span class="dot-sm" style="background:#64748b;box-shadow:none"></span><span class="picon">${svg.bot}</span><span class="plabel">tester · completed</span></div>`;
+            }
+            return row;
+          }).join('');
+          const offlineHint = w.offline
+            ? `<div class="empty-hint">Loading stopped — worker is offline. <span style="color:var(--accent-light)">Reconnect</span></div>`
+            : '';
+          body = `<div class="group-body">${rows}${offlineHint}</div>`;
+        }
+        return `<div class="group">${head}${body}</div>`;
+      }).join('');
+    }
+
+    function renderFlat() {
+      let html = `<div class="group-title">All projects · 3 workers</div>`;
+      workers.forEach(w => {
+        w.projects.forEach(p => {
+          html += projectRow(p, { chip: w.name.replace(/^(Local backend|External worker) · /, '') });
+        });
+      });
+      html += `<div class="group-title">Offline</div>`;
+      html += `<div class="empty-hint">Offline workers keep their projects listed above with a chip.</div>`;
+      return html;
+    }
+
+    function renderTree() {
+      document.getElementById('tree').innerHTML =
+        state.view === 'grouped' ? renderGrouped() : renderFlat();
+    }
+
+    function toggleGroup(id) {
+      if (collapsed.has(id)) collapsed.delete(id); else collapsed.add(id);
+      renderTree();
+    }
+
+    /* ---------- new project pane ---------- */
+    function renderPane() {
+      const w = workers.find(x => x.id === state.paneWorker);
+      document.getElementById('workerChoices').innerHTML = workers.map(x => `
+        <div class="choice${x.id === state.paneWorker ? ' selected' : ''}${x.offline ? ' disabled' : ''}"
+             ${x.offline ? '' : `onclick="pickWorker('${x.id}')"`}>
+          <span class="dot ${x.dot}"></span>${x.name}
+          ${x.offline ? '<span class="tag">offline</span>' : ''}
+        </div>`).join('');
+
+      const localOk = w.local;
+      const sources = [
+        { id: 'empty', label: 'Empty project', ok: true },
+        { id: 'local', label: 'Local folder', ok: localOk },
+        { id: 'github', label: 'GitHub repository', ok: true }
+      ];
+      document.getElementById('sourceChoices').innerHTML = sources.map(s => `
+        <div class="choice${s.id === state.paneSource ? ' selected' : ''}${s.ok ? '' : ' disabled'}"
+             ${s.ok ? `onclick="pickSource('${s.id}')"` : ''}>
+          ${s.label}${s.ok ? '' : '<span class="tag">local worker only</span>'}
+        </div>`).join('');
+
+      const hint = localOk
+        ? 'Attach a local folder in place; Git repositories become available for review.'
+        : `${w.name} is remote, so local folders are unavailable. Repositories are cloned and cached on that worker.`;
+      document.getElementById('sourceHint').textContent = hint;
+
+      const body = document.getElementById('sourceBody');
+      if (state.paneSource === 'github') {
+        body.innerHTML = `
+          <div class="field-label">On ${w.name.replace(/^(Local backend|External worker) · /, '')} · cached clones</div>
+          <div class="repo-list">
+            <div class="repo"><span class="rname">acme/api-gateway</span><span class="cloned">cloned here</span></div>
+            <div class="repo"><span class="rname">acme/shared-proto</span><span class="cloned">cloned here</span></div>
+            <div class="repo"><span class="rname">Search GitHub…</span></div>
+          </div>`;
+      } else if (state.paneSource === 'local') {
+        body.innerHTML = `
+          <div class="field-label">Local folder path</div>
+          <div class="repo-list"><div class="repo"><span class="rname" style="color:var(--muted)">/home/bjorn/src/project</span><span class="cloned">Use current folder</span></div></div>`;
+      } else {
+        body.innerHTML = `<div class="hint">Start a new project with no files or repositories.</div>`;
+      }
+
+      document.getElementById('targetSummary').innerHTML =
+        `<span class="dot ${w.dot}"></span>Run on <b>${w.name.replace(/^(Local backend|External worker) · /, '')}</b> · ${w.res} · ${w.models} models available`;
+    }
+
+    function pickWorker(id) { state.paneWorker = id; if (!workers.find(x => x.id === id).local && state.paneSource === 'local') state.paneSource = 'github'; renderPane(); }
+    function pickSource(id) { state.paneSource = id; renderPane(); }
+
+    function openNewProject() {
+      state.scene = 'newproject';
+      document.getElementById('scrim').classList.add('show');
+      syncScenes();
+      renderPane();
+    }
+    function closeNewProject() {
+      state.scene = 'main';
+      document.getElementById('scrim').classList.remove('show');
+      syncScenes();
+    }
+
+    function syncScenes() {
+      document.querySelectorAll('#sceneSeg button').forEach(b =>
+        b.classList.toggle('active', b.dataset.scene === state.scene));
+      const w = workers.find(x => x.id === state.paneWorker);
+      document.getElementById('canvasWorkerChip').textContent =
+        state.paneWorker === 'build-01' ? 'build-01' : w.name.replace(/^(Local backend|External worker) · /, '');
+    }
+
+    function setCaption() {
+      const cap = document.getElementById('caption');
+      if (state.scene === 'newproject') {
+        cap.innerHTML = `New project: choose <b>Run on</b> first. Source choices and the model list follow the selected worker; local folders are only offered on the local worker.`;
+      } else if (state.view === 'grouped') {
+        cap.innerHTML = `Recommended: projects grouped under each connected worker, with live status and resources. Selecting a project sets the active worker.`;
+      } else {
+        cap.innerHTML = `Fallback: one flat list. Each row carries a worker chip so origin is still visible; the filter spans all workers.`;
+      }
+    }
+
+    document.getElementById('viewSeg').addEventListener('click', e => {
+      const b = e.target.closest('button'); if (!b) return;
+      state.view = b.dataset.view;
+      document.querySelectorAll('#viewSeg button').forEach(x => x.classList.toggle('active', x === b));
+      renderTree(); setCaption();
+    });
+    document.getElementById('sceneSeg').addEventListener('click', e => {
+      const b = e.target.closest('button'); if (!b) return;
+      if (b.dataset.scene === 'newproject') openNewProject(); else closeNewProject();
+    });
+
+    renderTree(); renderPane(); setCaption();
+  </script>
+</body>
+</html>

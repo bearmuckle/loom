@@ -461,8 +461,16 @@ pub(crate) struct LoomView {
     project_feed_after_sequence: Option<EventSequence>,
     project_feed_epoch: Option<String>,
     project_poll_scheduled: bool,
-    session_tree: Option<Entity<TreeState>>,
-    session_tree_entries: Vec<SessionTreeNode>,
+    /// One session tree per worker node so the sidebar can group projects by
+    /// the worker that owns them. Keyed by the backend's stable node identity.
+    session_trees: BTreeMap<String, Entity<TreeState>>,
+    /// Last rendered tree nodes per worker node, used to skip redundant updates.
+    session_tree_entries: BTreeMap<String, Vec<SessionTreeNode>>,
+    /// Worker node groups the user has collapsed in the sidebar.
+    collapsed_worker_nodes: BTreeSet<String>,
+    /// Last session-list error per worker node, so a worker that failed to load
+    /// is distinguishable from one that simply has no projects.
+    node_session_load_errors: BTreeMap<String, String>,
     pub(crate) active_session: AgentSessionSnapshot,
     pub(crate) active_run: Option<AgentRunSnapshot>,
     pub(crate) active_run_id: Option<RunId>,
@@ -1345,19 +1353,10 @@ fn source_choice_is_allowed(
     }
 }
 
-fn local_source_available(
-    purpose: SessionSourceDialogPurpose,
-    configured: bool,
-    active_node_id: Option<&str>,
-    default_node_id: &str,
-) -> bool {
-    configured
-        && match purpose {
-            SessionSourceDialogPurpose::StartSession => true,
-            SessionSourceDialogPurpose::AddToSession => {
-                active_node_id.is_none_or(|node_id| node_id == default_node_id)
-            }
-        }
+/// Local folders can only be attached by the worker that runs on this machine,
+/// so the choice is offered only when the dialog targets the local node.
+fn local_source_available(configured: bool, target_node_id: &str, default_node_id: &str) -> bool {
+    configured && target_node_id == default_node_id
 }
 
 pub(crate) struct GitHubSource {
@@ -1406,6 +1405,10 @@ fn resolve_local_source_path(entered: &str, current: Option<&Path>) -> Option<St
 
 struct SessionSourceDialog {
     purpose: SessionSourceDialogPurpose,
+    /// The worker node the dialog creates the project on, chosen with the
+    /// "Run on" picker. Resolved when the dialog opens and updated by
+    /// `choose_source_node`.
+    target_node_id: String,
     choice: SessionSourceChoice,
     local_directory_available: bool,
     filter_subscription: Option<Subscription>,
@@ -1461,8 +1464,10 @@ impl LoomView {
             project_feed_after_sequence: None,
             project_feed_epoch: None,
             project_poll_scheduled: false,
-            session_tree: None,
-            session_tree_entries: Vec::new(),
+            session_trees: BTreeMap::new(),
+            session_tree_entries: BTreeMap::new(),
+            collapsed_worker_nodes: BTreeSet::new(),
+            node_session_load_errors: BTreeMap::new(),
             active_session: active_session.clone(),
             active_run: None,
             active_run_id: None,

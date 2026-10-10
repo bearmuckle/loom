@@ -118,6 +118,25 @@ impl LoomView {
             .iter()
             .map(|repository| repository.full_name.as_str())
             .collect::<Vec<_>>();
+        // The "Run on" picker lists connected workers with the home worker
+        // first. Selecting one scopes repository discovery and creation.
+        let mut worker_choices = self
+            .worker_nodes
+            .iter()
+            .map(|node| (node.status.node_id.clone(), worker_node_display_name(node)))
+            .collect::<Vec<_>>();
+        worker_choices = order_session_nodes(worker_choices, &self.default_backend_node_id);
+        let worker_online = self
+            .worker_nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.status.node_id.clone(),
+                    matches!(node.connection_state, WorkerConnectionState::Connected)
+                        && node.status.online,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
 
         let mut cloned_rows = div().flex().flex_col().gap_1();
         for repository in &self.cloned_repositories {
@@ -488,23 +507,42 @@ impl LoomView {
         } else {
             "Add to session"
         };
-        let form = div()
+        let mut run_on = div().w_full().flex().flex_col().gap_1();
+        if is_start && worker_choices.len() > 1 {
+            run_on = run_on.child(div().text_xs().text_color(rgb(0x8f98a6)).child("Run on"));
+            let mut row = div().flex().flex_wrap().items_center().gap_1();
+            for (node_id, label) in &worker_choices {
+                let selected = *node_id == dialog.target_node_id;
+                let online = worker_online.get(node_id).copied().unwrap_or(false);
+                let click_node = node_id.clone();
+                row = row.child(
+                    Button::new(format!("source-worker-node-{node_id}"))
+                        .label(label.clone())
+                        .small()
+                        .selected(selected)
+                        .disabled(!online)
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.choose_source_node(click_node.clone(), cx);
+                        })),
+                );
+            }
+            run_on = run_on.child(row);
+        }
+
+        let hint = div()
             .w_full()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x8f98a6))
-                    .child(if is_start {
-                        "Choose what the new project starts with."
-                    } else {
-                        "Choose a repository or folder to add to the active session."
-                    }),
-            )
-            .child(source_choices)
-            .child(dialog_body);
+            .text_xs()
+            .text_color(rgb(0x8f98a6))
+            .child(if is_start {
+                "Choose what the new project starts with."
+            } else {
+                "Choose a repository or folder to add to the active session."
+            });
+        let mut form = div().w_full().flex().flex_col().gap_3();
+        if is_start && worker_choices.len() > 1 {
+            form = form.child(run_on);
+        }
+        let form = form.child(hint).child(source_choices).child(dialog_body);
 
         // The fixed-width modal clipped its contents on phones and wasted space
         // on desktop. Use a full-height pane in the central area (like

@@ -27,3 +27,4 @@ mod transcript_paging_tests;
 mod visual_render_tests;
 mod worker_failure_tests;
 mod worker_node_tests;
+mod worker_project_tests;

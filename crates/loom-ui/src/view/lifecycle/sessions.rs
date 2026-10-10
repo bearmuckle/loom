@@ -69,59 +69,47 @@ impl LoomView {
     }
 
     /// Reloads sessions from every connected node while keeping their owners.
+    ///
+    /// Each worker is an independent backend with its own workspaces. Listing
+    /// only the home workspace id would hide a worker's pre-existing projects,
+    /// so every workspace on the node is listed and its sessions merged under
+    /// that node's owner.
     pub(crate) fn reload_sessions(&mut self, cx: &mut Context<Self>) {
         let workspace_id = self.workspace_id;
-        let mut node_requests = BTreeMap::new();
-        for node in self
+        let node_backends = self
             .worker_nodes
             .iter()
             .filter(|node| node.connection.is_some() && node.status.online)
-        {
-            if let Some(backend) = self.node_backends.get(&node.status.node_id) {
-                node_requests
-                    .entry(node.status.node_id.clone())
-                    .or_insert_with(|| {
-                        backend.submit(RequestEnvelope::new(ClientRequest::Workspace(
-                            WorkspaceRequest::ListWorkspaceSessions {
-                                workspace_id,
-                                include_archived: false,
-                            },
-                        )))
-                    });
-            }
-        }
+            .filter_map(|node| {
+                self.node_backends
+                    .get(&node.status.node_id)
+                    .cloned()
+                    .map(|backend| (node.status.node_id.clone(), backend))
+            })
+            .collect::<Vec<_>>();
         cx.spawn(async move |view, cx| {
-            let node_responses = cx
-                .background_spawn(async move {
-                    let mut node_responses = Vec::with_capacity(node_requests.len());
-                    for (node_id, pending) in node_requests {
-                        node_responses.push((node_id, pending.wait().await));
-                    }
-                    node_responses
-                })
-                .await;
+            let mut node_responses = Vec::with_capacity(node_backends.len());
+            for (node_id, backend) in node_backends {
+                let sessions = list_node_sessions(backend, workspace_id).await;
+                node_responses.push((node_id, sessions));
+            }
             view.update(cx, |view, cx| {
                 let previous_active_node_id =
                     view.session_node_ids.get(&view.active_session.id).cloned();
-                let node_results = node_responses
-                    .into_iter()
-                    .filter_map(|(node_id, response)| match response.result {
-                        Ok(ServerResponse::Session(SessionResponse::AgentSessions {
-                            sessions,
-                        })) => Some((node_id, sessions)),
+                let mut node_results = Vec::with_capacity(node_responses.len());
+                for (node_id, result) in node_responses {
+                    match result {
+                        Ok(sessions) => {
+                            view.node_session_load_errors.remove(&node_id);
+                            node_results.push((node_id, sessions));
+                        }
                         Err(error) => {
+                            view.node_session_load_errors
+                                .insert(node_id, error.message.clone());
                             view.record_backend_error("session list refresh", error);
-                            None
                         }
-                        Ok(response) => {
-                            view.record_backend_error(
-                                "session list refresh",
-                                unexpected_response("session list", response),
-                            );
-                            None
-                        }
-                    })
-                    .collect();
+                    }
+                }
                 (view.sessions, view.session_node_ids) =
                     merge_node_sessions(&view.sessions, &view.session_node_ids, node_results);
                 let active_node_id = view.session_node_ids.get(&view.active_session.id).cloned();
@@ -188,4 +176,55 @@ impl LoomView {
             *session = self.active_session.clone();
         }
     }
+}
+
+/// Lists every session a worker can see by walking each of its workspaces.
+///
+/// A worker that has been used standalone keeps its own workspace, so querying
+/// the client's home workspace id would return nothing. If a worker reports no
+/// workspaces yet (for example before the home workspace has been registered on
+/// it), the fallback workspace id is queried so a shared workspace still loads.
+async fn list_node_sessions(
+    backend: BackendWorker,
+    fallback_workspace: WorkspaceId,
+) -> Result<Vec<AgentSessionSnapshot>, LoomError> {
+    let workspace_list = backend
+        .submit(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::ListWorkspaces,
+        )))
+        .wait()
+        .await;
+    let workspaces = match workspace_list.result? {
+        ServerResponse::Workspace(WorkspaceResponse::Workspaces { workspaces }) => workspaces,
+        response => return Err(unexpected_response("workspace list", response)),
+    };
+    let workspace_ids = if workspaces.is_empty() {
+        vec![fallback_workspace]
+    } else {
+        workspaces
+            .into_iter()
+            .map(|workspace| workspace.id)
+            .collect()
+    };
+    let mut sessions = Vec::new();
+    for workspace_id in workspace_ids {
+        let response = backend
+            .submit(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::ListWorkspaceSessions {
+                    workspace_id,
+                    include_archived: false,
+                },
+            )))
+            .wait()
+            .await;
+        match response.result? {
+            ServerResponse::Session(SessionResponse::AgentSessions {
+                sessions: mut found,
+            }) => {
+                sessions.append(&mut found);
+            }
+            response => return Err(unexpected_response("session list refresh", response)),
+        }
+    }
+    Ok(sessions)
 }

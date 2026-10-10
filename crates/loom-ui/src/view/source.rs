@@ -10,16 +10,23 @@ impl LoomView {
         purpose: SessionSourceDialogPurpose,
         cx: &mut Context<Self>,
     ) {
-        let active_node_id = self.session_node_ids.get(&self.active_session.id);
+        let target_node_id = match purpose {
+            SessionSourceDialogPurpose::StartSession => self.default_backend_node_id.clone(),
+            SessionSourceDialogPurpose::AddToSession => self
+                .session_node_ids
+                .get(&self.active_session.id)
+                .cloned()
+                .unwrap_or_else(|| self.default_backend_node_id.clone()),
+        };
         let local_directory_available = local_source_available(
-            purpose,
             self.local_directory_sources_available,
-            active_node_id.map(String::as_str),
+            &target_node_id,
             &self.default_backend_node_id,
         );
         let choice = source_dialog_initial_state(purpose, local_directory_available);
         self.source_dialog = Some(SessionSourceDialog {
             purpose,
+            target_node_id,
             choice,
             local_directory_available,
             filter_subscription: None,
@@ -131,17 +138,51 @@ impl LoomView {
     }
 
     /// The worker node the source dialog targets.
-    fn source_node_id(&self) -> Option<String> {
+    pub(crate) fn source_node_id(&self) -> Option<String> {
         self.source_dialog
             .as_ref()
-            .map(|dialog| match dialog.purpose {
-                SessionSourceDialogPurpose::StartSession => self.default_backend_node_id.clone(),
-                SessionSourceDialogPurpose::AddToSession => self
-                    .session_node_ids
-                    .get(&self.active_session.id)
-                    .cloned()
-                    .unwrap_or_else(|| self.default_backend_node_id.clone()),
-            })
+            .map(|dialog| dialog.target_node_id.clone())
+    }
+
+    /// Switches the worker the source dialog creates on. Repository results and
+    /// clone caches belong to the previous worker, so they are cleared and the
+    /// new worker's clones are loaded when relevant.
+    pub(crate) fn choose_source_node(&mut self, node_id: String, cx: &mut Context<Self>) {
+        let Some(dialog) = self.source_dialog.as_ref() else {
+            return;
+        };
+        if dialog.target_node_id == node_id {
+            return;
+        }
+        let local_directory_available = local_source_available(
+            self.local_directory_sources_available,
+            &node_id,
+            &self.default_backend_node_id,
+        );
+        if let Some(dialog) = &mut self.source_dialog {
+            dialog.target_node_id = node_id;
+            dialog.local_directory_available = local_directory_available;
+            dialog.error = None;
+            dialog.selected_repository = None;
+            dialog.repositories.clear();
+            dialog.repositories_loading = false;
+            if !source_choice_is_allowed(dialog.purpose, local_directory_available, dialog.choice) {
+                dialog.choice =
+                    source_dialog_initial_state(dialog.purpose, local_directory_available);
+            }
+        }
+        self.cloned_repositories.clear();
+        self.cloned_repositories_loading = false;
+        self.repository_search_generation = self.repository_search_generation.wrapping_add(1);
+        self.repository_search_query.clear();
+        if self
+            .source_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.choice == SessionSourceChoice::GitHub)
+        {
+            self.load_cloned_repositories(cx);
+        }
+        cx.notify();
     }
 
     /// Loads the repositories already cloned on the worker node so the picker
@@ -330,7 +371,7 @@ impl LoomView {
                     session_name_for_source,
                 );
                 self.create_session_on_node_with_source(
-                    self.default_backend_node_id.clone(),
+                    dialog.target_node_id.clone(),
                     name,
                     source,
                     cx,

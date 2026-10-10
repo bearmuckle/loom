@@ -352,7 +352,8 @@ pub(crate) fn adjusted_project_agent_concurrency(current: u8, delta: i8) -> u8 {
     ) as u8
 }
 
-#[cfg(test)]
+/// Order worker nodes for a "Run on" picker, keeping the default/home worker
+/// first and preserving the caller's order for the rest.
 pub(crate) fn order_session_nodes(
     mut nodes: Vec<(String, String)>,
     default_node_id: &str,
@@ -590,6 +591,38 @@ pub(crate) fn merge_node_sessions(
     }
     owners.retain(|session_id, _| sessions.iter().any(|session| session.id == *session_id));
     (sessions, owners)
+}
+
+/// Group sessions by the worker node that owns them for the sidebar's
+/// worker-grouped view.
+///
+/// Every node in `node_order` gets a group, including empty ones, so the caller
+/// can show a header for a connected worker that has no projects yet. A session
+/// with no recorded owner falls back to `default_node_id`; sessions owned by a
+/// node that is no longer configured keep their own group so they stay visible.
+pub(crate) fn group_sessions_by_worker(
+    sessions: &[AgentSessionSnapshot],
+    owners: &BTreeMap<AgentSessionId, String>,
+    node_order: &[String],
+    default_node_id: &str,
+) -> Vec<(String, Vec<AgentSessionSnapshot>)> {
+    let mut by_owner = BTreeMap::<String, Vec<AgentSessionSnapshot>>::new();
+    for session in sessions {
+        let owner = owners
+            .get(&session.id)
+            .cloned()
+            .unwrap_or_else(|| default_node_id.to_owned());
+        by_owner.entry(owner).or_default().push(session.clone());
+    }
+    let mut groups = Vec::with_capacity(node_order.len());
+    for node_id in node_order {
+        let group = by_owner.remove(node_id).unwrap_or_default();
+        groups.push((node_id.clone(), group));
+    }
+    // Removed or otherwise unknown owners come last so they never mask a known
+    // worker in the grouped list.
+    groups.extend(by_owner);
+    groups
 }
 
 pub(crate) fn session_id_for_request(
