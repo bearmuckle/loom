@@ -284,6 +284,7 @@ impl LoomView {
                 model_provider_names,
             )]),
             model_catalog_node_id: Some(default_backend_node_id.clone()),
+            archived_sessions: ArchivedSessionsState::default(),
             model_refreshes_in_flight: BTreeSet::new(),
             model_catalog_refreshed_at: BTreeMap::new(),
             model_select: None,
@@ -507,6 +508,7 @@ impl LoomView {
             model_select_choices: BTreeMap::new(),
             default_model_select_choices: BTreeMap::new(),
             settings_open: options.is_configured(),
+            archived_sessions: ArchivedSessionsState::default(),
             settings_section: SettingsSection::Agents,
             providers: Vec::new(),
             providers_node_id: None,
@@ -842,6 +844,7 @@ impl LoomView {
             #[cfg(target_family = "wasm")]
             welcome_dialog_dismissed: false,
             demo_workspace: false,
+            archived_sessions: ArchivedSessionsState::default(),
             login_enabled: true,
             github_connected: false,
             github_repository_connected: false,
