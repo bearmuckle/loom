@@ -203,8 +203,12 @@ An operator can verify the policy inside the execution context:
 ```sh
 getent hosts github.com
 curl -fsS -o /dev/null https://api.github.com/
-curl -fsS -o /dev/null https://crates.io/
+curl -fsS -o /dev/null https://index.crates.io/config.json
 ```
+
+The package-registry check targets the crates.io index that Cargo itself uses
+rather than the website root: `crates.io` answers `403` to non-browser clients,
+which proves reachability but fails `curl -f`.
 
 Run them in the context that executes agent commands, for example with
 `docker exec loom-server ...` for a container deployment or as the backend
