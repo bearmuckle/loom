@@ -251,6 +251,205 @@ impl InProcessConnection {
 }
 
 impl InProcessConnection {
+    /// Permanently removes archived agent sessions and their stored history.
+    ///
+    /// A request that targets an archived project root cascades to its whole
+    /// archived hierarchy after every child task is terminal. Worktrees are
+    /// removed deepest-first before any row or filesystem root is touched, so a
+    /// dirty or locked checkout aborts the request without changing state.
+    pub(crate) fn delete_archived_session(
+        &self,
+        session_id: AgentSessionId,
+        force: bool,
+    ) -> Result<ServerResponse> {
+        let session = self.backend.sessions()?.get(session_id)?;
+        if session.state != AgentSessionState::Archived {
+            return Err(LoomError::invalid_state(
+                "only archived agent sessions can be deleted",
+            ));
+        }
+        let project = match &self.backend.persistence {
+            Some(persistence) => persistence.load_project_snapshot_for_session(session_id)?,
+            None => {
+                // Without persistence there is no project snapshot, so a project
+                // root is deleted as a plain session and its worktrees are not
+                // visible.
+                log::debug!(
+                    "[loom-server] deleting session {session_id} without persistence; project cascade and worktrees are unavailable"
+                );
+                None
+            }
+        };
+        let mut deleted_sessions = BTreeMap::from([(session_id, session.workspace_id)]);
+        if let Some(project) = &project
+            && project.root_session_id == session_id
+        {
+            // Validate every descendant before mutating anything, so a
+            // rejected child cannot leave a partially deleted project tree
+            // behind.
+            let unfinished_tasks = project
+                .tasks
+                .iter()
+                .filter(|task| {
+                    !matches!(
+                        task.status,
+                        loom_core::DelegatedTaskStatus::Completed
+                            | loom_core::DelegatedTaskStatus::Failed
+                            | loom_core::DelegatedTaskStatus::Cancelled
+                    )
+                })
+                .map(|task| format!("{} ({:?})", task.child_name, task.status))
+                .collect::<Vec<_>>();
+            let mut not_archived = Vec::new();
+            for agent in &project.agents {
+                if agent.session_id == session_id {
+                    continue;
+                }
+                let child = self.backend.sessions()?.get(agent.session_id)?;
+                if child.state == AgentSessionState::Archived {
+                    deleted_sessions.insert(child.id, child.workspace_id);
+                } else {
+                    not_archived.push(format!("{} ({:?})", child.id, child.state));
+                }
+            }
+            if !unfinished_tasks.is_empty() || !not_archived.is_empty() {
+                log::warn!(
+                    "[loom-server] refusing to delete project root {session_id}: unfinished child tasks {unfinished_tasks:?}, non-archived child sessions {not_archived:?}"
+                );
+                return Err(LoomError::new(
+                    ErrorCode::InvalidState,
+                    "finish or cancel every child task before deleting this project",
+                    false,
+                ));
+            }
+            log::info!(
+                "[loom-server] deleting project root {session_id} with {} descendant session(s)",
+                deleted_sessions.len().saturating_sub(1)
+            );
+        }
+        let deleted_ids = deleted_sessions.keys().copied().collect::<BTreeSet<_>>();
+        // Remove the checkouts of every worktree that belongs to a deleted
+        // session, deepest-first, so a parent checkout is never removed before
+        // a worktree that lives under it.
+        let mut removed_worktrees = Vec::new();
+        if let Some(project) = &project {
+            let depths = project
+                .agents
+                .iter()
+                .map(|agent| (agent.session_id, agent.depth))
+                .collect::<BTreeMap<_, _>>();
+            let mut worktrees = project
+                .worktrees
+                .iter()
+                .filter(|worktree| {
+                    deleted_ids.contains(&worktree.parent_session_id)
+                        || deleted_ids.contains(&worktree.child_session_id)
+                })
+                .collect::<Vec<_>>();
+            worktrees.sort_by_key(|worktree| {
+                std::cmp::Reverse(
+                    depths
+                        .get(&worktree.parent_session_id)
+                        .copied()
+                        .unwrap_or_default()
+                        .max(
+                            depths
+                                .get(&worktree.child_session_id)
+                                .copied()
+                                .unwrap_or_default(),
+                        ),
+                )
+            });
+            for worktree in worktrees {
+                if let Err(error) = self.remove_project_worktree_checkout(worktree, force) {
+                    log::warn!(
+                        "[loom-server] failed to remove project worktree {} while deleting session {session_id}: {}",
+                        worktree.worktree_name,
+                        error.message
+                    );
+                    return Err(error);
+                }
+                removed_worktrees.push(worktree.worktree_name.clone());
+            }
+        }
+        // Remove the per-session roots, which contain the checkouts. The shared
+        // clone cache next to the roots is never touched.
+        for (id, workspace_id) in &deleted_sessions {
+            let root = self
+                .backend
+                .session_root_base
+                .join(workspace_id.to_string())
+                .join(id.to_string());
+            match fs::remove_dir_all(&root) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    log::warn!(
+                        "[loom-server] could not remove the filesystem root of deleted session {id}: {error}"
+                    );
+                    return Err(LoomError::new(
+                        ErrorCode::WorkspaceAccessDenied,
+                        format!("could not remove the stored filesystem of session {id}: {error}"),
+                        false,
+                    ));
+                }
+            }
+        }
+        // Drop every in-memory trace before the durable rows, so neither the
+        // state save that follows this request nor a later request can observe
+        // or re-insert a deleted session.
+        for id in &deleted_ids {
+            self.backend.sessions()?.remove(*id)?;
+        }
+        self.backend
+            .session_filesystems()?
+            .retain(|id, _| !deleted_ids.contains(id));
+        self.backend
+            .persisted_session_filesystems()?
+            .retain(|id| !deleted_ids.contains(id));
+        self.backend
+            .session_repositories()?
+            .retain(|id, _| !deleted_ids.contains(id));
+        self.backend
+            .session_vcs()?
+            .retain(|(id, _), _| !deleted_ids.contains(id));
+        self.backend
+            .session_policies()?
+            .retain(|id, _| !deleted_ids.contains(id));
+        self.backend
+            .auto_approve_actions()?
+            .retain(|id, _| !deleted_ids.contains(id));
+        self.backend
+            .runs()?
+            .retain(|_, handle| !deleted_ids.contains(&handle.session_id));
+        self.backend
+            .persisted_runs()?
+            .retain(|_, summary| !deleted_ids.contains(&summary.snapshot.session_id));
+        {
+            let mut journal = self.backend.journal()?;
+            // A reconnecting client must never receive events for a session that
+            // no longer exists. The global sequence deliberately keeps its
+            // high-water mark so retained cursors stay valid.
+            journal
+                .events
+                .retain(|event| !deleted_ids.contains(&event.session_id));
+            journal
+                .pending_events
+                .retain(|event| !deleted_ids.contains(&event.session_id));
+        }
+        if let Some(persistence) = &self.backend.persistence {
+            persistence.delete_sessions(&deleted_ids)?;
+        }
+        log::info!(
+            "[loom-server] deleted {} archived agent session(s) for {session_id}; removed {} project worktree(s)",
+            deleted_ids.len(),
+            removed_worktrees.len()
+        );
+        Ok(ServerResponse::Session(
+            SessionResponse::AgentSessionDeleted { session_id },
+        ))
+    }
+
     pub(crate) fn session_snapshot_projection(
         &self,
         session_id: AgentSessionId,
