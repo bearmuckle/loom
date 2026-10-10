@@ -188,8 +188,12 @@ image.
 
 ## Telling deployments apart in diagnostics
 
-`loom-server --diagnostics` prints one `key: value` line per fact and exits
-without touching state. It reports:
+`loom-server --diagnostics` prints one `key: value` line per fact, after a first
+line naming the server version, and exits without touching state: it resolves
+paths without creating them, opens no database, and never generates a token. A
+containerized deployment whose state directory is not on a filesystem of its own
+also gets a final `warning:` line, because its workspaces are removed with the
+container. It reports:
 
 - `execution-context`: whether the backend runs on a host or in a container.
 - `container-runtime`: the container runtime that was detected, when there is
@@ -201,7 +205,11 @@ without touching state. It reports:
 - `state-directory`: Loom's own state directory below that root.
 - `state-persistence`: whether durable state exists or the backend is in
   memory.
-- `state-directory-filesystem`: the filesystem type holding the state root.
+- `state-directory-filesystem`: whether the state directory is on a
+  filesystem of its own, which is what a mounted volume looks like, or on the
+  same filesystem as its parent, which is the container's own writable layer.
+  The line reads `separate filesystem`, `same filesystem as its parent`, or
+  `unknown` when the comparison cannot be made.
 - `instance-directory`: the instance directory for this bind address.
 - `state-database`: the state database path, or the in-memory backend.
 - `agent-commands`: where agent commands execute.
@@ -225,8 +233,8 @@ docker ps --filter label=loom.deployment-role=server-image-smoke-test
 ```
 
 The image health check probes the port from the server's own command line, so an
-overridden `--bind` is followed instead of a hardcoded 8765. An override that
-changes the TLS scheme still needs its own probe.
+overridden `--bind` is followed instead of a hardcoded 8765, and an override that
+adds `--tls-cert` is probed over HTTPS.
 
 ## Operator checklist
 

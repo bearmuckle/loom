@@ -52,7 +52,7 @@ FROM debian:bookworm-slim AS runtime
 #   libssl3, zlib1g  OpenSSL and zlib that the source-built libgit2 links
 #   libgcc-s1        unwinder used by the Rust runtime
 #   ca-certificates  outbound HTTPS (provider and forge requests)
-#   curl             only backs the HEALTHCHECK probe below
+#   curl             the health check probe below shells out to it
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -65,6 +65,11 @@ RUN apt-get update \
 RUN useradd --system --create-home --home-dir /var/lib/loom --shell /usr/sbin/nologin loom
 
 COPY --from=builder /src/target/release/loom-server /usr/local/bin/loom-server
+# The probe is a script rather than an inline curl because it reads this
+# container's own command line and follows `--bind`, `--tls-cert` and `--tls-key`
+# wherever they point. `--chmod=0755` keeps it executable without a second layer;
+# see the script's header for its contract and its environment overrides.
+COPY --chmod=0755 packaging/loom-server-healthcheck.sh /usr/local/bin/loom-server-healthcheck
 COPY LICENSE-AGPL LICENSES.md /usr/share/doc/loom/
 
 USER loom
@@ -77,12 +82,24 @@ ENV LOOM_STATE_DIR=/var/lib/loom
 
 EXPOSE 8765
 
-# The backend serves an unauthenticated plain-HTTP `/health` endpoint wherever it
-# is bound, so this probe mirrors the default `--bind` in `CMD`; overriding
-# `--bind` (or publishing the port at a different mapping) means overriding this
-# probe as well.
+# The backend serves an unauthenticated `/health` endpoint wherever it is bound,
+# and this probe reads the host, port and scheme from the command line of the
+# `loom-server` process the container runs, so an overridden `--bind` or a TLS
+# override is followed without overriding the probe as well. The probe is bounded
+# and exits non-zero when the listener does not answer.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:8765/health || exit 1
+  CMD ["/usr/local/bin/loom-server-healthcheck"]
+
+# The role this container plays, so a filter such as `docker ps --filter
+# label=loom.deployment-role=agent-worker` lists the containers that execute
+# agent commands and leaves out other things running the same image -- notably
+# the release pipeline's one-off `loom.deployment-role=server-image-smoke-test`
+# containers.
+LABEL loom.deployment-role="agent-worker"
+# `LOOM_DEPLOYMENT_ROLE` is the same fact for the process, and what
+# `loom-server --diagnostics` prints as `deployment-role: <role>`; the server
+# reads it from the environment and defaults to `agent-worker` when it is unset.
+ENV LOOM_DEPLOYMENT_ROLE=agent-worker
 
 # The default command needs no mounted token. Without `--token` or
 # `--token-file` the first start generates a `loom-<uuid>` token inside the
@@ -97,8 +114,9 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
 # `--allow-insecure-remote`. That accepts the single shared bearer token and
 # every protocol frame travelling unencrypted between this container and its
 # clients: publish the port only to trusted peers, or override `CMD` with
-# `--tls-cert`/`--tls-key` to serve `wss://` instead. The HEALTHCHECK below
-# probes plain HTTP, so a TLS override needs it overridden too.
+# `--tls-cert`/`--tls-key` to serve `wss://` instead. The HEALTHCHECK derives its
+# scheme from the command line too, so that TLS override is probed over HTTPS
+# without a probe override.
 ENTRYPOINT ["loom-server"]
 CMD ["--bind", "0.0.0.0:8765", \
      "--allow-insecure-remote", \

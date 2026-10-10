@@ -203,8 +203,9 @@ reachable. The first start generates the token in that instance directory, so
 `docker exec <container> cat /var/lib/loom/loom/loom-server/token` reads it, or
 set a fixed value with `--token` or `--token-file` instead. Publish the port
 only to trusted peers, or pass your own TLS material with `--tls-cert` and
-`--tls-key` and drop the opt-in. The image's `HEALTHCHECK` probes plain HTTP, so
-a TLS override needs its own probe over HTTPS.
+`--tls-key` and drop the opt-in. The image's `HEALTHCHECK` derives its host, port
+and scheme from the server's own command line, so an overridden `--bind` or a TLS
+override is followed without overriding the probe.
 
 Where agent commands execute, which account and environment they inherit, what
 the state root keeps across a restart, and the intended network policy are
