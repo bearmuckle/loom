@@ -469,6 +469,10 @@ pub(crate) struct LoomView {
     session_trees: BTreeMap<String, Entity<TreeState>>,
     /// Last rendered tree nodes per worker node, used to skip redundant updates.
     session_tree_entries: BTreeMap<String, Vec<SessionTreeNode>>,
+    /// Active session each worker's tree was last synchronized to. Navigation
+    /// reveals the active session, but a chevron toggle must not force the
+    /// active session's ancestors back open.
+    session_tree_active: BTreeMap<String, AgentSessionId>,
     /// Worker node groups the user has collapsed in the sidebar.
     collapsed_worker_nodes: BTreeSet<String>,
     /// Last session-list error per worker node, so a worker that failed to load
@@ -1470,6 +1474,7 @@ impl LoomView {
             project_poll_scheduled: false,
             session_trees: BTreeMap::new(),
             session_tree_entries: BTreeMap::new(),
+            session_tree_active: BTreeMap::new(),
             collapsed_worker_nodes: BTreeSet::new(),
             node_session_load_errors: BTreeMap::new(),
             active_session: active_session.clone(),

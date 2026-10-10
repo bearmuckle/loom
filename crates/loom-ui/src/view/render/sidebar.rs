@@ -246,22 +246,38 @@ impl LoomView {
         let selected_session_id = self.active_session.id.to_string();
         let selected_item = find_session_tree_item(&tree_items, &selected_session_id);
         let tree = if let Some(tree) = self.session_trees.get(node_id).cloned() {
-            if self.session_tree_entries.get(node_id) != Some(&tree_nodes) {
+            let structure_changed = self.session_tree_entries.get(node_id) != Some(&tree_nodes);
+            if structure_changed {
                 tree.update(cx, |state, cx| state.set_items(tree_items.clone(), cx));
                 self.session_tree_entries
                     .insert(node_id.to_owned(), tree_nodes.clone());
             }
-            let current_selected_id = tree
-                .read(cx)
-                .selected_item()
-                .map(|item| item.id.to_string());
-            if current_selected_id.as_deref() != Some(selected_session_id.as_str()) {
+            let active_changed =
+                self.session_tree_active.get(node_id) != Some(&self.active_session.id);
+            if structure_changed || active_changed {
+                // Rebuilt items start collapsed, and navigating to a session
+                // should reveal it, so re-apply the selection (which expands
+                // the active session's ancestors).
                 tree.update(cx, |state, cx| state.set_selected_item(selected_item, cx));
+                self.session_tree_active
+                    .insert(node_id.to_owned(), self.active_session.id);
+            } else {
+                // A chevron toggle moves the tree's own highlight without
+                // changing the active session. Restore the highlight to the
+                // active row, but do not re-open ancestors the user collapsed.
+                let current_ix = tree.read(cx).selected_index();
+                let active_id: gpui_kit::SharedString = selected_session_id.clone().into();
+                let active_ix = tree.read(cx).index_of(&active_id);
+                if current_ix != active_ix {
+                    tree.update(cx, |state, cx| state.set_selected_index(active_ix, cx));
+                }
             }
             tree
         } else {
             self.session_tree_entries
                 .insert(node_id.to_owned(), tree_nodes);
+            self.session_tree_active
+                .insert(node_id.to_owned(), self.active_session.id);
             let tree = cx.new(|cx| TreeState::new(cx).items(tree_items.clone()));
             tree.update(cx, |state, cx| state.set_selected_item(selected_item, cx));
             self.session_trees.insert(node_id.to_owned(), tree.clone());
@@ -269,6 +285,9 @@ impl LoomView {
         };
 
         let view = cx.entity();
+        // The row render closure must own a clone it can focus on demand; the
+        // tree itself stays borrowed by `KitTree::new` below.
+        let tree_for_rows = tree.clone();
         let menu_sessions = sessions.clone();
         let menu_view = view.clone();
         let menu_project = self.project_snapshot.clone();
@@ -321,8 +340,148 @@ impl LoomView {
             } else {
                 rgb(0xb7c0d0)
             };
-            let click_view = view.clone();
-            let click_session = session.clone();
+            let focus_tree = tree_for_rows.clone();
+            // A plain click on the session name selects it. The chevron is a
+            // separate sibling that keeps the tree's built-in toggle, so
+            // selecting and expanding never happen in the same gesture.
+            let select_view = view.clone();
+            let select_session = session.clone();
+            let select = move |cx: &mut App| {
+                select_view.update(cx, |this, cx| {
+                    // Selecting from the phone drawer navigates, so dismiss the
+                    // drawer even when the session is already active.
+                    this.session_drawer_open = false;
+                    // Re-selecting the session already on screen would reload and
+                    // briefly blank the conversation.
+                    if this.active_session.id != select_session.id {
+                        this.select_session(select_session.clone(), cx);
+                    }
+                    cx.notify();
+                });
+            };
+            let row_content = div()
+                .flex_1()
+                .min_w(px(0.))
+                .flex()
+                .items_center()
+                .gap_2()
+                // Swallow the click so it selects the session without also
+                // expanding or collapsing the project.
+                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    cx.stop_propagation();
+                    // The tree's own mouse-down listener normally focuses it;
+                    // restore that now that propagation is stopped.
+                    focus_tree.update(cx, |state, cx| state.focus(window, cx));
+                    select(cx);
+                })
+                // A leaf has no chevron; its alignment spacer selects with the
+                // rest of the row.
+                .when(!entry.is_folder(), |element| {
+                    element.child(
+                        div()
+                            .w(px(if layout.phone { 16. } else { 12. }))
+                            .flex_shrink_0(),
+                    )
+                })
+                .child(
+                    Icon::new(icon)
+                        .size(px(15.))
+                        .flex_shrink_0()
+                        .text_color(icon_color),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_color(label_color)
+                        .when(is_root, |element| element.font_weight(FontWeight::SEMIBOLD))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap_2()
+                        .when_some(count_badge, |element, count| {
+                            element.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .px(px(6.))
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(if root_active {
+                                        rgb(0x2563eb)
+                                    } else {
+                                        rgb(0x30343f)
+                                    })
+                                    .text_xs()
+                                    .text_color(if root_active {
+                                        rgb(0x93c5fd)
+                                    } else {
+                                        rgb(0x64748b)
+                                    })
+                                    .child(count),
+                            )
+                        })
+                        .when_some(activity, |element, activity| element.child(activity))
+                        .when_some(pill, |element, pill| {
+                            element.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .px(px(7.))
+                                    .py(px(1.))
+                                    .rounded_full()
+                                    .bg(rgb(pill.background))
+                                    .text_xs()
+                                    .text_color(rgb(pill.foreground))
+                                    .child(pill.label),
+                            )
+                        })
+                        .when(layout.phone, |element| {
+                            // Touch has no right-click, so expose the
+                            // session context menu (rename/archive) as a
+                            // row action.
+                            let menu_session = session.clone();
+                            let menu_project = row_project.clone();
+                            let menu_view = view.clone();
+                            element.child(
+                                Button::new(("session-tree-menu", row_index))
+                                    .icon(Icon::new(IconName::Ellipsis))
+                                    .ghost()
+                                    .small()
+                                    .accessibility_label("Project actions")
+                                    .dropdown_menu(move |menu, _window, _cx| {
+                                        Self::build_project_session_context_menu(
+                                            menu,
+                                            menu_session.clone(),
+                                            (*menu_project).clone(),
+                                            menu_view.clone(),
+                                        )
+                                    }),
+                            )
+                        }),
+                );
+            let row = div()
+                .pl(px(depth as f32 * if layout.phone { 16. } else { 12. }))
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_2()
+                // The chevron stays outside the click guard so `TreeState` still
+                // expands or collapses this row when it is clicked.
+                .when(entry.is_folder(), |element| {
+                    element.child(
+                        div()
+                            .id(("session-tree-disclosure", row_index))
+                            .test_support()
+                            .w(px(if layout.phone { 16. } else { 12. }))
+                            .flex_shrink_0()
+                            .when_some(tree_indicator, |element, icon| element.child(icon)),
+                    )
+                })
+                .child(row_content);
             ListItem::new(("session-tree-root", row_index))
                 .selected(selected)
                 .mx_1()
@@ -330,113 +489,7 @@ impl LoomView {
                 .px_2()
                 .py(layout.nav_row_padding())
                 .text_size(layout.nav_row_font_size())
-                .child(
-                    div()
-                        .pl(px(depth as f32 * if layout.phone { 16. } else { 12. }))
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .w(px(if layout.phone { 16. } else { 12. }))
-                                .flex_shrink_0()
-                                .when_some(tree_indicator, |element, icon| element.child(icon)),
-                        )
-                        .child(
-                            Icon::new(icon)
-                                .size(px(15.))
-                                .flex_shrink_0()
-                                .text_color(icon_color),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .truncate()
-                                .text_color(label_color)
-                                .when(is_root, |element| element.font_weight(FontWeight::SEMIBOLD))
-                                .child(label),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_shrink_0()
-                                .items_center()
-                                .gap_2()
-                                .when_some(count_badge, |element, count| {
-                                    element.child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .px(px(6.))
-                                            .rounded_full()
-                                            .border_1()
-                                            .border_color(if root_active {
-                                                rgb(0x2563eb)
-                                            } else {
-                                                rgb(0x30343f)
-                                            })
-                                            .text_xs()
-                                            .text_color(if root_active {
-                                                rgb(0x93c5fd)
-                                            } else {
-                                                rgb(0x64748b)
-                                            })
-                                            .child(count),
-                                    )
-                                })
-                                .when_some(activity, |element, activity| element.child(activity))
-                                .when_some(pill, |element, pill| {
-                                    element.child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .px(px(7.))
-                                            .py(px(1.))
-                                            .rounded_full()
-                                            .bg(rgb(pill.background))
-                                            .text_xs()
-                                            .text_color(rgb(pill.foreground))
-                                            .child(pill.label),
-                                    )
-                                })
-                                .when(layout.phone, |element| {
-                                    // Touch has no right-click, so expose the
-                                    // session context menu (rename/archive) as a
-                                    // row action.
-                                    let menu_session = session.clone();
-                                    let menu_project = row_project.clone();
-                                    let menu_view = view.clone();
-                                    element.child(
-                                        Button::new(("session-tree-menu", row_index))
-                                            .icon(Icon::new(IconName::Ellipsis))
-                                            .ghost()
-                                            .small()
-                                            .accessibility_label("Project actions")
-                                            .dropdown_menu(move |menu, _window, _cx| {
-                                                Self::build_project_session_context_menu(
-                                                    menu,
-                                                    menu_session.clone(),
-                                                    (*menu_project).clone(),
-                                                    menu_view.clone(),
-                                                )
-                                            }),
-                                    )
-                                }),
-                        ),
-                )
-                .on_click(move |_, _, cx| {
-                    click_view.update(cx, |this, cx| {
-                        // Selecting from the phone drawer navigates, so dismiss
-                        // the drawer even when the session is already active.
-                        this.session_drawer_open = false;
-                        // Re-selecting the session already on screen would
-                        // reload and briefly blank the conversation.
-                        if this.active_session.id != click_session.id {
-                            this.select_session(click_session.clone(), cx);
-                        }
-                        cx.notify();
-                    });
-                })
+                .child(row)
         })
         .context_menu(move |_, entry, menu, _window, _cx| {
             let session_id = entry.item().id.to_string();

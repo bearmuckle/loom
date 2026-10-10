@@ -374,14 +374,38 @@ fn nested_project_tree_selects_grandchild_session_by_click(cx: &mut TestAppConte
         // Projects with sub-agents start collapsed.
         assert!(window.find(("session-tree-root", 0usize)).visible());
         assert!(window.try_find(("session-tree-root", 1usize)).is_none());
-        // Expanding the project, then its agent, reveals the grandchild.
+        // Clicking the project name selects it without expanding its agents.
         window.click(("session-tree-root", 0usize), cx);
         window.render_frame(cx);
+        assert_eq!(view.read(cx).active_session.name, "Project");
+        assert!(
+            window.try_find(("session-tree-root", 1usize)).is_none(),
+            "selecting a project name must not expand its sub-agents"
+        );
+        // The chevron expands the project, then the agent, revealing the grandchild.
+        window.click(("session-tree-disclosure", 0usize), cx);
+        window.render_frame(cx);
         assert!(window.find(("session-tree-root", 1usize)).visible());
-        window.click(("session-tree-root", 1usize), cx);
+        window.click(("session-tree-disclosure", 1usize), cx);
         window.render_frame(cx);
         assert!(window.find(("session-tree-root", 2usize)).visible());
+        // A plain click on the deepest agent still selects it.
         window.click(("session-tree-root", 2usize), cx);
+        assert_eq!(view.read(cx).active_session.name, "Worker");
+        // Collapsing an ancestor of the active agent keeps it collapsed
+        // instead of forcing the selection back into view.
+        window.click(("session-tree-disclosure", 1usize), cx);
+        window.render_frame(cx);
+        assert!(window.try_find(("session-tree-root", 2usize)).is_none());
+        assert_eq!(
+            view.read(cx).active_session.name,
+            "Worker",
+            "a chevron toggle must not change the active session"
+        );
+        // Re-expanding reveals the selected agent again.
+        window.click(("session-tree-disclosure", 1usize), cx);
+        window.render_frame(cx);
+        assert!(window.find(("session-tree-root", 2usize)).visible());
         assert_eq!(view.read(cx).active_session.name, "Worker");
     })
     .unwrap();
