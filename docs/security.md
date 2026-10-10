@@ -104,7 +104,10 @@ traversal and outside-root symlink rejection, revision-checked edits,
 session-scoped task working directories, and session ownership checks for
 terminal and task control requests. Workspace membership does not grant
 filesystem access by itself. A session root is a path-ownership boundary, not
-a promise of OS-level process sandboxing. The default `ApprovalPolicy`
+a promise of OS-level process sandboxing. Whether a command executes on a host
+account or inside a container is a deployment choice, documented in
+[deployment](deployment.md) together with the persistence, lifecycle, and
+network policy it implies. The default `ApprovalPolicy`
 allows reads, pauses writes and commands for approval, requests approval for
 network actions, and denies
 destructive actions. The policy evaluation is included in the agent event

@@ -315,6 +315,8 @@ and `/ws`; a `RunningRemoteServer` owns graceful shutdown. The
 native client and a browser client do not need different domain operations.
 Transport tasks may time out or be cancelled, but backend work that already
 entered the synchronous runtime is deliberately not tied to the connection.
+Where the backend runs fixes where its agent commands execute and what state
+outlives a restart; see [deployment](deployment.md).
 
 ## Repository layout
 

@@ -206,6 +206,10 @@ only to trusted peers, or pass your own TLS material with `--tls-cert` and
 `--tls-key` and drop the opt-in. The image's `HEALTHCHECK` probes plain HTTP, so
 a TLS override needs its own probe over HTTPS.
 
+Where agent commands execute, which account and environment they inherit, what
+the state root keeps across a restart, and the intended network policy are
+documented in [deployment](docs/deployment.md).
+
 ## Providers
 
 Configure the official OpenAI provider by entering an API key for the selected
