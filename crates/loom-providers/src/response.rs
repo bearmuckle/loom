@@ -102,29 +102,30 @@ pub fn normalize_openai_response(body: &serde_json::Value) -> Result<Vec<ModelSt
                         false,
                     )
                 })?;
-            let arguments = function
-                .get("arguments")
-                .map(|arguments| {
-                    if let Some(arguments) = arguments.as_str() {
-                        serde_json::from_str(arguments).map_err(|error| {
-                            LoomError::new(
-                                ErrorCode::ProviderInvalidResponse,
-                                format!("tool arguments were not valid JSON: {error}"),
-                                false,
-                            )
-                        })
-                    } else if arguments.is_object() {
-                        Ok(arguments.clone())
-                    } else {
-                        Err(LoomError::new(
-                            ErrorCode::ProviderInvalidResponse,
-                            "tool arguments must be a JSON object",
-                            false,
-                        ))
-                    }
-                })
-                .transpose()?
-                .unwrap_or_else(|| serde_json::json!({}));
+            // A call whose arguments cannot be decoded is reported as
+            // `InvalidToolCall` and the remaining calls still run, so one bad
+            // payload does not fail the whole completion. A call without a
+            // name stays a malformed-envelope error.
+            let raw = function.get("arguments").map_or_else(
+                || Ok(serde_json::json!({})),
+                |arguments| match arguments.as_str() {
+                    Some(raw) => decode_tool_arguments(name, raw),
+                    None => decode_tool_arguments(name, &arguments.to_string()),
+                },
+            );
+            let arguments = match raw {
+                Ok(arguments) => arguments,
+                Err(reason) => {
+                    log::warn!(
+                        "OpenAI-compatible tool call '{name}' could not be decoded: {reason}"
+                    );
+                    events.push(ModelStreamEvent::InvalidToolCall {
+                        name: name.to_owned(),
+                        reason,
+                    });
+                    continue;
+                }
+            };
             events.push(ModelStreamEvent::ToolCallDelta {
                 call: ToolCall {
                     id: ToolCallId::new(),
