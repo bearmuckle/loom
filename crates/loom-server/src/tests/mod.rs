@@ -39,6 +39,7 @@ use support::*;
 mod feed;
 mod filesystem;
 mod project_child;
+mod project_child_reliability;
 mod project_integration;
 mod project_manager;
 mod project_misc;

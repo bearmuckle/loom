@@ -512,21 +512,12 @@ impl GitService {
             )));
         }
 
-        let mut status_options = StatusOptions::new();
-        status_options
-            .include_untracked(true)
-            .recurse_untracked_dirs(true)
-            .include_ignored(true)
-            .recurse_ignored_dirs(true)
-            .include_unreadable(true)
-            .include_unreadable_as_untracked(true);
-        let statuses = repository
-            .statuses(Some(&mut status_options))
-            .map_err(|error| git_error("could not inspect parent Git checkout", error))?;
-        if !statuses.is_empty() {
-            return Err(LoomError::conflict(
-                "cannot fast-forward a parent Git checkout with staged, modified, untracked, ignored, or unreadable files",
-            ));
+        let blocking = blocking_parent_checkout_paths(&repository)?;
+        if !blocking.is_empty() {
+            return Err(LoomError::conflict(format!(
+                "cannot fast-forward a parent Git checkout with staged, modified, untracked, or unreadable files: {}",
+                blocking.join(", ")
+            )));
         }
 
         let target = repository
@@ -723,21 +714,12 @@ impl GitService {
             )));
         }
 
-        let mut status_options = StatusOptions::new();
-        status_options
-            .include_untracked(true)
-            .recurse_untracked_dirs(true)
-            .include_ignored(true)
-            .recurse_ignored_dirs(true)
-            .include_unreadable(true)
-            .include_unreadable_as_untracked(true);
-        let statuses = repository
-            .statuses(Some(&mut status_options))
-            .map_err(|error| git_error("could not inspect parent Git checkout", error))?;
-        if !statuses.is_empty() {
-            return Err(LoomError::conflict(
-                "cannot integrate into a parent Git checkout with staged, modified, untracked, ignored, or unreadable files",
-            ));
+        let blocking = blocking_parent_checkout_paths(&repository)?;
+        if !blocking.is_empty() {
+            return Err(LoomError::conflict(format!(
+                "cannot integrate into a parent Git checkout with staged, modified, untracked, or unreadable files: {}",
+                blocking.join(", ")
+            )));
         }
 
         if child_commit == expected_parent {
@@ -1317,6 +1299,37 @@ fn count_diff_lines(repository: &Repository, staged: bool) -> Result<BTreeMap<St
     Ok(counts)
 }
 
+/// Collects the paths that block a fast-forward or merge into a parent
+/// checkout: staged, modified, untracked, unreadable, or conflicted files.
+///
+/// Ignored paths are deliberately excluded. A path that neither the parent nor
+/// the child revision tracks cannot conflict with a fast-forward or merge, so
+/// ignored build output such as `target/` must not block integration. libgit2's
+/// safe checkout still refuses to overwrite a file that the target revision
+/// tracks, so a genuine collision remains protected. Naming the blocking paths
+/// also makes the error actionable instead of listing five file states.
+fn blocking_parent_checkout_paths(repository: &Repository) -> Result<Vec<String>> {
+    let mut options = StatusOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_unreadable(true)
+        .include_unreadable_as_untracked(true);
+    let statuses = repository
+        .statuses(Some(&mut options))
+        .map_err(|error| git_error("could not inspect parent Git checkout", error))?;
+    let mut paths = Vec::new();
+    for entry in statuses.iter() {
+        let path = entry
+            .path()
+            .map_err(|error| git_error("Git status contained invalid UTF-8", error))?;
+        paths.push(path.to_owned());
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
 fn status_kind(status: Status, index: bool) -> GitFileStatusKind {
     if status.is_conflicted() {
         return GitFileStatusKind::Conflicted;
@@ -1827,6 +1840,31 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn clean_head_fast_forward_ignores_ignored_build_output() {
+        let (git, root) = repository();
+        fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        run(&root, &["add", "--", ".gitignore"]);
+        run(&root, &["commit", "-qm", "ignore build output"]);
+        let expected = git.repository().unwrap().head().unwrap().target().unwrap();
+        let (target, _, _) = descendant_commit(&git, &root);
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join("target/artifact"), "build output\n").unwrap();
+
+        // Ignored build output is in neither revision, so it must not block a
+        // fast-forward and must be left untouched.
+        assert_eq!(git.advance_clean_head(expected, target).unwrap(), target);
+        assert_eq!(
+            git.repository().unwrap().head().unwrap().target(),
+            Some(target)
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("target/artifact")).unwrap(),
+            "build output\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn write_commit(root: &Path, file: &str, content: &str, message: &str) {
         fs::write(root.join(file), content).unwrap();
         run(root, &["add", "--", file]);
@@ -1951,6 +1989,42 @@ mod tests {
         assert_eq!(
             fs::read_to_string(root.join("README.md")).unwrap(),
             "local change\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn merge_integration_ignores_ignored_build_output() {
+        let (git, root) = repository();
+        fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        run(&root, &["add", "--", ".gitignore"]);
+        run(&root, &["commit", "-qm", "ignore build output"]);
+        let parent_branch = git.current_branch().unwrap().unwrap();
+        let child_branch = format!("codex/child-{}", loom_core::RepositoryId::new());
+        run(&root, &["checkout", "-qb", &child_branch]);
+        write_commit(&root, "child.txt", "child\n", "child change");
+        let child = git.repository().unwrap().head().unwrap().target().unwrap();
+        run(&root, &["checkout", "-q", &parent_branch]);
+        write_commit(&root, "README.md", "parent advanced\n", "parent change");
+        let parent_advanced = git.repository().unwrap().head().unwrap().target().unwrap();
+        fs::create_dir_all(root.join("target")).unwrap();
+        fs::write(root.join("target/artifact"), "build output\n").unwrap();
+
+        // Ignored build output cannot conflict with the merge and must not
+        // block it; the file is left in place for the next build.
+        let MergeIntegrationOutcome::Merged(merge) = git
+            .integrate_merge(parent_advanced, child, "integrate child")
+            .unwrap()
+        else {
+            panic!("expected a clean merge commit");
+        };
+        assert_eq!(
+            git.repository().unwrap().head().unwrap().target(),
+            Some(merge)
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("target/artifact")).unwrap(),
+            "build output\n"
         );
         fs::remove_dir_all(root).unwrap();
     }

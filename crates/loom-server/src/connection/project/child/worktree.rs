@@ -330,9 +330,21 @@ impl InProcessConnection {
         }
         let parent_status = parent_git.status()?;
         if !parent_status.clean || parent_status.branch.is_none() {
-            return Err(LoomError::conflict(
-                "parent checkout must be clean and on a local branch before integration",
-            ));
+            let mut paths = parent_status
+                .files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect::<Vec<_>>();
+            paths.sort();
+            paths.dedup();
+            return Err(LoomError::conflict(if paths.is_empty() {
+                "parent checkout must be clean and on a local branch before integration".to_owned()
+            } else {
+                format!(
+                    "parent checkout must be clean and on a local branch before integration; blocking paths: {}",
+                    paths.join(", ")
+                )
+            }));
         }
         let parent_revision = parent_status.head.ok_or_else(|| {
             LoomError::invalid_state("parent repository HEAD does not point to a commit")
