@@ -238,3 +238,298 @@ fn reopening_a_session_with_a_concurrent_event_restores_durable_run_state(cx: &m
         );
     });
 }
+
+/// Starts a real backend with one workspace and one session whose
+/// `deterministic/demo` run has already finished, plus the protocol version a
+/// view on that backend is initialized with. The rebuild tests below differ
+/// only in the response pair they feed the view.
+#[cfg(not(target_family = "wasm"))]
+fn completed_demo_session(
+    task: &str,
+) -> (
+    loom_local::OwnedBackend,
+    ClientConnection,
+    AgentSessionSnapshot,
+    ProtocolVersion,
+) {
+    let backend = loom_local::OwnedBackend::new();
+    let connection = ClientConnection::InProcess(Box::new(backend.connect()));
+    let negotiation = crate::connection::negotiate(&connection).unwrap();
+    let workspace = crate::connection::create_workspace(&connection, "Rebuild").unwrap();
+    let session = crate::connection::create_session_in_workspace(
+        &connection,
+        workspace.id,
+        "Rebuild session",
+    )
+    .unwrap();
+    let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id: session.id,
+            task: task.to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            system_instructions: None,
+            repository_instructions: None,
+        },
+    )));
+    assert!(
+        matches!(
+            started.result,
+            Ok(ServerResponse::Run(RunResponse::AgentRunStarted(_)))
+        ),
+        "unexpected run start response: {:?}",
+        started.result
+    );
+    wait_for_session_state(&connection, session.id, AgentSessionState::Completed);
+    (backend, connection, session, negotiation.protocol_version)
+}
+
+/// Opens a window on a view that has loaded `session`, which is the state both
+/// rebuild tests start from. The live worker's delayed status poll is cleared so
+/// the test stays synchronous.
+#[cfg(not(target_family = "wasm"))]
+fn open_selected_session_view(
+    cx: &mut TestAppContext,
+    backend: loom_local::OwnedBackend,
+    connection: ClientConnection,
+    session: AgentSessionSnapshot,
+    task: &str,
+    protocol_version: ProtocolVersion,
+) -> Entity<LoomView> {
+    let options = UiOptions {
+        project: None,
+        task: task.to_owned(),
+        demo: false,
+        model: ModelId::new("deterministic/demo"),
+        endpoint: None,
+        api_key: None,
+        remote: None,
+        token: None,
+        reset_state: false,
+        ca: None,
+        allow_insecure_remote: false,
+    };
+    let handle = cx.open_window(size(px(1280.), px(800.)), move |_, cx| {
+        let mut view = LoomView::initialize_from_connection(
+            &options,
+            connection,
+            PathBuf::new(),
+            false,
+            None,
+            cx.focus_handle(),
+            false,
+            Some(protocol_version),
+            None,
+        )
+        .unwrap();
+        view.owned_backend = Some(backend);
+        view.worker_nodes.clear();
+        view.select_session(session, cx);
+        view
+    });
+    // Let the interactive load settle so the test decides the final state.
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, _| {
+        window.root::<LoomView>().unwrap().unwrap()
+    })
+    .unwrap()
+}
+
+/// A rebuild answered with a `SessionEventsSnapshot` must apply the durable run
+/// projection even though the snapshot already carried a tail event.
+///
+/// A stale client cursor makes the server answer the events request with a
+/// snapshot window instead of an incremental batch. That window holds only the
+/// journal from `oldest_sequence` up, so the tail event it carries leaves the
+/// timeline non-empty; suppressing the durable projection there would drop the
+/// run's control state (stopping event streaming through `run_should_poll()`)
+/// and the run id that triggers the transcript page rebuilding the answer.
+#[cfg(not(target_family = "wasm"))]
+#[gpui_kit::test]
+fn session_load_from_a_stale_snapshot_restores_durable_run_state(cx: &mut TestAppContext) {
+    const TASK: &str = "rebuild the session from a stale cursor";
+    cx.update(gpui_kit::init);
+    let (backend, connection, session, protocol_version) = completed_demo_session(TASK);
+
+    // The durable half of the rebuild: production reads the initial state and
+    // wraps it as `AgentSessionSnapshot`. It omits the transcript, which the
+    // view pages separately.
+    let initial = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::GetAgentSessionInitialState {
+            session_id: session.id,
+        },
+    )));
+    let initial = match initial.result {
+        Ok(ServerResponse::Session(SessionResponse::AgentSessionInitialState(initial))) => initial,
+        response => panic!("unexpected initial state response: {response:?}"),
+    };
+    let run = initial
+        .projection
+        .active_run
+        .clone()
+        .expect("a session that ran has an active run projection");
+    assert!(
+        run.messages.is_empty(),
+        "the initial state omits the transcript; the view pages it"
+    );
+    let run_id = run.run.id;
+    let run_state = run.run.state;
+    // The snapshot window carries the session the server currently knows,
+    // which is the one the durable half describes.
+    let session_snapshot = initial.projection.session.clone();
+    // The window a stale cursor receives is a tail of the journal, so it is
+    // not the conversation: here one delta journaled after the cursor.
+    let tail_delta = loom_protocol::ServerEventEnvelope {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        sequence: initial.cursor.next(),
+        session_id: session.id,
+        event: ServerEvent::Agent {
+            event: AgentEvent::AssistantMessageDelta {
+                run_id,
+                message_id: 1,
+                text: "a delta carried by the snapshot tail".to_owned(),
+            },
+        },
+    };
+    let latest_sequence = tail_delta.sequence;
+
+    let view = open_selected_session_view(
+        cx,
+        backend,
+        connection,
+        session.clone(),
+        TASK,
+        protocol_version,
+    );
+    view.update(cx, |view, cx| {
+        view.finish_async_session_load(
+            session.id,
+            ResponseEnvelope::success(
+                loom_core::RequestId::new(),
+                ServerResponse::Session(SessionResponse::AgentSessionSnapshot(initial.projection)),
+            ),
+            ResponseEnvelope::success(
+                loom_core::RequestId::new(),
+                ServerResponse::Events(EventsResponse::SessionEventsSnapshot {
+                    session: session_snapshot,
+                    events: vec![tail_delta],
+                    oldest_sequence: latest_sequence,
+                    latest_sequence,
+                    stream_epoch: None,
+                }),
+            ),
+            cx,
+        );
+    });
+    // Drains the transcript page the snapshot arm must still request.
+    cx.run_until_parked();
+
+    view.update(cx, |view, _| {
+        assert_eq!(
+            view.active_run_id,
+            Some(run_id),
+            "the snapshot arm dropped the durable run id, so the transcript is never paged: timeline {:?}",
+            view.timeline
+        );
+        assert_eq!(view.run_state, Some(run_state));
+        assert!(
+            view.timeline
+                .iter()
+                .any(|item| matches!(item, TimelineItem::User(text) if text == TASK)),
+            "the rebuilt conversation is missing its task question: {:?}",
+            view.timeline
+        );
+        let assistant_text = view
+            .timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::Assistant(turn) => Some(turn),
+                _ => None,
+            })
+            .flat_map(|turn| turn.parts.clone())
+            .filter_map(|part| match part {
+                AssistantPart::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            assistant_text
+                .iter()
+                .any(|text| text.contains("The task is complete")),
+            "the rebuilt conversation collapsed to the snapshot tail: {assistant_text:?}"
+        );
+        // The snapshot's head is a floor, so an event older than it cannot be
+        // re-applied behind the cursor.
+        assert!(
+            view.after_sequence
+                .is_some_and(|cursor| cursor >= latest_sequence),
+            "the cursor fell behind the snapshot head: {:?}",
+            view.after_sequence
+        );
+    });
+}
+
+/// The boot ladder's snapshot step must seed run control state and rebuild the
+/// conversation from the durable projection when its event batch carried
+/// nothing.
+///
+/// `load_session` reaches this step through `collect_events_since` when the
+/// backend answers with a snapshot instead of an incremental batch. The backend
+/// cannot be made to answer the boot ladder with a snapshot deterministically,
+/// so the step is invoked directly with the empty batch that leaves the durable
+/// projection as the only source of both.
+#[cfg(not(target_family = "wasm"))]
+#[gpui_kit::test]
+fn apply_event_snapshot_restores_durable_run_state_and_conversation(cx: &mut TestAppContext) {
+    const TASK: &str = "rebuild the boot ladder from a snapshot";
+    cx.update(gpui_kit::init);
+    let (backend, connection, session, protocol_version) = completed_demo_session(TASK);
+
+    // Unlike `GetAgentSessionInitialState`, this response carries the run's
+    // messages, so the projection alone can rebuild the conversation.
+    let snapshot = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::GetAgentSessionSnapshot {
+            session_id: session.id,
+        },
+    )));
+    let projection = match snapshot.result {
+        Ok(ServerResponse::Session(SessionResponse::AgentSessionSnapshot(projection))) => {
+            projection
+        }
+        response => panic!("unexpected session snapshot response: {response:?}"),
+    };
+    let run = projection
+        .active_run
+        .clone()
+        .expect("a session that ran has an active run projection");
+    assert!(
+        !run.messages.is_empty(),
+        "the session snapshot carries the transcript the initial state omits"
+    );
+    let run_id = run.run.id;
+    let run_state = run.run.state;
+
+    let view = open_selected_session_view(
+        cx,
+        backend,
+        connection,
+        session.clone(),
+        TASK,
+        protocol_version,
+    );
+    view.update(cx, |view, _| {
+        view.apply_event_snapshot(
+            Vec::new(),
+            projection.latest_sequence,
+            projection.active_run.clone(),
+        );
+        assert_eq!(view.active_run_id, Some(run_id));
+        assert_eq!(view.run_state, Some(run_state));
+        assert!(
+            view.timeline
+                .iter()
+                .any(|item| matches!(item, TimelineItem::User(text) if text == TASK)),
+            "the boot rebuild is missing its task question: {:?}",
+            view.timeline
+        );
+    });
+}
