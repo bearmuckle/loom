@@ -3120,6 +3120,52 @@ fn phone_composer_reserves_space_for_the_on_screen_keyboard(cx: &mut TestAppCont
 }
 
 #[gpui_kit::test]
+fn phone_tap_on_composer_field_padding_focuses_the_composer(cx: &mut TestAppContext) {
+    use gpui_kit::Focusable as _;
+
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(390.), px(844.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view
+    });
+    cx.update_window(handle.into(), |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        window.render_frame(cx);
+        // The view focuses the composer as soon as it creates it, so focus has
+        // to move away first for the tap to be the cause of the refocus.
+        view.update(cx, |view, cx| {
+            if let Some(filter) = view.session_filter_input.clone() {
+                filter.update(cx, |state, cx| state.focus(window, cx));
+            }
+        });
+        window.render_frame(cx);
+        view.update(cx, |view, cx| {
+            let input = view.composer_input.clone().expect("composer input");
+            assert!(!input.read(cx).focus_handle(cx).is_focused(window));
+        });
+        // (4, 4) is inside the `composer-field` wrapper's `p_3` padding but
+        // outside the `Textarea` bounds, so only the wrapper handler can
+        // route focus back into the composer.
+        window.click_at("composer-field", gpui_kit::point(px(4.), px(4.)), cx);
+        window.render_frame(cx);
+        view.update(cx, |view, cx| {
+            let input = view.composer_input.clone().expect("composer input");
+            assert!(
+                input.read(cx).focus_handle(cx).is_focused(window),
+                "a tap on the composer field's padding should focus the field"
+            );
+        });
+        window.input("hi", cx);
+        view.update(cx, |view, cx| {
+            let input = view.composer_input.clone().expect("composer input");
+            assert_eq!(input.read(cx).value().to_string(), "hi");
+        });
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 async fn session_creation_uses_worker_model_catalog_and_selects_the_created_session(
     cx: &mut TestAppContext,
 ) {
