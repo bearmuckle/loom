@@ -552,16 +552,13 @@ impl LoomView {
                 // and the cursor ends at the later of the batch and the
                 // projection this rebuild started from.
                 self.apply_event_batch(events, fallback_latest_sequence);
-                if let Some(run) = fallback_projection
+                // The durable run projection is applied whether or not the
+                // batch produced timeline items. Suppressing it would drop the
+                // run's control state, the transcript page that rebuilds the
+                // conversation, and the run polling that keeps it streaming.
+                if let Some(projection) = fallback_projection
                     .as_ref()
-                    .and_then(|projection| projection.active_run.as_ref())
-                {
-                    self.seed_plan_from_projection(run);
-                }
-                if self.timeline.is_empty()
-                    && let Some(projection) = fallback_projection
-                        .as_ref()
-                        .and_then(|projection| projection.active_run.clone())
+                    .and_then(|projection| projection.active_run.clone())
                 {
                     self.apply_run_projection(projection);
                 }
@@ -577,26 +574,25 @@ impl LoomView {
                 self.active_session = session;
                 self.reset_projection();
                 self.apply_event_batch(events, Some(latest_sequence));
-                if let Some(run) = fallback_projection
+                // The durable run projection is applied whether or not the
+                // batch produced timeline items. Suppressing it would drop the
+                // run's control state, the transcript page that rebuilds the
+                // conversation, and the run polling that keeps it streaming.
+                if let Some(projection) = fallback_projection
                     .as_ref()
-                    .and_then(|projection| projection.active_run.as_ref())
-                {
-                    self.seed_plan_from_projection(run);
-                }
-                if self.timeline.is_empty()
-                    && let Some(projection) = fallback_projection
-                        .as_ref()
-                        .and_then(|projection| projection.active_run.clone())
+                    .and_then(|projection| projection.active_run.clone())
                 {
                     self.apply_run_projection(projection);
                 }
             }
             Err(error) => {
+                // The events request failed, so the durable projection is the
+                // only source of the run's control state and of the transcript
+                // page that rebuilds the conversation.
                 if let Some(projection) = fallback_projection
                     .as_ref()
                     .and_then(|projection| projection.active_run.clone())
                 {
-                    self.seed_plan_from_projection(&projection);
                     self.apply_run_projection(projection);
                 }
                 self.record_backend_error("load session events", error);
