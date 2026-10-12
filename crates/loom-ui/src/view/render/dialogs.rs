@@ -695,15 +695,14 @@ impl LoomView {
         let mut run_on = div().w_full().flex().flex_col().gap_1();
         if is_start && worker_choices.len() > 1 {
             run_on = run_on.child(div().text_xs().text_color(rgb(0x8f98a6)).child("Run on"));
-            // The worker picker is a compact set of mutually exclusive targets,
-            // which is what a joined group is for: side by side on wider windows
-            // and stacked full width on phones.
-            let mut worker_targets = Vec::new();
+            // One button per worker: they stay separate controls rather than a
+            // joined group, and wrap or stack full width on phones.
+            let mut row = div().flex().flex_wrap().items_center().gap_1();
             for (node_id, label) in &worker_choices {
                 let selected = *node_id == dialog.target_node_id;
                 let online = worker_online.get(node_id).copied().unwrap_or(false);
                 let click_node = node_id.clone();
-                worker_targets.push(
+                row = row.child(
                     Button::new(format!("source-worker-node-{node_id}"))
                         .label(label.clone())
                         .small()
@@ -715,15 +714,7 @@ impl LoomView {
                         })),
                 );
             }
-            run_on = run_on.child(
-                ButtonGroup::new("session-source-worker-choices")
-                    .outline()
-                    .small()
-                    .when(phone, |group| {
-                        group.w_full().layout(gpui_kit::Axis::Vertical)
-                    })
-                    .children(worker_targets),
-            );
+            run_on = run_on.child(row);
         }
 
         let hint = div()
