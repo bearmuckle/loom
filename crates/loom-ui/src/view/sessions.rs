@@ -30,11 +30,8 @@ impl LoomView {
         self.review.selected_file = None;
         self.review.selected_path = None;
         self.review.selected_staged = false;
-        self.review.selected_diff = None;
+        self.review.clear_diff();
         self.review.selected_file = None;
-        self.review.rows.clear();
-        self.review.hunk_rows.clear();
-        self.review.list_state.reset(0);
         self.review.changes.clear();
         self.review.vcs = None;
         self.review.repositories_loaded = false;
@@ -806,11 +803,8 @@ impl LoomView {
         let session_id = self.active_session.id;
         self.selected_repository_id = Some(repository_id);
         self.review.selected_path = None;
-        self.review.selected_diff = None;
+        self.review.clear_diff();
         self.review.selected_file = None;
-        self.review.rows.clear();
-        self.review.hunk_rows.clear();
-        self.review.list_state.reset(0);
         self.review.selection_revision += 1;
         self.review.vcs = None;
         self.dispatch(

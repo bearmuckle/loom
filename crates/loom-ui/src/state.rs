@@ -7,13 +7,14 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use gpui_kit::assets::IconName as AssetIconName;
-use gpui_kit::{ListAlignment, ListState, px};
+use gpui_kit::component::diff::{DiffFile, DiffState};
+use gpui_kit::{AppContext, Entity};
 use loom_core::{
     AgentSessionSnapshot, AgentSessionState, EventSequence, ToolCallId, UsageSnapshot,
 };
 use loom_model::ProviderUsageSummary;
 use loom_protocol::{
-    AgentPlanProgress, AgentRunState, GitDiff, GitDiffLine, GitRepositoryStatus,
+    AgentPlanProgress, AgentRunState, GitDiff, GitDiffLineKind, GitRepositoryStatus,
     SessionFilesystemChange, SessionFilesystemFile, WorkspaceEntry,
 };
 
@@ -148,78 +149,120 @@ pub(crate) struct ReviewState {
     pub(crate) selected_staged: bool,
     pub(crate) selection_revision: u64,
     pub(crate) selected_diff: Option<GitDiff>,
+    /// The `gpui-kit` diff surface for [`Self::selected_diff`].
+    ///
+    /// It is rebuilt for every selection so a surface can never outlive the
+    /// payload it was built from. `None` means the payload has nothing the
+    /// surface can show: no retained hunks, or a patch the parser rejected. The
+    /// pane keeps its own copy for those cases.
+    pub(crate) diff_view: Option<Entity<DiffState>>,
     pub(crate) diff_error: Option<String>,
     pub(crate) loading_diff: bool,
+    /// Whether diff and file previews soft-wrap instead of scrolling sideways.
     pub(crate) wrap_lines: bool,
-    pub(crate) rows: Vec<ReviewRow>,
-    pub(crate) hunk_rows: Vec<usize>,
-    pub(crate) collapsed_hunks: BTreeSet<usize>,
-    pub(crate) selected_hunk: usize,
-    pub(crate) list_state: ListState,
     pub(crate) usage: UsageState,
     pub(crate) files: FilesState,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) enum ReviewRow {
-    Hunk {
-        old_start: u32,
-        old_lines: u32,
-        new_start: u32,
-        new_lines: u32,
-    },
-    Line(GitDiffLine),
+/// Rebuilds a unified patch from the typed hunks.
+///
+/// The diff surface and the copy action share this text, so what the reviewer
+/// copies is what the reviewer sees. The typed hunks carry a declared line
+/// count per side, but the server bounds the retained lines independently, so
+/// the counts are recomputed from the lines that survived. A hunk left with no
+/// lines is dropped rather than emitted with a header the parser would reject.
+///
+/// A whole-checkout diff, such as a project child review, concatenates every
+/// changed file's hunks and carries no path to tell them apart, while hunks
+/// within one file are ordered and never overlap. A hunk that starts at or
+/// before a line the section already used therefore cannot belong to the
+/// section's file and opens a new one, which is also what keeps the text
+/// parseable: the parser rejects unordered or overlapping hunks.
+pub(crate) fn review_patch_text(diff: &GitDiff) -> String {
+    let path = diff.path.as_deref().unwrap_or_default();
+    let mut patch = String::new();
+    // The highest line number each side has used in the open section.
+    let mut old_used = 0usize;
+    let mut new_used = 0usize;
+    let mut section_open = false;
+    for hunk in &diff.hunks {
+        let mut body = String::new();
+        let mut old_lines = 0usize;
+        let mut new_lines = 0usize;
+        for line in &hunk.lines {
+            body.push(match line.kind {
+                GitDiffLineKind::Added => {
+                    new_lines += 1;
+                    '+'
+                }
+                GitDiffLineKind::Removed => {
+                    old_lines += 1;
+                    '-'
+                }
+                GitDiffLineKind::Context => {
+                    old_lines += 1;
+                    new_lines += 1;
+                    ' '
+                }
+            });
+            body.push_str(&line.content);
+            body.push('\n');
+        }
+        if body.is_empty() {
+            continue;
+        }
+        let old_start = hunk.old_start as usize;
+        let new_start = hunk.new_start as usize;
+        let unordered =
+            (old_lines > 0 && old_start <= old_used) || (new_lines > 0 && new_start <= new_used);
+        if !section_open || unordered {
+            patch.push_str(&format!("--- a/{path}\n+++ b/{path}\n"));
+            old_used = 0;
+            new_used = 0;
+            section_open = true;
+        }
+        if old_lines > 0 {
+            old_used = old_used.max(old_start + old_lines - 1);
+        }
+        if new_lines > 0 {
+            new_used = new_used.max(new_start + new_lines - 1);
+        }
+        patch.push_str(&format!(
+            "@@ -{old_start},{old_lines} +{new_start},{new_lines} @@\n{body}"
+        ));
+    }
+    patch
 }
 
 impl ReviewState {
-    pub(crate) fn show_diff(&mut self, diff: GitDiff) {
-        self.collapsed_hunks.clear();
+    /// Shows `diff` in the diff surface, replacing any previous selection.
+    ///
+    /// The surface is fed a patch rebuilt from the typed hunks rather than
+    /// [`GitDiff::patch`]: the server bounds that field at an arbitrary byte,
+    /// so it can end mid-line, while [`review_patch_text`] always ends on a
+    /// line boundary and matches the lines the hunks actually retained.
+    pub(crate) fn show_diff(&mut self, diff: GitDiff, cx: &mut impl AppContext) {
+        let files = if diff.hunks.is_empty() {
+            Vec::new()
+        } else {
+            match DiffFile::parse(&review_patch_text(&diff)) {
+                Ok(files) => files,
+                Err(error) => {
+                    log::warn!("could not parse the review patch for the diff surface: {error}");
+                    Vec::new()
+                }
+            }
+        };
+        self.diff_view = (!files.is_empty()).then(|| cx.new(|cx| DiffState::new(files, cx)));
         self.selected_diff = Some(diff);
-        self.selected_hunk = 0;
         self.loading_diff = false;
         self.diff_error = None;
-        self.rebuild_rows();
     }
 
-    /// Rebuilds the virtual rows from the selected diff, hiding the lines of
-    /// any collapsed hunk.
-    pub(crate) fn rebuild_rows(&mut self) {
-        self.rows.clear();
-        self.hunk_rows.clear();
-        let Some(diff) = self.selected_diff.as_ref() else {
-            self.list_state.reset(0);
-            return;
-        };
-        for (hunk_index, hunk) in diff.hunks.iter().enumerate() {
-            self.hunk_rows.push(self.rows.len());
-            self.rows.push(ReviewRow::Hunk {
-                old_start: hunk.old_start,
-                old_lines: hunk.old_lines,
-                new_start: hunk.new_start,
-                new_lines: hunk.new_lines,
-            });
-            if !self.collapsed_hunks.contains(&hunk_index) {
-                self.rows
-                    .extend(hunk.lines.iter().cloned().map(ReviewRow::Line));
-            }
-        }
-        self.list_state.reset(self.rows.len());
-    }
-
-    /// Toggles the collapse state of the hunk whose header is at `row`.
-    pub(crate) fn toggle_hunk(&mut self, row: usize) -> bool {
-        let Some(hunk_index) = self
-            .hunk_rows
-            .iter()
-            .position(|candidate| *candidate == row)
-        else {
-            return false;
-        };
-        if !self.collapsed_hunks.remove(&hunk_index) {
-            self.collapsed_hunks.insert(hunk_index);
-        }
-        self.rebuild_rows();
-        true
+    /// Clears the selected diff and the surface showing it.
+    pub(crate) fn clear_diff(&mut self) {
+        self.selected_diff = None;
+        self.diff_view = None;
     }
 
     /// Whether the given tab is currently displayed in an open pane.
@@ -419,14 +462,10 @@ impl Default for ReviewState {
             selected_staged: false,
             selection_revision: 0,
             selected_diff: None,
+            diff_view: None,
             diff_error: None,
             loading_diff: false,
             wrap_lines: false,
-            rows: Vec::new(),
-            hunk_rows: Vec::new(),
-            collapsed_hunks: BTreeSet::new(),
-            selected_hunk: 0,
-            list_state: ListState::new(0, ListAlignment::Top, px(120.)),
             usage: UsageState::default(),
             files: FilesState::default(),
         }
@@ -817,9 +856,11 @@ pub(crate) fn session_state_for_run(state: AgentRunState) -> AgentSessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::TestAppContext;
     use loom_core::ToolCallId;
     use loom_protocol::{
-        GitDiffHunk, GitDiffLineKind, GitFileStatus, GitFileStatusKind, WorkspaceChangeKind,
+        GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus, GitFileStatusKind,
+        WorkspaceChangeKind,
     };
 
     fn review_change(sequence: u64) -> SessionFilesystemChange {
@@ -1087,28 +1128,201 @@ mod tests {
         assert_eq!(usage.provider().unwrap().requests, 2);
     }
 
-    #[test]
-    fn review_hunks_map_to_virtual_rows() {
+    #[gpui_kit::test]
+    fn show_diff_feeds_the_diff_surface_from_the_typed_hunks(cx: &mut TestAppContext) {
         let mut review = ReviewState::default();
-        review.show_diff(GitDiff {
+        review.show_diff(
+            GitDiff {
+                path: Some("src/lib.rs".to_owned()),
+                staged: false,
+                // The server field is deliberately ignored: it can end mid-line.
+                patch: "not a patch".to_owned(),
+                binary: false,
+                truncated: false,
+                hunks: vec![
+                    GitDiffHunk {
+                        old_start: 1,
+                        old_lines: 2,
+                        new_start: 1,
+                        new_lines: 3,
+                        lines: vec![
+                            GitDiffLine {
+                                kind: GitDiffLineKind::Removed,
+                                old_line: Some(1),
+                                new_line: None,
+                                content: "old".to_owned(),
+                            },
+                            GitDiffLine {
+                                kind: GitDiffLineKind::Added,
+                                old_line: None,
+                                new_line: Some(1),
+                                content: "new 1".to_owned(),
+                            },
+                            GitDiffLine {
+                                kind: GitDiffLineKind::Added,
+                                old_line: None,
+                                new_line: Some(2),
+                                content: "new 2".to_owned(),
+                            },
+                            GitDiffLine {
+                                kind: GitDiffLineKind::Context,
+                                old_line: Some(2),
+                                new_line: Some(3),
+                                content: "same".to_owned(),
+                            },
+                        ],
+                    },
+                    GitDiffHunk {
+                        old_start: 20,
+                        old_lines: 1,
+                        new_start: 21,
+                        new_lines: 1,
+                        lines: vec![GitDiffLine {
+                            kind: GitDiffLineKind::Added,
+                            old_line: None,
+                            new_line: Some(21),
+                            content: "later".to_owned(),
+                        }],
+                    },
+                ],
+            },
+            cx,
+        );
+        let files = review
+            .diff_view
+            .as_ref()
+            .expect("both hunks are parsed into one file")
+            .read_with(cx, |state, _| {
+                state
+                    .files()
+                    .iter()
+                    .map(|file| (file.path().to_string(), file.additions(), file.deletions()))
+                    .collect::<Vec<_>>()
+            });
+        assert_eq!(files, vec![("src/lib.rs".to_owned(), 3, 1)]);
+
+        // A whole-checkout diff concatenates files, so the surface holds one
+        // entry per changed file.
+        review.show_diff(
+            GitDiff {
+                path: None,
+                staged: false,
+                patch: String::new(),
+                binary: false,
+                truncated: false,
+                hunks: vec![
+                    GitDiffHunk {
+                        old_start: 30,
+                        old_lines: 2,
+                        new_start: 30,
+                        new_lines: 2,
+                        lines: vec![
+                            GitDiffLine {
+                                kind: GitDiffLineKind::Removed,
+                                old_line: Some(30),
+                                new_line: None,
+                                content: "old first file".to_owned(),
+                            },
+                            GitDiffLine {
+                                kind: GitDiffLineKind::Added,
+                                old_line: None,
+                                new_line: Some(30),
+                                content: "new first file".to_owned(),
+                            },
+                        ],
+                    },
+                    GitDiffHunk {
+                        old_start: 1,
+                        old_lines: 1,
+                        new_start: 1,
+                        new_lines: 1,
+                        lines: vec![GitDiffLine {
+                            kind: GitDiffLineKind::Removed,
+                            old_line: Some(1),
+                            new_line: None,
+                            content: "old second file".to_owned(),
+                        }],
+                    },
+                ],
+            },
+            cx,
+        );
+        let files = review
+            .diff_view
+            .as_ref()
+            .expect("a whole-checkout diff parses")
+            .read_with(cx, |state, _| {
+                state
+                    .files()
+                    .iter()
+                    .map(|file| (file.additions(), file.deletions()))
+                    .collect::<Vec<_>>()
+            });
+        assert_eq!(files, vec![(1, 1), (0, 1)]);
+
+        // A selection with nothing to show builds no surface, so the pane keeps
+        // its own copy for the empty case.
+        review.show_diff(
+            GitDiff {
+                path: Some("src/lib.rs".to_owned()),
+                staged: false,
+                patch: String::new(),
+                binary: false,
+                truncated: false,
+                hunks: Vec::new(),
+            },
+            cx,
+        );
+        assert!(review.diff_view.is_none());
+        assert!(review.selected_diff.is_some());
+        review.clear_diff();
+        assert!(review.diff_view.is_none());
+        assert!(review.selected_diff.is_none());
+    }
+
+    #[test]
+    fn patch_text_rebuilds_a_unified_patch_from_the_typed_hunks() {
+        let diff = GitDiff {
             path: Some("src/lib.rs".to_owned()),
             staged: false,
             patch: String::new(),
             binary: false,
             truncated: false,
-            hunks: vec![
-                GitDiffHunk {
-                    old_start: 2,
-                    old_lines: 1,
-                    new_start: 2,
-                    new_lines: 1,
-                    lines: vec![GitDiffLine {
+            hunks: vec![GitDiffHunk {
+                old_start: 1,
+                old_lines: 2,
+                new_start: 1,
+                new_lines: 2,
+                lines: vec![
+                    GitDiffLine {
                         kind: GitDiffLineKind::Removed,
-                        old_line: Some(2),
+                        old_line: Some(1),
                         new_line: None,
                         content: "old".to_owned(),
-                    }],
-                },
+                    },
+                    GitDiffLine {
+                        kind: GitDiffLineKind::Added,
+                        old_line: None,
+                        new_line: Some(1),
+                        content: "new".to_owned(),
+                    },
+                    GitDiffLine {
+                        kind: GitDiffLineKind::Context,
+                        old_line: Some(2),
+                        new_line: Some(2),
+                        content: "same".to_owned(),
+                    },
+                ],
+            }],
+        };
+        assert_eq!(
+            review_patch_text(&diff),
+            "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n same\n"
+        );
+        // A second hunk of the same file stays in the same section.
+        let two_hunks = GitDiff {
+            hunks: vec![
+                diff.hunks[0].clone(),
                 GitDiffHunk {
                     old_start: 20,
                     old_lines: 1,
@@ -1118,61 +1332,117 @@ mod tests {
                         kind: GitDiffLineKind::Added,
                         old_line: None,
                         new_line: Some(20),
-                        content: "new".to_owned(),
+                        content: "later".to_owned(),
                     }],
                 },
             ],
-        });
-        assert_eq!(review.hunk_rows, vec![0, 2]);
-        assert_eq!(review.list_state.item_count(), 4);
+            ..diff.clone()
+        };
+        assert_eq!(
+            review_patch_text(&two_hunks),
+            "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n same\n\
+             @@ -20,0 +20,1 @@\n+later\n"
+        );
+        // A diff with no hunks has nothing to show and nothing to copy.
+        assert!(
+            review_patch_text(&GitDiff {
+                hunks: Vec::new(),
+                ..diff.clone()
+            })
+            .is_empty()
+        );
     }
 
     #[test]
-    fn collapsed_hunks_hide_their_lines_until_expanded() {
-        let mut review = ReviewState::default();
-        review.show_diff(GitDiff {
-            path: Some("src/lib.rs".to_owned()),
+    fn patch_text_starts_a_section_for_a_hunk_that_cannot_continue_the_file() {
+        // A whole-checkout diff concatenates files without a path per file, so a
+        // hunk that restarts below the open section's lines opens a new one and
+        // the text stays parseable.
+        let diff = GitDiff {
+            path: None,
             staged: false,
             patch: String::new(),
             binary: false,
             truncated: false,
             hunks: vec![
                 GitDiffHunk {
+                    old_start: 30,
+                    old_lines: 2,
+                    new_start: 30,
+                    new_lines: 2,
+                    lines: vec![
+                        GitDiffLine {
+                            kind: GitDiffLineKind::Removed,
+                            old_line: Some(30),
+                            new_line: None,
+                            content: "old first file".to_owned(),
+                        },
+                        GitDiffLine {
+                            kind: GitDiffLineKind::Added,
+                            old_line: None,
+                            new_line: Some(30),
+                            content: "new first file".to_owned(),
+                        },
+                    ],
+                },
+                GitDiffHunk {
                     old_start: 1,
                     old_lines: 1,
                     new_start: 1,
                     new_lines: 1,
                     lines: vec![GitDiffLine {
-                        kind: GitDiffLineKind::Removed,
-                        old_line: Some(1),
-                        new_line: None,
-                        content: "old".to_owned(),
-                    }],
-                },
-                GitDiffHunk {
-                    old_start: 9,
-                    old_lines: 1,
-                    new_start: 9,
-                    new_lines: 1,
-                    lines: vec![GitDiffLine {
                         kind: GitDiffLineKind::Added,
                         old_line: None,
-                        new_line: Some(9),
-                        content: "new".to_owned(),
+                        new_line: Some(1),
+                        content: "second file".to_owned(),
                     }],
                 },
             ],
-        });
-        assert_eq!(review.rows.len(), 4);
-        assert!(review.toggle_hunk(0));
-        assert!(review.collapsed_hunks.contains(&0));
-        assert_eq!(review.rows.len(), 3);
-        // The remaining hunk header keeps a valid row index.
-        assert_eq!(review.hunk_rows, vec![0, 1]);
-        assert_eq!(review.list_state.item_count(), 3);
-        assert!(review.toggle_hunk(0));
-        assert_eq!(review.rows.len(), 4);
-        assert!(!review.toggle_hunk(999));
+        };
+        assert_eq!(
+            review_patch_text(&diff),
+            "--- a/\n+++ b/\n@@ -30,1 +30,1 @@\n-old first file\n+new first file\n\
+             --- a/\n+++ b/\n@@ -1,0 +1,1 @@\n+second file\n"
+        );
+    }
+
+    #[test]
+    fn patch_text_recounts_the_lines_the_server_bounded() {
+        // The server bounds hunk lines without rewriting the declared counts, so
+        // a patch built from them must not claim more lines than it carries.
+        let diff = GitDiff {
+            path: Some("src/lib.rs".to_owned()),
+            staged: false,
+            patch: String::new(),
+            binary: false,
+            truncated: true,
+            hunks: vec![
+                GitDiffHunk {
+                    old_start: 1,
+                    old_lines: 40,
+                    new_start: 1,
+                    new_lines: 40,
+                    lines: vec![GitDiffLine {
+                        kind: GitDiffLineKind::Added,
+                        old_line: None,
+                        new_line: Some(1),
+                        content: "first".to_owned(),
+                    }],
+                },
+                // An emptied hunk carries no body, so it is dropped whole.
+                GitDiffHunk {
+                    old_start: 90,
+                    old_lines: 4,
+                    new_start: 90,
+                    new_lines: 4,
+                    lines: Vec::new(),
+                },
+            ],
+        };
+        assert_eq!(
+            review_patch_text(&diff),
+            "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,0 +1,1 @@\n+first\n"
+        );
     }
 
     #[test]

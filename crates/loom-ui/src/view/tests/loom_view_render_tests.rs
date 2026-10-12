@@ -5,7 +5,6 @@ use super::{
 use crate::state::GitHubLoginState;
 use crate::state::InspectorTab;
 use crate::state::RenameDialogState;
-use crate::state::ReviewRow;
 use crate::state::ThemeChoice;
 use crate::state::TimelineItem;
 use crate::state::{
@@ -37,6 +36,24 @@ use std::time::Duration;
 
 fn render_scenario(cx: &mut TestAppContext, configure: impl FnOnce(&mut LoomView)) {
     render_scenario_at(cx, size(px(1280.), px(800.)), configure);
+}
+
+/// Renders a scenario whose configuration also needs the view's own context,
+/// for example to build the diff surface before rendering it.
+fn render_scenario_with_context(
+    cx: &mut TestAppContext,
+    configure: impl FnOnce(&mut LoomView, &mut gpui_kit::Context<LoomView>),
+) {
+    let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            configure(&mut view, cx);
+            view
+        });
+        gpui_kit::component::Root::new(view, window, cx)
+    });
+    cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
 }
 
 fn render_scenario_at(
@@ -769,37 +786,43 @@ fn session_activation_resets_projection_and_resolves_backend_ownership(cx: &mut 
             .is_ok()
         );
 
-        view.review.rows = vec![
-            ReviewRow::Hunk {
-                old_start: 1,
-                old_lines: 1,
-                new_start: 1,
-                new_lines: 1,
+        view.review.show_diff(
+            GitDiff {
+                path: Some("src/lib.rs".to_owned()),
+                staged: false,
+                patch: String::new(),
+                binary: false,
+                truncated: false,
+                hunks: vec![GitDiffHunk {
+                    old_start: 1,
+                    old_lines: 2,
+                    new_start: 1,
+                    new_lines: 2,
+                    lines: vec![
+                        GitDiffLine {
+                            kind: GitDiffLineKind::Removed,
+                            old_line: Some(1),
+                            new_line: None,
+                            content: "removed".to_owned(),
+                        },
+                        GitDiffLine {
+                            kind: GitDiffLineKind::Added,
+                            old_line: None,
+                            new_line: Some(1),
+                            content: "added".to_owned(),
+                        },
+                        GitDiffLine {
+                            kind: GitDiffLineKind::Context,
+                            old_line: Some(2),
+                            new_line: Some(2),
+                            content: "context".to_owned(),
+                        },
+                    ],
+                }],
             },
-            ReviewRow::Line(GitDiffLine {
-                kind: GitDiffLineKind::Removed,
-                old_line: Some(1),
-                new_line: None,
-                content: "removed".to_owned(),
-            }),
-            ReviewRow::Line(GitDiffLine {
-                kind: GitDiffLineKind::Added,
-                old_line: None,
-                new_line: Some(1),
-                content: "added".to_owned(),
-            }),
-            ReviewRow::Line(GitDiffLine {
-                kind: GitDiffLineKind::Context,
-                old_line: Some(2),
-                new_line: Some(2),
-                content: "context".to_owned(),
-            }),
-        ];
-        view.review.hunk_rows = vec![0];
-        view.review.collapsed_hunks.insert(0);
-        for index in 0..=view.review.rows.len() {
-            let _ = view.render_review_row(index);
-        }
+            cx,
+        );
+        assert!(view.review.diff_view.is_some());
         view
     });
     cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
@@ -1264,15 +1287,53 @@ fn session_source_and_review_actions_cover_empty_invalid_and_missing_states(
             view.review.open = false;
             view.toggle_review_pane(cx);
             assert!(view.review.open);
-            view.jump_review_hunk(true, cx);
-            view.review.hunk_rows = vec![2, 5];
-            view.jump_review_hunk(true, cx);
-            assert_eq!(view.review.selected_hunk, 0);
-            view.jump_review_hunk(false, cx);
-            assert_eq!(view.review.selected_hunk, 0);
+            // Diff and hunk actions without a diff surface leave the pane alone.
             view.open_review_diff("missing.txt".to_owned(), false, cx);
             assert!(view.review.selected_path.is_none());
+            assert!(view.review.diff_view.is_none());
+            view.jump_review_hunk(true, cx);
+            view.jump_review_hunk(false, cx);
+            view.review.show_diff(
+                GitDiff {
+                    path: Some("src/lib.rs".to_owned()),
+                    staged: false,
+                    patch: String::new(),
+                    binary: false,
+                    truncated: false,
+                    hunks: vec![
+                        GitDiffHunk {
+                            old_start: 1,
+                            old_lines: 1,
+                            new_start: 1,
+                            new_lines: 1,
+                            lines: vec![GitDiffLine {
+                                kind: GitDiffLineKind::Removed,
+                                old_line: Some(1),
+                                new_line: None,
+                                content: "old".to_owned(),
+                            }],
+                        },
+                        GitDiffHunk {
+                            old_start: 20,
+                            old_lines: 1,
+                            new_start: 20,
+                            new_lines: 1,
+                            lines: vec![GitDiffLine {
+                                kind: GitDiffLineKind::Added,
+                                old_line: None,
+                                new_line: Some(20),
+                                content: "new".to_owned(),
+                            }],
+                        },
+                    ],
+                },
+                cx,
+            );
+            assert!(view.review.diff_view.is_some());
+            view.jump_review_hunk(true, cx);
+            view.jump_review_hunk(false, cx);
             view.open_review_file("missing.txt".to_owned(), cx);
+            assert!(view.review.diff_view.is_none());
             assert_eq!(view.review.selected_path.as_deref(), Some("missing.txt"));
             view
         });
@@ -3735,7 +3796,7 @@ fn rename_and_source_dialogs_render(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn review_panel_renders_workspace_and_git_changes(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    render_scenario(cx, |view| {
+    render_scenario_with_context(cx, |view, cx| {
         view.review.open = true;
         view.sessions = vec![view.active_session.clone()];
         view.review.repositories_loaded = true;
@@ -3766,41 +3827,84 @@ fn review_panel_renders_workspace_and_git_changes(cx: &mut TestAppContext) {
             captured_at: Timestamp::from_unix_millis(0),
         });
         view.review.selected_path = Some("src/lib.rs".to_owned());
-        view.review.selected_diff = Some(GitDiff {
-            path: Some("src/lib.rs".to_owned()),
-            staged: false,
-            patch: String::new(),
-            binary: false,
-            hunks: vec![GitDiffHunk {
-                old_start: 1,
-                old_lines: 1,
-                new_start: 1,
-                new_lines: 2,
-                lines: vec![GitDiffLine {
-                    kind: GitDiffLineKind::Added,
-                    old_line: None,
-                    new_line: Some(1),
-                    content: "new line".to_owned(),
+        view.review.show_diff(
+            GitDiff {
+                path: Some("src/lib.rs".to_owned()),
+                staged: false,
+                patch: String::new(),
+                binary: false,
+                hunks: vec![GitDiffHunk {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 1,
+                    new_lines: 2,
+                    lines: vec![
+                        GitDiffLine {
+                            kind: GitDiffLineKind::Context,
+                            old_line: Some(1),
+                            new_line: Some(1),
+                            content: "context".to_owned(),
+                        },
+                        GitDiffLine {
+                            kind: GitDiffLineKind::Added,
+                            old_line: None,
+                            new_line: Some(2),
+                            content: "new line".to_owned(),
+                        },
+                    ],
                 }],
-            }],
-            truncated: false,
-        });
-        view.review.rows = vec![
-            ReviewRow::Hunk {
-                old_start: 1,
-                old_lines: 1,
-                new_start: 1,
-                new_lines: 2,
+                truncated: false,
             },
-            ReviewRow::Line(GitDiffLine {
-                kind: GitDiffLineKind::Added,
-                old_line: None,
-                new_line: Some(1),
-                content: "new line".to_owned(),
-            }),
-        ];
-        view.review.hunk_rows = vec![0];
+            cx,
+        );
+        assert!(view.review.diff_view.is_some());
     });
+}
+
+/// The selected diff renders inside the pane at a real height, which is what
+/// tells the component's own scrolling has a viewport to work with.
+#[gpui_kit::test]
+fn review_pane_gives_the_diff_surface_the_remaining_height(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.review.open = true;
+            view.sessions = vec![view.active_session.clone()];
+            view.review.selected_path = Some("src/lib.rs".to_owned());
+            view.review.show_diff(
+                GitDiff {
+                    path: Some("src/lib.rs".to_owned()),
+                    staged: false,
+                    patch: String::new(),
+                    binary: false,
+                    truncated: false,
+                    hunks: vec![GitDiffHunk {
+                        old_start: 1,
+                        old_lines: 1,
+                        new_start: 1,
+                        new_lines: 1,
+                        lines: vec![GitDiffLine {
+                            kind: GitDiffLineKind::Added,
+                            old_line: None,
+                            new_line: Some(1),
+                            content: "added".to_owned(),
+                        }],
+                    }],
+                },
+                cx,
+            );
+            view
+        });
+        gpui_kit::component::Root::new(view, window, cx)
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let surface = window.find("review-diff-surface");
+        assert!(surface.visible());
+        assert!(surface.bounds().size.height > px(0.));
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]

@@ -38,7 +38,7 @@ use gpui_kit::component::{
 use gpui_kit::{
     Animation, AnimationExt, App, ClickEvent, ClipboardItem, Context, Element, Entity, FocusHandle,
     Focusable, FontWeight, HighlightStyle, MouseButton, Pixels, Render, Rgba, StyledText,
-    Subscription, Window, WindowAppearance, WindowControlArea, div, list, prelude::*, px,
+    Subscription, Window, WindowAppearance, WindowControlArea, div, prelude::*, px,
 };
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, ErrorCode,
@@ -57,14 +57,13 @@ use loom_protocol::{
     AgentRunSnapshotProjection, AgentRunState, CURRENT_PROTOCOL_VERSION, ClientRequest,
     ClonedRepository, ContextRequest, ContextResponse, EventsRequest, EventsResponse,
     FileActivityOperation, FilesystemRequest, FilesystemResponse,
-    GITHUB_REPOSITORY_QUERY_MIN_CHARS, GitDiffLineKind, GitFileStatusKind, GitHubRepository,
-    GitRepositoryStatus, MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, ProjectChildControlAction,
-    ProjectRequest, ProjectResponse, ProviderRequest, ProviderResponse, RepositoryRequest,
-    RepositoryResponse, RequestEnvelope, ResponseEnvelope, RunRequest, RunResponse, ServerEvent,
-    ServerResponse, SessionDirectory, SessionRepository, SessionRequest, SessionResponse,
-    TaskRequest, TerminalRequest, UsageRequest, UsageResponse, WorkerNodeConfig,
-    WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, WorkspaceEntryKind, WorkspaceFeedEvent,
-    WorkspaceRequest, WorkspaceResponse,
+    GITHUB_REPOSITORY_QUERY_MIN_CHARS, GitFileStatusKind, GitHubRepository, GitRepositoryStatus,
+    MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, ProjectChildControlAction, ProjectRequest, ProjectResponse,
+    ProviderRequest, ProviderResponse, RepositoryRequest, RepositoryResponse, RequestEnvelope,
+    ResponseEnvelope, RunRequest, RunResponse, ServerEvent, ServerResponse, SessionDirectory,
+    SessionRepository, SessionRequest, SessionResponse, TaskRequest, TerminalRequest, UsageRequest,
+    UsageResponse, WorkerNodeConfig, WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig,
+    WorkspaceEntryKind, WorkspaceFeedEvent, WorkspaceRequest, WorkspaceResponse,
 };
 #[cfg(not(target_family = "wasm"))]
 #[cfg(not(target_family = "wasm"))]
@@ -76,9 +75,9 @@ use crate::{
     connection::{BackendWorker, ClientConnection, ConnectionCleanupGuard},
     state::{
         AssistantPart, AssistantTurn, EvidenceText, FilesState, GitHubLoginKind, GitHubLoginState,
-        InspectorTab, PlanState, PlanStepStatus, RenameDialogState, ReviewRow, ReviewState,
-        SystemNote, SystemTone, ThemeChoice, TimelineItem, ToolPart, ToolPartStatus, UsageState,
-        bounded, bounded_to, finish_assistant_turn, has_tool_part, push_assistant_evidence,
+        InspectorTab, PlanState, PlanStepStatus, RenameDialogState, ReviewState, SystemNote,
+        SystemTone, ThemeChoice, TimelineItem, ToolPart, ToolPartStatus, UsageState, bounded,
+        bounded_to, finish_assistant_turn, has_tool_part, push_assistant_evidence,
         push_assistant_reasoning, push_assistant_text, session_state_for_run, upsert_tool_part,
     },
     syntax::{self, Language},

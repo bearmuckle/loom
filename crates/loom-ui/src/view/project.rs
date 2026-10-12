@@ -214,7 +214,7 @@ impl LoomView {
                     view.review.selected_staged = false;
                     view.review.selection_revision = view.review.selection_revision.wrapping_add(1);
                     view.review.vcs = Some(status);
-                    view.review.show_diff(diff);
+                    view.review.show_diff(diff, cx);
                     view.refresh_active_project_snapshot(cx);
                 }
                 Err(error) => view.record_backend_error("review project child", error),
@@ -273,7 +273,7 @@ impl LoomView {
                     view.review.selected_staged = false;
                     view.review.selection_revision = view.review.selection_revision.wrapping_add(1);
                     view.review.vcs = Some(status);
-                    view.review.show_diff(diff);
+                    view.review.show_diff(diff, cx);
                     view.record_status(
                         "Child checkout changed since review or has uncommitted edits. Review the current diff before integrating.",
                     );

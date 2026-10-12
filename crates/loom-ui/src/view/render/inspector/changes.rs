@@ -1,5 +1,9 @@
 use super::*;
 
+use gpui_kit::component::diff::Diff;
+
+use crate::state::review_patch_text;
+
 impl LoomView {
     pub(crate) fn render_inspector_changes(
         &self,
@@ -283,24 +287,6 @@ impl LoomView {
             body = body.child(empty_note("No files match the filter"));
         }
 
-        let parent_for_rows = cx.entity();
-        let diff_list = list(self.review.list_state.clone(), move |index, _window, cx| {
-            let view = parent_for_rows.read(cx);
-            let is_hunk = matches!(view.review.rows.get(index), Some(ReviewRow::Hunk { .. }));
-            let row = view.render_review_row(index);
-            if is_hunk {
-                let parent = parent_for_rows.clone();
-                row.id(("review-hunk-toggle", index))
-                    .cursor_pointer()
-                    .on_click(move |_, _, cx| {
-                        parent.update(cx, |this, cx| this.toggle_review_hunk(index, cx));
-                    })
-                    .into_any()
-            } else {
-                row.into_any()
-            }
-        })
-        .size_full();
         let mut detail = div().flex_1().min_w(px(0.)).flex().flex_col();
         if let Some(path) = &self.review.selected_path {
             detail = detail.child(self.render_changes_detail_header(path, cx));
@@ -318,24 +304,29 @@ impl LoomView {
         } else if let Some(diff) = &self.review.selected_diff {
             if diff.binary {
                 detail = detail.child(empty_note("Binary file: no text diff is available."));
-            } else if self.review.rows.is_empty() {
+            } else if let Some(diff_view) = &self.review.diff_view {
+                // The component owns its vertical and horizontal scrolling, so
+                // it is given the remaining height directly instead of a scroll
+                // wrapper of our own.
+                detail = detail.child(
+                    div()
+                        .id("review-diff-surface")
+                        .test_support()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .w_full()
+                        .child(
+                            Diff::new(diff_view)
+                                .header_visible(false)
+                                .soft_wrap(self.review.wrap_lines),
+                        ),
+                );
+            } else {
                 detail = detail.child(empty_note(if diff.truncated {
                     "The first changed line exceeds the review size limit."
                 } else {
                     "No line changes in this version of the file."
                 }));
-            } else if self.review.wrap_lines {
-                detail = detail.child(diff_list);
-            } else {
-                detail = detail.child(
-                    div()
-                        .id("review-diff-hscroll")
-                        .flex_1()
-                        .min_h(px(0.))
-                        .w_full()
-                        .overflow_x_scroll()
-                        .child(div().min_w(px(1.)).child(diff_list)),
-                );
             }
             if diff.truncated {
                 detail =
@@ -384,7 +375,12 @@ impl LoomView {
             "Working changes · read only"
         };
         let path_owned = path.to_owned();
-        let patch_text = review_patch_text(self.review.selected_diff.as_ref());
+        let patch_text = self
+            .review
+            .selected_diff
+            .as_ref()
+            .map(review_patch_text)
+            .unwrap_or_default();
         div()
             .w_full()
             .px_3()
@@ -415,7 +411,7 @@ impl LoomView {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .when(!self.review.hunk_rows.is_empty(), |header| {
+                    .when(self.review.diff_view.is_some(), |header| {
                         header
                             .child(
                                 Button::new("previous-review-hunk")
@@ -485,215 +481,6 @@ impl LoomView {
                     ),
             )
     }
-
-    pub(crate) fn render_review_row(&self, index: usize) -> gpui_kit::Div {
-        let Some(row) = self.review.rows.get(index) else {
-            return div().w_full().min_h(px(22.));
-        };
-        let wrap = self.review.wrap_lines;
-        match row {
-            ReviewRow::Hunk {
-                old_start,
-                old_lines,
-                new_start,
-                new_lines,
-            } => {
-                let (added, removed) = self.hunk_change_summary(index);
-                let mut header = format!("@@ -{old_start},{old_lines} +{new_start},{new_lines} @@");
-                if added > 0 || removed > 0 {
-                    header.push_str(&format!("  +{added} -{removed}"));
-                }
-                let collapsed = self
-                    .review
-                    .hunk_rows
-                    .iter()
-                    .position(|candidate| *candidate == index)
-                    .is_some_and(|hunk| self.review.collapsed_hunks.contains(&hunk));
-                div()
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .bg(rgb(0x293244))
-                    .font_family(mono_font())
-                    .text_xs()
-                    .text_color(rgb(0x93c5fd))
-                    .child(format!("{}  {header}", if collapsed { "▸" } else { "▾" }))
-            }
-            ReviewRow::Line(line) => {
-                let (marker, background, foreground) = match line.kind {
-                    GitDiffLineKind::Added => ("+", 0x24543d, 0xbbf7d0),
-                    GitDiffLineKind::Removed => ("-", 0x542936, 0xfecaca),
-                    GitDiffLineKind::Context => (" ", 0x17191f, 0xcbd5e1),
-                };
-                let language = self.diff_language();
-                let spans = syntax::highlight(&line.content, language);
-                let mut highlights = syntax::line_highlights(&spans, 0..line.content.len());
-                if let Some((start, end)) = self.line_emphasis(index) {
-                    let emphasis = match line.kind {
-                        GitDiffLineKind::Added => rgb(0x86efac).alpha(0.28),
-                        GitDiffLineKind::Removed => rgb(0xfca5a5).alpha(0.32),
-                        GitDiffLineKind::Context => rgb(0x93c5fd).alpha(0.25),
-                    };
-                    highlights.push((
-                        start..end,
-                        HighlightStyle {
-                            background_color: Some(emphasis.into()),
-                            ..Default::default()
-                        },
-                    ));
-                }
-                div()
-                    .w_full()
-                    .min_h(px(22.))
-                    .flex()
-                    .items_start()
-                    .bg(rgb(background))
-                    .font_family(mono_font())
-                    .text_xs()
-                    .text_color(rgb(foreground))
-                    .when(wrap, |element| element.whitespace_normal())
-                    .child(
-                        div()
-                            .w(px(40.))
-                            .flex_shrink_0()
-                            .text_color(rgb(0x8f98a6))
-                            .child(line.old_line.map(|n| n.to_string()).unwrap_or_default()),
-                    )
-                    .child(
-                        div()
-                            .w(px(40.))
-                            .flex_shrink_0()
-                            .text_color(rgb(0x8f98a6))
-                            .child(line.new_line.map(|n| n.to_string()).unwrap_or_default()),
-                    )
-                    .child(div().w(px(18.)).flex_shrink_0().child(marker))
-                    .child(
-                        div().flex_1().min_w(px(0.)).child(
-                            StyledText::new(line.content.clone()).with_highlights(highlights),
-                        ),
-                    )
-            }
-        }
-    }
-
-    /// The language used to highlight the selected diff, derived from its path.
-    fn diff_language(&self) -> Language {
-        self.review
-            .selected_path
-            .as_deref()
-            .map(Language::from_path)
-            .unwrap_or(Language::Text)
-    }
-
-    /// The added/removed line counts for the hunk whose header is at `index`.
-    fn hunk_change_summary(&self, index: usize) -> (usize, usize) {
-        let mut added = 0;
-        let mut removed = 0;
-        for row in self.review.rows.iter().skip(index + 1) {
-            match row {
-                ReviewRow::Hunk { .. } => break,
-                ReviewRow::Line(line) => match line.kind {
-                    GitDiffLineKind::Added => added += 1,
-                    GitDiffLineKind::Removed => removed += 1,
-                    GitDiffLineKind::Context => {}
-                },
-            }
-        }
-        (added, removed)
-    }
-
-    /// The differing byte range for a removed/added line paired with its
-    /// neighbour, used for intra-line emphasis.
-    fn line_emphasis(&self, index: usize) -> Option<(usize, usize)> {
-        let current = match self.review.rows.get(index)? {
-            ReviewRow::Line(line) => line,
-            ReviewRow::Hunk { .. } => return None,
-        };
-        match current.kind {
-            GitDiffLineKind::Removed => {
-                let next = match self.review.rows.get(index + 1)? {
-                    ReviewRow::Line(line) => line,
-                    ReviewRow::Hunk { .. } => return None,
-                };
-                (next.kind == GitDiffLineKind::Added)
-                    .then(|| emphasis_range(&current.content, &next.content))
-                    .flatten()
-            }
-            GitDiffLineKind::Added => {
-                if index == 0 {
-                    return None;
-                }
-                let previous = match self.review.rows.get(index - 1)? {
-                    ReviewRow::Line(line) => line,
-                    ReviewRow::Hunk { .. } => return None,
-                };
-                (previous.kind == GitDiffLineKind::Removed)
-                    .then(|| emphasis_range(&current.content, &previous.content))
-                    .flatten()
-            }
-            GitDiffLineKind::Context => None,
-        }
-    }
-}
-
-/// Reconstructs a unified patch from the typed hunks, including hunk headers.
-fn review_patch_text(diff: Option<&loom_protocol::GitDiff>) -> String {
-    let Some(diff) = diff else {
-        return String::new();
-    };
-    let mut patch = String::new();
-    for hunk in &diff.hunks {
-        patch.push_str(&format!(
-            "@@ -{},{ } +{},{ } @@\n",
-            hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines
-        ));
-        for line in &hunk.lines {
-            patch.push(match line.kind {
-                GitDiffLineKind::Added => '+',
-                GitDiffLineKind::Removed => '-',
-                GitDiffLineKind::Context => ' ',
-            });
-            patch.push_str(&line.content);
-            patch.push('\n');
-        }
-    }
-    patch
-}
-
-/// The byte range in `line` that differs from `other`, or `None` when they are
-/// identical. Shared prefixes and suffixes are left unemphasised.
-fn emphasis_range(line: &str, other: &str) -> Option<(usize, usize)> {
-    if line == other {
-        return None;
-    }
-    let prefix = common_prefix(line, other);
-    let line_tail = &line[prefix..];
-    let other_tail = &other[prefix..];
-    let suffix = common_suffix(line_tail, other_tail);
-    let end = line.len() - suffix;
-    (prefix < end).then_some((prefix, end))
-}
-
-fn common_prefix(left: &str, right: &str) -> usize {
-    let mut length = 0;
-    for (a, b) in left.chars().zip(right.chars()) {
-        if a != b {
-            break;
-        }
-        length += a.len_utf8();
-    }
-    length
-}
-
-fn common_suffix(left: &str, right: &str) -> usize {
-    let mut length = 0;
-    for (a, b) in left.chars().rev().zip(right.chars().rev()) {
-        if a != b {
-            break;
-        }
-        length += a.len_utf8();
-    }
-    length
 }
 
 fn counts(additions: u32, deletions: u32) -> impl IntoElement {
@@ -812,75 +599,4 @@ fn render_code_block_wrapped(
         offset = line_end + 1;
     }
     column.into_any()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use loom_protocol::{GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind};
-
-    #[test]
-    fn emphasis_range_isolates_the_changed_span() {
-        assert_eq!(emphasis_range("let x = 1;", "let x = 1;"), None);
-        assert_eq!(emphasis_range("let x = 1;", "let x = 2;"), Some((8, 9)));
-        // A shorter line has nothing beyond the shared prefix to emphasise.
-        assert_eq!(emphasis_range("abc", "abc def"), None);
-        assert_eq!(emphasis_range("abc def", "abc"), Some((3, 7)));
-        // Multi-byte characters must stay on character boundaries.
-        let (start, end) = emphasis_range("aαb", "aβb").unwrap();
-        assert_eq!(&"aαb"[start..end], "α");
-    }
-
-    #[test]
-    fn common_affixes_are_measured_in_bytes() {
-        assert_eq!(
-            common_prefix("prefix-left", "prefix-right"),
-            "prefix-".len()
-        );
-        assert_eq!(common_suffix("abα", "cdα"), "α".len());
-        assert_eq!(common_prefix("", "abc"), 0);
-        assert_eq!(common_suffix("abc", "abc"), 3);
-    }
-
-    #[test]
-    fn patch_text_reconstructs_hunk_headers_and_markers() {
-        let diff = GitDiff {
-            path: Some("src/lib.rs".to_owned()),
-            staged: false,
-            patch: String::new(),
-            binary: false,
-            truncated: false,
-            hunks: vec![GitDiffHunk {
-                old_start: 1,
-                old_lines: 2,
-                new_start: 1,
-                new_lines: 2,
-                lines: vec![
-                    GitDiffLine {
-                        kind: GitDiffLineKind::Removed,
-                        old_line: Some(1),
-                        new_line: None,
-                        content: "old".to_owned(),
-                    },
-                    GitDiffLine {
-                        kind: GitDiffLineKind::Added,
-                        old_line: None,
-                        new_line: Some(1),
-                        content: "new".to_owned(),
-                    },
-                    GitDiffLine {
-                        kind: GitDiffLineKind::Context,
-                        old_line: Some(2),
-                        new_line: Some(2),
-                        content: "same".to_owned(),
-                    },
-                ],
-            }],
-        };
-        assert_eq!(
-            review_patch_text(Some(&diff)),
-            "@@ -1,2 +1,2 @@\n-old\n+new\n same\n"
-        );
-        assert!(review_patch_text(None).is_empty());
-    }
 }
