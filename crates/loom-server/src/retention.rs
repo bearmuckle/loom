@@ -238,10 +238,100 @@ pub async fn run_archive_retention_sweeps(backend: Arc<InProcessBackend>, interv
     run_periodic_sweeps(interval, move || backend.sweep_archive_retention()).await;
 }
 
+/// Owns the periodic archive-retention sweep on a dedicated thread.
+///
+/// A native client that embeds its backend in-process has no async runtime of
+/// its own, so this owns one: it applies the stored policy, then sweeps
+/// immediately and on every `interval` from a background thread, so the client
+/// deletes expired archived sessions exactly like the standalone server. The
+/// first sweep runs on that thread rather than on the caller, so a client does
+/// not block its startup on a large database. Dropping the driver signals the
+/// loop and joins the thread, so a shutdown stops sweeping before the backend
+/// releases its database.
+///
+/// Starting is best-effort: a driver whose thread cannot start logs the reason
+/// and leaves automatic deletion manual, matching how a failed sweep never
+/// aborts a server.
+pub struct ArchiveRetentionSweepDriver {
+    stop: tokio::sync::watch::Sender<bool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ArchiveRetentionSweepDriver {
+    /// Applies the retained durable policy and starts sweeping `backend`.
+    pub fn start(backend: Arc<InProcessBackend>, interval: Duration) -> Self {
+        if let Err(error) = apply_startup_archive_retention(&backend, None) {
+            log::warn!(
+                "[loom-server] archive retention sweep driver could not apply the stored policy: {}",
+                error.message
+            );
+        }
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let sweep_backend = Arc::clone(&backend);
+        let thread = std::thread::Builder::new()
+            .name("loom-archive-retention".to_owned())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        log::warn!(
+                            "[loom-server] archive retention sweep driver could not start a runtime: {error}"
+                        );
+                        return;
+                    }
+                };
+                runtime.block_on(run_periodic_sweeps_until(
+                    interval,
+                    stop_rx,
+                    move || sweep_backend.sweep_archive_retention(),
+                ));
+            })
+            .map_err(|error| {
+                log::warn!(
+                    "[loom-server] could not start the archive retention sweep thread: {error}"
+                );
+            })
+            .ok();
+        log::info!(
+            "[loom-server] archive retention sweep driver started; interval {} s",
+            interval.as_secs()
+        );
+        Self { stop, thread }
+    }
+}
+
+impl Drop for ArchiveRetentionSweepDriver {
+    fn drop(&mut self) {
+        // A watch send both wakes a loop that is sleeping on a long interval and
+        // marks the stop, so dropping the driver joins promptly.
+        let _ = self.stop.send(true);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// [`run_archive_retention_sweeps`] with the sweep injected, so a test can watch
 /// the periodic driver without a server.
 pub(crate) async fn run_periodic_sweeps(
     interval: Duration,
+    sweep: impl FnMut() -> Result<ArchiveSweepReport>,
+) {
+    // No stop channel: the caller drops the future to stop the driver. The
+    // sender is kept alive for the loop's lifetime so the receiver never sees
+    // the channel close.
+    let (_stop, stop_rx) = tokio::sync::watch::channel(false);
+    run_periodic_sweeps_until(interval, stop_rx, sweep).await;
+}
+
+/// [`run_periodic_sweeps`] with a stop channel, so a background driver can end
+/// its loop and join its thread instead of being dropped.
+async fn run_periodic_sweeps_until(
+    interval: Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
     mut sweep: impl FnMut() -> Result<ArchiveSweepReport>,
 ) {
     // `tokio::time::interval` panics on a zero period, and the sweep must never
@@ -251,10 +341,20 @@ pub(crate) async fn run_periodic_sweeps(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         // The first tick completes immediately, so a sweep runs as soon as the
-        // driver is polled.
-        ticker.tick().await;
+        // driver is polled. Ticking and stopping are one select, so a stop
+        // requested while the loop sleeps on a long interval ends it promptly.
+        tokio::select! {
+            _ = stop.changed() => {
+                log::debug!("[loom-server] archive retention sweep driver stopping");
+                return;
+            }
+            _ = ticker.tick() => {}
+        }
+        log::debug!("[loom-server] archive retention sweep round started");
         match sweep() {
-            Ok(report) if report.is_empty() => {}
+            Ok(report) if report.is_empty() => log::debug!(
+                "[loom-server] archive retention sweep round had no candidate to act on"
+            ),
             Ok(report) => log::info!(
                 "[loom-server] archive retention deleted {} session(s) and skipped {} candidate(s)",
                 report.deleted_sessions.len(),

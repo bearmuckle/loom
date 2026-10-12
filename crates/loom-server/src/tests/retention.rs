@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use loom_protocol::ArchiveRetentionPolicy;
 
 use super::*;
-use crate::retention::run_periodic_sweeps;
+use crate::retention::{ArchiveRetentionSweepDriver, run_periodic_sweeps};
 
 /// A persistent backend with one workspace and one project root session.
 struct ProjectTree {
@@ -1049,4 +1049,34 @@ async fn the_periodic_helper_sweeps_immediately_and_stops_when_dropped() {
     let stopped = sweeps.load(Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert_eq!(sweeps.load(Ordering::SeqCst), stopped);
+}
+
+#[test]
+fn the_background_sweep_driver_deletes_an_expired_session_and_stops_on_drop() {
+    let (temp, _database, backend) = persistent_backend("driver");
+    let connection = backend.connect();
+    let (_workspace_id, session) = workspace_and_session(&connection, "driver");
+    archive_session(&connection, session.id);
+    backend
+        .set_archive_retention(enabled_retention(1, false))
+        .unwrap();
+    wait_past_a_one_millisecond_window();
+
+    let driver = ArchiveRetentionSweepDriver::start(Arc::clone(&backend), Duration::from_millis(5));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session_is_present(&backend, session.id) {
+        assert!(
+            Instant::now() < deadline,
+            "the background driver should delete the expired session"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    // Dropping the driver joins its thread, so the backend can release its
+    // database without a sweep racing the shutdown.
+    drop(driver);
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    let _ = fs::remove_dir_all(&temp);
 }

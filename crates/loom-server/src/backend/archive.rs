@@ -277,6 +277,7 @@ impl InProcessBackend {
     pub fn sweep_archive_retention(&self) -> Result<ArchiveSweepReport> {
         let policy = self.archive_retention();
         let Some(window) = policy.retention() else {
+            log::debug!("[loom-server] archive retention sweep is idle: retention is disabled");
             return Ok(ArchiveSweepReport::default());
         };
         let _gate = self.archive_gate()?;
@@ -296,6 +297,11 @@ impl InProcessBackend {
             .map(|session| session.id)
             .collect::<Vec<_>>();
         candidates.sort_unstable();
+        log::debug!(
+            "[loom-server] archive retention sweep considering {} archived session(s) with a {} ms window (force discard: {force})",
+            candidates.len(),
+            window_ms
+        );
 
         let mut report = ArchiveSweepReport::default();
         let mut deleted = BTreeSet::new();
