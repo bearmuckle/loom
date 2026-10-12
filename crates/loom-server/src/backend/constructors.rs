@@ -266,6 +266,7 @@ impl InProcessBackend {
         ];
         if persistence.is_some() {
             supported_capabilities.extend([
+                Capability::DeleteAgentSession,
                 Capability::CreateProjectChild,
                 Capability::ControlProjectChild,
                 Capability::SendProjectAgentMessage,
@@ -298,12 +299,14 @@ impl InProcessBackend {
             persistence,
             run_executor: RunExecutor::with_defaults(),
             session_root_base,
+            archive_retention: Mutex::new(loom_protocol::ArchiveRetentionPolicy::disabled()),
             idempotency_store: IdempotencyStore::new(),
             admissions: AdmissionService::new(),
             self_reference: Mutex::new(Weak::new()),
             request_lifecycle: RwLock::new(0),
             persistence_failed: AtomicBool::new(false),
             state_persist_gate: Mutex::new(()),
+            archive_gate: Mutex::new(()),
             #[cfg(test)]
             fail_next_state_save: AtomicBool::new(false),
             #[cfg(test)]

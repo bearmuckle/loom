@@ -241,6 +241,18 @@ impl InProcessConnection {
         if self.backend.persistence.is_none()
             && matches!(
                 &request,
+                ClientRequest::Session(SessionRequest::DeleteAgentSession { .. })
+            )
+        {
+            return Err(LoomError::new(
+                ErrorCode::UnsupportedCapability,
+                "deleting archived sessions requires durable storage",
+                false,
+            ));
+        }
+        if self.backend.persistence.is_none()
+            && matches!(
+                &request,
                 ClientRequest::Project(ProjectRequest::SendProjectAgentMessage { .. })
                     | ClientRequest::Project(ProjectRequest::ListProjectAgentMessages { .. })
                     | ClientRequest::Project(ProjectRequest::ControlProjectChild { .. })
@@ -518,6 +530,10 @@ impl InProcessConnection {
             | ClientRequest::Session(SessionRequest::ArchiveAgentSession {
                 session_id: requested_session,
             })
+            | ClientRequest::Session(SessionRequest::DeleteAgentSession {
+                session_id: requested_session,
+                ..
+            })
             | ClientRequest::Usage(UsageRequest::GetSessionUsage {
                 session_id: requested_session,
             })
@@ -784,6 +800,7 @@ impl InProcessConnection {
             }) => run_id = Some(*requested_run),
             ClientRequest::Control(ControlRequest::Negotiate { .. })
             | ClientRequest::Control(ControlRequest::DiscoverCapabilities)
+            | ClientRequest::Control(ControlRequest::GetArchiveRetentionPolicy)
             | ClientRequest::Workspace(WorkspaceRequest::ListWorkspaces)
             | ClientRequest::Provider(ProviderRequest::ListModels)
             | ClientRequest::Control(ControlRequest::GetWorkerNodeStatus)

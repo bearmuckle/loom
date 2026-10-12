@@ -227,6 +227,14 @@ pub enum ModelStreamEvent {
     ToolCallDelta {
         call: ToolCall,
     },
+    /// Reports one tool call whose arguments could not be decoded, without
+    /// failing the completion. The runtime answers that call with a tool error
+    /// so the model can resend it while the remaining calls in the same
+    /// completion are still processed.
+    InvalidToolCall {
+        name: String,
+        reason: String,
+    },
     Usage {
         usage: TokenUsage,
     },
@@ -264,6 +272,24 @@ mod tests {
             })
             .unwrap(),
             serde_json::json!({ "type": "completed", "data": { "reason": "tool_call" } })
+        );
+    }
+
+    #[test]
+    fn invalid_tool_calls_serialize_with_a_stable_type_tag() {
+        assert_eq!(
+            serde_json::to_value(ModelStreamEvent::InvalidToolCall {
+                name: "read_file".to_owned(),
+                reason: "arguments were not valid JSON".to_owned(),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "invalid_tool_call",
+                "data": {
+                    "name": "read_file",
+                    "reason": "arguments were not valid JSON"
+                }
+            })
         );
     }
 

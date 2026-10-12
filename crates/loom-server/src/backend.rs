@@ -1,6 +1,7 @@
 use super::*;
 
 mod accessors;
+mod archive;
 mod constructors;
 mod filesystem;
 mod persistence;

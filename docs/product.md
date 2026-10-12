@@ -103,7 +103,7 @@ The first release should optimize for this exact loop:
 | --- | --- |
 | Workspaces | Create, rename, configure, and navigate durable containers for sessions; no repository or directory is required |
 | Session repositories | Attach one or more repository sources and revisions to a session; create isolated clones or worktrees under its filesystem root |
-| Agent sessions | Create, rename, pause, resume, interrupt, retry, archive, fork, and compare persistent sessions |
+| Agent sessions | Create, rename, pause, resume, interrupt, retry, archive, permanently delete archived sessions, fork, and compare persistent sessions |
 | Agent orchestration | Plans, steps, dependencies, child agents, parallel tasks, retries, cancellation, budgets, and durable event history |
 | Model providers | Multiple hosted providers, OpenAI-compatible endpoints, local model servers, model discovery, per-session selection, fallback, and usage reporting |
 | Agent context | Repository instructions, conversation history, file references, tool results, summaries, compaction, token budgets, and context inspection |
@@ -131,6 +131,25 @@ timeline in the main canvas, and the composer at the point of control.
 Approvals, changed-file diffs, task results, and evidence open as focused review
 surfaces. File contents and repository state are read-only projections in
 M5; the client is not a general-purpose editor.
+
+## Archived session management
+
+Archiving retains a session permanently: it becomes terminal and immutable,
+and its runs, transcripts, checkpoints, filesystem root, and child worktrees
+stay in durable state. There is no restore or unarchive, and only an archived
+session can be deleted, so archived sessions accumulate until a user or an
+operator deletes them.
+
+The client provides an archived management view for that. It lists archived
+sessions grouped by project with each session's archive age, and offers a
+delete action. Deleting a project root deletes the whole project tree,
+including every descendant session and its worktrees, while deleting a
+descendant removes only that session. The delete action carries a force choice
+for a linked worktree that has changes or a lock: without it, the deletion is
+refused and the worktree is preserved. The view displays the active retention
+policy read-only, so a user can see whether the backend removes old archived
+sessions automatically and whether that sweep may discard dirty or locked
+worktrees.
 
 ## Guiding principles
 

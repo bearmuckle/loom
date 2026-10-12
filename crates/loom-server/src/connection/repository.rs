@@ -314,33 +314,16 @@ impl InProcessConnection {
         Ok(())
     }
 
+    /// Opens the Git service of one attached session repository.
+    ///
+    /// The backend owns the worktree and repository plumbing, because the
+    /// retention sweep removes worktrees without a connection; this wrapper
+    /// keeps the connection's call sites unchanged.
     pub(crate) fn session_git(
         &self,
         session_id: AgentSessionId,
         repository_id: RepositoryId,
     ) -> Result<GitService> {
-        if let Some(service) = self
-            .backend
-            .session_vcs()?
-            .get(&(session_id, repository_id))
-            .cloned()
-        {
-            return Ok(service);
-        }
-        let _filesystem = self.session_filesystem(session_id)?;
-        let repository = self
-            .backend
-            .session_repositories()?
-            .get(&session_id)
-            .and_then(|repositories| repositories.get(&repository_id))
-            .cloned()
-            .ok_or_else(|| LoomError::not_found("session repository", repository_id))?;
-        let filesystem = self.session_filesystem(session_id)?;
-        let path = filesystem.directory_path(&repository.path)?;
-        let service = GitService::open(path)?;
-        self.backend
-            .session_vcs()?
-            .insert((session_id, repository_id), service.clone());
-        Ok(service)
+        self.backend.session_git(session_id, repository_id)
     }
 }

@@ -566,6 +566,329 @@ pub(crate) fn save_session_rows(
     Ok(())
 }
 
+impl FilePersistence {
+    /// Permanently removes the given sessions and all of their stored rows.
+    ///
+    /// The removal is one write transaction, so no caller ever observes a
+    /// partially deleted session, and the content queued by the cascade
+    /// triggers is collected in the same commit. Returns the number of deleted
+    /// `sessions` rows.
+    pub fn delete_sessions(&self, session_ids: &BTreeSet<AgentSessionId>) -> Result<usize> {
+        if session_ids.is_empty() {
+            return Ok(0);
+        }
+        let connection = self.connection_for_write()?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin agent session deletion: {error}"),
+                true,
+            )
+        })?;
+        let deleted = delete_session_rows(&transaction, session_ids)?;
+        collect_unused_content(&transaction, MAX_MANUAL_CONTENT_GC_CANDIDATES)?;
+        transaction.commit().map_err(|error| {
+            persistence_error(
+                format!("could not commit agent session deletion: {error}"),
+                true,
+            )
+        })?;
+        Ok(deleted)
+    }
+}
+
+/// Permanently deletes the given sessions and every row the `sessions` cascade
+/// cannot reach on its own.
+///
+/// Rows protected by `ON DELETE RESTRICT` foreign keys are removed first, in
+/// dependency order, so the cascade that deletes the `sessions` rows can never
+/// abort because a message, a dependency edge, or a feed row still points at a
+/// deleted session. All work happens in the caller's transaction.
+///
+/// Returns the number of deleted `sessions` rows.
+pub(crate) fn delete_session_rows(
+    transaction: &Transaction<'_>,
+    session_ids: &BTreeSet<AgentSessionId>,
+) -> Result<usize> {
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_deleted_sessions (
+                id BLOB PRIMARY KEY NOT NULL
+             ) WITHOUT ROWID, STRICT;
+             CREATE TEMP TABLE IF NOT EXISTS _loom_deleted_tasks (
+                task_id BLOB PRIMARY KEY NOT NULL
+             ) WITHOUT ROWID, STRICT;
+             CREATE TEMP TABLE IF NOT EXISTS _loom_deleted_workspace_feed (
+                sequence INTEGER PRIMARY KEY
+             ) WITHOUT ROWID, STRICT;
+             DELETE FROM _loom_deleted_sessions;
+             DELETE FROM _loom_deleted_tasks;
+             DELETE FROM _loom_deleted_workspace_feed;",
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not stage deleted agent sessions: {error}"),
+                true,
+            )
+        })?;
+    for session_id in session_ids {
+        transaction
+            .execute(
+                "INSERT INTO _loom_deleted_sessions(id) VALUES (?1)",
+                [session_id.as_uuid().as_bytes().as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not stage deleted agent sessions: {error}"),
+                    true,
+                )
+            })?;
+    }
+    // A delegated task belongs to a session through its project, its requester,
+    // or its target, so any of those pulls the task into the deletion.
+    transaction
+        .execute(
+            "INSERT INTO _loom_deleted_tasks(task_id)
+             SELECT task_id FROM delegated_tasks
+             WHERE target_session_id IN (SELECT id FROM _loom_deleted_sessions)
+                OR requester_session_id IN (SELECT id FROM _loom_deleted_sessions)
+                OR project_id IN (SELECT id FROM _loom_deleted_sessions)",
+            [],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not stage deleted delegated tasks: {error}"),
+                true,
+            )
+        })?;
+    // `project_agent_messages.task_id` is `ON DELETE RESTRICT`, so a message that
+    // only references a deleted task must go before the delegated task cascade.
+    transaction
+        .execute(
+            "DELETE FROM project_agent_messages
+             WHERE project_id IN (SELECT id FROM _loom_deleted_sessions)
+                OR sender_session_id IN (SELECT id FROM _loom_deleted_sessions)
+                OR target_session_id IN (SELECT id FROM _loom_deleted_sessions)
+                OR task_id IN (SELECT task_id FROM _loom_deleted_tasks)",
+            [],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not delete agent messages: {error}"), true)
+        })?;
+    // `delegated_task_dependencies.dependency_task_id` is `ON DELETE RESTRICT`, so
+    // an edge survives the cascade only while both of its tasks do. Log the edges
+    // whose owning task outlives the dependency before removing them, because a
+    // dependency may point at a task from another project.
+    let surviving_dependencies = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT dependency.task_id, dependency.dependency_task_id
+                 FROM delegated_task_dependencies AS dependency
+                 WHERE dependency.dependency_task_id IN (SELECT task_id FROM _loom_deleted_tasks)
+                   AND dependency.task_id NOT IN (SELECT task_id FROM _loom_deleted_tasks)",
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not inspect delegated task dependencies: {error}"),
+                    true,
+                )
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not inspect delegated task dependencies: {error}"),
+                    true,
+                )
+            })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not inspect delegated task dependencies: {error}"),
+                    true,
+                )
+            })?
+    };
+    for (owner, dependency) in surviving_dependencies {
+        let owner = TaskId::from_uuid(decode_uuid(&owner, "delegated task id")?);
+        let dependency =
+            TaskId::from_uuid(decode_uuid(&dependency, "delegated task dependency id")?);
+        log::debug!(
+            "removing delegated task dependency edge {owner} -> {dependency} because \
+             {dependency} belongs to a deleted agent session while {owner} survives"
+        );
+    }
+    transaction
+        .execute(
+            "DELETE FROM delegated_task_dependencies
+             WHERE task_id IN (SELECT task_id FROM _loom_deleted_tasks)
+                OR dependency_task_id IN (SELECT task_id FROM _loom_deleted_tasks)",
+            [],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not delete delegated task dependencies: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute(
+            "DELETE FROM feed_events
+             WHERE session_id IN (SELECT id FROM _loom_deleted_sessions)",
+            [],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not delete session feed events: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute(
+            "DELETE FROM feed_session_meta
+             WHERE session_id IN (SELECT id FROM _loom_deleted_sessions)",
+            [],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not delete session feed cursors: {error}"),
+                true,
+            )
+        })?;
+    delete_workspace_feed_rows_for_sessions(transaction, session_ids)?;
+    // `session_settings` keys sessions without a foreign key to `sessions`, so
+    // the cascade cannot remove the deleted sessions' policy rows.
+    transaction
+        .execute(
+            "DELETE FROM session_settings
+             WHERE session_id IN (SELECT id FROM _loom_deleted_sessions)",
+            [],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not delete session settings: {error}"), true)
+        })?;
+    // Foreign keys are enabled, so this cascades to runs, run messages,
+    // activities, tool calls, checkpoints, filesystem records, hierarchy rows,
+    // delegated tasks, project worktrees, message sequences, cancellation
+    // cascades, and manager waits.
+    transaction
+        .execute(
+            "DELETE FROM sessions WHERE id IN (SELECT id FROM _loom_deleted_sessions)",
+            [],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not delete agent sessions: {error}"), true)
+        })
+}
+
+/// Deletes the workspace feed rows that were produced by the deleted sessions.
+///
+/// Those rows carry no session foreign key, so the affected workspaces have to
+/// be scanned and their payloads decoded. The scan is bounded in batches to keep
+/// the transaction's memory use independent of the retained feed size.
+fn delete_workspace_feed_rows_for_sessions(
+    transaction: &Transaction<'_>,
+    session_ids: &BTreeSet<AgentSessionId>,
+) -> Result<()> {
+    const WORKSPACE_FEED_SCAN_BATCH: usize = 512;
+    let mut cursor = 0_i64;
+    loop {
+        let batch = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT sequence, payload_codec, payload FROM workspace_feed_events
+                     WHERE workspace_id IN (
+                        SELECT DISTINCT workspace_id FROM sessions
+                        WHERE id IN (SELECT id FROM _loom_deleted_sessions)
+                     ) AND sequence > ?1
+                     ORDER BY sequence LIMIT ?2",
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not inspect workspace feed events: {error}"),
+                        true,
+                    )
+                })?;
+            let rows = statement
+                .query_map(params![cursor, WORKSPACE_FEED_SCAN_BATCH as i64], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not inspect workspace feed events: {error}"),
+                        true,
+                    )
+                })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not inspect workspace feed events: {error}"),
+                        true,
+                    )
+                })?
+        };
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let scanned = batch.len();
+        transaction
+            .execute("DELETE FROM _loom_deleted_workspace_feed", [])
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not stage deleted workspace feed events: {error}"),
+                    true,
+                )
+            })?;
+        for (sequence, payload_codec, payload) in batch {
+            cursor = sequence;
+            let decoded = decode_feed_payload(payload_codec, payload)?;
+            let event: WorkspaceFeedEvent = serde_json::from_slice(&decoded).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted workspace event is malformed: {error}"),
+                    false,
+                )
+            })?;
+            if let WorkspaceFeedEvent::Session(envelope) = event
+                && session_ids.contains(&envelope.session_id)
+            {
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO _loom_deleted_workspace_feed(sequence)
+                         VALUES (?1)",
+                        [sequence],
+                    )
+                    .map_err(|error| {
+                        persistence_error(
+                            format!("could not stage deleted workspace feed events: {error}"),
+                            true,
+                        )
+                    })?;
+            }
+        }
+        transaction
+            .execute(
+                "DELETE FROM workspace_feed_events
+                 WHERE sequence IN (SELECT sequence FROM _loom_deleted_workspace_feed)",
+                [],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not delete workspace feed events: {error}"),
+                    true,
+                )
+            })?;
+        if scanned < WORKSPACE_FEED_SCAN_BATCH {
+            return Ok(());
+        }
+    }
+}
+
 pub(crate) fn save_session_checkpoint_row(
     transaction: &Transaction<'_>,
     session: &AgentSessionSnapshot,

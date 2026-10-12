@@ -72,6 +72,9 @@ impl InProcessConnection {
         session_id: AgentSessionId,
         limit: usize,
     ) -> Result<Vec<ServerEventEnvelope>> {
+        // A deleted session must be reported as missing instead of as a session
+        // without events.
+        self.backend.sessions()?.get(session_id)?;
         let mut events = match &self.backend.persistence {
             Some(persistence) => persistence.load_recent_feed_events(session_id, limit)?,
             None => Vec::new(),

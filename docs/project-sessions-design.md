@@ -184,6 +184,31 @@ directories or multi-repository tasks, define whether each child receives an
 independent clone/worktree per repository and how local in-place attachments
 are handled; a child must never inherit a mutable attachment accidentally.
 
+## Project deletion and archived sessions
+
+Archiving a project retains everything: it makes the root and its descendants
+terminal and immutable, and it keeps their rows, filesystem roots, and child
+worktrees. Deletion is the way to reclaim that durable state. Only archived
+sessions can be deleted, so a live project is archived first, and archiving
+stays rejected while any child task is queued, blocked, or running.
+
+Deleting a project root deletes every descendant session of that project in one
+operation, resolved from the same project snapshot and in the same cascade
+order as archiving. `Archived` is terminal: there is no restore or unarchive,
+and deletion is the only way back. The deletion removes the linked child
+worktrees deepest-first through the parent session's `GitService`, then the
+session filesystem roots, then the durable rows; the storage design records
+that ordering and the feed-table exception.
+
+A linked worktree with changes or a lock refuses the deletion. The caller may
+force the deletion, which discards that checkout instead of failing the
+request. The automatic retention sweep does not force by default: it skips such
+a project, logs the reason, and retries later.
+
+Retention-based auto-delete is a backend operation rather than a client
+request. It considers only a fully archived project tree whose archive time is
+older than the configured retention, and it is disabled by default.
+
 ## Protocol and persistence design
 
 The protocol includes versioned operations and projections for project
@@ -495,8 +520,10 @@ server validates the persisted grant before creating a child.
   a delegated child cascades deepest-first through its descendants, while
   archiving the root is rejected until child tasks are terminal; successful
   archive then archives descendants deepest-first. A separate one-shot
-  project-wide cancel or project delete operation is not exposed; define its
-  lifecycle and worktree behavior before adding it.
+  project-wide cancel operation is not exposed; define its lifecycle and
+  worktree behavior before adding it. Deletion is exposed only for an archived
+  project tree, as described above.
 - Child worktrees are not automatically removed when a task or project
   completes. The parent explicitly retains, removes a clean checkout, or
-  discards changes. Automatic retention expiry or cleanup is future scope.
+  discards changes. The only automatic cleanup is the retention-based deletion
+  of a fully archived project tree.

@@ -25,6 +25,23 @@ impl LoomView {
         self.send_message(text, cx);
     }
 
+    /// Starts editing the composer from a tap anywhere in the field.
+    ///
+    /// The composer field's wrapper calls this so a tap on the padding around
+    /// the text element also focuses the input. The keyboard request must run
+    /// inside the tap's own user gesture on platforms that require one,
+    /// because the web platform raises the virtual keyboard only from its
+    /// `pointerup` heuristic, which additionally requires the tap to land
+    /// inside the text element's own bounds and therefore never fires for the
+    /// padding.
+    pub(crate) fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(input) = self.composer_input.clone() else {
+            return;
+        };
+        input.update(cx, |state, cx| state.focus(window, cx));
+        window.request_virtual_keyboard();
+    }
+
     pub(crate) fn run_slash_command(&mut self, text: &str, cx: &mut Context<Self>) {
         let mut parts = text.split_whitespace();
         let command = parts.next().unwrap_or_default();
@@ -42,7 +59,7 @@ impl LoomView {
     ) {
         match name {
             "" | "help" => self.record_status(
-                "Commands: /new, /repo, /review, /stop, /providers, /settings, /about, /help",
+                "Commands: /new, /repo, /review, /stop, /archived, /providers, /settings, /about, /help",
             ),
             "new" => self.begin_source_dialog(SessionSourceDialogPurpose::StartSession, cx),
             "repo" | "repository" => {
@@ -57,6 +74,7 @@ impl LoomView {
                 }
             }
             "providers" => self.open_providers_from_menu(cx),
+            "archived" => self.open_archived_sessions(cx),
             "settings" => self.open_settings_from_menu(cx),
             "about" => self.open_about_from_menu(cx),
             "model" => match argument {

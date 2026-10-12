@@ -8,6 +8,7 @@ pub enum Capability {
     CreateAgentSession,
     ReadAgentSession,
     ControlAgentSession,
+    DeleteAgentSession,
     SubscribeSessionEvents,
     SubscribeWorkspaceEvents,
     StartAgentRun,

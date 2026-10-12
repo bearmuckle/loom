@@ -12,6 +12,8 @@ pub enum ControlRequest {
     DiscoverCapabilities,
 
     GetWorkerNodeStatus,
+
+    GetArchiveRetentionPolicy,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -214,6 +216,12 @@ pub enum SessionRequest {
 
     ArchiveAgentSession {
         session_id: AgentSessionId,
+    },
+
+    /// Permanently removes an archived session and its stored history.
+    DeleteAgentSession {
+        session_id: AgentSessionId,
+        force: bool,
     },
 
     ForkAgentSession {

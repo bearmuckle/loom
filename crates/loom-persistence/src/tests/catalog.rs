@@ -1139,3 +1139,803 @@ fn workspace_only_events_share_the_cursor_and_persist_with_bounded_retention() {
     assert_eq!(loaded.workspace_events[0].sequence, EventSequence::new(2));
     fs::remove_file(path).unwrap();
 }
+
+fn child_snapshot(
+    id: AgentSessionId,
+    workspace_id: WorkspaceId,
+    name: &str,
+) -> AgentSessionSnapshot {
+    AgentSessionSnapshot {
+        id,
+        workspace_id,
+        name: name.to_owned(),
+        state: AgentSessionState::Idle,
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
+    }
+}
+
+fn delegated_task(
+    project_id: ProjectId,
+    requester_session_id: AgentSessionId,
+    target_session_id: AgentSessionId,
+    child_name: &str,
+    dependencies: Vec<TaskId>,
+) -> DelegatedTaskRecord {
+    DelegatedTaskRecord {
+        task_id: TaskId::new(),
+        project_id,
+        requester_session_id,
+        target_session_id,
+        child_name: child_name.to_owned(),
+        intent: "inspect the persistence layer".to_owned(),
+        model_id: "deterministic/demo".to_owned(),
+        context_references: Vec::new(),
+        dependencies,
+        code_change: false,
+        permissions: ProjectAgentPermissions::default(),
+        status: DelegatedTaskStatus::Queued,
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
+    }
+}
+
+fn session_row_count(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    session_id: AgentSessionId,
+) -> i64 {
+    connection
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE {column}=?1"),
+            [session_id.as_uuid().as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn table_count(connection: &Connection, table: &str) -> i64 {
+    connection
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+fn task_row_count(connection: &Connection, table: &str, column: &str, task_id: TaskId) -> i64 {
+    connection
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE {column}=?1"),
+            [task_id.as_uuid().as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn content_object_exists(connection: &Connection, hash: &[u8]) -> bool {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM content_objects WHERE hash=?1)",
+            [hash],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn queued_content_candidates(connection: &Connection, hash: &[u8]) -> i64 {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM content_gc_candidates WHERE hash=?1",
+            [hash],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn deleted_sessions_lose_their_rows_and_unused_content_in_one_transaction() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-delete-{}.db", Uuid::new_v4()));
+    let persistence = FilePersistence::open(&path).unwrap();
+    let workspace_id = WorkspaceId::new();
+    let mut manager = SessionManager::default();
+    let (root, _) = manager
+        .create_in_workspace(workspace_id, "Project manager")
+        .unwrap();
+    persistence
+        .save_state_with_sessions(&manager.export_state())
+        .unwrap();
+
+    let project_id = ProjectId::from_uuid(*root.id.as_uuid());
+    let survivor_id = AgentSessionId::new();
+    let deleted_id = AgentSessionId::new();
+    let grandchild_id = AgentSessionId::new();
+    let survivor_snapshot = child_snapshot(survivor_id, workspace_id, "Surviving child");
+    let deleted_snapshot = child_snapshot(deleted_id, workspace_id, "Deleted child");
+    let grandchild_snapshot = child_snapshot(grandchild_id, workspace_id, "Grandchild");
+
+    let survivor_task = persistence
+        .create_project_child(
+            RequestId::new(),
+            &survivor_snapshot,
+            manager.export_state().next_sequence,
+            &delegated_task(
+                project_id,
+                root.id,
+                survivor_id,
+                "Surviving child",
+                Vec::new(),
+            ),
+        )
+        .unwrap();
+    let deleted_task = delegated_task(
+        project_id,
+        root.id,
+        deleted_id,
+        "Deleted child",
+        vec![survivor_task.task_id],
+    );
+    let initial_worktree = ProjectWorktreeRecord {
+        project_id,
+        task_id: deleted_task.task_id,
+        parent_session_id: root.id,
+        child_session_id: deleted_id,
+        parent_repository_id: RepositoryId::new(),
+        child_repository_id: RepositoryId::new(),
+        relative_path: "worktrees/deleted-child".to_owned(),
+        worktree_name: "deleted-child".to_owned(),
+        branch_name: "loom/deleted-child".to_owned(),
+        base_revision: "base-sha".to_owned(),
+        result_revision: None,
+        integrated_revision: None,
+        status: ProjectWorktreeStatus::Creating,
+        conflict_paths: Vec::new(),
+        error: None,
+        cleanup_disposition: None,
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
+    };
+    let created_task = persistence
+        .create_project_child_with_worktree(
+            RequestId::new(),
+            &deleted_snapshot,
+            manager.export_state().next_sequence,
+            &deleted_task,
+            &initial_worktree,
+        )
+        .unwrap();
+    // The deepest task survives and depends on the deleted session's task, so
+    // the deletion has to remove a dependency edge whose owning task outlives it.
+    let grandchild_task = persistence
+        .create_project_child(
+            RequestId::new(),
+            &grandchild_snapshot,
+            manager.export_state().next_sequence,
+            &delegated_task(
+                project_id,
+                survivor_id,
+                grandchild_id,
+                "Grandchild",
+                vec![created_task.task_id],
+            ),
+        )
+        .unwrap();
+
+    // A message that only references the deleted task would block the delegated
+    // task cascade, so the deletion has to remove it first.
+    let task_message = persistence
+        .accept_agent_message(
+            RequestId::new(),
+            &AgentMessageDraft {
+                project_id,
+                task_id: Some(created_task.task_id),
+                sender_session_id: survivor_id,
+                target_session_id: root.id,
+                kind: AgentMessageKind::Question,
+                body: "Is the deleted child done?".to_owned(),
+            },
+        )
+        .unwrap();
+    let targeted_message = persistence
+        .accept_agent_message(
+            RequestId::new(),
+            &AgentMessageDraft {
+                project_id,
+                task_id: None,
+                sender_session_id: root.id,
+                target_session_id: deleted_id,
+                kind: AgentMessageKind::Direction,
+                body: "Wrap up the child task".to_owned(),
+            },
+        )
+        .unwrap();
+    assert_ne!(task_message.message_id, targeted_message.message_id);
+    let surviving_message = persistence
+        .accept_agent_message(
+            RequestId::new(),
+            &AgentMessageDraft {
+                project_id,
+                task_id: Some(survivor_task.task_id),
+                sender_session_id: root.id,
+                target_session_id: survivor_id,
+                kind: AgentMessageKind::Progress,
+                body: "Surviving child status".to_owned(),
+            },
+        )
+        .unwrap();
+
+    let deleted_run_id = RunId::new();
+    let survivor_run_id = RunId::new();
+    let deleted_message = "deleted session transcript content ".repeat(20);
+    let survivor_message = "survivor session transcript content ".repeat(20);
+    let deleted_content_hash = Sha256::digest(deleted_message.as_bytes()).to_vec();
+    let survivor_content_hash = Sha256::digest(survivor_message.as_bytes()).to_vec();
+    let checkpoint_text = "deleted checkpoint file content ".repeat(20);
+    let checkpoint_content_hash = Sha256::digest(checkpoint_text.as_bytes()).to_vec();
+    let run_summaries = BTreeMap::from([
+        (
+            deleted_run_id,
+            DurableRunSummary {
+                snapshot: AgentRunSnapshot {
+                    id: deleted_run_id,
+                    attempt_id: loom_core::RunAttemptId::new(),
+                    control_revision: 0,
+                    session_id: deleted_id,
+                    task: "delete me".to_owned(),
+                    model: ModelId::new("deterministic/demo"),
+                    state: AgentRunState::Completed,
+                    started_at: Timestamp::from_unix_millis(1_000),
+                    updated_at: Timestamp::from_unix_millis(2_000),
+                    completed_at: Some(Timestamp::from_unix_millis(2_000)),
+                    summary: Some("finished".to_owned()),
+                    evidence: Vec::new(),
+                },
+                usage: UsageSnapshot::default(),
+                attempts: None,
+                execution_state: None,
+                interactions: None,
+            },
+        ),
+        (
+            survivor_run_id,
+            DurableRunSummary {
+                snapshot: AgentRunSnapshot {
+                    id: survivor_run_id,
+                    attempt_id: loom_core::RunAttemptId::new(),
+                    control_revision: 0,
+                    session_id: survivor_id,
+                    task: "keep me".to_owned(),
+                    model: ModelId::new("deterministic/demo"),
+                    state: AgentRunState::Completed,
+                    started_at: Timestamp::from_unix_millis(1_000),
+                    updated_at: Timestamp::from_unix_millis(2_000),
+                    completed_at: Some(Timestamp::from_unix_millis(2_000)),
+                    summary: None,
+                    evidence: Vec::new(),
+                },
+                usage: UsageSnapshot::default(),
+                attempts: None,
+                execution_state: None,
+                interactions: None,
+            },
+        ),
+    ]);
+    let run_messages = BTreeMap::from([
+        (
+            deleted_run_id,
+            vec![DurableRunMessage {
+                timeline_ordinal: 0,
+                role: loom_model::MessageRole::User,
+                content: deleted_message.clone(),
+                name: None,
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            }],
+        ),
+        (
+            survivor_run_id,
+            vec![DurableRunMessage {
+                timeline_ordinal: 0,
+                role: loom_model::MessageRole::User,
+                content: survivor_message.clone(),
+                name: None,
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            }],
+        ),
+    ]);
+    let checkpoint_id = CheckpointId::new();
+    let filesystem_records = [DurableFilesystemRecord {
+        session_id: deleted_id,
+        root: "/tmp/loom-deleted-session".to_owned(),
+        control: WorkspaceControl::Agent,
+        checkpoints: vec![Checkpoint {
+            id: checkpoint_id,
+            session_id: deleted_id,
+            label: "rollback point".to_owned(),
+            created_at: Timestamp::from_unix_millis(1_500),
+            files: BTreeMap::from([(
+                "src/main.rs".to_owned(),
+                CheckpointFile {
+                    existed: true,
+                    content: checkpoint_text.clone(),
+                    revision: "revision-a".to_owned(),
+                    expected_revision: "revision-b".to_owned(),
+                },
+            )]),
+        }],
+        edits: Vec::new(),
+        changes: Vec::new(),
+        repositories: BTreeMap::new(),
+        directories: Vec::new(),
+        payload: serde_json::json!({
+            "filesystem": {
+                "session_id": deleted_id,
+                "root": "/tmp/loom-deleted-session",
+                "control": "agent",
+                "checkpoints": [],
+                "edits": [],
+                "next_sequence": 0,
+                "changes": []
+            }
+        }),
+        delta: None,
+    }];
+    let feed = DurableFeedState {
+        next_sequence: EventSequence::new(4),
+        retention_limit: 250,
+        events: vec![
+            ServerEventEnvelope {
+                protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
+                sequence: EventSequence::new(1),
+                session_id: deleted_id,
+                event: loom_model::ServerEvent::AgentSessionArchived {
+                    session_id: deleted_id,
+                },
+            },
+            ServerEventEnvelope {
+                protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
+                sequence: EventSequence::new(2),
+                session_id: survivor_id,
+                event: loom_model::ServerEvent::AgentSessionRenamed {
+                    session_id: survivor_id,
+                    name: "Surviving child".to_owned(),
+                },
+            },
+        ],
+        workspace_events: vec![
+            WorkspaceEventEnvelope {
+                protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
+                sequence: EventSequence::new(3),
+                workspace_id,
+                event: loom_model::WorkspaceEvent::Renamed {
+                    name: "workspace".to_owned(),
+                },
+            },
+            WorkspaceEventEnvelope {
+                protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
+                sequence: EventSequence::new(4),
+                workspace_id,
+                event: loom_model::WorkspaceEvent::ConfigChanged { revision: 1 },
+            },
+        ],
+    };
+    let mut stored_state = manager.export_state();
+    stored_state.sessions.insert(survivor_id, survivor_snapshot);
+    stored_state.sessions.insert(deleted_id, deleted_snapshot);
+    stored_state
+        .sessions
+        .insert(grandchild_id, grandchild_snapshot);
+    let settings = DurableSessionSettings {
+        approval_policies: BTreeMap::from([
+            (deleted_id, ApprovalPolicy::default()),
+            (survivor_id, ApprovalPolicy::default()),
+        ]),
+        auto_approve_actions: BTreeMap::from([(deleted_id, true), (survivor_id, false)]),
+    };
+    persistence
+        .save_state(DurableStateWrite {
+            sessions: &stored_state,
+            workspaces: None,
+            settings: Some(&settings),
+            workspace_configs: None,
+            providers: None,
+            usage: None,
+            idempotency: None,
+            run_summaries: Some(&run_summaries),
+            run_runtime_configs: None,
+            run_context_checkpoints: None,
+            run_plans: None,
+            run_messages: Some(&run_messages),
+            run_activities: None,
+            filesystem_records: Some(&filesystem_records),
+            feed: Some(&feed),
+        })
+        .unwrap();
+
+    // The current writer only stores workspace-only events in `workspace_feed_events`,
+    // but an older or migrated row can still carry a session envelope. The
+    // deletion decodes the affected workspaces to find those rows.
+    let legacy_workspace_row =
+        serde_json::to_vec(&WorkspaceFeedEvent::Session(ServerEventEnvelope {
+            protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
+            sequence: EventSequence::new(5),
+            session_id: deleted_id,
+            event: loom_model::ServerEvent::AgentSessionArchived {
+                session_id: deleted_id,
+            },
+        }))
+        .unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO workspace_feed_events(sequence, workspace_id, payload_codec, payload)
+             VALUES (5, ?1, 0, ?2)",
+            params![
+                workspace_id.as_uuid().as_bytes().as_slice(),
+                legacy_workspace_row
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    // An empty id set is a no-op.
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(table_count(&connection, "sessions"), 4);
+    drop(connection);
+    assert_eq!(persistence.delete_sessions(&BTreeSet::new()).unwrap(), 0);
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(table_count(&connection, "sessions"), 4);
+    drop(connection);
+
+    assert_eq!(
+        persistence
+            .delete_sessions(&BTreeSet::from([deleted_id]))
+            .unwrap(),
+        1
+    );
+
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(
+        session_row_count(&connection, "sessions", "id", deleted_id),
+        0
+    );
+    assert_eq!(
+        session_row_count(&connection, "sessions", "id", survivor_id),
+        1
+    );
+    assert_eq!(
+        session_row_count(&connection, "sessions_hierarchy", "session_id", deleted_id),
+        0
+    );
+    assert_eq!(
+        session_row_count(
+            &connection,
+            "sessions_hierarchy",
+            "session_id",
+            grandchild_id
+        ),
+        1
+    );
+    assert_eq!(
+        session_row_count(&connection, "run_summaries", "session_id", deleted_id),
+        0
+    );
+    assert_eq!(
+        session_row_count(&connection, "run_messages", "session_id", deleted_id),
+        0
+    );
+    assert_eq!(
+        session_row_count(&connection, "run_summaries", "session_id", survivor_id),
+        1
+    );
+    assert_eq!(
+        session_row_count(&connection, "run_messages", "session_id", survivor_id),
+        1
+    );
+    assert_eq!(
+        session_row_count(&connection, "session_filesystems", "session_id", deleted_id),
+        0
+    );
+    assert_eq!(
+        session_row_count(
+            &connection,
+            "filesystem_change_state",
+            "session_id",
+            deleted_id
+        ),
+        0
+    );
+    assert_eq!(
+        session_row_count(&connection, "checkpoints", "session_id", deleted_id),
+        0
+    );
+    assert_eq!(
+        session_row_count(&connection, "checkpoint_files", "session_id", deleted_id),
+        0
+    );
+    assert_eq!(
+        session_row_count(&connection, "session_settings", "session_id", deleted_id),
+        0
+    );
+    assert_eq!(
+        session_row_count(&connection, "session_settings", "session_id", survivor_id),
+        1
+    );
+    assert_eq!(
+        session_row_count(
+            &connection,
+            "delegated_tasks",
+            "target_session_id",
+            deleted_id
+        ),
+        0
+    );
+    assert_eq!(
+        session_row_count(
+            &connection,
+            "delegated_tasks",
+            "target_session_id",
+            survivor_id
+        ),
+        1
+    );
+    assert_eq!(
+        session_row_count(
+            &connection,
+            "delegated_tasks",
+            "target_session_id",
+            grandchild_id
+        ),
+        1
+    );
+    // Both dependency edges go: the deleted session's own edge and the edge of
+    // the surviving task that pointed at the deleted task.
+    assert_eq!(table_count(&connection, "delegated_task_dependencies"), 0);
+    assert_eq!(
+        session_row_count(
+            &connection,
+            "project_worktrees",
+            "child_session_id",
+            deleted_id
+        ),
+        0
+    );
+    assert_eq!(
+        task_row_count(
+            &connection,
+            "project_worktree_conflict_paths",
+            "task_id",
+            created_task.task_id
+        ),
+        0
+    );
+    assert_eq!(table_count(&connection, "project_agent_messages"), 1);
+    let remaining_message_id: Vec<u8> = connection
+        .query_row(
+            "SELECT message_id FROM project_agent_messages WHERE task_id=?1",
+            [survivor_task.task_id.as_uuid().as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        remaining_message_id,
+        surviving_message.message_id.as_uuid().as_bytes().to_vec()
+    );
+    assert_eq!(
+        session_row_count(&connection, "feed_events", "session_id", deleted_id),
+        0
+    );
+    assert_eq!(
+        session_row_count(&connection, "feed_events", "session_id", survivor_id),
+        1
+    );
+    assert_eq!(
+        session_row_count(&connection, "feed_session_meta", "session_id", deleted_id),
+        0
+    );
+    assert_eq!(
+        session_row_count(&connection, "feed_session_meta", "session_id", survivor_id),
+        1
+    );
+    let workspace_feed_sequences: Vec<i64> = connection
+        .prepare("SELECT sequence FROM workspace_feed_events ORDER BY sequence")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(workspace_feed_sequences, vec![3, 4]);
+    // Content reachable only from the deleted session is reclaimed in the same
+    // call, with no queued candidate left behind, while the surviving session's
+    // content stays.
+    assert!(!content_object_exists(&connection, &deleted_content_hash));
+    assert!(!content_object_exists(
+        &connection,
+        &checkpoint_content_hash
+    ));
+    assert_eq!(
+        queued_content_candidates(&connection, &deleted_content_hash),
+        0
+    );
+    assert_eq!(
+        queued_content_candidates(&connection, &checkpoint_content_hash),
+        0
+    );
+    assert!(content_object_exists(&connection, &survivor_content_hash));
+    assert_eq!(
+        queued_content_candidates(&connection, &survivor_content_hash),
+        0
+    );
+    drop(connection);
+
+    let project = persistence
+        .load_project_snapshot(project_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(project.tasks.len(), 2);
+    assert!(project.worktrees.is_empty());
+    assert!(
+        persistence
+            .load_delegated_task(created_task.task_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        persistence
+            .load_delegated_task(grandchild_task.task_id)
+            .unwrap()
+            .is_some()
+    );
+
+    drop(persistence);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn deleting_unknown_sessions_reports_no_rows() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-delete-{}.db", Uuid::new_v4()));
+    let persistence = FilePersistence::open(&path).unwrap();
+    let mut manager = SessionManager::default();
+    manager
+        .create_in_workspace(WorkspaceId::new(), "Untouched")
+        .unwrap();
+    persistence
+        .save_state_with_sessions(&manager.export_state())
+        .unwrap();
+
+    assert_eq!(
+        persistence
+            .delete_sessions(&BTreeSet::from([AgentSessionId::new()]))
+            .unwrap(),
+        0
+    );
+
+    drop(persistence);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn session_deletion_rolls_back_when_a_workspace_feed_row_is_corrupt() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-delete-{}.db", Uuid::new_v4()));
+    let persistence = FilePersistence::open(&path).unwrap();
+    let workspace_id = WorkspaceId::new();
+    let mut manager = SessionManager::default();
+    let (session, _) = manager
+        .create_in_workspace(workspace_id, "Corrupt feed")
+        .unwrap();
+    let feed = DurableFeedState {
+        next_sequence: EventSequence::new(1),
+        retention_limit: 250,
+        events: vec![ServerEventEnvelope {
+            protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
+            sequence: EventSequence::new(1),
+            session_id: session.id,
+            event: loom_model::ServerEvent::AgentSessionArchived {
+                session_id: session.id,
+            },
+        }],
+        workspace_events: Vec::new(),
+    };
+    persistence
+        .save_state_with_sessions_and_feed(&manager.export_state(), Some(&feed))
+        .unwrap();
+    // The deletion decodes the workspace feed of the affected workspace, so a
+    // corrupt row has to abort the whole transaction instead of leaving the
+    // session half-deleted.
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO workspace_feed_events(sequence, workspace_id, payload_codec, payload)
+             VALUES (2, ?1, 0, ?2)",
+            params![
+                workspace_id.as_uuid().as_bytes().as_slice(),
+                b"not a feed event".to_vec()
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = persistence
+        .delete_sessions(&BTreeSet::from([session.id]))
+        .unwrap_err();
+    assert_eq!(error.code, loom_core::ErrorCode::MalformedPayload);
+
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(
+        session_row_count(&connection, "sessions", "id", session.id),
+        1
+    );
+    assert_eq!(
+        session_row_count(&connection, "feed_events", "session_id", session.id),
+        1
+    );
+    assert_eq!(table_count(&connection, "workspace_feed_events"), 1);
+    drop(connection);
+
+    drop(persistence);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn session_deletion_reaches_the_store_through_the_persistence_trait_object() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-delete-{}.db", Uuid::new_v4()));
+    let store = Arc::new(FilePersistence::open(&path).unwrap());
+    let persistence: Arc<dyn Persistence> = store.clone();
+    let workspace_id = WorkspaceId::new();
+    let mut manager = SessionManager::default();
+    let (survivor, _) = manager
+        .create_in_workspace(workspace_id, "Survivor")
+        .unwrap();
+    let (first, _) = manager
+        .create_in_workspace(workspace_id, "First deleted")
+        .unwrap();
+    let (second, _) = manager
+        .create_in_workspace(workspace_id, "Second deleted")
+        .unwrap();
+    manager.archive(first.id).unwrap();
+    manager.archive(second.id).unwrap();
+    // The server holds `Arc<dyn Persistence>` and clones the store behind an
+    // `Arc`, so deletion has to work through both handles.
+    persistence
+        .save_state(DurableStateWrite {
+            sessions: &manager.export_state(),
+            workspaces: None,
+            settings: None,
+            workspace_configs: None,
+            providers: None,
+            usage: None,
+            idempotency: None,
+            run_summaries: None,
+            run_runtime_configs: None,
+            run_context_checkpoints: None,
+            run_plans: None,
+            run_messages: None,
+            run_activities: None,
+            filesystem_records: None,
+            feed: None,
+        })
+        .unwrap();
+
+    assert_eq!(
+        store.delete_sessions(&BTreeSet::from([first.id])).unwrap(),
+        1
+    );
+    assert_eq!(
+        persistence
+            .delete_sessions(&BTreeSet::from([second.id]))
+            .unwrap(),
+        1
+    );
+
+    let sessions = persistence.load_sessions().unwrap().unwrap().sessions;
+    assert!(sessions.contains_key(&survivor.id));
+    assert!(!sessions.contains_key(&first.id));
+    assert!(!sessions.contains_key(&second.id));
+
+    drop(persistence);
+    drop(store);
+    fs::remove_file(path).unwrap();
+}

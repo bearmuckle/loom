@@ -16,10 +16,13 @@ use std::{
 };
 
 use loom_core::{ErrorCode, LoomError};
+use loom_protocol::ArchiveRetentionPolicy;
 use loom_server::{
+    ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FORCE_DISCARD_ENV, ARCHIVE_RETENTION_SWEEP_INTERVAL,
     AuthTokenStore, AuthorizationScope, DiagnosticsSettings, InProcessBackend, Instance,
     InstanceLayout, InstanceOptions, ProcessContext, RemoteServer, RemoteServerConfig,
-    RunningRemoteServer, ServerTlsConfig, TlsState, diagnostics_lines, startup_summary,
+    RunningRemoteServer, ServerTlsConfig, TlsState, diagnostics_lines, resolve_archive_retention,
+    run_archive_retention_sweeps, startup_summary, sweep_archive_retention_at_startup,
 };
 
 /// The bind address used when `--bind` is not supplied.
@@ -65,6 +68,10 @@ struct ServerOptions {
     token_file: Option<PathBuf>,
     persistence: Option<PathBuf>,
     reset_state: bool,
+    /// Raw `--archive-retention` value, before it is resolved into a policy.
+    archive_retention: Option<String>,
+    /// Raw `--archive-retention-force-discard` value.
+    archive_retention_force_discard: Option<String>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     allow_insecure_remote: bool,
@@ -79,6 +86,8 @@ impl Default for ServerOptions {
             token_file: None,
             persistence: None,
             reset_state: false,
+            archive_retention: None,
+            archive_retention_force_discard: None,
             tls_cert: None,
             tls_key: None,
             allow_insecure_remote: false,
@@ -87,16 +96,33 @@ impl Default for ServerOptions {
 }
 
 impl ServerOptions {
-    /// The settings [`Instance`] applies its defaults to.
-    fn instance_options(&self) -> InstanceOptions {
-        InstanceOptions {
+    /// The archive-retention policy the operator asked for, resolving the
+    /// environment fallback exactly like the flags and refusing an unusable
+    /// value with the flag or variable that carried it.
+    fn retention_policy(&self) -> Result<ArchiveRetentionPolicy, LoomError> {
+        resolve_archive_retention(
+            self.archive_retention.as_deref(),
+            self.archive_retention_force_discard.as_deref(),
+            env::var(ARCHIVE_RETENTION_ENV).ok().as_deref(),
+            env::var(ARCHIVE_RETENTION_FORCE_DISCARD_ENV)
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    /// The settings [`Instance`] applies its defaults to. The archive-retention
+    /// policy is resolved here because it is operator input that fails a start
+    /// when it cannot be parsed.
+    fn instance_options(&self) -> Result<InstanceOptions, LoomError> {
+        Ok(InstanceOptions {
             bind: self.bind,
             instance_name: self.instance_name.clone(),
             persistence: self.persistence.clone(),
             token: self.token.clone(),
             token_file: self.token_file.clone(),
             reset_state: self.reset_state,
-        }
+            archive_retention: self.retention_policy()?,
+        })
     }
 }
 
@@ -141,6 +167,15 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
                     Some(PathBuf::from(required_value(&mut args, "--persistence")?));
             }
             "--reset-state" => options.reset_state = true,
+            "--archive-retention" => {
+                options.archive_retention = Some(required_value(&mut args, "--archive-retention")?);
+            }
+            "--archive-retention-force-discard" => {
+                options.archive_retention_force_discard = Some(required_value(
+                    &mut args,
+                    "--archive-retention-force-discard",
+                )?);
+            }
             "--diagnostics" => diagnostics = true,
             "--tls-cert" => {
                 options.tls_cert = Some(PathBuf::from(required_value(&mut args, "--tls-cert")?));
@@ -165,6 +200,13 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
             }
             value if value.starts_with("--persistence=") => {
                 options.persistence = Some(PathBuf::from(&value["--persistence=".len()..]));
+            }
+            value if value.starts_with("--archive-retention=") => {
+                options.archive_retention = Some(value["--archive-retention=".len()..].to_owned());
+            }
+            value if value.starts_with("--archive-retention-force-discard=") => {
+                options.archive_retention_force_discard =
+                    Some(value["--archive-retention-force-discard=".len()..].to_owned());
             }
             value if value.starts_with("--tls-cert=") => {
                 options.tls_cert = Some(PathBuf::from(&value["--tls-cert=".len()..]));
@@ -222,7 +264,9 @@ fn help_text() -> String {
     format!(
         "Usage: loom-server [--bind <addr>] [--instance-name <name>] \
          [--token <token> | --token-file <path>] [--persistence <path>] \
-         [--reset-state] [--tls-cert <pem> --tls-key <pem>] \
+         [--reset-state] [--archive-retention <duration>] \
+         [--archive-retention-force-discard <bool>] \
+         [--tls-cert <pem> --tls-key <pem>] \
          [--allow-insecure-remote] [--diagnostics]\n\
          \n\
          A standalone Loom backend that serves the remote WebSocket protocol.\n\
@@ -236,6 +280,12 @@ fn help_text() -> String {
          \x20 --token-file <path>   file whose trimmed contents are the bearer token\n\
          \x20 --persistence <path>  keep state in the database at this path\n\
          \x20 --reset-state         wipe an incompatible state database and start empty\n\
+         \x20 --archive-retention <duration>\n\
+         \x20                        delete archived projects older than <duration> \
+         (LOOM_ARCHIVE_RETENTION is the fallback)\n\
+         \x20 --archive-retention-force-discard <bool>\n\
+         \x20                        let the retention sweep discard dirty or locked \
+         worktrees (LOOM_ARCHIVE_RETENTION_FORCE_DISCARD is the fallback)\n\
          \x20 --tls-cert <pem>      serve wss:// with this PEM certificate chain\n\
          \x20 --tls-key <pem>       PEM private key matching --tls-cert\n\
          \x20 --allow-insecure-remote\n\
@@ -255,12 +305,18 @@ fn help_text() -> String {
          like the credential store. The path is always logged; the value is printed only \
          when stdout is a terminal.\n\
          \n\
+         Archive retention is disabled by default, so an absent or zero value never \
+         auto-deletes. A duration is <n><unit> with unit ms, s, m, h, d, or w; a bare \
+         integer means seconds, and off and never mean disabled. The sweep runs once at \
+         startup and every {} minutes while the server runs.\n\
+         \n\
          A bind address that is not loopback needs TLS; --allow-insecure-remote accepts \
          the risk of sending the bearer token and all traffic in plaintext instead.\n\
          \n\
          --diagnostics prints where agent commands would execute, as which account, which \
          state a start would use, and the intended egress policy, without printing the \
-         token value."
+         token value.",
+        ARCHIVE_RETENTION_SWEEP_INTERVAL.as_secs() / 60
     )
 }
 
@@ -276,7 +332,7 @@ fn diagnostics_report_in(
     options: &ServerOptions,
     state_directory: &Path,
 ) -> Result<String, LoomError> {
-    let instance_options = options.instance_options();
+    let instance_options = options.instance_options()?;
     // Resolving the layout is the whole report: it creates no directory, opens no
     // database, and never generates a token, so running it against a live
     // deployment changes nothing.
@@ -337,11 +393,16 @@ fn version_label(version: &str, revision: &str) -> String {
 /// Opens the backend the operator asked for: the path [`Instance`] resolved, or
 /// the in-memory backend when this instance has no durable database. This
 /// mirrors the standalone server mode of the native `loom` shell.
-fn build_backend(persistence: Option<&Path>) -> Result<Arc<InProcessBackend>, LoomError> {
-    match persistence {
-        Some(path) => InProcessBackend::new_persistent_with_github_copilot(path),
-        None => InProcessBackend::new_with_github_copilot(),
-    }
+fn build_backend(
+    persistence: Option<&Path>,
+    archive_retention: ArchiveRetentionPolicy,
+) -> Result<Arc<InProcessBackend>, LoomError> {
+    let backend = match persistence {
+        Some(path) => InProcessBackend::new_persistent_with_github_copilot(path)?,
+        None => InProcessBackend::new_with_github_copilot()?,
+    };
+    backend.set_archive_retention(archive_retention)?;
+    Ok(backend)
 }
 
 /// The running standalone backend. It is owned by the caller so a test can stop
@@ -458,7 +519,7 @@ async fn serve_in(
     shutdown: impl Future<Output = Result<(), LoomError>>,
 ) -> Result<(), LoomError> {
     let instance = prepare_instance(&options, state_directory)?;
-    let instance_options = options.instance_options();
+    let instance_options = options.instance_options()?;
     let settings = diagnostics_settings(
         &options,
         &instance_options,
@@ -466,9 +527,21 @@ async fn serve_in(
         state_directory,
     );
     log::info!("{}", startup_summary(&ProcessContext::detect(), &settings));
-    let backend = build_backend(instance.state_db())?;
-    let server = start(&options, backend, &instance).await?;
-    shutdown.await?;
+    let backend = build_backend(instance.state_db(), instance_options.archive_retention)?;
+    // The startup sweep runs before the listener accepts clients. It is not part
+    // of `restore_persisted` because the retention policy is operator input the
+    // backend learns only after it was constructed, and a failed sweep must be
+    // reported without stopping the server.
+    sweep_archive_retention_at_startup(&backend);
+    let server = start(&options, Arc::clone(&backend), &instance).await?;
+    let sweeps =
+        run_archive_retention_sweeps(Arc::clone(&backend), ARCHIVE_RETENTION_SWEEP_INTERVAL);
+    tokio::select! {
+        result = shutdown => result?,
+        // The driver sweeps immediately and then on every interval until it is
+        // dropped by the shutdown branch.
+        () = sweeps => {}
+    }
     log::info!("Shutting down loom-server");
     server.stop().await
 }
@@ -481,7 +554,7 @@ fn prepare_instance(
     options: &ServerOptions,
     state_directory: &Path,
 ) -> Result<Instance, LoomError> {
-    let instance = Instance::prepare(&options.instance_options(), state_directory)?;
+    let instance = Instance::prepare(&options.instance_options()?, state_directory)?;
     if let Some(directory) = instance.layout().directory() {
         log::info!("Instance directory: {}", directory.display());
     }
@@ -535,6 +608,7 @@ mod tests {
         path::{Path, PathBuf},
     };
 
+    use loom_protocol::ArchiveRetentionPolicy;
     use loom_server::{InProcessBackend, Instance, TokenSource};
 
     use super::{
@@ -542,6 +616,7 @@ mod tests {
         help_text, parse_args, prepare_instance, resolve_tls, run, serve_in, start, version_label,
         version_text,
     };
+    use loom_server::resolve_archive_retention;
 
     fn arguments<'a>(values: &'a [&str]) -> impl Iterator<Item = String> + 'a {
         values.iter().map(|value| (*value).to_owned())
@@ -591,6 +666,8 @@ mod tests {
         assert_eq!(defaults.tls_cert, None);
         assert_eq!(defaults.tls_key, None);
         assert!(!defaults.allow_insecure_remote);
+        assert_eq!(defaults.archive_retention, None);
+        assert_eq!(defaults.archive_retention_force_discard, None);
 
         let spaced = serve_options(&[
             "--bind",
@@ -602,6 +679,10 @@ mod tests {
             "--persistence",
             "/tmp/loom.db",
             "--reset-state",
+            "--archive-retention",
+            "14d",
+            "--archive-retention-force-discard",
+            "yes",
             "--tls-cert",
             "/tmp/cert.pem",
             "--tls-key",
@@ -616,6 +697,11 @@ mod tests {
             spaced.persistence.as_deref(),
             Some(Path::new("/tmp/loom.db"))
         );
+        assert_eq!(spaced.archive_retention.as_deref(), Some("14d"));
+        assert_eq!(
+            spaced.archive_retention_force_discard.as_deref(),
+            Some("yes")
+        );
         assert_eq!(spaced.tls_cert.as_deref(), Some(Path::new("/tmp/cert.pem")));
         assert_eq!(spaced.tls_key.as_deref(), Some(Path::new("/tmp/key.pem")));
         assert!(spaced.allow_insecure_remote);
@@ -625,6 +711,8 @@ mod tests {
             "--instance-name=pinned",
             "--token-file=/tmp/token",
             "--persistence=/tmp/other.db",
+            "--archive-retention=30m",
+            "--archive-retention-force-discard=0",
             "--tls-cert=/tmp/other-cert.pem",
             "--tls-key=/tmp/other-key.pem",
         ]);
@@ -636,6 +724,8 @@ mod tests {
             equals.persistence.as_deref(),
             Some(Path::new("/tmp/other.db"))
         );
+        assert_eq!(equals.archive_retention.as_deref(), Some("30m"));
+        assert_eq!(equals.archive_retention_force_discard.as_deref(), Some("0"));
         assert_eq!(
             equals.tls_cert.as_deref(),
             Some(Path::new("/tmp/other-cert.pem"))
@@ -655,6 +745,8 @@ mod tests {
             "--token",
             "--token-file",
             "--persistence",
+            "--archive-retention",
+            "--archive-retention-force-discard",
             "--tls-cert",
             "--tls-key",
         ] {
@@ -679,6 +771,72 @@ mod tests {
     }
 
     #[test]
+    fn archive_retention_flags_and_environment_resolve_one_policy() {
+        // The flags reach the settings the backend is configured from.
+        let flagged = serve_options(&[
+            "--archive-retention",
+            "14d",
+            "--archive-retention-force-discard",
+            "yes",
+        ]);
+        assert_eq!(
+            flagged.instance_options().unwrap().archive_retention,
+            ArchiveRetentionPolicy {
+                retention_ms: Some(1_209_600_000),
+                force_discard_worktrees: true,
+            }
+        );
+
+        // The environment is the fallback, and a flag always wins over it.
+        assert_eq!(
+            resolve_archive_retention(None, None, Some("2h"), Some("yes")).unwrap(),
+            ArchiveRetentionPolicy {
+                retention_ms: Some(7_200_000),
+                force_discard_worktrees: true,
+            }
+        );
+        let disabled = serve_options(&[
+            "--archive-retention=off",
+            "--archive-retention-force-discard=0",
+        ])
+        .instance_options()
+        .unwrap()
+        .archive_retention;
+        assert_eq!(disabled, ArchiveRetentionPolicy::disabled());
+        if std::env::var("LOOM_ARCHIVE_RETENTION").is_err()
+            && std::env::var("LOOM_ARCHIVE_RETENTION_FORCE_DISCARD").is_err()
+        {
+            assert_eq!(
+                serve_options(&[])
+                    .instance_options()
+                    .unwrap()
+                    .archive_retention,
+                ArchiveRetentionPolicy::disabled()
+            );
+        }
+
+        // A rejected value names the flag it came from.
+        let error = serve_options(&["--archive-retention", "soon"])
+            .instance_options()
+            .unwrap_err();
+        assert_eq!(error.code, loom_core::ErrorCode::InvalidRequest);
+        assert!(error.message.contains("--archive-retention"), "{error}");
+        let error = serve_options(&["--archive-retention-force-discard=maybe"])
+            .instance_options()
+            .unwrap_err();
+        assert!(
+            error.message.contains("--archive-retention-force-discard"),
+            "{error}"
+        );
+        assert!(
+            parse(&["--archive-retention"])
+                .unwrap_err()
+                .message
+                .contains("requires a value")
+        );
+    }
+
+    #[test]
     fn help_and_version_short_circuit_the_remaining_arguments() {
         assert_eq!(parse(&["--help"]).unwrap(), ParsedArgs::Help);
         assert_eq!(parse(&["-h", "--mystery"]).unwrap(), ParsedArgs::Help);
@@ -698,6 +856,10 @@ mod tests {
         assert!(help.contains("--tls-key <pem>"));
         assert!(help.contains("--allow-insecure-remote"));
         assert!(help.contains("--diagnostics"));
+        assert!(help.contains("--archive-retention <duration>"));
+        assert!(help.contains("--archive-retention-force-discard <bool>"));
+        assert!(help.contains("LOOM_ARCHIVE_RETENTION"));
+        assert!(help.contains("LOOM_ARCHIVE_RETENTION_FORCE_DISCARD"));
         assert!(help.contains("127.0.0.1:8765"));
         assert!(version_text().starts_with("loom-server "));
         assert!(version_text().contains(build_version()));
@@ -1000,6 +1162,141 @@ mod tests {
         std::fs::remove_dir_all(&state).ok();
     }
 
+    #[tokio::test]
+    async fn serve_in_sweeps_expired_archived_sessions_before_binding() {
+        let state = temporary_directory("retention");
+        let database = temporary_path("retention-state.db");
+        let (workspace_id, session_id) = archived_session_in(&database);
+
+        let options = ServerOptions {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: Some("retention-token".to_owned()),
+            persistence: Some(database.clone()),
+            archive_retention: Some("1ms".to_owned()),
+            ..ServerOptions::default()
+        };
+        serve_in(options, &state, async { Ok(()) }).await.unwrap();
+
+        // The startup sweep ran before the listener accepted clients, so the
+        // archived session is already gone from the durable database.
+        let backend = InProcessBackend::new_persistent(&database).unwrap();
+        let connection = backend.connect();
+        assert_eq!(
+            listed_sessions(&connection, workspace_id)
+                .iter()
+                .filter(|session| session.id == session_id)
+                .count(),
+            0
+        );
+        backend.shutdown().unwrap();
+        std::fs::remove_file(&database).ok();
+        std::fs::remove_file(database.with_extension("credentials.json")).ok();
+        std::fs::remove_dir_all(database.with_extension("session-roots")).ok();
+        std::fs::remove_dir_all(database.with_extension("clone-cache")).ok();
+        std::fs::remove_dir_all(&state).ok();
+    }
+
+    /// Negotiates the capabilities these tests use and returns the workspace's
+    /// sessions, including archived ones.
+    fn listed_sessions(
+        connection: &loom_server::InProcessConnection,
+        workspace_id: loom_core::WorkspaceId,
+    ) -> Vec<loom_core::AgentSessionSnapshot> {
+        use loom_core::{Capability, CapabilitySet};
+        use loom_protocol::{
+            CURRENT_PROTOCOL_VERSION, ClientRequest, ControlRequest, RequestEnvelope,
+            ServerResponse, SessionResponse, WorkspaceRequest,
+        };
+
+        let negotiated = connection.request(RequestEnvelope::new(ClientRequest::Control(
+            ControlRequest::Negotiate {
+                client_version: CURRENT_PROTOCOL_VERSION,
+                capabilities: CapabilitySet::new([
+                    Capability::ManageWorkspaces,
+                    Capability::CreateAgentSession,
+                    Capability::ControlAgentSession,
+                    Capability::ReadAgentSession,
+                ]),
+            },
+        )));
+        assert!(negotiated.result.is_ok(), "{:?}", negotiated.result);
+        match connection
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::ListWorkspaceSessions {
+                    workspace_id,
+                    include_archived: true,
+                },
+            )))
+            .result
+            .unwrap()
+        {
+            ServerResponse::Session(SessionResponse::AgentSessions { sessions }) => sessions,
+            response => panic!("unexpected session list response: {response:?}"),
+        }
+    }
+
+    /// Creates one archived session in the durable database at `path`, the way a
+    /// previous run would have left it.
+    fn archived_session_in(path: &Path) -> (loom_core::WorkspaceId, loom_core::AgentSessionId) {
+        use loom_core::{Capability, CapabilitySet};
+        use loom_protocol::{
+            CURRENT_PROTOCOL_VERSION, ClientRequest, ControlRequest, RequestEnvelope,
+            ServerResponse, SessionRequest, SessionResponse, WorkspaceRequest, WorkspaceResponse,
+        };
+
+        let backend = InProcessBackend::new_persistent(path).unwrap();
+        let connection = backend.connect();
+        let negotiated = connection.request(RequestEnvelope::new(ClientRequest::Control(
+            ControlRequest::Negotiate {
+                client_version: CURRENT_PROTOCOL_VERSION,
+                capabilities: CapabilitySet::new([
+                    Capability::ManageWorkspaces,
+                    Capability::CreateAgentSession,
+                    Capability::ControlAgentSession,
+                ]),
+            },
+        )));
+        assert!(negotiated.result.is_ok(), "{:?}", negotiated.result);
+        let workspace = match connection
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::CreateWorkspace {
+                    name: "Archive retention".to_owned(),
+                },
+            )))
+            .result
+            .unwrap()
+        {
+            ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+            response => panic!("unexpected workspace response: {response:?}"),
+        };
+        let session = match connection
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Archived".to_owned(),
+                },
+            )))
+            .result
+            .unwrap()
+        {
+            ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session,
+            response => panic!("unexpected session response: {response:?}"),
+        };
+        let archived = connection.request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::ArchiveAgentSession {
+                session_id: session.id,
+            },
+        )));
+        assert!(matches!(
+            archived.result,
+            Ok(ServerResponse::Session(
+                SessionResponse::AgentSessionArchived(_)
+            ))
+        ));
+        backend.shutdown().unwrap();
+        (workspace.id, session.id)
+    }
+
     #[test]
     fn reset_state_wipes_a_defaulted_database_and_needs_one_to_wipe() {
         let state = temporary_directory("reset");
@@ -1154,7 +1451,9 @@ mod tests {
     fn backend_selection_reports_errors_for_an_unusable_persistence_path() {
         let directory = temporary_path("state-dir");
         std::fs::create_dir_all(&directory).unwrap();
-        assert!(super::build_backend(Some(&directory)).is_err());
+        assert!(
+            super::build_backend(Some(&directory), ArchiveRetentionPolicy::disabled()).is_err()
+        );
         std::fs::remove_dir_all(directory).ok();
     }
 

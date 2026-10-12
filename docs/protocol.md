@@ -317,6 +317,13 @@ stable for that instance, and its display name includes the host name plus a
 short ID suffix so separate backend processes on one host remain distinguishable.
 Clients should render unavailable values as `n/a`.
 
+`GetArchiveRetentionPolicy` is read-only and returns
+`archive_retention_policy { retention_ms, force_discard_worktrees }`. It
+requires the `read_worker_node_status` capability. `retention_ms` is `null` or
+zero when retention is disabled. Automatic deletion is an internal backend
+operation rather than a client request: a client reads the active policy and
+observes the resulting session removals.
+
 Session-card indicators pulse smoothly only while CPU usage is above the
 workspace-configured threshold. The online color changes to red only after
 three consecutive 10-second status polls report both CPU and RAM above 90%;
@@ -327,6 +334,7 @@ The existing M1-M4 mutations remain the control surface:
 
 ```text
 CreateAgentSession / RenameAgentSession / ArchiveAgentSession
+DeleteAgentSession
 StartAgentRun / SendAgentMessage
 PauseAgentRun / ResumeAgentRun / InterruptAgentRun
 ApproveAgentAction / RejectAgentAction / RetryAgentStep
@@ -334,6 +342,17 @@ ApproveAgentAction / RejectAgentAction / RetryAgentStep
 
 `ArchiveAgentSession` interrupts a non-terminal run for the session before
 archiving it, so clients do not need to issue a separate interrupt request.
+
+`DeleteAgentSession { session_id, force }` deletes an archived session and
+returns `agent_session_deleted { session_id }`. It is a retryable mutation and
+requires the separate `delete_agent_session` capability. Only archived sessions
+can be deleted, and `Archived` is terminal: there is no restore or unarchive,
+so an archived session is immutable until it is deleted. Deleting a project
+root deletes every descendant session of that project in one operation, using
+the same project snapshot and cascade order as archiving. The `force` flag
+allows discarding a dirty or locked linked worktree that would otherwise
+refuse the deletion; without it, such a project is refused, and the caller
+decides whether to force it.
 
 Session and run snapshots must be sufficient to render the active
 conversation, plan, step state, tool calls, approvals, bounded output,

@@ -205,6 +205,26 @@ impl SessionManager {
         Ok((snapshot, record))
     }
 
+    /// Removes an archived session from the catalog and returns its final snapshot.
+    ///
+    /// The server persists the removal separately; no journal event is produced
+    /// here because the deletion itself is applied by the durable store.
+    pub fn remove(&mut self, session_id: AgentSessionId) -> Result<AgentSessionSnapshot> {
+        let snapshot = self
+            .sessions
+            .get(&session_id)
+            .ok_or_else(|| LoomError::not_found("agent session", session_id))?;
+        if snapshot.state != AgentSessionState::Archived {
+            return Err(LoomError::invalid_state(
+                "only archived agent sessions can be deleted",
+            ));
+        }
+        Ok(self
+            .sessions
+            .remove(&session_id)
+            .expect("checked agent session is present"))
+    }
+
     pub fn transition(
         &mut self,
         session_id: AgentSessionId,
@@ -404,5 +424,80 @@ mod tests {
             SessionEvent::AgentSessionArchived { session_id } if session_id == archived.id
         ));
         assert_eq!(manager.get(archived.id).unwrap(), archived);
+    }
+
+    #[test]
+    fn removal_requires_an_archived_session() {
+        let mut manager = SessionManager::default();
+        let (snapshot, _) = manager
+            .create_in_workspace(WorkspaceId::new(), "Delete candidate")
+            .unwrap();
+
+        let unknown = AgentSessionId::new();
+        assert_eq!(
+            manager.remove(unknown).unwrap_err().code,
+            loom_core::ErrorCode::NotFound
+        );
+        let active = manager.remove(snapshot.id).unwrap_err();
+        assert_eq!(active.code, loom_core::ErrorCode::InvalidState);
+        assert_eq!(
+            active.message,
+            "only archived agent sessions can be deleted"
+        );
+        assert_eq!(manager.session_count(), 1);
+
+        manager.archive(snapshot.id).unwrap();
+        let removed = manager.remove(snapshot.id).unwrap();
+        assert_eq!(removed.state, AgentSessionState::Archived);
+    }
+
+    #[test]
+    fn removal_drops_the_session_from_the_catalog() {
+        let workspace_id = WorkspaceId::new();
+        let mut manager = SessionManager::default();
+        let (deleted, _) = manager
+            .create_in_workspace(workspace_id, "Deleted")
+            .unwrap();
+        let (survivor, _) = manager
+            .create_in_workspace(workspace_id, "Survivor")
+            .unwrap();
+        manager.archive(deleted.id).unwrap();
+        let sequence_before = manager.next_sequence();
+
+        let removed = manager.remove(deleted.id).unwrap();
+
+        assert_eq!(removed.id, deleted.id);
+        assert_eq!(removed.state, AgentSessionState::Archived);
+        assert_eq!(
+            manager.get(deleted.id).unwrap_err().code,
+            loom_core::ErrorCode::NotFound
+        );
+        assert_eq!(manager.session_count(), 1);
+        assert_eq!(
+            manager.list_in_workspace(Some(workspace_id), true),
+            vec![survivor]
+        );
+        // Removal is not a journal event; the lifecycle sequence is unchanged.
+        assert_eq!(manager.next_sequence(), sequence_before);
+    }
+
+    #[test]
+    fn removal_round_trips_through_exported_state_without_the_session() {
+        let workspace_id = WorkspaceId::new();
+        let mut manager = SessionManager::default();
+        let (deleted, _) = manager
+            .create_in_workspace(workspace_id, "Deleted")
+            .unwrap();
+        let (survivor, _) = manager
+            .create_in_workspace(workspace_id, "Survivor")
+            .unwrap();
+        manager.archive(deleted.id).unwrap();
+        manager.remove(deleted.id).unwrap();
+
+        let restored = SessionManager::from_state(manager.export_state()).unwrap();
+
+        assert_eq!(restored.session_count(), 1);
+        assert_eq!(restored.get(survivor.id).unwrap(), survivor);
+        assert_eq!(restored.export_state(), manager.export_state());
     }
 }

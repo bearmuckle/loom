@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use loom_core::{ErrorCode, EventSequence, LoomError, Result, TaskId, TerminalId, Timestamp};
@@ -25,6 +25,7 @@ use portable_pty::{
 const DEFAULT_EVENT_LIMIT: usize = 1024;
 const DEFAULT_TASK_OUTPUT_LIMIT: usize = 64 * 1024;
 const MAX_OUTPUT_CHUNK: usize = 8 * 1024;
+const TASK_READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 struct TerminalState {
@@ -427,6 +428,7 @@ struct TaskHandle {
     id: TaskId,
     state: Mutex<TaskState>,
     child: Mutex<Option<Child>>,
+    readers: Mutex<Vec<thread::JoinHandle<()>>>,
     cancel_requested: AtomicBool,
     artifact_paths: Vec<String>,
     root: PathBuf,
@@ -545,6 +547,7 @@ impl TaskSupervisor {
                 output_limit,
             }),
             child: Mutex::new(Some(child)),
+            readers: Mutex::new(Vec::new()),
             cancel_requested: AtomicBool::new(false),
             artifact_paths: spec.artifact_paths,
             root: self.root.clone(),
@@ -566,8 +569,14 @@ impl TaskSupervisor {
             },
             |snapshot| snapshot.status = TaskStatus::Running,
         )?;
-        spawn_task_reader(Arc::clone(&handle), self.event_limit, stdout);
-        spawn_task_reader(Arc::clone(&handle), self.event_limit, stderr);
+        let readers = vec![
+            spawn_task_reader(Arc::clone(&handle), self.event_limit, stdout),
+            spawn_task_reader(Arc::clone(&handle), self.event_limit, stderr),
+        ];
+        *handle
+            .readers
+            .lock()
+            .map_err(|_| internal_lock_error("task readers"))? = readers;
         let event_limit = self.event_limit;
         thread::spawn({
             let handle = Arc::clone(&handle);
@@ -701,7 +710,7 @@ fn spawn_task_reader<R: Read + Send + 'static>(
     handle: Arc<TaskHandle>,
     event_limit: usize,
     reader: R,
-) {
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         let mut buffer = vec![0_u8; MAX_OUTPUT_CHUNK];
@@ -721,7 +730,34 @@ fn spawn_task_reader<R: Read + Send + 'static>(
             let chunk = String::from_utf8_lossy(&buffer[..read]).into_owned();
             let _ = append_task_output(&handle, event_limit, chunk);
         }
-    });
+    })
+}
+
+/// Waits for the stdout and stderr readers to reach EOF so the terminal
+/// snapshot contains all output. The wait is bounded because a task whose
+/// descendants keep the pipe write ends open never reaches EOF; in that case
+/// the readers are left running and their late appends still update the
+/// snapshot. No `state` or `child` lock is held while waiting.
+fn await_task_readers(handle: &TaskHandle) {
+    let readers = match handle.readers.lock() {
+        Ok(mut readers) => std::mem::take(&mut *readers),
+        Err(_) => return,
+    };
+    let deadline = Instant::now() + TASK_READER_DRAIN_TIMEOUT;
+    loop {
+        if readers.iter().all(thread::JoinHandle::is_finished) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    for reader in readers {
+        if reader.is_finished() {
+            let _ = reader.join();
+        }
+    }
 }
 
 fn append_task_output(handle: &TaskHandle, event_limit: usize, chunk: String) -> Result<()> {
@@ -777,6 +813,7 @@ fn wait_for_task(handle: Arc<TaskHandle>, event_limit: usize) {
         }
         thread::sleep(Duration::from_millis(10));
     };
+    await_task_readers(&handle);
     let cancelled = handle.cancel_requested.load(Ordering::SeqCst);
     let exit_code = status.and_then(|status| status.code());
     let task_status = if cancelled {
@@ -1153,21 +1190,15 @@ mod tests {
                 artifact_paths: Vec::new(),
             })
             .unwrap();
-        let mut completed_without_output = None;
         for _ in 0..100 {
             let current = supervisor.get(task.id).unwrap();
             if current.status == TaskStatus::Completed {
-                if current.output.contains(external.to_str().unwrap()) {
-                    fs::remove_dir_all(root).unwrap();
-                    fs::remove_dir_all(external).unwrap();
-                    return;
-                }
-                completed_without_output = Some(current);
+                assert!(current.output.contains(external.to_str().unwrap()));
+                fs::remove_dir_all(root).unwrap();
+                fs::remove_dir_all(external).unwrap();
+                return;
             }
             thread::sleep(Duration::from_millis(10));
-        }
-        if let Some(current) = completed_without_output {
-            assert!(current.output.contains(external.to_str().unwrap()));
         }
         panic!("task did not finish");
     }

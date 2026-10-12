@@ -282,6 +282,7 @@ impl LoomView {
             .project_tree_snapshots
             .iter()
             .chain(self.project_snapshot.iter())
+            .chain(self.archived_sessions.projects.iter())
         {
             if project.root_session_id == archived_id {
                 for agent in &project.agents {
@@ -311,6 +312,22 @@ impl LoomView {
                 .retain(|worktree| !removed.contains(&worktree.child_session_id));
         };
         self.project_tree_snapshots.retain_mut(|project| {
+            if removed.contains(&project.root_session_id) {
+                return false;
+            }
+            prune(project);
+            true
+        });
+        // The archived-session surface keeps its own copy of the entries and the
+        // project snapshots it groups them by, so a cascade that removed whole
+        // projects cannot leave stale rows behind there.
+        self.archived_sessions
+            .entries
+            .retain(|entry| !removed.contains(&entry.session.id));
+        self.archived_sessions
+            .force
+            .retain(|session_id| !removed.contains(session_id));
+        self.archived_sessions.projects.retain_mut(|project| {
             if removed.contains(&project.root_session_id) {
                 return false;
             }
@@ -532,16 +549,13 @@ impl LoomView {
                 // and the cursor ends at the later of the batch and the
                 // projection this rebuild started from.
                 self.apply_event_batch(events, fallback_latest_sequence);
-                if let Some(run) = fallback_projection
+                // The durable run projection is applied whether or not the
+                // batch produced timeline items. Suppressing it would drop the
+                // run's control state, the transcript page that rebuilds the
+                // conversation, and the run polling that keeps it streaming.
+                if let Some(projection) = fallback_projection
                     .as_ref()
-                    .and_then(|projection| projection.active_run.as_ref())
-                {
-                    self.seed_plan_from_projection(run);
-                }
-                if self.timeline.is_empty()
-                    && let Some(projection) = fallback_projection
-                        .as_ref()
-                        .and_then(|projection| projection.active_run.clone())
+                    .and_then(|projection| projection.active_run.clone())
                 {
                     self.apply_run_projection(projection);
                 }
@@ -557,26 +571,25 @@ impl LoomView {
                 self.active_session = session;
                 self.reset_projection();
                 self.apply_event_batch(events, Some(latest_sequence));
-                if let Some(run) = fallback_projection
+                // The durable run projection is applied whether or not the
+                // batch produced timeline items. Suppressing it would drop the
+                // run's control state, the transcript page that rebuilds the
+                // conversation, and the run polling that keeps it streaming.
+                if let Some(projection) = fallback_projection
                     .as_ref()
-                    .and_then(|projection| projection.active_run.as_ref())
-                {
-                    self.seed_plan_from_projection(run);
-                }
-                if self.timeline.is_empty()
-                    && let Some(projection) = fallback_projection
-                        .as_ref()
-                        .and_then(|projection| projection.active_run.clone())
+                    .and_then(|projection| projection.active_run.clone())
                 {
                     self.apply_run_projection(projection);
                 }
             }
             Err(error) => {
+                // The events request failed, so the durable projection is the
+                // only source of the run's control state and of the transcript
+                // page that rebuilds the conversation.
                 if let Some(projection) = fallback_projection
                     .as_ref()
                     .and_then(|projection| projection.active_run.clone())
                 {
-                    self.seed_plan_from_projection(&projection);
                     self.apply_run_projection(projection);
                 }
                 self.record_backend_error("load session events", error);

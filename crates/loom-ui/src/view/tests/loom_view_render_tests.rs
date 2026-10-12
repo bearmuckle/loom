@@ -391,14 +391,38 @@ fn nested_project_tree_selects_grandchild_session_by_click(cx: &mut TestAppConte
         // Projects with sub-agents start collapsed.
         assert!(window.find(("session-tree-root", 0usize)).visible());
         assert!(window.try_find(("session-tree-root", 1usize)).is_none());
-        // Expanding the project, then its agent, reveals the grandchild.
+        // Clicking the project name selects it without expanding its agents.
         window.click(("session-tree-root", 0usize), cx);
         window.render_frame(cx);
+        assert_eq!(view.read(cx).active_session.name, "Project");
+        assert!(
+            window.try_find(("session-tree-root", 1usize)).is_none(),
+            "selecting a project name must not expand its sub-agents"
+        );
+        // The chevron expands the project, then the agent, revealing the grandchild.
+        window.click(("session-tree-disclosure", 0usize), cx);
+        window.render_frame(cx);
         assert!(window.find(("session-tree-root", 1usize)).visible());
-        window.click(("session-tree-root", 1usize), cx);
+        window.click(("session-tree-disclosure", 1usize), cx);
         window.render_frame(cx);
         assert!(window.find(("session-tree-root", 2usize)).visible());
+        // A plain click on the deepest agent still selects it.
         window.click(("session-tree-root", 2usize), cx);
+        assert_eq!(view.read(cx).active_session.name, "Worker");
+        // Collapsing an ancestor of the active agent keeps it collapsed
+        // instead of forcing the selection back into view.
+        window.click(("session-tree-disclosure", 1usize), cx);
+        window.render_frame(cx);
+        assert!(window.try_find(("session-tree-root", 2usize)).is_none());
+        assert_eq!(
+            view.read(cx).active_session.name,
+            "Worker",
+            "a chevron toggle must not change the active session"
+        );
+        // Re-expanding reveals the selected agent again.
+        window.click(("session-tree-disclosure", 1usize), cx);
+        window.render_frame(cx);
+        assert!(window.find(("session-tree-root", 2usize)).visible());
         assert_eq!(view.read(cx).active_session.name, "Worker");
     })
     .unwrap();
@@ -3152,6 +3176,52 @@ fn phone_composer_reserves_space_for_the_on_screen_keyboard(cx: &mut TestAppCont
             send.bottom() <= visible.bottom(),
             "send action is hidden behind the keyboard: {send:?} vs {visible:?}"
         );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn phone_tap_on_composer_field_padding_focuses_the_composer(cx: &mut TestAppContext) {
+    use gpui_kit::Focusable as _;
+
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(390.), px(844.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view
+    });
+    cx.update_window(handle.into(), |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        window.render_frame(cx);
+        // The view focuses the composer as soon as it creates it, so focus has
+        // to move away first for the tap to be the cause of the refocus.
+        view.update(cx, |view, cx| {
+            if let Some(filter) = view.session_filter_input.clone() {
+                filter.update(cx, |state, cx| state.focus(window, cx));
+            }
+        });
+        window.render_frame(cx);
+        view.update(cx, |view, cx| {
+            let input = view.composer_input.clone().expect("composer input");
+            assert!(!input.read(cx).focus_handle(cx).is_focused(window));
+        });
+        // (4, 4) is inside the `composer-field` wrapper's `p_3` padding but
+        // outside the `Textarea` bounds, so only the wrapper handler can
+        // route focus back into the composer.
+        window.click_at("composer-field", gpui_kit::point(px(4.), px(4.)), cx);
+        window.render_frame(cx);
+        view.update(cx, |view, cx| {
+            let input = view.composer_input.clone().expect("composer input");
+            assert!(
+                input.read(cx).focus_handle(cx).is_focused(window),
+                "a tap on the composer field's padding should focus the field"
+            );
+        });
+        window.input("hi", cx);
+        view.update(cx, |view, cx| {
+            let input = view.composer_input.clone().expect("composer input");
+            assert_eq!(input.read(cx).value().to_string(), "hi");
+        });
     })
     .unwrap();
 }
