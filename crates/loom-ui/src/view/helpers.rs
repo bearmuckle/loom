@@ -34,6 +34,39 @@ pub(crate) fn responsive_layout(width: Pixels) -> ResponsiveLayout {
 /// stays usable with a finger instead of a pointer.
 pub(crate) const PHONE_TOUCH_TARGET: Pixels = px(44.);
 
+/// The project name's pixel size in the pane, which is `0.8125rem` at the
+/// compact base of 14 that predates the current default base.
+const PROJECT_ROW_FONT_SIZE_PX: f32 = 0.8125 * 14.;
+
+/// The smallest square kept for an icon-only action in the projects pane header
+/// on layouts that are not phone-sized. The three actions there are bare glyphs,
+/// and a phone in landscape, or a tablet, reports a desktop width, so the square
+/// stays comfortable for a finger instead of shrinking to the text-row size.
+const PANE_ACTION_MIN_SIZE: Pixels = px(32.);
+
+/// A short context label for the source a project's files come from.
+///
+/// A clone URL becomes `owner/repository` and a local folder becomes its last
+/// two path segments, so the second line of a project row says where the
+/// project lives without growing unboundedly.
+pub(crate) fn source_context_label(source: &str) -> String {
+    let trimmed = source.trim().trim_end_matches(['/', '\\']);
+    let without_git_suffix = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    // Drop the scheme and host of a URL, so only the repository path remains.
+    let path = without_git_suffix
+        .split_once("://")
+        .map_or(without_git_suffix, |(_, path)| path);
+    let segments = path
+        .split(['/', '\\', ':'])
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    match segments.as_slice() {
+        [] => "Unknown source".to_owned(),
+        [only] => (*only).to_owned(),
+        [.., parent, name] => format!("{parent}/{name}"),
+    }
+}
+
 impl ResponsiveLayout {
     /// The interactive control height for this layout.
     pub(crate) fn control_size(self) -> Pixels {
@@ -55,6 +88,36 @@ impl ResponsiveLayout {
             gpui_kit::rems(14. / BASE_FONT_SIZE)
         } else {
             gpui_kit::rems(0.8125)
+        }
+    }
+
+    /// The square hit box for an icon-only action in the projects pane header.
+    ///
+    /// Each of those actions shows only a glyph, so the square around the icon
+    /// is what a user aims at. The square is applied to the control itself, not
+    /// to the glyph, so the whole square reacts to a tap. Phone layouts use the
+    /// finger-sized target; wider layouts keep a smaller but still touchable
+    /// square.
+    pub(crate) fn pane_action_size(self) -> Pixels {
+        if self.phone {
+            PHONE_TOUCH_TARGET
+        } else {
+            self.control_size().max(PANE_ACTION_MIN_SIZE)
+        }
+    }
+
+    /// The font size for a project name in the side pane.
+    ///
+    /// The default UI base is 5% larger than the compact base it replaced, so
+    /// the project name is held at the pixel size it had before that change:
+    /// the larger default applies to the rest of the interface, not to the
+    /// pane's project names. The phone row already pins its label to 14px, so
+    /// it needs no adjustment.
+    pub(crate) fn project_row_font_size(self) -> gpui_kit::Rems {
+        if self.phone {
+            self.nav_row_font_size()
+        } else {
+            gpui_kit::rems(PROJECT_ROW_FONT_SIZE_PX / BASE_FONT_SIZE)
         }
     }
 }
@@ -2527,6 +2590,22 @@ pub(crate) fn initial_worker_nodes(
 mod tests {
     use super::*;
     use loom_protocol::WorkspaceChangeKind;
+
+    #[test]
+    fn source_labels_stay_short_and_name_the_owner() {
+        assert_eq!(
+            source_context_label("https://github.com/bearmuckle/loom.git"),
+            "bearmuckle/loom"
+        );
+        assert_eq!(
+            source_context_label("git@github.com:bearmuckle/loom.git"),
+            "bearmuckle/loom"
+        );
+        assert_eq!(source_context_label("/home/bjorn/src/loom"), "src/loom");
+        assert_eq!(source_context_label("/srv/project/"), "srv/project");
+        assert_eq!(source_context_label("loom"), "loom");
+        assert_eq!(source_context_label("   "), "Unknown source");
+    }
 
     #[test]
     fn relative_time_buckets() {

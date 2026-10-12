@@ -349,19 +349,31 @@ impl LoomView {
         removed.contains(&self.active_session.id)
     }
 
+    /// Dismisses every surface that covers the conversation.
+    ///
+    /// Navigating to a project always returns to the conversation, including
+    /// when the project is already the active one: otherwise a click on the
+    /// open project looks like it did nothing while Settings, the new-project
+    /// pane, the archived-sessions surface, or the GitHub login pane is in
+    /// front of it and the user has to close it by hand first.
+    pub(crate) fn dismiss_surfaces(&mut self) {
+        self.settings_open = false;
+        self.source_dialog = None;
+        self.github_login = None;
+        self.archived_sessions.open = false;
+        self.session_drawer_open = false;
+    }
+
     pub(crate) fn select_session(&mut self, session: AgentSessionSnapshot, cx: &mut Context<Self>) {
         if let Err(error) = self.backend_for_session(session.id) {
             self.record_backend_error("select session", error);
             cx.notify();
             return;
         }
-        self.github_login = None;
-        self.source_dialog = None;
-        self.settings_open = false;
+        self.dismiss_surfaces();
         self.status_banner = None;
         self.review.open = false;
         self.project_child_review = None;
-        self.session_drawer_open = false;
         let project_context = self.project_snapshot.clone().filter(|snapshot| {
             snapshot
                 .agents
@@ -606,6 +618,132 @@ impl LoomView {
         self.refresh_review(cx);
         self.refresh_active_project_snapshot(cx);
         cx.notify();
+    }
+
+    /// The most projects whose source is looked up in one refresh, so opening
+    /// the client does not issue a request per project at once.
+    pub(crate) const SESSION_SOURCE_LOOKUPS_PER_REFRESH: usize = 6;
+
+    /// Remembers the active project's main source from the sources its session
+    /// load just refreshed, so opening a project fills its row's second line.
+    pub(crate) fn remember_active_session_source(&mut self) {
+        let label = self
+            .session_repositories
+            .first()
+            .map(|repository| source_context_label(&repository.source))
+            .or_else(|| {
+                self.session_directories
+                    .first()
+                    .map(|directory| source_context_label(&directory.source))
+            });
+        let session_id = self.active_session.id;
+        match label {
+            Some(label) => {
+                self.session_sources.insert(session_id, label);
+            }
+            None => {
+                self.session_sources.remove(&session_id);
+            }
+        }
+    }
+
+    /// Records a source reported by a per-session lookup.
+    ///
+    /// A repository outranks a folder, and the label is only set once one of
+    /// the two answers is known, so the responses may arrive in either order.
+    pub(crate) fn record_session_source_candidate(
+        &mut self,
+        session_id: AgentSessionId,
+        repository: Option<String>,
+        directory: Option<String>,
+    ) {
+        let candidate = self
+            .session_source_lookups
+            .entry(session_id)
+            .or_insert_with(|| (None, None));
+        if let Some(repository) = repository {
+            candidate.0 = Some(repository);
+        }
+        if let Some(directory) = directory {
+            candidate.1 = Some(directory);
+        }
+        if let Some(label) = candidate.0.clone().or_else(|| candidate.1.clone()) {
+            self.session_sources.insert(session_id, label);
+        }
+    }
+
+    /// Asks the backend where each project without a known source came from, so
+    /// a project row can show its main source without the project being opened.
+    /// Every project is asked at most once, and the fan-out per refresh is
+    /// bounded.
+    pub(crate) fn refresh_session_source_labels(&mut self, cx: &mut Context<Self>) {
+        for session_id in self.session_source_lookup_candidates() {
+            self.session_source_lookups.insert(session_id, (None, None));
+            self.dispatch(
+                cx,
+                ClientRequest::Repository(RepositoryRequest::ListSessionRepositories {
+                    session_id,
+                }),
+                move |view, response, _| {
+                    if let Ok(ServerResponse::Repository(
+                        RepositoryResponse::SessionRepositories { repositories },
+                    )) = response.result
+                    {
+                        view.record_session_source_candidate(
+                            session_id,
+                            repositories
+                                .first()
+                                .map(|repository| repository.source.clone()),
+                            None,
+                        );
+                    }
+                },
+            );
+            self.dispatch(
+                cx,
+                ClientRequest::Filesystem(FilesystemRequest::ListSessionDirectories { session_id }),
+                move |view, response, _| {
+                    if let Ok(ServerResponse::Filesystem(
+                        FilesystemResponse::SessionDirectories { directories },
+                    )) = response.result
+                    {
+                        view.record_session_source_candidate(
+                            session_id,
+                            None,
+                            directories
+                                .first()
+                                .map(|directory| directory.source.clone()),
+                        );
+                    }
+                },
+            );
+        }
+    }
+
+    /// Projects whose main source is still unknown, in list order and bounded
+    /// per refresh. A delegated agent is skipped: it appears under its
+    /// project's own row, which carries the project's source.
+    fn session_source_lookup_candidates(&self) -> Vec<AgentSessionId> {
+        self.sessions
+            .iter()
+            .filter(|session| !self.session_sources.contains_key(&session.id))
+            .filter(|session| !self.session_source_lookups.contains_key(&session.id))
+            .filter(|session| !self.session_is_project_child(session.id))
+            .take(Self::SESSION_SOURCE_LOOKUPS_PER_REFRESH)
+            .map(|session| session.id)
+            .collect()
+    }
+
+    /// Whether a known project lists this session as one of its delegated
+    /// agents rather than as its root.
+    fn session_is_project_child(&self, session_id: AgentSessionId) -> bool {
+        self.project_tree_snapshots.iter().any(|project| {
+            project.root_session_id != session_id
+                && project
+                    .agents
+                    .iter()
+                    .any(|agent| agent.session_id == session_id)
+        })
     }
 
     pub(crate) fn new_session(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {

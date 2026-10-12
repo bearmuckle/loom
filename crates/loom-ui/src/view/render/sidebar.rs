@@ -11,13 +11,9 @@ impl LoomView {
         Button::new("new-session")
             .icon(Icon::new(IconName::Plus))
             .ghost()
-            .when(layout.phone, |button| {
-                button
-                    .large()
-                    .h(layout.control_size())
-                    .w(layout.control_size())
-            })
-            .when(!layout.phone, |button| button.small())
+            .when(layout.phone, |button| button.large())
+            .h(layout.pane_action_size())
+            .w(layout.pane_action_size())
             .accessibility_label("New project")
             .on_click(cx.listener(Self::new_session))
             .into_any_element()
@@ -33,13 +29,9 @@ impl LoomView {
         Button::new("archived-sessions")
             .icon(Icon::new(AssetIconName::Archive))
             .ghost()
-            .when(layout.phone, |button| {
-                button
-                    .large()
-                    .h(layout.control_size())
-                    .w(layout.control_size())
-            })
-            .when(!layout.phone, |button| button.small())
+            .when(layout.phone, |button| button.large())
+            .h(layout.pane_action_size())
+            .w(layout.pane_action_size())
             .accessibility_label("Archived sessions")
             .tooltip("Archived sessions")
             .on_click(cx.listener(|view, _, _, cx| {
@@ -316,6 +308,9 @@ impl LoomView {
         let menu_sessions = sessions.clone();
         let menu_view = view.clone();
         let menu_project = self.project_snapshot.clone();
+        // The main source of every project, shown as the second line of a
+        // project row. Cloned because the row closure cannot borrow the view.
+        let source_labels = self.session_sources.clone();
         // Shared so the per-row overflow menu can build the session context
         // menu lazily without cloning the project snapshot every frame.
         let row_project = std::rc::Rc::new(self.project_snapshot.clone());
@@ -377,12 +372,62 @@ impl LoomView {
                     // drawer even when the session is already active.
                     this.session_drawer_open = false;
                     // Re-selecting the session already on screen would reload and
-                    // briefly blank the conversation.
+                    // briefly blank the conversation. It must still dismiss
+                    // whatever covers the conversation; otherwise a click on the
+                    // open project looks like it did nothing while Settings or
+                    // the new-project pane is in front of it.
                     if this.active_session.id != select_session.id {
                         this.select_session(select_session.clone(), cx);
+                    } else {
+                        this.dismiss_surfaces();
                     }
                     cx.notify();
                 });
+            };
+            // A project row carries two lines: its name and the main source it
+            // was created from, so the list says where each project lives
+            // without opening it. Child rows keep the single-line label.
+            let label_element = if is_root {
+                let mut label_column = div().flex_1().min_w(px(0.)).flex().flex_col().child(
+                    div()
+                        .id(("session-tree-label", row_index))
+                        .test_support()
+                        .aria_label(label.clone())
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_size(layout.project_row_font_size())
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(label_color)
+                        .child(label),
+                );
+                let context = source_labels.get(&session.id).cloned().unwrap_or_else(|| {
+                    format!(
+                        "updated {}",
+                        relative_time(
+                            session.updated_at.as_unix_millis(),
+                            Timestamp::now().as_unix_millis()
+                        )
+                    )
+                });
+                label_column = label_column.child(
+                    div()
+                        .id(("session-tree-source", row_index))
+                        .test_support()
+                        .aria_label(context.clone())
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_xs()
+                        .text_color(rgb(0x8f98a6))
+                        .child(context),
+                );
+                label_column
+            } else {
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_color(label_color)
+                    .child(label)
             };
             let row_content = div()
                 .flex_1()
@@ -414,15 +459,7 @@ impl LoomView {
                         .flex_shrink_0()
                         .text_color(icon_color),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.))
-                        .truncate()
-                        .text_color(label_color)
-                        .when(is_root, |element| element.font_weight(FontWeight::SEMIBOLD))
-                        .child(label),
-                )
+                .child(label_element)
                 .child(
                     div()
                         .flex()
@@ -595,13 +632,9 @@ impl LoomView {
                                 Button::new("settings-button")
                                     .icon(Icon::new(IconName::Settings))
                                     .ghost()
-                                    .when(layout.phone, |button| {
-                                        button
-                                            .large()
-                                            .h(layout.control_size())
-                                            .w(layout.control_size())
-                                    })
-                                    .when(!layout.phone, |button| button.small())
+                                    .when(layout.phone, |button| button.large())
+                                    .h(layout.pane_action_size())
+                                    .w(layout.pane_action_size())
                                     .accessibility_label("Settings")
                                     .on_click({
                                         let view = view.clone();
