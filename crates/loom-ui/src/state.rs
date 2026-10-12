@@ -164,6 +164,24 @@ pub(crate) struct ReviewState {
     pub(crate) files: FilesState,
 }
 
+/// A path a patch header line can carry.
+///
+/// Git allows control characters in file names, but a header cannot hold them:
+/// a newline ends the line and a tab ends the parsed path. Header text is only
+/// structure for this pane, which never shows it, so replacing the character is
+/// enough to keep the patch readable.
+fn patch_header_path(path: &str) -> String {
+    path.chars()
+        .map(|character| {
+            if character.is_control() {
+                '?'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 /// Rebuilds a unified patch from the typed hunks.
 ///
 /// The diff surface and the copy action share this text, so what the reviewer
@@ -179,11 +197,16 @@ pub(crate) struct ReviewState {
 /// section's file and opens a new one, which is also what keeps the text
 /// parseable: the parser rejects unordered or overlapping hunks.
 pub(crate) fn review_patch_text(diff: &GitDiff) -> String {
-    let path = diff.path.as_deref().unwrap_or_default();
+    // A path-less diff names its sections after their position instead. The
+    // surface resolves a file by path, and one path shared by every section
+    // would make each lookup after the first act on the first section: fold
+    // disclosures and gutter selection would jump to, or copy, the wrong one.
+    let path = diff.path.as_deref().filter(|path| !path.is_empty());
     let mut patch = String::new();
     // The highest line number each side has used in the open section.
     let mut old_used = 0usize;
     let mut new_used = 0usize;
+    let mut sections = 0usize;
     let mut section_open = false;
     for hunk in &diff.hunks {
         let mut body = String::new();
@@ -216,7 +239,12 @@ pub(crate) fn review_patch_text(diff: &GitDiff) -> String {
         let unordered =
             (old_lines > 0 && old_start <= old_used) || (new_lines > 0 && new_start <= new_used);
         if !section_open || unordered {
-            patch.push_str(&format!("--- a/{path}\n+++ b/{path}\n"));
+            let name = match path {
+                Some(path) => patch_header_path(path),
+                None => format!("section-{}", sections + 1),
+            };
+            sections += 1;
+            patch.push_str(&format!("--- a/{name}\n+++ b/{name}\n"));
             old_used = 0;
             new_used = 0;
             section_open = true;
@@ -242,18 +270,22 @@ impl ReviewState {
     /// so it can end mid-line, while [`review_patch_text`] always ends on a
     /// line boundary and matches the lines the hunks actually retained.
     pub(crate) fn show_diff(&mut self, diff: GitDiff, cx: &mut impl AppContext) {
-        let files = if diff.hunks.is_empty() {
-            Vec::new()
-        } else {
+        // A patch this pane cannot read is a defect in the patch it was given,
+        // not something to explain to the reviewer: the pane keeps its own copy
+        // for a diff with nothing to show, and the log records the cause.
+        let mut diff_view = None;
+        if !diff.hunks.is_empty() {
             match DiffFile::parse(&review_patch_text(&diff)) {
-                Ok(files) => files,
+                Ok(files) if !files.is_empty() => {
+                    diff_view = Some(cx.new(|cx| DiffState::new(files, cx)));
+                }
+                Ok(_) => {}
                 Err(error) => {
                     log::warn!("could not parse the review patch for the diff surface: {error}");
-                    Vec::new()
                 }
             }
-        };
-        self.diff_view = (!files.is_empty()).then(|| cx.new(|cx| DiffState::new(files, cx)));
+        }
+        self.diff_view = diff_view;
         self.selected_diff = Some(diff);
         self.loading_diff = false;
         self.diff_error = None;
@@ -1202,7 +1234,9 @@ mod tests {
         assert_eq!(files, vec![("src/lib.rs".to_owned(), 3, 1)]);
 
         // A whole-checkout diff concatenates files, so the surface holds one
-        // entry per changed file.
+        // entry per changed file. Sections carry distinct paths because the
+        // surface resolves a file by path: one shared path would make fold
+        // disclosures and gutter selection act on the first section.
         review.show_diff(
             GitDiff {
                 path: None,
@@ -1255,10 +1289,16 @@ mod tests {
                 state
                     .files()
                     .iter()
-                    .map(|file| (file.additions(), file.deletions()))
+                    .map(|file| (file.path().to_string(), file.additions(), file.deletions()))
                     .collect::<Vec<_>>()
             });
-        assert_eq!(files, vec![(1, 1), (0, 1)]);
+        assert_eq!(
+            files,
+            vec![
+                ("section-1".to_owned(), 1, 1),
+                ("section-2".to_owned(), 0, 1)
+            ]
+        );
 
         // A selection with nothing to show builds no surface, so the pane keeps
         // its own copy for the empty case.
@@ -1275,9 +1315,46 @@ mod tests {
         );
         assert!(review.diff_view.is_none());
         assert!(review.selected_diff.is_some());
+        // An empty diff is not an error: the pane says there are no line
+        // changes instead.
+        assert!(review.diff_error.is_none());
         review.clear_diff();
         assert!(review.diff_view.is_none());
         assert!(review.selected_diff.is_none());
+    }
+
+    #[gpui_kit::test]
+    fn show_diff_stays_quiet_about_a_patch_it_cannot_read(cx: &mut TestAppContext) {
+        let mut review = ReviewState::default();
+        // A hunk that starts at line zero with content cannot be expressed as a
+        // patch header, so the surface cannot be built from it.
+        review.show_diff(
+            GitDiff {
+                path: Some("src/lib.rs".to_owned()),
+                staged: false,
+                patch: String::new(),
+                binary: false,
+                truncated: false,
+                hunks: vec![GitDiffHunk {
+                    old_start: 0,
+                    old_lines: 1,
+                    new_start: 0,
+                    new_lines: 1,
+                    lines: vec![GitDiffLine {
+                        kind: GitDiffLineKind::Removed,
+                        old_line: Some(1),
+                        new_line: None,
+                        content: "gone".to_owned(),
+                    }],
+                }],
+            },
+            cx,
+        );
+        // The pane keeps its own copy; nothing about the patch reaches the
+        // reviewer through this state.
+        assert!(review.diff_view.is_none());
+        assert!(review.selected_diff.is_some());
+        assert!(review.diff_error.is_none());
     }
 
     #[test]
@@ -1354,6 +1431,35 @@ mod tests {
     }
 
     #[test]
+    fn patch_text_replaces_characters_a_header_cannot_carry() {
+        // A newline in a file name would end the header line and leave the
+        // modified side missing, and a tab would end the parsed path.
+        let diff = GitDiff {
+            path: Some("src/a\tb\nc.rs".to_owned()),
+            staged: false,
+            patch: String::new(),
+            binary: false,
+            truncated: false,
+            hunks: vec![GitDiffHunk {
+                old_start: 3,
+                old_lines: 1,
+                new_start: 3,
+                new_lines: 1,
+                lines: vec![GitDiffLine {
+                    kind: GitDiffLineKind::Added,
+                    old_line: None,
+                    new_line: Some(3),
+                    content: "line".to_owned(),
+                }],
+            }],
+        };
+        assert_eq!(
+            review_patch_text(&diff),
+            "--- a/src/a?b?c.rs\n+++ b/src/a?b?c.rs\n@@ -3,0 +3,1 @@\n+line\n"
+        );
+    }
+
+    #[test]
     fn patch_text_starts_a_section_for_a_hunk_that_cannot_continue_the_file() {
         // A whole-checkout diff concatenates files without a path per file, so a
         // hunk that restarts below the open section's lines opens a new one and
@@ -1401,8 +1507,8 @@ mod tests {
         };
         assert_eq!(
             review_patch_text(&diff),
-            "--- a/\n+++ b/\n@@ -30,1 +30,1 @@\n-old first file\n+new first file\n\
-             --- a/\n+++ b/\n@@ -1,0 +1,1 @@\n+second file\n"
+            "--- a/section-1\n+++ b/section-1\n@@ -30,1 +30,1 @@\n-old first file\n+new first file\n\
+             --- a/section-2\n+++ b/section-2\n@@ -1,0 +1,1 @@\n+second file\n"
         );
     }
 
