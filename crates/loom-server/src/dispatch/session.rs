@@ -43,7 +43,7 @@ impl InProcessConnection {
                 self.archive_session(session_id)
             }
             ClientRequest::Session(SessionRequest::DeleteAgentSession { session_id, force }) => {
-                self.delete_archived_session(session_id, force)
+                self.delete_agent_session(session_id, force)
             }
             ClientRequest::Session(SessionRequest::ForkAgentSession { session_id, name }) => {
                 let source = self.backend.sessions()?.get(session_id)?;

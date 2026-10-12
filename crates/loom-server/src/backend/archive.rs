@@ -15,34 +15,31 @@ impl InProcessBackend {
 
     /// Permanently removes archived agent sessions and their stored history.
     ///
-    /// A request that targets an archived project root cascades to its whole
-    /// archived hierarchy after every child task is terminal. Worktrees are
-    /// removed deepest-first before any row or filesystem root is touched, so a
-    /// dirty or locked checkout aborts the request without changing state. The
-    /// archive gate keeps this mutually exclusive with the retention sweep.
-    pub(crate) fn delete_archived_session(
+    /// A request that targets a project root cascades to its whole hierarchy,
+    /// archived or not, once every child task is terminal and no session being
+    /// deleted has a live run; the caller cancels a live project before this
+    /// runs, so a project never has to finish first. Worktrees are removed
+    /// deepest-first before any row or filesystem root is touched, so a dirty or
+    /// locked checkout aborts the request without changing state. The archive
+    /// gate keeps this mutually exclusive with the retention sweep.
+    pub(crate) fn delete_agent_session(
         &self,
         session_id: AgentSessionId,
         force: bool,
     ) -> Result<ServerResponse> {
         let _gate = self.archive_gate()?;
-        let (_, response) = self.delete_archived_session_locked(session_id, force)?;
+        let (_, response) = self.delete_agent_session_locked(session_id, force)?;
         Ok(response)
     }
 
-    /// [`InProcessBackend::delete_archived_session`] assuming the archive gate
-    /// is already held, reporting the sessions it removed.
-    fn delete_archived_session_locked(
+    /// [`InProcessBackend::delete_agent_session`] assuming the archive gate is
+    /// already held, reporting the sessions it removed.
+    fn delete_agent_session_locked(
         &self,
         session_id: AgentSessionId,
         force: bool,
     ) -> Result<(BTreeSet<AgentSessionId>, ServerResponse)> {
         let session = self.sessions()?.get(session_id)?;
-        if session.state != AgentSessionState::Archived {
-            return Err(LoomError::invalid_state(
-                "only archived agent sessions can be deleted",
-            ));
-        }
         let project = match &self.persistence {
             Some(persistence) => persistence.load_project_snapshot_for_session(session_id)?,
             None => {
@@ -55,34 +52,35 @@ impl InProcessBackend {
                 None
             }
         };
+        // A project root is the only session that may be deleted without being
+        // archived, because its live work is cancelled before this runs. Every
+        // other session, including a project descendant, must be archived. A
+        // session is trivially a one-member project of its own, so a root is a
+        // project root only when it owns another member or a delegated task.
+        let project_root = project.as_ref().filter(|project| {
+            project.root_session_id == session_id
+                && (project.agents.len() > 1 || !project.tasks.is_empty())
+        });
+        if project_root.is_none() && session.state != AgentSessionState::Archived {
+            return Err(LoomError::invalid_state(
+                "only archived agent sessions can be deleted",
+            ));
+        }
         let mut deleted_sessions = BTreeMap::from([(session_id, session.workspace_id)]);
-        if let Some(project) = &project
-            && project.root_session_id == session_id
-        {
-            // Validate every descendant before mutating anything, so a
-            // rejected child cannot leave a partially deleted project tree
-            // behind.
+        if let Some(project) = project_root {
+            // Validate every child task before mutating anything, so a rejected
+            // project cannot leave a partially deleted tree behind. A project
+            // whose caller did not cancel it first refuses here while any task
+            // is still queued, blocked, running, or otherwise unsettled.
             let unfinished_tasks = project
                 .tasks
                 .iter()
                 .filter(|task| !delegated_task_is_terminal(task.status))
                 .map(|task| format!("{} ({:?})", task.child_name, task.status))
                 .collect::<Vec<_>>();
-            let mut not_archived = Vec::new();
-            for agent in &project.agents {
-                if agent.session_id == session_id {
-                    continue;
-                }
-                let child = self.sessions()?.get(agent.session_id)?;
-                if child.state == AgentSessionState::Archived {
-                    deleted_sessions.insert(child.id, child.workspace_id);
-                } else {
-                    not_archived.push(format!("{} ({:?})", child.id, child.state));
-                }
-            }
-            if !unfinished_tasks.is_empty() || !not_archived.is_empty() {
+            if !unfinished_tasks.is_empty() {
                 log::warn!(
-                    "[loom-server] refusing to delete project root {session_id}: unfinished child tasks {unfinished_tasks:?}, non-archived child sessions {not_archived:?}"
+                    "[loom-server] refusing to delete project root {session_id}: unfinished child tasks {unfinished_tasks:?}"
                 );
                 return Err(LoomError::new(
                     ErrorCode::InvalidState,
@@ -90,12 +88,35 @@ impl InProcessBackend {
                     false,
                 ));
             }
+            // The whole tree is one unit, so every descendant is deleted with
+            // its root whatever state it is in.
+            for agent in &project.agents {
+                if agent.session_id == session_id {
+                    continue;
+                }
+                let child = self.sessions()?.get(agent.session_id)?;
+                deleted_sessions.insert(child.id, child.workspace_id);
+            }
             log::info!(
                 "[loom-server] deleting project root {session_id} with {} descendant session(s)",
                 deleted_sessions.len().saturating_sub(1)
             );
         }
         let deleted_ids = deleted_sessions.keys().copied().collect::<BTreeSet<_>>();
+        // A run that is still live would keep writing the state this deletion
+        // drops, so every session being deleted must be free of runs that are
+        // neither completed, failed, nor cancelled, in memory or in its durable
+        // checkpoint. A cancelled project satisfies this because its cascade
+        // interrupted each run first.
+        let live_runs = self.non_terminal_runs_of_sessions(&deleted_ids)?;
+        if !live_runs.is_empty() {
+            log::warn!(
+                "[loom-server] refusing to delete session {session_id}: non-terminal runs {live_runs:?}"
+            );
+            return Err(LoomError::invalid_state(
+                "stop or cancel every run of this session before deleting it",
+            ));
+        }
         // Remove the checkouts of every worktree that belongs to a deleted
         // session, deepest-first, so a parent checkout is never removed before
         // a worktree that lives under it.
@@ -162,6 +183,25 @@ impl InProcessBackend {
                 }
             }
         }
+        // The session catalog only releases an archived session, so a live
+        // project tree is archived in memory first. Its rows are removed below
+        // and its journal records are purged with the rest of the session, so
+        // the archive state never becomes durable; the run guard above already
+        // proved that none of these sessions has live work.
+        for id in &deleted_ids {
+            let record = {
+                let mut sessions = self.sessions()?;
+                if sessions.get(*id)?.state == AgentSessionState::Archived {
+                    None
+                } else {
+                    let (_, record) = sessions.transition(*id, AgentSessionState::Archived)?;
+                    Some(record)
+                }
+            };
+            if let Some(record) = record {
+                self.journal()?.append_session(record);
+            }
+        }
         // Drop every in-memory trace before the durable rows, so neither the
         // state save that follows this request nor a later request can observe
         // or re-insert a deleted session.
@@ -208,6 +248,48 @@ impl InProcessBackend {
             deleted_ids,
             ServerResponse::Session(SessionResponse::AgentSessionDeleted { session_id }),
         ))
+    }
+
+    /// The non-terminal runs of the given sessions, loaded or persisted.
+    ///
+    /// A run is reported once: the in-memory state wins over the durable
+    /// checkpoint, because a run that was interrupted in this process has not
+    /// necessarily written its last checkpoint yet.
+    fn non_terminal_runs_of_sessions(
+        &self,
+        sessions: &BTreeSet<AgentSessionId>,
+    ) -> Result<Vec<String>> {
+        let mut live = Vec::new();
+        let loaded = {
+            let runs = self.runs()?;
+            runs.iter()
+                .filter(|(_, handle)| sessions.contains(&handle.session_id))
+                .map(|(run_id, handle)| (*run_id, handle.snapshot().state))
+                .collect::<BTreeMap<_, _>>()
+        };
+        for (run_id, state) in &loaded {
+            if !is_terminal_agent_run_state(*state) {
+                live.push(format!("{run_id} ({state:?})"));
+            }
+        }
+        if let Some(persistence) = &self.persistence {
+            for session_id in sessions {
+                let Some(summary) = persistence.load_latest_run_summary_for_session(*session_id)?
+                else {
+                    continue;
+                };
+                if loaded.contains_key(&summary.snapshot.id)
+                    || is_terminal_agent_run_state(summary.snapshot.state)
+                {
+                    continue;
+                }
+                live.push(format!(
+                    "{} ({:?})",
+                    summary.snapshot.id, summary.snapshot.state
+                ));
+            }
+        }
+        Ok(live)
     }
 
     /// Discards archived sessions and fully archived project trees whose archive
@@ -291,7 +373,7 @@ impl InProcessBackend {
                 });
                 continue;
             }
-            match self.delete_archived_session_locked(session_id, force) {
+            match self.delete_agent_session_locked(session_id, force) {
                 Ok((removed, _)) => {
                     deleted.extend(removed.iter().copied());
                     report.deleted_sessions.extend(removed);
