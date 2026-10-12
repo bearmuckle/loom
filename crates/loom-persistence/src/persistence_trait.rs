@@ -3,6 +3,7 @@ use std::sync::Arc;
 use super::*;
 
 pub trait CatalogRepository: Send + Sync {
+    fn load_archive_retention_policy(&self) -> Result<Option<DurableArchiveRetentionPolicy>>;
     fn load_idempotency_records(&self) -> Result<BTreeMap<RequestId, DurableIdempotencyRecord>>;
     fn load_provider_configs(&self) -> Result<Vec<ProviderConfig>>;
     fn load_provider_health(&self) -> Result<BTreeMap<ProviderId, ProviderHealth>>;
@@ -16,6 +17,9 @@ pub trait CatalogRepository: Send + Sync {
 }
 
 impl CatalogRepository for FilePersistence {
+    fn load_archive_retention_policy(&self) -> Result<Option<DurableArchiveRetentionPolicy>> {
+        FilePersistence::load_archive_retention_policy(self)
+    }
     fn load_idempotency_records(&self) -> Result<BTreeMap<RequestId, DurableIdempotencyRecord>> {
         FilePersistence::load_idempotency_records(self)
     }
@@ -49,6 +53,9 @@ impl CatalogRepository for FilePersistence {
 }
 
 impl<T: CatalogRepository + ?Sized> CatalogRepository for Arc<T> {
+    fn load_archive_retention_policy(&self) -> Result<Option<DurableArchiveRetentionPolicy>> {
+        (**self).load_archive_retention_policy()
+    }
     fn load_idempotency_records(&self) -> Result<BTreeMap<RequestId, DurableIdempotencyRecord>> {
         (**self).load_idempotency_records()
     }

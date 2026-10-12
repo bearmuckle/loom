@@ -39,9 +39,12 @@ pub struct InstanceOptions {
     /// `--reset-state`: wipe an incompatible durable database instead of
     /// failing.
     pub reset_state: bool,
-    /// `--archive-retention`: when an archived session or project tree may be
-    /// discarded automatically. Retention is disabled by default.
-    pub archive_retention: ArchiveRetentionPolicy,
+    /// `--archive-retention`: the archive-retention policy this start asks for,
+    /// or `None` when neither the flags nor their variables were given, in which
+    /// case the policy stored in durable state applies. It is a startup default
+    /// rather than the policy itself: the server stores it and a client can
+    /// change it later. Retention is disabled by default.
+    pub archive_retention: Option<ArchiveRetentionPolicy>,
 }
 
 impl InstanceOptions {
@@ -53,7 +56,7 @@ impl InstanceOptions {
             token: None,
             token_file: None,
             reset_state: false,
-            archive_retention: ArchiveRetentionPolicy::disabled(),
+            archive_retention: None,
         }
     }
 }

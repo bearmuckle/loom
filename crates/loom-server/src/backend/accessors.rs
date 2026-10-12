@@ -163,8 +163,8 @@ impl InProcessBackend {
 
     /// Archive-retention policy this backend applies to archived sessions.
     ///
-    /// The policy is stored and exposed here; the sweep that discards expired
-    /// archived sessions is wired in the retention change.
+    /// The sweep reads this at the start of every round, so a policy change
+    /// applies from the next round instead of starting one.
     pub fn archive_retention(&self) -> loom_protocol::ArchiveRetentionPolicy {
         *self
             .archive_retention
@@ -172,23 +172,86 @@ impl InProcessBackend {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Sets the archive-retention policy.
+    /// Whether the policy in effect is the one stored in durable state, either
+    /// loaded when this backend opened or written by a later change.
+    pub fn archive_retention_is_stored(&self) -> bool {
+        self.archive_retention_stored.load(Ordering::SeqCst)
+    }
+
+    /// Loads the policy stored in durable state, when this backend has a durable
+    /// database that holds one.
     ///
-    /// A zero retention window is normalized to `None`, which means retention
-    /// is disabled. The sweep that acts on the policy is wired in the retention
-    /// change; nothing is discarded here.
-    pub fn set_archive_retention(
+    /// The backend installs no policy by itself, so a start without an explicit
+    /// flag applies exactly what the previous start or a client stored.
+    pub(crate) fn restore_archive_retention(&self) -> Result<()> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+        let Some(stored) = persistence.load_archive_retention_policy()? else {
+            return Ok(());
+        };
+        self.store_archive_retention(loom_protocol::ArchiveRetentionPolicy {
+            retention_ms: stored.retention_ms.filter(|retention_ms| *retention_ms > 0),
+            force_discard_worktrees: stored.force_discard_worktrees,
+        });
+        // Recorded so a start without explicit input can log that the stored
+        // policy won rather than the built-in default.
+        self.archive_retention_stored.store(true, Ordering::SeqCst);
+        log::info!(
+            "[loom-server] archive retention policy loaded from durable state: {}",
+            crate::retention::describe_archive_retention(self.archive_retention())
+        );
+        Ok(())
+    }
+
+    /// Sets the archive-retention policy of this backend without writing durable
+    /// state, and reports the policy that was in effect.
+    fn store_archive_retention(
         &self,
         policy: loom_protocol::ArchiveRetentionPolicy,
-    ) -> Result<()> {
+    ) -> loom_protocol::ArchiveRetentionPolicy {
         let normalized = loom_protocol::ArchiveRetentionPolicy {
             retention_ms: policy.retention_ms.filter(|retention_ms| *retention_ms > 0),
             force_discard_worktrees: policy.force_discard_worktrees,
         };
-        *self
+        let mut current = self
             .archive_retention
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = normalized;
+            .unwrap_or_else(PoisonError::into_inner);
+        std::mem::replace(&mut *current, normalized)
+    }
+
+    /// Sets the archive-retention policy and writes it to durable state.
+    ///
+    /// A zero retention window is normalized to `None`, which means retention
+    /// is disabled. The sweep reads the policy at the start of every round, so
+    /// the change applies from the next sweep; it does not start one. A failed
+    /// durable write restores the previous in-memory policy and fails the
+    /// request, so the sweep and the stored policy never disagree.
+    pub fn set_archive_retention(
+        &self,
+        policy: loom_protocol::ArchiveRetentionPolicy,
+    ) -> Result<()> {
+        let previous = self.store_archive_retention(policy);
+        let normalized = self.archive_retention();
+        if let Err(error) = self.persist_state() {
+            self.store_archive_retention(previous);
+            log::error!(
+                "[loom-server] archive retention policy was not changed; durable state save failed: {}",
+                error.message
+            );
+            return Err(error);
+        }
+        if self.persistence.is_some() {
+            self.archive_retention_stored.store(true, Ordering::SeqCst);
+        }
+        if previous != normalized {
+            log::info!(
+                "[loom-server] archive retention policy changed: {} -> {}; the change applies from the next sweep",
+                crate::retention::describe_archive_retention(previous),
+                crate::retention::describe_archive_retention(normalized)
+            );
+        }
         Ok(())
     }
 }

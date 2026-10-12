@@ -597,9 +597,17 @@ impl InProcessBackend {
             events: journal.pending_events.clone(),
             workspace_events: journal.pending_workspace_events.clone(),
         };
+        let archive_retention = self.archive_retention();
         let session_settings = DurableSessionSettings {
             approval_policies: self.session_policies()?.clone(),
             auto_approve_actions: self.auto_approve_actions()?.clone(),
+            // A zero window is stored disabled, matching `archive_retention`.
+            archive_retention: DurableArchiveRetentionPolicy {
+                retention_ms: archive_retention
+                    .retention_ms
+                    .filter(|retention_ms| *retention_ms > 0),
+                force_discard_worktrees: archive_retention.force_discard_worktrees,
+            },
         };
         let workspace_configs = self.workspace_configs()?.clone();
         let provider_state = DurableProviderState {

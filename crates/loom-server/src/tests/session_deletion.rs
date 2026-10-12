@@ -658,54 +658,21 @@ fn a_dirty_linked_worktree_refuses_deletion_until_forced() {
 }
 
 #[test]
-fn a_project_with_a_non_terminal_child_task_is_refused() {
+fn deleting_a_project_root_with_queued_children_cancels_and_deletes_the_tree() {
     let fixture = project_code_child_fixture();
     let child_session_id = fixture.worktree.child_session_id;
-    complete_project_code_child(&fixture);
-    archive(&fixture.connection, fixture.root_id);
-    // Put the archived child task back into a non-terminal state, as a
-    // restarted schedule would.
-    persistence(&fixture.backend)
-        .update_delegated_task_status(
-            fixture.task_id,
-            loom_core::DelegatedTaskStatus::Queued,
-            Timestamp::now(),
-        )
-        .unwrap();
-
-    let error = delete(&fixture.connection, fixture.root_id, false).unwrap_err();
-    assert_eq!(error.code, ErrorCode::InvalidState);
-    assert_eq!(
-        error.message,
-        "finish or cancel every child task before deleting this project"
-    );
-
-    // Nothing changes: sessions, checkout, worktree row, and task stay.
-    assert_eq!(
-        fixture
-            .backend
-            .sessions()
-            .unwrap()
-            .get(fixture.root_id)
-            .unwrap()
-            .state,
-        AgentSessionState::Archived
-    );
-    assert!(
-        fixture
-            .backend
-            .sessions()
-            .unwrap()
-            .get(child_session_id)
-            .is_ok()
-    );
-    assert!(fixture.child_checkout.exists());
+    let workspace_id = fixture
+        .backend
+        .sessions()
+        .unwrap()
+        .get(fixture.root_id)
+        .unwrap()
+        .workspace_id;
+    let root_dir = session_root(&fixture.backend, workspace_id, fixture.root_id);
+    let child_dir = session_root(&fixture.backend, workspace_id, child_session_id);
     let rows = persistence(&fixture.backend);
-    assert!(
-        rows.load_project_worktree_by_task(fixture.task_id)
-            .unwrap()
-            .is_some()
-    );
+    // The child task was created but never admitted, so its session has no run
+    // and the project is neither archived nor finished.
     assert_eq!(
         rows.load_delegated_task(fixture.task_id)
             .unwrap()
@@ -714,17 +681,95 @@ fn a_project_with_a_non_terminal_child_task_is_refused() {
         loom_core::DelegatedTaskStatus::Queued
     );
     assert!(
-        rows.load_sessions()
+        rows.load_latest_run_summary_for_session(child_session_id)
             .unwrap()
+            .is_none()
+    );
+    assert!(fixture.child_checkout.exists());
+
+    // The client does not have to archive or cancel anything first.
+    assert_deleted(
+        delete(&fixture.connection, fixture.root_id, false).unwrap(),
+        fixture.root_id,
+    );
+
+    // Both sessions, their rows, their filesystem roots, and the cancelled
+    // intent are gone.
+    for session_id in [fixture.root_id, child_session_id] {
+        assert_eq!(
+            fixture
+                .backend
+                .sessions()
+                .unwrap()
+                .get(session_id)
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+    }
+    assert!(!root_dir.exists());
+    assert!(!child_dir.exists());
+    assert!(!fixture.child_checkout.exists());
+    assert!(
+        rows.list_project_tasks(fixture.project_id)
             .unwrap()
-            .sessions
-            .contains_key(&child_session_id)
+            .is_empty()
     );
     assert!(
+        rows.list_pending_project_cancellation_cascades()
+            .unwrap()
+            .is_empty(),
+        "the cancellation cascade must be completed, not left pending"
+    );
+    assert!(
+        rows.load_project_worktree_by_task(fixture.task_id)
+            .unwrap()
+            .is_none()
+    );
+    let durable = rows.load_sessions().unwrap().unwrap();
+    assert!(!durable.sessions.contains_key(&fixture.root_id));
+    assert!(!durable.sessions.contains_key(&child_session_id));
+    fixture.shutdown();
+}
+
+#[test]
+fn deleting_a_non_archived_project_child_is_refused_and_changes_nothing() {
+    let fixture = project_code_child_fixture();
+    let child_session_id = fixture.worktree.child_session_id;
+
+    // A project descendant that is not the root is not a project root, so it
+    // still has to be archived before it can be deleted.
+    for force in [false, true] {
+        let error = delete(&fixture.connection, child_session_id, force).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidState);
+        assert_eq!(error.message, "only archived agent sessions can be deleted");
+        assert!(!error.retryable);
+    }
+
+    let rows = persistence(&fixture.backend);
+    assert_eq!(
         fixture
-            .parent_git
-            .open_linked_worktree(&fixture.worktree.worktree_name, &fixture.child_checkout)
-            .is_ok()
+            .backend
+            .sessions()
+            .unwrap()
+            .get(child_session_id)
+            .unwrap()
+            .state,
+        AgentSessionState::Idle
+    );
+    assert!(fixture.child_checkout.exists());
+    assert!(rows.load_delegated_task(fixture.task_id).unwrap().is_some());
+    assert_eq!(
+        rows.load_delegated_task(fixture.task_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        loom_core::DelegatedTaskStatus::Queued
+    );
+    assert!(
+        rows.list_pending_project_cancellation_cascades()
+            .unwrap()
+            .is_empty()
     );
     fixture.shutdown();
 }
@@ -1050,6 +1095,939 @@ fn a_locked_linked_worktree_refuses_deletion_until_forced() {
             .load_project_worktree_by_task(fixture.task_id)
             .unwrap()
             .is_none()
+    );
+    fixture.shutdown();
+}
+
+#[test]
+fn a_dirty_live_project_worktree_refuses_deletion_until_forced() {
+    let fixture = project_code_child_fixture();
+    let child_session_id = fixture.worktree.child_session_id;
+    // The project is live: its root is not archived and its child task was
+    // never admitted.
+    fs::write(fixture.child_checkout.join("uncommitted.txt"), "dirty\n").unwrap();
+
+    let error = delete(&fixture.connection, fixture.root_id, false).unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(
+        error.message.contains("has changes"),
+        "unexpected message: {}",
+        error.message
+    );
+
+    // The refusal happens after the project was cancelled, and it keeps every
+    // session, row, and the dirty checkout.
+    let rows = persistence(&fixture.backend);
+    assert_eq!(
+        rows.load_delegated_task(fixture.task_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        loom_core::DelegatedTaskStatus::Cancelled
+    );
+    assert!(fixture.child_checkout.join("uncommitted.txt").exists());
+    for session_id in [fixture.root_id, child_session_id] {
+        assert!(
+            fixture.backend.sessions().unwrap().get(session_id).is_ok(),
+            "session {session_id} must survive a refused deletion"
+        );
+    }
+    assert!(
+        rows.load_project_worktree_by_task(fixture.task_id)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        rows.load_sessions()
+            .unwrap()
+            .unwrap()
+            .sessions
+            .contains_key(&fixture.root_id)
+    );
+
+    // A forced retry discards the checkout with the rest of the tree. It needs
+    // no further cancellation, because the cancelled tree has no live work.
+    assert_deleted(
+        delete(&fixture.connection, fixture.root_id, true).unwrap(),
+        fixture.root_id,
+    );
+    assert!(!fixture.child_checkout.exists());
+    for session_id in [fixture.root_id, child_session_id] {
+        assert!(fixture.backend.sessions().unwrap().get(session_id).is_err());
+    }
+    assert!(
+        rows.load_project_worktree_by_task(fixture.task_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        rows.list_project_tasks(fixture.project_id)
+            .unwrap()
+            .is_empty()
+    );
+    fixture.shutdown();
+}
+
+#[test]
+fn a_locked_live_project_worktree_refuses_deletion_until_forced() {
+    let fixture = project_code_child_fixture();
+    let child_session_id = fixture.worktree.child_session_id;
+    // A live project locks its checkout the same way an archived one does.
+    git_in(
+        fixture.parent_git.root(),
+        &["worktree", "lock", fixture.child_checkout.to_str().unwrap()],
+    );
+
+    let error = delete(&fixture.connection, fixture.root_id, false).unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidState);
+    assert!(
+        error.message.contains("is locked"),
+        "unexpected message: {}",
+        error.message
+    );
+    assert!(fixture.child_checkout.exists());
+    for session_id in [fixture.root_id, child_session_id] {
+        assert!(
+            fixture.backend.sessions().unwrap().get(session_id).is_ok(),
+            "session {session_id} must survive a refused deletion"
+        );
+    }
+    assert!(
+        persistence(&fixture.backend)
+            .load_project_worktree_by_task(fixture.task_id)
+            .unwrap()
+            .is_some()
+    );
+
+    assert_deleted(
+        delete(&fixture.connection, fixture.root_id, true).unwrap(),
+        fixture.root_id,
+    );
+    assert!(!fixture.child_checkout.exists());
+    for session_id in [fixture.root_id, child_session_id] {
+        assert!(fixture.backend.sessions().unwrap().get(session_id).is_err());
+    }
+    assert!(
+        persistence(&fixture.backend)
+            .load_project_worktree_by_task(fixture.task_id)
+            .unwrap()
+            .is_none()
+    );
+    fixture.shutdown();
+}
+
+/// A project root with one delegated child whose run is parked inside a model
+/// stream, so the whole tree is live.
+struct LiveProjectChildFixture {
+    temp: PathBuf,
+    backend: Arc<InProcessBackend>,
+    connection: InProcessConnection,
+    root_id: AgentSessionId,
+    child_session_id: AgentSessionId,
+    project_id: ProjectId,
+    task_id: loom_core::TaskId,
+    run_id: loom_core::RunId,
+    child_stream: thread::JoinHandle<()>,
+}
+
+impl LiveProjectChildFixture {
+    /// Stops the parked model stream and drops the backend.
+    fn shutdown(self) {
+        drop(self.connection);
+        self.backend.shutdown().unwrap();
+        drop(self.backend);
+        self.child_stream.join().unwrap();
+        let _ = fs::remove_dir_all(&self.temp);
+    }
+}
+
+/// Builds a project root whose single child run is held open by `model`.
+fn live_project_child_fixture(
+    model: &mut ScriptedOpenAiEndpoint,
+    model_id: &ModelId,
+) -> LiveProjectChildFixture {
+    let temp = std::env::temp_dir().join(format!(
+        "loom-live-project-deletion-{}",
+        AgentSessionId::new()
+    ));
+    fs::create_dir_all(&temp).unwrap();
+    let backend = InProcessBackend::with_provider_registry_persistent(
+        scripted_project_provider_registry(&model.endpoint, model_id.clone()),
+        temp.join("state.sqlite"),
+    )
+    .unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Live project deletion".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let root_id = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Project root".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    let child_task = match connection
+        .create_project_child(
+            RequestId::new(),
+            root_id,
+            "live child".to_owned(),
+            loom_core::DelegatedTaskSpec {
+                intent: "Hold a run open until the project is deleted.".to_owned(),
+                model_id: model_id.as_str().to_owned(),
+                context_references: Vec::new(),
+                dependencies: Vec::new(),
+                code_change: false,
+                permissions: loom_core::ProjectAgentPermissions::default(),
+            },
+        )
+        .unwrap()
+    {
+        ServerResponse::Project(ProjectResponse::ProjectChildCreated { task, .. }) => task,
+        response => panic!("unexpected project child response: {response:?}"),
+    };
+    assert_eq!(
+        child_task.status,
+        loom_core::DelegatedTaskStatus::Running,
+        "the child is admitted as soon as it is created"
+    );
+    // Hold the child's first model turn open, then resolve its run.
+    let child_turn = model.next_for_child();
+    let child_stream = hold_scripted_model_stream_until_cancelled(child_turn);
+    let run_id = {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(run_id) = backend
+                .runs()
+                .unwrap()
+                .iter()
+                .find(|(_, handle)| handle.session_id == child_task.target_session_id)
+                .map(|(run_id, _)| *run_id)
+            {
+                break run_id;
+            }
+            assert!(Instant::now() < deadline, "the child run should start");
+            thread::sleep(Duration::from_millis(1));
+        }
+    };
+    LiveProjectChildFixture {
+        temp,
+        backend,
+        connection,
+        root_id,
+        child_session_id: child_task.target_session_id,
+        project_id: child_task.project_id,
+        task_id: child_task.task_id,
+        run_id,
+        child_stream,
+    }
+}
+
+#[test]
+fn deleting_a_live_project_root_interrupts_its_child_run_and_deletes_the_tree() {
+    let mut model = ScriptedOpenAiEndpoint::start();
+    let model_id = ModelId::new("fixture/live-project-deletion");
+    let fixture = live_project_child_fixture(&mut model, &model_id);
+    let child_run = fixture
+        .backend
+        .runs()
+        .unwrap()
+        .get(&fixture.run_id)
+        .cloned()
+        .expect("the parked child run stays registered");
+    assert!(
+        matches!(
+            child_run.snapshot().state,
+            AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
+        ),
+        "the child run must still be in flight"
+    );
+    let rows = persistence(&fixture.backend);
+    assert_eq!(
+        rows.load_delegated_task(fixture.task_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        loom_core::DelegatedTaskStatus::Running
+    );
+    assert!(
+        rows.load_latest_run_summary_for_session(fixture.child_session_id)
+            .unwrap()
+            .is_some(),
+        "the live child run has a durable checkpoint"
+    );
+
+    // The project does not have to be archived or cancelled first.
+    assert_deleted(
+        delete(&fixture.connection, fixture.root_id, false).unwrap(),
+        fixture.root_id,
+    );
+
+    // The child run is interrupted instead of being left behind, and the whole
+    // tree is gone: sessions, tasks, and run checkpoints.
+    assert_eq!(child_run.snapshot().state, AgentRunState::Cancelled);
+    for session_id in [fixture.root_id, fixture.child_session_id] {
+        assert_eq!(
+            fixture
+                .backend
+                .sessions()
+                .unwrap()
+                .get(session_id)
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+    }
+    assert!(fixture.backend.runs().unwrap().is_empty());
+    assert!(
+        rows.list_project_tasks(fixture.project_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        rows.list_pending_project_cancellation_cascades()
+            .unwrap()
+            .is_empty(),
+        "the cancellation cascade must be completed, not left pending"
+    );
+    assert!(
+        rows.load_latest_run_summary_for_session(fixture.child_session_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        rows.load_project_snapshot(fixture.project_id)
+            .unwrap()
+            .is_none_or(|project| project.agents.is_empty())
+    );
+    let durable = rows.load_sessions().unwrap().unwrap();
+    assert!(!durable.sessions.contains_key(&fixture.root_id));
+    assert!(!durable.sessions.contains_key(&fixture.child_session_id));
+    fixture.shutdown();
+}
+
+#[test]
+fn deleting_a_project_root_with_an_unfinished_task_is_refused_and_retryable() {
+    let fixture = project_code_child_fixture();
+    let rows = persistence(&fixture.backend);
+    assert_eq!(
+        rows.load_delegated_task(fixture.task_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        loom_core::DelegatedTaskStatus::Queued
+    );
+
+    // A task committed after the caller cancelled the project reaches this guard
+    // directly. The refusal is retryable, because a retried request cancels the
+    // newer task before it deletes.
+    for force in [false, true] {
+        let error = fixture
+            .backend
+            .delete_agent_session(fixture.root_id, force)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidState);
+        assert_eq!(
+            error.message,
+            "finish or cancel every child task before deleting this project"
+        );
+        assert!(error.retryable);
+    }
+
+    // The refused request changed nothing.
+    assert!(
+        fixture
+            .backend
+            .sessions()
+            .unwrap()
+            .get(fixture.root_id)
+            .is_ok()
+    );
+    assert!(rows.load_delegated_task(fixture.task_id).unwrap().is_some());
+    assert!(fixture.child_checkout.exists());
+    fixture.shutdown();
+}
+
+/// A project root whose parked manager run waits on one live code child, so the
+/// manager's own run and the child's run are both in flight when a deletion
+/// arrives.
+struct LiveManagerProjectFixture {
+    temp: PathBuf,
+    source: PathBuf,
+    backend: Arc<InProcessBackend>,
+    connection: InProcessConnection,
+    root_id: AgentSessionId,
+    root_run_id: loom_core::RunId,
+    root_run: Arc<RunHandle>,
+    child_session_id: AgentSessionId,
+    child_run: Arc<RunHandle>,
+    project_id: ProjectId,
+    task_id: loom_core::TaskId,
+    child_checkout: PathBuf,
+    child_stream: std::cell::Cell<Option<thread::JoinHandle<()>>>,
+}
+
+impl LiveManagerProjectFixture {
+    /// Waits for the parked child model stream to end after its run stopped.
+    fn join_child_stream(&self) {
+        if let Some(stream) = self.child_stream.take() {
+            stream.join().unwrap();
+        }
+    }
+
+    fn shutdown(self) {
+        let LiveManagerProjectFixture {
+            temp,
+            source,
+            backend,
+            connection,
+            child_stream,
+            ..
+        } = self;
+        drop(connection);
+        backend.shutdown().unwrap();
+        drop(backend);
+        if let Some(stream) = child_stream.into_inner() {
+            stream.join().unwrap();
+        }
+        let _ = fs::remove_dir_all(&temp);
+        let _ = fs::remove_dir_all(&source);
+    }
+}
+
+/// Builds a project root whose manager run is parked in
+/// `wait_for_project_children` over one live code child whose model stream is
+/// held open, so the whole tree is live.
+fn live_manager_project_fixture(
+    model: &mut ScriptedOpenAiEndpoint,
+    model_id: &ModelId,
+) -> LiveManagerProjectFixture {
+    let temp = workspace();
+    let source = git_repository();
+    let backend = InProcessBackend::with_provider_registry_persistent(
+        scripted_project_provider_registry(&model.endpoint, model_id.clone()),
+        temp.join("state.sqlite"),
+    )
+    .unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace_record = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Live manager project deletion".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    // One slot, so the manager has to park before its child can start.
+    assert!(matches!(
+        connection
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::SetWorkspaceConfigForWorkspace {
+                    workspace_id: workspace_record.id,
+                    config: WorkspaceConfig {
+                        project_agent_concurrency: 1,
+                        ..WorkspaceConfig::default()
+                    },
+                }
+            )))
+            .result,
+        Ok(ServerResponse::Workspace(
+            WorkspaceResponse::WorkspaceConfigUpdated
+        ))
+    ));
+    let root_id = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace_record.id,
+                name: "Project root".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    assert!(matches!(
+        connection
+            .request(RequestEnvelope::new(ClientRequest::Repository(
+                RepositoryRequest::AttachSessionRepository {
+                    session_id: root_id,
+                    source: source.display().to_string(),
+                    path: "repo".to_owned(),
+                    revision: None,
+                    reuse_local: false,
+                },
+            )))
+            .result,
+        Ok(ServerResponse::Repository(
+            RepositoryResponse::SessionRepositoryAttached(_)
+        ))
+    ));
+    let root_run_id = match connection
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::StartSessionAgentRun {
+                session_id: root_id,
+                task: "Delegate one code task and wait for it.".to_owned(),
+                model: model_id.clone(),
+                system_instructions: None,
+                repository_instructions: None,
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
+        response => panic!("unexpected run response: {response:?}"),
+    };
+    let project_id = ProjectId::from_uuid(*root_id.as_uuid());
+    let rows = persistence(&backend);
+
+    // Turn one delegates a code child that owns its own linked worktree.
+    let root_delegate = model.next_for_manager();
+    assert!(request_has_tool(
+        &root_delegate.request,
+        "delegate_project_code_task"
+    ));
+    model.respond_with_tool(
+        root_delegate,
+        "delegate_project_code_task",
+        serde_json::json!({
+            "child_name": "code-worker",
+            "intent": "Hold a checkout open until the project is deleted.",
+            "model_id": model_id,
+        }),
+    );
+
+    // Turn two parks the manager on that child, which frees the only slot.
+    let root_wait = model.next_for_manager();
+    assert!(request_has_tool(
+        &root_wait.request,
+        "wait_for_project_children"
+    ));
+    let child_task = rows
+        .list_project_tasks(project_id)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.child_name == "code-worker")
+        .expect("delegation should create the code worker task");
+    assert!(child_task.code_change);
+    model.respond_with_tool(
+        root_wait,
+        "wait_for_project_children",
+        serde_json::json!({ "task_ids": [child_task.task_id] }),
+    );
+    let root_run = backend
+        .runs()
+        .unwrap()
+        .get(&root_run_id)
+        .cloned()
+        .expect("the manager run stays registered");
+    let park_deadline = Instant::now() + Duration::from_secs(15);
+    while root_run.snapshot().state != AgentRunState::Paused {
+        assert!(
+            Instant::now() < park_deadline,
+            "the manager should park in wait_for_project_children"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    // The freed slot admits the child, whose first model turn is held open.
+    let child_turn = model.next_for_child();
+    let child_stream = hold_scripted_model_stream_until_cancelled(child_turn);
+    let admit_deadline = Instant::now() + Duration::from_secs(15);
+    let (child_run, child_task) = loop {
+        let task = rows
+            .load_delegated_task(child_task.task_id)
+            .unwrap()
+            .unwrap();
+        let run = backend
+            .runs()
+            .unwrap()
+            .iter()
+            .find(|(_, handle)| handle.session_id == child_task.target_session_id)
+            .map(|(_, handle)| Arc::clone(handle));
+        if let Some(run) = run
+            && task.status == loom_core::DelegatedTaskStatus::Running
+        {
+            break (run, task);
+        }
+        assert!(
+            Instant::now() < admit_deadline,
+            "parking the manager should admit its child"
+        );
+        thread::sleep(Duration::from_millis(1));
+    };
+    assert!(
+        !matches!(
+            child_run.snapshot().state,
+            AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+        ),
+        "the child run must be in flight"
+    );
+
+    let worktree = rows
+        .load_project_worktree_by_task(child_task.task_id)
+        .unwrap()
+        .expect("the code child owns a durable worktree");
+    assert_eq!(worktree.status, ProjectWorktreeStatus::Ready);
+    let child_checkout = connection
+        .session_filesystem(child_task.target_session_id)
+        .unwrap()
+        .root()
+        .join(&worktree.relative_path);
+    assert!(
+        child_checkout.exists(),
+        "the child checkout must exist before the deletion"
+    );
+
+    LiveManagerProjectFixture {
+        temp,
+        source,
+        backend,
+        connection,
+        root_id,
+        root_run_id,
+        root_run,
+        child_session_id: child_task.target_session_id,
+        child_run,
+        project_id,
+        task_id: child_task.task_id,
+        child_checkout,
+        child_stream: std::cell::Cell::new(Some(child_stream)),
+    }
+}
+
+#[test]
+fn deleting_a_parked_project_manager_with_a_live_child_ends_both_runs_and_the_tree() {
+    let mut model = ScriptedOpenAiEndpoint::start();
+    let model_id = ModelId::new("fixture/live-manager-project-deletion");
+    let fixture = live_manager_project_fixture(&mut model, &model_id);
+    let workspace_id = fixture
+        .backend
+        .sessions()
+        .unwrap()
+        .get(fixture.root_id)
+        .unwrap()
+        .workspace_id;
+    let root_dir = session_root(&fixture.backend, workspace_id, fixture.root_id);
+    let child_dir = session_root(&fixture.backend, workspace_id, fixture.child_session_id);
+    let rows = persistence(&fixture.backend);
+    assert_eq!(fixture.root_run.snapshot().state, AgentRunState::Paused);
+    assert_eq!(fixture.root_run_id, fixture.root_run.snapshot().id);
+    assert_eq!(
+        rows.load_latest_run_summary_for_session(fixture.root_id)
+            .unwrap()
+            .expect("the parked manager run has a durable checkpoint")
+            .snapshot
+            .state,
+        AgentRunState::Paused
+    );
+
+    // The client neither archives nor cancels anything first.
+    assert_deleted(
+        delete(&fixture.connection, fixture.root_id, false).unwrap(),
+        fixture.root_id,
+    );
+
+    // The manager's own run is interrupted before the tree is cancelled, so the
+    // deletion guard sees no live run and the project does not have to finish.
+    assert_eq!(fixture.root_run.snapshot().state, AgentRunState::Cancelled);
+    assert_eq!(fixture.child_run.snapshot().state, AgentRunState::Cancelled);
+    for session_id in [fixture.root_id, fixture.child_session_id] {
+        assert_eq!(
+            fixture
+                .backend
+                .sessions()
+                .unwrap()
+                .get(session_id)
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+    }
+    assert!(fixture.backend.runs().unwrap().is_empty());
+    assert!(!root_dir.exists());
+    assert!(!child_dir.exists());
+    assert!(!fixture.child_checkout.exists());
+    assert!(
+        rows.list_project_tasks(fixture.project_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        rows.list_pending_project_cancellation_cascades()
+            .unwrap()
+            .is_empty(),
+        "the cancellation cascade must be completed, not left pending"
+    );
+    assert!(
+        rows.load_project_worktree_by_task(fixture.task_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        rows.load_latest_run_summary_for_session(fixture.child_session_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        rows.load_latest_run_summary_for_session(fixture.root_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        rows.load_project_snapshot(fixture.project_id)
+            .unwrap()
+            .is_none_or(|project| project.agents.is_empty())
+    );
+    let durable = rows.load_sessions().unwrap().unwrap();
+    assert!(!durable.sessions.contains_key(&fixture.root_id));
+    assert!(!durable.sessions.contains_key(&fixture.child_session_id));
+    fixture.join_child_stream();
+    fixture.shutdown();
+}
+
+#[test]
+fn deleting_a_project_whose_only_live_run_is_the_manager_removes_the_tree() {
+    let mut model = ScriptedOpenAiEndpoint::start();
+    let model_id = ModelId::new("fixture/manager-only-live-deletion");
+    let fixture = live_manager_project_fixture(&mut model, &model_id);
+
+    // Cancelling the child ends its run and releases the manager's wait, so the
+    // manager's resumed run is the only live work left in the project.
+    let cancelled = fixture
+        .connection
+        .request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::ControlProjectChild {
+                project_id: fixture.project_id,
+                manager_session_id: fixture.root_id,
+                task_id: fixture.task_id,
+                action: ProjectChildControlAction::Cancel,
+            },
+        )));
+    let ServerResponse::Project(ProjectResponse::ProjectChildControlled { task, .. }) =
+        cancelled.result.unwrap()
+    else {
+        panic!("unexpected child cancellation response");
+    };
+    assert_eq!(task.status, loom_core::DelegatedTaskStatus::Cancelled);
+    fixture.join_child_stream();
+    let manager_stream = hold_scripted_model_stream_until_cancelled(model.next_for_manager());
+    let rows = persistence(&fixture.backend);
+    let resume_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let state = fixture.root_run.snapshot().state;
+        if matches!(
+            state,
+            AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
+        ) {
+            break;
+        }
+        assert!(
+            Instant::now() < resume_deadline,
+            "the released manager wait should resume its run, got {state:?}"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        rows.list_project_tasks(fixture.project_id)
+            .unwrap()
+            .iter()
+            .all(|task| matches!(
+                task.status,
+                loom_core::DelegatedTaskStatus::Completed
+                    | loom_core::DelegatedTaskStatus::Failed
+                    | loom_core::DelegatedTaskStatus::Cancelled
+            )),
+        "every task is terminal, so only the manager's own run is live"
+    );
+
+    assert_deleted(
+        delete(&fixture.connection, fixture.root_id, false).unwrap(),
+        fixture.root_id,
+    );
+
+    assert_eq!(fixture.root_run.snapshot().state, AgentRunState::Cancelled);
+    for session_id in [fixture.root_id, fixture.child_session_id] {
+        assert_eq!(
+            fixture
+                .backend
+                .sessions()
+                .unwrap()
+                .get(session_id)
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+    }
+    assert!(fixture.backend.runs().unwrap().is_empty());
+    assert!(
+        rows.list_project_tasks(fixture.project_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        rows.load_project_worktree_by_task(fixture.task_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!fixture.child_checkout.exists());
+    manager_stream.join().unwrap();
+    fixture.shutdown();
+}
+
+#[test]
+fn deleting_an_archived_session_with_a_stale_run_summary_succeeds() {
+    let temp = workspace();
+    let path = temp.join("state.sqlite");
+    let backend = InProcessBackend::new_persistent(&path).unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let (workspace_record, session) =
+        create_workspace_and_session(&connection, "Stale run history");
+    let root = session_root(&backend, workspace_record.id, session.id);
+    archive(&connection, session.id);
+
+    // A crash between the archive write and the run checkpoint leaves a
+    // non-terminal run summary behind with no loaded handle and no executor.
+    let run_id = loom_core::RunId::new();
+    let created_at = Timestamp::now();
+    let stale_summary = DurableRunSummary {
+        snapshot: AgentRunSnapshot {
+            id: run_id,
+            attempt_id: loom_core::RunAttemptId::new(),
+            control_revision: 0,
+            session_id: session.id,
+            task: "Interrupted by a crash before its checkpoint".to_owned(),
+            model: ModelId::new("fixture/stale-run"),
+            state: AgentRunState::Executing,
+            started_at: created_at,
+            updated_at: created_at,
+            completed_at: None,
+            summary: None,
+            evidence: Vec::new(),
+        },
+        usage: UsageSnapshot::default(),
+        attempts: None,
+        execution_state: None,
+        interactions: None,
+    };
+    let sessions_state = backend.sessions().unwrap().export_state();
+    persistence(&backend)
+        .save_state(DurableStateWrite {
+            sessions: &sessions_state,
+            workspaces: None,
+            settings: None,
+            workspace_configs: None,
+            providers: None,
+            usage: None,
+            idempotency: None,
+            run_summaries: Some(&BTreeMap::from([(run_id, stale_summary)])),
+            run_runtime_configs: None,
+            run_context_checkpoints: None,
+            run_plans: None,
+            run_messages: None,
+            run_activities: None,
+            filesystem_records: None,
+            feed: None,
+        })
+        .unwrap();
+    let rows = persistence(&backend);
+    assert_eq!(
+        rows.load_latest_run_summary_for_session(session.id)
+            .unwrap()
+            .expect("the stale summary must be durable")
+            .snapshot
+            .state,
+        AgentRunState::Executing
+    );
+    assert!(
+        backend.runs().unwrap().is_empty(),
+        "the stale summary has no loaded handle"
+    );
+
+    // Only a loaded run can keep writing, so the stale summary must not make the
+    // session permanently undeletable for the retention sweep.
+    assert_deleted(delete(&connection, session.id, false).unwrap(), session.id);
+    assert!(
+        rows.load_latest_run_summary_for_session(session.id)
+            .unwrap()
+            .is_none(),
+        "the stale summary is discarded with the session"
+    );
+    assert!(rows.load_run_summary(run_id).unwrap().is_none());
+    assert_eq!(
+        backend
+            .sessions()
+            .unwrap()
+            .get(session.id)
+            .unwrap_err()
+            .code,
+        ErrorCode::NotFound
+    );
+    assert!(!root.exists());
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn a_project_with_a_live_run_is_refused_by_the_deletion_guard() {
+    let mut model = ScriptedOpenAiEndpoint::start();
+    let model_id = ModelId::new("fixture/live-project-guard");
+    let fixture = live_project_child_fixture(&mut model, &model_id);
+    // A stale durable record that is already terminal, as a cancellation leaves
+    // it, so only the live run can refuse the deletion.
+    persistence(&fixture.backend)
+        .update_delegated_task_status(
+            fixture.task_id,
+            loom_core::DelegatedTaskStatus::Cancelled,
+            Timestamp::now(),
+        )
+        .unwrap();
+
+    // The connection cancels a project before it deletes it, so this reaches
+    // the backend guard directly: a run that is still live must refuse the
+    // deletion instead of dropping state an executor keeps writing.
+    let error = fixture
+        .backend
+        .delete_agent_session(fixture.root_id, false)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidState);
+    assert_eq!(
+        error.message,
+        "stop or cancel every run of this session before deleting it"
+    );
+    assert!(
+        fixture
+            .backend
+            .sessions()
+            .unwrap()
+            .get(fixture.root_id)
+            .is_ok()
     );
     fixture.shutdown();
 }

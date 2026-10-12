@@ -14,6 +14,13 @@ pub enum ControlRequest {
     GetWorkerNodeStatus,
 
     GetArchiveRetentionPolicy,
+
+    /// Replaces the archive-retention policy this worker applies. The policy is
+    /// stored in durable state, so it survives a restart, and the sweep reads
+    /// it at the start of every round.
+    SetArchiveRetentionPolicy {
+        policy: ArchiveRetentionPolicy,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

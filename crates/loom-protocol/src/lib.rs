@@ -293,6 +293,9 @@ impl ClientRequest {
             Self::Control(ControlRequest::GetArchiveRetentionPolicy) => {
                 Some(Capability::ReadWorkerNodeStatus)
             }
+            Self::Control(ControlRequest::SetArchiveRetentionPolicy { .. }) => {
+                Some(Capability::ConfigureArchiveRetention)
+            }
             Self::Workspace(WorkspaceRequest::CreateWorkspace { .. })
             | Self::Workspace(WorkspaceRequest::RegisterWorkspace { .. })
             | Self::Workspace(WorkspaceRequest::RenameWorkspace { .. }) => {
@@ -510,6 +513,7 @@ impl ClientRequest {
                 | Self::Session(SessionRequest::RenameAgentSession { .. })
                 | Self::Session(SessionRequest::ArchiveAgentSession { .. })
                 | Self::Session(SessionRequest::DeleteAgentSession { .. })
+                | Self::Control(ControlRequest::SetArchiveRetentionPolicy { .. })
                 | Self::Run(RunRequest::ApproveAgentAction { .. })
                 | Self::Run(RunRequest::RejectAgentAction { .. })
                 | Self::Run(RunRequest::SendAgentMessage { .. })

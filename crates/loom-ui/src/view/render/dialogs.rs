@@ -1,6 +1,145 @@
 use super::*;
+use crate::view::archive::{PROJECT_DELETE_CANCELLATION, project_deletion_consequence};
+use gpui_kit::component::checkbox::Checkbox;
 
 impl LoomView {
+    /// The confirmation an archived project deletion goes through.
+    ///
+    /// It covers the whole window, so it also covers the full-screen
+    /// archived-sessions surface that usually opens it. Nothing is submitted
+    /// until Delete is pressed, and a refusal keeps the dialog open with the
+    /// backend's reason so the deletion can be retried.
+    pub(crate) fn render_project_delete_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(dialog) = &self.project_delete_dialog else {
+            return div().into_any();
+        };
+        let in_flight = dialog.in_flight;
+        let consequence = project_deletion_consequence(&dialog.name, dialog.session_count);
+        let mut card = div()
+            .id("project-delete-card")
+            .test_support()
+            .w(px(460.))
+            .p_4()
+            .rounded_lg()
+            .bg(rgb(0x1b1d24))
+            .border_1()
+            .border_color(rgb(0x3b4555))
+            .shadow_lg()
+            .text_color(rgb(0xe5e7eb))
+            .child(
+                div()
+                    .id("project-delete-title")
+                    .test_support()
+                    .aria_label("Delete project")
+                    .text_sm()
+                    .text_color(rgb(0xf3f4f6))
+                    .child("Delete project"),
+            )
+            .child(
+                div()
+                    .id("project-delete-project")
+                    .test_support()
+                    .aria_label(dialog.name.clone())
+                    .mt_2()
+                    .text_sm()
+                    .child(dialog.name.clone()),
+            )
+            .child(
+                div()
+                    .id("project-delete-consequence")
+                    .test_support()
+                    .aria_label(consequence.clone())
+                    .mt_1()
+                    .text_xs()
+                    .text_color(rgb(0x8f98a6))
+                    .child(consequence),
+            )
+            .child(
+                div()
+                    .id("project-delete-cancellation")
+                    .test_support()
+                    .aria_label(PROJECT_DELETE_CANCELLATION)
+                    .mt_1()
+                    .text_xs()
+                    .text_color(rgb(0x8f98a6))
+                    .child(PROJECT_DELETE_CANCELLATION),
+            )
+            .child(
+                div().mt_3().child(
+                    Checkbox::new("project-delete-force")
+                        .checked(dialog.force)
+                        .disabled(in_flight)
+                        .label("Discard checkouts that have changes or a lock")
+                        .on_change({
+                            let view = cx.entity();
+                            move |checked, _, cx| {
+                                let checked = *checked;
+                                view.update(cx, |view, cx| {
+                                    view.set_project_delete_force(checked, cx);
+                                });
+                            }
+                        }),
+                ),
+            );
+        if let Some(refusal) = dialog.refusal.clone() {
+            card = card.child(
+                div()
+                    .id("project-delete-refusal")
+                    .test_support()
+                    .aria_label(format!("Delete refused: {refusal}"))
+                    .mt_3()
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
+                    .bg(rgb(ERROR_CARD_SURFACE))
+                    .border_1()
+                    .border_color(rgb(ERROR_CARD_ACCENT))
+                    .text_sm()
+                    .text_color(rgb(ERROR_CARD_ACCENT))
+                    .child(format!("Delete refused: {refusal}")),
+            );
+        }
+        div()
+            .id("project-delete-dialog")
+            .test_support()
+            .occlude()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui_kit::hsla(0., 0., 0., 0.55))
+            .child(
+                card.child(
+                    div()
+                        .mt_3()
+                        .flex()
+                        .justify_end()
+                        .gap_1()
+                        .child(
+                            Button::new("project-delete-cancel")
+                                .label("Cancel")
+                                .disabled(in_flight)
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.cancel_project_delete(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("project-delete-confirm")
+                                .label("Delete")
+                                .danger()
+                                .disabled(in_flight)
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.confirm_project_delete(cx);
+                                })),
+                        ),
+                ),
+            )
+            .into_any()
+    }
+
     pub(crate) fn render_rename_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(dialog) = &self.rename_dialog else {
             return div().into_any();

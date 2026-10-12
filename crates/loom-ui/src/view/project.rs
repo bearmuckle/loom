@@ -387,6 +387,11 @@ impl LoomView {
             .as_ref()
             .filter(|project| project.root_session_id == session.id)
             .map_or("Archive", |_| "Archive project");
+        // Deleting a project removes the whole tree, so it is offered only for
+        // the root and always goes through the confirmation.
+        let is_project_root = menu_project
+            .as_ref()
+            .is_some_and(|project| project.root_session_id == session.id);
         menu = menu
             .item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
                 let rename_session = rename_session.clone();
@@ -553,6 +558,17 @@ impl LoomView {
                     ));
                 }
             }
+        }
+        if is_project_root {
+            let delete_view = menu_view.clone();
+            let delete_session_id = session.id;
+            menu = menu.item(
+                PopupMenuItem::new("Delete project").on_click(move |_, _, cx| {
+                    delete_view.update(cx, |view, cx| {
+                        view.begin_project_delete(delete_session_id, cx);
+                    });
+                }),
+            );
         }
         menu
     }

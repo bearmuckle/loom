@@ -31,8 +31,9 @@ use loom_model::{
     ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId, ToolCall, ToolDefinition,
 };
 use loom_persistence::{
-    DurableFeedSessionCursor, DurableFeedState, DurableFeedWorkspaceCursor, DurableFilesystemDelta,
-    DurableFilesystemEdit, DurableFilesystemRecord, DurableIdempotencyRecord, DurableProviderState,
+    DurableArchiveRetentionPolicy, DurableFeedSessionCursor, DurableFeedState,
+    DurableFeedWorkspaceCursor, DurableFilesystemDelta, DurableFilesystemEdit,
+    DurableFilesystemRecord, DurableIdempotencyRecord, DurableProviderState,
     DurableRunCheckpointWrite, DurableRunContextCheckpoint, DurableRunMessage,
     DurableRunMessageDelta, DurableRunRuntimeConfig, DurableRunSummary,
     DurableSessionProjectionRead, DurableSessionSettings, DurableStateWrite, FilePersistence,
@@ -137,9 +138,10 @@ pub use remote::{
 };
 pub use retention::{
     ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FLAG, ARCHIVE_RETENTION_FORCE_DISCARD_ENV,
-    ARCHIVE_RETENTION_FORCE_DISCARD_FLAG, ARCHIVE_RETENTION_SWEEP_INTERVAL, ArchiveSweepReport,
-    ArchiveSweepSkip, parse_force_discard, parse_retention_window, resolve_archive_retention,
-    run_archive_retention_sweeps, sweep_archive_retention_at_startup,
+    ARCHIVE_RETENTION_FORCE_DISCARD_FLAG, ARCHIVE_RETENTION_SWEEP_INTERVAL, ArchiveRetentionSource,
+    ArchiveSweepReport, ArchiveSweepSkip, apply_startup_archive_retention, parse_force_discard,
+    parse_retention_window, resolve_archive_retention, run_archive_retention_sweeps,
+    sweep_archive_retention_at_startup,
 };
 
 const DEFAULT_EVENT_RETENTION: usize = 4096;
@@ -318,6 +320,10 @@ pub struct InProcessBackend {
     /// Configured archive-retention policy; read through
     /// [`InProcessBackend::archive_retention`].
     archive_retention: Mutex<loom_protocol::ArchiveRetentionPolicy>,
+    /// Whether the policy in effect is the one stored in durable state, either
+    /// loaded when this backend opened or written by a later change; read
+    /// through [`InProcessBackend::archive_retention_is_stored`].
+    archive_retention_stored: AtomicBool,
     idempotency_store: IdempotencyStore,
     admissions: AdmissionService,
     self_reference: Mutex<Weak<InProcessBackend>>,

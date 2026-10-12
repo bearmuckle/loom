@@ -10,7 +10,8 @@ use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::diff::{DiffFile, DiffState};
 use gpui_kit::{AppContext, Entity};
 use loom_core::{
-    AgentSessionSnapshot, AgentSessionState, EventSequence, ToolCallId, UsageSnapshot,
+    AgentSessionId, AgentSessionSnapshot, AgentSessionState, EventSequence, ToolCallId,
+    UsageSnapshot,
 };
 use loom_model::ProviderUsageSummary;
 use loom_protocol::{
@@ -333,6 +334,29 @@ pub(crate) struct RenameDialogState {
     pub(crate) session: AgentSessionSnapshot,
     pub(crate) input: String,
     pub(crate) is_project: bool,
+}
+
+/// The confirmation a project deletion goes through before it is submitted.
+///
+/// A project deletion cascades to every session in the tree, so it is never
+/// submitted from the row that opens this: the dialog holds everything the
+/// request needs and keeps the backend's refusal for a retry.
+#[derive(Clone, Debug)]
+pub(crate) struct ProjectDeleteDialogState {
+    /// The project root the deletion targets.
+    pub(crate) session_id: AgentSessionId,
+    /// The name the dialog and the request are about.
+    pub(crate) name: String,
+    /// How many sessions the deletion removes, the root included.
+    pub(crate) session_count: usize,
+    /// The worker that owns the tree, so the request goes to its owner.
+    pub(crate) node_id: String,
+    /// Whether the deletion may discard a worktree with changes or a lock.
+    pub(crate) force: bool,
+    /// A request in flight, which disables both actions.
+    pub(crate) in_flight: bool,
+    /// The last refusal and the backend's reason, which keeps the dialog open.
+    pub(crate) refusal: Option<String>,
 }
 
 #[derive(Clone, Debug)]

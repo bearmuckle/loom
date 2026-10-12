@@ -761,6 +761,11 @@ impl Render for LoomView {
             )
             .when(self.command_palette_open, |element| {
                 element.child(self.render_command_palette(cx))
+            })
+            // Rendered last so the confirmation covers the full-screen
+            // archived-sessions surface it is usually opened from.
+            .when(self.project_delete_dialog.is_some(), |element| {
+                element.child(self.render_project_delete_dialog(cx))
             });
         content.into_any()
     }

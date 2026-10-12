@@ -34,7 +34,8 @@ impl InProcessConnection {
             ClientRequest::Control(ControlRequest::GetWorkerNodeStatus) => {
                 self.control_dispatch(request, request_id)
             }
-            ClientRequest::Control(ControlRequest::GetArchiveRetentionPolicy) => {
+            ClientRequest::Control(ControlRequest::GetArchiveRetentionPolicy)
+            | ClientRequest::Control(ControlRequest::SetArchiveRetentionPolicy { .. }) => {
                 self.control_dispatch(request, request_id)
             }
             ClientRequest::Workspace(WorkspaceRequest::CreateWorkspace { .. }) => {

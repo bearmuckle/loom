@@ -9,6 +9,9 @@ pub enum Capability {
     ReadAgentSession,
     ControlAgentSession,
     DeleteAgentSession,
+    /// Allows a client to change the archive-retention policy this worker
+    /// applies. Reading the policy stays on [`Capability::ReadWorkerNodeStatus`].
+    ConfigureArchiveRetention,
     SubscribeSessionEvents,
     SubscribeWorkspaceEvents,
     StartAgentRun,

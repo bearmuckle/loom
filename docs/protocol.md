@@ -320,9 +320,27 @@ Clients should render unavailable values as `n/a`.
 `GetArchiveRetentionPolicy` is read-only and returns
 `archive_retention_policy { retention_ms, force_discard_worktrees }`. It
 requires the `read_worker_node_status` capability. `retention_ms` is `null` or
-zero when retention is disabled. Automatic deletion is an internal backend
-operation rather than a client request: a client reads the active policy and
-observes the resulting session removals.
+zero when retention is disabled.
+
+`SetArchiveRetentionPolicy { policy }` replaces that policy and answers with the
+normalized policy that was stored, so the caller sees exactly what the worker
+will apply from its next sweep. It is a retryable mutation and requires the
+separate `configure_archive_retention` capability, so a client that may only
+read the worker status cannot turn automatic deletion on. A zero or absent
+`retention_ms` disables retention while `force_discard_worktrees` is kept as
+sent. The policy is stored in durable state and survives a restart; changing it
+takes effect at the next sweep, because a change does not start one, and it
+requires durable storage, so an in-memory worker refuses the request with
+`unsupported_capability`.
+
+A worker resolves its retention policy at startup in one order: an explicit
+`--archive-retention`/`LOOM_ARCHIVE_RETENTION` window (with
+`--archive-retention-force-discard`/`LOOM_ARCHIVE_RETENTION_FORCE_DISCARD`) wins
+over the persisted policy and is persisted in turn, otherwise the policy loaded
+when the durable state was opened applies, otherwise retention is disabled. The
+startup log names the source that won. Automatic deletion itself remains an
+internal backend operation rather than a client request: a client reads or sets
+the active policy and observes the resulting session removals.
 
 Session-card indicators pulse smoothly only while CPU usage is above the
 workspace-configured threshold. The online color changes to red only after
