@@ -1,5 +1,40 @@
 use super::*;
 
+/// Copies each project agent's authoritative `state` onto the matching session
+/// snapshot, returning how many entries actually changed.
+///
+/// A project snapshot is polled on its own cadence while the session list is
+/// only rebuilt by a full reload. Without this, a delegated agent that has since
+/// finished keeps whatever state the list held when it was first loaded, so its
+/// project row keeps reporting activity until the client is reloaded.
+///
+/// The session named by `skip` is left alone: its state is owned by its own
+/// event stream, which a possibly older snapshot must not regress. Sessions the
+/// snapshot does not mention are untouched, and the snapshot adds no entries.
+pub(crate) fn apply_project_agent_states(
+    sessions: &mut [AgentSessionSnapshot],
+    project: &loom_core::ProjectSnapshot,
+    skip: AgentSessionId,
+) -> usize {
+    let mut changed = 0;
+    for agent in &project.agents {
+        if agent.session_id == skip {
+            continue;
+        }
+        let Some(session) = sessions
+            .iter_mut()
+            .find(|session| session.id == agent.session_id)
+        else {
+            continue;
+        };
+        if session.state != agent.state {
+            session.state = agent.state;
+            changed += 1;
+        }
+    }
+    changed
+}
+
 impl LoomView {
     pub(crate) fn refresh_active_project_snapshot(&mut self, cx: &mut Context<Self>) {
         let session_id = self.active_session.id;
@@ -27,6 +62,12 @@ impl LoomView {
                     Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(snapshot))) => {
                         reload_sessions =
                             project_snapshot_has_unloaded_agent_sessions(&snapshot, &view.sessions);
+                        // The snapshot is authoritative for the agents it
+                        // carries, so apply their states instead of waiting for
+                        // a reload to notice that work has finished. The active
+                        // session is skipped because its own event stream owns
+                        // its state.
+                        apply_project_agent_states(&mut view.sessions, &snapshot, session_id);
                         view.project_tree_snapshots
                             .retain(|known| known.project_id != snapshot.project_id);
                         view.project_tree_snapshots.push(snapshot.clone());
@@ -100,6 +141,13 @@ impl LoomView {
                     if let Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(snapshot))) =
                         response.result
                     {
+                        // Even without a project open in the pane, the snapshot
+                        // updates the state of every session it covers.
+                        apply_project_agent_states(
+                            &mut view.sessions,
+                            &snapshot,
+                            view.active_session.id,
+                        );
                         view.project_tree_snapshots
                             .retain(|known| known.project_id != snapshot.project_id);
                         view.project_tree_snapshots.push(snapshot);
