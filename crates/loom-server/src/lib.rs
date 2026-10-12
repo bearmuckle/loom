@@ -139,9 +139,9 @@ pub use remote::{
 pub use retention::{
     ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FLAG, ARCHIVE_RETENTION_FORCE_DISCARD_ENV,
     ARCHIVE_RETENTION_FORCE_DISCARD_FLAG, ARCHIVE_RETENTION_SWEEP_INTERVAL, ArchiveRetentionSource,
-    ArchiveSweepReport, ArchiveSweepSkip, apply_startup_archive_retention, parse_force_discard,
-    parse_retention_window, resolve_archive_retention, run_archive_retention_sweeps,
-    sweep_archive_retention_at_startup,
+    ArchiveRetentionSweepDriver, ArchiveSweepReport, ArchiveSweepSkip,
+    apply_startup_archive_retention, parse_force_discard, parse_retention_window,
+    resolve_archive_retention, run_archive_retention_sweeps, sweep_archive_retention_at_startup,
 };
 
 const DEFAULT_EVENT_RETENTION: usize = 4096;

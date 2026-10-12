@@ -813,4 +813,31 @@ mod tests {
                 .contains("remove worker-node credential")
         );
     }
+
+    #[test]
+    fn an_in_memory_owned_backend_runs_no_retention_sweep() {
+        let backend = OwnedBackend::new();
+        assert!(
+            !backend.runs_archive_retention_sweeps(),
+            "an in-memory backend cannot store a policy, so it needs no sweep"
+        );
+        backend.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_durable_owned_backend_runs_the_archive_retention_sweep() {
+        let path = env::temp_dir().join(format!("loom-local-retention-{}.db", WorkspaceId::new()));
+        let backend = OwnedBackend::new_persistent(path.clone()).expect("durable backend");
+        assert!(
+            backend.runs_archive_retention_sweeps(),
+            "a durable embedded backend must sweep expired archived sessions"
+        );
+        // Shutting down stops the sweep before the backend releases its
+        // database, so a second shutdown would not race a round.
+        backend.shutdown().unwrap();
+        drop(backend);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(path.with_extension("session-roots"));
+        let _ = fs::remove_dir_all(path.with_extension("clone-cache"));
+    }
 }

@@ -172,7 +172,9 @@ archived project tree: a descendant that is not archived or a child task that is
 not terminal skips the project. `--archive-retention-force-discard`, or
 `LOOM_ARCHIVE_RETENTION_FORCE_DISCARD` (default off), lets the sweep discard
 dirty or locked worktrees; without it, the sweep skips such a project, logs the
-reason, and retries later.
+reason, and retries later. The native desktop client runs the same sweep for the
+durable backend it embeds, so a retention policy set from the client acts even
+without a separate `loom-server` process.
 
 ## Network policy
 

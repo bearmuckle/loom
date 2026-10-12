@@ -12,23 +12,36 @@ use std::{
 use loom_core::{ErrorCode, LoomError, Result};
 use loom_model::ModelId;
 use loom_protocol::{RequestEnvelope, ResponseEnvelope};
+use loom_server::{ARCHIVE_RETENTION_SWEEP_INTERVAL, ArchiveRetentionSweepDriver};
 
 /// An owned in-process backend embedded in a native client.
 pub struct OwnedBackend {
     inner: Arc<loom_server::InProcessBackend>,
+    /// The background archive-retention sweep, present only for a durable
+    /// backend that can store a retention policy. Dropping it stops the sweep
+    /// before the backend releases its database.
+    retention_sweeps: Mutex<Option<ArchiveRetentionSweepDriver>>,
 }
 
 impl OwnedBackend {
     pub fn new() -> Self {
         Self {
             inner: loom_server::InProcessBackend::new(),
+            retention_sweeps: Mutex::new(None),
         }
     }
 
     pub fn demo_with_github_copilot() -> Result<Self> {
         Ok(Self {
             inner: loom_server::InProcessBackend::demo_with_github_copilot()?,
+            retention_sweeps: Mutex::new(None),
         })
+    }
+
+    pub fn new_persistent(path: PathBuf) -> Result<Self> {
+        Ok(Self::with_retention_sweeps(
+            loom_server::InProcessBackend::new_persistent(path)?,
+        ))
     }
 
     pub fn with_openai_compatible_persistent_with_github_copilot(
@@ -37,17 +50,34 @@ impl OwnedBackend {
         model: ModelId,
         path: PathBuf,
     ) -> Result<Self> {
-        Ok(Self {
-            inner: loom_server::InProcessBackend::with_openai_compatible_persistent_with_github_copilot(
+        Ok(Self::with_retention_sweeps(
+            loom_server::InProcessBackend::with_openai_compatible_persistent_with_github_copilot(
                 endpoint, api_key, model, path,
             )?,
-        })
+        ))
     }
 
     pub fn new_persistent_with_github_copilot(path: PathBuf) -> Result<Self> {
-        Ok(Self {
-            inner: loom_server::InProcessBackend::new_persistent_with_github_copilot(path)?,
-        })
+        Ok(Self::with_retention_sweeps(
+            loom_server::InProcessBackend::new_persistent_with_github_copilot(path)?,
+        ))
+    }
+
+    /// Wraps a durable backend and starts the archive-retention sweep.
+    ///
+    /// A native client that embeds its backend has no server process to run the
+    /// sweep, so without this an archived session would stay forever however the
+    /// retention policy is set. Starting is best-effort: a driver that cannot
+    /// start its thread logs the reason there instead of failing the client.
+    fn with_retention_sweeps(inner: Arc<loom_server::InProcessBackend>) -> Self {
+        let driver = ArchiveRetentionSweepDriver::start(
+            Arc::clone(&inner),
+            ARCHIVE_RETENTION_SWEEP_INTERVAL,
+        );
+        Self {
+            inner,
+            retention_sweeps: Mutex::new(Some(driver)),
+        }
     }
 
     pub fn connect(&self) -> LocalConnection {
@@ -55,7 +85,21 @@ impl OwnedBackend {
     }
 
     pub fn shutdown(&self) -> Result<()> {
+        // Stop the sweep before the backend releases its database, so no round
+        // runs against a shutting-down store.
+        if let Ok(mut driver) = self.retention_sweeps.lock() {
+            drop(driver.take());
+        }
         self.inner.shutdown()
+    }
+
+    /// Whether a background archive-retention sweep is running for this backend.
+    #[cfg(test)]
+    pub(crate) fn runs_archive_retention_sweeps(&self) -> bool {
+        self.retention_sweeps
+            .lock()
+            .map(|driver| driver.is_some())
+            .unwrap_or(false)
     }
 }
 
