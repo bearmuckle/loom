@@ -147,12 +147,12 @@ including every descendant session and its worktrees, and it does not have to be
 archived first: the backend cancels the live work first, interrupting the
 project manager's own run and then every running sub-agent, so a project can be
 removed while its manager and children are still working. Deleting a descendant
-removes only that session and still requires it to be archived. The
-delete action carries a force choice for a linked worktree that has changes or a
-lock: without it, the deletion is refused and the worktree is preserved. The
-view displays the active retention policy read-only, so a user can see whether
-the backend removes old archived sessions automatically and whether that sweep
-may discard dirty or locked worktrees.
+removes only that session and still requires it to be archived. The delete
+action carries a force choice for a linked worktree that has changes or a lock:
+without it, the deletion is refused and the worktree is preserved. The retention
+policy is editable in that view rather than read-only: a user sets the window and
+the force-discard switch, the worker stores that policy durably, and it applies
+from the next sweep.
 
 ## Guiding principles
 

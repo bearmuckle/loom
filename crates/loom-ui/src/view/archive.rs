@@ -3,10 +3,12 @@
 //! It lists the archived sessions of the workspaces this client already knows,
 //! grouped by the project the backend projects for them. Nothing here guesses a
 //! hierarchy: the grouping uses `GetProjectSnapshotForSession`, the same
-//! authoritative projection the sidebar uses, and the retention text reads the
+//! authoritative projection the sidebar uses, and the retention card edits the
 //! policy the backend reports.
 
 use super::*;
+use loom_core::Capability;
+use loom_protocol::ArchiveRetentionPolicy;
 
 /// How many characters of a session id stand in for a project label when the
 /// project root is not itself among the archived sessions.
@@ -95,6 +97,76 @@ impl RetentionPolicyText {
                     },
                 }
             }
+        }
+    }
+}
+
+/// The retention windows the card's editor offers, "Off" first.
+pub(crate) const RETENTION_WINDOW_PRESETS: [Option<Duration>; 6] = [
+    None,
+    Some(Duration::from_secs(86_400)),
+    Some(Duration::from_secs(7 * 86_400)),
+    Some(Duration::from_secs(14 * 86_400)),
+    Some(Duration::from_secs(30 * 86_400)),
+    Some(Duration::from_secs(90 * 86_400)),
+];
+
+/// The label of the choice that turns automatic deletion off.
+const RETENTION_OFF_LABEL: &str = "Off";
+
+/// What one window choice of the card means for the draft.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetentionWindowChoice {
+    /// No automatic deletion.
+    Off,
+    /// A window the card offers as a preset.
+    Window(Duration),
+    /// The stored window no preset covers. Choosing it keeps that window.
+    Custom,
+}
+
+/// Reads a choice label back to what it means for the draft.
+pub(crate) fn retention_window_choice(label: &str) -> RetentionWindowChoice {
+    if label == RETENTION_OFF_LABEL {
+        return RetentionWindowChoice::Off;
+    }
+    RETENTION_WINDOW_PRESETS
+        .iter()
+        .flatten()
+        .find(|window| retention_window_label(**window) == label)
+        .map_or(RetentionWindowChoice::Custom, |window| {
+            RetentionWindowChoice::Window(*window)
+        })
+}
+
+/// The label of one window choice.
+fn retention_window_choice_label(window: Option<Duration>) -> String {
+    match window {
+        None => RETENTION_OFF_LABEL.to_owned(),
+        Some(window) => retention_window_label(window),
+    }
+}
+
+/// The card's window choices and the one a policy selects.
+///
+/// A stored window that matches no preset is offered as its own
+/// `Custom (…)` entry instead of being passed off as a preset, so it stays in
+/// place until the user picks another value.
+pub(crate) fn retention_window_choices(policy: ArchiveRetentionPolicy) -> (Vec<String>, String) {
+    let mut choices = RETENTION_WINDOW_PRESETS
+        .iter()
+        .map(|window| retention_window_choice_label(*window))
+        .collect::<Vec<_>>();
+    let stored = policy.retention();
+    match stored {
+        Some(window) if !RETENTION_WINDOW_PRESETS.contains(&Some(window)) => {
+            let label = format!("Custom ({})", retention_window_label(window));
+            choices.push(label.clone());
+            (choices, label)
+        }
+        _ => {
+            let label = retention_window_choice_label(stored);
+            (choices, label)
         }
     }
 }
@@ -263,6 +335,19 @@ pub(crate) struct ArchivedSessionsState {
     /// not already have are requested.
     pub(crate) projects: Vec<loom_core::ProjectSnapshot>,
     pub(crate) retention: RetentionPolicyState,
+    /// Whether the active backend advertises `ConfigureArchiveRetention`, so the
+    /// card can store a change. A worker without durable storage does not.
+    pub(crate) retention_editable: bool,
+    /// The policy the card's controls edit. `Some` only while the card is an
+    /// editor, so a read-only card holds no draft.
+    pub(crate) retention_draft: Option<ArchiveRetentionPolicy>,
+    /// A `SetArchiveRetentionPolicy` request in flight.
+    pub(crate) retention_saving: bool,
+    /// A save the worker confirmed, shown until the draft is edited again.
+    pub(crate) retention_saved: bool,
+    /// The last refused save and the backend's reason, which keeps the policy
+    /// the worker reported.
+    pub(crate) retention_refusal: Option<String>,
     /// A load failure, shown without hiding what did load.
     pub(crate) error: Option<String>,
     /// The last refused delete and the backend's reason.
@@ -298,6 +383,117 @@ impl LoomView {
             self.archived_sessions.force.insert(session_id);
         } else {
             self.archived_sessions.force.remove(&session_id);
+        }
+        cx.notify();
+    }
+
+    /// Sets the draft's force-discard switch: whether the sweep may discard a
+    /// worktree that has changes or a lock.
+    pub(crate) fn set_archive_retention_force(&mut self, force: bool, cx: &mut Context<Self>) {
+        let Some(draft) = self.archived_sessions.retention_draft.as_mut() else {
+            return;
+        };
+        if draft.force_discard_worktrees == force {
+            return;
+        }
+        draft.force_discard_worktrees = force;
+        self.archived_sessions.retention_saved = false;
+        cx.notify();
+    }
+
+    /// Applies a window choice of the card's editor to the draft.
+    ///
+    /// The custom entry keeps the window the worker stored, which is the only
+    /// thing that entry can mean, so a stored window no preset covers survives
+    /// until the user picks another value.
+    pub(crate) fn choose_archive_retention_window(&mut self, choice: &str, cx: &mut Context<Self>) {
+        let window = match retention_window_choice(choice) {
+            RetentionWindowChoice::Off => None,
+            RetentionWindowChoice::Window(window) => Some(window.as_millis() as u64),
+            RetentionWindowChoice::Custom => return,
+        };
+        let Some(draft) = self.archived_sessions.retention_draft.as_mut() else {
+            return;
+        };
+        if draft.retention_ms == window {
+            return;
+        }
+        draft.retention_ms = window;
+        self.archived_sessions.retention_saved = false;
+        cx.notify();
+    }
+
+    /// Whether the draft differs from the policy the worker reported.
+    pub(crate) fn archive_retention_draft_is_dirty(&self) -> bool {
+        match (
+            &self.archived_sessions.retention_draft,
+            &self.archived_sessions.retention,
+        ) {
+            (Some(draft), RetentionPolicyState::Available(policy)) => draft != policy,
+            _ => false,
+        }
+    }
+
+    /// Writes the draft policy to the active backend, which stores it durably
+    /// and answers with the policy it stored.
+    pub(crate) fn save_archive_retention_policy(&mut self, cx: &mut Context<Self>) {
+        if self.archived_sessions.retention_saving {
+            log::info!("[loom-ui] ignoring the archive-retention change: a save is in flight");
+            return;
+        }
+        let Some(policy) = self.archived_sessions.retention_draft else {
+            return;
+        };
+        if !self.archive_retention_draft_is_dirty() {
+            return;
+        }
+        self.archived_sessions.retention_saving = true;
+        self.archived_sessions.retention_saved = false;
+        self.archived_sessions.retention_refusal = None;
+        log::info!("[loom-ui] storing the archive retention policy {policy:?}");
+        self.dispatch(
+            cx,
+            ClientRequest::Control(ControlRequest::SetArchiveRetentionPolicy { policy }),
+            |view, response, cx| view.finish_archive_retention_save(response, cx),
+        );
+        cx.notify();
+    }
+
+    /// Applies the answer to a retention-policy save.
+    ///
+    /// The card adopts the policy in the answer, so it shows exactly what the
+    /// worker stored rather than what was asked for. A refusal shows the
+    /// backend's reason and keeps the stored policy; the draft stays as the
+    /// user left it, so the change can be retried.
+    pub(crate) fn finish_archive_retention_save(
+        &mut self,
+        response: ResponseEnvelope,
+        cx: &mut Context<Self>,
+    ) {
+        self.archived_sessions.retention_saving = false;
+        match response.result {
+            Ok(ServerResponse::Control(ControlResponse::ArchiveRetentionPolicy(stored))) => {
+                log::info!("[loom-ui] stored the archive retention policy {stored:?}");
+                self.archived_sessions.retention = RetentionPolicyState::Available(stored);
+                self.archived_sessions.retention_draft = Some(stored);
+                self.archived_sessions.retention_saved = true;
+                self.archived_sessions.retention_refusal = None;
+            }
+            Err(error) => {
+                log::warn!(
+                    "[loom-ui] storing the archive retention policy was refused: {:?}: {}",
+                    error.code,
+                    error.message
+                );
+                self.archived_sessions.retention_refusal = Some(error.message);
+            }
+            Ok(response) => {
+                log::warn!(
+                    "[loom-ui] storing the archive retention policy returned an unexpected response"
+                );
+                let error = unexpected_response("archive retention policy", response);
+                self.archived_sessions.retention_refusal = Some(error.message);
+            }
         }
         cx.notify();
     }
@@ -392,8 +588,18 @@ impl LoomView {
                 }
             }
             let retention = retention_policy(&retention_backend).await;
+            // The card is an editor only when the worker can store a change, so
+            // a worker without durable storage keeps the read-only card.
+            let retention_editable = archive_retention_editable(&retention_backend).await;
             view.update(cx, |view, cx| {
-                view.finish_archived_sessions_load(entries, known_projects, retention, errors, cx);
+                view.finish_archived_sessions_load(
+                    entries,
+                    known_projects,
+                    retention,
+                    retention_editable,
+                    errors,
+                    cx,
+                );
             })
             .ok();
         })
@@ -406,6 +612,7 @@ impl LoomView {
         entries: Vec<ArchivedSessionEntry>,
         projects: Vec<loom_core::ProjectSnapshot>,
         retention: RetentionPolicyState,
+        retention_editable: bool,
         errors: Vec<LoomError>,
         cx: &mut Context<Self>,
     ) {
@@ -422,6 +629,19 @@ impl LoomView {
             .filter(|project| seen_projects.insert(project.project_id))
             .collect();
         self.archived_sessions.retention = retention;
+        // The editor starts from the policy the worker reports and is offered
+        // only when the worker can store a change. A load discards an unapplied
+        // draft, so the card always shows the policy in effect.
+        let stored = match &self.archived_sessions.retention {
+            RetentionPolicyState::Available(policy) => Some(*policy),
+            RetentionPolicyState::Loading | RetentionPolicyState::Unavailable => None,
+        };
+        let editable = retention_editable && stored.is_some();
+        self.archived_sessions.retention_editable = editable;
+        self.archived_sessions.retention_draft = if editable { stored } else { None };
+        self.archived_sessions.retention_saving = false;
+        self.archived_sessions.retention_saved = false;
+        self.archived_sessions.retention_refusal = None;
         self.archived_sessions.force.retain(|session_id| {
             self.archived_sessions
                 .entries
@@ -631,6 +851,44 @@ pub(crate) fn retention_policy_state(
                 error.message
             );
             RetentionPolicyState::Unavailable
+        }
+    }
+}
+
+/// Whether the active backend can store a changed archive-retention policy.
+async fn archive_retention_editable(backend: &BackendWorker) -> bool {
+    let response = backend
+        .submit(RequestEnvelope::new(ClientRequest::Control(
+            ControlRequest::GetWorkerNodeStatus,
+        )))
+        .wait()
+        .await;
+    retention_editable_state(response.result)
+}
+
+/// Maps a worker-node-status answer to whether the card can offer an editor.
+///
+/// The capability is what a worker with durable storage advertises, so a worker
+/// without one stays read-only instead of offering a control that its answer to
+/// every save would refuse.
+pub(crate) fn retention_editable_state(result: Result<ServerResponse, LoomError>) -> bool {
+    match result {
+        Ok(ServerResponse::Control(ControlResponse::WorkerNodeStatus(status))) => status
+            .capabilities
+            .contains(Capability::ConfigureArchiveRetention),
+        Ok(response) => {
+            log::debug!(
+                "[loom-ui] the worker-node-status request returned an unexpected response: {response:?}; the retention policy stays read-only"
+            );
+            false
+        }
+        Err(error) => {
+            log::debug!(
+                "[loom-ui] the worker-node-status request failed: {:?}: {}; the retention policy stays read-only",
+                error.code,
+                error.message
+            );
+            false
         }
     }
 }

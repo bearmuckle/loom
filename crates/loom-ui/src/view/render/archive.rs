@@ -1,6 +1,11 @@
 use super::*;
-use crate::view::archive::{ArchivedSessionRow, RetentionPolicyText, archived_session_groups};
+use crate::view::archive::{
+    ArchivedSessionRow, RetentionPolicyState, RetentionPolicyText, archived_session_groups,
+    retention_window_choices,
+};
+use gpui_kit::WeakEntity;
 use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectState};
 
 /// How one archived-session row is drawn: its position in the list, the force
 /// choice the user made for it, and the layout it renders into.
@@ -15,7 +20,8 @@ struct ArchivedSessionRowStyle {
 impl LoomView {
     /// The archived-session management surface: every archived session the
     /// known workspaces hold, grouped by project, with a delete action and the
-    /// active retention policy read-only.
+    /// active backend's retention policy, which can be edited when the worker
+    /// behind that backend can store a change.
     pub(crate) fn render_archived_sessions(
         &self,
         layout: ResponsiveLayout,
@@ -28,26 +34,8 @@ impl LoomView {
             &self.archived_sessions.projects,
             now,
         );
-        let retention = RetentionPolicyText::of(&self.archived_sessions.retention);
         let mut content = div().w_full().flex().flex_col().gap_4();
 
-        let mut policy_card = div().px_4().py_3().flex().flex_col().gap_1().child(
-            div()
-                .id("archive-retention-policy")
-                .test_support()
-                .text_sm()
-                .child(retention.headline.clone()),
-        );
-        if !retention.detail.is_empty() {
-            policy_card = policy_card.child(
-                div()
-                    .id("archive-retention-detail")
-                    .test_support()
-                    .text_xs()
-                    .text_color(rgb(0x8f98a6))
-                    .child(retention.detail.clone()),
-            );
-        }
         content = content.child(
             div()
                 .w_full()
@@ -55,16 +43,7 @@ impl LoomView {
                 .flex_col()
                 .gap_2()
                 .child(settings_section_heading("RETENTION POLICY"))
-                .child(
-                    settings_card().child(
-                        policy_card.child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(0x64748b))
-                                .child("Set by the operator; this view is read-only."),
-                        ),
-                    ),
-                ),
+                .child(settings_card().child(self.render_archive_retention_card(cx))),
         );
 
         if let Some(refusal) = &self.archived_sessions.refusal {
@@ -249,6 +228,152 @@ impl LoomView {
             .into_any()
     }
 
+    /// The retention-policy card.
+    ///
+    /// It is an editor when the worker behind the active backend can store a
+    /// change; a worker that reports no policy, and one that advertises no
+    /// `ConfigureArchiveRetention`, keep the read-only text with a short
+    /// explanation instead of controls.
+    fn render_archive_retention_card(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let state = &self.archived_sessions;
+        let stored = match &state.retention {
+            RetentionPolicyState::Available(policy) => Some(*policy),
+            RetentionPolicyState::Loading | RetentionPolicyState::Unavailable => None,
+        };
+        // The card is an editor only when the worker reported a policy and can
+        // replace it; the load keeps a draft exactly then, so all three facts
+        // have to agree before the controls are drawn.
+        let draft = match (state.retention_editable, stored, state.retention_draft) {
+            (true, Some(_), Some(draft)) => Some(draft),
+            _ => None,
+        };
+        let Some(draft) = draft else {
+            let reason = stored.map(|_| {
+                "This worker does not store policy changes, so it keeps the policy it started with."
+                    .to_owned()
+            });
+            return render_retention_policy_text(RetentionPolicyText::of(&state.retention), reason);
+        };
+
+        let (choices, selected) = retention_window_choices(draft);
+        let saving = state.retention_saving;
+        let worker = self
+            .node_names
+            .get(&self.default_backend_node_id)
+            .cloned()
+            .unwrap_or_else(|| self.default_backend_node_id.clone());
+        let status = if saving {
+            div()
+                .id("archive-retention-saving")
+                .test_support()
+                .text_xs()
+                .text_color(rgb(0x8f98a6))
+                .child("Storing the policy…")
+        } else if state.retention_saved {
+            div()
+                .id("archive-retention-saved")
+                .test_support()
+                .text_xs()
+                .text_color(rgb(0x8f98a6))
+                .child("Stored.")
+        } else if self.archive_retention_draft_is_dirty() {
+            div()
+                .id("archive-retention-pending")
+                .test_support()
+                .text_xs()
+                .text_color(rgb(0x8f98a6))
+                .child("Not stored yet.")
+        } else {
+            div()
+                .id("archive-retention-current")
+                .test_support()
+                .text_xs()
+                .text_color(rgb(0x8f98a6))
+                .child("Stored on the worker.")
+        };
+
+        let mut card = div()
+            .px_4()
+            .py_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0xf3f4f6))
+                    .child("Delete archived sessions after"),
+            )
+            .child(RetentionWindowSelect::new(
+                ("archive-retention-window", 0usize),
+                cx.entity().downgrade(),
+                choices,
+                selected,
+                saving,
+            ))
+            .child(
+                Checkbox::new("archive-retention-force")
+                    .checked(draft.force_discard_worktrees)
+                    .disabled(saving)
+                    .label("Force delete, discarding dirty or locked worktrees")
+                    .on_change({
+                        let view = cx.entity();
+                        move |checked, _, cx| {
+                            let checked = *checked;
+                            view.update(cx, |view, cx| {
+                                view.set_archive_retention_force(checked, cx);
+                            });
+                        }
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Button::new("apply-archive-retention")
+                            .label("Apply")
+                            .small()
+                            .disabled(saving || !self.archive_retention_draft_is_dirty())
+                            .accessibility_label("Apply the archive retention policy")
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.save_archive_retention_policy(cx);
+                            })),
+                    )
+                    .child(status),
+            )
+            .child(
+                div()
+                    .id("archive-retention-worker")
+                    .test_support()
+                    .text_xs()
+                    .text_color(rgb(0x64748b))
+                    .child(format!(
+                        "Stores on {worker} · the change applies from the next sweep."
+                    )),
+            );
+        if let Some(refusal) = &state.retention_refusal {
+            card = card.child(
+                div()
+                    .id("archive-retention-refusal")
+                    .test_support()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
+                    .bg(rgb(0x2a1c22))
+                    .border_1()
+                    .border_color(rgb(0x7f1d1d))
+                    .text_sm()
+                    .text_color(rgb(0xfca5a5))
+                    .child(format!("Change refused: {refusal}")),
+            );
+        }
+        card.into_any_element()
+    }
+
     /// One archived-session row: its name, worker, archive age, the force
     /// choice, and the delete action.
     fn render_archived_session_row(
@@ -369,5 +494,155 @@ impl LoomView {
                     .child(format!("{worker} · {consequence}")),
             )
             .child(controls)
+    }
+}
+
+/// The read-only retention text: the headline, its supporting line, and an
+/// optional explanation of why the card offers no editor.
+fn render_retention_policy_text(
+    text: RetentionPolicyText,
+    reason: Option<String>,
+) -> gpui_kit::AnyElement {
+    let mut card = div().px_4().py_3().flex().flex_col().gap_1().child(
+        div()
+            .id("archive-retention-policy")
+            .test_support()
+            .text_sm()
+            .child(text.headline),
+    );
+    if !text.detail.is_empty() {
+        card = card.child(
+            div()
+                .id("archive-retention-detail")
+                .test_support()
+                .text_xs()
+                .text_color(rgb(0x8f98a6))
+                .child(text.detail),
+        );
+    }
+    if let Some(reason) = reason {
+        card = card.child(
+            div()
+                .id("archive-retention-read-only")
+                .test_support()
+                .text_xs()
+                .text_color(rgb(0x64748b))
+                .child(reason),
+        );
+    }
+    card.into_any_element()
+}
+
+/// The retention-window Select of the card's editor.
+///
+/// A `SelectState` is created with a window, and the archived-sessions dialog
+/// renders without one, so the control's state lives in the window that draws
+/// it, keyed by this element's identity, and is created on the first frame that
+/// draws the editor. Its confirmation goes to the view, which owns the draft.
+#[derive(IntoElement)]
+struct RetentionWindowSelect {
+    id: (&'static str, usize),
+    view: WeakEntity<LoomView>,
+    choices: Vec<String>,
+    selected: String,
+    disabled: bool,
+}
+
+/// The window-owned state of one retention-window Select: the control plus what
+/// it was last given, so its items and value are only rewritten when they differ.
+struct RetentionWindowSelectState {
+    select: Entity<SelectState<SearchableVec<String>>>,
+    choices: Vec<String>,
+    selected: String,
+    /// Held so the control keeps reporting confirmations while the window keeps
+    /// this state.
+    _confirm: Subscription,
+}
+
+impl RetentionWindowSelect {
+    fn new(
+        id: (&'static str, usize),
+        view: WeakEntity<LoomView>,
+        choices: Vec<String>,
+        selected: String,
+        disabled: bool,
+    ) -> Self {
+        Self {
+            id,
+            view,
+            choices,
+            selected,
+            disabled,
+        }
+    }
+
+    /// The row of `selected` in `choices`, which the control seeds its cursor
+    /// from.
+    fn selected_row(choices: &[String], selected: &str) -> Option<IndexPath> {
+        choices
+            .iter()
+            .position(|choice| choice == selected)
+            .map(|row| IndexPath::default().row(row))
+    }
+}
+
+impl RenderOnce for RetentionWindowSelect {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let state = window.use_keyed_state(self.id, cx, |window, cx| {
+            let view = self.view.clone();
+            let select = cx.new(|cx| {
+                SelectState::new(
+                    SearchableVec::new(self.choices.clone()),
+                    RetentionWindowSelect::selected_row(&self.choices, &self.selected),
+                    window,
+                    cx,
+                )
+            });
+            let confirm = cx.subscribe(
+                &select,
+                move |_, _, event: &SelectEvent<SearchableVec<String>>, cx| {
+                    let SelectEvent::Confirm(Some(choice)) = event else {
+                        return;
+                    };
+                    let choice = choice.clone();
+                    if let Some(view) = view.upgrade() {
+                        view.update(cx, |view, cx| {
+                            view.choose_archive_retention_window(&choice, cx);
+                        });
+                    }
+                },
+            );
+            RetentionWindowSelectState {
+                select,
+                choices: self.choices.clone(),
+                selected: self.selected.clone(),
+                _confirm: confirm,
+            }
+        });
+
+        let up_to_date = {
+            let state = state.read(cx);
+            state.choices == self.choices && state.selected == self.selected
+        };
+        if !up_to_date {
+            state.update(cx, |state, cx| {
+                state.select.update(cx, |select, cx| {
+                    // The items come first: the value is matched against them,
+                    // so a new custom entry has to exist before it is selected.
+                    select.set_items(SearchableVec::new(self.choices.clone()), window, cx);
+                    select.set_selected_value(&self.selected, window, cx);
+                });
+                state.choices = self.choices.clone();
+                state.selected = self.selected.clone();
+            });
+        }
+
+        let select = state.read(cx).select.clone();
+        Select::new(&select)
+            .id(self.id)
+            .small()
+            .disabled(self.disabled)
+            .accessibility_label("Delete archived sessions after")
+            .into_any_element()
     }
 }
