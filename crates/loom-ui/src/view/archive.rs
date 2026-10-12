@@ -1,17 +1,19 @@
 //! The archived-session management surface.
 //!
-//! It lists the archived sessions of the workspaces this client already knows,
-//! grouped by the project the backend projects for them. Nothing here guesses a
-//! hierarchy: the grouping uses `GetProjectSnapshotForSession`, the same
+//! It lists the archived sessions of the workspaces this client already knows as
+//! one row per project, because a project's member sessions are deleted with it,
+//! plus a row for every archived session no project covers. Nothing here guesses
+//! a hierarchy: the grouping uses `GetProjectSnapshotForSession`, the same
 //! authoritative projection the sidebar uses, and the retention card edits the
-//! policy the backend reports.
+//! policy the backend reports. Deleting a whole project goes through a
+//! confirmation the surface and the project context menu share.
 
 use super::*;
 use loom_core::Capability;
 use loom_protocol::ArchiveRetentionPolicy;
 
-/// How many characters of a session id stand in for a project label when the
-/// project root is not itself among the archived sessions.
+/// How many characters of a session id stand in for a project label when neither
+/// the archived entries nor the client's session list name the project root.
 const SHORT_SESSION_ID_CHARS: usize = 8;
 
 /// The heading for archived sessions that belong to no project.
@@ -25,26 +27,61 @@ pub(crate) struct ArchivedSessionEntry {
     pub(crate) session: AgentSessionSnapshot,
 }
 
-/// One archived session row: its rendered archive age, and — for a project root
-/// — how many descendant sessions a delete cascades to.
+/// One archived-session row.
+///
+/// A project contributes exactly one row, which carries the whole tree: the
+/// member sessions are deleted with it and are never listed on their own. A
+/// session no project covers is a plain row that deletes itself.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ArchivedSessionRow {
+    /// The session a deletion targets: the project root, or the session itself.
+    pub(crate) session_id: AgentSessionId,
+    /// The heading: the project root's name, or the session's name.
+    pub(crate) label: String,
+    /// The worker the deletion is routed to.
     pub(crate) node_id: String,
-    pub(crate) session: AgentSessionSnapshot,
-    /// `Archived 3d ago`, derived from the session's archive timestamp.
+    /// `Archived 3d ago`, from the newest archived member's archive timestamp.
     pub(crate) age: String,
-    pub(crate) is_project_root: bool,
-    pub(crate) descendant_count: usize,
+    /// How many sessions a deletion removes: the whole tree for a project row,
+    /// one for a plain row.
+    pub(crate) session_count: usize,
+    /// Whether the row deletes a whole project.
+    pub(crate) is_project: bool,
 }
 
 /// Archived sessions grouped by project, with an explicit group for sessions
 /// that belong to no project.
+///
+/// A project group holds exactly one row: the project. The group label repeats
+/// the row's heading so the group reads as the tree it stands for.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ArchivedSessionGroup {
     /// The project root, or `None` for the no-project group.
     pub(crate) project_root: Option<AgentSessionId>,
     pub(crate) label: String,
     pub(crate) rows: Vec<ArchivedSessionRow>,
+}
+
+impl ArchivedSessionGroup {
+    /// The trailing detail of the group heading.
+    pub(crate) fn heading_detail(&self) -> String {
+        match self.rows.as_slice() {
+            [row] if row.is_project => format!(
+                "{} in the tree",
+                match row.session_count {
+                    1 => "1 session".to_owned(),
+                    count => format!("{count} sessions"),
+                }
+            ),
+            rows => format!(
+                "{} archived",
+                match rows.len() {
+                    1 => "1 session".to_owned(),
+                    count => format!("{count} sessions"),
+                }
+            ),
+        }
+    }
 }
 
 /// The archive-retention policy the surface can render.
@@ -219,14 +256,97 @@ fn short_session_id(session_id: AgentSessionId) -> String {
         .collect()
 }
 
+/// Whether a project snapshot describes a real project.
+///
+/// `GetProjectSnapshotForSession` answers with a one-member snapshot for an
+/// ordinary session, so only a snapshot that owns another member or a delegated
+/// task is a project: anything else is the session on its own.
+pub(crate) fn is_project_tree(project: &loom_core::ProjectSnapshot) -> bool {
+    project.agents.len() > 1 || !project.tasks.is_empty()
+}
+
+/// The worker that owns a project tree.
+///
+/// The routing follows what the surface holds: the root's own archived entry
+/// when it is archived, otherwise the shallowest archived member, which lives on
+/// the worker the whole tree is on.
+pub(crate) fn project_tree_node(
+    root_session_id: AgentSessionId,
+    project: &loom_core::ProjectSnapshot,
+    entries: &[ArchivedSessionEntry],
+) -> Option<String> {
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.session.id == root_session_id)
+    {
+        return Some(entry.node_id.clone());
+    }
+    let mut members = project
+        .agents
+        .iter()
+        .filter(|agent| agent.session_id != root_session_id)
+        .filter_map(|agent| {
+            entries
+                .iter()
+                .find(|entry| entry.session.id == agent.session_id)
+                .map(|entry| (agent.depth, agent.session_id, entry.node_id.clone()))
+        })
+        .collect::<Vec<_>>();
+    members.sort();
+    members.first().map(|(_, _, node_id)| node_id.clone())
+}
+
+/// What a confirmed project deletion stops, phrased for the confirmation
+/// dialog.
+pub(crate) const PROJECT_DELETE_CANCELLATION: &str =
+    "A running project manager and any running sub-agents are cancelled.";
+
+/// What a project row's deletion removes, phrased for the row.
+///
+/// It names the whole tree rather than only the archived members, because the
+/// deletion cascades to every session the project holds.
+pub(crate) fn project_row_consequence(session_count: usize) -> String {
+    let sub_agents = session_count.saturating_sub(1);
+    match sub_agents {
+        0 => "Deletes this project and its stored history.".to_owned(),
+        1 => {
+            "Deletes this project, 1 sub-agent session, and their history and worktrees (2 sessions in the tree)."
+                .to_owned()
+        }
+        count => format!(
+            "Deletes this project, {count} sub-agent sessions, and their history and worktrees ({} sessions in the tree).",
+            session_count
+        ),
+    }
+}
+
+/// What a confirmed project deletion removes, phrased for the confirmation
+/// dialog that names the project.
+pub(crate) fn project_deletion_consequence(name: &str, session_count: usize) -> String {
+    let sub_agents = session_count.saturating_sub(1);
+    match sub_agents {
+        0 => format!(
+            "{name} is permanently removed with its stored history. It has no sub-agent sessions."
+        ),
+        1 => format!(
+            "{name} is permanently removed with 1 sub-agent session, its history and its worktrees."
+        ),
+        count => format!(
+            "{name} is permanently removed with its {count} sub-agent sessions, their history and their worktrees."
+        ),
+    }
+}
+
 /// Groups archived sessions by the project the backend projects for them.
 ///
-/// A project's group holds its archived root first and then its archived
-/// descendants in depth order, so the delete cascade reads as a tree. Sessions
-/// that no known project covers go into one explicit trailing group.
+/// A project the client can resolve that covers at least one archived session
+/// contributes exactly one row: its members are deleted with it and are never
+/// listed on their own. A session that only covers itself is not a project, and
+/// it joins the sessions no project covers in one explicit trailing group.
 pub(crate) fn archived_session_groups(
     entries: &[ArchivedSessionEntry],
     projects: &[loom_core::ProjectSnapshot],
+    session_names: &BTreeMap<AgentSessionId, String>,
     now_millis: u64,
 ) -> Vec<ArchivedSessionGroup> {
     let by_id = entries
@@ -235,41 +355,46 @@ pub(crate) fn archived_session_groups(
         .collect::<BTreeMap<_, _>>();
     let mut grouped = BTreeSet::new();
     let mut groups = Vec::new();
-    for project in projects {
+    for project in projects.iter().filter(|project| is_project_tree(project)) {
         let mut members = project
             .agents
             .iter()
-            .filter(|agent| by_id.contains_key(&agent.session_id))
             .filter(|agent| !grouped.contains(&agent.session_id))
-            .map(|agent| (agent.depth, agent.session_id))
+            .filter_map(|agent| by_id.get(&agent.session_id).copied())
             .collect::<Vec<_>>();
         if members.is_empty() {
             continue;
         }
-        members.sort_by_key(|(depth, session_id)| (*depth, *session_id));
-        let rows = members
-            .into_iter()
-            .filter_map(|(_, session_id)| by_id.get(&session_id).copied())
-            .collect::<Vec<_>>();
-        if rows.is_empty() {
+        // The newest archived member dates the whole row, so a row whose root
+        // was archived long ago still reads as the work the tree holds.
+        members.sort_by_key(|entry| (entry.session.updated_at, entry.session.id));
+        let Some(newest) = members.last() else {
             continue;
-        }
-        let descendant_count = rows.len().saturating_sub(1);
-        let label = rows
+        };
+        let Some(node_id) = project_tree_node(project.root_session_id, project, entries) else {
+            log::debug!(
+                "[loom-ui] project {} has archived sessions but no worker to route a deletion to",
+                project.project_id
+            );
+            continue;
+        };
+        let label = members
             .iter()
             .find(|entry| entry.session.id == project.root_session_id)
             .map(|entry| entry.session.name.clone())
+            .or_else(|| session_names.get(&project.root_session_id).cloned())
             .unwrap_or_else(|| format!("Project {}", short_session_id(project.root_session_id)));
         groups.push(ArchivedSessionGroup {
             project_root: Some(project.root_session_id),
-            label,
-            rows: rows
-                .into_iter()
-                .map(|entry| {
-                    let is_project_root = entry.session.id == project.root_session_id;
-                    archived_session_row(entry, is_project_root, descendant_count, now_millis)
-                })
-                .collect(),
+            label: label.clone(),
+            rows: vec![ArchivedSessionRow {
+                session_id: project.root_session_id,
+                label,
+                node_id,
+                age: archived_age_label(newest.session.updated_at.as_unix_millis(), now_millis),
+                session_count: project.agents.len(),
+                is_project: true,
+            }],
         });
         for agent in &project.agents {
             grouped.insert(agent.session_id);
@@ -292,26 +417,18 @@ pub(crate) fn archived_session_groups(
             label: NO_PROJECT_LABEL.to_owned(),
             rows: loose
                 .into_iter()
-                .map(|entry| archived_session_row(entry, false, 0, now_millis))
+                .map(|entry| ArchivedSessionRow {
+                    session_id: entry.session.id,
+                    label: entry.session.name.clone(),
+                    node_id: entry.node_id.clone(),
+                    age: archived_age_label(entry.session.updated_at.as_unix_millis(), now_millis),
+                    session_count: 1,
+                    is_project: false,
+                })
                 .collect(),
         });
     }
     groups
-}
-
-fn archived_session_row(
-    entry: &ArchivedSessionEntry,
-    is_project_root: bool,
-    descendant_count: usize,
-    now_millis: u64,
-) -> ArchivedSessionRow {
-    ArchivedSessionRow {
-        node_id: entry.node_id.clone(),
-        session: entry.session.clone(),
-        age: archived_age_label(entry.session.updated_at.as_unix_millis(), now_millis),
-        is_project_root,
-        descendant_count: if is_project_root { descendant_count } else { 0 },
-    }
 }
 
 /// The delete request for one archived session. `force` allows the backend to
@@ -352,7 +469,9 @@ pub(crate) struct ArchivedSessionsState {
     pub(crate) error: Option<String>,
     /// The last refused delete and the backend's reason.
     pub(crate) refusal: Option<String>,
-    /// Rows whose delete may discard dirty or locked worktrees.
+    /// Rows whose delete may discard dirty or locked worktrees, keyed by the
+    /// session a row's deletion targets: the project root of a project row, the
+    /// session itself for a plain row.
     pub(crate) force: BTreeSet<AgentSessionId>,
     /// The session with a delete request in flight, if any.
     pub(crate) delete_in_flight: Option<AgentSessionId>,
@@ -647,6 +766,11 @@ impl LoomView {
                 .entries
                 .iter()
                 .any(|entry| entry.session.id == *session_id)
+                || self
+                    .archived_sessions
+                    .projects
+                    .iter()
+                    .any(|project| project.root_session_id == *session_id)
         });
         self.archived_sessions.error = errors.first().map(|error| error.message.clone());
         if let Some(error) = errors.first() {
@@ -665,25 +789,227 @@ impl LoomView {
         cx.notify();
     }
 
+    /// The project snapshot whose root is `session_id`, from every tree the
+    /// client holds.
+    pub(crate) fn project_root_snapshot(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Option<loom_core::ProjectSnapshot> {
+        self.project_tree_snapshots
+            .iter()
+            .chain(self.project_snapshot.iter())
+            .chain(self.archived_sessions.projects.iter())
+            .find(|project| project.root_session_id == session_id)
+            .cloned()
+    }
+
+    /// The name the client knows for a session, from what it lists and the
+    /// archived entries it holds.
+    fn known_session_name(&self, session_id: AgentSessionId) -> Option<String> {
+        self.archived_sessions
+            .entries
+            .iter()
+            .find(|entry| entry.session.id == session_id)
+            .map(|entry| entry.session.name.clone())
+            .or_else(|| {
+                self.sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    .map(|session| session.name.clone())
+            })
+            .or_else(|| {
+                (self.active_session.id == session_id).then(|| self.active_session.name.clone())
+            })
+    }
+
+    /// The names the client knows for the sessions it lists, so a project row
+    /// can name its root even when the root itself is not archived.
+    pub(crate) fn known_session_names(&self) -> BTreeMap<AgentSessionId, String> {
+        let mut names = self
+            .sessions
+            .iter()
+            .map(|session| (session.id, session.name.clone()))
+            .collect::<BTreeMap<_, _>>();
+        names
+            .entry(self.active_session.id)
+            .or_insert_with(|| self.active_session.name.clone());
+        names
+    }
+
+    /// The worker a deletion of `session_id` is routed to: the session's own
+    /// archived entry, a project's archived member when the root is not itself
+    /// listed, and otherwise the node the client assigned the session to.
+    pub(crate) fn archived_session_node(&self, session_id: AgentSessionId) -> Option<String> {
+        let entries = &self.archived_sessions.entries;
+        if let Some(entry) = entries.iter().find(|entry| entry.session.id == session_id) {
+            return Some(entry.node_id.clone());
+        }
+        if let Some(project) = self.project_root_snapshot(session_id)
+            && let Some(node_id) = project_tree_node(session_id, &project, entries)
+        {
+            return Some(node_id);
+        }
+        self.session_node_ids.get(&session_id).cloned()
+    }
+
     /// The node and request a delete of `session_id` would use, or `None` when
-    /// the session is not part of the loaded list.
+    /// no worker owns the session.
     pub(crate) fn archived_session_delete_request(
         &self,
         session_id: AgentSessionId,
     ) -> Option<(String, ClientRequest)> {
-        let entry = self
-            .archived_sessions
-            .entries
-            .iter()
-            .find(|entry| entry.session.id == session_id)?;
+        let node_id = self.archived_session_node(session_id)?;
         let force = self.archived_sessions.force.contains(&session_id);
+        Some((node_id, delete_archived_session_request(session_id, force)))
+    }
+
+    /// Opens the confirmation a project deletion goes through.
+    ///
+    /// Nothing is submitted here: the project is only removed once the dialog is
+    /// confirmed. A session no connected worker owns opens no dialog, because
+    /// the request could not be routed anywhere.
+    pub(crate) fn begin_project_delete(
+        &mut self,
+        session_id: AgentSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(node_id) = self.archived_session_node(session_id) else {
+            log::warn!(
+                "[loom-ui] ignoring the delete of project {session_id}: no connected worker owns it"
+            );
+            self.record_status("Cannot delete the project: no worker owns it");
+            cx.notify();
+            return;
+        };
+        let session_count = self
+            .project_root_snapshot(session_id)
+            .map_or(1, |project| project.agents.len().max(1));
+        let name = self
+            .known_session_name(session_id)
+            .unwrap_or_else(|| format!("Project {}", short_session_id(session_id)));
+        log::debug!(
+            "[loom-ui] asking to confirm the deletion of project {session_id} ({session_count} session(s)) on worker {node_id}"
+        );
+        self.project_delete_dialog = Some(ProjectDeleteDialogState {
+            session_id,
+            name,
+            session_count,
+            node_id,
+            // The row's own force choice is the delete the user already
+            // described, so the confirmation starts from it.
+            force: self.archived_sessions.force.contains(&session_id),
+            in_flight: false,
+            refusal: None,
+        });
+        cx.notify();
+    }
+
+    /// Sets the confirmation's force choice.
+    pub(crate) fn set_project_delete_force(&mut self, force: bool, cx: &mut Context<Self>) {
+        let Some(dialog) = self.project_delete_dialog.as_mut() else {
+            return;
+        };
+        if dialog.force == force {
+            return;
+        }
+        dialog.force = force;
+        cx.notify();
+    }
+
+    /// Closes the confirmation without submitting anything.
+    pub(crate) fn cancel_project_delete(&mut self, cx: &mut Context<Self>) {
+        if self.project_delete_dialog.take().is_some() {
+            log::debug!("[loom-ui] cancelled a project deletion");
+        }
+        cx.notify();
+    }
+
+    /// The request the open confirmation would submit, or `None` when no
+    /// confirmation is open.
+    pub(crate) fn project_delete_request(&self) -> Option<(String, ClientRequest)> {
+        let dialog = self.project_delete_dialog.as_ref()?;
         Some((
-            entry.node_id.clone(),
-            delete_archived_session_request(session_id, force),
+            dialog.node_id.clone(),
+            delete_archived_session_request(dialog.session_id, dialog.force),
         ))
     }
 
-    /// Deletes one archived session, carrying the row's force choice. The
+    /// Submits the confirmed project deletion to the worker that owns the tree.
+    pub(crate) fn confirm_project_delete(&mut self, cx: &mut Context<Self>) {
+        let Some((node_id, request)) = self.project_delete_request() else {
+            return;
+        };
+        let Some(dialog) = self.project_delete_dialog.as_mut() else {
+            return;
+        };
+        if dialog.in_flight {
+            log::info!(
+                "[loom-ui] ignoring the confirmed project deletion {}: a request is already in flight",
+                dialog.session_id
+            );
+            return;
+        }
+        let session_id = dialog.session_id;
+        let force = dialog.force;
+        dialog.in_flight = true;
+        dialog.refusal = None;
+        log::info!("[loom-ui] deleting project {session_id} on worker {node_id} (force={force})");
+        self.dispatch_to_node(cx, node_id, request, move |view, response, cx| {
+            view.finish_project_delete(session_id, response, cx);
+        });
+        cx.notify();
+    }
+
+    /// Applies the answer to a confirmed project deletion.
+    ///
+    /// A refusal keeps the dialog open with the backend's reason, so the
+    /// deletion can be retried; success closes it and drops the whole tree.
+    pub(crate) fn finish_project_delete(
+        &mut self,
+        session_id: AgentSessionId,
+        response: ResponseEnvelope,
+        cx: &mut Context<Self>,
+    ) {
+        let refusal = match response.result {
+            Ok(ServerResponse::Session(SessionResponse::AgentSessionDeleted {
+                session_id: deleted,
+            })) => {
+                if deleted != session_id {
+                    log::warn!(
+                        "[loom-ui] the delete of project {session_id} reported session {deleted} as deleted"
+                    );
+                }
+                log::info!("[loom-ui] deleted project {deleted}");
+                self.project_delete_dialog = None;
+                self.finish_deleted_session(deleted, "Project deleted", cx);
+                None
+            }
+            Err(error) => {
+                log::warn!(
+                    "[loom-ui] deleting project {session_id} was refused: {:?}: {}",
+                    error.code,
+                    error.message
+                );
+                Some(error.message)
+            }
+            Ok(response) => {
+                log::warn!(
+                    "[loom-ui] deleting project {session_id} returned an unexpected response"
+                );
+                Some(unexpected_response("project deletion", response).message)
+            }
+        };
+        if let Some(refusal) = refusal
+            && let Some(dialog) = self.project_delete_dialog.as_mut()
+            && dialog.session_id == session_id
+        {
+            dialog.in_flight = false;
+            dialog.refusal = Some(refusal);
+        }
+        cx.notify();
+    }
+
+    /// Deletes one plain archived session, carrying the row's force choice. The
     /// request goes to the worker that owns the session.
     pub(crate) fn delete_archived_session(
         &mut self,
@@ -696,10 +1022,19 @@ impl LoomView {
             );
             return;
         }
-        let Some((node_id, request)) = self.archived_session_delete_request(session_id) else {
+        if !self
+            .archived_sessions
+            .entries
+            .iter()
+            .any(|entry| entry.session.id == session_id)
+        {
             log::warn!(
                 "[loom-ui] ignoring the delete of {session_id}: it is not in the archived-session list"
             );
+            return;
+        }
+        let Some((node_id, request)) = self.archived_session_delete_request(session_id) else {
+            log::warn!("[loom-ui] ignoring the delete of {session_id}: no worker owns it");
             return;
         };
         let force = self.archived_sessions.force.contains(&session_id);
@@ -714,7 +1049,7 @@ impl LoomView {
         cx.notify();
     }
 
-    /// Applies the answer to a delete request.
+    /// Applies the answer to a plain delete request.
     ///
     /// A refusal keeps the row and shows the backend's reason in the surface;
     /// success drops the session and, for a project root, every descendant the
@@ -736,21 +1071,7 @@ impl LoomView {
                     );
                 }
                 log::info!("[loom-ui] deleted archived session {deleted}");
-                self.archived_sessions.refusal = None;
-                let was_active = self.forget_archived_session(deleted);
-                if was_active {
-                    // The session on screen no longer exists, so move the
-                    // selection instead of leaving a deleted session active.
-                    if let Some(session) = self.sessions.first().cloned() {
-                        self.select_session(session, cx);
-                    } else {
-                        self.activate_session(empty_session_snapshot(self.workspace_id));
-                        self.review.open = false;
-                    }
-                }
-                self.record_status("Archived session deleted");
-                self.reload_archived_sessions(cx);
-                cx.notify();
+                self.finish_deleted_session(deleted, "Archived session deleted", cx);
             }
             Err(error) => {
                 log::warn!(
@@ -770,6 +1091,32 @@ impl LoomView {
                 cx.notify();
             }
         }
+    }
+
+    /// Applies a confirmed removal of `deleted` and every session the backend
+    /// deleted with it: the sidebar state forgets the whole tree, the selection
+    /// moves off it, and the open archived listing is refreshed.
+    fn finish_deleted_session(
+        &mut self,
+        deleted: AgentSessionId,
+        status: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.archived_sessions.refusal = None;
+        let was_active = self.forget_archived_session(deleted);
+        if was_active {
+            // The session on screen no longer exists, so move the selection
+            // instead of leaving a deleted session active.
+            if let Some(session) = self.sessions.first().cloned() {
+                self.select_session(session, cx);
+            } else {
+                self.activate_session(empty_session_snapshot(self.workspace_id));
+                self.review.open = false;
+            }
+        }
+        self.record_status(status);
+        self.reload_archived_sessions(cx);
+        cx.notify();
     }
 }
 

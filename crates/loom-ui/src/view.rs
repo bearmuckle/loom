@@ -75,10 +75,11 @@ use crate::{
     connection::{BackendWorker, ClientConnection, ConnectionCleanupGuard},
     state::{
         AssistantPart, AssistantTurn, EvidenceText, FilesState, GitHubLoginKind, GitHubLoginState,
-        InspectorTab, PlanState, PlanStepStatus, RenameDialogState, ReviewState, SystemNote,
-        SystemTone, ThemeChoice, TimelineItem, ToolPart, ToolPartStatus, UsageState, bounded,
-        bounded_to, finish_assistant_turn, has_tool_part, push_assistant_evidence,
-        push_assistant_reasoning, push_assistant_text, session_state_for_run, upsert_tool_part,
+        InspectorTab, PlanState, PlanStepStatus, ProjectDeleteDialogState, RenameDialogState,
+        ReviewState, SystemNote, SystemTone, ThemeChoice, TimelineItem, ToolPart, ToolPartStatus,
+        UsageState, bounded, bounded_to, finish_assistant_turn, has_tool_part,
+        push_assistant_evidence, push_assistant_reasoning, push_assistant_text,
+        session_state_for_run, upsert_tool_part,
     },
     syntax::{self, Language},
     theme::{
@@ -598,6 +599,9 @@ pub(crate) struct LoomView {
     selected_repository_id: Option<RepositoryId>,
     session_drawer_open: bool,
     pub(crate) rename_dialog: Option<RenameDialogState>,
+    /// The confirmation an archived project deletion goes through. A whole tree
+    /// is never removed without it.
+    pub(crate) project_delete_dialog: Option<ProjectDeleteDialogState>,
     source_dialog: Option<SessionSourceDialog>,
     #[cfg(target_family = "wasm")]
     welcome_dialog_dismissed: bool,
@@ -1581,6 +1585,7 @@ impl LoomView {
             selected_repository_id: None,
             session_drawer_open: false,
             rename_dialog: None,
+            project_delete_dialog: None,
             source_dialog: None,
             #[cfg(target_family = "wasm")]
             welcome_dialog_dismissed: false,

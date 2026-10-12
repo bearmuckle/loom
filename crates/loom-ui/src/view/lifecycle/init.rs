@@ -361,6 +361,7 @@ impl LoomView {
             selected_repository_id: None,
             session_drawer_open: false,
             rename_dialog: None,
+            project_delete_dialog: None,
             source_dialog: None,
             #[cfg(target_family = "wasm")]
             welcome_dialog_dismissed: false,
@@ -581,6 +582,7 @@ impl LoomView {
             selected_repository_id: None,
             session_drawer_open: false,
             rename_dialog: None,
+            project_delete_dialog: None,
             source_dialog: None,
             #[cfg(target_family = "wasm")]
             welcome_dialog_dismissed: false,
@@ -840,6 +842,7 @@ impl LoomView {
             selected_repository_id: None,
             session_drawer_open: false,
             rename_dialog: None,
+            project_delete_dialog: None,
             source_dialog: None,
             #[cfg(target_family = "wasm")]
             welcome_dialog_dismissed: false,

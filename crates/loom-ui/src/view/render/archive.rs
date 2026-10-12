@@ -1,7 +1,7 @@
 use super::*;
 use crate::view::archive::{
     ArchivedSessionRow, RetentionPolicyState, RetentionPolicyText, archived_session_groups,
-    retention_window_choices,
+    project_row_consequence, retention_window_choices,
 };
 use gpui_kit::WeakEntity;
 use gpui_kit::component::checkbox::Checkbox;
@@ -18,10 +18,11 @@ struct ArchivedSessionRowStyle {
 }
 
 impl LoomView {
-    /// The archived-session management surface: every archived session the
-    /// known workspaces hold, grouped by project, with a delete action and the
-    /// active backend's retention policy, which can be edited when the worker
-    /// behind that backend can store a change.
+    /// The archived-session management surface: one row per project the known
+    /// workspaces resolve, plus one row per archived session that belongs to no
+    /// project, with a delete action and the active backend's retention policy,
+    /// which can be edited when the worker behind that backend can store a
+    /// change.
     pub(crate) fn render_archived_sessions(
         &self,
         layout: ResponsiveLayout,
@@ -29,9 +30,11 @@ impl LoomView {
     ) -> gpui_kit::AnyElement {
         let phone = layout.phone;
         let now = Timestamp::now().as_unix_millis();
+        let session_names = self.known_session_names();
         let groups = archived_session_groups(
             &self.archived_sessions.entries,
             &self.archived_sessions.projects,
+            &session_names,
             now,
         );
         let mut content = div().w_full().flex().flex_col().gap_4();
@@ -106,7 +109,7 @@ impl LoomView {
                 for row in &group.rows {
                     let style = ArchivedSessionRowStyle {
                         index: row_index,
-                        force: force.contains(&row.session.id),
+                        force: force.contains(&row.session_id),
                         delete_in_flight,
                         first_in_group,
                         phone,
@@ -142,13 +145,7 @@ impl LoomView {
                                         .flex_shrink_0()
                                         .text_xs()
                                         .text_color(rgb(0x64748b))
-                                        .child(format!(
-                                            "{} archived",
-                                            match group.rows.len() {
-                                                1 => "1 session".to_owned(),
-                                                count => format!("{count} sessions"),
-                                            }
-                                        )),
+                                        .child(group.heading_detail()),
                                 ),
                         )
                         .child(card),
@@ -374,8 +371,9 @@ impl LoomView {
         card.into_any_element()
     }
 
-    /// One archived-session row: its name, worker, archive age, the force
-    /// choice, and the delete action.
+    /// One archived-session row: its heading, worker, archive age, the force
+    /// choice, and the delete action. A project row lists the whole tree and
+    /// deletes it behind a confirmation; a plain row deletes itself.
     fn render_archived_session_row(
         &self,
         row: &ArchivedSessionRow,
@@ -383,22 +381,17 @@ impl LoomView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let index = style.index;
-        let session_id = row.session.id;
+        let session_id = row.session_id;
+        let is_project = row.is_project;
         let delete_in_flight = style.delete_in_flight;
         let phone = style.phone;
-        let delete_label = if row.is_project_root {
+        let delete_label = if is_project {
             "Delete project"
         } else {
             "Delete"
         };
-        let consequence = if row.is_project_root {
-            match row.descendant_count {
-                0 => "Deletes this project and its stored history.".to_owned(),
-                1 => "Deletes this project, 1 descendant session, and their worktrees.".to_owned(),
-                count => format!(
-                    "Deletes this project, {count} descendant sessions, and their worktrees."
-                ),
-            }
+        let consequence = if is_project {
+            project_row_consequence(row.session_count)
         } else {
             "Deletes this session, its stored history, and its worktrees.".to_owned()
         };
@@ -431,12 +424,18 @@ impl LoomView {
                     .danger()
                     .small()
                     .disabled(delete_in_flight.is_some())
-                    .accessibility_label(format!("{delete_label}: {}", row.session.name))
+                    .accessibility_label(format!("{delete_label}: {}", row.label))
                     .on_click({
                         let view = cx.entity();
                         move |_, _, cx| {
                             view.update(cx, |view, cx| {
-                                view.delete_archived_session(session_id, cx);
+                                if is_project {
+                                    // A whole tree is never removed without
+                                    // the confirmation.
+                                    view.begin_project_delete(session_id, cx);
+                                } else {
+                                    view.delete_archived_session(session_id, cx);
+                                }
                             });
                         }
                     }),
@@ -458,7 +457,7 @@ impl LoomView {
                     .items_center()
                     .gap_2()
                     .child(
-                        Icon::new(if row.is_project_root {
+                        Icon::new(if is_project {
                             AssetIconName::Folder
                         } else {
                             AssetIconName::BotMessageSquare
@@ -474,10 +473,10 @@ impl LoomView {
                             .truncate()
                             .text_sm()
                             .text_color(rgb(0xe5e7eb))
-                            .when(row.is_project_root, |element| {
+                            .when(is_project, |element| {
                                 element.font_weight(FontWeight::SEMIBOLD)
                             })
-                            .child(row.session.name.clone()),
+                            .child(row.label.clone()),
                     )
                     .child(
                         div()
