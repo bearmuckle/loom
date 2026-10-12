@@ -723,7 +723,7 @@ impl LoomView {
     /// Projects whose main source is still unknown, in list order and bounded
     /// per refresh. A delegated agent is skipped: it appears under its
     /// project's own row, which carries the project's source.
-    fn session_source_lookup_candidates(&self) -> Vec<AgentSessionId> {
+    pub(crate) fn session_source_lookup_candidates(&self) -> Vec<AgentSessionId> {
         self.sessions
             .iter()
             .filter(|session| !self.session_sources.contains_key(&session.id))

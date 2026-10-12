@@ -312,6 +312,85 @@ fn project_rows_without_a_known_source_keep_the_second_line(cx: &mut TestAppCont
     .unwrap();
 }
 
+/// A delegated agent is not asked where it came from: it appears under its
+/// project's own row, which carries the project's source. Standalone projects
+/// are asked, and the number of lookups per refresh is bounded.
+#[gpui_kit::test]
+fn source_lookups_skip_delegated_agents_and_stay_bounded(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (handle, view) = open_view_window(cx, |_| {});
+    cx.update_window(handle.into(), |_, _, cx| {
+        view.update(cx, |view, _| {
+            // A project whose snapshot lists the second session as its agent.
+            let root_id = view.active_session.id;
+            let child_id = loom_core::AgentSessionId::new();
+            let mut child = view.active_session.clone();
+            child.id = child_id;
+            child.name = "agent".to_owned();
+            view.sessions.push(child);
+            let project_id = loom_core::ProjectId::from_uuid(*root_id.as_uuid());
+            view.project_tree_snapshots = vec![loom_core::ProjectSnapshot {
+                project_id,
+                root_session_id: root_id,
+                agents: vec![
+                    agent_record(root_id, project_id, None, 1),
+                    agent_record(child_id, project_id, Some(root_id), 2),
+                ],
+                tasks: Vec::new(),
+                worktrees: Vec::new(),
+            }];
+            // Only the project root is looked up; the agent inherits its
+            // project's source. The window may already have run a frame, so the
+            // per-refresh bookkeeping starts clean here.
+            view.session_sources.clear();
+            view.session_source_lookups.clear();
+            assert_eq!(view.session_source_lookup_candidates(), vec![root_id]);
+
+            // A project that already has a source, or has already been asked,
+            // is not asked again.
+            view.session_sources
+                .insert(root_id, "bearmuckle/loom".to_owned());
+            assert!(view.session_source_lookup_candidates().is_empty());
+            view.session_sources.clear();
+            view.session_source_lookups.insert(root_id, (None, None));
+            assert!(view.session_source_lookup_candidates().is_empty());
+
+            // Standalone projects are all looked up, up to the refresh bound.
+            view.project_tree_snapshots.clear();
+            view.session_source_lookups.clear();
+            for _ in 0..8 {
+                let mut session = view.active_session.clone();
+                session.id = loom_core::AgentSessionId::new();
+                view.sessions.push(session);
+            }
+            assert_eq!(
+                view.session_source_lookup_candidates().len(),
+                LoomView::SESSION_SOURCE_LOOKUPS_PER_REFRESH
+            );
+        });
+    })
+    .unwrap();
+}
+
+/// One agent record of a project snapshot.
+fn agent_record(
+    session_id: loom_core::AgentSessionId,
+    project_id: loom_core::ProjectId,
+    parent_session_id: Option<loom_core::AgentSessionId>,
+    depth: u8,
+) -> loom_core::ProjectAgentRecord {
+    loom_core::ProjectAgentRecord {
+        session_id,
+        project_id,
+        parent_session_id,
+        depth,
+        state: loom_core::AgentSessionState::Idle,
+        task_summary: None,
+        output_cursor: loom_core::EventSequence::default(),
+        updated_at: loom_core::Timestamp::from_unix_millis(1),
+    }
+}
+
 #[test]
 fn the_pane_project_name_ignores_the_larger_default_base() {
     let desktop = responsive_layout(px(1280.));
