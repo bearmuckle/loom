@@ -846,6 +846,8 @@ fn task_activity_indicator(index: usize, status: SessionStatusPill) -> gpui_kit:
             )
     };
     div()
+        .id(("session-tree-activity", index))
+        .test_support()
         .h(px(12.))
         .flex_shrink_0()
         .flex()

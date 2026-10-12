@@ -34,13 +34,15 @@ use loom_protocol::{
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-fn render_scenario(cx: &mut TestAppContext, configure: impl FnOnce(&mut LoomView)) {
+/// Shared by the other view test modules, so each area can render a scenario
+/// without re-deriving the harness.
+pub(super) fn render_scenario(cx: &mut TestAppContext, configure: impl FnOnce(&mut LoomView)) {
     render_scenario_at(cx, size(px(1280.), px(800.)), configure);
 }
 
 /// Renders a scenario whose configuration also needs the view's own context,
 /// for example to build the diff surface before rendering it.
-fn render_scenario_with_context(
+pub(super) fn render_scenario_with_context(
     cx: &mut TestAppContext,
     configure: impl FnOnce(&mut LoomView, &mut gpui_kit::Context<LoomView>),
 ) {
@@ -56,7 +58,7 @@ fn render_scenario_with_context(
         .unwrap();
 }
 
-fn render_scenario_at(
+pub(super) fn render_scenario_at(
     cx: &mut TestAppContext,
     window_size: gpui_kit::Size<gpui_kit::Pixels>,
     configure: impl FnOnce(&mut LoomView),
@@ -73,7 +75,7 @@ fn render_scenario_at(
         .unwrap();
 }
 
-fn nested_project_view(focus_handle: gpui_kit::FocusHandle) -> LoomView {
+pub(super) fn nested_project_view(focus_handle: gpui_kit::FocusHandle) -> LoomView {
     use loom_core::{
         AgentSessionSnapshot, AgentSessionState, DelegatedTaskRecord, DelegatedTaskStatus,
         ProjectAgentPermissions, ProjectAgentRecord, ProjectSnapshot, ProjectWorktreeRecord,
