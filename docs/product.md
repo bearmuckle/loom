@@ -144,9 +144,10 @@ The client provides an archived management view for that. It lists archived
 sessions grouped by project with each session's archive age, and offers a
 delete action. Deleting a project root deletes the whole project tree,
 including every descendant session and its worktrees, and it does not have to be
-archived first: the backend cancels the live sub-agents and then deletes the
-tree, so a project can be removed while its children are still running. Deleting
-a descendant removes only that session and still requires it to be archived. The
+archived first: the backend cancels the live work first, interrupting the
+project manager's own run and then every running sub-agent, so a project can be
+removed while its manager and children are still working. Deleting a descendant
+removes only that session and still requires it to be archived. The
 delete action carries a force choice for a linked worktree that has changes or a
 lock: without it, the deletion is refused and the worktree is preserved. The
 view displays the active retention policy read-only, so a user can see whether

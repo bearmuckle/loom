@@ -560,14 +560,31 @@ impl InProcessConnection {
         Ok(run)
     }
 
-    /// Cancels every non-terminal top-level task of `project` and its
-    /// descendants, exactly as a user-issued child cancel does.
+    /// Cancels the live work of `project` before the deletion path removes it.
     ///
     /// The deletion path uses this so a project with live sub-agents can be
     /// deleted immediately instead of waiting for its tree to finish. A project
-    /// whose top-level tasks are all terminal has no live work and needs
-    /// nothing here.
+    /// whose top-level tasks are all terminal and whose root session has no
+    /// loaded live run has no live work and needs nothing here.
+    ///
+    /// The manager's own run of the root session is interrupted first, because a
+    /// manager that is running or parked in `wait_for_project_children` owns a
+    /// non-terminal run that the backend deletion guard refuses. Stopping it
+    /// first also stops it from committing new children while the tree is
+    /// cancelled. The project admission lock is deliberately not held across
+    /// that call: `stop_run` reconciles the project and takes the same lock
+    /// itself.
+    ///
+    /// The project snapshot is re-read afterwards, so a child the manager
+    /// committed before it stopped is still cancelled, and each non-terminal
+    /// top-level task subtree is cancelled through `cancel_project_child_subtree`,
+    /// which takes the project admission lock itself and refreshes the hierarchy
+    /// under it. A task created after that last reload is refused by the backend
+    /// task guard; the race is retryable, and a retried request observes and
+    /// cancels the newer task.
     pub(crate) fn cancel_project_live_work(&self, project: &ProjectSnapshot) -> Result<()> {
+        self.interrupt_project_root_runs(project.root_session_id)?;
+        let project = self.load_project_snapshot(project.project_id)?;
         let live_tasks = project
             .tasks
             .iter()
@@ -596,6 +613,30 @@ impl InProcessConnection {
                 project.root_session_id,
                 task_id,
             )?;
+        }
+        Ok(())
+    }
+
+    /// Interrupts every non-terminal run that this process has loaded for
+    /// `session_id`, which is the project manager's own run for a project root.
+    ///
+    /// A persisted run summary without a loaded handle is left alone: it has no
+    /// executor that could keep working, so it cannot commit new children and
+    /// the deletion guard ignores it.
+    fn interrupt_project_root_runs(&self, session_id: AgentSessionId) -> Result<()> {
+        let run_ids = self
+            .backend
+            .runs()?
+            .iter()
+            .filter(|(_, handle)| handle.session_id == session_id)
+            .filter(|(_, handle)| !is_terminal_agent_run_state(handle.snapshot().state))
+            .map(|(run_id, _)| *run_id)
+            .collect::<Vec<_>>();
+        for run_id in run_ids {
+            log::info!(
+                "[loom-server] interrupting run {run_id} of project root {session_id} before its deletion"
+            );
+            self.stop_run(run_id, RunStop::Interrupt)?;
         }
         Ok(())
     }

@@ -255,9 +255,11 @@ impl InProcessConnection {
     ///
     /// A project root is the only session that may be deleted before it is
     /// archived, and its live work is cancelled first so a project with running
-    /// sub-agents is removed immediately instead of being refused. The backend
-    /// owns the deletion itself, because the retention sweep performs the same
-    /// work without a connection; this wrapper only cancels and forwards.
+    /// sub-agents is removed immediately instead of being refused: the manager's
+    /// own run is interrupted before its live child subtrees are cancelled. The
+    /// backend owns the deletion itself, because the retention sweep performs
+    /// the same work without a connection; this wrapper only cancels and
+    /// forwards.
     pub(crate) fn delete_agent_session(
         &self,
         session_id: AgentSessionId,

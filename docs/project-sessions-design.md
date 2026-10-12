@@ -197,17 +197,30 @@ still requires `Archived`, and `Archived` is terminal: there is no restore or
 unarchive, so an archived session is immutable until it is deleted.
 
 Cancelling a live project before its deletion reuses the child `cancel` control
-path. The cancellation intent is persisted for every non-terminal top-level task
-of the project, each live run in the captured subtrees is interrupted, the tasks
-are terminalized, and the captured manager waits are abandoned. A project whose
-top-level tasks are already terminal has no live work and needs no cancellation.
+path. The manager's own run of the root session is interrupted first, so a
+manager that is running or parked in `wait_for_project_children` cannot commit
+new children while the tree is cancelled and its run does not refuse the
+deletion. The project snapshot is then re-read and, for every non-terminal
+top-level task, the cancellation intent is persisted, each live run in the
+captured subtree is interrupted, the tasks are terminalized, and the captured
+manager waits are abandoned. A task committed after that reload is refused by
+the backend task guard instead of being deleted with the tree; the refusal is
+retryable, and a retried request cancels the newer task first. A project whose
+top-level tasks are all terminal and whose root session has no loaded live run
+has no live work and needs no cancellation.
 
 Deleting a project root deletes every descendant session of that project in one
 operation, resolved from the same project snapshot and in the same cascade
 order as archiving, whether or not those descendants are archived. A request
-only proceeds with every delegated task of the project terminal and no live run
-left on any session being deleted, so it either deletes the whole tree or
-changes nothing. The deletion removes the linked child worktrees deepest-first
+only proceeds with every delegated task of the project terminal and no run that
+is loaded in this process left non-terminal on any session being deleted, so it
+either deletes the whole tree or changes nothing. A run checkpoint without a
+loaded run has no executor that could keep writing, so it does not refuse the
+deletion: refusing on one would make an archived session permanently undeletable
+after a crash between the archive write and its run checkpoint, which the
+retention sweep would then skip forever. The removal is state-agnostic in the
+session catalog, so no archive transition is synthesized for a live project tree
+on its way out. The deletion removes the linked child worktrees deepest-first
 through the parent session's `GitService`, then the session filesystem roots,
 then the durable rows; the storage design records that ordering and the
 feed-table exception.
@@ -538,8 +551,9 @@ server validates the persisted grant before creating a child.
   archiving the root is rejected until child tasks are terminal; successful
   archive then archives descendants deepest-first. A separate project-wide
   cancel operation is not exposed: the deletion path reuses the child cascade
-  internally for a project root, as described above. Deletion is exposed for an
-  archived session or for a project root, which is cancelled first.
+  internally for a project root, as described above, after interrupting the
+  manager's own run. Deletion is exposed for an archived session or for a
+  project root, which is cancelled first.
 - Child worktrees are not automatically removed when a task or project
   completes. The parent explicitly retains, removes a clean checkout, or
   discards changes. The only automatic cleanup is the retention-based deletion

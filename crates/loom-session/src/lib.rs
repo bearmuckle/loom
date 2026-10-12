@@ -205,24 +205,19 @@ impl SessionManager {
         Ok((snapshot, record))
     }
 
-    /// Removes an archived session from the catalog and returns its final snapshot.
+    /// Removes a session from the catalog in any state and returns its final
+    /// snapshot.
     ///
-    /// The server persists the removal separately; no journal event is produced
-    /// here because the deletion itself is applied by the durable store.
+    /// The server already established that the removal is safe when it calls
+    /// this: it cancels the live work of a project root before deleting its tree,
+    /// so the catalog does not require an archived session and does not
+    /// synthesize an archive transition only to drop the session again. The
+    /// server persists the removal separately; no journal event is produced here
+    /// because the deletion itself is applied by the durable store.
     pub fn remove(&mut self, session_id: AgentSessionId) -> Result<AgentSessionSnapshot> {
-        let snapshot = self
-            .sessions
-            .get(&session_id)
-            .ok_or_else(|| LoomError::not_found("agent session", session_id))?;
-        if snapshot.state != AgentSessionState::Archived {
-            return Err(LoomError::invalid_state(
-                "only archived agent sessions can be deleted",
-            ));
-        }
-        Ok(self
-            .sessions
+        self.sessions
             .remove(&session_id)
-            .expect("checked agent session is present"))
+            .ok_or_else(|| LoomError::not_found("agent session", session_id))
     }
 
     pub fn transition(
@@ -427,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn removal_requires_an_archived_session() {
+    fn removal_accepts_a_session_in_any_state() {
         let mut manager = SessionManager::default();
         let (snapshot, _) = manager
             .create_in_workspace(WorkspaceId::new(), "Delete candidate")
@@ -438,17 +433,11 @@ mod tests {
             manager.remove(unknown).unwrap_err().code,
             loom_core::ErrorCode::NotFound
         );
-        let active = manager.remove(snapshot.id).unwrap_err();
-        assert_eq!(active.code, loom_core::ErrorCode::InvalidState);
-        assert_eq!(
-            active.message,
-            "only archived agent sessions can be deleted"
-        );
-        assert_eq!(manager.session_count(), 1);
-
-        manager.archive(snapshot.id).unwrap();
+        // Deletion does not require an archive transition first: the server
+        // cancels a project root's live work before it removes the session.
         let removed = manager.remove(snapshot.id).unwrap();
-        assert_eq!(removed.state, AgentSessionState::Archived);
+        assert_eq!(removed.state, AgentSessionState::Idle);
+        assert_eq!(manager.session_count(), 0);
     }
 
     #[test]

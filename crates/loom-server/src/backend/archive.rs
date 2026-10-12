@@ -17,11 +17,12 @@ impl InProcessBackend {
     ///
     /// A request that targets a project root cascades to its whole hierarchy,
     /// archived or not, once every child task is terminal and no session being
-    /// deleted has a live run; the caller cancels a live project before this
-    /// runs, so a project never has to finish first. Worktrees are removed
-    /// deepest-first before any row or filesystem root is touched, so a dirty or
-    /// locked checkout aborts the request without changing state. The archive
-    /// gate keeps this mutually exclusive with the retention sweep.
+    /// deleted has a run that is loaded and live in this process; the caller
+    /// cancels a live project before this runs, so a project never has to finish
+    /// first. Worktrees are removed deepest-first before any row or filesystem
+    /// root is touched, so a dirty or locked checkout aborts the request without
+    /// changing state. The archive gate keeps this mutually exclusive with the
+    /// retention sweep.
     pub(crate) fn delete_agent_session(
         &self,
         session_id: AgentSessionId,
@@ -82,10 +83,13 @@ impl InProcessBackend {
                 log::warn!(
                     "[loom-server] refusing to delete project root {session_id}: unfinished child tasks {unfinished_tasks:?}"
                 );
+                // A task committed after the caller cancelled the project lands
+                // here. The caller can retry: a retried request re-reads the
+                // project and cancels the newer task before it deletes.
                 return Err(LoomError::new(
                     ErrorCode::InvalidState,
                     "finish or cancel every child task before deleting this project",
-                    false,
+                    true,
                 ));
             }
             // The whole tree is one unit, so every descendant is deleted with
@@ -103,11 +107,12 @@ impl InProcessBackend {
             );
         }
         let deleted_ids = deleted_sessions.keys().copied().collect::<BTreeSet<_>>();
-        // A run that is still live would keep writing the state this deletion
-        // drops, so every session being deleted must be free of runs that are
-        // neither completed, failed, nor cancelled, in memory or in its durable
-        // checkpoint. A cancelled project satisfies this because its cascade
-        // interrupted each run first.
+        // A loaded run that is still live would keep writing the state this
+        // deletion drops, so every session being deleted must be free of
+        // non-terminal runs loaded in this process. A cancelled project
+        // satisfies this because the caller interrupted each of its runs first.
+        // A durable run summary without a loaded handle is inert, see
+        // `non_terminal_runs_of_sessions`.
         let live_runs = self.non_terminal_runs_of_sessions(&deleted_ids)?;
         if !live_runs.is_empty() {
             log::warn!(
@@ -183,28 +188,12 @@ impl InProcessBackend {
                 }
             }
         }
-        // The session catalog only releases an archived session, so a live
-        // project tree is archived in memory first. Its rows are removed below
-        // and its journal records are purged with the rest of the session, so
-        // the archive state never becomes durable; the run guard above already
-        // proved that none of these sessions has live work.
-        for id in &deleted_ids {
-            let record = {
-                let mut sessions = self.sessions()?;
-                if sessions.get(*id)?.state == AgentSessionState::Archived {
-                    None
-                } else {
-                    let (_, record) = sessions.transition(*id, AgentSessionState::Archived)?;
-                    Some(record)
-                }
-            };
-            if let Some(record) = record {
-                self.journal()?.append_session(record);
-            }
-        }
         // Drop every in-memory trace before the durable rows, so neither the
         // state save that follows this request nor a later request can observe
-        // or re-insert a deleted session.
+        // or re-insert a deleted session. The catalog accepts a removal in any
+        // state: a project root is often live here, its work was cancelled above,
+        // and synthesizing an archive transition for it would append journal
+        // records that misreport the state of a session that no longer exists.
         for id in &deleted_ids {
             self.sessions()?.remove(*id)?;
         }
@@ -250,43 +239,27 @@ impl InProcessBackend {
         ))
     }
 
-    /// The non-terminal runs of the given sessions, loaded or persisted.
+    /// The non-terminal runs of the given sessions that are loaded in this
+    /// process.
     ///
-    /// A run is reported once: the in-memory state wins over the durable
-    /// checkpoint, because a run that was interrupted in this process has not
-    /// necessarily written its last checkpoint yet.
+    /// Only a loaded run has an executor that can keep writing the state a
+    /// deletion drops, so only a loaded run may refuse the deletion. A durable
+    /// run summary without a loaded handle has no executor: refusing on one would
+    /// make the session permanently undeletable, for example an archived session
+    /// left by a crash between the archive write and the run checkpoint, which
+    /// the retention sweep would then skip forever.
     fn non_terminal_runs_of_sessions(
         &self,
         sessions: &BTreeSet<AgentSessionId>,
     ) -> Result<Vec<String>> {
         let mut live = Vec::new();
-        let loaded = {
-            let runs = self.runs()?;
-            runs.iter()
-                .filter(|(_, handle)| sessions.contains(&handle.session_id))
-                .map(|(run_id, handle)| (*run_id, handle.snapshot().state))
-                .collect::<BTreeMap<_, _>>()
-        };
-        for (run_id, state) in &loaded {
-            if !is_terminal_agent_run_state(*state) {
-                live.push(format!("{run_id} ({state:?})"));
+        for (run_id, handle) in self.runs()?.iter() {
+            if !sessions.contains(&handle.session_id) {
+                continue;
             }
-        }
-        if let Some(persistence) = &self.persistence {
-            for session_id in sessions {
-                let Some(summary) = persistence.load_latest_run_summary_for_session(*session_id)?
-                else {
-                    continue;
-                };
-                if loaded.contains_key(&summary.snapshot.id)
-                    || is_terminal_agent_run_state(summary.snapshot.state)
-                {
-                    continue;
-                }
-                live.push(format!(
-                    "{} ({:?})",
-                    summary.snapshot.id, summary.snapshot.state
-                ));
+            let state = handle.snapshot().state;
+            if !is_terminal_agent_run_state(state) {
+                live.push(format!("{run_id} ({state:?})"));
             }
         }
         Ok(live)
