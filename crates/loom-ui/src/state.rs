@@ -7,14 +7,15 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use gpui_kit::assets::IconName as AssetIconName;
-use gpui_kit::{ListAlignment, ListState, px};
+use gpui_kit::component::diff::{DiffFile, DiffState};
+use gpui_kit::{AppContext, Entity};
 use loom_core::{
     AgentSessionSnapshot, AgentSessionState, EventSequence, ToolCallId, UsageSnapshot,
 };
 use loom_model::ProviderUsageSummary;
 use loom_protocol::{
-    AgentPlanProgress, AgentRunState, GitDiff, GitDiffLine, GitRepositoryStatus,
-    SessionFilesystemChange, SessionFilesystemFile, WorkspaceEntry,
+    AgentPlanProgress, AgentRunState, GitDiff, GitRepositoryStatus, SessionFilesystemChange,
+    SessionFilesystemFile, WorkspaceEntry,
 };
 
 use crate::MAX_TIMELINE_OUTPUT;
@@ -148,78 +149,47 @@ pub(crate) struct ReviewState {
     pub(crate) selected_staged: bool,
     pub(crate) selection_revision: u64,
     pub(crate) selected_diff: Option<GitDiff>,
+    /// The `gpui-kit` diff surface for [`Self::selected_diff`].
+    ///
+    /// It is rebuilt for every selection so a surface can never outlive the
+    /// payload it was built from. `None` means the payload has nothing the
+    /// surface can show: no retained hunks, or a patch the parser rejected. The
+    /// pane keeps its own copy for those cases.
+    pub(crate) diff_view: Option<Entity<DiffState>>,
     pub(crate) diff_error: Option<String>,
     pub(crate) loading_diff: bool,
+    /// Whether diff and file previews soft-wrap instead of scrolling sideways.
     pub(crate) wrap_lines: bool,
-    pub(crate) rows: Vec<ReviewRow>,
-    pub(crate) hunk_rows: Vec<usize>,
-    pub(crate) collapsed_hunks: BTreeSet<usize>,
-    pub(crate) selected_hunk: usize,
-    pub(crate) list_state: ListState,
     pub(crate) usage: UsageState,
     pub(crate) files: FilesState,
 }
-
-#[derive(Clone, Debug)]
-pub(crate) enum ReviewRow {
-    Hunk {
-        old_start: u32,
-        old_lines: u32,
-        new_start: u32,
-        new_lines: u32,
-    },
-    Line(GitDiffLine),
-}
-
 impl ReviewState {
-    pub(crate) fn show_diff(&mut self, diff: GitDiff) {
-        self.collapsed_hunks.clear();
+    /// Shows `diff` in the diff surface, replacing any previous selection.
+    ///
+    /// The patch the backend rendered is what the surface displays: it is
+    /// already bounded to whole hunks, so it parses as sent and needs no
+    /// rebuilding on this side.
+    pub(crate) fn show_diff(&mut self, diff: GitDiff, cx: &mut impl AppContext) {
+        let files = match DiffFile::parse(&diff.patch) {
+            Ok(files) => files,
+            Err(error) => {
+                // The backend bounds a patch to whole hunks, so a patch that
+                // does not parse is a defect to record, not something to put in
+                // front of the reviewer.
+                log::warn!("could not parse the rendered review patch: {error}");
+                Vec::new()
+            }
+        };
+        self.diff_view = (!files.is_empty()).then(|| cx.new(|cx| DiffState::new(files, cx)));
         self.selected_diff = Some(diff);
-        self.selected_hunk = 0;
         self.loading_diff = false;
         self.diff_error = None;
-        self.rebuild_rows();
     }
 
-    /// Rebuilds the virtual rows from the selected diff, hiding the lines of
-    /// any collapsed hunk.
-    pub(crate) fn rebuild_rows(&mut self) {
-        self.rows.clear();
-        self.hunk_rows.clear();
-        let Some(diff) = self.selected_diff.as_ref() else {
-            self.list_state.reset(0);
-            return;
-        };
-        for (hunk_index, hunk) in diff.hunks.iter().enumerate() {
-            self.hunk_rows.push(self.rows.len());
-            self.rows.push(ReviewRow::Hunk {
-                old_start: hunk.old_start,
-                old_lines: hunk.old_lines,
-                new_start: hunk.new_start,
-                new_lines: hunk.new_lines,
-            });
-            if !self.collapsed_hunks.contains(&hunk_index) {
-                self.rows
-                    .extend(hunk.lines.iter().cloned().map(ReviewRow::Line));
-            }
-        }
-        self.list_state.reset(self.rows.len());
-    }
-
-    /// Toggles the collapse state of the hunk whose header is at `row`.
-    pub(crate) fn toggle_hunk(&mut self, row: usize) -> bool {
-        let Some(hunk_index) = self
-            .hunk_rows
-            .iter()
-            .position(|candidate| *candidate == row)
-        else {
-            return false;
-        };
-        if !self.collapsed_hunks.remove(&hunk_index) {
-            self.collapsed_hunks.insert(hunk_index);
-        }
-        self.rebuild_rows();
-        true
+    /// Clears the selected diff and the surface showing it.
+    pub(crate) fn clear_diff(&mut self) {
+        self.selected_diff = None;
+        self.diff_view = None;
     }
 
     /// Whether the given tab is currently displayed in an open pane.
@@ -419,14 +389,10 @@ impl Default for ReviewState {
             selected_staged: false,
             selection_revision: 0,
             selected_diff: None,
+            diff_view: None,
             diff_error: None,
             loading_diff: false,
             wrap_lines: false,
-            rows: Vec::new(),
-            hunk_rows: Vec::new(),
-            collapsed_hunks: BTreeSet::new(),
-            selected_hunk: 0,
-            list_state: ListState::new(0, ListAlignment::Top, px(120.)),
             usage: UsageState::default(),
             files: FilesState::default(),
         }
@@ -817,10 +783,9 @@ pub(crate) fn session_state_for_run(state: AgentRunState) -> AgentSessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui_kit::TestAppContext;
     use loom_core::ToolCallId;
-    use loom_protocol::{
-        GitDiffHunk, GitDiffLineKind, GitFileStatus, GitFileStatusKind, WorkspaceChangeKind,
-    };
+    use loom_protocol::{GitFileStatus, GitFileStatusKind, WorkspaceChangeKind};
 
     fn review_change(sequence: u64) -> SessionFilesystemChange {
         SessionFilesystemChange {
@@ -1087,92 +1052,105 @@ mod tests {
         assert_eq!(usage.provider().unwrap().requests, 2);
     }
 
-    #[test]
-    fn review_hunks_map_to_virtual_rows() {
+    #[gpui_kit::test]
+    fn show_diff_renders_the_patch_the_backend_rendered(cx: &mut TestAppContext) {
         let mut review = ReviewState::default();
-        review.show_diff(GitDiff {
-            path: Some("src/lib.rs".to_owned()),
-            staged: false,
-            patch: String::new(),
-            binary: false,
-            truncated: false,
-            hunks: vec![
-                GitDiffHunk {
-                    old_start: 2,
-                    old_lines: 1,
-                    new_start: 2,
-                    new_lines: 1,
-                    lines: vec![GitDiffLine {
-                        kind: GitDiffLineKind::Removed,
-                        old_line: Some(2),
-                        new_line: None,
-                        content: "old".to_owned(),
-                    }],
-                },
-                GitDiffHunk {
-                    old_start: 20,
-                    old_lines: 1,
-                    new_start: 20,
-                    new_lines: 1,
-                    lines: vec![GitDiffLine {
-                        kind: GitDiffLineKind::Added,
-                        old_line: None,
-                        new_line: Some(20),
-                        content: "new".to_owned(),
-                    }],
-                },
-            ],
-        });
-        assert_eq!(review.hunk_rows, vec![0, 2]);
-        assert_eq!(review.list_state.item_count(), 4);
+        review.show_diff(
+            GitDiff {
+                path: Some("src/lib.rs".to_owned()),
+                staged: false,
+                patch: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n same\n"
+                    .to_owned(),
+                binary: false,
+                truncated: false,
+                // The typed hunks are protocol data; the pane shows the patch.
+                hunks: Vec::new(),
+            },
+            cx,
+        );
+        let files = review
+            .diff_view
+            .as_ref()
+            .expect("the rendered patch builds a surface")
+            .read_with(cx, |state, _| {
+                state
+                    .files()
+                    .iter()
+                    .map(|file| (file.path().to_string(), file.additions(), file.deletions()))
+                    .collect::<Vec<_>>()
+            });
+        assert_eq!(files, vec![("src/lib.rs".to_owned(), 1, 1)]);
+
+        // A whole-checkout patch names its own files, so the surface keeps them
+        // apart and each one resolves on its own.
+        review.show_diff(
+            GitDiff {
+                path: None,
+                staged: false,
+                patch: "--- a/first.rs\n+++ b/first.rs\n@@ -1,1 +1,1 @@\n-old first\n+new first\n\
+                        --- a/second.rs\n+++ b/second.rs\n@@ -1,1 +1,1 @@\n-old second\n+new second\n"
+                    .to_owned(),
+                binary: false,
+                truncated: false,
+                hunks: Vec::new(),
+            },
+            cx,
+        );
+        let files = review
+            .diff_view
+            .as_ref()
+            .expect("a whole-checkout patch parses")
+            .read_with(cx, |state, _| {
+                state
+                    .files()
+                    .iter()
+                    .map(|file| file.path().to_string())
+                    .collect::<Vec<_>>()
+            });
+        assert_eq!(files, vec!["first.rs".to_owned(), "second.rs".to_owned()]);
+
+        // A diff with no patch has nothing to show, and that is not an error:
+        // the pane keeps its own copy for the empty case.
+        review.show_diff(
+            GitDiff {
+                path: Some("src/lib.rs".to_owned()),
+                staged: false,
+                patch: String::new(),
+                binary: false,
+                truncated: false,
+                hunks: Vec::new(),
+            },
+            cx,
+        );
+        assert!(review.diff_view.is_none());
+        assert!(review.selected_diff.is_some());
+        assert!(review.diff_error.is_none());
+        review.clear_diff();
+        assert!(review.diff_view.is_none());
+        assert!(review.selected_diff.is_none());
     }
 
-    #[test]
-    fn collapsed_hunks_hide_their_lines_until_expanded() {
+    #[gpui_kit::test]
+    fn show_diff_stays_quiet_about_a_patch_it_cannot_read(cx: &mut TestAppContext) {
         let mut review = ReviewState::default();
-        review.show_diff(GitDiff {
-            path: Some("src/lib.rs".to_owned()),
-            staged: false,
-            patch: String::new(),
-            binary: false,
-            truncated: false,
-            hunks: vec![
-                GitDiffHunk {
-                    old_start: 1,
-                    old_lines: 1,
-                    new_start: 1,
-                    new_lines: 1,
-                    lines: vec![GitDiffLine {
-                        kind: GitDiffLineKind::Removed,
-                        old_line: Some(1),
-                        new_line: None,
-                        content: "old".to_owned(),
-                    }],
-                },
-                GitDiffHunk {
-                    old_start: 9,
-                    old_lines: 1,
-                    new_start: 9,
-                    new_lines: 1,
-                    lines: vec![GitDiffLine {
-                        kind: GitDiffLineKind::Added,
-                        old_line: None,
-                        new_line: Some(9),
-                        content: "new".to_owned(),
-                    }],
-                },
-            ],
-        });
-        assert_eq!(review.rows.len(), 4);
-        assert!(review.toggle_hunk(0));
-        assert!(review.collapsed_hunks.contains(&0));
-        assert_eq!(review.rows.len(), 3);
-        // The remaining hunk header keeps a valid row index.
-        assert_eq!(review.hunk_rows, vec![0, 1]);
-        assert_eq!(review.list_state.item_count(), 3);
-        assert!(review.toggle_hunk(0));
-        assert_eq!(review.rows.len(), 4);
-        assert!(!review.toggle_hunk(999));
+        // A body that stops short of the counts its header declares is not a
+        // patch, so there is no surface to build from it.
+        review.show_diff(
+            GitDiff {
+                path: Some("src/lib.rs".to_owned()),
+                staged: false,
+                patch: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n-only\n".to_owned(),
+                binary: false,
+                truncated: false,
+                hunks: Vec::new(),
+            },
+            cx,
+        );
+        // The pane keeps its own copy for a diff with nothing to show, and the
+        // reason stays in the log rather than in front of the reviewer.
+        assert!(review.diff_view.is_none());
+        assert!(review.selected_diff.is_some());
+        assert!(review.diff_error.is_none());
     }
 
     #[test]
