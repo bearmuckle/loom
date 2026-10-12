@@ -430,6 +430,14 @@ CREATE TABLE IF NOT EXISTS workspace_configs (
 ) WITHOUT ROWID, STRICT;
 CREATE INDEX IF NOT EXISTS workspace_configs_by_revision
     ON workspace_configs(revision DESC, workspace_id);
+-- One row holds the archive-retention policy this worker applies. A row exists
+-- once retention was set explicitly, by an operator flag at startup or by a
+-- client request; a zero window is stored as NULL.
+CREATE TABLE IF NOT EXISTS archive_retention_policy (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    retention_ms INTEGER CHECK(retention_ms IS NULL OR retention_ms > 0),
+    force_discard_worktrees INTEGER NOT NULL CHECK(force_discard_worktrees IN (0, 1))
+) STRICT;
 CREATE TABLE IF NOT EXISTS provider_configs (
     provider_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(provider_id)) > 0),
     config TEXT NOT NULL CHECK(length(config) <= 65536)
@@ -962,6 +970,25 @@ fn migrate_schema(connection: &Connection, from_version: u32) -> Result<()> {
                         )
                     })?;
                 version = 4;
+            }
+            // v5 adds the singleton archive-retention policy row.
+            4 => {
+                transaction
+                    .execute_batch(
+                        "CREATE TABLE IF NOT EXISTS archive_retention_policy (
+                             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                             retention_ms INTEGER CHECK(retention_ms IS NULL OR retention_ms > 0),
+                             force_discard_worktrees INTEGER NOT NULL
+                                 CHECK(force_discard_worktrees IN (0, 1))
+                         ) STRICT;",
+                    )
+                    .map_err(|error| {
+                        persistence_error(
+                            format!("could not migrate persistence schema to v5: {error}"),
+                            true,
+                        )
+                    })?;
+                version = 5;
             }
             other => return Err(unsupported_database_error(other)),
         }

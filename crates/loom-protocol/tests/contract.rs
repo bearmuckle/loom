@@ -519,6 +519,32 @@ fn archived_session_deletion_and_retention_policy_contracts_round_trip() {
         policy_request
     );
 
+    // Changing the policy is a separate, retryable mutation behind its own
+    // capability, so a client that may only read the worker status cannot turn
+    // automatic deletion on.
+    let set_policy_request = RequestEnvelope::new(ClientRequest::Control(
+        ControlRequest::SetArchiveRetentionPolicy {
+            policy: ArchiveRetentionPolicy {
+                retention_ms: Some(86_400_000),
+                force_discard_worktrees: true,
+            },
+        },
+    ));
+    assert_eq!(
+        set_policy_request.request.required_capability(),
+        Some(Capability::ConfigureArchiveRetention)
+    );
+    assert!(set_policy_request.request.is_retryable_mutation());
+    assert_eq!(
+        decode_request(&encode_request(&set_policy_request).unwrap()).unwrap(),
+        set_policy_request
+    );
+    // A zero or absent window is what disables retention; the field defaults
+    // so a request may carry an explicit zero.
+    let disabled_policy: ArchiveRetentionPolicy =
+        serde_json::from_str(r#"{"retention_ms":0}"#).unwrap();
+    assert!(!disabled_policy.is_enabled());
+
     let deleted = ResponseEnvelope::success(
         loom_core::RequestId::new(),
         ServerResponse::Session(SessionResponse::AgentSessionDeleted { session_id }),

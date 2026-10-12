@@ -128,6 +128,103 @@ fn typed_workspace_catalog_round_trips_and_uses_its_activity_index() {
 }
 
 #[test]
+fn archive_retention_policy_round_trips_through_state_saves() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+    let persistence = FilePersistence::open(&path).unwrap();
+    let sessions = SessionManager::default().export_state();
+
+    // A database that never stored a policy has no row, which means retention
+    // is disabled.
+    assert_eq!(persistence.load_archive_retention_policy().unwrap(), None);
+    assert_eq!(
+        persistence
+            .load_session_settings()
+            .unwrap()
+            .archive_retention,
+        DurableArchiveRetentionPolicy::default()
+    );
+
+    let enabled = DurableArchiveRetentionPolicy {
+        retention_ms: Some(1_209_600_000),
+        force_discard_worktrees: true,
+    };
+    save_archive_retention(&persistence, &sessions, enabled);
+    assert_eq!(
+        persistence.load_archive_retention_policy().unwrap(),
+        Some(enabled)
+    );
+    assert_eq!(
+        persistence
+            .load_session_settings()
+            .unwrap()
+            .archive_retention,
+        enabled
+    );
+
+    // A state save that carries no settings leaves the stored policy alone.
+    persistence.save_state_with_sessions(&sessions).unwrap();
+    assert_eq!(
+        persistence.load_archive_retention_policy().unwrap(),
+        Some(enabled)
+    );
+
+    // Turning retention off stores a disabled policy instead of deleting the
+    // row, so a later start can tell "off" from "never set".
+    save_archive_retention(
+        &persistence,
+        &sessions,
+        DurableArchiveRetentionPolicy::default(),
+    );
+    assert_eq!(
+        persistence.load_archive_retention_policy().unwrap(),
+        Some(DurableArchiveRetentionPolicy::default())
+    );
+    let connection = Connection::open(&path).unwrap();
+    let stored: (Option<i64>, i64) = connection
+        .query_row(
+            "SELECT retention_ms, force_discard_worktrees FROM archive_retention_policy",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored, (None, 0));
+    drop(connection);
+    fs::remove_file(path).unwrap();
+}
+
+/// Saves one state carrying the given archive-retention policy and no session
+/// settings.
+fn save_archive_retention(
+    persistence: &FilePersistence,
+    sessions: &loom_session::SessionManagerState,
+    archive_retention: DurableArchiveRetentionPolicy,
+) {
+    let settings = DurableSessionSettings {
+        archive_retention,
+        ..DurableSessionSettings::default()
+    };
+    persistence
+        .save_state(DurableStateWrite {
+            sessions,
+            workspaces: None,
+            settings: Some(&settings),
+            workspace_configs: None,
+            providers: None,
+            usage: None,
+            idempotency: None,
+            run_summaries: None,
+            run_runtime_configs: None,
+            run_context_checkpoints: None,
+            run_plans: None,
+            run_messages: None,
+            run_activities: None,
+            filesystem_records: None,
+            feed: None,
+        })
+        .unwrap();
+}
+
+#[test]
 fn session_and_workspace_settings_are_bounded_indexed_and_atomic() {
     let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
     let persistence = FilePersistence::open(&path).unwrap();
@@ -140,6 +237,7 @@ fn session_and_workspace_settings_are_bounded_indexed_and_atomic() {
     let settings = DurableSessionSettings {
         approval_policies: BTreeMap::from([(session.id, ApprovalPolicy::default())]),
         auto_approve_actions: BTreeMap::from([(session.id, true)]),
+        ..DurableSessionSettings::default()
     };
     let config = WorkspaceConfig {
         revision: 4,
@@ -1534,6 +1632,7 @@ fn deleted_sessions_lose_their_rows_and_unused_content_in_one_transaction() {
             (survivor_id, ApprovalPolicy::default()),
         ]),
         auto_approve_actions: BTreeMap::from([(deleted_id, true), (survivor_id, false)]),
+        ..DurableSessionSettings::default()
     };
     persistence
         .save_state(DurableStateWrite {

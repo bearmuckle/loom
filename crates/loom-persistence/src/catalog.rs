@@ -114,11 +114,13 @@ impl FilePersistence {
         Ok(Some(WorkspaceManagerState { workspaces }))
     }
 
-    /// Loads policy and auto-approval settings by session key.
+    /// Loads policy and auto-approval settings by session key, plus the
+    /// worker-wide archive-retention policy.
     pub fn load_session_settings(&self) -> Result<DurableSessionSettings> {
         if !self.path.exists() {
             return Ok(DurableSessionSettings::default());
         }
+        let archive_retention = self.load_archive_retention_policy()?.unwrap_or_default();
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(
@@ -172,7 +174,64 @@ impl FilePersistence {
             settings.approval_policies.insert(id, policy);
             settings.auto_approve_actions.insert(id, auto_approve);
         }
+        settings.archive_retention = archive_retention;
         Ok(settings)
+    }
+
+    /// Loads the singleton archive-retention policy this worker applies, or
+    /// `None` when the database never stored one.
+    ///
+    /// An absent durable database also reports `None`, which means retention is
+    /// disabled.
+    pub fn load_archive_retention_policy(&self) -> Result<Option<DurableArchiveRetentionPolicy>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT retention_ms, force_discard_worktrees
+                 FROM archive_retention_policy WHERE singleton = 1",
+                [],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read the archive retention policy: {error}"),
+                    true,
+                )
+            })?;
+        let Some((retention_ms, force_discard_worktrees)) = row else {
+            return Ok(None);
+        };
+        let retention_ms = retention_ms
+            .map(|retention_ms| {
+                u64::try_from(retention_ms).map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "persisted archive retention window is negative",
+                        false,
+                    )
+                })
+            })
+            .transpose()?
+            .filter(|retention_ms| *retention_ms > 0);
+        let force_discard_worktrees = match force_discard_worktrees {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted archive retention force-discard flag is invalid",
+                    false,
+                ));
+            }
+        };
+        Ok(Some(DurableArchiveRetentionPolicy {
+            retention_ms,
+            force_discard_worktrees,
+        }))
     }
 
     /// Loads bounded workspace configuration records by workspace key.
@@ -1101,6 +1160,45 @@ pub(crate) fn save_session_settings_rows(
         )
         .map_err(|error| {
             persistence_error(format!("could not prune session settings: {error}"), true)
+        })?;
+    // The retention policy is one worker-wide row rather than a per-session
+    // setting. It is written here so a state save keeps it in the same
+    // transaction as the settings it travels with, and a zero window is stored
+    // as `NULL`.
+    let retention_ms = settings
+        .archive_retention
+        .retention_ms
+        .filter(|retention_ms| *retention_ms > 0)
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "archive retention window exceeds SQLite's integer range",
+                false,
+            )
+        })?;
+    transaction
+        .execute(
+            "INSERT INTO archive_retention_policy(
+                singleton, retention_ms, force_discard_worktrees
+             ) VALUES (1, ?1, ?2)
+             ON CONFLICT(singleton) DO UPDATE SET
+                retention_ms=excluded.retention_ms,
+                force_discard_worktrees=excluded.force_discard_worktrees
+             WHERE archive_retention_policy.retention_ms IS NOT excluded.retention_ms
+                OR archive_retention_policy.force_discard_worktrees
+                    IS NOT excluded.force_discard_worktrees",
+            params![
+                retention_ms,
+                settings.archive_retention.force_discard_worktrees
+            ],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not save the archive retention policy: {error}"),
+                true,
+            )
         })?;
     Ok(())
 }

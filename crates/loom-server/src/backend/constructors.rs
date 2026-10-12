@@ -267,6 +267,7 @@ impl InProcessBackend {
         if persistence.is_some() {
             supported_capabilities.extend([
                 Capability::DeleteAgentSession,
+                Capability::ConfigureArchiveRetention,
                 Capability::CreateProjectChild,
                 Capability::ControlProjectChild,
                 Capability::SendProjectAgentMessage,
@@ -300,6 +301,7 @@ impl InProcessBackend {
             run_executor: RunExecutor::with_defaults(),
             session_root_base,
             archive_retention: Mutex::new(loom_protocol::ArchiveRetentionPolicy::disabled()),
+            archive_retention_stored: AtomicBool::new(false),
             idempotency_store: IdempotencyStore::new(),
             admissions: AdmissionService::new(),
             self_reference: Mutex::new(Weak::new()),
@@ -317,6 +319,10 @@ impl InProcessBackend {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&backend);
         backend.restore_persisted()?;
+        // The stored retention policy is loaded here rather than in the restore
+        // path, so a start that was given an explicit flag can tell that it
+        // overrides a stored policy instead of the built-in default.
+        backend.restore_archive_retention()?;
         Ok(backend)
     }
 }

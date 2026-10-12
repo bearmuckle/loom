@@ -253,6 +253,18 @@ impl InProcessConnection {
         if self.backend.persistence.is_none()
             && matches!(
                 &request,
+                ClientRequest::Control(ControlRequest::SetArchiveRetentionPolicy { .. })
+            )
+        {
+            return Err(LoomError::new(
+                ErrorCode::UnsupportedCapability,
+                "changing the archive retention policy requires durable storage",
+                false,
+            ));
+        }
+        if self.backend.persistence.is_none()
+            && matches!(
+                &request,
                 ClientRequest::Project(ProjectRequest::SendProjectAgentMessage { .. })
                     | ClientRequest::Project(ProjectRequest::ListProjectAgentMessages { .. })
                     | ClientRequest::Project(ProjectRequest::ControlProjectChild { .. })
@@ -801,6 +813,7 @@ impl InProcessConnection {
             ClientRequest::Control(ControlRequest::Negotiate { .. })
             | ClientRequest::Control(ControlRequest::DiscoverCapabilities)
             | ClientRequest::Control(ControlRequest::GetArchiveRetentionPolicy)
+            | ClientRequest::Control(ControlRequest::SetArchiveRetentionPolicy { .. })
             | ClientRequest::Workspace(WorkspaceRequest::ListWorkspaces)
             | ClientRequest::Provider(ProviderRequest::ListModels)
             | ClientRequest::Control(ControlRequest::GetWorkerNodeStatus)

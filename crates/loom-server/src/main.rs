@@ -21,8 +21,9 @@ use loom_server::{
     ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FORCE_DISCARD_ENV, ARCHIVE_RETENTION_SWEEP_INTERVAL,
     AuthTokenStore, AuthorizationScope, DiagnosticsSettings, InProcessBackend, Instance,
     InstanceLayout, InstanceOptions, ProcessContext, RemoteServer, RemoteServerConfig,
-    RunningRemoteServer, ServerTlsConfig, TlsState, diagnostics_lines, resolve_archive_retention,
-    run_archive_retention_sweeps, startup_summary, sweep_archive_retention_at_startup,
+    RunningRemoteServer, ServerTlsConfig, TlsState, apply_startup_archive_retention,
+    diagnostics_lines, resolve_archive_retention, run_archive_retention_sweeps, startup_summary,
+    sweep_archive_retention_at_startup,
 };
 
 /// The bind address used when `--bind` is not supplied.
@@ -96,10 +97,11 @@ impl Default for ServerOptions {
 }
 
 impl ServerOptions {
-    /// The archive-retention policy the operator asked for, resolving the
+    /// The archive-retention policy this start asks for, resolving the
     /// environment fallback exactly like the flags and refusing an unusable
-    /// value with the flag or variable that carried it.
-    fn retention_policy(&self) -> Result<ArchiveRetentionPolicy, LoomError> {
+    /// value with the flag or variable that carried it. `None` means no
+    /// retention input was given, so the persisted policy applies.
+    fn retention_policy(&self) -> Result<Option<ArchiveRetentionPolicy>, LoomError> {
         resolve_archive_retention(
             self.archive_retention.as_deref(),
             self.archive_retention_force_discard.as_deref(),
@@ -393,16 +395,15 @@ fn version_label(version: &str, revision: &str) -> String {
 /// Opens the backend the operator asked for: the path [`Instance`] resolved, or
 /// the in-memory backend when this instance has no durable database. This
 /// mirrors the standalone server mode of the native `loom` shell.
-fn build_backend(
-    persistence: Option<&Path>,
-    archive_retention: ArchiveRetentionPolicy,
-) -> Result<Arc<InProcessBackend>, LoomError> {
-    let backend = match persistence {
-        Some(path) => InProcessBackend::new_persistent_with_github_copilot(path)?,
-        None => InProcessBackend::new_with_github_copilot()?,
-    };
-    backend.set_archive_retention(archive_retention)?;
-    Ok(backend)
+///
+/// A durable backend loads the retention policy stored in its database, so a
+/// start without an explicit flag keeps the policy an earlier start or a client
+/// stored.
+fn build_backend(persistence: Option<&Path>) -> Result<Arc<InProcessBackend>, LoomError> {
+    match persistence {
+        Some(path) => InProcessBackend::new_persistent_with_github_copilot(path),
+        None => InProcessBackend::new_with_github_copilot(),
+    }
 }
 
 /// The running standalone backend. It is owned by the caller so a test can stop
@@ -527,11 +528,13 @@ async fn serve_in(
         state_directory,
     );
     log::info!("{}", startup_summary(&ProcessContext::detect(), &settings));
-    let backend = build_backend(instance.state_db(), instance_options.archive_retention)?;
-    // The startup sweep runs before the listener accepts clients. It is not part
-    // of `restore_persisted` because the retention policy is operator input the
-    // backend learns only after it was constructed, and a failed sweep must be
-    // reported without stopping the server.
+    let backend = build_backend(instance.state_db())?;
+    // An explicit flag or variable wins over the persisted policy and is
+    // persisted in turn; otherwise the policy loaded when the durable state was
+    // opened applies; otherwise retention stays disabled. Either way the
+    // startup sweep runs before the listener accepts clients, and a failed sweep
+    // is reported without stopping the server.
+    apply_startup_archive_retention(&backend, instance_options.archive_retention)?;
     sweep_archive_retention_at_startup(&backend);
     let server = start(&options, Arc::clone(&backend), &instance).await?;
     let sweeps =
@@ -781,19 +784,19 @@ mod tests {
         ]);
         assert_eq!(
             flagged.instance_options().unwrap().archive_retention,
-            ArchiveRetentionPolicy {
+            Some(ArchiveRetentionPolicy {
                 retention_ms: Some(1_209_600_000),
                 force_discard_worktrees: true,
-            }
+            })
         );
 
         // The environment is the fallback, and a flag always wins over it.
         assert_eq!(
             resolve_archive_retention(None, None, Some("2h"), Some("yes")).unwrap(),
-            ArchiveRetentionPolicy {
+            Some(ArchiveRetentionPolicy {
                 retention_ms: Some(7_200_000),
                 force_discard_worktrees: true,
-            }
+            })
         );
         let disabled = serve_options(&[
             "--archive-retention=off",
@@ -802,16 +805,22 @@ mod tests {
         .instance_options()
         .unwrap()
         .archive_retention;
-        assert_eq!(disabled, ArchiveRetentionPolicy::disabled());
+        assert_eq!(disabled, Some(ArchiveRetentionPolicy::disabled()));
         if std::env::var("LOOM_ARCHIVE_RETENTION").is_err()
             && std::env::var("LOOM_ARCHIVE_RETENTION_FORCE_DISCARD").is_err()
         {
+            // No input at all leaves the policy to the durable state, so a
+            // start neither enables nor disables retention by itself.
             assert_eq!(
                 serve_options(&[])
                     .instance_options()
                     .unwrap()
                     .archive_retention,
-                ArchiveRetentionPolicy::disabled()
+                None
+            );
+            assert_eq!(
+                resolve_archive_retention(None, None, None, None).unwrap(),
+                None
             );
         }
 
@@ -1451,9 +1460,7 @@ mod tests {
     fn backend_selection_reports_errors_for_an_unusable_persistence_path() {
         let directory = temporary_path("state-dir");
         std::fs::create_dir_all(&directory).unwrap();
-        assert!(
-            super::build_backend(Some(&directory), ArchiveRetentionPolicy::disabled()).is_err()
-        );
+        assert!(super::build_backend(Some(&directory)).is_err());
         std::fs::remove_dir_all(directory).ok();
     }
 

@@ -130,6 +130,14 @@ and retries later. The node-level repository clone cache
 (`<session-root-base>.clone-cache`) is shared between sessions and is never
 deleted with a session.
 
+The archive-retention policy the sweep applies is one `archive_retention_policy`
+row per database: a `retention_ms` window (`NULL` when retention is disabled)
+and the `force_discard_worktrees` flag. It is written in the same transaction as
+the session settings, so a startup flag that overrides the stored policy, or a
+`SetArchiveRetentionPolicy` request, is durable as soon as it is answered. A
+restart applies the stored policy unless an explicit
+`--archive-retention`/`LOOM_ARCHIVE_RETENTION` overrides and replaces it.
+
 Deletions are durable across restarts. A restart does not recreate a deleted
 filesystem root, re-register a deleted worktree, or restore deleted rows, so a
 session that is absent from the database stays absent.

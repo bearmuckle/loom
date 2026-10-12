@@ -68,7 +68,7 @@ pub use schema::*;
 /// no registered step, are rejected and must be wiped by the operator. New
 /// optional state should prefer a versioned JSON payload column over a new
 /// column where the payload column already exists.
-const DATABASE_SCHEMA_VERSION: u32 = 4;
+const DATABASE_SCHEMA_VERSION: u32 = 5;
 /// Oldest schema version that the migration ladder can upgrade in place.
 const DATABASE_MIN_MIGRATABLE_VERSION: u32 = 2;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
@@ -153,6 +153,24 @@ pub struct DurableFeedWorkspaceCursor {
 pub struct DurableSessionSettings {
     pub approval_policies: BTreeMap<AgentSessionId, ApprovalPolicy>,
     pub auto_approve_actions: BTreeMap<AgentSessionId, bool>,
+    /// Archive-retention policy of the whole worker node.
+    ///
+    /// It is not keyed by session, but it is stored and read with the settings
+    /// bucket so one state save writes it in the same transaction as the
+    /// settings it sits beside.
+    pub archive_retention: DurableArchiveRetentionPolicy,
+}
+
+/// Durable form of the worker node's archive-retention policy.
+///
+/// A zero `retention_ms` is stored as `None`, so a stored policy is either
+/// disabled or a positive window.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DurableArchiveRetentionPolicy {
+    /// Retention window in milliseconds; `None` leaves retention disabled.
+    pub retention_ms: Option<u64>,
+    /// Whether an automatic sweep may discard dirty or locked worktrees.
+    pub force_discard_worktrees: bool,
 }
 
 #[derive(Clone, Debug, Default)]

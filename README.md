@@ -63,6 +63,15 @@ image:
 docker run --rm -p 127.0.0.1:8765:8765 ghcr.io/<owner>/loom-server:<tag>
 ```
 
+`--archive-retention <duration>` (or `LOOM_ARCHIVE_RETENTION`), with
+`--archive-retention-force-discard`, sets a startup default that overrides the
+policy stored in the worker's durable state and is stored in turn: a worker
+started without the flag resumes the policy it stored, and a client can change
+the window and the force-discard switch at runtime through
+`SetArchiveRetentionPolicy`. Retention is disabled when no flag, variable, or
+stored policy enables it. [deployment](docs/deployment.md) documents the
+duration syntax and the sweep.
+
 ## Providers
 
 Configure OpenAI, DeepSeek, or GitHub Copilot in the Providers dialog; the

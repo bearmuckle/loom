@@ -1,11 +1,15 @@
 //! Archive-retention input and the periodic sweep that acts on it.
 //!
-//! Retention is operator input rather than a client request: the window comes
-//! from `--archive-retention` or `LOOM_ARCHIVE_RETENTION` and the force-discard
-//! switch from `--archive-retention-force-discard` or
-//! `LOOM_ARCHIVE_RETENTION_FORCE_DISCARD`. Both binaries resolve that input
-//! here, so the standalone server and `loom --serve` accept exactly the same
-//! syntax and the same fallback order.
+//! The window and the force-discard switch come from
+//! `--archive-retention`/`LOOM_ARCHIVE_RETENTION` and
+//! `--archive-retention-force-discard`/`LOOM_ARCHIVE_RETENTION_FORCE_DISCARD`,
+//! and both binaries resolve that input here, so the standalone server and
+//! `loom --serve` accept exactly the same syntax and the same fallback order.
+//!
+//! Explicit input at a start is a startup default rather than the policy
+//! itself: it overrides the policy stored in durable state and is stored in
+//! turn. Either way the policy is changeable at runtime through
+//! `SetArchiveRetentionPolicy`.
 
 use std::{sync::Arc, time::Duration};
 
@@ -103,15 +107,20 @@ pub fn parse_force_discard(value: &str, source: &str) -> Result<bool> {
 /// Resolves the archive-retention policy from the explicit flags and their
 /// environment fallback.
 ///
-/// An explicit flag always wins over the variable it falls back to. A missing,
-/// `off`, `never`, or zero window keeps retention disabled, so an absent value
-/// never auto-deletes anything.
+/// An explicit flag always wins over the variable it falls back to. `None`
+/// means this start gave no retention input at all, so the policy stored in
+/// durable state applies; a returned policy is the startup default, and a
+/// missing, `off`, `never`, or zero window in it keeps retention disabled.
+/// Either way an absent value never auto-deletes anything.
 pub fn resolve_archive_retention(
     flag: Option<&str>,
     force_flag: Option<&str>,
     env: Option<&str>,
     force_env: Option<&str>,
-) -> Result<ArchiveRetentionPolicy> {
+) -> Result<Option<ArchiveRetentionPolicy>> {
+    if flag.is_none() && force_flag.is_none() && env.is_none() && force_env.is_none() {
+        return Ok(None);
+    }
     let retention_ms = match flag {
         Some(value) => parse_retention_window(value, ARCHIVE_RETENTION_FLAG)?,
         None => match env {
@@ -126,24 +135,86 @@ pub fn resolve_archive_retention(
             None => false,
         },
     };
-    Ok(ArchiveRetentionPolicy {
+    Ok(Some(ArchiveRetentionPolicy {
         retention_ms: retention_ms.filter(|retention_ms| *retention_ms > 0),
         force_discard_worktrees,
-    })
+    }))
+}
+
+/// The input that decided the archive-retention policy a start applies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArchiveRetentionSource {
+    /// A flag or environment variable given at this start. It overrides the
+    /// persisted policy and is persisted in turn.
+    Explicit,
+    /// The policy stored in durable state by an earlier start or by a client.
+    Persisted,
+    /// Neither: retention is disabled.
+    Default,
+}
+
+impl ArchiveRetentionSource {
+    /// How the source is named in the startup log line.
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Explicit => "an explicit flag or environment variable",
+            Self::Persisted => "durable state",
+            Self::Default => "the built-in default",
+        }
+    }
+}
+
+/// One-line description of a policy for the logs.
+pub(crate) fn describe_archive_retention(policy: ArchiveRetentionPolicy) -> String {
+    match policy.retention() {
+        Some(window) => format!(
+            "{} ms window (force discard worktrees: {})",
+            window.as_millis(),
+            policy.force_discard_worktrees
+        ),
+        None => format!(
+            "disabled (force discard worktrees: {})",
+            policy.force_discard_worktrees
+        ),
+    }
+}
+
+/// Applies the startup precedence for the archive-retention policy and logs
+/// which source won.
+///
+/// An explicit `--archive-retention`/`LOOM_ARCHIVE_RETENTION` (with the
+/// force-discard flag or variable) wins over the persisted policy and is
+/// persisted in turn, so the next start keeps it. Without explicit input the
+/// policy loaded when the durable state was opened applies. Without either,
+/// retention is disabled.
+pub fn apply_startup_archive_retention(
+    backend: &InProcessBackend,
+    explicit: Option<ArchiveRetentionPolicy>,
+) -> Result<ArchiveRetentionSource> {
+    let source = match explicit {
+        Some(policy) => {
+            backend.set_archive_retention(policy)?;
+            ArchiveRetentionSource::Explicit
+        }
+        None if backend.archive_retention_is_stored() => ArchiveRetentionSource::Persisted,
+        None => ArchiveRetentionSource::Default,
+    };
+    log::info!(
+        "[loom-server] archive retention policy from {}: {}",
+        source.description(),
+        describe_archive_retention(backend.archive_retention())
+    );
+    Ok(source)
 }
 
 /// Sweeps once before a server starts accepting clients, logging the active
 /// policy and any failure instead of aborting the start.
 pub fn sweep_archive_retention_at_startup(backend: &InProcessBackend) {
     let policy = backend.archive_retention();
-    match policy.retention() {
-        Some(window) => log::info!(
-            "[loom-server] archive retention deletes archived projects after {} ms (force discard worktrees: {})",
-            window.as_millis(),
-            policy.force_discard_worktrees
-        ),
-        None => log::info!("[loom-server] archive retention is disabled"),
-    }
+    log::info!(
+        "[loom-server] archive retention at startup: {}",
+        describe_archive_retention(policy)
+    );
     match backend.sweep_archive_retention() {
         Ok(report) => log::info!(
             "[loom-server] archive retention startup sweep deleted {} session(s) and skipped {} candidate(s)",
@@ -160,7 +231,9 @@ pub fn sweep_archive_retention_at_startup(backend: &InProcessBackend) {
 /// Sweeps immediately, then every `interval` until the caller drops the future.
 ///
 /// A failed sweep is logged and the next interval still runs, so a locked or
-/// unreachable database cannot stop retention or abort the server.
+/// unreachable database cannot stop retention or abort the server. Each round
+/// reads the policy again, so a policy changed through the protocol applies from
+/// the next round: a change does not start a sweep of its own.
 pub async fn run_archive_retention_sweeps(backend: Arc<InProcessBackend>, interval: Duration) {
     run_periodic_sweeps(interval, move || backend.sweep_archive_retention()).await;
 }

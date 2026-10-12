@@ -28,7 +28,8 @@ use loom_server::{
     ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FORCE_DISCARD_ENV, ARCHIVE_RETENTION_SWEEP_INTERVAL,
     AuthTokenStore, AuthorizationScope, InProcessBackend, InProcessConnection, Instance,
     InstanceOptions, RemoteServer, RemoteServerConfig, WebSocketConnection, WebSocketTransport,
-    resolve_archive_retention, run_archive_retention_sweeps, sweep_archive_retention_at_startup,
+    apply_startup_archive_retention, resolve_archive_retention, run_archive_retention_sweeps,
+    sweep_archive_retention_at_startup,
 };
 
 /// How long the shell waits between event polls while a run is executing.
@@ -197,9 +198,10 @@ struct CliOptions {
 }
 
 impl CliOptions {
-    /// The archive-retention policy the operator asked for, resolving the
-    /// environment fallback exactly like `loom-server` does.
-    fn retention_policy(&self) -> Result<loom_protocol::ArchiveRetentionPolicy, LoomError> {
+    /// The archive-retention policy this start asks for, resolving the
+    /// environment fallback exactly like `loom-server` does. `None` means no
+    /// retention input was given, so the persisted policy applies.
+    fn retention_policy(&self) -> Result<Option<loom_protocol::ArchiveRetentionPolicy>, LoomError> {
         resolve_archive_retention(
             self.archive_retention.as_deref(),
             self.archive_retention_force_discard.as_deref(),
@@ -250,9 +252,10 @@ fn help_text() -> String {
         "Use --reset-state to wipe an incompatible state database instead of being prompted.",
         "Use --archive-retention <duration> (or LOOM_ARCHIVE_RETENTION) to delete archived \
          projects once the archive time is older than <n><unit> with unit ms, s, m, h, d, or w, \
-         a bare number of seconds, or off. --archive-retention-force-discard <bool> (or \
-         LOOM_ARCHIVE_RETENTION_FORCE_DISCARD) lets the sweep discard dirty or locked \
-         worktrees.",
+         a bare number of seconds, or off. It is a startup default that overrides and replaces \
+         the policy stored in durable state, and a client can change that policy at runtime. \
+         --archive-retention-force-discard <bool> (or LOOM_ARCHIVE_RETENTION_FORCE_DISCARD) \
+         lets the sweep discard dirty or locked worktrees.",
     ]
     .join("\n")
 }
@@ -430,10 +433,12 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
         Some(path) => InProcessBackend::new_persistent_with_github_copilot(path)?,
         None => InProcessBackend::new_with_github_copilot()?,
     };
-    backend.set_archive_retention(instance_options.archive_retention)?;
-    // The startup sweep runs before the listener accepts clients. It is not part
-    // of the backend's restore path because the policy is operator input the
-    // backend learns only after it was constructed.
+    // An explicit flag or variable wins over the persisted policy and is
+    // persisted in turn; otherwise the policy loaded when the durable state was
+    // opened applies; otherwise retention stays disabled. The startup sweep runs
+    // before the listener accepts clients, and a failed sweep is reported
+    // without stopping the server.
+    apply_startup_archive_retention(&backend, instance_options.archive_retention)?;
     sweep_archive_retention_at_startup(&backend);
     let auth = Arc::new(AuthTokenStore::new());
     let _issued = auth.insert(instance.token().token(), AuthorizationScope::all())?;
@@ -1665,10 +1670,10 @@ mod tests {
         );
         assert_eq!(
             spaced.instance_options().unwrap().archive_retention,
-            ArchiveRetentionPolicy {
+            Some(ArchiveRetentionPolicy {
                 retention_ms: Some(1_209_600_000),
                 force_discard_worktrees: true,
-            }
+            })
         );
 
         let equals = parse_args(arguments(&[
@@ -1681,30 +1686,33 @@ mod tests {
         assert_eq!(equals.archive_retention_force_discard.as_deref(), Some("0"));
         assert_eq!(
             equals.instance_options().unwrap().archive_retention,
-            ArchiveRetentionPolicy {
+            Some(ArchiveRetentionPolicy {
                 retention_ms: Some(1_800_000),
                 force_discard_worktrees: false,
-            }
+            })
         );
 
         // The environment is the fallback, and a flag always wins over it.
         assert_eq!(
             resolve_archive_retention(None, None, Some("off"), Some("no")).unwrap(),
-            ArchiveRetentionPolicy::disabled()
+            Some(ArchiveRetentionPolicy::disabled())
         );
         assert_eq!(
             resolve_archive_retention(Some("1h"), Some("1"), Some("off"), Some("no")).unwrap(),
-            ArchiveRetentionPolicy {
+            Some(ArchiveRetentionPolicy {
                 retention_ms: Some(3_600_000),
                 force_discard_worktrees: true,
-            }
+            })
         );
         if std::env::var("LOOM_ARCHIVE_RETENTION").is_err()
             && std::env::var("LOOM_ARCHIVE_RETENTION_FORCE_DISCARD").is_err()
         {
+            // No input at all leaves the policy to the durable state, so a
+            // start neither enables nor disables retention by itself.
+            assert_eq!(defaults.instance_options().unwrap().archive_retention, None);
             assert_eq!(
-                defaults.instance_options().unwrap().archive_retention,
-                ArchiveRetentionPolicy::disabled()
+                resolve_archive_retention(None, None, None, None).unwrap(),
+                None
             );
         }
 

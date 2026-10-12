@@ -90,6 +90,64 @@ fn enabled_retention(window_ms: u64, force_discard_worktrees: bool) -> ArchiveRe
     }
 }
 
+/// Negotiates exactly the capabilities a test grants the connection.
+fn negotiate_with(
+    connection: &InProcessConnection,
+    capabilities: impl IntoIterator<Item = Capability>,
+) {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Control(
+        ControlRequest::Negotiate {
+            client_version: CURRENT_PROTOCOL_VERSION,
+            capabilities: CapabilitySet::new(capabilities),
+        },
+    )));
+    assert!(response.result.is_ok(), "{:?}", response.result);
+}
+
+/// The policy the worker reports for the active retention policy.
+fn archive_retention_policy(connection: &InProcessConnection) -> ArchiveRetentionPolicy {
+    match connection
+        .request(RequestEnvelope::new(ClientRequest::Control(
+            ControlRequest::GetArchiveRetentionPolicy,
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Control(ControlResponse::ArchiveRetentionPolicy(policy)) => policy,
+        response => panic!("unexpected policy response: {response:?}"),
+    }
+}
+
+/// Sends `SetArchiveRetentionPolicy` and returns the policy the worker stored.
+fn set_archive_retention_policy(
+    connection: &InProcessConnection,
+    policy: ArchiveRetentionPolicy,
+) -> ArchiveRetentionPolicy {
+    match connection
+        .request(RequestEnvelope::new(ClientRequest::Control(
+            ControlRequest::SetArchiveRetentionPolicy { policy },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Control(ControlResponse::ArchiveRetentionPolicy(stored)) => stored,
+        response => panic!("unexpected policy response: {response:?}"),
+    }
+}
+
+/// Sends `SetArchiveRetentionPolicy` and returns the error it was refused with.
+fn set_archive_retention_policy_error(
+    connection: &InProcessConnection,
+    policy: ArchiveRetentionPolicy,
+) -> loom_core::LoomError {
+    connection
+        .request(RequestEnvelope::new(ClientRequest::Control(
+            ControlRequest::SetArchiveRetentionPolicy { policy },
+        )))
+        .result
+        .unwrap_err()
+}
+
 /// Builds a persistent backend with one workspace and one project root session.
 fn project_tree(label: &str) -> ProjectTree {
     let (temp, _database, backend) = persistent_backend(label);
@@ -248,31 +306,34 @@ fn flags_win_over_the_environment_and_off_disables_retention() {
     // Both flags win over both variables.
     assert_eq!(
         resolve_archive_retention(Some("14d"), Some("1"), Some("1ms"), Some("no")).unwrap(),
-        enabled_retention(1_209_600_000, true)
+        Some(enabled_retention(1_209_600_000, true))
     );
     assert_eq!(
         resolve_archive_retention(Some("30m"), Some("no"), None, Some("yes")).unwrap(),
-        enabled_retention(1_800_000, false)
+        Some(enabled_retention(1_800_000, false))
     );
     // Without a flag the variable is the fallback.
     assert_eq!(
         resolve_archive_retention(None, None, Some("30m"), Some("YES")).unwrap(),
-        enabled_retention(1_800_000, true)
+        Some(enabled_retention(1_800_000, true))
     );
-    // An absent value keeps retention disabled.
+    // No input at all leaves the policy to the durable state, so a start never
+    // disables retention an earlier start or a client turned on.
     assert_eq!(
         resolve_archive_retention(None, None, None, None).unwrap(),
-        ArchiveRetentionPolicy::disabled()
+        None
     );
     // `off` on the flag wins over an enabled variable, and a zero window disables
     // retention while the force switch is kept.
     assert_eq!(
         resolve_archive_retention(Some("off"), None, Some("1s"), None)
             .unwrap()
-            .retention(),
-        None
+            .map(|policy| policy.retention()),
+        Some(None)
     );
-    let zero = resolve_archive_retention(Some("0s"), Some("true"), None, None).unwrap();
+    let zero = resolve_archive_retention(Some("0s"), Some("true"), None, None)
+        .unwrap()
+        .expect("an explicit zero window is still explicit input");
     assert!(!zero.is_enabled());
     assert!(zero.force_discard_worktrees);
 
@@ -688,6 +749,272 @@ fn a_persistent_backend_with_a_policy_sweeps_at_startup_before_serving() {
             .is_empty()
     );
     drop(reopened);
+    let _ = fs::remove_dir_all(&temp);
+}
+
+#[test]
+fn the_protocol_stores_the_policy_it_reports() {
+    use crate::retention::ArchiveRetentionSource;
+
+    let (temp, _database, backend) = persistent_backend("protocol-policy");
+    let connection = backend.connect();
+    negotiate(&connection);
+    assert_eq!(
+        archive_retention_policy(&connection),
+        ArchiveRetentionPolicy::disabled()
+    );
+
+    let requested = enabled_retention(1_800_000, true);
+    assert_eq!(
+        set_archive_retention_policy(&connection, requested),
+        requested,
+        "the answer is the policy that was stored"
+    );
+    assert_eq!(backend.archive_retention(), requested);
+    assert_eq!(archive_retention_policy(&connection), requested);
+
+    // A zero window is stored disabled while the force switch stays as sent.
+    let normalized = set_archive_retention_policy(
+        &connection,
+        ArchiveRetentionPolicy {
+            retention_ms: Some(0),
+            force_discard_worktrees: true,
+        },
+    );
+    assert_eq!(
+        normalized,
+        ArchiveRetentionPolicy {
+            retention_ms: None,
+            force_discard_worktrees: true,
+        }
+    );
+    assert_eq!(backend.archive_retention(), normalized);
+
+    // A stored policy is the source a start without explicit input applies, and
+    // the next sweep reads it without any extra trigger.
+    assert_eq!(
+        apply_startup_archive_retention(&backend, None).unwrap(),
+        ArchiveRetentionSource::Persisted
+    );
+
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    let _ = fs::remove_dir_all(&temp);
+}
+
+#[test]
+fn a_stored_policy_survives_rebuilding_the_backend() {
+    use crate::retention::ArchiveRetentionSource;
+
+    let (temp, database, backend) = persistent_backend("stored-policy");
+    let connection = backend.connect();
+    negotiate(&connection);
+    let stored = enabled_retention(86_400_000, true);
+    set_archive_retention_policy(&connection, stored);
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+
+    // Reopening the same database installs the stored policy before any flag is
+    // considered, which is what a restart without the flag must apply.
+    let reopened = InProcessBackend::new_persistent(&database).unwrap();
+    assert_eq!(reopened.archive_retention(), stored);
+    assert!(reopened.archive_retention_is_stored());
+    assert_eq!(
+        apply_startup_archive_retention(&reopened, None).unwrap(),
+        ArchiveRetentionSource::Persisted
+    );
+    assert_eq!(reopened.archive_retention(), stored);
+
+    // An in-memory backend installs nothing, so no policy is reported as stored.
+    let ephemeral = InProcessBackend::new();
+    assert!(!ephemeral.archive_retention_is_stored());
+    assert_eq!(
+        ephemeral.archive_retention(),
+        ArchiveRetentionPolicy::disabled()
+    );
+    let ephemeral_roots = ephemeral.session_root_base.clone();
+    drop(ephemeral);
+
+    reopened.shutdown().unwrap();
+    drop(reopened);
+    let _ = fs::remove_dir_all(&temp);
+    let _ = fs::remove_dir_all(ephemeral_roots);
+}
+
+#[test]
+fn an_explicit_retention_input_overrides_a_stored_policy() {
+    use crate::retention::ArchiveRetentionSource;
+
+    let (temp, database, backend) = persistent_backend("override-policy");
+    let connection = backend.connect();
+    negotiate(&connection);
+    let stored = enabled_retention(3_600_000, false);
+    set_archive_retention_policy(&connection, stored);
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+
+    let backend = InProcessBackend::new_persistent(&database).unwrap();
+    assert_eq!(backend.archive_retention(), stored);
+    let explicit = enabled_retention(1_000, true);
+    assert_eq!(
+        apply_startup_archive_retention(&backend, Some(explicit)).unwrap(),
+        ArchiveRetentionSource::Explicit
+    );
+    assert_eq!(backend.archive_retention(), explicit);
+
+    // The explicit input is persisted in turn, so the next start keeps it.
+    backend.shutdown().unwrap();
+    drop(backend);
+    let backend = InProcessBackend::new_persistent(&database).unwrap();
+    assert_eq!(backend.archive_retention(), explicit);
+    assert_eq!(
+        apply_startup_archive_retention(&backend, None).unwrap(),
+        ArchiveRetentionSource::Persisted
+    );
+
+    // An explicit `off` disables a stored policy too.
+    assert_eq!(
+        apply_startup_archive_retention(&backend, Some(ArchiveRetentionPolicy::disabled()))
+            .unwrap(),
+        ArchiveRetentionSource::Explicit
+    );
+    assert!(!backend.archive_retention().is_enabled());
+    backend.shutdown().unwrap();
+    drop(backend);
+
+    let reopened = InProcessBackend::new_persistent(&database).unwrap();
+    assert!(!reopened.archive_retention().is_enabled());
+    assert_eq!(
+        apply_startup_archive_retention(&reopened, None).unwrap(),
+        ArchiveRetentionSource::Persisted
+    );
+    drop(reopened);
+    let _ = fs::remove_dir_all(&temp);
+}
+
+#[test]
+fn retention_stays_disabled_without_input_or_a_stored_policy() {
+    use crate::retention::ArchiveRetentionSource;
+
+    let (temp, _database, backend) = persistent_backend("default-policy");
+    assert!(!backend.archive_retention_is_stored());
+    assert_eq!(
+        backend.archive_retention(),
+        ArchiveRetentionPolicy::disabled()
+    );
+    assert_eq!(
+        apply_startup_archive_retention(&backend, None).unwrap(),
+        ArchiveRetentionSource::Default
+    );
+    assert_eq!(
+        backend.archive_retention(),
+        ArchiveRetentionPolicy::disabled()
+    );
+    backend.shutdown().unwrap();
+    drop(backend);
+    let _ = fs::remove_dir_all(&temp);
+}
+
+#[test]
+fn an_in_memory_backend_refuses_to_store_a_policy() {
+    let ephemeral = InProcessBackend::new();
+    let connection = ephemeral.connect();
+    let discovered = connection
+        .request(RequestEnvelope::new(ClientRequest::Control(
+            ControlRequest::DiscoverCapabilities,
+        )))
+        .result
+        .unwrap();
+    assert!(matches!(
+        discovered,
+        ServerResponse::Control(ControlResponse::Capabilities(result))
+            if !result.capabilities.contains(Capability::ConfigureArchiveRetention)
+    ));
+
+    // A client that still asks for the capability, for example across a protocol
+    // version skew, reaches the durable-storage guard instead.
+    *connection.negotiated_capabilities().unwrap() =
+        Some(CapabilitySet::new([Capability::ConfigureArchiveRetention]));
+    let error = set_archive_retention_policy_error(&connection, enabled_retention(1_000, false));
+    assert_eq!(error.code, ErrorCode::UnsupportedCapability);
+    assert_eq!(
+        error.message,
+        "changing the archive retention policy requires durable storage"
+    );
+    assert_eq!(
+        ephemeral.archive_retention(),
+        ArchiveRetentionPolicy::disabled()
+    );
+    let roots = ephemeral.session_root_base.clone();
+    drop(connection);
+    drop(ephemeral);
+    let _ = fs::remove_dir_all(roots);
+}
+
+#[test]
+fn a_failed_durable_save_keeps_the_previous_policy() {
+    let (temp, _database, backend) = persistent_backend("policy-failure");
+    let connection = backend.connect();
+    negotiate(&connection);
+    let first = enabled_retention(3_600_000, false);
+    assert_eq!(set_archive_retention_policy(&connection, first), first);
+
+    // A failed durable save must not leave the sweep and the stored policy out
+    // of step, so the request fails and the in-memory policy stays as it was.
+    backend.fail_next_state_save.store(true, Ordering::SeqCst);
+    let error = set_archive_retention_policy_error(&connection, enabled_retention(1, true));
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert_eq!(backend.archive_retention(), first);
+
+    // The failed save fail-stops the backend, which shutdown still releases.
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    let _ = fs::remove_dir_all(&temp);
+}
+
+#[test]
+fn a_connection_without_the_capability_cannot_change_the_policy() {
+    let (temp, _database, backend) = persistent_backend("policy-capability");
+    let connection = backend.connect();
+    negotiate_with(&connection, [Capability::ReadWorkerNodeStatus]);
+
+    // Reading stays available to a status-only client; writing is refused.
+    assert_eq!(
+        archive_retention_policy(&connection),
+        ArchiveRetentionPolicy::disabled()
+    );
+    let error = set_archive_retention_policy_error(&connection, enabled_retention(1_000, true));
+    assert_eq!(error.code, ErrorCode::CapabilityDenied);
+    assert!(
+        error.message.contains("ConfigureArchiveRetention"),
+        "{error}"
+    );
+    assert_eq!(
+        backend.archive_retention(),
+        ArchiveRetentionPolicy::disabled()
+    );
+
+    // A connection that negotiated the capability still writes it.
+    negotiate_with(
+        &connection,
+        [
+            Capability::ReadWorkerNodeStatus,
+            Capability::ConfigureArchiveRetention,
+        ],
+    );
+    let requested = enabled_retention(1_000, true);
+    assert_eq!(
+        set_archive_retention_policy(&connection, requested),
+        requested
+    );
+
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
     let _ = fs::remove_dir_all(&temp);
 }
 
