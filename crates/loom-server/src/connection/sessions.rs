@@ -251,16 +251,33 @@ impl InProcessConnection {
 }
 
 impl InProcessConnection {
-    /// Permanently removes archived agent sessions and their stored history.
+    /// Deletes one archived session, or a project root with its whole tree.
     ///
-    /// The backend owns the deletion, because the retention sweep performs the
-    /// same work without a connection; this wrapper only forwards the request.
-    pub(crate) fn delete_archived_session(
+    /// A project root is the only session that may be deleted before it is
+    /// archived, and its live work is cancelled first so a project with running
+    /// sub-agents is removed immediately instead of being refused. The backend
+    /// owns the deletion itself, because the retention sweep performs the same
+    /// work without a connection; this wrapper only cancels and forwards.
+    pub(crate) fn delete_agent_session(
         &self,
         session_id: AgentSessionId,
         force: bool,
     ) -> Result<ServerResponse> {
-        self.backend.delete_archived_session(session_id, force)
+        // Every session is a one-member project of its own, so only a root that
+        // owns another member or a delegated task is a project root.
+        let project = self
+            .backend
+            .persistence
+            .as_ref()
+            .map(|persistence| persistence.load_project_snapshot_for_session(session_id))
+            .transpose()?
+            .flatten()
+            .filter(|project| project.root_session_id == session_id)
+            .filter(|project| project.agents.len() > 1 || !project.tasks.is_empty());
+        if let Some(project) = &project {
+            self.cancel_project_live_work(project)?;
+        }
+        self.backend.delete_agent_session(session_id, force)
     }
 
     pub(crate) fn session_snapshot_projection(

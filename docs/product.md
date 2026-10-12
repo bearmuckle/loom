@@ -137,19 +137,21 @@ M5; the client is not a general-purpose editor.
 Archiving retains a session permanently: it becomes terminal and immutable,
 and its runs, transcripts, checkpoints, filesystem root, and child worktrees
 stay in durable state. There is no restore or unarchive, and only an archived
-session can be deleted, so archived sessions accumulate until a user or an
-operator deletes them.
+session or a project root can be deleted, so archived sessions accumulate until
+a user or an operator deletes them.
 
 The client provides an archived management view for that. It lists archived
 sessions grouped by project with each session's archive age, and offers a
 delete action. Deleting a project root deletes the whole project tree,
-including every descendant session and its worktrees, while deleting a
-descendant removes only that session. The delete action carries a force choice
-for a linked worktree that has changes or a lock: without it, the deletion is
-refused and the worktree is preserved. The view displays the active retention
-policy read-only, so a user can see whether the backend removes old archived
-sessions automatically and whether that sweep may discard dirty or locked
-worktrees.
+including every descendant session and its worktrees, and it does not have to be
+archived first: the backend cancels the live sub-agents and then deletes the
+tree, so a project can be removed while its children are still running. Deleting
+a descendant removes only that session and still requires it to be archived. The
+delete action carries a force choice for a linked worktree that has changes or a
+lock: without it, the deletion is refused and the worktree is preserved. The
+view displays the active retention policy read-only, so a user can see whether
+the backend removes old archived sessions automatically and whether that sweep
+may discard dirty or locked worktrees.
 
 ## Guiding principles
 
