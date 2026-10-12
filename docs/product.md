@@ -146,10 +146,9 @@ delete action. Deleting a project root deletes the whole project tree,
 including every descendant session and its worktrees, while deleting a
 descendant removes only that session. The delete action carries a force choice
 for a linked worktree that has changes or a lock: without it, the deletion is
-refused and the worktree is preserved. The view displays the active retention
-policy read-only, so a user can see whether the backend removes old archived
-sessions automatically and whether that sweep may discard dirty or locked
-worktrees.
+refused and the worktree is preserved. The retention policy is editable there
+rather than read-only: a user sets the window and the force-discard switch, the
+worker stores that policy durably, and it applies from the next sweep.
 
 ## Guiding principles
 

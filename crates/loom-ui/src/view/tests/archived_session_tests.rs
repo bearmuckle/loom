@@ -1,5 +1,6 @@
 //! Archived-session management: project grouping, deletion, and the
-//! read-only archive-retention policy.
+//! archive-retention policy, which the surface can edit on a worker that stores
+//! one.
 
 use super::*;
 use gpui_kit::test::TestWindowExt;
@@ -8,9 +9,10 @@ use loom_core::Capability;
 use loom_protocol::{ArchiveRetentionPolicy, SessionRequest, SessionResponse};
 
 use crate::view::archive::{
-    ArchivedSessionEntry, ArchivedSessionsState, RetentionPolicyState, RetentionPolicyText,
-    archived_age_label, archived_session_groups, delete_archived_session_request,
-    retention_policy_state, retention_window_label,
+    ArchivedSessionEntry, ArchivedSessionsState, RETENTION_WINDOW_PRESETS, RetentionPolicyState,
+    RetentionPolicyText, RetentionWindowChoice, archived_age_label, archived_session_groups,
+    delete_archived_session_request, retention_editable_state, retention_policy_state,
+    retention_window_choice, retention_window_choices, retention_window_label,
 };
 
 /// An archived session whose archive timestamp is `archived_at`.
@@ -242,6 +244,65 @@ fn a_worker_without_a_retention_policy_reads_as_unavailable() {
         ))),
         RetentionPolicyState::Unavailable
     );
+}
+
+#[test]
+fn retention_window_choices_offer_presets_and_a_custom_entry() {
+    let preset = ArchiveRetentionPolicy {
+        retention_ms: Some(7 * 86_400_000),
+        force_discard_worktrees: false,
+    };
+    let (choices, selected) = retention_window_choices(preset);
+    assert_eq!(choices.len(), RETENTION_WINDOW_PRESETS.len());
+    assert_eq!(choices.first().map(String::as_str), Some("Off"));
+    assert_eq!(selected, "7 days");
+    assert!(choices.contains(&selected));
+
+    // Every label maps back to the window it stands for.
+    assert_eq!(retention_window_choice("Off"), RetentionWindowChoice::Off);
+    for window in RETENTION_WINDOW_PRESETS.iter().flatten() {
+        assert_eq!(
+            retention_window_choice(&retention_window_label(*window)),
+            RetentionWindowChoice::Window(*window)
+        );
+    }
+
+    // A stored window that matches no preset is offered as its own entry, so
+    // nothing silently moves it to a preset.
+    let custom = ArchiveRetentionPolicy {
+        retention_ms: Some(37 * 60_000),
+        force_discard_worktrees: true,
+    };
+    let (choices, selected) = retention_window_choices(custom);
+    assert_eq!(choices.len(), RETENTION_WINDOW_PRESETS.len() + 1);
+    assert_eq!(selected, "Custom (37 minutes)");
+    assert_eq!(choices.last(), Some(&selected));
+    assert_eq!(
+        retention_window_choice(&selected),
+        RetentionWindowChoice::Custom
+    );
+    assert_eq!(
+        retention_window_choice("a window nobody offers"),
+        RetentionWindowChoice::Custom
+    );
+
+    // A disabled policy selects the off entry rather than a window.
+    let (_, selected) = retention_window_choices(ArchiveRetentionPolicy::disabled());
+    assert_eq!(selected, "Off");
+}
+
+#[test]
+fn retention_editability_follows_the_worker_capability() {
+    // An answer that is not a worker-node status, and a failure, both leave the
+    // card read-only rather than offering a control that cannot work.
+    assert!(!retention_editable_state(Ok(ServerResponse::Workspace(
+        WorkspaceResponse::Workspaces { workspaces: vec![] }
+    ))));
+    assert!(!retention_editable_state(Err(LoomError::new(
+        ErrorCode::UnsupportedCapability,
+        "no such request",
+        false
+    ))));
 }
 
 #[test]
@@ -670,4 +731,707 @@ fn archived_sessions_surface_renders_the_policy_and_the_rows(cx: &mut TestAppCon
         assert!(window.find(("archived-session-delete", 0usize)).visible());
     })
     .unwrap();
+}
+
+/// The retention policy the connection's worker reports.
+fn reported_retention_policy(connection: &ClientConnection) -> ArchiveRetentionPolicy {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Control(
+        ControlRequest::GetArchiveRetentionPolicy,
+    )));
+    match response.result {
+        Ok(ServerResponse::Control(ControlResponse::ArchiveRetentionPolicy(policy))) => policy,
+        response => panic!("reading the retention policy failed: {response:?}"),
+    }
+}
+
+#[gpui_kit::test]
+fn applying_a_window_stores_it_and_the_card_shows_the_stored_policy(cx: &mut TestAppContext) {
+    // A durable worker is required: an in-memory one refuses every change.
+    let state_path = std::env::temp_dir().join(format!(
+        "loom-ui-archive-retention-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let backend = loom_local::OwnedBackend::new_persistent_with_github_copilot(state_path)
+        .expect("durable backend");
+    let connection = ClientConnection::InProcess(Box::new(backend.connect()));
+    crate::connection::negotiate(&connection).unwrap();
+
+    let view = cx.new(|cx| {
+        let mut view = view_over_connection(&connection, cx);
+        view.open_archived_sessions(cx);
+        view
+    });
+    cx.run_until_parked();
+
+    let reported = cx.update(|cx| {
+        let view = view.read(cx);
+        let RetentionPolicyState::Available(policy) = view.archived_sessions.retention else {
+            panic!("a durable worker reports its retention policy");
+        };
+        assert!(
+            view.archived_sessions.retention_editable,
+            "a worker with durable storage can store a change"
+        );
+        assert_eq!(view.archived_sessions.retention_draft, Some(policy));
+        assert!(
+            !view.archive_retention_draft_is_dirty(),
+            "the untouched draft is the policy the worker reported"
+        );
+        policy
+    });
+
+    // Nothing is submitted while the draft still holds the stored policy.
+    view.update(cx, |view, cx| view.save_archive_retention_policy(cx));
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(
+            !view.archived_sessions.retention_saving,
+            "an unchanged draft is not submitted"
+        );
+        assert!(!view.archived_sessions.retention_saved);
+    });
+
+    // The user picks a preset and turns the force-discard switch on.
+    let (choices, selected) = retention_window_choices(reported);
+    view.update(cx, |view, cx| {
+        view.choose_archive_retention_window("7 days", cx);
+        view.set_archive_retention_force(true, cx);
+    });
+    let expected = ArchiveRetentionPolicy {
+        retention_ms: Some(7 * 86_400_000),
+        force_discard_worktrees: true,
+    };
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(choices.contains(&selected), "the presets are on offer");
+        assert_eq!(view.archived_sessions.retention_draft, Some(expected));
+        assert!(view.archive_retention_draft_is_dirty());
+    });
+
+    view.update(cx, |view, cx| view.save_archive_retention_policy(cx));
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(!view.archived_sessions.retention_saving);
+        assert!(view.archived_sessions.retention_saved);
+        assert!(view.archived_sessions.retention_refusal.is_none());
+        // The card adopts the answer, so what it shows is what the worker
+        // stored rather than what was asked for.
+        assert_eq!(
+            view.archived_sessions.retention,
+            RetentionPolicyState::Available(expected)
+        );
+        assert_eq!(view.archived_sessions.retention_draft, Some(expected));
+        assert!(!view.archive_retention_draft_is_dirty());
+        let (choices, selected) = retention_window_choices(expected);
+        assert_eq!(selected, "7 days");
+        assert!(choices.contains(&selected));
+    });
+    assert_eq!(
+        reported_retention_policy(&connection),
+        expected,
+        "the worker stored the policy the card was asked to apply"
+    );
+    backend.shutdown().ok();
+}
+
+#[gpui_kit::test]
+fn a_refused_window_change_shows_the_reason_and_keeps_the_stored_policy(cx: &mut TestAppContext) {
+    let view = cx.new(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        crate::connection::negotiate(&view.connection).unwrap();
+        view.open_archived_sessions(cx);
+        view
+    });
+    cx.run_until_parked();
+
+    let reported = cx.update(|cx| {
+        let view = view.read(cx);
+        let RetentionPolicyState::Available(policy) = view.archived_sessions.retention else {
+            panic!("the in-memory worker reports a policy");
+        };
+        assert!(
+            !view.archived_sessions.retention_editable,
+            "an in-memory worker cannot store a change"
+        );
+        policy
+    });
+
+    // A worker that offered the editor and then refused the change: the surface
+    // shows the backend's own reason and leaves the stored policy alone. The
+    // draft stays as the user left it, so the change can be retried.
+    let requested = ArchiveRetentionPolicy {
+        retention_ms: Some(30 * 86_400_000),
+        force_discard_worktrees: true,
+    };
+    view.update(cx, |view, cx| {
+        view.archived_sessions.retention_editable = true;
+        view.archived_sessions.retention_draft = Some(requested);
+        view.save_archive_retention_policy(cx);
+    });
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(!view.archived_sessions.retention_saving);
+        assert!(!view.archived_sessions.retention_saved);
+        let refusal = view
+            .archived_sessions
+            .retention_refusal
+            .clone()
+            .expect("a refused change is shown in the surface");
+        assert!(
+            refusal.contains("ConfigureArchiveRetention"),
+            "the surface shows the worker's reason: {refusal}"
+        );
+        assert_eq!(
+            view.archived_sessions.retention,
+            RetentionPolicyState::Available(reported),
+            "a refused change leaves the previous policy in place"
+        );
+        assert_eq!(
+            view.archived_sessions.retention_draft,
+            Some(requested),
+            "the draft survives a refusal"
+        );
+    });
+    let connection = cx.update(|cx| view.read(cx).connection.clone());
+    assert_eq!(
+        reported_retention_policy(&connection),
+        reported,
+        "a refused change is not stored"
+    );
+}
+
+#[gpui_kit::test]
+fn an_unexpected_answer_to_a_policy_change_is_reported(cx: &mut TestAppContext) {
+    let view = cx.new(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.archived_sessions.open = true;
+        view.archived_sessions.loaded = true;
+        view.archived_sessions.retention_editable = true;
+        view.archived_sessions.retention_draft = Some(ArchiveRetentionPolicy {
+            retention_ms: Some(86_400_000),
+            force_discard_worktrees: false,
+        });
+        view
+    });
+    let request = RequestEnvelope::new(ClientRequest::Control(
+        ControlRequest::SetArchiveRetentionPolicy {
+            policy: ArchiveRetentionPolicy {
+                retention_ms: Some(86_400_000),
+                force_discard_worktrees: false,
+            },
+        },
+    ));
+    view.update(cx, |view, cx| {
+        view.finish_archive_retention_save(
+            ResponseEnvelope::success(
+                request.request_id,
+                ServerResponse::Workspace(WorkspaceResponse::Workspaces { workspaces: vec![] }),
+            ),
+            cx,
+        );
+    });
+    cx.update(|cx| {
+        let view = view.read(cx);
+        let refusal = view
+            .archived_sessions
+            .retention_refusal
+            .clone()
+            .expect("an unexpected answer is reported");
+        assert!(refusal.contains("unexpected"), "{refusal}");
+        assert!(
+            !view.archived_sessions.retention_saved,
+            "an unexpected answer is no confirmation"
+        );
+        assert!(
+            view.archived_sessions.retention_draft.is_some(),
+            "the draft survives an unexpected answer"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn choosing_a_window_edits_the_draft_without_touching_a_custom_window(cx: &mut TestAppContext) {
+    let stored = ArchiveRetentionPolicy {
+        retention_ms: Some(37 * 60_000),
+        force_discard_worktrees: false,
+    };
+    let view = cx.new(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.archived_sessions = ArchivedSessionsState {
+            open: true,
+            loaded: true,
+            retention: RetentionPolicyState::Available(stored),
+            retention_editable: true,
+            retention_draft: Some(stored),
+            ..ArchivedSessionsState::default()
+        };
+        view
+    });
+
+    let custom = "Custom (37 minutes)".to_owned();
+    let (choices, selected) = retention_window_choices(stored);
+    assert_eq!(selected, custom);
+    assert!(choices.contains(&custom));
+
+    // The custom entry means the window the worker stored: choosing it keeps
+    // that window instead of moving it to a preset.
+    view.update(cx, |view, cx| {
+        view.choose_archive_retention_window(&custom, cx);
+        // The switch ignores a value it already has.
+        view.set_archive_retention_force(false, cx);
+    });
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.archived_sessions.retention_draft, Some(stored));
+        assert!(!view.archive_retention_draft_is_dirty());
+    });
+
+    // A preset replaces the custom window, and Off clears it.
+    view.update(cx, |view, cx| {
+        view.choose_archive_retention_window("7 days", cx)
+    });
+    let seven_days = ArchiveRetentionPolicy {
+        retention_ms: Some(7 * 86_400_000),
+        ..stored
+    };
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.archived_sessions.retention_draft, Some(seven_days));
+        assert!(view.archive_retention_draft_is_dirty());
+    });
+
+    // Choosing the window the draft already holds changes nothing.
+    view.update(cx, |view, cx| {
+        view.choose_archive_retention_window("7 days", cx)
+    });
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx).archived_sessions.retention_draft,
+            Some(seven_days)
+        );
+    });
+    view.update(cx, |view, cx| {
+        view.set_archive_retention_force(true, cx);
+        view.choose_archive_retention_window("Off", cx);
+    });
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(
+            view.archived_sessions.retention_draft,
+            Some(ArchiveRetentionPolicy {
+                retention_ms: None,
+                force_discard_worktrees: true,
+            })
+        );
+        assert!(view.archive_retention_draft_is_dirty());
+    });
+
+    // A read-only card has no draft, so a choice and a save change nothing and
+    // the draft checks read as clean.
+    view.update(cx, |view, cx| {
+        view.archived_sessions.retention_draft = None;
+        view.archived_sessions.retention_editable = false;
+        view.choose_archive_retention_window("Off", cx);
+        view.set_archive_retention_force(false, cx);
+        view.save_archive_retention_policy(cx);
+    });
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(view.archived_sessions.retention_draft.is_none());
+        assert!(!view.archive_retention_draft_is_dirty());
+        assert!(!view.archived_sessions.retention_saving);
+        assert_eq!(
+            view.archived_sessions.retention,
+            RetentionPolicyState::Available(stored),
+            "a read-only card leaves the reported policy alone"
+        );
+    });
+
+    // A change is ignored while another one is in flight.
+    view.update(cx, |view, cx| {
+        view.archived_sessions.retention_draft = Some(seven_days);
+        view.archived_sessions.retention_saving = true;
+        view.save_archive_retention_policy(cx);
+        assert!(
+            view.archived_sessions.retention_saving,
+            "a save in flight is not started again"
+        );
+        view.archived_sessions.retention_saving = false;
+    });
+}
+
+#[gpui_kit::test]
+fn loading_a_worker_that_reports_no_policy_keeps_the_card_read_only(cx: &mut TestAppContext) {
+    let view = cx.new(|cx| LoomView::new_for_test(cx.focus_handle()));
+
+    // A worker that reports no policy has nothing to edit, even though it would
+    // accept a change.
+    view.update(cx, |view, cx| {
+        view.finish_archived_sessions_load(
+            Vec::new(),
+            Vec::new(),
+            RetentionPolicyState::Unavailable,
+            true,
+            Vec::new(),
+            cx,
+        );
+    });
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(matches!(
+            view.archived_sessions.retention,
+            RetentionPolicyState::Unavailable
+        ));
+        assert!(!view.archived_sessions.retention_editable);
+        assert!(view.archived_sessions.retention_draft.is_none());
+        assert!(!view.archived_sessions.retention_saving);
+        assert!(!view.archived_sessions.retention_saved);
+        assert!(view.archived_sessions.retention_refusal.is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn a_worker_without_durable_storage_loads_the_policy_read_only(cx: &mut TestAppContext) {
+    let view = cx.new(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        crate::connection::negotiate(&view.connection).unwrap();
+        view.open_archived_sessions(cx);
+        view
+    });
+    cx.run_until_parked();
+
+    // The in-memory worker reports a policy it cannot change, so the card holds
+    // no draft and no request is made for one.
+    view.update(cx, |view, cx| view.save_archive_retention_policy(cx));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(
+            matches!(
+                view.archived_sessions.retention,
+                RetentionPolicyState::Available(_)
+            ),
+            "the in-memory worker reports a policy"
+        );
+        assert!(!view.archived_sessions.retention_editable);
+        assert!(view.archived_sessions.retention_draft.is_none());
+        assert!(!view.archived_sessions.retention_saving);
+        assert!(view.archived_sessions.retention_refusal.is_none());
+    });
+}
+
+/// Opens the archived-sessions dialog with `state` in place.
+fn open_retention_card(
+    cx: &mut TestAppContext,
+    state: ArchivedSessionsState,
+) -> (gpui_kit::AnyWindowHandle, Entity<LoomView>) {
+    let mut built = None;
+    let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            crate::connection::negotiate(&view.connection).unwrap();
+            view.node_names.insert(
+                view.default_backend_node_id.clone(),
+                "local worker".to_owned(),
+            );
+            view.archived_sessions = state;
+            view
+        });
+        built = Some(view.clone());
+        gpui_kit::component::Root::new(view, window, cx)
+    });
+    let view = built.expect("the window built the archived-sessions view");
+    (handle.into(), view)
+}
+
+/// Reports whether a frame of the dialog drew the read-only retention text and
+/// the editor's window Select.
+fn retention_card_elements(
+    cx: &mut TestAppContext,
+    handle: gpui_kit::AnyWindowHandle,
+) -> (bool, bool) {
+    let mut read_only = false;
+    let mut editor = false;
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.find("archived-sessions-dialog").visible());
+        read_only = window.try_find("archive-retention-policy").is_some();
+        editor = window
+            .try_find(("archive-retention-window", 0usize))
+            .is_some();
+    })
+    .unwrap();
+    (read_only, editor)
+}
+
+#[gpui_kit::test]
+fn a_worker_that_cannot_change_the_policy_renders_the_card_read_only(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let reported = ArchiveRetentionPolicy {
+        retention_ms: Some(7 * 86_400_000),
+        force_discard_worktrees: false,
+    };
+    // A worker that reports a policy but cannot store a change explains itself
+    // instead of offering controls.
+    let (handle, _) = open_retention_card(
+        cx,
+        ArchivedSessionsState {
+            open: true,
+            loaded: true,
+            retention: RetentionPolicyState::Available(reported),
+            ..ArchivedSessionsState::default()
+        },
+    );
+    let (read_only, editor) = retention_card_elements(cx, handle);
+    assert!(read_only);
+    assert!(!editor);
+
+    // A worker that reports no policy at all stays read-only as well, even when
+    // a draft was left behind.
+    let (handle, _) = open_retention_card(
+        cx,
+        ArchivedSessionsState {
+            open: true,
+            loaded: true,
+            retention: RetentionPolicyState::Unavailable,
+            retention_editable: true,
+            retention_draft: Some(reported),
+            ..ArchivedSessionsState::default()
+        },
+    );
+    let (read_only, editor) = retention_card_elements(cx, handle);
+    assert!(read_only);
+    assert!(!editor);
+}
+
+#[gpui_kit::test]
+fn confirming_a_window_in_the_card_edits_the_draft_and_apply_submits_it(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let stored = ArchiveRetentionPolicy {
+        retention_ms: Some(7 * 86_400_000),
+        force_discard_worktrees: false,
+    };
+    let (handle, view) = open_retention_card(
+        cx,
+        ArchivedSessionsState {
+            open: true,
+            loaded: true,
+            retention: RetentionPolicyState::Available(stored),
+            retention_editable: true,
+            retention_draft: Some(stored),
+            ..ArchivedSessionsState::default()
+        },
+    );
+
+    // Down from the stored window confirms the next preset, and the control
+    // reports that choice to the view.
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find(("archive-retention-window", 0usize)).value(),
+            Some("7 days")
+        );
+        window.click(("archive-retention-window", 0usize), cx);
+        window.press("down", cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let chosen = cx.update(|cx| {
+        let view = view.read(cx);
+        let draft = view
+            .archived_sessions
+            .retention_draft
+            .expect("the card holds a draft");
+        assert_eq!(draft.retention_ms, Some(14 * 86_400_000));
+        assert!(view.archive_retention_draft_is_dirty());
+        draft
+    });
+
+    // Applying submits it to the active backend, which here is an in-memory
+    // worker: the surface shows its reason and keeps the stored policy.
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("archive-retention-pending").visible());
+        window.click("apply-archive-retention", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(!view.archived_sessions.retention_saving);
+        assert_eq!(
+            view.archived_sessions.retention,
+            RetentionPolicyState::Available(stored),
+            "a refused apply leaves the stored policy in place"
+        );
+        assert_eq!(view.archived_sessions.retention_draft, Some(chosen));
+        let refusal = view
+            .archived_sessions
+            .retention_refusal
+            .clone()
+            .expect("the worker's reason is shown");
+        assert!(refusal.contains("ConfigureArchiveRetention"), "{refusal}");
+    });
+}
+
+#[gpui_kit::test]
+fn the_retention_card_renders_the_editor_for_a_worker_that_stores_a_policy(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let stored = ArchiveRetentionPolicy {
+        retention_ms: Some(37 * 60_000),
+        force_discard_worktrees: false,
+    };
+    let (handle, view) = open_retention_card(
+        cx,
+        ArchivedSessionsState {
+            open: true,
+            loaded: true,
+            retention: RetentionPolicyState::Available(stored),
+            retention_editable: true,
+            retention_draft: Some(stored),
+            ..ArchivedSessionsState::default()
+        },
+    );
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.find("archived-sessions-dialog").visible());
+        // The stored window matches no preset, so the control shows it as it is.
+        assert_eq!(
+            window.find(("archive-retention-window", 0usize)).value(),
+            Some("Custom (37 minutes)")
+        );
+        assert_eq!(
+            window.find("archive-retention-force").checked(),
+            Some(false)
+        );
+        assert!(window.find("apply-archive-retention").visible());
+        assert!(window.find("archive-retention-worker").visible());
+        assert!(window.find("archive-retention-current").visible());
+        assert!(window.try_find("archive-retention-policy").is_none());
+        assert!(window.try_find("archive-retention-read-only").is_none());
+    })
+    .unwrap();
+
+    // A draft that differs from the stored policy, a save in flight, and a save
+    // the worker confirmed each render their own status line.
+    view.update(cx, |view, cx| {
+        view.archived_sessions.retention_draft = Some(ArchiveRetentionPolicy {
+            retention_ms: Some(7 * 86_400_000),
+            force_discard_worktrees: true,
+        });
+        cx.notify();
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.find("archive-retention-pending").visible());
+        assert!(window.find("apply-archive-retention").visible());
+    })
+    .unwrap();
+    view.update(cx, |view, cx| {
+        view.archived_sessions.retention_saving = true;
+        cx.notify();
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.find("archive-retention-saving").visible());
+    })
+    .unwrap();
+    let saved = ArchiveRetentionPolicy {
+        retention_ms: Some(7 * 86_400_000),
+        force_discard_worktrees: true,
+    };
+    view.update(cx, |view, cx| {
+        view.finish_archive_retention_save(
+            ResponseEnvelope::success(
+                RequestEnvelope::new(ClientRequest::Control(
+                    ControlRequest::SetArchiveRetentionPolicy { policy: saved },
+                ))
+                .request_id,
+                ServerResponse::Control(ControlResponse::ArchiveRetentionPolicy(saved)),
+            ),
+            cx,
+        );
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.find("archive-retention-saved").visible());
+        assert_eq!(
+            window.find(("archive-retention-window", 0usize)).value(),
+            Some("7 days")
+        );
+        assert_eq!(window.find("archive-retention-force").checked(), Some(true));
+    })
+    .unwrap();
+
+    // A refused change keeps the card usable and shows the backend's reason.
+    view.update(cx, |view, cx| {
+        view.archived_sessions.retention_refusal = Some("no durable storage".to_owned());
+        cx.notify();
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.find("archive-retention-refusal").visible());
+        assert!(window.find("apply-archive-retention").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn toggling_the_force_switch_in_the_card_edits_the_draft(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let stored = ArchiveRetentionPolicy {
+        retention_ms: Some(7 * 86_400_000),
+        force_discard_worktrees: false,
+    };
+    let (handle, view) = open_retention_card(
+        cx,
+        ArchivedSessionsState {
+            open: true,
+            loaded: true,
+            retention: RetentionPolicyState::Available(stored),
+            retention_editable: true,
+            retention_draft: Some(stored),
+            ..ArchivedSessionsState::default()
+        },
+    );
+
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("archive-retention-force").checked(),
+            Some(false)
+        );
+        window.click("archive-retention-force", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("archive-retention-force").checked(), Some(true));
+        assert!(window.find("archive-retention-pending").visible());
+    })
+    .unwrap();
+
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(
+            view.archived_sessions.retention_draft,
+            Some(ArchiveRetentionPolicy {
+                force_discard_worktrees: true,
+                ..stored
+            }),
+            "the switch reports its change to the card's draft"
+        );
+        assert!(view.archive_retention_draft_is_dirty());
+    });
 }
