@@ -30,12 +30,12 @@ impl LoomView {
                     // applied; the cursor never ends below the cursor this
                     // request was made with.
                     self.apply_event_batch(events, after_sequence);
-                    if let Some(projection) = fallback.as_ref() {
-                        self.seed_plan_from_projection(projection);
-                    }
-                    if self.timeline.is_empty()
-                        && let Some(projection) = fallback
-                    {
+                    // The durable run projection is applied whether or not the
+                    // batch produced timeline items. Suppressing it would drop
+                    // the run's control state, the transcript page that rebuilds
+                    // the conversation, and the run polling that keeps it
+                    // streaming.
+                    if let Some(projection) = fallback {
                         self.apply_run_projection(projection);
                     }
                     return Ok(());
@@ -103,12 +103,11 @@ impl LoomView {
         // Anything older than the window is recovered by the durable rebuild
         // this snapshot triggered.
         self.apply_event_batch(events, Some(latest_sequence));
-        if let Some(projection) = fallback.as_ref() {
-            self.seed_plan_from_projection(projection);
-        }
-        if self.timeline.is_empty()
-            && let Some(projection) = fallback
-        {
+        // The durable run projection is applied whether or not the batch
+        // produced timeline items. Suppressing it would drop the run's control
+        // state, the transcript page that rebuilds the conversation, and the
+        // run polling that keeps it streaming.
+        if let Some(projection) = fallback {
             self.apply_run_projection(projection);
         }
     }
