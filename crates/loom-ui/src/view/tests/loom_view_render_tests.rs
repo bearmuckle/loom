@@ -25,11 +25,11 @@ use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, ClientRequest,
     ClonedRepository, ContextBudget, ContextInspection, ContextItem, ContextItemKind,
     ContextSummary, EventsResponse, FileActivityOperation, FilesystemRequest, FilesystemResponse,
-    GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus, GitFileStatusKind,
-    GitHubRepository, GitRepositoryStatus, ProviderRequest, RequestEnvelope, RunRequest,
-    RunResponse, ServerResponse, SessionFilesystemChange, SessionFilesystemFile, SessionRepository,
-    SessionRequest, SessionResponse, WorkerNodeResources, WorkerNodeStatus, WorkspaceChangeKind,
-    WorkspaceEntry, WorkspaceEntryKind, WorkspaceRequest,
+    GitDiff, GitFileStatus, GitFileStatusKind, GitHubRepository, GitRepositoryStatus,
+    ProviderRequest, RequestEnvelope, RunRequest, RunResponse, ServerResponse,
+    SessionFilesystemChange, SessionFilesystemFile, SessionRepository, SessionRequest,
+    SessionResponse, WorkerNodeResources, WorkerNodeStatus, WorkspaceChangeKind, WorkspaceEntry,
+    WorkspaceEntryKind, WorkspaceRequest,
 };
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -814,35 +814,10 @@ fn session_activation_resets_projection_and_resolves_backend_ownership(cx: &mut 
             GitDiff {
                 path: Some("src/lib.rs".to_owned()),
                 staged: false,
-                patch: String::new(),
+                patch: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n-removed\n+added\n context\n".to_owned(),
                 binary: false,
                 truncated: false,
-                hunks: vec![GitDiffHunk {
-                    old_start: 1,
-                    old_lines: 2,
-                    new_start: 1,
-                    new_lines: 2,
-                    lines: vec![
-                        GitDiffLine {
-                            kind: GitDiffLineKind::Removed,
-                            old_line: Some(1),
-                            new_line: None,
-                            content: "removed".to_owned(),
-                        },
-                        GitDiffLine {
-                            kind: GitDiffLineKind::Added,
-                            old_line: None,
-                            new_line: Some(1),
-                            content: "added".to_owned(),
-                        },
-                        GitDiffLine {
-                            kind: GitDiffLineKind::Context,
-                            old_line: Some(2),
-                            new_line: Some(2),
-                            content: "context".to_owned(),
-                        },
-                    ],
-                }],
+                hunks: Vec::new(),
             },
             cx,
         );
@@ -1321,35 +1296,10 @@ fn session_source_and_review_actions_cover_empty_invalid_and_missing_states(
                 GitDiff {
                     path: Some("src/lib.rs".to_owned()),
                     staged: false,
-                    patch: String::new(),
+                    patch: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,0 @@\n-old\n@@ -20,0 +20,1 @@\n+new\n".to_owned(),
                     binary: false,
                     truncated: false,
-                    hunks: vec![
-                        GitDiffHunk {
-                            old_start: 1,
-                            old_lines: 1,
-                            new_start: 1,
-                            new_lines: 1,
-                            lines: vec![GitDiffLine {
-                                kind: GitDiffLineKind::Removed,
-                                old_line: Some(1),
-                                new_line: None,
-                                content: "old".to_owned(),
-                            }],
-                        },
-                        GitDiffHunk {
-                            old_start: 20,
-                            old_lines: 1,
-                            new_start: 20,
-                            new_lines: 1,
-                            lines: vec![GitDiffLine {
-                                kind: GitDiffLineKind::Added,
-                                old_line: None,
-                                new_line: Some(20),
-                                content: "new".to_owned(),
-                            }],
-                        },
-                    ],
+                    hunks: Vec::new(),
                 },
                 cx,
             );
@@ -3901,28 +3851,10 @@ fn review_panel_renders_workspace_and_git_changes(cx: &mut TestAppContext) {
             GitDiff {
                 path: Some("src/lib.rs".to_owned()),
                 staged: false,
-                patch: String::new(),
+                patch: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,2 @@\n context\n+new line\n"
+                    .to_owned(),
                 binary: false,
-                hunks: vec![GitDiffHunk {
-                    old_start: 1,
-                    old_lines: 1,
-                    new_start: 1,
-                    new_lines: 2,
-                    lines: vec![
-                        GitDiffLine {
-                            kind: GitDiffLineKind::Context,
-                            old_line: Some(1),
-                            new_line: Some(1),
-                            content: "context".to_owned(),
-                        },
-                        GitDiffLine {
-                            kind: GitDiffLineKind::Added,
-                            old_line: None,
-                            new_line: Some(2),
-                            content: "new line".to_owned(),
-                        },
-                    ],
-                }],
+                hunks: Vec::new(),
                 truncated: false,
             },
             cx,
@@ -3946,21 +3878,11 @@ fn review_pane_gives_the_diff_surface_the_remaining_height(cx: &mut TestAppConte
                 GitDiff {
                     path: Some("src/lib.rs".to_owned()),
                     staged: false,
-                    patch: String::new(),
+                    patch: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,0 +1,1 @@\n+added\n"
+                        .to_owned(),
                     binary: false,
                     truncated: false,
-                    hunks: vec![GitDiffHunk {
-                        old_start: 1,
-                        old_lines: 1,
-                        new_start: 1,
-                        new_lines: 1,
-                        lines: vec![GitDiffLine {
-                            kind: GitDiffLineKind::Added,
-                            old_line: None,
-                            new_line: Some(1),
-                            content: "added".to_owned(),
-                        }],
-                    }],
+                    hunks: Vec::new(),
                 },
                 cx,
             );
@@ -4028,7 +3950,6 @@ fn review_panel_renders_loading_file_and_binary_diff_states(cx: &mut TestAppCont
     render_scenario(cx, |view| {
         view.review.open = true;
         view.sessions = vec![view.active_session.clone()];
-        view.review.repositories_loaded = true;
         view.session_repositories = vec![
             SessionRepository {
                 id: loom_core::RepositoryId::new(),

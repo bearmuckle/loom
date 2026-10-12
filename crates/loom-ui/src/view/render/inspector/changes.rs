@@ -2,8 +2,6 @@ use super::*;
 
 use gpui_kit::component::diff::Diff;
 
-use crate::state::review_patch_text;
-
 impl LoomView {
     pub(crate) fn render_inspector_changes(
         &self,
@@ -379,7 +377,7 @@ impl LoomView {
             .review
             .selected_diff
             .as_ref()
-            .map(review_patch_text)
+            .map(|diff| diff.patch.clone())
             .unwrap_or_default();
         div()
             .w_full()
