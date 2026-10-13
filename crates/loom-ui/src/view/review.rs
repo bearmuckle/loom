@@ -61,6 +61,10 @@ impl LoomView {
                     directories,
                 })) => {
                     view.session_directories = directories;
+                    // The directory list carries the project's folder source, so
+                    // the project row's second line fills in with the rest of
+                    // the review projections.
+                    view.remember_active_session_source();
                 }
                 Err(error) => view.record_backend_error("list session directories", error),
                 Ok(response) => view.record_backend_error(
@@ -89,6 +93,7 @@ impl LoomView {
                             .or_else(|| repositories.first())
                             .cloned();
                         view.session_repositories = repositories;
+                        view.remember_active_session_source();
                         view.selected_repository_id =
                             repository.as_ref().map(|repository| repository.id);
                         if let Some(repository) = repository {

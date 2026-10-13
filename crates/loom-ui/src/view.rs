@@ -11,7 +11,7 @@ use gpui_kit::TestSupportExt as _;
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::base::{Disableable, Selectable, TextSelectionLayer};
 use gpui_kit::component::bubble::{Bubble, BubbleContent, BubbleVariant};
-use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants};
+use gpui_kit::component::button::{Button, ButtonVariants};
 // Only the wasm disconnected screen still uses the dialog component.
 #[cfg(target_family = "wasm")]
 use gpui_kit::component::dialog::Dialog;
@@ -482,6 +482,12 @@ pub(crate) struct LoomView {
     session_tree_active: BTreeMap<String, AgentSessionId>,
     /// Worker node groups the user has collapsed in the sidebar.
     collapsed_worker_nodes: BTreeSet<String>,
+    /// The main source of each known project, shown as the second line of a
+    /// project row: `owner/repository` for a clone, a short path for a folder.
+    session_sources: BTreeMap<AgentSessionId, String>,
+    /// Sources reported per session while its lookup is in flight, and the set
+    /// of sessions already asked about, so a project is only looked up once.
+    session_source_lookups: BTreeMap<AgentSessionId, (Option<String>, Option<String>)>,
     /// Last session-list error per worker node, so a worker that failed to load
     /// is distinguishable from one that simply has no projects.
     node_session_load_errors: BTreeMap<String, String>,
@@ -846,6 +852,8 @@ fn task_activity_indicator(index: usize, status: SessionStatusPill) -> gpui_kit:
             )
     };
     div()
+        .id(("session-tree-activity", index))
+        .test_support()
         .h(px(12.))
         .flex_shrink_0()
         .flex()
@@ -1489,6 +1497,8 @@ impl LoomView {
             session_tree_entries: BTreeMap::new(),
             session_tree_active: BTreeMap::new(),
             collapsed_worker_nodes: BTreeSet::new(),
+            session_sources: BTreeMap::new(),
+            session_source_lookups: BTreeMap::new(),
             node_session_load_errors: BTreeMap::new(),
             active_session: active_session.clone(),
             active_run: None,

@@ -42,7 +42,7 @@ impl TimelineView {
 }
 
 impl Render for TimelineView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.parent_subscription.is_none() {
             let parent = self.parent.clone();
             self.parent_subscription = Some(cx.observe(&parent, |_, _, cx| cx.notify()));
@@ -143,6 +143,9 @@ impl Render for TimelineView {
             let scrolled_up = self.scroller.read(cx).is_scrolled_up();
             let transcript_has_older = self.parent.read(cx).transcript_has_older;
             let autoload_older = transcript_has_older && scrolled_up;
+            // The row renderer needs the layout so a question component can
+            // pick finger-sized controls on a phone.
+            let layout = responsive_layout(window.bounds().size.width);
             let parent_for_rows = self.parent.clone();
             let row_style = gpui_kit::StyleRefinement {
                 padding: gpui_kit::EdgesRefinement {
@@ -169,12 +172,9 @@ impl Render for TimelineView {
                         .w_full()
                         .flex()
                         .justify_center()
-                        .child(
-                            div()
-                                .w_full()
-                                .max_w(TIMELINE_CONTENT_MAX_WIDTH)
-                                .child(view.render_timeline_item(item, index, &parent_for_rows)),
-                        )
+                        .child(div().w_full().max_w(TIMELINE_CONTENT_MAX_WIDTH).child(
+                            view.render_timeline_item(item, index, layout, &parent_for_rows),
+                        ))
                         .into_any_element()
                 },
             )

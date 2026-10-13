@@ -2,6 +2,7 @@
 
 use super::*;
 
+mod agent_question_tests;
 mod archived_session_tests;
 mod disconnected_screen_render_tests;
 mod display_helper_tests;
@@ -9,7 +10,9 @@ mod event_resync_tests;
 mod lifecycle_source_action_tests;
 mod local_source_path_tests;
 mod loom_view_render_tests;
+mod new_project_pane_tests;
 mod project_action_tests;
+mod project_activity_tests;
 mod provider_control_tests;
 mod provider_error_tests;
 mod provider_mode_tests;
@@ -21,6 +24,7 @@ mod session_header_render_tests;
 mod session_load_tests;
 mod session_name_tests;
 mod session_run_action_tests;
+mod sidebar_navigation_tests;
 mod state_toggle_tests;
 mod transcript_action_tests;
 mod transcript_paging_tests;

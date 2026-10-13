@@ -236,6 +236,10 @@ impl Render for LoomView {
             }
         }
         self.schedule_worker_node_poll(cx);
+        // Project rows show the source each project was created from, so ask for
+        // the ones the client does not know yet. The call is idempotent and
+        // bounded, and issues nothing once every project has been asked about.
+        self.refresh_session_source_labels(cx);
         self.sync_model_select_states(window, cx);
         self.schedule_run_poll(cx);
         self.schedule_project_poll(cx);
