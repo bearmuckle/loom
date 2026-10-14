@@ -10,6 +10,7 @@ impl Render for LoomView {
         if !self.browser_window_initialized {
             self.browser_window_initialized = true;
             self.observe_system_appearance(window, cx);
+            self.observe_browser_visibility(window, cx);
             self.composer_focus_handle.focus(window, cx);
             self.select_theme(ThemeChoice::System, window, cx);
         }
