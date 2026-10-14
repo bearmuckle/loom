@@ -1097,6 +1097,35 @@ pub(crate) fn run_state_label(state: Option<AgentRunState>) -> &'static str {
     }
 }
 
+/// The longest failure reason shown in the run status row. The row is one line,
+/// so a longer reason is cut off instead of wrapping it.
+pub(crate) const MAX_RUN_FAILURE_REASON_CHARS: usize = 200;
+
+/// Appended to a failure reason that was cut off at
+/// [`MAX_RUN_FAILURE_REASON_CHARS`].
+const RUN_FAILURE_REASON_ELLIPSIS: char = '…';
+
+/// The reason a failed run recorded, as the status row can show it.
+///
+/// Returns `None` when the summary is absent, is not a failure summary, or has
+/// no reason after the prefix. The reason is collapsed onto a single line and
+/// bounded, because it shares a line with the run state label.
+pub(crate) fn run_failure_reason(summary: Option<&str>) -> Option<String> {
+    let reason = summary?.strip_prefix(loom_model::AGENT_RUN_FAILURE_SUMMARY_PREFIX)?;
+    let normalized = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    let mut reason = normalized
+        .chars()
+        .take(MAX_RUN_FAILURE_REASON_CHARS)
+        .collect::<String>();
+    if normalized.chars().count() > MAX_RUN_FAILURE_REASON_CHARS {
+        reason.push(RUN_FAILURE_REASON_ELLIPSIS);
+    }
+    Some(reason)
+}
+
 pub(crate) fn change_kind_label(kind: loom_protocol::WorkspaceChangeKind) -> &'static str {
     match kind {
         loom_protocol::WorkspaceChangeKind::Created => "New",
