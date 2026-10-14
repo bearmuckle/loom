@@ -391,6 +391,85 @@ fn agent_record(
     }
 }
 
+/// On a phone the projects pane is a drawer that covers the conversation, so an
+/// action that opens a full-surface pane has to dismiss the drawer. Otherwise
+/// the pane opens behind the drawer: the tap looks like it did nothing until a
+/// later tap closes the drawer and reveals the pane that was opened first.
+#[gpui_kit::test]
+fn pane_actions_reveal_the_surface_they_open_on_a_phone(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (handle, view) = open_drawer_window(cx);
+    let actions = [
+        ("new-session", "source-dialog-pane"),
+        ("archived-sessions", "archived-sessions-dialog"),
+        ("settings-button", "settings-content"),
+    ];
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        for (action, surface) in actions {
+            if window.try_find("mobile-session-drawer").is_none() {
+                window.click("open-session-drawer", cx);
+                window.render_frame(cx);
+            }
+            window.click(action, cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("mobile-session-drawer").is_none(),
+                "tapping {action} must dismiss the drawer so {surface} is on screen"
+            );
+            assert!(window.find(surface).visible(), "{surface} must be shown");
+            view.update(cx, |view, cx| {
+                view.dismiss_surfaces();
+                cx.notify();
+            });
+            window.render_frame(cx);
+        }
+    })
+    .unwrap();
+}
+
+/// A width that leaves the phone layout must not leave two copies of the pane
+/// actions on screen. The phone drawer and the fixed side panel carry the same
+/// element ids, so while both are present a tap can resolve to the copy behind
+/// the drawer and run the wrong action.
+#[gpui_kit::test]
+fn pane_actions_stay_targeted_after_the_width_leaves_the_phone_layout(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let rendered = Rc::new(RefCell::new(None));
+    let rendered_for_window = rendered.clone();
+    // A phone in landscape is wider than the phone breakpoint, so the fixed
+    // side panel renders; the drawer state carried over from portrait.
+    let handle = cx.open_window(size(px(844.), px(390.)), move |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.sessions = vec![view.active_session.clone()];
+            view.session_drawer_open = true;
+            view
+        });
+        *rendered_for_window.borrow_mut() = Some(view.clone());
+        gpui_kit::component::Root::new(view, window, cx)
+    });
+    let view = rendered
+        .borrow_mut()
+        .take()
+        .expect("the window built the view");
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("mobile-session-drawer").is_none(),
+            "the phone drawer must not stay over the side panel"
+        );
+        window.click("settings-button", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).settings_open, "settings must be the action");
+        assert!(
+            view.read(cx).source_dialog.is_none(),
+            "a tap on settings must not open the new-project pane"
+        );
+    })
+    .unwrap();
+}
+
 #[test]
 fn the_pane_project_name_ignores_the_larger_default_base() {
     let desktop = responsive_layout(px(1280.));
