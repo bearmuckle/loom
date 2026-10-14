@@ -480,6 +480,9 @@ pub(crate) struct ArchivedSessionsState {
 impl LoomView {
     /// Opens the archived-sessions surface and loads what it shows.
     pub(crate) fn open_archived_sessions(&mut self, cx: &mut Context<Self>) {
+        // The surface covers the central area, so a phone's session drawer goes
+        // with it, exactly as it does for Settings and the new-project pane.
+        self.session_drawer_open = false;
         self.archived_sessions.open = true;
         self.archived_sessions.refusal = None;
         self.reload_archived_sessions(cx);

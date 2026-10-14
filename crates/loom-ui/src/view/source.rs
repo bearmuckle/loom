@@ -24,6 +24,11 @@ impl LoomView {
             &self.default_backend_node_id,
         );
         let choice = source_dialog_initial_state(purpose, local_directory_available);
+        // The pane covers the central area, so a phone's session drawer has to go
+        // with it. Otherwise the pane is rendered behind the drawer: the tap
+        // looks like it did nothing until something else dismisses the drawer
+        // and reveals the pane that was opened first.
+        self.session_drawer_open = false;
         self.source_dialog = Some(SessionSourceDialog {
             purpose,
             target_node_id,
