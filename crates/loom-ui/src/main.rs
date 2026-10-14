@@ -207,6 +207,10 @@ fn start_browser_client(cx: &mut App) {
             .unwrap()
             .update(cx, |view, cx| {
                 view.observe_system_appearance(window, cx);
+                // This view starts with its window-initialization block already
+                // marked done, so the render path never registers the
+                // visibility observer for it.
+                view.observe_browser_visibility(window, cx);
                 view.composer_focus_handle.focus(window, cx);
                 view.select_theme(crate::state::ThemeChoice::System, window, cx);
                 if auto_connect {

@@ -33,3 +33,4 @@ mod visual_render_tests;
 mod worker_failure_tests;
 mod worker_node_tests;
 mod worker_project_tests;
+mod worker_resume_tests;

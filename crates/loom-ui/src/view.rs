@@ -98,6 +98,7 @@ use crate::connection::{
 use crate::connection::{
     attach_session_repository_async, create_session_in_workspace_async, create_workspace_async,
     list_models_from_backend, list_workspace_sessions_async, list_workspaces_async,
+    probe_worker_connection,
 };
 #[cfg(target_family = "wasm")]
 use crate::connection::{redact_secret, unexpected_response};
@@ -631,6 +632,14 @@ pub(crate) struct LoomView {
     browser_model: Option<ModelId>,
     #[cfg(target_family = "wasm")]
     browser_window_initialized: bool,
+    /// Keeps the page-visibility observer alive; a set value also marks the
+    /// observer as registered so it is never registered twice.
+    #[cfg(target_family = "wasm")]
+    visibility_subscription: Option<Subscription>,
+    /// Single-flight guard for the resume probe and the reconnect bootstrap,
+    /// so overlapping visibility changes cannot start two of either.
+    #[cfg(target_family = "wasm")]
+    browser_resume_in_flight: bool,
     browser_startup_error: Option<String>,
     /// Set when the browser transport is known to be closed so the disconnected
     /// screen can offer a reconnect instead of a settings prompt. A plain field
@@ -901,6 +910,53 @@ pub(crate) fn disconnected_screen(connection_lost: Option<&str>) -> Disconnected
             footer: "Not connected  ·  Connect a worker in Settings",
             reconnect: false,
         },
+    }
+}
+
+/// What the browser client should do once the page becomes visible again.
+///
+/// Kept as a pure decision so the table below can be tested on native builds,
+/// where no browser window exists to report a visibility change.
+#[cfg(any(target_family = "wasm", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BrowserResumption {
+    /// Do nothing. Either the page is a demo that never talks to a worker, or
+    /// it never connected and has no saved worker settings to reconnect with,
+    /// so becoming visible changes nothing. This arm never opens the settings
+    /// dialog, because a page becoming visible is not a user request.
+    Ignore,
+    /// Bootstrap the worker connection again. The view recorded a lost
+    /// connection, or it never connected but saved worker settings are
+    /// available to connect with.
+    Reconnect,
+    /// Confirm the connection the view still believes is open. A hidden page
+    /// can leave a socket that never reports its close, so the socket has to
+    /// answer a probe before the view trusts it again.
+    Verify,
+}
+
+/// Chooses a [`BrowserResumption`] for a page that just became visible.
+///
+/// A demo is ignored because it has no worker to reach. A connection the view
+/// still believes is open is only verified, never re-bootstrapped, so
+/// returning to a tab cannot tear down a working connection. Otherwise the
+/// view reconnects when it recorded a loss or has saved worker settings to
+/// reconnect with, and leaves a page without a worker alone.
+#[cfg(any(target_family = "wasm", test))]
+pub(crate) fn browser_resumption(
+    demo: bool,
+    connected: bool,
+    connection_lost: bool,
+    configured: bool,
+) -> BrowserResumption {
+    if demo {
+        BrowserResumption::Ignore
+    } else if connected {
+        BrowserResumption::Verify
+    } else if connection_lost || configured {
+        BrowserResumption::Reconnect
+    } else {
+        BrowserResumption::Ignore
     }
 }
 
