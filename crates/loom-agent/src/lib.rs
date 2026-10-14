@@ -2369,6 +2369,10 @@ mod tests {
         );
         let summary = runtime.snapshot().summary.unwrap_or_default();
         assert!(
+            summary.starts_with(loom_model::AGENT_RUN_FAILURE_SUMMARY_PREFIX),
+            "unexpected summary: {summary}"
+        );
+        assert!(
             summary.contains("output token limit"),
             "unexpected summary: {summary}"
         );

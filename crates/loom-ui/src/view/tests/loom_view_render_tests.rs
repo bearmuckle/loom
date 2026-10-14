@@ -2291,6 +2291,51 @@ fn completing_a_run_stops_the_streaming_cursor(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn a_failed_run_status_row_names_its_reason(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.run_state = Some(loom_protocol::AgentRunState::Failed);
+        view.active_run = Some(loom_protocol::AgentRunSnapshot {
+            id: RunId::new(),
+            attempt_id: loom_core::RunAttemptId::new(),
+            control_revision: 0,
+            session_id: view.active_session.id,
+            task: "explain the failure".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            state: loom_protocol::AgentRunState::Failed,
+            started_at: Timestamp::from_unix_millis(1),
+            updated_at: Timestamp::from_unix_millis(2),
+            completed_at: Some(Timestamp::from_unix_millis(2)),
+            summary: Some(format!(
+                "{}the provider refused the request",
+                loom_model::AGENT_RUN_FAILURE_SUMMARY_PREFIX
+            )),
+            evidence: Vec::new(),
+        });
+        view
+    });
+    cx.update_window(handle.into(), |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        window.render_frame(cx);
+        assert!(window.try_find("run-failure-reason").is_some());
+
+        // The reason belongs to a failed run only, so another run state keeps
+        // the row to its label.
+        view.update(cx, |view, cx| {
+            view.run_state = Some(loom_protocol::AgentRunState::Completed);
+            let run = view.active_run.as_mut().expect("the run stays active");
+            run.state = loom_protocol::AgentRunState::Completed;
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("run-failure-reason").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn agent_event_projection_handles_the_run_lifecycle_and_tool_fallback(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {

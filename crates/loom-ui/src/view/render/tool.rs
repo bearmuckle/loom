@@ -870,7 +870,27 @@ impl LoomView {
             } else {
                 run_state_label(Some(state)).to_owned()
             };
-            row = row.child(div().text_color(run_state_color(state)).child(label));
+            let color = run_state_color(state);
+            row = row.child(div().text_color(color).child(label));
+            // A failed run names the reason it failed next to the state label,
+            // so the status row describes the failure instead of only labeling
+            // it. The reason is presentation state from the active run's
+            // snapshot; no other state adds one.
+            if state == AgentRunState::Failed
+                && let Some(reason) = run_failure_reason(
+                    self.active_run
+                        .as_ref()
+                        .and_then(|run| run.summary.as_deref()),
+                )
+            {
+                row = row.child(
+                    div()
+                        .id("run-failure-reason")
+                        .test_support()
+                        .text_color(color)
+                        .child(reason),
+                );
+            }
         } else if self.sending_message {
             row = row.child(div().text_color(rgb(0x93c5fd)).child("Sending"));
         } else if self.pending_input.is_some() {
