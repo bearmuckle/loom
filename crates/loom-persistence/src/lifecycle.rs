@@ -352,6 +352,9 @@ impl FilePersistence {
         if let Some(feed) = write.feed {
             save_feed_rows(&transaction, feed)?;
         }
+        // Content garbage collection runs once per state transaction, after
+        // every row write that can stage candidates.
+        collect_unused_content(&transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)?;
         transaction.commit().map_err(|error| {
             persistence_error(
                 format!("could not commit persistence transaction: {error}"),

@@ -697,7 +697,6 @@ pub(crate) fn save_filesystem_records(
         save_session_repository_rows(transaction, record.session_id, &record.repositories)?;
         save_session_directory_rows(transaction, record.session_id, &record.directories)?;
     }
-    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)?;
     Ok(())
 }
 

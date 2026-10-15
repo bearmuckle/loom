@@ -1138,3 +1138,88 @@ fn session_and_workspace_feed_share_the_global_payload_budget() {
     drop(connection);
     fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn incremental_feed_rows_resolve_each_session_workspace_and_reject_unknown_sessions() {
+    let path = std::env::temp_dir().join(format!("loom-incremental-feed-{}.db", Uuid::new_v4()));
+    let connection = Connection::open(&path).unwrap();
+    initialize_schema(&connection).unwrap();
+    let session_id = AgentSessionId::new();
+    let workspace_id = WorkspaceId::new();
+    connection
+        .execute(
+            "INSERT INTO sessions(id, workspace_id, name, state, created_at, updated_at)
+             VALUES (?1, ?2, 'incremental feed session', 'idle', 1, 1)",
+            params![
+                session_id.as_uuid().as_bytes().as_slice(),
+                workspace_id.as_uuid().as_bytes().as_slice()
+            ],
+        )
+        .unwrap();
+    let event = |session_id: AgentSessionId, workspace_id: WorkspaceId, sequence: u64| {
+        ServerEventEnvelope {
+            protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
+            sequence: EventSequence::new(sequence),
+            session_id,
+            event: loom_model::ServerEvent::AgentSessionCreated {
+                snapshot: AgentSessionSnapshot {
+                    id: session_id,
+                    workspace_id,
+                    name: "incremental feed session".to_owned(),
+                    state: AgentSessionState::Idle,
+                    created_at: Timestamp::from_unix_millis(1),
+                    updated_at: Timestamp::from_unix_millis(1),
+                },
+            },
+        }
+    };
+    let feed = DurableFeedState {
+        next_sequence: EventSequence::new(3),
+        retention_limit: 250,
+        events: vec![
+            event(session_id, workspace_id, 1),
+            event(session_id, workspace_id, 2),
+        ],
+        workspace_events: Vec::new(),
+    };
+    let transaction = connection.unchecked_transaction().unwrap();
+    save_feed_rows_incremental(&transaction, &feed).unwrap();
+    transaction.commit().unwrap();
+
+    let rows: Vec<(i64, Vec<u8>)> = connection
+        .prepare("SELECT sequence, workspace_id FROM feed_events ORDER BY sequence")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .all(|(_, stored)| stored.as_slice() == workspace_id.as_uuid().as_bytes()),
+        "every event must keep its session's workspace"
+    );
+    let (first_sequence, latest_sequence): (i64, i64) = connection
+        .query_row(
+            "SELECT first_sequence, latest_sequence FROM feed_session_meta WHERE session_id=?1",
+            [session_id.as_uuid().as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((first_sequence, latest_sequence), (1, 2));
+
+    let unknown_session = AgentSessionId::new();
+    let unknown_feed = DurableFeedState {
+        next_sequence: EventSequence::new(1),
+        retention_limit: 250,
+        events: vec![event(unknown_session, workspace_id, 1)],
+        workspace_events: Vec::new(),
+    };
+    let transaction = connection.unchecked_transaction().unwrap();
+    let error = save_feed_rows_incremental(&transaction, &unknown_feed).unwrap_err();
+    assert_eq!(error.code, ErrorCode::Persistence);
+    assert!(error.message.contains("unknown session"));
+    drop(transaction);
+    drop(connection);
+    fs::remove_file(path).unwrap();
+}
