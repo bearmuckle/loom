@@ -1,5 +1,24 @@
 use super::*;
 
+/// Characters of a stored child result a multi-child listing carries. Selecting
+/// one child returns the whole stored result instead, so nothing is unreachable.
+const PROJECT_CHILD_RESULT_EXCERPT_CHARS: usize = 512;
+
+/// Names the manager's escape from a blocked code child, so a completion guard
+/// that no integration can satisfy is never a dead end.
+const PROJECT_CHILD_COMPLETION_ESCAPE: &str = " If the child's work cannot be landed, close the task with control_project_child action `abandon`, which reports its uncommitted paths and releases this guard.";
+
+/// Whether a delegated task has reached a state that produces no further
+/// result.
+fn delegated_task_is_terminal(status: loom_core::DelegatedTaskStatus) -> bool {
+    matches!(
+        status,
+        loom_core::DelegatedTaskStatus::Completed
+            | loom_core::DelegatedTaskStatus::Failed
+            | loom_core::DelegatedTaskStatus::Cancelled
+    )
+}
+
 impl ToolExtension for ProjectAgentTools {
     fn definitions(&self) -> Vec<ToolDefinition> {
         let mut definitions = Vec::new();
@@ -128,10 +147,12 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_inspect_children {
             definitions.push(ToolDefinition {
                 name: "list_project_children".to_owned(),
-                description: "Inspect the current status of your direct child agents and their delegated tasks in this project.".to_owned(),
+                description: "Inspect the current status of your direct child agents and their delegated tasks in this project. Each child reports its stored result and whether that result reached this session, so a completed child whose result never arrived stays retrievable: pass its task_id to return the whole stored result instead of a bounded excerpt.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "task_id": {"type": "string", "format": "uuid", "description": "Optional direct-child task ID; when given, only that child is listed and its stored result is returned in full."}
+                    },
                     "additionalProperties": false
                 }),
             });
@@ -139,7 +160,7 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_wait_children {
             definitions.push(ToolDefinition {
                 name: "wait_for_project_children".to_owned(),
-                description: "Wait until the listed direct child tasks are return-ready, releasing this manager's agent slot while they run. The result includes terminal child states; code results still need review and integration before the overall task is complete.".to_owned(),
+                description: "Wait until the listed direct child tasks are return-ready, releasing this manager's agent slot while they run. The result includes terminal child states and whether each child's own result reached your transcript; code results still need review and integration before the overall task is complete.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -158,12 +179,12 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_control_children {
             definitions.push(ToolDefinition {
                 name: "control_project_child".to_owned(),
-                description: "Continue a paused child, retry its most recent failed tool step, or cancel it. Address children only by delegated task_id. Retry does not restart an entire task.".to_owned(),
+                description: "Continue a paused child, retry its most recent failed tool step, cancel a live child, or abandon a finished child whose result you will not land. Address children only by delegated task_id. Retry does not restart an entire task. Abandon closes a finished child as failed, reports any uncommitted paths it left in its checkout, and releases the completion guard for that child; the checkout is preserved for inspection.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "task_id": {"type": "string", "format": "uuid"},
-                        "action": {"type": "string", "enum": ["continue", "retry_failed_step", "cancel"]}
+                        "action": {"type": "string", "enum": ["continue", "retry_failed_step", "cancel", "abandon"]}
                     },
                     "required": ["task_id", "action"],
                     "additionalProperties": false
@@ -340,7 +361,7 @@ impl ToolExtension for ProjectAgentTools {
                     Ok(Some(worktree)) => {
                         let Some(result_revision) = worktree.result_revision.as_deref() else {
                             return Some(format!(
-                                "completed code child task {} ({}) has not had its result reviewed",
+                                "completed code child task {} ({}) has not had its result reviewed.{PROJECT_CHILD_COMPLETION_ESCAPE}",
                                 task.task_id, task.child_name
                             ));
                         };
@@ -351,13 +372,13 @@ impl ToolExtension for ProjectAgentTools {
                                         && status.head.as_deref() == Some(result_revision) => {}
                                 Ok(_) => {
                                     return Some(format!(
-                                        "completed code child task {} ({}) changed after review or has uncommitted work; review its current checkout before reporting completion",
+                                        "completed code child task {} ({}) changed after review or has uncommitted work; review its current checkout before reporting completion.{PROJECT_CHILD_COMPLETION_ESCAPE}",
                                         task.task_id, task.child_name
                                     ));
                                 }
                                 Err(_) => {
                                     return Some(format!(
-                                        "the live checkout for code child task {} ({}) could not be confirmed",
+                                        "the live checkout for code child task {} ({}) could not be confirmed.{PROJECT_CHILD_COMPLETION_ESCAPE}",
                                         task.task_id, task.child_name
                                     ));
                                 }
@@ -376,13 +397,13 @@ impl ToolExtension for ProjectAgentTools {
                                         }
                                     };
                                     return Some(format!(
-                                        "completed code child task {} ({}) has a reviewed result that still needs integration: {detail}",
+                                        "completed code child task {} ({}) has a reviewed result that still needs integration: {detail}.{PROJECT_CHILD_COMPLETION_ESCAPE}",
                                         task.task_id, task.child_name
                                     ));
                                 }
                                 Err(_) => {
                                     return Some(format!(
-                                        "integration state for code child task {} ({}) could not be confirmed",
+                                        "integration state for code child task {} ({}) could not be confirmed.{PROJECT_CHILD_COMPLETION_ESCAPE}",
                                         task.task_id, task.child_name
                                     ));
                                 }
@@ -391,13 +412,13 @@ impl ToolExtension for ProjectAgentTools {
                     }
                     Ok(None) => {
                         return Some(format!(
-                            "completed code child task {} ({}) has no durable worktree record to verify",
+                            "completed code child task {} ({}) has no durable worktree record to verify.{PROJECT_CHILD_COMPLETION_ESCAPE}",
                             task.task_id, task.child_name
                         ));
                     }
                     Err(_) => {
                         return Some(format!(
-                            "integration state for code child task {} ({}) could not be confirmed",
+                            "integration state for code child task {} ({}) could not be confirmed.{PROJECT_CHILD_COMPLETION_ESCAPE}",
                             task.task_id, task.child_name
                         ));
                     }
@@ -516,20 +537,62 @@ impl ProjectAgentTools {
                             | loom_core::DelegatedTaskStatus::Failed
                             | loom_core::DelegatedTaskStatus::Cancelled
                     )
-                }) => ToolResult::success(
-                call,
-                serde_json::to_string(&serde_json::json!({
-                    "return_ready": true,
-                    "children": tasks.iter().map(|task| serde_json::json!({
+                }) =>
+            {
+                let Some(connection) = self.connection() else {
+                    return ToolResult::failure(call, "project backend is no longer available");
+                };
+                let Some(persistence) = &connection.backend.persistence else {
+                    return ToolResult::failure(
+                        call,
+                        "project child waits require durable storage",
+                    );
+                };
+                let mut children = Vec::new();
+                for task in &tasks {
+                    // Return-ready says nothing about the payload: report whether
+                    // the child's own result already reached this manager, so a
+                    // silent child is visible instead of looking like a delivered
+                    // result.
+                    let delivery = match connection.project_child_result_delivery(persistence, task)
+                    {
+                        Ok(delivery) => delivery,
+                        Err(error) => return ToolResult::failure(call, error.message),
+                    };
+                    let state = delivery.state(true);
+                    children.push(serde_json::json!({
                         "task_id": task.task_id,
                         "child_name": task.child_name,
                         "status": task.status,
                         "code_change": task.code_change,
-                    })).collect::<Vec<_>>(),
-                    "note": "Code child results still require review and integration before the manager reports completion."
-                }))
-                .unwrap_or_else(|error| format!("could not encode child wait result: {error}")),
-            ),
+                        "result_state": state.as_str(),
+                        "result_message_id": delivery.message.as_ref().map(|message| message.message_id),
+                        "result_project_sequence": delivery.message.as_ref().map(|message| message.project_sequence),
+                        "result_accepted_at": delivery.message.as_ref().map(|message| message.accepted_at),
+                    }));
+                }
+                let missing = children
+                    .iter()
+                    .filter(|child| child["result_state"] == "missing")
+                    .count();
+                let note = if missing > 0 {
+                    format!(
+                        "{missing} of the return-ready children never reported a result; read them with list_project_children before reporting completion. Code child results still require review and integration."
+                    )
+                } else {
+                    "result_state reports whether each child's own result has already reached your transcript; an undelivered result is delivered when this wait resumes. Code child results still require review and integration before the manager reports completion."
+                        .to_owned()
+                };
+                ToolResult::success(
+                    call,
+                    serde_json::to_string(&serde_json::json!({
+                        "return_ready": true,
+                        "children": children,
+                        "note": note,
+                    }))
+                    .unwrap_or_else(|error| format!("could not encode child wait result: {error}")),
+                )
+            }
             Ok(_) => ToolResult::failure(
                 call,
                 "child tasks are still active; retry through the durable wait continuation",
@@ -760,11 +823,16 @@ impl ProjectAgentTools {
     }
 
     pub(crate) fn execute_list_children(&self, call: &ToolCall) -> ToolResult {
-        if let Err(error) =
-            serde_json::from_value::<ListProjectChildrenArguments>(call.arguments.clone())
-        {
-            return ToolResult::failure(call, format!("invalid project child query: {error}"));
-        }
+        let arguments =
+            match serde_json::from_value::<ListProjectChildrenArguments>(call.arguments.clone()) {
+                Ok(arguments) => arguments,
+                Err(error) => {
+                    return ToolResult::failure(
+                        call,
+                        format!("invalid project child query: {error}"),
+                    );
+                }
+            };
         let Some(connection) = self.connection() else {
             return ToolResult::failure(call, "project backend is no longer available");
         };
@@ -799,6 +867,11 @@ impl ProjectAgentTools {
             let task = tasks
                 .iter()
                 .find(|task| task.target_session_id == agent.session_id);
+            if let Some(selected) = arguments.task_id
+                && task.is_none_or(|task| task.task_id != selected)
+            {
+                continue;
+            }
             let name = sessions
                 .get(agent.session_id)
                 .map(|session| session.name.clone())
@@ -817,6 +890,38 @@ impl ProjectAgentTools {
                 },
                 None => None,
             };
+            // A completed child's result is durable whether or not it ever
+            // reached this manager, so every child entry reports the stored
+            // result and its delivery state. Selecting one task returns the whole
+            // stored result instead of a bounded excerpt.
+            let delivery = match task {
+                Some(task) => match connection.project_child_result_delivery(persistence, task) {
+                    Ok(delivery) => Some((task, delivery)),
+                    Err(error) => return ToolResult::failure(call, error.message),
+                },
+                None => None,
+            };
+            let result_state = delivery
+                .as_ref()
+                .map(|(task, delivery)| delivery.state(delegated_task_is_terminal(task.status)));
+            let (result_body, result_body_truncated) = match delivery.as_ref() {
+                Some((_, delivery)) => match &delivery.message {
+                    Some(message) if arguments.task_id.is_some() => {
+                        (Some(message.body.clone()), false)
+                    }
+                    Some(message) => {
+                        let excerpt = message
+                            .body
+                            .chars()
+                            .take(PROJECT_CHILD_RESULT_EXCERPT_CHARS)
+                            .collect::<String>();
+                        let truncated = excerpt.len() < message.body.len();
+                        (Some(excerpt), truncated)
+                    }
+                    None => (None, false),
+                },
+                None => (None, false),
+            };
             children.push(serde_json::json!({
                 "session_id": agent.session_id,
                 "name": name,
@@ -828,8 +933,23 @@ impl ProjectAgentTools {
                 "run_summary": run.as_ref().and_then(|summary| summary.snapshot.summary.as_ref()).map(|summary| summary.chars().take(256).collect::<String>()),
                 "worktree_status": worktree.as_ref().map(|worktree| worktree.status),
                 "result_revision": worktree.as_ref().and_then(|worktree| worktree.result_revision.clone()),
+                "result_state": result_state.map(|state| state.as_str()),
+                "result_message_id": delivery.as_ref().and_then(|(_, delivery)| delivery.message.as_ref()).map(|message| message.message_id),
+                "result_project_sequence": delivery.as_ref().and_then(|(_, delivery)| delivery.message.as_ref()).map(|message| message.project_sequence),
+                "result_accepted_at": delivery.as_ref().and_then(|(_, delivery)| delivery.message.as_ref()).map(|message| message.accepted_at),
+                "result_delivered": delivery.as_ref().is_some_and(|(_, delivery)| delivery.delivered()),
+                "result_body": result_body,
+                "result_body_truncated": result_body_truncated,
                 "updated_at": agent.updated_at,
             }));
+        }
+        if let Some(selected) = arguments.task_id
+            && children.is_empty()
+        {
+            return ToolResult::failure(
+                call,
+                format!("{selected} is not one of your direct child tasks"),
+            );
         }
         children.sort_by(|left, right| {
             right["updated_at"]
@@ -845,6 +965,7 @@ impl ProjectAgentTools {
             output: serde_json::to_string(&serde_json::json!({
                 "children": children,
                 "truncated": truncated,
+                "note": "result_state reports whether each child's stored result reached this session: delivered, undelivered (accepted for delivery but not yet in your transcript), missing (a finished child never reported a result), or pending. Pass a child's task_id to return its whole stored result."
             }))
             .unwrap_or_else(|error| format!("could not encode project child status: {error}")),
         }
@@ -870,21 +991,31 @@ impl ProjectAgentTools {
             arguments.task_id,
             arguments.action,
         ) {
-            Ok((task, run)) => ToolResult {
-                tool_call_id: call.id,
-                name: call.name.clone(),
-                success: true,
-                output: serde_json::to_string(&serde_json::json!({
-                    "task_id": task.task_id,
-                    "status": task.status,
-                    "child_session_id": task.target_session_id,
-                    "run_state": run.as_ref().map(|snapshot| snapshot.state),
-                    "run_summary": run.as_ref().and_then(|snapshot| snapshot.summary.clone()),
-                }))
-                .unwrap_or_else(|error| {
-                    format!("could not encode project child control result: {error}")
-                }),
-            },
+            Ok(outcome) => {
+                let mut output = serde_json::json!({
+                    "task_id": outcome.task.task_id,
+                    "status": outcome.task.status,
+                    "child_session_id": outcome.task.target_session_id,
+                    "run_state": outcome.run.as_ref().map(|snapshot| snapshot.state),
+                    "run_summary": outcome.run.as_ref().and_then(|snapshot| snapshot.summary.clone()),
+                });
+                if arguments.action == ProjectChildControlAction::Abandon {
+                    // The outcome names what the manager left behind, so a closed
+                    // child with uncommitted work is actionable rather than silent.
+                    output["uncommitted_paths"] = serde_json::json!(outcome.uncommitted_paths);
+                    output["note"] = serde_json::json!(
+                        "The completed child was closed as failed; its checkout is preserved with these uncommitted paths, and the completion guard no longer requires this result."
+                    );
+                }
+                ToolResult {
+                    tool_call_id: call.id,
+                    name: call.name.clone(),
+                    success: true,
+                    output: serde_json::to_string(&output).unwrap_or_else(|error| {
+                        format!("could not encode project child control result: {error}")
+                    }),
+                }
+            }
             Err(error) => ToolResult::failure(call, error.message),
         }
     }

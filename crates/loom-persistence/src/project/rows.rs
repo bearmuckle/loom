@@ -993,15 +993,58 @@ pub(crate) fn agent_message_matches_draft(
         && message.body == draft.body
 }
 
+/// The columns every agent-message reader decodes, in one place so the readers
+/// cannot drift apart.
+const AGENT_MESSAGE_COLUMNS: &str = "message_id, project_id, task_id, sender_session_id,
+            target_session_id, kind, project_sequence, accepted_at, body";
+
+type AgentMessageRow = (
+    Vec<u8>,
+    Vec<u8>,
+    Option<Vec<u8>>,
+    Vec<u8>,
+    Vec<u8>,
+    String,
+    i64,
+    i64,
+    String,
+);
+
+fn agent_message_from_row(row: AgentMessageRow) -> Result<AgentMessageRecord> {
+    let (message_id, project_id, task_id, sender_id, target_id, kind, sequence, accepted_at, body) =
+        row;
+    let sequence = u64::try_from(sequence).map_err(|_| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted project message sequence is invalid",
+            false,
+        )
+    })?;
+    Ok(AgentMessageRecord {
+        message_id: AgentMessageId::from_uuid(decode_uuid(&message_id, "message id")?),
+        project_id: ProjectId::from_uuid(decode_uuid(&project_id, "project id")?),
+        task_id: task_id
+            .as_deref()
+            .map(|id| decode_uuid(id, "task id").map(TaskId::from_uuid))
+            .transpose()?,
+        sender_session_id: AgentSessionId::from_uuid(decode_uuid(&sender_id, "sender session id")?),
+        target_session_id: AgentSessionId::from_uuid(decode_uuid(&target_id, "target session id")?),
+        kind: parse_agent_message_kind(&kind)?,
+        project_sequence: sequence,
+        accepted_at: decode_timestamp(accepted_at)?,
+        body,
+    })
+}
+
 pub(crate) fn load_agent_message_by_request(
     connection: &Connection,
     request_id: &[u8],
 ) -> Result<Option<AgentMessageRecord>> {
     let row = connection
         .query_row(
-            "SELECT message_id, project_id, task_id, sender_session_id, target_session_id,
-                    kind, project_sequence, accepted_at, body
-             FROM project_agent_messages WHERE request_id=?1",
+            &format!(
+                "SELECT {AGENT_MESSAGE_COLUMNS} FROM project_agent_messages WHERE request_id=?1"
+            ),
             [request_id],
             |row| {
                 Ok((
@@ -1024,39 +1067,50 @@ pub(crate) fn load_agent_message_by_request(
                 true,
             )
         })?;
-    let Some((
-        message_id,
-        project_id,
-        task_id,
-        sender_id,
-        target_id,
-        kind,
-        sequence,
-        accepted_at,
-        body,
-    )) = row
-    else {
-        return Ok(None);
-    };
-    let sequence = u64::try_from(sequence).map_err(|_| {
-        LoomError::new(
-            ErrorCode::MalformedPayload,
-            "persisted project message sequence is invalid",
-            false,
+    row.map(agent_message_from_row).transpose()
+}
+
+/// Loads the latest `result` message a delegated task reported to its manager.
+///
+/// The result is the child's own report addressed to the manager session, so it
+/// stays readable after the task completes even when the manager's run never
+/// consumed its inbox.
+pub(crate) fn load_project_task_result(
+    connection: &Connection,
+    task_id: TaskId,
+    target_session_id: AgentSessionId,
+) -> Result<Option<AgentMessageRecord>> {
+    let row = connection
+        .query_row(
+            &format!(
+                "SELECT {AGENT_MESSAGE_COLUMNS} FROM project_agent_messages
+                 WHERE task_id=?1 AND target_session_id=?2 AND kind='result'
+                 ORDER BY project_sequence DESC LIMIT 1"
+            ),
+            params![
+                task_id.as_uuid().as_bytes().as_slice(),
+                target_session_id.as_uuid().as_bytes().as_slice()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
         )
-    })?;
-    Ok(Some(AgentMessageRecord {
-        message_id: AgentMessageId::from_uuid(decode_uuid(&message_id, "message id")?),
-        project_id: ProjectId::from_uuid(decode_uuid(&project_id, "project id")?),
-        task_id: task_id
-            .as_deref()
-            .map(|id| decode_uuid(id, "task id").map(TaskId::from_uuid))
-            .transpose()?,
-        sender_session_id: AgentSessionId::from_uuid(decode_uuid(&sender_id, "sender session id")?),
-        target_session_id: AgentSessionId::from_uuid(decode_uuid(&target_id, "target session id")?),
-        kind: parse_agent_message_kind(&kind)?,
-        project_sequence: sequence,
-        accepted_at: decode_timestamp(accepted_at)?,
-        body,
-    }))
+        .optional()
+        .map_err(|error| {
+            persistence_error(
+                format!("could not read delegated task result: {error}"),
+                true,
+            )
+        })?;
+    row.map(agent_message_from_row).transpose()
 }

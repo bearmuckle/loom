@@ -1,5 +1,13 @@
 use super::*;
 
+/// Outcome of one project child control action.
+pub(crate) struct ProjectChildControlOutcome {
+    pub(crate) task: loom_core::DelegatedTaskRecord,
+    pub(crate) run: Option<AgentRunSnapshot>,
+    /// Paths a finished code child left uncommitted when it was abandoned.
+    pub(crate) uncommitted_paths: Vec<String>,
+}
+
 impl InProcessConnection {
     pub(crate) fn control_project_child(
         &self,
@@ -7,7 +15,7 @@ impl InProcessConnection {
         project_id: ProjectId,
         task_id: loom_core::TaskId,
         action: ProjectChildControlAction,
-    ) -> Result<(loom_core::DelegatedTaskRecord, Option<AgentRunSnapshot>)> {
+    ) -> Result<ProjectChildControlOutcome> {
         if !self.project_agent_permission_enabled_for_session(
             manager_session_id,
             Capability::ControlProjectChild,
@@ -67,6 +75,7 @@ impl InProcessConnection {
                     .map(|summary| summary.snapshot)
             })
             .transpose()?;
+        let mut uncommitted_paths = Vec::new();
 
         match action {
             ProjectChildControlAction::Continue => {
@@ -278,11 +287,92 @@ impl InProcessConnection {
             ProjectChildControlAction::Cancel => {
                 run = self.cancel_project_child_subtree(project_id, manager_session_id, task_id)?;
             }
+            ProjectChildControlAction::Abandon => {
+                uncommitted_paths = self.abandon_project_child_task(persistence, &mut task)?;
+            }
         }
         task = persistence
             .load_delegated_task(task_id)?
             .ok_or_else(|| LoomError::not_found("delegated task", task_id))?;
-        Ok((task, run))
+        Ok(ProjectChildControlOutcome {
+            task,
+            run,
+            uncommitted_paths,
+        })
+    }
+
+    /// Closes a finished direct child task without landing its result.
+    ///
+    /// A code child that ends its run with uncommitted files has no committed
+    /// revision to review or integrate, and every other control action refuses a
+    /// finished run, so the manager would otherwise have no action that releases
+    /// its completion guard. Abandoning records the live uncommitted paths on the
+    /// worktree record, marks the task failed, and leaves the checkout in place
+    /// for a later inspection or cleanup.
+    ///
+    /// Returns the uncommitted paths it recorded. A task that is already closed
+    /// is left as it is, so a retried request reports the same outcome.
+    fn abandon_project_child_task(
+        &self,
+        persistence: &dyn Persistence,
+        task: &mut loom_core::DelegatedTaskRecord,
+    ) -> Result<Vec<String>> {
+        let run = persistence.load_latest_run_summary_for_session(task.target_session_id)?;
+        let run_is_live = run
+            .as_ref()
+            .is_some_and(|summary| !is_terminal_agent_run_state(summary.snapshot.state));
+        if run_is_live
+            || (run.is_none()
+                && !matches!(
+                    task.status,
+                    loom_core::DelegatedTaskStatus::Completed
+                        | loom_core::DelegatedTaskStatus::Failed
+                        | loom_core::DelegatedTaskStatus::Cancelled
+                ))
+        {
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "the child is still live; cancel it or wait for it to finish before abandoning its result",
+                false,
+            ));
+        }
+        let mut uncommitted_paths = Vec::new();
+        if task.code_change
+            && let Some(mut worktree) = persistence.load_project_worktree_by_task(task.task_id)?
+        {
+            // The checkout may already be gone or unreadable, which must not keep
+            // the manager from closing the task, so an inspection failure is
+            // recorded in the outcome instead of raised.
+            let note = match project_child_worktree_status(&self.backend, &worktree) {
+                Ok(status) => {
+                    uncommitted_paths = status
+                        .files
+                        .iter()
+                        .map(|file| file.path.clone())
+                        .collect::<Vec<_>>();
+                    uncommitted_paths.sort();
+                    uncommitted_paths.dedup();
+                    if uncommitted_paths.is_empty() {
+                        "the manager abandoned this completed child without integrating it"
+                            .to_owned()
+                    } else {
+                        format!(
+                            "the manager abandoned this completed child without integrating it; uncommitted paths: {}",
+                            uncommitted_paths.join(", ")
+                        )
+                    }
+                }
+                Err(error) => format!(
+                    "the manager abandoned this completed child without integrating it; its checkout could not be inspected: {}",
+                    error.message
+                ),
+            };
+            worktree.error = Some(note);
+            worktree.updated_at = Timestamp::now();
+            self.save_project_worktree_state(&worktree)?;
+        }
+        self.set_project_task_status(persistence, task, loom_core::DelegatedTaskStatus::Failed)?;
+        Ok(uncommitted_paths)
     }
 
     /// Cancels one direct child task and its descendants, returning the

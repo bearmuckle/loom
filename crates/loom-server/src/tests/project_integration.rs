@@ -5,6 +5,159 @@ use super::support::*;
 use super::*;
 
 #[test]
+fn a_finished_code_child_with_uncommitted_work_can_be_abandoned() {
+    let fixture = project_code_child_fixture();
+    // The child finishes without committing: the reviewed revision is still the
+    // base revision, so there is nothing to integrate while the checkout holds
+    // uncommitted work.
+    let uncommitted = fixture.child_checkout.join("uncommitted.txt");
+    fs::write(&uncommitted, "uncommitted work\n").unwrap();
+    complete_project_code_child(&fixture);
+    assert_eq!(
+        review_project_code_child(&fixture),
+        fixture.worktree.base_revision
+    );
+
+    let completion_guard = project_completion_guard(&fixture);
+    let blocker = completion_guard
+        .completion_blocker()
+        .expect("uncommitted child work must block completion");
+    assert!(blocker.contains("uncommitted work"), "{blocker}");
+    assert!(
+        blocker.contains("abandon"),
+        "the guard should name the manager's escape: {blocker}"
+    );
+
+    let extension = fixture
+        .backend
+        .project_agent_tools(
+            fixture.root_id,
+            ModelId::new("deterministic/demo"),
+            ProjectAgentToolGrants {
+                child_control: true,
+                ..ProjectAgentToolGrants::default()
+            },
+        )
+        .unwrap()
+        .expect("manager child control tools");
+    let tools = ToolExecutor::new_with_workspace(
+        fixture
+            .connection
+            .session_filesystem(fixture.root_id)
+            .unwrap(),
+    )
+    .with_extension(extension);
+    let abandon = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "control_project_child".to_owned(),
+        arguments: serde_json::json!({
+            "task_id": fixture.task_id,
+            "action": "abandon",
+        }),
+    });
+    assert!(abandon.success, "{}", abandon.output);
+    let abandon: serde_json::Value = serde_json::from_str(&abandon.output).unwrap();
+    assert_eq!(abandon["status"], "failed");
+    assert_eq!(
+        abandon["uncommitted_paths"],
+        serde_json::json!(["uncommitted.txt"]),
+        "the outcome must name what the manager left behind"
+    );
+
+    // The task is closed, the guard no longer holds, and the uncommitted work is
+    // still on disk for inspection.
+    assert_eq!(
+        fixture
+            .backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_delegated_task(fixture.task_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        loom_core::DelegatedTaskStatus::Failed
+    );
+    let worktree = integrated_worktree(&fixture);
+    assert_eq!(worktree.status, ProjectWorktreeStatus::Ready);
+    assert!(
+        worktree
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("uncommitted.txt")),
+        "the abandonment should be recorded with its uncommitted paths"
+    );
+    assert_eq!(
+        completion_guard.completion_blocker(),
+        None,
+        "abandoning the child must release the completion guard"
+    );
+    assert_eq!(
+        fs::read_to_string(&uncommitted).unwrap(),
+        "uncommitted work\n"
+    );
+
+    // A closed child can no longer be integrated, and a retried abandonment
+    // reports the same paths instead of changing anything.
+    let integration = fixture
+        .connection
+        .request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::IntegrateProjectChild {
+                project_id: fixture.project_id,
+                manager_session_id: fixture.root_id,
+                task_id: fixture.task_id,
+                expected_parent_revision: fixture.worktree.base_revision.clone(),
+            },
+        )));
+    assert!(matches!(integration.result, Err(error) if error.code == ErrorCode::InvalidState));
+    let repeated = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "control_project_child".to_owned(),
+        arguments: serde_json::json!({
+            "task_id": fixture.task_id,
+            "action": "abandon",
+        }),
+    });
+    assert!(repeated.success, "{}", repeated.output);
+    let repeated: serde_json::Value = serde_json::from_str(&repeated.output).unwrap();
+    assert_eq!(repeated["uncommitted_paths"], abandon["uncommitted_paths"]);
+    fixture.shutdown();
+}
+
+#[test]
+fn abandoning_a_live_child_is_refused() {
+    let fixture = project_code_child_fixture();
+    let abandon = fixture
+        .connection
+        .request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::ControlProjectChild {
+                project_id: fixture.project_id,
+                manager_session_id: fixture.root_id,
+                task_id: fixture.task_id,
+                action: ProjectChildControlAction::Abandon,
+            },
+        )));
+    let Err(error) = abandon.result else {
+        panic!("a queued child with no finished run cannot be abandoned");
+    };
+    assert_eq!(error.code, ErrorCode::InvalidState);
+    assert!(error.message.contains("still live"), "{}", error.message);
+    assert_eq!(
+        fixture
+            .backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_delegated_task(fixture.task_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        loom_core::DelegatedTaskStatus::Queued
+    );
+    fixture.shutdown();
+}
+
+#[test]
 fn project_child_worktree_can_be_reviewed_fast_forwarded_and_cleaned_up() {
     let temp = workspace();
     let source = git_repository();

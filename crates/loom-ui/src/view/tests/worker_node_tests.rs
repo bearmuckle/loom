@@ -669,8 +669,15 @@ fn project_child_controls_follow_run_and_task_state() {
         project_child_control_actions(SessionState::Failed, TaskStatus::Failed),
         vec![Action::RetryFailedStep, Action::Cancel]
     );
+    // A completed child still offers one action: closing its result as failed,
+    // which releases the manager's completion guard when the work cannot be
+    // landed.
+    assert_eq!(
+        project_child_control_actions(SessionState::Completed, TaskStatus::Completed),
+        vec![Action::Abandon]
+    );
     assert!(
-        project_child_control_actions(SessionState::Completed, TaskStatus::Completed).is_empty()
+        project_child_control_actions(SessionState::Cancelled, TaskStatus::Cancelled).is_empty()
     );
 }
 

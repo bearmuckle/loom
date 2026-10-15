@@ -1191,6 +1191,23 @@ impl FilePersistence {
         load_agent_message_by_request(&connection, request_id.as_uuid().as_bytes())
     }
 
+    /// Loads the latest result a delegated task reported to its manager.
+    ///
+    /// The result is the child's own `result` message addressed to the manager
+    /// session, so a completed task's payload stays readable after the fact even
+    /// when the manager's run never consumed its inbox.
+    pub fn load_project_task_result(
+        &self,
+        task_id: TaskId,
+        target_session_id: AgentSessionId,
+    ) -> Result<Option<loom_core::AgentMessageRecord>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        load_project_task_result(&connection, task_id, target_session_id)
+    }
+
     /// Lists messages addressed to one project agent after its last seen sequence.
     pub fn list_agent_messages(
         &self,

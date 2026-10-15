@@ -49,6 +49,13 @@ pub enum ProjectChildControlAction {
     Pause,
     Interrupt,
     Cancel,
+    /// Closes a finished child task as failed without landing its result.
+    ///
+    /// A finished code child that left uncommitted work in its checkout blocks
+    /// the manager's completion guard with no integration available; abandoning
+    /// records the uncommitted paths, marks the task failed, and releases the
+    /// guard while preserving the checkout.
+    Abandon,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -639,7 +646,7 @@ mod run_message_protocol_tests {
 
     #[test]
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 1));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 2));
         let project_id = ProjectId::new();
         let request = ClientRequest::Project(ProjectRequest::GetProjectSnapshot { project_id });
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));
@@ -759,6 +766,28 @@ mod run_message_protocol_tests {
             .unwrap()
             .request,
             control_request
+        );
+
+        // Abandoning a finished child is the same control request and shares its
+        // capability and retryable-mutation classification.
+        let abandon_request = ClientRequest::Project(ProjectRequest::ControlProjectChild {
+            project_id,
+            manager_session_id: parent,
+            task_id: loom_core::TaskId::new(),
+            action: ProjectChildControlAction::Abandon,
+        });
+        assert_eq!(
+            abandon_request.required_capability(),
+            Some(Capability::ControlProjectChild)
+        );
+        assert!(abandon_request.is_retryable_mutation());
+        assert_eq!(
+            decode_request(
+                &encode_request(&RequestEnvelope::new(abandon_request.clone())).unwrap()
+            )
+            .unwrap()
+            .request,
+            abandon_request
         );
 
         let review_request = ClientRequest::Project(ProjectRequest::GetProjectChildReview {

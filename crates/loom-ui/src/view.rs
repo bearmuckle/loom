@@ -1398,7 +1398,8 @@ fn project_child_control_actions(
             ProjectChildControlAction::RetryFailedStep,
             ProjectChildControlAction::Cancel,
         ],
-        TaskStatus::Completed | TaskStatus::Cancelled => Vec::new(),
+        TaskStatus::Completed => vec![ProjectChildControlAction::Abandon],
+        TaskStatus::Cancelled => Vec::new(),
     }
 }
 
@@ -1409,6 +1410,7 @@ fn project_child_control_label(action: ProjectChildControlAction) -> &'static st
         ProjectChildControlAction::Pause => "Pause child",
         ProjectChildControlAction::Interrupt => "Interrupt child",
         ProjectChildControlAction::Cancel => "Cancel child and descendants",
+        ProjectChildControlAction::Abandon => "Abandon completed result",
     }
 }
 

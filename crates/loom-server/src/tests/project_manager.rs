@@ -781,6 +781,244 @@ fn project_manager_tool_creates_an_idempotent_non_code_child() {
 }
 
 #[test]
+fn a_finished_child_result_stays_readable_with_its_delivery_state() {
+    let temp = std::env::temp_dir().join(format!(
+        "loom-finished-child-result-read-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&temp).unwrap();
+    let backend = InProcessBackend::new_persistent(temp.join("state.sqlite")).unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Finished child result read".into(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let root = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Manager".into(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    let project_id = ProjectId::from_uuid(*root.as_uuid());
+    let persistence = backend.persistence.as_ref().unwrap();
+
+    // One child reports a long result and one finishes without reporting at all.
+    // Neither is delivered to a manager run, which is the state the manager has
+    // to tell apart after a lost delivery.
+    let created_at = Timestamp::now();
+    let mut tasks = Vec::new();
+    for name in ["reporter", "silent"] {
+        let child_id = AgentSessionId::new();
+        let child = AgentSessionSnapshot {
+            id: child_id,
+            workspace_id: workspace.id,
+            name: name.to_owned(),
+            state: AgentSessionState::Idle,
+            created_at,
+            updated_at: created_at,
+        };
+        let task = loom_core::DelegatedTaskRecord {
+            task_id: loom_core::TaskId::new(),
+            project_id,
+            requester_session_id: root,
+            target_session_id: child_id,
+            child_name: name.to_owned(),
+            intent: "Report a finding to the manager".to_owned(),
+            model_id: "deterministic/demo".to_owned(),
+            context_references: vec![],
+            dependencies: vec![],
+            code_change: false,
+            permissions: loom_core::ProjectAgentPermissions::default(),
+            status: loom_core::DelegatedTaskStatus::Queued,
+            created_at,
+            updated_at: created_at,
+        };
+        let (_, created_event) = backend
+            .sessions()
+            .unwrap()
+            .create_in_workspace_with_id(workspace.id, child_id, child.name.clone())
+            .unwrap();
+        backend.journal().unwrap().append_session(created_event);
+        persistence
+            .create_project_child(
+                RequestId::new(),
+                &child,
+                backend.sessions().unwrap().next_sequence().next(),
+                &task,
+            )
+            .unwrap();
+        assert!(
+            persistence
+                .update_delegated_task_status(
+                    task.task_id,
+                    loom_core::DelegatedTaskStatus::Completed,
+                    Timestamp::now(),
+                )
+                .unwrap()
+        );
+        tasks.push(task);
+    }
+    let reporter = &tasks[0];
+    let silent = &tasks[1];
+    let body = format!("{}the-final-detail", "detail ".repeat(120));
+    let accepted = backend
+        .accept_project_agent_message(
+            RequestId::new(),
+            reporter.target_session_id,
+            true,
+            false,
+            loom_core::AgentMessageDraft {
+                project_id,
+                task_id: Some(reporter.task_id),
+                sender_session_id: reporter.target_session_id,
+                target_session_id: root,
+                kind: loom_core::AgentMessageKind::Result,
+                body: body.clone(),
+            },
+        )
+        .expect("a finished child must be able to report its result");
+    let ServerResponse::Project(ProjectResponse::ProjectAgentMessageAccepted(accepted)) = accepted
+    else {
+        panic!("unexpected project message response");
+    };
+
+    let extension = backend
+        .project_agent_tools(
+            root,
+            ModelId::new("deterministic/demo"),
+            ProjectAgentToolGrants {
+                delegation: true,
+                inspection: true,
+                ..ProjectAgentToolGrants::default()
+            },
+        )
+        .unwrap()
+        .expect("manager inspection tools");
+    let tools = ToolExecutor::new_with_workspace(connection.session_filesystem(root).unwrap())
+        .with_extension(extension);
+
+    // The listing reports both children, the stored result the manager never
+    // received, and the child that reported nothing at all.
+    let listing = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "list_project_children".to_owned(),
+        arguments: serde_json::json!({}),
+    });
+    assert!(listing.success, "{}", listing.output);
+    let listing: serde_json::Value = serde_json::from_str(&listing.output).unwrap();
+    let child_entry = |task_id: loom_core::TaskId| {
+        listing["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|child| child["task_id"] == task_id.to_string())
+            .cloned()
+            .unwrap_or_else(|| panic!("missing child entry for {task_id}"))
+    };
+    let reported = child_entry(reporter.task_id);
+    assert_eq!(reported["task_status"], "completed");
+    assert_eq!(
+        reported["result_state"], "undelivered",
+        "an accepted result that no manager run consumed must not look delivered"
+    );
+    assert_eq!(reported["result_delivered"], false);
+    assert_eq!(
+        reported["result_message_id"],
+        accepted.message_id.to_string()
+    );
+    assert_eq!(
+        reported["result_project_sequence"],
+        accepted.project_sequence
+    );
+    assert_eq!(reported["result_body_truncated"], true);
+    assert!(
+        reported["result_body"]
+            .as_str()
+            .is_some_and(|excerpt| excerpt.starts_with("detail detail")),
+        "the listed excerpt should carry the start of the stored result"
+    );
+    let quiet = child_entry(silent.task_id);
+    assert_eq!(quiet["task_status"], "completed");
+    assert_eq!(
+        quiet["result_state"], "missing",
+        "a finished child that never reported must be distinguishable"
+    );
+    assert!(quiet["result_body"].is_null());
+
+    // Selecting one child returns its whole stored result, so a result the
+    // manager never received is recoverable from the durable message.
+    let selected = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "list_project_children".to_owned(),
+        arguments: serde_json::json!({ "task_id": reporter.task_id }),
+    });
+    assert!(selected.success, "{}", selected.output);
+    let selected: serde_json::Value = serde_json::from_str(&selected.output).unwrap();
+    let selected_children = selected["children"].as_array().unwrap();
+    assert_eq!(selected_children.len(), 1);
+    assert_eq!(selected_children[0]["result_body"], body);
+    assert_eq!(selected_children[0]["result_body_truncated"], false);
+
+    let unrelated = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "list_project_children".to_owned(),
+        arguments: serde_json::json!({ "task_id": loom_core::TaskId::new() }),
+    });
+    assert!(!unrelated.success);
+
+    // A wait is return-ready for both children, and it now says which of them
+    // finished without a readable result instead of implying both reported.
+    let wait = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "wait_for_project_children".to_owned(),
+        arguments: serde_json::json!({
+            "task_ids": [reporter.task_id, silent.task_id],
+        }),
+    });
+    assert!(wait.success, "{}", wait.output);
+    let wait: serde_json::Value = serde_json::from_str(&wait.output).unwrap();
+    assert_eq!(wait["return_ready"], true);
+    let waited = |task_id: loom_core::TaskId| {
+        wait["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|child| child["task_id"] == task_id.to_string())
+            .cloned()
+            .unwrap_or_else(|| panic!("missing waited child entry for {task_id}"))
+    };
+    assert_eq!(waited(reporter.task_id)["result_state"], "undelivered");
+    assert_eq!(waited(silent.task_id)["result_state"], "missing");
+    assert!(
+        wait["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("never reported a result")),
+        "the wait should point at the silent child"
+    );
+
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
 fn a_child_report_reaches_a_completed_project_manager() {
     let temp = std::env::temp_dir().join(format!(
         "loom-completed-manager-report-{}",
@@ -1411,6 +1649,42 @@ fn child_report_wakes_a_completed_manager_with_its_message() {
         await_settled_run(&connection, root_run_id).state,
         AgentRunState::Completed
     );
+
+    // The manager consumed the report, so the task projection must report the
+    // result as delivered rather than undelivered, and the stored result must
+    // stay readable.
+    let extension = backend
+        .project_agent_tools(
+            root,
+            model_id.clone(),
+            ProjectAgentToolGrants {
+                inspection: true,
+                ..ProjectAgentToolGrants::default()
+            },
+        )
+        .unwrap()
+        .expect("manager inspection tools");
+    let tools = ToolExecutor::new_with_workspace(connection.session_filesystem(root).unwrap())
+        .with_extension(extension);
+    let listing = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "list_project_children".to_owned(),
+        arguments: serde_json::json!({}),
+    });
+    assert!(listing.success, "{}", listing.output);
+    let listing: serde_json::Value = serde_json::from_str(&listing.output).unwrap();
+    let worker = listing["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["task_id"] == child_task.task_id.to_string())
+        .expect("the worker task should be listed");
+    assert_eq!(
+        worker["result_state"], "delivered",
+        "a result the manager already consumed must not read as undelivered"
+    );
+    assert_eq!(worker["result_delivered"], true);
+    assert_eq!(worker["result_body"], "worker: the real report body.");
 
     drop(connection);
     backend.shutdown().unwrap();

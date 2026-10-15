@@ -37,12 +37,12 @@ impl InProcessConnection {
                 task_id,
                 action,
             }) => {
-                let (task, run) =
+                let outcome =
                     self.control_project_child(manager_session_id, project_id, task_id, action)?;
                 Ok(ServerResponse::Project(
                     ProjectResponse::ProjectChildControlled {
-                        task: Box::new(task),
-                        run: run.map(Box::new),
+                        task: Box::new(outcome.task),
+                        run: outcome.run.map(Box::new),
                     },
                 ))
             }

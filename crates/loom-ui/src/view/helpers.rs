@@ -2102,6 +2102,7 @@ pub(crate) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
             Some("continue") => "Continue sub-agent".to_owned(),
             Some("retry_failed_step") => "Retry sub-agent step".to_owned(),
             Some("cancel") => "Cancel sub-agent".to_owned(),
+            Some("abandon") => "Abandon sub-agent result".to_owned(),
             _ => "Control sub-agent".to_owned(),
         },
         "send_project_agent_message" => "Message sub-agent".to_owned(),

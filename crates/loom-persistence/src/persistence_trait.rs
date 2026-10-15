@@ -706,6 +706,16 @@ pub trait ProjectRepository: Send + Sync {
         &self,
         wait_id: ProjectManagerWaitId,
     ) -> Result<Option<ProjectManagerWaitRecord>>;
+    /// Loads the latest result a delegated task reported to its manager.
+    ///
+    /// The result is the child's own `result` message addressed to the manager
+    /// session, so it stays readable after the task completes even when the
+    /// manager's run never consumed its inbox.
+    fn load_project_task_result(
+        &self,
+        task_id: TaskId,
+        target_session_id: AgentSessionId,
+    ) -> Result<Option<loom_core::AgentMessageRecord>>;
     fn load_project_snapshot(&self, project_id: ProjectId) -> Result<Option<ProjectSnapshot>>;
     fn load_project_snapshot_for_session(
         &self,
@@ -868,6 +878,13 @@ impl ProjectRepository for FilePersistence {
         wait_id: ProjectManagerWaitId,
     ) -> Result<Option<ProjectManagerWaitRecord>> {
         FilePersistence::load_project_manager_wait(self, wait_id)
+    }
+    fn load_project_task_result(
+        &self,
+        task_id: TaskId,
+        target_session_id: AgentSessionId,
+    ) -> Result<Option<loom_core::AgentMessageRecord>> {
+        FilePersistence::load_project_task_result(self, task_id, target_session_id)
     }
     fn load_project_snapshot(&self, project_id: ProjectId) -> Result<Option<ProjectSnapshot>> {
         FilePersistence::load_project_snapshot(self, project_id)
@@ -1046,6 +1063,13 @@ impl<T: ProjectRepository + ?Sized> ProjectRepository for Arc<T> {
         wait_id: ProjectManagerWaitId,
     ) -> Result<Option<ProjectManagerWaitRecord>> {
         (**self).load_project_manager_wait(wait_id)
+    }
+    fn load_project_task_result(
+        &self,
+        task_id: TaskId,
+        target_session_id: AgentSessionId,
+    ) -> Result<Option<loom_core::AgentMessageRecord>> {
+        (**self).load_project_task_result(task_id, target_session_id)
     }
     fn load_project_snapshot(&self, project_id: ProjectId) -> Result<Option<ProjectSnapshot>> {
         (**self).load_project_snapshot(project_id)

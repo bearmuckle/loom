@@ -380,7 +380,12 @@ struct SendProjectAgentMessageArguments {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ListProjectChildrenArguments {}
+struct ListProjectChildrenArguments {
+    /// Optional direct-child task selector. When given, only that child is
+    /// listed and its stored result message is returned in full.
+    #[serde(default)]
+    task_id: Option<loom_core::TaskId>,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
