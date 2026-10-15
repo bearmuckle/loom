@@ -103,7 +103,7 @@ jobs:
             libxkbcommon-x11-dev
       # Pinned to the `rust-version` declared in the workspace manifest, so the
       # claim is checked instead of being assumed to hold on stable.
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
       - name: Check the declared minimum supported Rust version
