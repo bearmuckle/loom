@@ -94,12 +94,24 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Run Clippy
+        # `--all-features` is deliberately omitted: it would enable the
+        # `loom-ui` `visual-tests` feature, whose render tests need a GPU or a
+        # software Vulkan/GL driver. The dedicated step below runs that feature
+        # explicitly instead.
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build workspace
+        run: cargo build --workspace --locked
       - name: Run headless visual render tests
         run: cargo test -p loom-ui --features visual-tests --locked --bins visual_render_tests
       - name: Run tests
         if: github.event_name == 'push'
         run: cargo test --workspace --locked --lib --bins --tests
+      - name: Run benchmarks
+        if: github.event_name == 'push'
+        # Both bench targets are `harness = false`: they print measurements
+        # rather than assert thresholds, so this only keeps them compiling and
+        # running instead of rotting.
+        run: cargo bench -p loom-persistence -p loom-server --locked
       - name: Run tests and collect coverage
         if: github.event_name == 'pull_request'
         run: |
@@ -129,3 +141,54 @@ jobs:
             --exclude 'crates/*/src/*/tests.rs' \
             --exclude 'crates/*/src/*/tests/*' \
             --exclude 'crates/*/tests/*'
+
+  msrv:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native UI build dependencies
+        run: |
+          # `cargo check` needs the headers and pkg-config files the client
+          # compiles against, but not the drivers and font data the render
+          # tests need: those are runtime dependencies of the `rust` job.
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libdbus-1-dev \
+            libxcb1-dev \
+            libfontconfig1-dev \
+            pkg-config \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+      # Pinned to the `rust-version` declared in the workspace manifest, so the
+      # claim is checked instead of being assumed to hold on stable.
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Check the declared minimum supported Rust version
+        run: cargo check --workspace --locked
+
+  wasm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      # GPUI's browser backend opts into unstable features, the same way the
+      # published `trunk build` in `pages.yml` does.
+      RUSTC_BOOTSTRAP: "1"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+      # `pages.yml` publishes the browser client from `main` and has no
+      # pre-merge counterpart, so this is the only check that the wasm target
+      # still compiles before a merge.
+      - name: Check the browser client for wasm32
+        run: cargo check -p loom-ui --target wasm32-unknown-unknown --locked
