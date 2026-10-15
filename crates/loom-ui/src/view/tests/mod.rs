@@ -1,4 +1,13 @@
 //! View tests, one file per focused area.
+//!
+//! # Leave no active run behind
+//!
+//! A `#[gpui_kit::test]` that ends while `active_run_id` is set and `run_state`
+//! is still Planning, Executing, Evaluating, or Paused hangs: `run_should_poll`
+//! stays true, so the test app keeps polling the run after the test body
+//! returns. Clear the run before the test ends (`view.active_run_id = None;`
+//! `view.run_state = None;`) or finish it with a terminal state. The workaround
+//! for an interruptible run is in `loom_view_render_tests.rs`.
 
 use super::*;
 

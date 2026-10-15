@@ -43,8 +43,12 @@ pub trait ToolExtension: Send + Sync {
     /// runtime continuation and can be completed by the owning server later.
     /// Implementations must keep this check side-effect free; durable state is
     /// written with the run checkpoint after the runtime parks the call.
-    fn prepare_deferred(&self, _call: &ToolCall) -> Option<String> {
-        None
+    ///
+    /// An error means the deferral decision could not be made (for example a
+    /// transient persistence failure). The runtime answers the call with that
+    /// failure instead of executing it as if no wait were needed.
+    fn prepare_deferred(&self, _call: &ToolCall) -> Result<Option<String>> {
+        Ok(None)
     }
 
     /// Explains why this agent cannot report completion yet. Project-aware
@@ -534,14 +538,18 @@ impl ToolExecutor {
 
     /// Returns the stable continuation key for an extension tool that must
     /// suspend the current agent run. Built-in tools are always synchronous.
-    pub fn prepare_deferred(&self, call: &ToolCall) -> Option<String> {
+    pub fn prepare_deferred(&self, call: &ToolCall) -> Result<Option<String>> {
         if ToolKind::from_name(&call.name).is_some() {
-            return None;
+            return Ok(None);
         }
-        self.extension
+        let Some(extension) = self
+            .extension
             .as_ref()
             .filter(|extension| extension.action_kind(call).is_some())
-            .and_then(|extension| extension.prepare_deferred(call))
+        else {
+            return Ok(None);
+        };
+        extension.prepare_deferred(call)
     }
 
     /// Returns a server-owned completion blocker supplied by the active tool

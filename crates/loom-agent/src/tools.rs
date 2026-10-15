@@ -52,6 +52,37 @@ impl AgentRuntime {
         result
     }
 
+    /// Answers a tool call that was not executed with a failure result and
+    /// records it in the transcript, so the model reads the reason instead of
+    /// the call disappearing from the conversation.
+    pub(crate) fn fail_tool_call(
+        &mut self,
+        call: &ToolCall,
+        message: String,
+        events: &mut Vec<AgentEvent>,
+    ) -> ToolResult {
+        let result = ToolResult {
+            tool_call_id: call.id,
+            name: call.name.clone(),
+            success: false,
+            output: message,
+        };
+        events.push(AgentEvent::ToolCallCompleted {
+            run_id: self.run.id,
+            result: result.clone(),
+        });
+        events.push(self.complete_tool_activity(&result, AgentActivityStatus::Failed));
+        self.push_message(ModelMessage {
+            role: MessageRole::Tool,
+            content: result.output.clone(),
+            name: Some(result.name.clone()),
+            tool_call_id: Some(result.tool_call_id),
+            tool_calls: Vec::new(),
+            reasoning_content: None,
+        });
+        result
+    }
+
     pub(crate) fn start_activity(&mut self, mut activity: AgentActivityRecord) -> AgentEvent {
         activity.timeline_ordinal = self.allocate_timeline_ordinal();
         let run_id = activity.run_id;

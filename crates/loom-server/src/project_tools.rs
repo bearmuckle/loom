@@ -264,14 +264,38 @@ impl ToolExtension for ProjectAgentTools {
         }
     }
 
-    fn prepare_deferred(&self, call: &ToolCall) -> Option<String> {
+    fn prepare_deferred(&self, call: &ToolCall) -> Result<Option<String>> {
         if call.name != "wait_for_project_children" || !self.can_wait_children {
-            return None;
+            return Ok(None);
         }
         let arguments =
             serde_json::from_value::<WaitForProjectChildrenArguments>(call.arguments.clone())
-                .ok()?;
-        let tasks = self.load_wait_child_tasks(&arguments.task_ids).ok()?;
+                .map_err(|error| {
+                    // The call must fail here rather than run as if no wait was
+                    // requested: an unreadable payload cannot be parked.
+                    let error = LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        format!("invalid project child wait arguments: {error}"),
+                        false,
+                    );
+                    log::error!(
+                        "project child wait call {} could not be decoded: {}",
+                        call.id,
+                        error.message,
+                    );
+                    error
+                })?;
+        let tasks = self
+            .load_wait_child_tasks(&arguments.task_ids)
+            .inspect_err(|error| {
+                // A transient persistence failure must not read as "nothing to
+                // wait for": report it so the manager call fails instead.
+                log::error!(
+                    "project child wait call {} could not load its child tasks: {}",
+                    call.id,
+                    error.message,
+                );
+            })?;
         if tasks.iter().any(|task| {
             !matches!(
                 task.status,
@@ -280,9 +304,9 @@ impl ToolExtension for ProjectAgentTools {
                     | loom_core::DelegatedTaskStatus::Cancelled
             )
         }) {
-            Some(call.id.to_string())
+            Ok(Some(call.id.to_string()))
         } else {
-            None
+            Ok(None)
         }
     }
 

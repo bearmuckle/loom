@@ -342,7 +342,7 @@ pub struct AgentRuntime {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{fs, path::PathBuf, sync::atomic::AtomicUsize};
 
     use loom_core::{AgentSessionId, LimitKind, SessionLimits};
     use loom_providers::DeterministicProvider;
@@ -776,6 +776,50 @@ mod tests {
                 success: true,
                 output: "extension completed".to_owned(),
             }
+        }
+    }
+
+    /// A server extension whose deferral check can fail: with
+    /// `park_first_call` set the first check reports a parked wait and every
+    /// later one fails like a transient persistence error would.
+    struct FailingDeferralExtension {
+        executed: Arc<AtomicBool>,
+        deferrals: AtomicUsize,
+        park_first_call: bool,
+    }
+
+    impl ToolExtension for FailingDeferralExtension {
+        fn definitions(&self) -> Vec<loom_model::ToolDefinition> {
+            vec![loom_model::ToolDefinition {
+                name: "agent_extension_tool".to_owned(),
+                description: "Test-only server extension with a failing deferral check.".to_owned(),
+                input_schema: serde_json::json!({"type": "object", "additionalProperties": false}),
+            }]
+        }
+
+        fn action_kind(&self, call: &ToolCall) -> Option<loom_core::ActionKind> {
+            (call.name == "agent_extension_tool").then_some(loom_core::ActionKind::Read)
+        }
+
+        fn execute(&self, call: &ToolCall) -> ToolResult {
+            self.executed.store(true, Ordering::SeqCst);
+            ToolResult {
+                tool_call_id: call.id,
+                name: call.name.clone(),
+                success: true,
+                output: "extension completed".to_owned(),
+            }
+        }
+
+        fn prepare_deferred(&self, _call: &ToolCall) -> Result<Option<String>> {
+            if self.park_first_call && self.deferrals.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(Some("project-wait-1".to_owned()));
+            }
+            Err(LoomError::new(
+                ErrorCode::Internal,
+                "project child state could not be loaded",
+                true,
+            ))
         }
     }
 
@@ -1631,6 +1675,106 @@ mod tests {
                 if result.name == "agent_extension_tool" && result.success
         )));
         assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_deferral_check_answers_the_tool_call_with_an_error() {
+        let root = workspace();
+        let tool_called = Arc::new(AtomicBool::new(false));
+        let mut descriptor = loom_providers::deterministic_descriptor();
+        descriptor.id = ModelId::new("deterministic/extension");
+        let provider = ExtensionToolProvider {
+            descriptor,
+            cursor: 0,
+            saw_extension_tool: Arc::new(AtomicBool::new(false)),
+        };
+        let tools =
+            ToolExecutor::new(&root)
+                .unwrap()
+                .with_extension(Arc::new(FailingDeferralExtension {
+                    executed: Arc::clone(&tool_called),
+                    deferrals: AtomicUsize::new(0),
+                    park_first_call: false,
+                }));
+        let task = AgentTask::new(
+            "run the server extension",
+            ModelId::new("deterministic/extension"),
+        )
+        .unwrap();
+        let mut runtime = AgentRuntime::new(AgentSessionId::new(), task, Box::new(provider), tools);
+
+        let events = runtime.start().unwrap();
+
+        assert!(
+            !tool_called.load(Ordering::SeqCst),
+            "a call whose deferral check failed must not run"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCallCompleted { result, .. }
+                if result.name == "agent_extension_tool"
+                    && !result.success
+                    && result.output.contains("project child state could not be loaded")
+        )));
+        assert!(runtime.export_state().messages.iter().any(|message| {
+            message.role == MessageRole::Tool
+                && message.name.as_deref() == Some("agent_extension_tool")
+                && message
+                    .content
+                    .contains("project child state could not be loaded")
+        }));
+        assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_deferral_check_after_a_queued_park_answers_the_tool_call() {
+        let root = workspace();
+        let tool_called = Arc::new(AtomicBool::new(false));
+        let mut descriptor = loom_providers::deterministic_descriptor();
+        descriptor.id = ModelId::new("deterministic/extension");
+        let provider = ExtensionToolProvider {
+            descriptor,
+            cursor: 0,
+            saw_extension_tool: Arc::new(AtomicBool::new(false)),
+        };
+        let tools =
+            ToolExecutor::new(&root)
+                .unwrap()
+                .with_extension(Arc::new(FailingDeferralExtension {
+                    executed: Arc::clone(&tool_called),
+                    deferrals: AtomicUsize::new(0),
+                    park_first_call: true,
+                }));
+        let task = AgentTask::new(
+            "run the server extension",
+            ModelId::new("deterministic/extension"),
+        )
+        .unwrap();
+        let mut runtime = AgentRuntime::new(AgentSessionId::new(), task, Box::new(provider), tools);
+
+        let events = runtime.start().unwrap();
+
+        // The first check queued a park; the queued call is answered with the
+        // failure of the second check instead of being executed.
+        assert!(
+            !tool_called.load(Ordering::SeqCst),
+            "a queued call whose deferral check failed must not run"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCallCompleted { result, .. }
+                if result.name == "agent_extension_tool" && !result.success
+        )));
+        assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+        assert!(runtime.export_state().messages.iter().any(|message| {
+            message.role == MessageRole::Tool
+                && message.tool_call_id.is_some()
+                && message
+                    .content
+                    .contains("project child state could not be loaded")
+        }));
         fs::remove_dir_all(root).unwrap();
     }
 

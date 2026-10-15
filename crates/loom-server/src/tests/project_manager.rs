@@ -2914,3 +2914,60 @@ fn project_coordination_exchange_and_transcripts_survive_restart() {
     drop(model);
     fs::remove_dir_all(temp).unwrap();
 }
+
+/// A deferral check that cannot read the child state must fail the call instead
+/// of reporting "nothing to wait for", which would resume a parked manager on
+/// a transient persistence error.
+#[test]
+fn a_manager_wait_reports_child_state_that_cannot_be_read() {
+    let backend = InProcessBackend::new();
+    let tools = ProjectAgentTools {
+        backend: Arc::downgrade(&backend),
+        session_id: AgentSessionId::new(),
+        project_id: ProjectId::new(),
+        model_id: ModelId::new("deterministic/demo"),
+        can_delegate: false,
+        can_delegate_code: false,
+        can_message: false,
+        can_branch_message: false,
+        can_inspect_children: false,
+        can_wait_children: true,
+        can_control_children: false,
+        can_review_children: false,
+        can_integrate_children: false,
+    };
+
+    // The in-memory worker has no durable storage, so the child lookup fails.
+    let wait = ToolCall {
+        id: ToolCallId::new(),
+        name: "wait_for_project_children".to_owned(),
+        arguments: serde_json::json!({"task_ids": [loom_core::TaskId::new()]}),
+    };
+    let error = tools
+        .prepare_deferred(&wait)
+        .expect_err("an unreadable child state must not read as no wait");
+    assert_eq!(error.code, ErrorCode::UnsupportedCapability);
+
+    let malformed = ToolCall {
+        id: ToolCallId::new(),
+        name: "wait_for_project_children".to_owned(),
+        arguments: serde_json::json!({"task_ids": ["not-a-task-id"]}),
+    };
+    let error = tools
+        .prepare_deferred(&malformed)
+        .expect_err("an undecodable wait payload must not read as no wait");
+    assert_eq!(error.code, ErrorCode::MalformedPayload);
+
+    // A call that is not a project wait is still not deferred.
+    let other = ToolCall {
+        id: ToolCallId::new(),
+        name: "list_project_children".to_owned(),
+        arguments: serde_json::json!({}),
+    };
+    assert!(
+        tools
+            .prepare_deferred(&other)
+            .expect("a non-wait call is not deferred")
+            .is_none()
+    );
+}

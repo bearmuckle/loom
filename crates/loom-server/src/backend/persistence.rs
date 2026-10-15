@@ -186,9 +186,10 @@ impl InProcessBackend {
             let message_delta = DurableRunMessageDelta {
                 start_ordinal: start_ordinal as u64,
                 reset: reset_messages,
-                messages: durable_run_messages_from_runtime(
-                    &state.messages[start_index..],
-                    &state.message_timeline_ordinals[start_index..],
+                messages: durable_run_messages_from_runtime_tail(
+                    &state.messages,
+                    &state.message_timeline_ordinals,
+                    start_index,
                 )?,
             };
             let project_manager_wait = state

@@ -752,11 +752,7 @@ pub(crate) fn durable_run_messages_from_runtime(
     timeline_ordinals: &[u64],
 ) -> Result<Vec<DurableRunMessage>> {
     if messages.len() != timeline_ordinals.len() {
-        return Err(LoomError::new(
-            ErrorCode::MalformedPayload,
-            "run transcript and timeline order are out of sync",
-            false,
-        ));
+        return Err(run_transcript_out_of_sync_error());
     }
     Ok(messages
         .iter()
@@ -771,6 +767,34 @@ pub(crate) fn durable_run_messages_from_runtime(
             reasoning_content: message.reasoning_content.clone(),
         })
         .collect())
+}
+
+/// Projects the tail of a runtime transcript for a durable run checkpoint.
+///
+/// `start_index` comes from the message checkpoint cursor, so it can exceed the
+/// length of either vector when a recovered run carries a transcript and a
+/// timeline order of different lengths. Both lengths are checked through `get`
+/// so a mismatch returns `MalformedPayload` instead of panicking on a slice.
+pub(crate) fn durable_run_messages_from_runtime_tail(
+    messages: &[ModelMessage],
+    timeline_ordinals: &[u64],
+    start_index: usize,
+) -> Result<Vec<DurableRunMessage>> {
+    let messages = messages
+        .get(start_index..)
+        .ok_or_else(run_transcript_out_of_sync_error)?;
+    let timeline_ordinals = timeline_ordinals
+        .get(start_index..)
+        .ok_or_else(run_transcript_out_of_sync_error)?;
+    durable_run_messages_from_runtime(messages, timeline_ordinals)
+}
+
+fn run_transcript_out_of_sync_error() -> LoomError {
+    LoomError::new(
+        ErrorCode::MalformedPayload,
+        "run transcript and timeline order are out of sync",
+        false,
+    )
 }
 
 pub(crate) fn persisted_run_messages(messages: Vec<DurableRunMessage>) -> Vec<ModelMessage> {

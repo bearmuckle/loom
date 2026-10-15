@@ -74,9 +74,29 @@ impl AgentRuntime {
             return Ok(StepOutcome::Blocked);
         }
         if let Some(call) = self.pending_tool_execution.clone() {
-            if let Some(wait_id) = self.tools.prepare_deferred(&call) {
-                events.extend(self.park_pending_project_join_inner(wait_id, call)?);
-                return Ok(StepOutcome::Blocked);
+            match self.tools.prepare_deferred(&call) {
+                Ok(Some(wait_id)) => {
+                    events.extend(self.park_pending_project_join_inner(wait_id, call)?);
+                    return Ok(StepOutcome::Blocked);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    // The extension could not decide whether the call must be
+                    // parked (for example a transient persistence error while
+                    // reading child state). Fail the call instead of running it
+                    // as if no wait had been requested.
+                    log::warn!(
+                        "tool '{}' could not be prepared for deferral (run {}): {}",
+                        call.name,
+                        self.run.id,
+                        error.message,
+                    );
+                    self.pending_tool_execution = None;
+                    events.extend(self.set_state(AgentRunState::Executing));
+                    self.fail_tool_call(&call, error.message, events);
+                    self.last_failed_call = None;
+                    return Ok(StepOutcome::Continue);
+                }
             }
             self.pending_tool_execution = None;
             events.extend(self.set_state(AgentRunState::Executing));
@@ -717,16 +737,40 @@ impl AgentRuntime {
                 // Deferred tools (project joins) need the step boundary so the
                 // run can park durably; queue them for the run driver like the
                 // previous single-tool path.
-                if self.tools.prepare_deferred(&call).is_some() {
-                    self.pending_tool_execution = Some(call.clone());
-                    self.step_id = None;
-                    self.step_index = self.step_index.saturating_add(1);
-                    ctx.events.push(AgentEvent::StepCompleted {
-                        run_id: self.run.id,
-                        step_id: ctx.step_id,
-                        index: ctx.step_index,
-                    });
-                    return Ok(StreamFlow::Stop);
+                match self.tools.prepare_deferred(&call) {
+                    Ok(Some(_)) => {
+                        self.pending_tool_execution = Some(call.clone());
+                        self.step_id = None;
+                        self.step_index = self.step_index.saturating_add(1);
+                        ctx.events.push(AgentEvent::StepCompleted {
+                            run_id: self.run.id,
+                            step_id: ctx.step_id,
+                            index: ctx.step_index,
+                        });
+                        return Ok(StreamFlow::Stop);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        // The extension could not decide whether the call must
+                        // be parked. Answer it with a tool error inside the same
+                        // turn instead of running it as if no wait had been
+                        // requested.
+                        log::warn!(
+                            "tool '{}' could not be prepared for deferral (run {}): {}",
+                            call.name,
+                            self.run.id,
+                            error.message,
+                        );
+                        self.fail_tool_call(
+                            &call,
+                            format!(
+                                "{}. Retry the call once the project child state can be read.",
+                                error.message,
+                            ),
+                            &mut ctx.events,
+                        );
+                        return Ok(StreamFlow::Continue);
+                    }
                 }
                 // Every remaining policy decision allows execution. Buffer the
                 // call so consecutive read-only calls in this model turn can run
