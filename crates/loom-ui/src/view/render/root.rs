@@ -21,19 +21,25 @@ impl Render for LoomView {
             let view = cx.entity().downgrade();
             self.shortcut_interceptor = Some(cx.intercept_keystrokes(move |event, _window, cx| {
                 let modifiers = event.keystroke.modifiers;
-                if (modifiers.platform || modifiers.control)
-                    && modifiers.shift
-                    && event.keystroke.key.eq_ignore_ascii_case("p")
-                {
+                let primary = modifiers.platform || modifiers.control;
+                let key = event.keystroke.key.as_str();
+                if primary && modifiers.shift && key.eq_ignore_ascii_case("p") {
                     let _ = view.update(cx, |view, cx| view.toggle_command_palette(cx));
                     cx.stop_propagation();
-                } else if event.keystroke.key == "escape" {
+                } else if key == "escape" {
                     let _ = view.update(cx, |view, cx| {
-                        if view.command_palette_open {
-                            view.close_command_palette(cx);
+                        if view.handle_escape(cx) {
                             cx.stop_propagation();
                         }
                     });
+                } else if primary && !modifiers.shift && key.eq_ignore_ascii_case("b") {
+                    // Advertised by the "Toggle review panel" command.
+                    let _ = view.update(cx, |view, cx| view.run_command("review", None, cx));
+                    cx.stop_propagation();
+                } else if primary && key == "," {
+                    // Advertised by the "Settings" command.
+                    let _ = view.update(cx, |view, cx| view.run_command("settings", None, cx));
+                    cx.stop_propagation();
                 }
             }));
         }

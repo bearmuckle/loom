@@ -1779,6 +1779,207 @@ fn primary_shift_p_opens_the_command_palette(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+/// The advertised "Stop run" keystroke, which also dismisses open surfaces.
+fn escape_shortcut() -> gpui_kit::Keystroke {
+    gpui_kit::Keystroke {
+        modifiers: gpui_kit::Modifiers::default(),
+        key: "escape".to_owned(),
+        key_char: None,
+    }
+}
+
+/// A shortcut advertised with the platform's primary modifier: `B` for the
+/// review panel and `,` for settings.
+fn primary_shortcut(key: &str) -> gpui_kit::Keystroke {
+    gpui_kit::Keystroke {
+        modifiers: gpui_kit::Modifiers {
+            control: true,
+            ..Default::default()
+        },
+        key: key.to_owned(),
+        key_char: None,
+    }
+}
+
+#[gpui_kit::test]
+fn escape_dismisses_each_open_surface(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        LoomView::new_for_test(cx.focus_handle())
+    });
+    let window: gpui_kit::AnyWindowHandle = handle.into();
+    cx.update_window(window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+
+    // The command palette is the innermost surface.
+    cx.update_window(window, |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        view.update(cx, |view, cx| view.toggle_command_palette(cx));
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.dispatch_keystroke(window, escape_shortcut());
+    cx.update_window(window, |view, _, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        assert!(!view.read(cx).command_palette_open);
+    })
+    .unwrap();
+
+    // The source dialog closes without starting a session.
+    cx.update_window(window, |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        view.update(cx, |view, cx| view.run_command("repo", None, cx));
+        window.render_frame(cx);
+        assert!(view.read(cx).source_dialog.is_some());
+    })
+    .unwrap();
+    cx.dispatch_keystroke(window, escape_shortcut());
+    cx.update_window(window, |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        assert!(view.read(cx).source_dialog.is_none());
+        window.render_frame(cx);
+        assert!(window.try_find("source-dialog-pane").is_none());
+    })
+    .unwrap();
+
+    // Settings close, and the dialog is gone with them.
+    cx.update_window(window, |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        view.update(cx, |view, cx| view.run_command("settings", None, cx));
+        window.render_frame(cx);
+        assert!(
+            window
+                .within("settings-dialog")
+                .find("close-settings")
+                .visible()
+        );
+    })
+    .unwrap();
+    cx.dispatch_keystroke(window, escape_shortcut());
+    cx.update_window(window, |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        assert!(!view.read(cx).settings_open);
+        window.render_frame(cx);
+        assert!(window.try_find("close-settings").is_none());
+    })
+    .unwrap();
+
+    // The phone drawer and the review pane are panes rather than dialogs.
+    cx.update_window(window, |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        view.update(cx, |view, cx| {
+            view.session_drawer_open = true;
+            cx.notify();
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.dispatch_keystroke(window, escape_shortcut());
+    cx.update_window(window, |view, _, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        assert!(!view.read(cx).session_drawer_open);
+    })
+    .unwrap();
+
+    cx.update_window(window, |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        view.update(cx, |view, cx| {
+            view.review.open = true;
+            cx.notify();
+        });
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.dispatch_keystroke(window, escape_shortcut());
+    cx.update_window(window, |view, _, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        assert!(!view.read(cx).review.open);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn escape_interrupts_an_active_run_only_when_no_surface_is_open(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        LoomView::new_for_test(cx.focus_handle())
+    });
+    let window: gpui_kit::AnyWindowHandle = handle.into();
+    cx.update_window(window, |view, _, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        view.update(cx, |view, cx| {
+            // With nothing open and no run, escape belongs to the rest of the
+            // app, so it is not consumed.
+            assert!(!view.dismiss_open_surface(cx));
+            assert!(!view.run_can_interrupt());
+            assert!(!view.handle_escape(cx));
+
+            // A run that already finished cannot be interrupted either.
+            view.active_run_id = Some(RunId::new());
+            view.run_state = Some(loom_protocol::AgentRunState::Completed);
+            assert!(!view.run_can_interrupt());
+            assert!(!view.handle_escape(cx));
+
+            // An open pane is dismissed first, and the run stays interruptible,
+            // so the escape after it is the one that stops the run.
+            view.run_state = Some(loom_protocol::AgentRunState::Executing);
+            view.review.open = true;
+            assert!(view.dismiss_open_surface(cx));
+            assert!(!view.review.open);
+            assert!(view.run_can_interrupt());
+            assert!(!view.dismiss_open_surface(cx));
+            assert!(view.handle_escape(cx));
+
+            // Leave no run behind: the test app keeps polling an interruptible
+            // run, which outlives the test body.
+            view.active_run_id = None;
+            view.run_state = None;
+        });
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn advertised_primary_shortcuts_dispatch_their_commands(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        LoomView::new_for_test(cx.focus_handle())
+    });
+    let window: gpui_kit::AnyWindowHandle = handle.into();
+    cx.update_window(window, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+
+    // `B` toggles the review panel, as its command label promises.
+    cx.dispatch_keystroke(window, primary_shortcut("B"));
+    cx.update_window(window, |view, _, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        assert!(view.read(cx).review.open);
+    })
+    .unwrap();
+    cx.dispatch_keystroke(window, primary_shortcut("b"));
+    cx.update_window(window, |view, _, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        assert!(!view.read(cx).review.open);
+    })
+    .unwrap();
+
+    // `,` opens settings, which escape closes again.
+    cx.dispatch_keystroke(window, primary_shortcut(","));
+    cx.update_window(window, |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        assert!(view.read(cx).settings_open);
+        window.render_frame(cx);
+        assert!(window.try_find("close-settings").is_some());
+    })
+    .unwrap();
+    cx.dispatch_keystroke(window, escape_shortcut());
+    cx.update_window(window, |view, _, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        assert!(!view.read(cx).settings_open);
+    })
+    .unwrap();
+}
+
 #[gpui_kit::test]
 fn github_login_failures_update_account_state(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
