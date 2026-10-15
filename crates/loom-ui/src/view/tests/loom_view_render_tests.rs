@@ -1,3 +1,13 @@
+//! Render tests for the root view and its shortcut handling.
+//!
+//! # Leave no active run behind
+//!
+//! A `#[gpui_kit::test]` that ends while `active_run_id` is set and `run_state`
+//! is still Planning, Executing, Evaluating, or Paused hangs: the test app
+//! keeps polling the run after the test body returns. Clear the run before the
+//! test returns; the escape test below shows the workaround for an
+//! interruptible run.
+
 use super::{
     LoomView, SETTINGS_SECTIONS, SessionSourceChoice, SessionSourceDialog,
     SessionSourceDialogPurpose, SettingsSection, WorkerConnectionState, WorkerNodeEntry,
