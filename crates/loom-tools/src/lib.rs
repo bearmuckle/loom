@@ -72,6 +72,7 @@ pub enum ToolKind {
     RunCommand,
     GitHubListPullRequests,
     GitHubGetPullRequest,
+    GitHubGetBranchChecks,
     GitHubCreatePullRequest,
     GitHubPushBranch,
     GitHubListIssues,
@@ -101,6 +102,7 @@ impl ToolKind {
             "run_command" => Some(Self::RunCommand),
             "github_list_pull_requests" => Some(Self::GitHubListPullRequests),
             "github_get_pull_request" => Some(Self::GitHubGetPullRequest),
+            "github_get_branch_checks" => Some(Self::GitHubGetBranchChecks),
             "github_create_pull_request" => Some(Self::GitHubCreatePullRequest),
             "github_push_branch" => Some(Self::GitHubPushBranch),
             "github_list_issues" => Some(Self::GitHubListIssues),
@@ -133,6 +135,7 @@ impl ToolKind {
             Self::RunCommand => "run_command",
             Self::GitHubListPullRequests => "github_list_pull_requests",
             Self::GitHubGetPullRequest => "github_get_pull_request",
+            Self::GitHubGetBranchChecks => "github_get_branch_checks",
             Self::GitHubCreatePullRequest => "github_create_pull_request",
             Self::GitHubPushBranch => "github_push_branch",
             Self::GitHubListIssues => "github_list_issues",
@@ -176,7 +179,8 @@ impl ToolKind {
             | Self::GitHubGetPullRequest
             | Self::GitHubListIssues
             | Self::GitHubGetIssue
-            | Self::GitHubGetComments => ActionKind::Network,
+            | Self::GitHubGetComments
+            | Self::GitHubGetBranchChecks => ActionKind::Network,
             // Destructive means "denied by default". The default policy and
             // `ApprovalPolicy::auto_approve` both deny this kind, so the
             // classification is a deliberate refusal, not an extra prompt.
@@ -498,6 +502,7 @@ impl ToolExecutor {
                 | ToolKind::GitHubListIssues
                 | ToolKind::GitHubGetIssue
                 | ToolKind::GitHubGetComments
+                | ToolKind::GitHubGetBranchChecks
                 | ToolKind::GitHubCreatePullRequest
                 | ToolKind::GitHubCreateIssue
                 | ToolKind::GitHubUpdateIssue
@@ -616,6 +621,7 @@ impl ToolExecutor {
             ToolKind::RunCommand => self.run_command(call, cancel),
             ToolKind::GitHubListPullRequests => self.github_list_pull_requests(call),
             ToolKind::GitHubGetPullRequest => self.github_get_pull_request(call),
+            ToolKind::GitHubGetBranchChecks => self.github_get_branch_checks(call),
             ToolKind::GitHubCreatePullRequest => self.github_create_pull_request(call),
             ToolKind::GitHubPushBranch => self.github_push_branch(call),
             ToolKind::GitHubListIssues => self.github_list_issues(call),
@@ -1193,6 +1199,78 @@ impl ToolExecutor {
             "review_comments": review_comments,
             "check_runs": check_runs,
             "commit_status": commit_status,
+        });
+        ToolResult::success(call, self.limit_output(result.to_string()))
+    }
+
+    /// Reports the CI check state of one revision: a branch name, tag, or
+    /// commit SHA.
+    ///
+    /// The revision is resolved to its commit first, so the reported state is
+    /// tied to one immutable SHA and an unknown ref fails with the request that
+    /// failed. Workflow check runs and commit statuses are both read, and every
+    /// entry carries its job or context name and a link, so a session can tell
+    /// "no run started" from "run in progress" from "run failed or passed".
+    fn github_get_branch_checks(&self, call: &ToolCall) -> ToolResult {
+        let arguments: GitHubBranchChecksArguments = match parse_arguments(call) {
+            Ok(arguments) => arguments,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let revision = arguments.revision.trim();
+        if revision.is_empty() {
+            return ToolResult::failure(call, "revision must not be empty");
+        }
+        let commit = match self.github_api(
+            "GET",
+            &arguments.repository,
+            &format!("commits/{}", encode_github_revision(revision)),
+            None,
+        ) {
+            Ok(commit) => commit,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let Some(sha) = commit.get("sha").and_then(serde_json::Value::as_str) else {
+            return ToolResult::failure(call, "GitHub commit response did not include its sha");
+        };
+        let checks = match self.github_api(
+            "GET",
+            &arguments.repository,
+            &format!("commits/{sha}/check-runs?per_page={GITHUB_PAGE_SIZE}"),
+            None,
+        ) {
+            Ok(checks) => checks,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let statuses = match self.github_api(
+            "GET",
+            &arguments.repository,
+            &format!("commits/{sha}/status?per_page={GITHUB_PAGE_SIZE}"),
+            None,
+        ) {
+            Ok(statuses) => statuses,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let mut entries = Vec::new();
+        for run in github_json_array(&checks, "check_runs") {
+            entries.push(github_check_run_entry(run));
+        }
+        for status in github_json_array(&statuses, "statuses") {
+            entries.push(github_commit_status_entry(status));
+        }
+        // Both endpoints page at `GITHUB_PAGE_SIZE`, but the combined list is
+        // capped as well so the result stays bounded however many entries a
+        // single source reports.
+        let truncated = entries.len() > GITHUB_PAGE_SIZE;
+        entries.truncate(GITHUB_PAGE_SIZE);
+        let state = github_check_state(&entries);
+        let result = serde_json::json!({
+            "repository": arguments.repository,
+            "revision": revision,
+            "sha": sha,
+            "state": state,
+            "message": github_check_state_message(state),
+            "entries": entries,
+            "truncated": truncated,
         });
         ToolResult::success(call, self.limit_output(result.to_string()))
     }
@@ -2292,6 +2370,133 @@ fn github_draft_state_result(
     })
 }
 
+/// Conclusions and commit-status states that mean a revision did not pass.
+/// `action_required`, `cancelled`, `startup_failure`, `stale`, and `timed_out`
+/// are all "not green" to a session waiting on the result, and a commit status
+/// reports a broken service as `error` rather than `failure`.
+const GITHUB_FAILED_CHECK_CONCLUSIONS: [&str; 7] = [
+    "action_required",
+    "cancelled",
+    "error",
+    "failure",
+    "stale",
+    "startup_failure",
+    "timed_out",
+];
+
+/// Percent-encodes a revision for use inside a request path while keeping `/`
+/// literal: GitHub resolves multi-segment refs such as `loom/feature-branch` or
+/// `heads/main` from the path itself, so encoding the slashes would break the
+/// common case of a pushed feature branch.
+fn encode_github_revision(revision: &str) -> String {
+    let mut encoded = String::with_capacity(revision.len());
+    for byte in revision.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'/') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+/// Borrows the array under `key`, treating a missing or malformed field as an
+/// empty list so a partial response from one endpoint cannot hide the other
+/// endpoint's entries.
+fn github_json_array<'a>(value: &'a serde_json::Value, key: &str) -> &'a [serde_json::Value] {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+/// Reads a string field, defaulting to an empty string so a partial entry still
+/// has the shape the caller expects.
+fn github_entry_text<'a>(value: &'a serde_json::Value, key: &str) -> &'a str {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+}
+
+/// The link to a check entry's details: check runs expose `html_url` and
+/// `details_url`, commit statuses expose `target_url`.
+fn github_entry_link(value: &serde_json::Value) -> &str {
+    ["html_url", "details_url", "target_url"]
+        .into_iter()
+        .find_map(|key| value.get(key).and_then(serde_json::Value::as_str))
+        .unwrap_or_default()
+}
+
+/// Shortens one workflow check run to what a session needs: the job name, its
+/// progress, its conclusion, and the link to its details.
+fn github_check_run_entry(run: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "check_run",
+        "name": github_entry_text(run, "name"),
+        "status": github_entry_text(run, "status"),
+        "conclusion": run.get("conclusion").and_then(serde_json::Value::as_str),
+        "url": github_entry_link(run),
+    })
+}
+
+/// Shortens one commit status the same way. GitHub reports a commit status'
+/// result in `state`, and `pending` is the only state that means "still
+/// running", so it is mapped onto the check-run vocabulary the summary uses.
+/// A missing state is treated as unfinished, so a partial response is never
+/// reported as a pass.
+fn github_commit_status_entry(status: &serde_json::Value) -> serde_json::Value {
+    let state = github_entry_text(status, "state");
+    let pending = matches!(state, "pending" | "");
+    serde_json::json!({
+        "kind": "status",
+        "name": github_entry_text(status, "context"),
+        "status": if pending { "in_progress" } else { "completed" },
+        "conclusion": (!pending && !state.is_empty()).then(|| state.to_owned()),
+        "url": github_entry_link(status),
+    })
+}
+
+/// The overall state of one revision, derived from its entries: `none` when
+/// nothing has reported yet, `pending` while any entry is unfinished,
+/// `failure` when any finished entry did not pass, otherwise `success`.
+///
+/// A failure outranks a still-running entry: a session must not be told a
+/// revision is merely pending when a finished job already failed.
+fn github_check_state(entries: &[serde_json::Value]) -> &'static str {
+    if entries.is_empty() {
+        return "none";
+    }
+    let mut pending = false;
+    for entry in entries {
+        if entry.get("status").and_then(serde_json::Value::as_str) != Some("completed") {
+            pending = true;
+            continue;
+        }
+        if GITHUB_FAILED_CHECK_CONCLUSIONS.contains(&github_entry_text(entry, "conclusion")) {
+            return "failure";
+        }
+    }
+    if pending { "pending" } else { "success" }
+}
+
+/// A one-line summary of [`github_check_state`] for the tool result.
+fn github_check_state_message(state: &str) -> &'static str {
+    match state {
+        "none" => "No check run or commit status has reported for this revision yet.",
+        "pending" => "Checks are still running for this revision.",
+        "failure" => "At least one check did not pass for this revision.",
+        _ => "Every reported check passed for this revision.",
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubBranchChecksArguments {
+    repository: String,
+    revision: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct GitHubPullRequestListArguments {
     repository: String,
@@ -2606,7 +2811,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolKind::GitHubGetPullRequest.name().to_owned(),
-            description: "Read a pull request's details and merge status. Requires a connected GitHub account and approval for network access.".to_owned(),
+            description: "Read a pull request's details, merge status, its head revision's workflow check runs and commit status, and its conversation and review comments. Requires a connected GitHub account and approval for network access.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -2614,6 +2819,19 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "number": {"type": "integer", "minimum": 1}
                 },
                 "required": ["repository", "number"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: ToolKind::GitHubGetBranchChecks.name().to_owned(),
+            description: "Read the CI check state of one revision (a branch name, tag, or commit SHA) in a GitHub repository: its workflow check runs and commit statuses, each with the job or context name and a link, plus an overall state of none, pending, failure, or success. Use it after pushing a branch, or for a pull request's head revision, to tell whether the pushed revision is green, still running, or has not started. The revision is resolved to a commit SHA first and the entry list is bounded. Requires a connected GitHub account and approval for network access.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repository": {"type": "string", "description": "Repository in owner/name format."},
+                    "revision": {"type": "string", "description": "Branch name, tag, or commit SHA to report checks for. Multi-segment branch names are accepted."}
+                },
+                "required": ["repository", "revision"],
                 "additionalProperties": false
             }),
         },
@@ -3726,6 +3944,7 @@ mod tests {
         for name in [
             "github_list_pull_requests",
             "github_get_pull_request",
+            "github_get_branch_checks",
             "github_create_pull_request",
             "github_list_issues",
             "github_get_issue",
@@ -4601,6 +4820,324 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A revision that exists but has nothing reported yet must read as "none",
+    /// not "pending": a session waiting on a push must not mistake "nothing
+    /// started" for "still running".
+    #[test]
+    fn github_get_branch_checks_reports_no_run_started() {
+        let root = workspace();
+        let mock = MockGitHub::start(vec![
+            MockResponse::json(serde_json::json!({"sha": "abc123"})),
+            MockResponse::json(serde_json::json!({"total_count": 0})),
+            MockResponse::json(serde_json::json!({"state": "pending"})),
+        ]);
+        let executor = github_executor(&root, &mock);
+        let result = executor.execute(&call(
+            "github_get_branch_checks",
+            serde_json::json!({"repository": "owner/name", "revision": " heads/loom/feature "}),
+        ));
+        assert!(result.success, "{}", result.output);
+        let value: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(value["repository"], "owner/name");
+        assert_eq!(value["revision"], "heads/loom/feature");
+        assert_eq!(value["sha"], "abc123");
+        assert_eq!(value["state"], "none");
+        assert!(value["message"].as_str().unwrap().contains("yet"));
+        assert_eq!(value["entries"], serde_json::json!([]));
+        assert_eq!(value["truncated"], false);
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 3);
+        // A multi-segment revision stays a literal path; encoding its slashes
+        // would make GitHub reject the ref.
+        assert_eq!(
+            requests[0].1,
+            "/repos/owner/name/commits/heads/loom/feature"
+        );
+        assert_eq!(
+            requests[1].1,
+            "/repos/owner/name/commits/abc123/check-runs?per_page=100"
+        );
+        assert_eq!(
+            requests[2].1,
+            "/repos/owner/name/commits/abc123/status?per_page=100"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_get_branch_checks_reports_running_checks() {
+        let root = workspace();
+        let mock = MockGitHub::start(vec![
+            MockResponse::json(serde_json::json!({"sha": "def456"})),
+            MockResponse::json(serde_json::json!({
+                "total_count": 2,
+                "check_runs": [
+                    {
+                        "name": "fmt",
+                        "status": "queued",
+                        "conclusion": null,
+                        "html_url": "https://github.com/owner/name/runs/1",
+                        "details_url": "https://github.com/owner/name/actions/runs/1/job/2"
+                    },
+                    {
+                        "name": "rust",
+                        "status": "in_progress",
+                        "conclusion": null,
+                        "html_url": "https://github.com/owner/name/runs/2"
+                    }
+                ]
+            })),
+            MockResponse::json(serde_json::json!({
+                "state": "pending",
+                "statuses": [
+                    {
+                        "context": "ci/release",
+                        "state": "pending",
+                        "target_url": "https://ci.example/1"
+                    }
+                ]
+            })),
+        ]);
+        let executor = github_executor(&root, &mock);
+        let result = executor.execute(&call(
+            "github_get_branch_checks",
+            serde_json::json!({"repository": "owner/name", "revision": "loom/feature"}),
+        ));
+        assert!(result.success, "{}", result.output);
+        let value: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(value["state"], "pending");
+        assert_eq!(value["entries"].as_array().unwrap().len(), 3);
+        assert_eq!(value["entries"][0]["kind"], "check_run");
+        assert_eq!(value["entries"][0]["name"], "fmt");
+        assert_eq!(value["entries"][0]["status"], "queued");
+        assert_eq!(value["entries"][0]["conclusion"], serde_json::Value::Null);
+        assert_eq!(
+            value["entries"][0]["url"],
+            "https://github.com/owner/name/runs/1"
+        );
+        assert_eq!(value["entries"][1]["name"], "rust");
+        assert_eq!(value["entries"][2]["kind"], "status");
+        assert_eq!(value["entries"][2]["name"], "ci/release");
+        assert_eq!(value["entries"][2]["status"], "in_progress");
+        assert_eq!(value["entries"][2]["url"], "https://ci.example/1");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_get_branch_checks_reports_failed_and_passed_runs() {
+        let root = workspace();
+        let failed_mock = MockGitHub::start(vec![
+            MockResponse::json(serde_json::json!({"sha": "aaa111"})),
+            MockResponse::json(serde_json::json!({
+                "check_runs": [
+                    {
+                        "name": "msrv",
+                        "status": "completed",
+                        "conclusion": "failure",
+                        "details_url": "https://github.com/owner/name/actions/runs/3/job/7"
+                    },
+                    {"name": "docs", "status": "completed", "conclusion": "skipped"}
+                ]
+            })),
+            MockResponse::json(serde_json::json!({
+                "state": "success",
+                "statuses": [
+                    {
+                        "context": "ci/deploy",
+                        "state": "success",
+                        "target_url": "https://ci.example/2"
+                    }
+                ]
+            })),
+        ]);
+        let executor = github_executor(&root, &failed_mock);
+        let failed = executor.execute(&call(
+            "github_get_branch_checks",
+            serde_json::json!({"repository": "owner/name", "revision": "main"}),
+        ));
+        assert!(failed.success, "{}", failed.output);
+        let value: serde_json::Value = serde_json::from_str(&failed.output).unwrap();
+        assert_eq!(value["state"], "failure");
+        assert!(value["message"].as_str().unwrap().contains("did not pass"));
+        // A check run without `html_url` falls back to its `details_url`.
+        assert_eq!(
+            value["entries"][0]["url"],
+            "https://github.com/owner/name/actions/runs/3/job/7"
+        );
+        assert_eq!(value["entries"][1]["conclusion"], "skipped");
+        assert_eq!(value["entries"][2]["conclusion"], "success");
+
+        let passed_mock = MockGitHub::start(vec![
+            MockResponse::json(serde_json::json!({"sha": "bbb222"})),
+            MockResponse::json(serde_json::json!({
+                "check_runs": [
+                    {
+                        "name": "fmt",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "html_url": "https://github.com/owner/name/runs/4"
+                    }
+                ]
+            })),
+            MockResponse::json(serde_json::json!({"statuses": []})),
+        ]);
+        let passed_executor = github_executor(&root, &passed_mock);
+        let passed = passed_executor.execute(&call(
+            "github_get_branch_checks",
+            serde_json::json!({"repository": "owner/name", "revision": "bbb222"}),
+        ));
+        assert!(passed.success, "{}", passed.output);
+        let value: serde_json::Value = serde_json::from_str(&passed.output).unwrap();
+        assert_eq!(value["state"], "success");
+        assert!(value["message"].as_str().unwrap().contains("passed"));
+        assert_eq!(value["entries"].as_array().unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_get_branch_checks_reports_transport_and_http_errors() {
+        let root = workspace();
+        // An empty revision never reaches the network.
+        let no_revision = ToolExecutor::new(&root)
+            .unwrap()
+            .with_github_token(Some("test-token".to_owned()));
+        let empty = no_revision.execute(&call(
+            "github_get_branch_checks",
+            serde_json::json!({"repository": "owner/name", "revision": "   "}),
+        ));
+        assert!(!empty.success);
+        assert!(empty.output.contains("revision must not be empty"));
+
+        // An unknown ref fails with the request that failed.
+        let missing_mock = MockGitHub::start(vec![MockResponse::body(
+            404,
+            r#"{"message":"No commit found for the ref gone"}"#,
+        )]);
+        let missing_executor = github_executor(&root, &missing_mock);
+        let missing = missing_executor.execute(&call(
+            "github_get_branch_checks",
+            serde_json::json!({"repository": "owner/name", "revision": "gone"}),
+        ));
+        assert!(!missing.success);
+        assert!(missing.output.contains("HTTP 404"), "{}", missing.output);
+        assert!(
+            missing
+                .output
+                .contains("for GET /repos/owner/name/commits/gone"),
+            "{}",
+            missing.output
+        );
+        assert_eq!(missing_mock.requests().len(), 1);
+
+        // A malformed commit response is reported instead of being read as "no
+        // checks".
+        let malformed_mock = MockGitHub::start(vec![MockResponse::json(serde_json::json!({}))]);
+        let malformed = github_executor(&root, &malformed_mock).execute(&call(
+            "github_get_branch_checks",
+            serde_json::json!({"repository": "owner/name", "revision": "main"}),
+        ));
+        assert!(!malformed.success);
+        assert!(
+            malformed.output.contains("did not include its sha"),
+            "{}",
+            malformed.output
+        );
+
+        // A failure after the revision resolves names the endpoint that
+        // failed, for both sources.
+        let checks_mock = MockGitHub::start(vec![
+            MockResponse::json(serde_json::json!({"sha": "ddd444"})),
+            MockResponse::status(500),
+        ]);
+        let checks_failed = github_executor(&root, &checks_mock).execute(&call(
+            "github_get_branch_checks",
+            serde_json::json!({"repository": "owner/name", "revision": "main"}),
+        ));
+        assert!(!checks_failed.success);
+        assert!(
+            checks_failed.output.contains(
+                "HTTP 500 for GET /repos/owner/name/commits/ddd444/check-runs?per_page=100"
+            ),
+            "{}",
+            checks_failed.output
+        );
+
+        let status_mock = MockGitHub::start(vec![
+            MockResponse::json(serde_json::json!({"sha": "eee555"})),
+            MockResponse::json(serde_json::json!({"check_runs": []})),
+            MockResponse::status(500),
+        ]);
+        let status_failed = github_executor(&root, &status_mock).execute(&call(
+            "github_get_branch_checks",
+            serde_json::json!({"repository": "owner/name", "revision": "main"}),
+        ));
+        assert!(!status_failed.success);
+        assert!(
+            status_failed
+                .output
+                .contains("HTTP 500 for GET /repos/owner/name/commits/eee555/status?per_page=100"),
+            "{}",
+            status_failed.output
+        );
+
+        // A closed port fails the transport; the message names the request and
+        // never carries the token.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let mut unreachable = ToolExecutor::new(&root)
+            .unwrap()
+            .with_github_token(Some("test-token".to_owned()));
+        unreachable.github_api_base = format!("http://{address}");
+        let transport = unreachable.execute(&call(
+            "github_get_branch_checks",
+            serde_json::json!({"repository": "owner/name", "revision": "main"}),
+        ));
+        assert!(!transport.success);
+        assert!(
+            transport
+                .output
+                .contains("GitHub request failed for GET /repos/owner/name/commits/main"),
+            "{}",
+            transport.output
+        );
+        assert!(
+            !transport.output.contains("test-token"),
+            "{}",
+            transport.output
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_get_branch_checks_bounds_the_entry_list() {
+        let root = workspace();
+        let many = (0..GITHUB_PAGE_SIZE + 5)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("job{index}"),
+                    "status": "completed",
+                    "conclusion": "success"
+                })
+            })
+            .collect::<Vec<_>>();
+        let mock = MockGitHub::start(vec![
+            MockResponse::json(serde_json::json!({"sha": "ccc333"})),
+            MockResponse::json(serde_json::json!({"check_runs": many})),
+            MockResponse::json(serde_json::json!({"statuses": []})),
+        ]);
+        let result = github_executor(&root, &mock).execute(&call(
+            "github_get_branch_checks",
+            serde_json::json!({"repository": "owner/name", "revision": "ccc333"}),
+        ));
+        assert!(result.success, "{}", result.output);
+        let value: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(value["state"], "success");
+        assert_eq!(value["entries"].as_array().unwrap().len(), GITHUB_PAGE_SIZE);
+        assert_eq!(value["truncated"], true);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn github_label_tools_add_and_remove() {
         let root = workspace();
@@ -4833,6 +5370,50 @@ mod helper_tests {
         assert_eq!(encode_github_path_segment("café"), "caf%C3%A9");
     }
 
+    #[test]
+    fn github_check_helpers_handle_partial_entries() {
+        // Slashes stay literal so a pushed feature branch is a usable revision.
+        assert_eq!(encode_github_revision("loom/x y"), "loom/x%20y");
+        assert_eq!(encode_github_revision("v1.2.3"), "v1.2.3");
+        assert!(github_json_array(&serde_json::json!({}), "check_runs").is_empty());
+        assert!(github_json_array(&serde_json::json!({"check_runs": 1}), "check_runs").is_empty());
+
+        let partial = github_check_run_entry(&serde_json::json!({}));
+        assert_eq!(partial["name"], "");
+        assert_eq!(partial["status"], "");
+        assert_eq!(partial["conclusion"], serde_json::Value::Null);
+        assert_eq!(partial["url"], "");
+        // An entry without a status cannot be assumed finished.
+        assert_eq!(github_check_state(&[partial]), "pending");
+
+        let timed_out = github_check_run_entry(&serde_json::json!({
+            "name": "msrv",
+            "status": "completed",
+            "conclusion": "timed_out"
+        }));
+        assert_eq!(github_check_state(&[timed_out]), "failure");
+
+        let failed_status = github_commit_status_entry(&serde_json::json!({
+            "context": "ci/deploy",
+            "state": "error"
+        }));
+        assert_eq!(failed_status["status"], "completed");
+        assert_eq!(github_check_state(&[failed_status]), "failure");
+        let unfinished_status = github_commit_status_entry(&serde_json::json!({}));
+        assert_eq!(unfinished_status["status"], "in_progress");
+        assert_eq!(unfinished_status["conclusion"], serde_json::Value::Null);
+        assert_eq!(github_check_state(&[unfinished_status]), "pending");
+
+        assert_eq!(github_check_state(&[]), "none");
+        assert_eq!(
+            github_check_state_message("none"),
+            "No check run or commit status has reported for this revision yet."
+        );
+        assert!(github_check_state_message("pending").contains("still running"));
+        assert!(github_check_state_message("failure").contains("did not pass"));
+        assert!(github_check_state_message("success").contains("passed"));
+    }
+
     /// Every `ToolKind` variant. The exhaustive match is a compile-time guard:
     /// a variant that is added without being classified here fails to build, so
     /// the classification test below cannot stop being exhaustive.
@@ -4849,6 +5430,7 @@ mod helper_tests {
             ToolKind::RunCommand,
             ToolKind::GitHubListPullRequests,
             ToolKind::GitHubGetPullRequest,
+            ToolKind::GitHubGetBranchChecks,
             ToolKind::GitHubCreatePullRequest,
             ToolKind::GitHubPushBranch,
             ToolKind::GitHubListIssues,
@@ -4877,6 +5459,7 @@ mod helper_tests {
                 | ToolKind::RunCommand
                 | ToolKind::GitHubListPullRequests
                 | ToolKind::GitHubGetPullRequest
+                | ToolKind::GitHubGetBranchChecks
                 | ToolKind::GitHubCreatePullRequest
                 | ToolKind::GitHubPushBranch
                 | ToolKind::GitHubListIssues
