@@ -60,8 +60,8 @@ impl GitService {
         let repository = if let Some(token) = token {
             let token = token.to_owned();
             let mut callbacks = RemoteCallbacks::new();
-            callbacks.credentials(move |_url, username_from_url, _allowed_types| {
-                Cred::userpass_plaintext(username_from_url.unwrap_or("x-access-token"), &token)
+            callbacks.credentials(move |url, username_from_url, allowed_types| {
+                credential_for(url, username_from_url, allowed_types, &token)
             });
             let mut fetch_options = FetchOptions::new();
             fetch_options.remote_callbacks(callbacks);
@@ -461,8 +461,8 @@ impl GitService {
         })?;
         let token = token.to_owned();
         let mut callbacks = RemoteCallbacks::new();
-        callbacks.credentials(move |_url, username_from_url, _allowed_types| {
-            Cred::userpass_plaintext(username_from_url.unwrap_or("x-access-token"), &token)
+        callbacks.credentials(move |url, username_from_url, allowed_types| {
+            credential_for(url, username_from_url, allowed_types, &token)
         });
         callbacks.push_update_reference(|reference, status| match status {
             Some(status) => Err(git2::Error::from_str(&format!(
@@ -790,19 +790,6 @@ impl GitService {
             .find_commit(merge_commit)
             .map_err(|error| git_error("could not read the project child merge commit", error))?;
 
-        let mut checkout = CheckoutBuilder::new();
-        checkout.safe().update_index(true);
-        if let Err(error) = repository.checkout_tree(merge_commit.as_object(), Some(&mut checkout))
-        {
-            return Err(git_error(
-                &format!(
-                    "safe checkout of merge result {} failed; parent branch remains at {expected_parent} and checkout state was preserved",
-                    merge_commit.id()
-                ),
-                error,
-            ));
-        }
-
         let mut transaction = repository
             .transaction()
             .map_err(|error| git_error("could not start parent branch update", error))?;
@@ -819,6 +806,20 @@ impl GitService {
                 "parent Git branch changed before integration: expected {expected_parent}, found {locked_target}"
             )));
         }
+
+        let mut checkout = CheckoutBuilder::new();
+        checkout.safe().update_index(true);
+        if let Err(error) = repository.checkout_tree(merge_commit.as_object(), Some(&mut checkout))
+        {
+            return Err(git_error(
+                &format!(
+                    "safe checkout of merge result {} failed; parent branch remains at {expected_parent} and checkout state was preserved",
+                    merge_commit.id()
+                ),
+                error,
+            ));
+        }
+
         transaction
             .set_target(
                 &branch_refname,
@@ -1492,6 +1493,30 @@ fn with_worktree_setup_cleanup(original: LoomError, cleanup: Result<()>) -> Loom
     }
 }
 
+/// Resolves a credential request from a remote against the configured token.
+///
+/// SSH-key requests are answered with an SSH agent credential, user/password
+/// requests with the token as the password, and every other request fails
+/// explicitly so the remote reports a useful error instead of replaying the
+/// callback. Failures name the remote but never include the token.
+fn credential_for(
+    url: &str,
+    username_from_url: Option<&str>,
+    allowed_types: git2::CredentialType,
+    token: &str,
+) -> std::result::Result<Cred, git2::Error> {
+    if allowed_types.contains(git2::CredentialType::SSH_KEY) {
+        return Cred::ssh_key_from_agent(username_from_url.unwrap_or("git"));
+    }
+    if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
+        return Cred::userpass_plaintext(username_from_url.unwrap_or("x-access-token"), token);
+    }
+    Err(git2::Error::from_str(&format!(
+        "remote '{url}' requested unsupported credential type {allowed_types:?}; Loom supplies \
+         tokens over HTTPS and keys through the SSH agent"
+    )))
+}
+
 fn git_error(operation: &str, error: git2::Error) -> LoomError {
     LoomError::new(ErrorCode::Vcs, format!("{operation}: {error}"), false)
 }
@@ -1608,6 +1633,55 @@ mod tests {
         );
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(bare).unwrap();
+    }
+
+    #[test]
+    fn credential_requests_are_answered_by_their_type() {
+        // HTTPS remotes ask for user/password, so the token is the password.
+        let userpass = credential_for(
+            "https://example.test/owner/repo.git",
+            Some("x-access-token"),
+            git2::CredentialType::USER_PASS_PLAINTEXT | git2::CredentialType::DEFAULT,
+            "test-token",
+        )
+        .unwrap();
+        assert_eq!(
+            i64::from(userpass.credtype()),
+            i64::from(git2::CredentialType::USER_PASS_PLAINTEXT.bits())
+        );
+
+        // SSH remotes ask for a key, which the agent supplies instead of the
+        // token. `credtype()` is `i32` on Windows and `u32` elsewhere.
+        let ssh = credential_for(
+            "ssh://git@example.test/owner/repo.git",
+            Some("git"),
+            git2::CredentialType::SSH_KEY | git2::CredentialType::SSH_CUSTOM,
+            "test-token",
+        )
+        .unwrap();
+        assert_eq!(
+            i64::from(ssh.credtype()),
+            i64::from(git2::CredentialType::SSH_KEY.bits())
+        );
+
+        // Any other request fails with the remote in the message instead of
+        // replaying the callback, and never repeats the token.
+        let error = match credential_for(
+            "ssh://example.test/owner/repo.git",
+            None,
+            git2::CredentialType::USERNAME,
+            "test-token",
+        ) {
+            Ok(_) => panic!("expected an unsupported credential type failure"),
+            Err(error) => error,
+        };
+        assert!(error.message().contains("unsupported credential type"));
+        assert!(
+            error
+                .message()
+                .contains("ssh://example.test/owner/repo.git")
+        );
+        assert!(!error.message().contains("test-token"));
     }
 
     #[test]
@@ -1966,6 +2040,47 @@ mod tests {
         let status = git.status().unwrap();
         assert!(status.clean);
         assert!(status.conflicts.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn merge_integration_locks_the_parent_branch_before_checkout() {
+        let (git, root) = repository();
+        let parent_branch = git.current_branch().unwrap().unwrap();
+        let child_branch = format!("codex/child-{}", loom_core::RepositoryId::new());
+        run(&root, &["checkout", "-qb", &child_branch]);
+        write_commit(&root, "child.txt", "child\n", "child change");
+        let child = git.repository().unwrap().head().unwrap().target().unwrap();
+        run(&root, &["checkout", "-q", &parent_branch]);
+        write_commit(&root, "README.md", "parent advanced\n", "parent change");
+        let parent_advanced = git.repository().unwrap().head().unwrap().target().unwrap();
+
+        // Another writer holds the parent branch lock, mirroring the race the
+        // locked-branch re-check guards against: the merge result must not
+        // reach the working tree because the branch cannot move.
+        let holder = git.repository().unwrap();
+        let mut held = holder.transaction().unwrap();
+        held.lock_ref(&format!("refs/heads/{parent_branch}"))
+            .unwrap();
+
+        assert_eq!(
+            git.integrate_merge(parent_advanced, child, "integrate child")
+                .unwrap_err()
+                .code,
+            ErrorCode::Vcs
+        );
+        assert_eq!(
+            git.repository().unwrap().head().unwrap().target(),
+            Some(parent_advanced)
+        );
+        assert!(!root.join("child.txt").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("README.md")).unwrap(),
+            "parent advanced\n"
+        );
+        assert!(git.status().unwrap().clean);
+
+        drop(held);
         fs::remove_dir_all(root).unwrap();
     }
 
