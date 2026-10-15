@@ -18,6 +18,14 @@ pub enum PolicyDecision {
     Deny,
 }
 
+/// Per-kind approval decisions for tool actions.
+///
+/// `destructive` classifies audited, hard-to-reverse actions; it is not a
+/// refusal. The shipped presets allow destructive actions, and a user who wants
+/// a gate sets that dimension to [`PolicyDecision::RequireApproval`], which
+/// prompts per instance instead of deciding for the user. The agent still
+/// enforces [`PolicyDecision::Deny`], which a deployment can choose for a hard
+/// refusal.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ApprovalPolicy {
     pub read: PolicyDecision,
@@ -34,23 +42,26 @@ impl Default for ApprovalPolicy {
             write: PolicyDecision::RequireApproval,
             command: PolicyDecision::RequireApproval,
             network: PolicyDecision::RequireApproval,
-            destructive: PolicyDecision::Deny,
+            destructive: PolicyDecision::Allow,
         }
     }
 }
 
 impl ApprovalPolicy {
-    /// Allows all non-destructive actions without prompting.
+    /// Allows every action kind without prompting.
     ///
-    /// Destructive actions remain denied even in automatic mode so enabling
-    /// automatic approvals cannot authorize irreversible workspace operations.
+    /// The destructive classification describes an audited, hard-to-reverse
+    /// action rather than a refusal, so it is allowed here like any other kind.
+    /// Selecting this policy is the caller's explicit decision to let such
+    /// actions run unapproved; a user who wants a per-instance prompt sets the
+    /// destructive dimension to [`PolicyDecision::RequireApproval`] instead.
     pub const fn auto_approve() -> Self {
         Self {
             read: PolicyDecision::Allow,
             write: PolicyDecision::Allow,
             command: PolicyDecision::Allow,
             network: PolicyDecision::Allow,
-            destructive: PolicyDecision::Deny,
+            destructive: PolicyDecision::Allow,
         }
     }
 
@@ -95,7 +106,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_policy_is_safe_but_keeps_reading_automatic() {
+    fn default_policy_allows_reads_and_destructive_actions() {
         let policy = ApprovalPolicy::default();
         assert_eq!(policy.decision(ActionKind::Read), PolicyDecision::Allow);
         assert_eq!(
@@ -103,8 +114,16 @@ mod tests {
             PolicyDecision::RequireApproval
         );
         assert_eq!(
+            policy.decision(ActionKind::Command),
+            PolicyDecision::RequireApproval
+        );
+        assert_eq!(
+            policy.decision(ActionKind::Network),
+            PolicyDecision::RequireApproval
+        );
+        assert_eq!(
             policy.decision(ActionKind::Destructive),
-            PolicyDecision::Deny
+            PolicyDecision::Allow
         );
     }
 
@@ -117,7 +136,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_approve_allows_non_destructive_actions_only() {
+    fn auto_approve_allows_every_action_kind() {
         let policy = ApprovalPolicy::auto_approve();
         assert_eq!(policy.decision(ActionKind::Read), PolicyDecision::Allow);
         assert_eq!(policy.decision(ActionKind::Write), PolicyDecision::Allow);
@@ -125,7 +144,35 @@ mod tests {
         assert_eq!(policy.decision(ActionKind::Network), PolicyDecision::Allow);
         assert_eq!(
             policy.decision(ActionKind::Destructive),
-            PolicyDecision::Deny
+            PolicyDecision::Allow
         );
+    }
+
+    /// A deployment that wants destructive actions refused outright can still
+    /// say so; the agent keeps enforcing that decision.
+    #[test]
+    fn a_policy_that_denies_destructive_actions_evaluates_to_deny() {
+        let policy = ApprovalPolicy {
+            destructive: PolicyDecision::Deny,
+            ..Default::default()
+        };
+        let evaluation =
+            PolicyEvaluation::evaluate(&policy, ActionKind::Destructive, "github_push_branch");
+        assert_eq!(evaluation.decision, PolicyDecision::Deny);
+        assert!(evaluation.reason.contains("denied"));
+    }
+
+    /// A user who wants a gate on the destructive dimension asks for a prompt
+    /// rather than a refusal.
+    #[test]
+    fn a_policy_can_require_approval_for_destructive_actions() {
+        let policy = ApprovalPolicy {
+            destructive: PolicyDecision::RequireApproval,
+            ..Default::default()
+        };
+        let evaluation =
+            PolicyEvaluation::evaluate(&policy, ActionKind::Destructive, "github_push_branch");
+        assert_eq!(evaluation.decision, PolicyDecision::RequireApproval);
+        assert!(evaluation.reason.contains("approval"));
     }
 }

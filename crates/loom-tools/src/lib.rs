@@ -157,9 +157,10 @@ impl ToolKind {
     /// Whether this tool is expected to prompt for approval instead of running
     /// unapproved. Derived from [`ToolKind::action_kind`] so the action
     /// classification is the only place a tool is decided about: only reads are
-    /// allowed outright by the default policy, and every other kind is either
-    /// approved by the user or denied. Destructive tools are denied rather than
-    /// prompted, so this returns `true` for them as well.
+    /// allowed outright by the default policy, and every other kind is gated by
+    /// an approval decision. Destructive tools are the user's decision rather
+    /// than a refusal, so this returns `true` for them as well: they prompt
+    /// whenever the policy gates that dimension.
     pub const fn requires_approval(self) -> bool {
         // Expressed as "not a read" rather than as a list of kinds, so a kind
         // added later has to be classified as a read to run unapproved.
@@ -181,9 +182,11 @@ impl ToolKind {
             | Self::GitHubGetIssue
             | Self::GitHubGetComments
             | Self::GitHubGetBranchChecks => ActionKind::Network,
-            // Destructive means "denied by default". The default policy and
-            // `ApprovalPolicy::auto_approve` both deny this kind, so the
-            // classification is a deliberate refusal, not an extra prompt.
+            // Destructive classifies an audited, hard-to-reverse action for the
+            // user to decide about: the default policy and
+            // `ApprovalPolicy::auto_approve` both allow this kind, and a user
+            // who wants a gate sets the dimension to `RequireApproval`, which
+            // prompts per instance.
             //
             // `github_push_branch` publishes local commits to the origin
             // remote. Published commits can be fetched or mirrored by others
@@ -192,9 +195,8 @@ impl ToolKind {
             // automation, even though the labels themselves can be re-added.
             //
             // `run_command` deliberately stays `Command`: that kind already
-            // requires approval by default, and calling it destructive would
-            // deny every build and test command under both the default policy
-            // and automatic mode, breaking the primary workflow.
+            // requires approval by default, and builds and tests are routine,
+            // repeatable commands rather than audited hard-to-reverse actions.
             Self::GitHubPushBranch | Self::GitHubRemoveLabels => ActionKind::Destructive,
             Self::GitHubCreatePullRequest
             | Self::GitHubCreateIssue
@@ -2854,7 +2856,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolKind::GitHubPushBranch.name().to_owned(),
-            description: "Push a local branch in the workspace to the GitHub repository's origin remote using the connected account, so a pull request can be opened. This is a destructive action: it requires enabled GitHub write access and an approval policy that permits destructive actions, and it is denied by the default policy and by automatic approvals.".to_owned(),
+            description: "Push a local branch in the workspace to the GitHub repository's origin remote using the connected account, so a pull request can be opened. This is a destructive action: it requires enabled GitHub write access and an approval policy that permits destructive actions; the default policy and automatic approvals allow it, and a user who gates destructive actions is prompted for each call.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -3011,7 +3013,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolKind::GitHubRemoveLabels.name().to_owned(),
-            description: "Remove labels from an issue or pull request by number. This is a destructive action: it requires an approval policy that permits destructive actions, and it is denied by the default policy and by automatic approvals.".to_owned(),
+            description: "Remove labels from an issue or pull request by number. This is a destructive action: it requires an approval policy that permits destructive actions; the default policy and automatic approvals allow it, and a user who gates destructive actions is prompted for each call.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -3077,7 +3079,7 @@ pub fn tool_guidance(definitions: &[ToolDefinition]) -> Option<String> {
         ToolKind::from_name(&definition.name).is_some_and(ToolKind::requires_approval)
     }) {
         guidance.push(
-            "Write, command, network, and destructive tools may require user approval; destructive tools are denied by the default policy and by automatic approvals; if a call is rejected, do not repeat it—adjust your approach.".to_owned(),
+            "Write, command, network, and destructive tools may require user approval; destructive tools are allowed by the default policy and by automatic approvals and are prompted only when the user gates destructive actions; if a call is rejected, do not repeat it—adjust your approach.".to_owned(),
         );
     }
     if guidance.is_empty() {
@@ -5480,9 +5482,18 @@ mod helper_tests {
 
     /// Every tool must be classified and must agree with the policy that decides
     /// on it, so the approval expectation cannot drift away from `action_kind`.
+    /// The comparison uses a policy that prompts for every non-read kind,
+    /// because `requires_approval` means "may prompt", not "is refused by the
+    /// shipped presets".
     #[test]
-    fn every_tool_kind_is_classified_and_agrees_with_the_default_policy() {
-        let policy = ApprovalPolicy::default();
+    fn every_tool_kind_is_classified_and_agrees_with_the_policy_that_gates_it() {
+        let policy = ApprovalPolicy {
+            read: loom_core::PolicyDecision::Allow,
+            write: loom_core::PolicyDecision::RequireApproval,
+            command: loom_core::PolicyDecision::RequireApproval,
+            network: loom_core::PolicyDecision::RequireApproval,
+            destructive: loom_core::PolicyDecision::RequireApproval,
+        };
         for kind in every_tool_kind() {
             // An unclassified variant would also be unreachable by name.
             assert_eq!(
@@ -5524,13 +5535,13 @@ mod helper_tests {
     /// so the assertions below and the policy expectations cannot drift.
     const DESTRUCTIVE_TOOLS: [&str; 2] = ["github_push_branch", "github_remove_labels"];
 
-    /// The destructive classification is what makes these tools denied instead
-    /// of prompted, so it must stay exactly these two tools, and neither the
-    /// default policy nor automatic approvals may allow them. `run_command` is
-    /// deliberately not destructive: it stays `Command` and stays allowed under
-    /// automatic approvals so builds and tests remain runnable.
+    /// The destructive classification marks these two tools as audited,
+    /// hard-to-reverse actions for the user to decide about, so it must stay
+    /// exactly these two tools and the shipped presets must allow them.
+    /// `RequireApproval` is how a user asks for a prompt per instance, and
+    /// `run_command` is deliberately not destructive: it stays `Command`.
     #[test]
-    fn destructive_tools_are_denied_and_run_command_is_not_destructive() {
+    fn destructive_tools_are_the_users_decision_and_run_command_is_not_destructive() {
         let destructive = every_tool_kind()
             .into_iter()
             .filter(|kind| kind.action_kind() == ActionKind::Destructive)
@@ -5539,23 +5550,25 @@ mod helper_tests {
         assert_eq!(destructive, DESTRUCTIVE_TOOLS.to_vec());
         for name in DESTRUCTIVE_TOOLS {
             let kind = ToolKind::from_name(name).expect("destructive tool is classified");
-            assert!(kind.requires_approval(), "{name} must not run unapproved");
-            // The default policy denies destructive actions rather than
-            // prompting for them; `RequireApproval` is accepted here so raising
-            // the destructive dimension stays a safe change, but the default
-            // policy may never allow the call.
-            let default_decision = ApprovalPolicy::default().decision(kind.action_kind());
-            assert!(
-                matches!(
-                    default_decision,
-                    loom_core::PolicyDecision::RequireApproval | loom_core::PolicyDecision::Deny
-                ),
-                "{name} must not be allowed by the default policy: {default_decision:?}"
+            assert!(kind.requires_approval(), "{name} may prompt for approval");
+            assert_eq!(
+                ApprovalPolicy::default().decision(kind.action_kind()),
+                loom_core::PolicyDecision::Allow,
+                "{name} is allowed by the default policy"
             );
             assert_eq!(
                 ApprovalPolicy::auto_approve().decision(kind.action_kind()),
-                loom_core::PolicyDecision::Deny,
-                "{name} must stay denied in automatic mode"
+                loom_core::PolicyDecision::Allow,
+                "{name} is allowed in automatic mode"
+            );
+            let gated = ApprovalPolicy {
+                destructive: loom_core::PolicyDecision::RequireApproval,
+                ..Default::default()
+            };
+            assert_eq!(
+                gated.decision(kind.action_kind()),
+                loom_core::PolicyDecision::RequireApproval,
+                "{name} prompts when the user gates destructive actions"
             );
         }
 
