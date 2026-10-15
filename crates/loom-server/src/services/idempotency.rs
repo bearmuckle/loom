@@ -142,6 +142,18 @@ impl IdempotencyStore {
         }
     }
 
+    /// Request ids that currently hold a serialization slot, so a test can
+    /// prove that every request exit releases its slot.
+    #[cfg(test)]
+    pub(crate) fn in_flight_request_ids(&self) -> Vec<RequestId> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect()
+    }
+
     pub(crate) fn durable_gate(&self) -> Result<MutexGuard<'_, ()>> {
         self.durable_gate.lock().map_err(|_| {
             LoomError::new(
