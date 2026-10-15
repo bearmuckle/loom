@@ -1015,6 +1015,10 @@ impl FilePersistence {
             return Ok(Vec::new());
         }
         let connection = self.connection()?;
+        // One batch read replaces a fragments row read per message, and one
+        // decode cache keeps repeated content hashes to a single decode.
+        let fragment_payloads = load_run_message_fragment_payloads(&connection, run_id)?;
+        let mut decoded_content = ContentDecodeCache::default();
         let mut statement = connection
             .prepare(
                 "SELECT ordinal, timeline_ordinal, role, content_hash, name, tool_call_id,
@@ -1054,7 +1058,11 @@ impl FilePersistence {
                 persistence_error(format!("could not read run message: {error}"), true)
             })?;
             let role = parse_message_role(&role)?;
-            let ordinal = u64::try_from(ordinal).map_err(|_| {
+            let stored_ordinal = ordinal;
+            // The stored ordinal stays an i64 because the fragment lookup is
+            // keyed on the persisted value; a negative ordinal is still
+            // rejected with the same error as before.
+            u64::try_from(ordinal).map_err(|_| {
                 LoomError::new(
                     ErrorCode::MalformedPayload,
                     "persisted message ordinal is negative",
@@ -1076,10 +1084,10 @@ impl FilePersistence {
                         false,
                     )
                 })?;
-            let mut content = content_hash
-                .map(|hash| decode_content(&connection, &hash))
-                .transpose()?
-                .unwrap_or_default();
+            let mut content = match content_hash {
+                Some(hash) => decoded_content.decode(&connection, &hash)?,
+                None => String::new(),
+            };
             let fragment_offset = u64::try_from(content.len()).map_err(|_| {
                 LoomError::new(
                     ErrorCode::MalformedPayload,
@@ -1087,12 +1095,11 @@ impl FilePersistence {
                     false,
                 )
             })?;
-            let fragments = load_run_message_fragments(
-                &connection,
-                run_id,
-                ordinal,
+            let fragments = assemble_run_message_fragments(
+                fragment_payloads.get(&stored_ordinal).map(String::as_str),
                 fragment_offset,
                 usize::MAX,
+                &mut |hash| decoded_content.decode(&connection, hash),
             )?;
             if !fragments.is_empty() {
                 content.push_str(&String::from_utf8(fragments).map_err(|error| {

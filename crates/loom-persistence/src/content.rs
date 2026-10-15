@@ -195,7 +195,26 @@ pub(crate) fn load_content_range(
     Ok(output)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Counts `decode_content` calls on the current test thread so a test can
+    /// assert that one transcript read decodes repeated content once.
+    static DECODED_CONTENT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_decoded_content_calls() {
+    DECODED_CONTENT_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn decoded_content_calls() -> usize {
+    DECODED_CONTENT_CALLS.with(|calls| calls.get())
+}
+
 pub(crate) fn decode_content(connection: &Connection, hash: &[u8]) -> Result<String> {
+    #[cfg(test)]
+    DECODED_CONTENT_CALLS.with(|calls| calls.set(calls.get() + 1));
     let raw_size: i64 = connection
         .query_row(
             "SELECT raw_size FROM content_objects WHERE hash = ?1",
@@ -224,6 +243,30 @@ pub(crate) fn decode_content(connection: &Connection, hash: &[u8]) -> Result<Str
         )
     })
 }
+
+/// Memoizes decoded content for one read pass.
+///
+/// A transcript can reference the same content hash many times: a repeated
+/// message body, or a fragment already committed on an earlier message.
+/// Without this cache each reference re-reads the object metadata, re-reads
+/// its bytes and re-hashes the whole object. The cache is scoped to one call,
+/// so a caller still observes committed changes between calls.
+#[derive(Default)]
+pub(crate) struct ContentDecodeCache {
+    decoded: BTreeMap<Vec<u8>, String>,
+}
+
+impl ContentDecodeCache {
+    pub(crate) fn decode(&mut self, connection: &Connection, hash: &[u8]) -> Result<String> {
+        if let Some(content) = self.decoded.get(hash) {
+            return Ok(content.clone());
+        }
+        let content = decode_content(connection, hash)?;
+        self.decoded.insert(hash.to_vec(), content.clone());
+        Ok(content)
+    }
+}
+
 pub(crate) fn store_content(transaction: &Transaction<'_>, content: &[u8]) -> Result<Vec<u8>> {
     if content.len() > MAX_CONTENT_BYTES {
         return Err(LoomError::invalid_request(

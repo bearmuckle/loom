@@ -477,6 +477,128 @@ fn streamed_messages_are_append_only_and_paged_by_keyset() {
 }
 
 #[test]
+fn streamed_transcript_reuses_decoded_content_across_messages() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+    let persistence = FilePersistence::open(&path).unwrap();
+    let mut manager = SessionManager::default();
+    let (session, _) = manager
+        .create_in_workspace(WorkspaceId::new(), "Repeated transcript content")
+        .unwrap();
+    let run_id = RunId::new();
+    let summary = DurableRunSummary {
+        snapshot: AgentRunSnapshot {
+            id: run_id,
+            attempt_id: loom_core::RunAttemptId::new(),
+            control_revision: 0,
+            session_id: session.id,
+            task: "reuse decoded content".to_owned(),
+            model: ModelId::new("deterministic-model"),
+            state: AgentRunState::Executing,
+            started_at: Timestamp::from_unix_millis(1000),
+            updated_at: Timestamp::from_unix_millis(1000),
+            completed_at: None,
+            summary: None,
+            evidence: Vec::new(),
+        },
+        usage: UsageSnapshot::default(),
+        attempts: None,
+        execution_state: None,
+        interactions: None,
+    };
+    let run_summaries = BTreeMap::from([(run_id, summary)]);
+    let large_content = "0123456789".repeat(60_000);
+    let message = |role: loom_model::MessageRole, content: &str| DurableRunMessage {
+        timeline_ordinal: 0,
+        role,
+        content: content.to_owned(),
+        name: None,
+        tool_call_id: None,
+        tool_calls: Vec::new(),
+        reasoning_content: None,
+    };
+    let run_messages = BTreeMap::from([(
+        run_id,
+        vec![
+            message(loom_model::MessageRole::User, "question"),
+            message(loom_model::MessageRole::Assistant, "seed"),
+            message(loom_model::MessageRole::Assistant, ""),
+            message(loom_model::MessageRole::User, &large_content),
+            // The base and two fragments of message one, committed again.
+            message(loom_model::MessageRole::Assistant, "seed"),
+        ],
+    )]);
+    persistence
+        .save_state(DurableStateWrite {
+            sessions: &manager.export_state(),
+            workspaces: None,
+            settings: None,
+            workspace_configs: None,
+            providers: None,
+            usage: None,
+            idempotency: None,
+            run_summaries: Some(&run_summaries),
+            run_runtime_configs: None,
+            run_context_checkpoints: None,
+            run_plans: None,
+            run_messages: Some(&run_messages),
+            run_activities: None,
+            filesystem_records: None,
+            feed: None,
+        })
+        .unwrap();
+    for (message_ordinal, fragment_ordinal, byte_offset, bytes) in [
+        (1_u64, 0_u64, 4_u64, b"hello ".as_slice()),
+        (1, 1, 10, b"world"),
+        (1, 2, 15, b"!"),
+        (2, 0, 0, b"part"),
+        (2, 1, 4, b"ial"),
+        (4, 0, 4, b"world"),
+        (4, 1, 9, b"!"),
+    ] {
+        persistence
+            .append_run_message_fragment(
+                run_id,
+                session.id,
+                message_ordinal,
+                fragment_ordinal,
+                byte_offset,
+                bytes,
+            )
+            .unwrap();
+    }
+    assert_eq!(stored_fragment_count(&path, run_id), 7);
+
+    reset_decoded_content_calls();
+    let transcript = persistence.load_run_messages(run_id).unwrap();
+    // One decode per distinct content object: the question, `seed`, `hello `,
+    // `world`, `!`, `part`, `ial` and the large body. Message four's repeat of
+    // `seed`, `world` and `!` must not decode and hash them again.
+    assert_eq!(decoded_content_calls(), 8);
+    assert_eq!(transcript.len(), 5);
+    assert_eq!(transcript[0].content, "question");
+    assert_eq!(transcript[1].content, "seedhello world!");
+    assert_eq!(transcript[2].content, "partial");
+    assert_eq!(transcript[3].content, large_content);
+    assert_eq!(transcript[4].content, "seedworld!");
+    assert_eq!(
+        transcript
+            .iter()
+            .map(|message| message.timeline_ordinal)
+            .collect::<Vec<_>>(),
+        vec![0, 0, 0, 0, 0]
+    );
+    // The cache is scoped to one call, so a second read decodes the same eight
+    // objects again instead of serving state from the first read.
+    reset_decoded_content_calls();
+    let reloaded = persistence.load_run_messages(run_id).unwrap();
+    assert_eq!(decoded_content_calls(), 8);
+    assert_eq!(reloaded[1].content, "seedhello world!");
+    assert_eq!(reloaded[4].content, "seedworld!");
+    drop(persistence);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn run_message_pages_reject_invalid_limits_and_cursors() {
     let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
     let store = FilePersistence::open(&path).unwrap();

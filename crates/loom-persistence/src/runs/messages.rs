@@ -191,6 +191,9 @@ pub(crate) fn fragment_total(fragments: &[StoredFragment]) -> Option<u64> {
         .max()
 }
 
+/// Assembles one message's fragments for a bounded range read, which touches a
+/// single message. A whole-transcript read batches every message through
+/// [`load_run_message_fragment_payloads`] instead.
 pub(crate) fn load_run_message_fragments(
     connection: &Connection,
     run_id: RunId,
@@ -215,10 +218,57 @@ pub(crate) fn load_run_message_fragments(
         .map_err(|error| {
             persistence_error(format!("could not read message fragments: {error}"), true)
         })?;
+    assemble_run_message_fragments(payload.as_deref(), byte_offset, length, &mut |hash| {
+        decode_content(connection, hash)
+    })
+}
+
+/// Reads the stored fragment descriptors of every message in one run, so a
+/// transcript read does not issue one row read per message.
+pub(crate) fn load_run_message_fragment_payloads(
+    connection: &Connection,
+    run_id: RunId,
+) -> Result<BTreeMap<i64, String>> {
+    let mut statement = connection
+        .prepare("SELECT ordinal, fragments FROM run_messages WHERE run_id=?1")
+        .map_err(|error| {
+            persistence_error(
+                format!("could not prepare message fragments: {error}"),
+                true,
+            )
+        })?;
+    let rows = statement
+        .query_map([run_id.as_uuid().as_bytes().as_slice()], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| {
+            persistence_error(format!("could not read message fragments: {error}"), true)
+        })?;
+    let mut payloads = BTreeMap::new();
+    for row in rows {
+        let (ordinal, payload) = row.map_err(|error| {
+            persistence_error(format!("could not read message fragments: {error}"), true)
+        })?;
+        payloads.insert(ordinal, payload);
+    }
+    Ok(payloads)
+}
+
+/// Assembles a byte range of one message from already-read fragment
+/// descriptors, decoding each referenced content object through `decode`.
+///
+/// A `None` payload means the message row carries no fragments, and an absent
+/// requested range is empty rather than an error, matching a missing row.
+pub(crate) fn assemble_run_message_fragments(
+    payload: Option<&str>,
+    byte_offset: u64,
+    length: usize,
+    decode: &mut dyn FnMut(&[u8]) -> Result<String>,
+) -> Result<Vec<u8>> {
     let Some(payload) = payload else {
         return Ok(Vec::new());
     };
-    let mut fragments = decode_stored_fragments(&payload)?;
+    let mut fragments = decode_stored_fragments(payload)?;
     fragments.sort_by_key(|fragment| fragment.fragment_ordinal);
     let Some(total) = fragment_total(&fragments) else {
         return Ok(Vec::new());
@@ -271,7 +321,7 @@ pub(crate) fn load_run_message_fragments(
             )
         })?;
         let hash = decode_hash_hex(&fragment.content_hash, "fragment content hash")?;
-        let bytes = decode_content(connection, &hash)?.into_bytes();
+        let bytes = decode(&hash)?.into_bytes();
         if bytes.len() != fragment_length {
             return Err(LoomError::new(
                 ErrorCode::MalformedPayload,
