@@ -257,7 +257,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn symlink_leafs_are_refused_and_the_target_is_left_alone() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{PermissionsExt, symlink};
 
         let root = env::temp_dir().join(format!("loom-core-paths-{}", crate::RunId::new()));
         let target = root.join("target");
@@ -279,7 +279,12 @@ mod tests {
         let dangling = root.join("dangling");
         symlink(root.join("missing"), &dangling).unwrap();
         assert!(create_private_dir(&dangling).is_err());
-        assert!(fs::symlink_metadata(&dangling).unwrap().file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(&dangling)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 }
