@@ -1924,13 +1924,13 @@ pub(crate) fn tool_display_detail(part: &ToolPart) -> Option<String> {
 /// Whether expanding a tool block would reveal anything. A block whose result is
 /// only the action already shown on the row has nothing to expand, so it offers
 /// no disclosure control.
-/// Whether a successful result that exists nowhere else is shown. Failed output
-/// is never shown: the row reports the failed status, and whether the failure
-/// matters is the agent's judgement, reported in its answer. A denial's reason
+/// Whether a result that exists nowhere else is shown. A failed call's output
+/// is shown as well: the row summarizes the reason in a note, so expanding the
+/// row has to reach the whole error that note was cut from. A denial's reason
 /// is the policy's own statement and is shown by `tool_policy_note` instead of
 /// as tool output.
 pub(crate) fn tool_shows_output(part: &ToolPart) -> bool {
-    !matches!(part.status, ToolPartStatus::Failed | ToolPartStatus::Denied)
+    part.status != ToolPartStatus::Denied
         && part
             .output
             .as_deref()
@@ -2311,6 +2311,39 @@ pub(crate) fn tool_policy_note(part: &ToolPart) -> Option<String> {
         note.push_str(reason);
     }
     Some(note)
+}
+
+/// The longest failure reason shown in the note under a tool row. The note
+/// summarizes an output the row can also expand, so it stays short enough to
+/// read at a glance.
+pub(crate) const MAX_TOOL_FAILURE_REASON_CHARS: usize = 200;
+
+/// The reason a failed call gave, as the always-visible note under its row can
+/// show it.
+///
+/// A failed row reported only its status label, which left the reason behind
+/// the disclosure. The note carries the reason itself, collapsed onto one line
+/// because the row it belongs to is one line, and bounded because the expanded
+/// row still holds the whole output. `None` when the call did not fail or its
+/// result carried no reason, so a failure with nothing to say gains no empty
+/// note.
+pub(crate) fn tool_failure_reason(part: &ToolPart) -> Option<String> {
+    if part.status != ToolPartStatus::Failed {
+        return None;
+    }
+    let collapsed = part
+        .output
+        .as_deref()?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    // Bounding marks a cut with a line of its own, which the one-line note folds
+    // back into the text it summarizes.
+    let reason = bounded_to(&collapsed, MAX_TOOL_FAILURE_REASON_CHARS);
+    Some(reason.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 pub(crate) fn tool_part_from_activity(activity: &AgentActivityRecord) -> Option<ToolPart> {
@@ -2911,15 +2944,17 @@ mod tests {
             Some("Lines 1–2"),
             Some("fn main() {}")
         )));
-        // A failure is never shown, even for a result that exists nowhere else;
-        // the row reports the failed status and the agent reports the detail.
+        // A workspace-derived result is still not repeated, so a failed read
+        // has no body: the reason note under the row carries the error.
         assert!(!tool_has_body(&part(
             "read_file",
             ToolPartStatus::Failed,
             None,
             Some("No such file or directory")
         )));
-        assert!(!tool_has_body(&part(
+        // A failed result that exists nowhere else is shown, so the whole error
+        // behind the row's reason note can be read.
+        assert!(tool_has_body(&part(
             "web_search",
             ToolPartStatus::Failed,
             None,
