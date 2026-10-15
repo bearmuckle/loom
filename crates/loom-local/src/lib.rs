@@ -7,8 +7,7 @@
 #[cfg(test)]
 use std::{collections::BTreeMap, sync::Mutex};
 use std::{
-    env, fs,
-    io::{self, IsTerminal, Write},
+    env, fs, io,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -21,7 +20,10 @@ use sha2::{Digest, Sha256};
 
 mod connection;
 
-pub use connection::{LocalConnection, OwnedBackend, RemoteConnection, RemoteConnectionOptions};
+pub use connection::{
+    DEFAULT_REQUEST_TIMEOUT, LocalConnection, OwnedBackend, RemoteConnection,
+    RemoteConnectionOptions,
+};
 
 /// Whether the native WebSocket transport can negotiate TLS (`wss://`).
 ///
@@ -346,46 +348,12 @@ impl UiOptions {
 /// incompatible database is wiped only when the operator passed
 /// `--reset-state` or explicitly confirmed the interactive prompt; otherwise
 /// the error is returned so the GUI reports it instead of failing silently.
+/// The decision itself is the shared [`loom_server::ensure_state_database`].
 pub fn prepare_backend_state(options: &UiOptions) -> Result<(), LoomError> {
     if options.remote.is_some() || options.demo {
         return Ok(());
     }
-    let path = backend_persistence_path();
-    let status = loom_persistence::FilePersistence::schema_status(&path)?;
-    if status.is_compatible() {
-        return Ok(());
-    }
-    let wipe = options.reset_state || confirm_state_wipe(&path, status)?;
-    if !wipe {
-        return Err(loom_persistence::incompatible_database_error(&path, status));
-    }
-    loom_persistence::FilePersistence::reset_database(&path)
-}
-
-fn confirm_state_wipe(
-    path: &Path,
-    status: loom_persistence::SchemaStatus,
-) -> Result<bool, LoomError> {
-    if !io::stdin().is_terminal() {
-        return Ok(false);
-    }
-    eprintln!(
-        "Loom state database '{}' uses {} and cannot be opened by this build.",
-        path.display(),
-        status.description()
-    );
-    eprint!("Wipe it and start with an empty database? [y/N] ");
-    io::stderr()
-        .flush()
-        .map_err(|error| LoomError::new(ErrorCode::Internal, format!("{error}"), true))?;
-    let mut answer = String::new();
-    io::stdin()
-        .read_line(&mut answer)
-        .map_err(|error| LoomError::new(ErrorCode::Internal, format!("{error}"), true))?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
+    loom_server::ensure_state_database(&backend_persistence_path(), options.reset_state)
 }
 
 /// Resolves the default project root from a process working directory. Returns

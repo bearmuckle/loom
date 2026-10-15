@@ -2,7 +2,6 @@ use super::*;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum ControlRequest {
     Negotiate {
         client_version: ProtocolVersion,
@@ -25,7 +24,6 @@ pub enum ControlRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum WorkspaceRequest {
     CreateWorkspace {
         name: String,
@@ -64,7 +62,6 @@ pub enum WorkspaceRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum RepositoryRequest {
     AttachSessionRepository {
         session_id: AgentSessionId,
@@ -122,7 +119,6 @@ pub enum RepositoryRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum FilesystemRequest {
     ImportSessionDirectory {
         session_id: AgentSessionId,
@@ -190,7 +186,6 @@ pub enum FilesystemRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum SessionRequest {
     SetSessionApprovalPolicy {
         session_id: AgentSessionId,
@@ -239,7 +234,6 @@ pub enum SessionRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum EventsRequest {
     GetSessionEvents {
         session_id: Option<AgentSessionId>,
@@ -262,7 +256,6 @@ pub enum EventsRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum RunRequest {
     StartSessionAgentRun {
         session_id: AgentSessionId,
@@ -364,7 +357,6 @@ pub enum RunRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum ProviderRequest {
     ListModels,
 
@@ -414,7 +406,6 @@ pub enum ProviderRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum UsageRequest {
     GetRunUsage { run_id: RunId },
 
@@ -423,14 +414,12 @@ pub enum UsageRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum ContextRequest {
     InspectAgentContext { run_id: RunId },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum TerminalRequest {
     OpenSessionTerminal {
         session_id: AgentSessionId,
@@ -466,7 +455,6 @@ pub enum TerminalRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum TaskRequest {
     StartSessionTask {
         session_id: AgentSessionId,
@@ -501,7 +489,6 @@ pub enum TaskRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum ProjectRequest {
     GetProjectSnapshot {
         project_id: ProjectId,
@@ -552,7 +539,6 @@ pub enum ProjectRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum ClientRequest {
     Control(ControlRequest),
     Workspace(WorkspaceRequest),

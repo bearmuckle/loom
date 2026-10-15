@@ -2,7 +2,6 @@ use super::*;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum ControlResponse {
     Negotiated(NegotiationResult),
 
@@ -15,7 +14,6 @@ pub enum ControlResponse {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum WorkspaceResponse {
     WorkspaceCreated(WorkspaceRecord),
 
@@ -30,7 +28,6 @@ pub enum WorkspaceResponse {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum RepositoryResponse {
     SessionRepositories {
         repositories: Vec<SessionRepository>,
@@ -63,7 +60,6 @@ pub enum RepositoryResponse {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum FilesystemResponse {
     SessionDirectoryImported {
         path: String,
@@ -107,7 +103,6 @@ pub enum FilesystemResponse {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum SessionResponse {
     AgentSessions { sessions: Vec<AgentSessionSnapshot> },
 
@@ -117,9 +112,9 @@ pub enum SessionResponse {
 
     AgentSession(AgentSessionSnapshot),
 
-    AgentSessionSnapshot(AgentSessionSnapshotProjection),
+    AgentSessionSnapshot(Box<AgentSessionSnapshotProjection>),
 
-    AgentSessionInitialState(AgentSessionInitialState),
+    AgentSessionInitialState(Box<AgentSessionInitialState>),
 
     AgentSessionRenamed(AgentSessionSnapshot),
 
@@ -132,7 +127,6 @@ pub enum SessionResponse {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum EventsResponse {
     SessionEvents {
         events: Vec<ServerEventEnvelope>,
@@ -172,13 +166,12 @@ pub enum EventsResponse {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum RunResponse {
     AgentRunStarted(AgentRunSnapshot),
 
     AgentRun(AgentRunSnapshot),
 
-    AgentRunSnapshot(AgentRunSnapshotProjection),
+    AgentRunSnapshot(Box<AgentRunSnapshotProjection>),
 
     AgentRunMessagePage {
         run_id: RunId,
@@ -204,7 +197,6 @@ pub enum RunResponse {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum ProviderResponse {
     Models {
         models: Vec<ModelDescriptor>,
@@ -253,7 +245,6 @@ pub enum ProviderResponse {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum UsageResponse {
     RunUsage {
         usage: UsageSnapshot,
@@ -268,14 +259,12 @@ pub enum UsageResponse {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum ContextResponse {
     ContextInspection(ContextInspection),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum TerminalResponse {
     TerminalOpened(TerminalSnapshot),
 
@@ -286,7 +275,6 @@ pub enum TerminalResponse {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum TaskResponse {
     TaskStarted(TaskSnapshot),
 
@@ -299,14 +287,19 @@ pub enum TaskResponse {
     TaskEvidence { evidence: Vec<TaskEvidenceLink> },
 }
 
+/// A project operation result.
+///
+/// The variants carrying a whole record or snapshot — a delegated task, a child
+/// worktree, a run snapshot — box that payload: the enum is as large as its
+/// largest variant, and every message is moved and cloned at that size. Boxing
+/// keeps the JSON shape, because `serde` serializes `Box<T>` exactly like `T`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum ProjectResponse {
     ProjectSnapshot(ProjectSnapshot),
 
     ProjectChildCreated {
-        task: DelegatedTaskRecord,
+        task: Box<DelegatedTaskRecord>,
         child: ProjectAgentRecord,
     },
 
@@ -318,22 +311,21 @@ pub enum ProjectResponse {
     },
 
     ProjectChildControlled {
-        task: DelegatedTaskRecord,
-        run: Option<AgentRunSnapshot>,
+        task: Box<DelegatedTaskRecord>,
+        run: Option<Box<AgentRunSnapshot>>,
     },
 
     ProjectChildReview {
-        worktree: ProjectWorktreeRecord,
+        worktree: Box<ProjectWorktreeRecord>,
         status: GitRepositoryStatus,
         diff: GitDiff,
     },
 
-    ProjectChildWorktreeUpdated(ProjectWorktreeRecord),
+    ProjectChildWorktreeUpdated(Box<ProjectWorktreeRecord>),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
 pub enum ServerResponse {
     Control(ControlResponse),
     Workspace(WorkspaceResponse),

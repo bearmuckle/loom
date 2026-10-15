@@ -21,7 +21,7 @@ fn async_session_load_and_creation_paths(cx: &mut TestAppContext) {
             loom_core::RequestId::new(),
             loom_core::LoomError::new(loom_core::ErrorCode::Internal, "stale", false),
         );
-        view.finish_async_session_load(session_id, failure.clone(), failure, cx);
+        view.finish_async_session_load(session_id, None, failure.clone(), failure, cx);
         view.begin_transcript_page(Some(5), cx);
         view
     });
@@ -136,7 +136,9 @@ fn reopening_a_session_with_a_concurrent_event_restores_durable_run_state(cx: &m
     };
     let snapshot_response = ResponseEnvelope::success(
         loom_core::RequestId::new(),
-        ServerResponse::Session(SessionResponse::AgentSessionSnapshot(initial.projection)),
+        ServerResponse::Session(SessionResponse::AgentSessionSnapshot(Box::new(
+            initial.projection,
+        ))),
     );
     let events_response = ResponseEnvelope::success(
         loom_core::RequestId::new(),
@@ -195,7 +197,7 @@ fn reopening_a_session_with_a_concurrent_event_restores_durable_run_state(cx: &m
         // The reopen's own initial-state plus events pair, applied while the
         // run is in flight: production reaches this through
         // `begin_session_data_load`.
-        view.finish_async_session_load(session.id, snapshot_response, events_response, cx);
+        view.finish_async_session_load(session.id, None, snapshot_response, events_response, cx);
     });
     // Drains the transcript page the reopen must request.
     cx.run_until_parked();
@@ -403,9 +405,12 @@ fn session_load_from_a_stale_snapshot_restores_durable_run_state(cx: &mut TestAp
     view.update(cx, |view, cx| {
         view.finish_async_session_load(
             session.id,
+            None,
             ResponseEnvelope::success(
                 loom_core::RequestId::new(),
-                ServerResponse::Session(SessionResponse::AgentSessionSnapshot(initial.projection)),
+                ServerResponse::Session(SessionResponse::AgentSessionSnapshot(Box::new(
+                    initial.projection,
+                ))),
             ),
             ResponseEnvelope::success(
                 loom_core::RequestId::new(),
