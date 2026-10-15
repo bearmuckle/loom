@@ -574,14 +574,17 @@ fn project_session_popup_menu_dispatches_child_control_review_and_integration(
     cx.update_window(review_window, |_, window, cx| {
         window.render_frame(cx);
         let mut menu = window.within("popup-menu");
-        assert_eq!(menu.find(2usize).label(), Some("Review child changes"));
-        assert_eq!(menu.find(3usize).label(), Some("Integrate child changes"));
-        assert_eq!(menu.find(4usize).label(), Some("Keep child checkout"));
+        // A completed child now offers its abandonment first, because that is
+        // the only control action left for a finished task.
+        assert_eq!(menu.find(2usize).label(), Some("Abandon completed result"));
+        assert_eq!(menu.find(3usize).label(), Some("Review child changes"));
+        assert_eq!(menu.find(4usize).label(), Some("Integrate child changes"));
+        assert_eq!(menu.find(5usize).label(), Some("Keep child checkout"));
         assert_eq!(
-            menu.find(5usize).label(),
+            menu.find(6usize).label(),
             Some("Remove clean child checkout")
         );
-        menu.click(2usize, cx);
+        menu.click(3usize, cx);
     })
     .unwrap();
     cx.run_until_parked();
@@ -605,7 +608,9 @@ fn project_session_popup_menu_dispatches_child_control_review_and_integration(
     let (integration_window, integration_view) = open_nested_project_menu(cx, 2);
     cx.update_window(integration_window, |_, window, cx| {
         window.render_frame(cx);
-        window.within("popup-menu").click(3usize, cx);
+        // Index 4 is "Integrate child changes": the abandonment action a
+        // completed child now offers shifted every later item by one.
+        window.within("popup-menu").click(4usize, cx);
     })
     .unwrap();
     cx.run_until_parked();
