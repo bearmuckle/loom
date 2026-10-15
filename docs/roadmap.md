@@ -166,6 +166,16 @@ session-centric product model.
 - Replace native-only APIs with platform adapters.
 - Add browser-specific file, clipboard, download, and accessibility behavior.
 
+**M6 status:** the browser client builds and is published today, without a
+pre-merge check for the wasm target. `.github/workflows/pages.yml` builds
+`crates/loom-ui` with `trunk build --release` and deploys it to GitHub Pages on
+every push to `main`, and the client has a wasm-only in-browser WebSocket
+transport with connection settings read from the page query string
+(`crates/loom-ui/src/browser.rs`). `.github/workflows/ci.yml` runs only the Node
+browser entry-point tests (`scripts/browser-entry.test.mjs`,
+`scripts/pwa.test.mjs`) on a pull request and builds no wasm artifact, so a
+browser-only regression becomes visible after merge rather than before it.
+
 **Exit condition:** the browser client can complete the M1-M5 agent workflows
 against a remote backend using supported browsers.
 
@@ -244,9 +254,12 @@ existing persisted or protocol identities:
   attachment list; keep mutable checkouts session-exclusive.
 - Scope filesystem, process, terminal, checkpoint, and VCS services to the
   session. Keep any shared clone cache immutable and backend-internal.
-- Migrate the CLI's current folder-backed `--workspace` bootstrap as a
+- Migrate the CLI's current folder-backed `--root` bootstrap as a
   compatibility path, then replace it with explicit workspace and
-  session-repository operations.
+  session-repository operations. `--root <path>` points a one-shot CLI session
+  at that directory, creating it when missing, and attaches it as a repository
+  when it contains `.git`; `--serve` rejects the flag and lets each server
+  session manage its own repositories (`crates/loom-cli/src/main.rs`).
 
 Before implementation, settle repository attachment lifecycle and checkout
 choices (clone versus worktree) at the service boundary. Those choices must
@@ -264,16 +277,22 @@ session's working tree.
 
 Measure the paths users feel:
 
-- Time to first usable project view.
-- Time to first streamed model output.
-- Keystroke-to-render latency for ordinary files.
-- Search latency on representative repositories.
-- Terminal and tool-output throughput and memory use.
-- Reconnect and snapshot time.
-- CPU, memory, and binary size for native and wasm builds.
+- Time to first usable project view. Unmeasured today.
+- Time to first streamed model output. Measured by the `agent_quality` gate as
+  the maximum time from run start to the first `AssistantMessageDelta`
+  (`crates/loom-server/tests/agent_quality.rs`).
+- Keystroke-to-render latency for ordinary files. Unmeasured today.
+- Search latency on representative repositories. Measured by the `agent_quality`
+  gate as the median `search_text` call, but over its bounded fixture workspace
+  rather than representative repositories (`crates/loom-server/tests/agent_quality.rs`).
+- Terminal and tool-output throughput and memory use. Unmeasured today.
+- Reconnect and snapshot time. Unmeasured today.
+- CPU, memory, and binary size for native and wasm builds. Unmeasured today.
 
-Use representative repositories and slow-network profiles rather than
-optimizing only loopback benchmarks.
+`crates/loom-server/tests/agent_quality.rs` is the only harness that measures
+any of these; the thresholds it enforces are listed in
+[the quality gate](quality.md). Use representative repositories and
+slow-network profiles rather than optimizing only loopback benchmarks.
 
 ### Testing
 
@@ -290,14 +309,16 @@ optimizing only loopback benchmarks.
 
 ## Decisions to settle early
 
-These choices should be recorded as architecture decision records when made:
+These choices should be recorded as architecture decision records when made;
+the process and the current index live in [the ADR directory](adr/README.md).
+The records accepted there cover the persistence engine, the minimum remote
+authentication mechanism, protocol versioning, and the client toolkit. Still
+open:
 
 - The exact GPUI/`gpui-gc` fork and supported native platforms.
 - The first wasm/browser support target and minimum browser versions.
 - MessagePack versus CBOR, and the schema/code-generation approach.
 - Whether QUIC is a first-release transport or a later optimization.
-- The persistence engine for sessions, event journals, and configuration.
-- The minimum authentication mechanism for remote deployments.
 - The supported source-control providers beyond Git.
 - The provider adapter contract and local model compatibility baseline.
 

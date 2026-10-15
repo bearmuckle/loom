@@ -111,9 +111,33 @@ network policy it implies. The default `ApprovalPolicy`
 allows reads, pauses writes and commands for approval, requests approval for
 network actions, and denies
 destructive actions. The policy evaluation is included in the agent event
-stream before a tool executes. The UI's optional Auto approve mode allows
-non-destructive writes, commands, and network actions, but destructive actions
-remain denied.
+stream before a tool executes, and a denial is reported to the client as that
+evaluation (with its reason) plus a failed tool result carrying the same
+reason, so it is never a silent failure. The UI's optional Auto approve mode
+allows non-destructive writes, commands, and network actions, but destructive
+actions remain denied.
+
+Exactly two built-in tools are classified as destructive, and both are denied
+by the default policy and by Auto approve mode:
+
+- `github_push_branch` publishes local commits to the origin remote. Published
+  commits can be fetched or mirrored by others before any force-push, so the
+  action is not locally reversible.
+- `github_remove_labels` is a remote DELETE that can drive remote automation,
+  even though labels themselves can be re-added.
+
+`run_command` is deliberately *not* destructive. The `Command` kind already
+requires approval by default, and classifying commands as destructive would
+deny every build and test command under both the default policy and automatic
+approvals, breaking the primary workflow.
+
+A session's approval policy is configurable per session. Clients can raise the
+destructive decision deliberately with the `SetSessionApprovalPolicy` request
+(capability `ConfigureApprovalPolicy`), which replaces all five kind decisions
+and optionally records the session's `auto_approve_actions` preference; without
+that explicit change the destructive decision stays denied. The UI exposes the
+default policy and Auto approve mode, both of which keep destructive actions
+denied.
 
 M3 makes context and resource boundaries visible as structured state. Input
 context is assembled from system instructions, repository instructions, task,

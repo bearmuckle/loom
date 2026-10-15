@@ -44,6 +44,22 @@ The thresholds are deliberately loose enough for loaded CI runners while still
 catching an order-of-magnitude regression. Rate thresholds are exact because
 the provider is deterministic.
 
+## Coverage of the roadmap performance list
+
+The gate measures two of the signals in the roadmap's
+[Performance](roadmap.md) list:
+
+- Time to first streamed output (maximum time from run start to the first
+  `AssistantMessageDelta`, on a deterministic-provider run).
+- Search latency (median `search_text` call over the bounded fixture workspace,
+  executed directly through the tool executor and not over representative
+  repositories).
+
+Time to first usable project view, keystroke-to-render latency, terminal and
+tool-output throughput and memory use, reconnect and snapshot time, and native
+or wasm CPU, memory, and binary size have no harness today, so this document
+records no numbers for them.
+
 ## Changing the gate
 
 When a new interaction becomes important, add a fixture and, if it introduces a
