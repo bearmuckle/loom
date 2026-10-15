@@ -170,7 +170,7 @@ fn a_run_projection_updates_the_session_state_on_both_paths(cx: &mut TestAppCont
             None,
             loom_protocol::ResponseEnvelope::success(
                 loom_core::RequestId::new(),
-                ServerResponse::Session(SessionResponse::AgentSessionSnapshot(snapshot)),
+                ServerResponse::Session(SessionResponse::AgentSessionSnapshot(Box::new(snapshot))),
             ),
             loom_protocol::ResponseEnvelope::success(
                 loom_core::RequestId::new(),
@@ -283,7 +283,7 @@ fn a_rebuild_ends_at_the_durable_cursor_on_both_paths(cx: &mut TestAppContext) {
             None,
             loom_protocol::ResponseEnvelope::success(
                 loom_core::RequestId::new(),
-                ServerResponse::Session(SessionResponse::AgentSessionSnapshot(snapshot)),
+                ServerResponse::Session(SessionResponse::AgentSessionSnapshot(Box::new(snapshot))),
             ),
             loom_protocol::ResponseEnvelope::success(
                 loom_core::RequestId::new(),
@@ -312,7 +312,7 @@ fn a_rebuild_ends_at_the_durable_cursor_on_both_paths(cx: &mut TestAppContext) {
             Some(snapshot_head),
             loom_protocol::ResponseEnvelope::success(
                 loom_core::RequestId::new(),
-                ServerResponse::Session(SessionResponse::AgentSessionSnapshot(snapshot)),
+                ServerResponse::Session(SessionResponse::AgentSessionSnapshot(Box::new(snapshot))),
             ),
             loom_protocol::ResponseEnvelope::success(
                 loom_core::RequestId::new(),
