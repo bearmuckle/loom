@@ -5,6 +5,7 @@ impl LoomView {
     pub(crate) fn collect_events_since(
         &mut self,
         mut after_sequence: Option<EventSequence>,
+        mut durable_latest_sequence: Option<EventSequence>,
         mut fallback: Option<AgentRunSnapshotProjection>,
     ) -> Result<(), LoomError> {
         let session_id = self.active_session.id;
@@ -24,20 +25,12 @@ impl LoomView {
                     events,
                     stream_epoch,
                 }) => {
-                    self.reset_projection();
                     self.event_stream_epoch = stream_epoch;
-                    // The projection is empty again, so the whole batch is
-                    // applied; the cursor never ends below the cursor this
-                    // request was made with.
-                    self.apply_event_batch(events, after_sequence);
-                    if let Some(projection) = fallback.as_ref() {
-                        self.seed_plan_from_projection(projection);
-                    }
-                    if self.timeline.is_empty()
-                        && let Some(projection) = fallback
-                    {
-                        self.apply_run_projection(projection);
-                    }
+                    self.rebuild_projection_from_events(
+                        events,
+                        Self::rebuild_cursor_floor(after_sequence, durable_latest_sequence),
+                        fallback,
+                    );
                     return Ok(());
                 }
                 ServerResponse::Events(EventsResponse::SessionEventsSnapshot {
@@ -59,6 +52,7 @@ impl LoomView {
                     ))) = refreshed.result
                     {
                         after_sequence = Some(initial.cursor);
+                        durable_latest_sequence = Some(initial.projection.latest_sequence);
                         fallback = initial.projection.active_run;
                         self.active_session = initial.projection.session;
                         self.session_state = self.active_session.state;
@@ -96,13 +90,49 @@ impl LoomView {
         latest_sequence: EventSequence,
         fallback: Option<AgentRunSnapshotProjection>,
     ) {
-        self.reset_projection();
         // A snapshot's window is not necessarily the whole conversation, so
         // the events are applied in full and the cursor is raised to the
         // snapshot's head afterwards instead of being adopted before them.
         // Anything older than the window is recovered by the durable rebuild
         // this snapshot triggered.
-        self.apply_event_batch(events, Some(latest_sequence));
+        self.rebuild_projection_from_events(events, Some(latest_sequence), fallback);
+    }
+
+    /// The cursor a rebuilt projection must not end below.
+    ///
+    /// A rebuild resumes from the durable projection that was read and then
+    /// applies the events after it, so the cursor is the request cursor
+    /// (`request_cursor`) raised to the durable projection's `latest_sequence`
+    /// when one was read. The synchronous and asynchronous rebuild paths used
+    /// to pick one or the other, so the same resync could end at two different
+    /// cursors; both derive the floor here.
+    pub(crate) fn rebuild_cursor_floor(
+        request_cursor: Option<EventSequence>,
+        durable_latest_sequence: Option<EventSequence>,
+    ) -> Option<EventSequence> {
+        match (request_cursor, durable_latest_sequence) {
+            (Some(request), Some(durable)) => Some(request.max(durable)),
+            (None, floor) | (floor, None) => floor,
+        }
+    }
+
+    /// Rebuilds the projection from a reset plus a batch of journaled events,
+    /// falling back to the durable run projection the rebuild started from.
+    ///
+    /// This is the one resync ladder: the startup bootstrap, the interactive
+    /// session load and the poll-driven snapshot rebuild all call it, so the
+    /// reset order, the cursor floor and the fallback order cannot drift apart
+    /// between the synchronous and asynchronous paths.
+    pub(crate) fn rebuild_projection_from_events(
+        &mut self,
+        events: Vec<loom_protocol::ServerEventEnvelope>,
+        floor: Option<EventSequence>,
+        fallback: Option<AgentRunSnapshotProjection>,
+    ) {
+        // The projection is empty again, so the whole batch is applied and the
+        // cursor never ends below the floor the caller derived.
+        self.reset_projection();
+        self.apply_event_batch(events, floor);
         if let Some(projection) = fallback.as_ref() {
             self.seed_plan_from_projection(projection);
         }
@@ -244,7 +274,7 @@ impl LoomView {
                 self.context_inspection = None;
                 self.active_run = Some(snapshot.clone());
                 self.active_run_id = Some(snapshot.id);
-                self.run_state = Some(snapshot.state);
+                self.set_run_state(snapshot.state);
             }
             AgentEvent::PlanProposed { plan, .. } => {
                 let steps = plan
@@ -443,10 +473,7 @@ impl LoomView {
                 self.record_status(format!("Recovery required: {reason}"));
             }
             AgentEvent::RunStateChanged { state, .. } => {
-                self.run_state = Some(*state);
-                self.session_state = session_state_for_run(*state);
-                self.active_session.state = self.session_state;
-                self.update_session_list();
+                self.set_run_state(*state);
                 if matches!(
                     state,
                     AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
@@ -457,10 +484,7 @@ impl LoomView {
             AgentEvent::RunCompleted { snapshot } => {
                 self.active_run = Some(snapshot.clone());
                 self.active_run_id = Some(snapshot.id);
-                self.run_state = Some(snapshot.state);
-                self.session_state = session_state_for_run(snapshot.state);
-                self.active_session.state = self.session_state;
-                self.update_session_list();
+                self.set_run_state(snapshot.state);
                 // The run is over, so stop the streaming cursor even when no
                 // completion summary is rendered.
                 finish_assistant_turn(&mut self.timeline);
@@ -506,6 +530,19 @@ impl LoomView {
         }
     }
 
+    /// Applies a run state to the run and derives the session state from it.
+    ///
+    /// The session state mirrors the run state (the backend keeps them in step
+    /// the same way), so the session label the inspector shows and the run row
+    /// cannot report different states. The existing label helpers stay the
+    /// only formatting source for both.
+    pub(crate) fn set_run_state(&mut self, state: AgentRunState) {
+        self.run_state = Some(state);
+        self.session_state = session_state_for_run(state);
+        self.active_session.state = self.session_state;
+        self.update_session_list();
+    }
+
     /// Seeds the active plan from a run snapshot when the event stream has not
     /// already established one. Progress comes from the backend so a reopened
     /// session keeps its completed and active markers.
@@ -530,7 +567,7 @@ impl LoomView {
         self.seed_plan_from_projection(&projection);
         self.active_run_id = Some(projection.run.id);
         self.active_run = Some(projection.run.clone());
-        self.run_state = Some(projection.run.state);
+        self.set_run_state(projection.run.state);
         self.pending_approval = projection.pending_approval;
         self.pending_input = projection.pending_input;
         let activity_records = projection.activities;

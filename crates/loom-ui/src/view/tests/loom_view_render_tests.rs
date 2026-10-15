@@ -2570,6 +2570,7 @@ fn async_session_load_falls_back_to_run_projection_and_ignores_stale_responses(
             };
             view.finish_async_session_load(
                 session_id,
+                Some(loom_core::EventSequence::new(7)),
                 loom_protocol::ResponseEnvelope::success(
                     loom_core::RequestId::new(),
                     loom_protocol::ServerResponse::Session(SessionResponse::AgentSessionSnapshot(snapshot)),
@@ -2598,6 +2599,7 @@ fn async_session_load_falls_back_to_run_projection_and_ignores_stale_responses(
             let old_timeline_len = view.timeline.len();
             view.finish_async_session_load(
                 AgentSessionId::new(),
+                None,
                 loom_protocol::ResponseEnvelope::failure(
                     loom_core::RequestId::new(),
                     loom_core::LoomError::new(ErrorCode::Internal, "stale", false),
