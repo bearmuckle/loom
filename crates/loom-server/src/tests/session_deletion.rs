@@ -1736,14 +1736,23 @@ fn deleting_a_parked_project_manager_with_a_live_child_ends_both_runs_and_the_tr
     let rows = persistence(&fixture.backend);
     assert_eq!(fixture.root_run.snapshot().state, AgentRunState::Paused);
     assert_eq!(fixture.root_run_id, fixture.root_run.snapshot().id);
-    assert_eq!(
-        rows.load_latest_run_summary_for_session(fixture.root_id)
+    let persistence_deadline = Instant::now() + Duration::from_secs(5);
+    let persisted_root_run = loop {
+        let summary = rows
+            .load_latest_run_summary_for_session(fixture.root_id)
             .unwrap()
-            .expect("the parked manager run has a durable checkpoint")
-            .snapshot
-            .state,
-        AgentRunState::Paused
-    );
+            .expect("the parked manager run has a durable checkpoint");
+        if summary.snapshot.state == AgentRunState::Paused {
+            break summary;
+        }
+        assert!(
+            Instant::now() < persistence_deadline,
+            "the parked manager checkpoint should persist as Paused; found {:?}",
+            summary.snapshot.state
+        );
+        thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(persisted_root_run.snapshot.state, AgentRunState::Paused);
 
     // The client neither archives nor cancels anything first.
     assert_deleted(
