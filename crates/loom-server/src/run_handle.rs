@@ -387,11 +387,11 @@ impl RunHandle {
                 state.run.control_revision = *control_revision;
             }
             AgentEvent::ToolCallStarted { call, .. } => {
-                if state
+                let replaces_pending = state
                     .pending_tool_execution
                     .as_ref()
-                    .is_some_and(|pending| pending.id == call.id)
-                {
+                    .is_some_and(|pending| pending.id == call.id);
+                if replaces_pending {
                     state.pending_tool_execution = None;
                 }
             }
