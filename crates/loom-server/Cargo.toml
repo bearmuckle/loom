@@ -14,6 +14,9 @@ path = "src/main.rs"
 name = "server_restore"
 harness = false
 
+[build-dependencies]
+loom-build.workspace = true
+
 [dependencies]
 loom-agent.workspace = true
 loom-context.workspace = true

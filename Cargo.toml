@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/loom-build",
     "crates/loom-core",
     "crates/loom-tools",
     "crates/loom-workspace",
@@ -35,6 +36,7 @@ rust-version = "1.95"
 version = "0.1.0"
 
 [workspace.dependencies]
+loom-build = { path = "crates/loom-build" }
 loom-core = { path = "crates/loom-core" }
 loom-tools = { path = "crates/loom-tools" }
 loom-workspace = { path = "crates/loom-workspace" }

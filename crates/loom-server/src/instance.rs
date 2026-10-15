@@ -150,7 +150,9 @@ impl InstanceLayout {
     /// Makes the durable state database openable by this build. An incompatible
     /// database is wiped only when the operator asked for `--reset-state`, so a
     /// defaulted database that meets a newer schema never hard-fails without a
-    /// documented recovery flag.
+    /// documented recovery flag. The confirmation policy is the shared
+    /// [`crate::serve::ensure_state_database_with`] one with the fail-closed
+    /// confirmation, so this path never prompts.
     pub fn prepare_state_database(&self, reset_requested: bool) -> Result<(), LoomError> {
         let Some(path) = self.state_db.as_deref() else {
             if reset_requested {
@@ -161,11 +163,7 @@ impl InstanceLayout {
             }
             return Ok(());
         };
-        let status = loom_persistence::prepare_database(path, reset_requested)?;
-        if status.is_compatible() {
-            return Ok(());
-        }
-        Err(loom_persistence::incompatible_database_error(path, status))
+        crate::serve::ensure_state_database_with(path, reset_requested, |_, _| Ok(false))
     }
 }
 
