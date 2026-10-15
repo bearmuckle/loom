@@ -335,72 +335,135 @@ fn baseline_schema_folds_transcript_and_tool_state_into_parent_rows() {
     fs::remove_file(path).unwrap();
 }
 
-#[test]
-fn opens_and_migrates_an_older_schema_in_place() {
-    let path = std::env::temp_dir().join(format!("loom-persistence-migrate-{}.db", Uuid::new_v4()));
-    let run_id = RunId::new();
-    {
-        let connection = Connection::open(&path).unwrap();
-        // Minimal v2 layout: `run_messages` without the v3 reasoning column,
-        // plus the run tables the v4 direction queue migration touches.
-        connection
-            .execute_batch(
-                "CREATE TABLE run_messages (
-                    run_id BLOB NOT NULL,
-                    session_id BLOB NOT NULL,
-                    ordinal INTEGER NOT NULL,
-                    timeline_ordinal INTEGER NOT NULL DEFAULT 0,
-                    role TEXT NOT NULL,
-                    content_hash BLOB,
-                    name TEXT,
-                    tool_call_id BLOB,
-                    tool_calls TEXT NOT NULL DEFAULT '[]',
-                    fragments TEXT NOT NULL DEFAULT '[]',
-                    PRIMARY KEY(run_id, ordinal)
-                ) WITHOUT ROWID, STRICT;
-                CREATE TABLE run_summaries (
-                    run_id BLOB NOT NULL,
-                    session_id BLOB NOT NULL,
-                    PRIMARY KEY(run_id, session_id)
-                ) WITHOUT ROWID, STRICT;
-                CREATE TABLE run_execution_state (
-                    run_id BLOB PRIMARY KEY NOT NULL
-                ) WITHOUT ROWID, STRICT;
-                PRAGMA user_version = 2;",
-            )
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO run_messages(
-                    run_id, session_id, ordinal, timeline_ordinal, role, tool_calls, fragments)
-                 VALUES (?1, ?2, 0, 0, 'assistant', '[]', '[]')",
-                params![run_id.as_uuid().as_bytes().as_slice(), [0u8; 16].as_slice()],
-            )
-            .unwrap();
-    }
-
-    let store = FilePersistence::open(&path).unwrap();
-    let messages = store.load_run_messages(run_id).unwrap();
-    assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].reasoning_content, None);
-    drop(store);
-
-    let connection = Connection::open(&path).unwrap();
-    let version: u32 = connection
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .unwrap();
-    assert_eq!(version, DATABASE_SCHEMA_VERSION);
-    let has_column: bool = connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('run_messages')
-             WHERE name='reasoning_content')",
-            [],
-            |row| row.get(0),
+fn schema_object_names(connection: &Connection) -> Vec<(String, String)> {
+    let mut statement = connection
+        .prepare(
+            "SELECT type, name FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_%' AND name NOT LIKE '_loom_%'
+             ORDER BY type, name",
         )
         .unwrap();
-    assert!(has_column, "migration adds the reasoning_content column");
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<std::result::Result<Vec<(String, String)>, _>>()
+        .unwrap()
+}
+
+#[test]
+fn opens_and_migrates_an_older_schema_in_place() {
+    let fresh_path =
+        std::env::temp_dir().join(format!("loom-persistence-fresh-{}.db", Uuid::new_v4()));
+    let connection = Connection::open(&fresh_path).unwrap();
+    initialize_schema(&connection).unwrap();
+    let baseline_objects = schema_object_names(&connection);
+    let baseline_indexes = baseline_objects
+        .iter()
+        .filter(|(kind, _)| kind == "index")
+        .map(|(_, name)| name.as_str())
+        .collect::<Vec<_>>();
+    for expected in [
+        "run_messages_by_content",
+        "run_context_checkpoints_by_summary",
+        "run_activities_by_content",
+        "run_tool_calls_by_arguments",
+        "runtime_configurations_by_system_instructions",
+        "runtime_configurations_by_repository_instructions",
+    ] {
+        assert!(
+            baseline_indexes.contains(&expected),
+            "the baseline is missing content garbage-collection index {expected}"
+        );
+    }
     drop(connection);
-    fs::remove_file(path).unwrap();
+
+    for database_version in [2u32, 3u32] {
+        let path = std::env::temp_dir().join(format!(
+            "loom-persistence-migrate-v{database_version}-{}.db",
+            Uuid::new_v4()
+        ));
+        let run_id = RunId::new();
+        {
+            let connection = Connection::open(&path).unwrap();
+            // Minimal layout for the requested version: `run_messages` without
+            // the v3 reasoning column, plus the run tables the v4 direction
+            // queue migration touches. The baseline batches must fill in every
+            // other table, index, and trigger.
+            let reasoning_column = if database_version >= 3 {
+                "reasoning_content TEXT,"
+            } else {
+                ""
+            };
+            connection
+                .execute_batch(&format!(
+                    "CREATE TABLE run_messages (
+                        run_id BLOB NOT NULL,
+                        session_id BLOB NOT NULL,
+                        ordinal INTEGER NOT NULL,
+                        timeline_ordinal INTEGER NOT NULL DEFAULT 0,
+                        role TEXT NOT NULL,
+                        content_hash BLOB,
+                        name TEXT,
+                        tool_call_id BLOB,
+                        tool_calls TEXT NOT NULL DEFAULT '[]',
+                        {reasoning_column}
+                        fragments TEXT NOT NULL DEFAULT '[]',
+                        PRIMARY KEY(run_id, ordinal)
+                    ) WITHOUT ROWID, STRICT;
+                    CREATE TABLE run_summaries (
+                        run_id BLOB NOT NULL,
+                        session_id BLOB NOT NULL,
+                        updated_at INTEGER,
+                        state TEXT,
+                        PRIMARY KEY(run_id, session_id)
+                    ) WITHOUT ROWID, STRICT;
+                    CREATE TABLE run_execution_state (
+                        run_id BLOB PRIMARY KEY NOT NULL,
+                        session_id BLOB,
+                        state TEXT
+                    ) WITHOUT ROWID, STRICT;
+                    PRAGMA user_version = {database_version};"
+                ))
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO run_messages(
+                        run_id, session_id, ordinal, timeline_ordinal, role, tool_calls, fragments)
+                     VALUES (?1, ?2, 0, 0, 'assistant', '[]', '[]')",
+                    params![run_id.as_uuid().as_bytes().as_slice(), [0u8; 16].as_slice()],
+                )
+                .unwrap();
+        }
+
+        let store = FilePersistence::open(&path).unwrap();
+        let messages = store.load_run_messages(run_id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].reasoning_content, None);
+        drop(store);
+
+        let connection = Connection::open(&path).unwrap();
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, DATABASE_SCHEMA_VERSION);
+        let has_column: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('run_messages')
+                 WHERE name='reasoning_content')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_column, "migration adds the reasoning_content column");
+        assert_eq!(
+            schema_object_names(&connection),
+            baseline_objects,
+            "a database migrated from v{database_version} must hold every baseline table, index, and trigger"
+        );
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+    fs::remove_file(fresh_path).unwrap();
 }
 
 #[test]

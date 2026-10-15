@@ -67,8 +67,10 @@ pub use schema::*;
 /// older supported versions in place; versions newer than this build, or with
 /// no registered step, are rejected and must be wiped by the operator. New
 /// optional state should prefer a versioned JSON payload column over a new
-/// column where the payload column already exists.
-const DATABASE_SCHEMA_VERSION: u32 = 5;
+/// column where the payload column already exists. The upgrade path
+/// additionally re-applies the idempotent baseline batches, so a bump is what
+/// hands new baseline objects (such as indexes) to existing databases.
+const DATABASE_SCHEMA_VERSION: u32 = 6;
 /// Oldest schema version that the migration ladder can upgrade in place.
 const DATABASE_MIN_MIGRATABLE_VERSION: u32 = 2;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;

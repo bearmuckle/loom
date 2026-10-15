@@ -1989,6 +1989,10 @@ impl FilePersistence {
         } else {
             save_feed_rows_incremental(&transaction, write.feed)?;
         }
+        // Content garbage collection runs once per checkpoint transaction, so
+        // candidates staged by any of the row writes above are collected in
+        // the same commit instead of on the next write.
+        collect_unused_content(&transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)?;
         transaction.commit().map_err(|error| {
             persistence_error(
                 format!("could not commit run checkpoint transaction: {error}"),
