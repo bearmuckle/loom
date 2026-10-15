@@ -1023,6 +1023,12 @@ impl ToolExecutor {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // A `PATH` that misses the system directories makes an installed
+        // program look absent, so the command gets a baseline `PATH` unless the
+        // inherited one already covers it.
+        if let Some(path) = loom_core::child_path() {
+            command.env("PATH", path);
+        }
         // Run the command in its own process group so a timeout can terminate
         // the whole tree instead of only the direct child.
         #[cfg(unix)]
@@ -3613,6 +3619,29 @@ mod tests {
         ));
         assert!(!invalid.success);
         assert!(invalid.output.contains("timeout_ms must be between"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_always_runs_with_a_path_covering_the_baseline() {
+        let root = workspace();
+        let executor = ToolExecutor::new(&root).unwrap();
+        let printed = executor.execute(&call(
+            "run_command",
+            serde_json::json!({
+                "command": "sh",
+                "args": ["-c", "printf '%s\\n' \"$PATH\" | tr ':' '\\n'"]
+            }),
+        ));
+        assert!(printed.success, "{}", printed.output);
+        for directory in ["/usr/local/bin", "/usr/bin", "/bin"] {
+            assert!(
+                printed.output.lines().any(|line| line == directory),
+                "'{}' must carry the baseline directory {directory}",
+                printed.output
+            );
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

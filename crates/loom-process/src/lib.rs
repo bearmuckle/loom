@@ -110,6 +110,11 @@ impl TerminalManager {
         let mut builder = CommandBuilder::new(&command);
         builder.args(&args);
         builder.cwd(&cwd);
+        // A terminal without the system directories on `PATH` cannot tell an
+        // installed program from a missing one.
+        if let Some(path) = loom_core::child_path() {
+            builder.env("PATH", path);
+        }
         let child = pty.slave.spawn_command(builder).map_err(|error| {
             LoomError::new(
                 ErrorCode::ToolExecution,
@@ -510,20 +515,24 @@ impl TaskSupervisor {
             artifacts: Vec::new(),
             evidence: Vec::new(),
         };
-        let mut child = Command::new(&spec.command)
+        let mut command = Command::new(&spec.command);
+        command
             .args(&spec.args)
             .current_dir(&cwd)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .stdin(Stdio::null())
-            .spawn()
-            .map_err(|error| {
-                LoomError::new(
-                    ErrorCode::ToolExecution,
-                    format!("could not start task '{}': {error}", spec.command),
-                    false,
-                )
-            })?;
+            .stdin(Stdio::null());
+        // A task must not inherit a `PATH` that hides installed programs.
+        if let Some(path) = loom_core::child_path() {
+            command.env("PATH", path);
+        }
+        let mut child = command.spawn().map_err(|error| {
+            LoomError::new(
+                ErrorCode::ToolExecution,
+                format!("could not start task '{}': {error}", spec.command),
+                false,
+            )
+        })?;
         let stdout = child.stdout.take().ok_or_else(|| {
             LoomError::new(
                 ErrorCode::Internal,
@@ -1162,6 +1171,64 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("task did not finish");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminals_and_tasks_always_run_with_a_path_covering_the_baseline() {
+        let root = std::env::temp_dir().join(format!("loom-path-{}", AgentSessionId::new()));
+        fs::create_dir_all(&root).unwrap();
+        // A program that prints the `PATH` it was started with.
+        let (program, args) = command("printf %s \"$PATH\"");
+
+        let manager = TerminalManager::new();
+        let terminal = manager.open(program.clone(), args.clone(), &root).unwrap();
+        let finished = wait_terminal(&manager, terminal.id);
+        assert_eq!(finished.status, TerminalStatus::Exited);
+        let terminal_path = manager
+            .events_since(terminal.id, None)
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.event {
+                TerminalEvent::Output { chunk, .. } => Some(chunk),
+                _ => None,
+            })
+            .collect::<String>();
+
+        let supervisor = TaskSupervisor::new(&root).unwrap();
+        let task = supervisor
+            .start(TaskSpec {
+                kind: TaskKind::Command,
+                label: "path".to_owned(),
+                command: program,
+                args,
+                cwd: None,
+                output_limit_bytes: None,
+                artifact_paths: Vec::new(),
+            })
+            .unwrap();
+        let mut task_path = None;
+        for _ in 0..100 {
+            let current = supervisor.get(task.id).unwrap();
+            if matches!(
+                current.status,
+                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+            ) {
+                task_path = Some(current.output);
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let task_path = task_path.expect("task did not finish");
+        for path in [terminal_path.as_str(), task_path.as_str()] {
+            for directory in ["/usr/local/bin", "/usr/bin", "/bin"] {
+                assert!(
+                    path.split(':').any(|entry| entry == directory),
+                    "'{path}' must carry the baseline directory {directory}"
+                );
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

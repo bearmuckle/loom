@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 loom-core.workspace = true
 loom-model.workspace = true
+log.workspace = true
 loom-protocol.workspace = true
 loom-vcs.workspace = true
 loom-workspace.workspace = true

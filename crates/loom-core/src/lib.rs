@@ -1,4 +1,5 @@
 mod capability;
+mod command_env;
 mod context;
 mod error;
 mod filesystem;
@@ -15,6 +16,9 @@ mod version;
 mod workspace;
 
 pub use capability::{Capability, CapabilitySet};
+#[cfg(unix)]
+pub use command_env::BASELINE_PATH_DIRECTORIES;
+pub use command_env::{baseline_path, child_path};
 pub use context::{
     ContextAssemblyOptions, ContextBudget, ContextInspection, ContextItem, ContextItemKind,
     ContextSummary,

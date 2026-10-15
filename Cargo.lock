@@ -4460,6 +4460,7 @@ name = "loom-core"
 version = "0.1.0"
 dependencies = [
  "js-sys",
+ "log",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -4513,6 +4514,7 @@ dependencies = [
 name = "loom-process"
 version = "0.1.0"
 dependencies = [
+ "log",
  "loom-core",
  "loom-protocol",
  "portable-pty",
@@ -4594,6 +4596,7 @@ version = "0.1.0"
 dependencies = [
  "globset",
  "libc",
+ "log",
  "loom-core",
  "loom-model",
  "loom-protocol",
