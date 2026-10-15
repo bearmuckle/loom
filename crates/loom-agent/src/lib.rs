@@ -1206,6 +1206,170 @@ mod tests {
         );
     }
 
+    /// Emits one destructive tool call and then acknowledges the outcome, so a
+    /// test can drive the call through the approval and refusal paths.
+    fn destructive_tool_runtime(destructive: loom_core::PolicyDecision) -> (AgentRuntime, PathBuf) {
+        let root = workspace();
+        let task = AgentTask::new("remove a label", ModelId::new("deterministic/demo")).unwrap();
+        let provider = loom_providers::DeterministicProvider {
+            descriptor: loom_providers::deterministic_descriptor(),
+            steps: vec![
+                vec![
+                    ModelStreamEvent::ToolCallDelta {
+                        call: ToolCall {
+                            id: loom_core::ToolCallId::new(),
+                            name: "github_remove_labels".to_owned(),
+                            arguments: serde_json::json!({
+                                "repository": "owner/name",
+                                "number": 1,
+                                "labels": ["bug"]
+                            }),
+                        },
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: loom_model::FinishReason::ToolCall,
+                    },
+                ],
+                vec![
+                    ModelStreamEvent::TextDelta {
+                        text: "The label change is settled.".to_owned(),
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: loom_model::FinishReason::Stop,
+                    },
+                ],
+            ],
+            cursor: 0,
+        };
+        let runtime = AgentRuntime::new_with_policy(
+            AgentSessionId::new(),
+            task,
+            Box::new(provider),
+            ToolExecutor::new(&root).unwrap(),
+            loom_core::ApprovalPolicy {
+                destructive,
+                ..Default::default()
+            },
+        );
+        (runtime, root)
+    }
+
+    /// A destructive call the user gates behaves like any other non-read call:
+    /// it waits for approval, and the approved call executes.
+    #[test]
+    fn a_destructive_tool_waits_for_approval_and_executes_on_approval() {
+        let (mut runtime, root) =
+            destructive_tool_runtime(loom_core::PolicyDecision::RequireApproval);
+        let events = runtime.start().unwrap();
+
+        let evaluation = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolPolicyEvaluated {
+                    call, evaluation, ..
+                } if call.name == "github_remove_labels" => Some(evaluation.clone()),
+                _ => None,
+            })
+            .expect("the destructive call is evaluated against the policy");
+        assert_eq!(evaluation.action, loom_core::ActionKind::Destructive);
+        assert_eq!(
+            evaluation.decision,
+            loom_core::PolicyDecision::RequireApproval
+        );
+
+        let call_id = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolApprovalRequired { call, .. }
+                    if call.name == "github_remove_labels" =>
+                {
+                    Some(call.id)
+                }
+                _ => None,
+            })
+            .expect("a gated destructive call waits for approval");
+        assert_eq!(runtime.snapshot().state, AgentRunState::AwaitingApproval);
+
+        let approved = runtime.approve(call_id).unwrap();
+        assert!(
+            approved.iter().any(|event| matches!(
+                event,
+                AgentEvent::ToolCallStarted { call, .. } if call.name == "github_remove_labels"
+            )),
+            "the approved destructive call runs instead of being refused"
+        );
+        assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Rejecting a gated destructive call completes it as a failed result with
+    /// the rejection reason and lets the run continue.
+    #[test]
+    fn rejecting_a_destructive_tool_reports_the_rejection_reason() {
+        let (mut runtime, root) =
+            destructive_tool_runtime(loom_core::PolicyDecision::RequireApproval);
+        let events = runtime.start().unwrap();
+        let call_id = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolApprovalRequired { call, .. }
+                    if call.name == "github_remove_labels" =>
+                {
+                    Some(call.id)
+                }
+                _ => None,
+            })
+            .expect("a gated destructive call waits for approval");
+
+        let rejected = runtime
+            .reject(call_id, Some("not this time".to_owned()))
+            .unwrap();
+
+        assert!(rejected.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCallCompleted { result, .. }
+                if !result.success && result.output == "not this time"
+        )));
+        let advanced = runtime.advance().unwrap();
+        assert!(advanced.iter().any(|event| matches!(
+            event,
+            AgentEvent::RunCompleted { snapshot }
+                if snapshot.state == AgentRunState::Completed
+        )));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A policy that denies the destructive dimension still refuses the call,
+    /// and the completed result carries the policy reason.
+    #[test]
+    fn a_denied_destructive_tool_completes_with_the_policy_reason() {
+        let (mut runtime, root) = destructive_tool_runtime(loom_core::PolicyDecision::Deny);
+        let events = runtime.start().unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolPolicyEvaluated { evaluation, .. }
+                if evaluation.action == loom_core::ActionKind::Destructive
+                    && evaluation.decision == loom_core::PolicyDecision::Deny
+        )));
+        let result = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolCallCompleted { result, .. } => Some(result.clone()),
+                _ => None,
+            })
+            .expect("a denied call completes as a failed result");
+        assert!(!result.success);
+        assert!(result.output.contains("denied by the workspace policy"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolApprovalRequired { .. }))
+        );
+        assert!(runtime.pending_approval().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn deterministic_run_waits_for_approval_and_completes() {
         let root = workspace();

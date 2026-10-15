@@ -211,16 +211,17 @@ The listener side is separate from egress:
 Approval policy is not an egress filter. Network-classified tool actions
 require approval under the default `ApprovalPolicy`, and command actions do
 too, so a command that reaches the network is gated by the command decision
-rather than by a network check. Auto approve mode allows non-destructive writes,
+rather than by a network check. Auto approve mode allows writes,
 commands, and network actions without prompting, so approval gating does not
 restrict egress either.
 
-Destructive actions are denied in both modes, so they are never an egress path:
+Destructive actions are allowed in both modes, so they are an egress path:
 `github_push_branch` and `github_remove_labels` are classified as destructive
-and are refused by the default policy and by auto approve. Using either one
-requires an operator to permit destructive actions for the session with the
-`SetSessionApprovalPolicy` request; `run_command` stays a command action so
-builds and tests keep working under both policies.
+and the default policy and auto approve both allow them. An operator who wants
+to gate either tool sets the destructive dimension to `RequireApproval` for the
+session with the `SetSessionApprovalPolicy` request, which then prompts per
+instance, or to `Deny` for a hard refusal; `run_command` stays a command action
+so builds and tests keep working under both policies.
 
 An operator can verify the policy inside the execution context:
 

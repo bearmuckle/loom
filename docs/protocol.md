@@ -172,11 +172,12 @@ authoritative for approval-required actions.
 Agent and Edit modes allow read, write, command, and network actions without
 prompting by default; the session settings can opt out, which restores explicit
 approval for writes, commands, and network actions. **Auto approve** remains an
-explicit mode. Destructive actions remain denied in every mode; exactly two
+explicit mode. The default policy allows destructive actions; exactly two
 built-in tools are classified as destructive, `github_push_branch` and
-`github_remove_labels`, so they are denied by the default policy and by auto
-approve instead of prompting. `run_command` is a command action and stays
-runnable in automatic mode.
+`github_remove_labels`, and a client that wants to gate them sets the
+destructive dimension to `RequireApproval`, which prompts per instance. `Deny`
+on that dimension stays available to a deployment that wants a hard refusal,
+and `run_command` is a command action that stays runnable in automatic mode.
 
 M3 adds typed provider and durable-orchestration requests:
 

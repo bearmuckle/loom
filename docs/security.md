@@ -108,17 +108,21 @@ a promise of OS-level process sandboxing. Whether a command executes on a host
 account or inside a container is a deployment choice, documented in
 [deployment](deployment.md) together with the persistence, lifecycle, and
 network policy it implies. The default `ApprovalPolicy`
-allows reads, pauses writes and commands for approval, requests approval for
-network actions, and denies
-destructive actions. The policy evaluation is included in the agent event
+allows reads and destructive actions, pauses writes and commands for approval,
+and requests approval for network actions. `destructive` is a classification
+for audited, hard-to-reverse actions rather than a refusal: the shipped presets
+allow it, and a user who wants a gate sets that dimension to
+`RequireApproval`, which prompts per instance. `Deny` remains part of the model
+and the agent still enforces it, for a deployment that wants a hard refusal.
+The policy evaluation is included in the agent event
 stream before a tool executes, and a denial is reported to the client as that
 evaluation (with its reason) plus a failed tool result carrying the same
 reason, so it is never a silent failure. The UI's optional Auto approve mode
-allows non-destructive writes, commands, and network actions, but destructive
-actions remain denied.
+allows writes, commands, network actions, and destructive actions without
+prompting.
 
-Exactly two built-in tools are classified as destructive, and both are denied
-by the default policy and by Auto approve mode:
+Exactly two built-in tools are classified as destructive, and the default
+policy and Auto approve mode both allow them:
 
 - `github_push_branch` publishes local commits to the origin remote. Published
   commits can be fetched or mirrored by others before any force-push, so the
@@ -126,18 +130,24 @@ by the default policy and by Auto approve mode:
 - `github_remove_labels` is a remote DELETE that can drive remote automation,
   even though labels themselves can be re-added.
 
-`run_command` is deliberately *not* destructive. The `Command` kind already
-requires approval by default, and classifying commands as destructive would
-deny every build and test command under both the default policy and automatic
-approvals, breaking the primary workflow.
+The classification exists so a user can decide about those two calls: setting
+the destructive dimension to `RequireApproval` prompts for each call, and
+setting it to `Deny` refuses them outright.
 
-A session's approval policy is configurable per session. Clients can raise the
-destructive decision deliberately with the `SetSessionApprovalPolicy` request
-(capability `ConfigureApprovalPolicy`), which replaces all five kind decisions
-and optionally records the session's `auto_approve_actions` preference; without
-that explicit change the destructive decision stays denied. The UI exposes the
-default policy and Auto approve mode, both of which keep destructive actions
-denied.
+`run_command` is deliberately *not* destructive. The `Command` kind already
+requires approval by default, builds and tests are routine and repeatable
+rather than audited hard-to-reverse actions, and classifying every command as
+destructive would put each build and test in the same bucket as the two tools
+above.
+
+A session's approval policy is configurable per session. A client can gate
+destructive actions with the `SetSessionApprovalPolicy` request (capability
+`ConfigureApprovalPolicy`), which replaces all five kind decisions and
+optionally records the session's `auto_approve_actions` preference: setting the
+destructive dimension to `RequireApproval` prompts per instance, and setting it
+to `Deny` is a hard refusal. Without that explicit change the destructive
+dimension stays allowed, as in both shipped presets. The UI exposes the default
+policy and Auto approve mode, both of which allow destructive actions.
 
 M3 makes context and resource boundaries visible as structured state. Input
 context is assembled from system instructions, repository instructions, task,
