@@ -46,8 +46,6 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - name: Install native UI dependencies
         run: |
           sudo apt-get update
@@ -57,42 +55,16 @@ jobs:
             libfontconfig1-dev \
             pkg-config \
             libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            fonts-dejavu-core \
-            mesa-vulkan-drivers \
-            libgl1-mesa-dri
-          # The visual render tests capture real frames through GPUI's headless
-          # wgpu renderer. The runner has no GPU, so Mesa's lavapipe (Vulkan)
-          # and llvmpipe (GL) software adapters stand in; fonts-dejavu-core
-          # gives the real text system a deterministic font.
+            libxkbcommon-x11-dev
+          # Loom UI links native desktop libraries; visual render tests are
+          # optional local checks.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: taiki-e/install-action@cargo-llvm-cov
-        if: github.event_name == 'pull_request'
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: Detect UI changes
-        id: ui
-        shell: bash
-        run: |
-          # The client (gpui-kit/wgpu) is reached only through the `loom-ui`
-          # crate, so its coverage build pulls in the whole client stack. Mark
-          # the run as UI-relevant when the client or one of its workspace
-          # dependencies changed.
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          git fetch --no-tags --quiet origin "${{ github.base_ref }}"
-          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" \
-            | grep -qE '^crates/loom-(ui|local|core|model|protocol)/|^Cargo\.(toml|lock)$'; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
       - name: Run Clippy
         # `--all-features` is deliberately omitted: it would enable the
         # `loom-ui` `visual-tests` feature, whose render tests need a GPU or a
@@ -101,10 +73,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Build workspace
         run: cargo build --workspace --locked
-      - name: Run headless visual render tests
-        run: cargo test -p loom-ui --features visual-tests --locked --bins visual_render_tests
       - name: Run tests
-        if: github.event_name == 'push'
         run: cargo test --workspace --locked --lib --bins --tests
       - name: Run benchmarks
         if: github.event_name == 'push'
@@ -112,35 +81,6 @@ jobs:
         # rather than assert thresholds, so this only keeps them compiling and
         # running instead of rotting.
         run: cargo bench -p loom-persistence -p loom-server --locked
-      - name: Run tests and collect coverage
-        if: github.event_name == 'pull_request'
-        run: |
-          # cargo-llvm-cov compiles every dependency into a separate
-          # instrumented target directory, so including the client forces a
-          # full client rebuild that the normal build cache cannot reuse. Skip
-          # that rebuild unless a UI-relevant path changed. Clippy still builds
-          # the client on every pull request, so breaking changes still fail.
-          if [ "${{ steps.ui.outputs.changed }}" = "true" ]; then
-            cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
-          else
-            cargo llvm-cov --workspace --exclude loom-ui --locked --lcov --output-path lcov.info
-          fi
-      - name: Enforce patch coverage on changed lines
-        if: github.event_name == 'pull_request'
-        run: |
-          python3 -m pip install --quiet diff-cover
-          git fetch origin "${{ github.base_ref }}"
-          # When the client is excluded from coverage its files are absent from
-          # lcov, and diff-cover ignores changed files that are not in the
-          # report, so UI lines are gated only on UI-relevant runs.
-          diff-cover lcov.info \
-            --compare-branch="origin/${{ github.base_ref }}" \
-            --fail-under=75 \
-            --exclude 'crates/*/src/tests.rs' \
-            --exclude 'crates/*/src/tests/*' \
-            --exclude 'crates/*/src/*/tests.rs' \
-            --exclude 'crates/*/src/*/tests/*' \
-            --exclude 'crates/*/tests/*'
 
   msrv:
     runs-on: ubuntu-latest

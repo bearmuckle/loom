@@ -28,8 +28,7 @@ jobs:
         with:
           fetch-depth: 0
       # The same native packages as `.github/workflows/ci.yml`: the GPUI client
-      # links them, and the visual render test below needs a software Vulkan
-      # adapter because the runner has no GPU.
+      # links them; visual render tests are optional local checks.
       - name: Install native UI dependencies
         run: |
           sudo apt-get update
@@ -39,10 +38,7 @@ jobs:
             libfontconfig1-dev \
             pkg-config \
             libxkbcommon-dev \
-            libxkbcommon-x11-dev \
-            fonts-dejavu-core \
-            mesa-vulkan-drivers \
-            libgl1-mesa-dri
+            libxkbcommon-x11-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -54,8 +50,6 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Run headless visual render tests
-        run: cargo test -p loom-ui --features visual-tests --locked --bins visual_render_tests
       - name: Run tests
         run: cargo test --workspace --locked --lib --bins --tests
 

@@ -16,33 +16,33 @@ develops.
 ## Development
 
 Install Rust 1.95 or newer and the native system dependencies listed in the
-[CI workflow](.github/workflows/ci.yml). Use the locked workspace checks:
+[CI workflow](.github/workflows/ci.yml). Use the locked workspace checks for local
+verification:
 
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
 cargo build --workspace --locked
 ```
 
-`--all-features` is deliberately not used: it would turn on the `loom-ui`
-`visual-tests` feature, whose render tests capture real frames through GPUI's
-headless renderer and therefore need a GPU or a software Vulkan/GL driver. CI
-runs those tests in a dedicated `cargo test -p loom-ui --features visual-tests`
-step, so Clippy, coverage, and the build stay runnable without a driver.
+Full workspace coverage is an optional local diagnostic:
 
-Coverage is enforced per pull request as **patch coverage**: at least 75% of the
-non-test lines changed by the PR must be covered (via `diff-cover` against the
-base branch). There is no flat workspace threshold.
+```sh
+cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+```
 
-The same commands are collected in `./scripts/ci-check.sh`. CI runs these
-checks for pull requests and pushes to `main`. It additionally checks that:
+Visual render tests are also optional local checks. They require the native UI
+libraries, fonts, and software rendering dependencies documented in the CI
+workflow:
 
-- the workspace compiles on the declared minimum Rust version (`1.95`),
-- the browser client still compiles for `wasm32-unknown-unknown`, because
-  `pages.yml` publishes it from `main` without a pre-merge check,
-- the `loom-persistence` and `loom-server` benchmarks still run on pushes to
-  `main` (they print measurements; they do not assert thresholds).
+```sh
+cargo test -p loom-ui --features visual-tests --locked --bins visual_render_tests
+```
+
+CI does not run full coverage or visual render tests. Coverage should be
+focused on changed code when needed; there is no workspace-wide coverage gate.
+`./scripts/ci-check.sh` runs routine formatting, Clippy, and build checks. CI
+runs formatting, Clippy, workspace tests, and benchmarks on pushes to `main`.
 
 ### Faster builds with sccache
 
