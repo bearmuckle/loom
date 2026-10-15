@@ -52,8 +52,8 @@ pub use project::{
     AgentMessageDraft, AgentMessageKind, AgentMessageRecord, DelegatedTaskRecord,
     DelegatedTaskSpec, DelegatedTaskStatus, MAX_PROJECT_AGENT_DEPTH, ProjectAgentPermissions,
     ProjectAgentRecord, ProjectManagerWaitRecord, ProjectManagerWaitStatus, ProjectSnapshot,
-    ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord, ProjectWorktreeStatus,
-    TaskContextReference,
+    ProjectWorktreeBaseRefresh, ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord,
+    ProjectWorktreeStatus, TaskContextReference,
 };
 pub use session::{
     AgentSessionSnapshot, AgentSessionState, SessionEvent, SessionEventRecord, SessionManagerState,

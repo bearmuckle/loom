@@ -325,8 +325,8 @@ impl FilePersistence {
                     parent_repository_id, child_repository_id, relative_path,
                     worktree_name, branch_name, base_revision, result_revision,
                     integrated_revision, status, error, cleanup_disposition,
-                    created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                    base_refresh, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
                  ON CONFLICT(task_id) DO UPDATE SET
                     project_id=excluded.project_id,
                     parent_session_id=excluded.parent_session_id,
@@ -342,6 +342,7 @@ impl FilePersistence {
                     status=excluded.status,
                     error=excluded.error,
                     cleanup_disposition=excluded.cleanup_disposition,
+                    base_refresh=excluded.base_refresh,
                     created_at=excluded.created_at,
                     updated_at=excluded.updated_at",
                 params![
@@ -360,6 +361,7 @@ impl FilePersistence {
                     project_worktree_status_name(worktree.status),
                     worktree.error,
                     worktree.cleanup_disposition.map(project_worktree_cleanup_name),
+                    encode_project_worktree_base_refresh(worktree.base_refresh.as_ref())?,
                     encode_timestamp(worktree.created_at)?,
                     encode_timestamp(worktree.updated_at)?,
                 ],

@@ -161,6 +161,7 @@ fn add_code_child(
         worktree_name: format!("loom-child-{task_id}"),
         branch_name: format!("loom/project-child-{task_id}"),
         base_revision: base_revision.to_owned(),
+        base_refresh: None,
         result_revision: None,
         integrated_revision: None,
         status: ProjectWorktreeStatus::Creating,

@@ -202,6 +202,15 @@ pub(super) fn commit_file(dir: &Path, file: &str, content: &str, message: &str) 
 }
 
 pub(super) fn project_code_child_fixture() -> ProjectCodeChildFixture {
+    let mut fixture = pending_project_code_child_fixture();
+    create_project_code_child_checkout(&mut fixture);
+    fixture
+}
+
+/// Persists a code child and its worktree intent without creating the checkout,
+/// so a test can change the parent checkout's remote before the base is
+/// refreshed and the linked worktree is materialized.
+pub(super) fn pending_project_code_child_fixture() -> ProjectCodeChildFixture {
     let temp = workspace();
     let source = git_repository();
     let database_path = temp.join("state.sqlite");
@@ -283,7 +292,7 @@ pub(super) fn project_code_child_fixture() -> ProjectCodeChildFixture {
         created_at,
         updated_at: created_at,
     };
-    let mut worktree = ProjectWorktreeRecord {
+    let worktree = ProjectWorktreeRecord {
         project_id: task.project_id,
         task_id,
         parent_session_id: root.id,
@@ -294,6 +303,7 @@ pub(super) fn project_code_child_fixture() -> ProjectCodeChildFixture {
         worktree_name: format!("loom-child-{task_id}"),
         branch_name: format!("loom/project-child-{task_id}"),
         base_revision,
+        base_refresh: None,
         result_revision: None,
         integrated_revision: None,
         status: ProjectWorktreeStatus::Creating,
@@ -325,14 +335,6 @@ pub(super) fn project_code_child_fixture() -> ProjectCodeChildFixture {
         )
         .unwrap();
     backend.journal().unwrap().append_session(event);
-    connection
-        .ensure_project_worktree_ready(&mut worktree)
-        .unwrap();
-    let child_checkout = connection
-        .session_filesystem(child_session_id)
-        .unwrap()
-        .root()
-        .join(&worktree.relative_path);
 
     ProjectCodeChildFixture {
         temp,
@@ -343,9 +345,33 @@ pub(super) fn project_code_child_fixture() -> ProjectCodeChildFixture {
         project_id: task.project_id,
         task_id,
         worktree,
-        child_checkout,
+        child_checkout: PathBuf::new(),
         parent_git,
     }
+}
+
+/// Creates the checkout of a pending code child fixture: the step that
+/// refreshes the recorded base against the parent checkout's `origin` before
+/// the linked worktree exists.
+pub(super) fn create_project_code_child_checkout(fixture: &mut ProjectCodeChildFixture) {
+    fixture
+        .connection
+        .ensure_project_worktree_ready(&mut fixture.worktree)
+        .unwrap();
+    fixture.worktree = fixture
+        .backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .load_project_worktree_by_task(fixture.task_id)
+        .unwrap()
+        .expect("child worktree should be durable after creation");
+    fixture.child_checkout = fixture
+        .connection
+        .session_filesystem(fixture.worktree.child_session_id)
+        .unwrap()
+        .root()
+        .join(&fixture.worktree.relative_path);
 }
 
 pub(super) fn complete_project_code_child(fixture: &ProjectCodeChildFixture) {

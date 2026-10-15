@@ -397,7 +397,14 @@ impl InProcessConnection {
                     parent_status.clean,
                 ) {
                     (Some(_), Some(base_revision), true) => {
-                        checkout = Some((parent_repository_id, base_revision.to_owned()));
+                        // Refresh the remote before the child is created so the
+                        // base revision and its drift from the fetched
+                        // default-branch tip are recorded and reported to the
+                        // manager. A failed refresh is recorded as unknown.
+                        let base_refresh =
+                            self.refresh_child_base_revision(&parent_git, base_revision);
+                        checkout =
+                            Some((parent_repository_id, base_revision.to_owned(), base_refresh));
                     }
                     _ if exactly_one_repository => {
                         checkout_blocker = Some(parent_checkout_blocker(&parent_status));
@@ -406,7 +413,7 @@ impl InProcessConnection {
                 }
             }
             match checkout {
-                Some((parent_repository_id, base_revision)) => {
+                Some((parent_repository_id, base_revision, base_refresh)) => {
                     let child_repository_id = RepositoryId::new();
                     let child_filesystem = self.backend.create_session_filesystem(
                         parent_snapshot.workspace_id,
@@ -424,6 +431,7 @@ impl InProcessConnection {
                         worktree_name: format!("loom-child-{task_id}"),
                         branch_name: format!("loom/project-child-{task_id}"),
                         base_revision,
+                        base_refresh: Some(base_refresh),
                         result_revision: None,
                         integrated_revision: None,
                         status: ProjectWorktreeStatus::Creating,

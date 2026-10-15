@@ -1384,6 +1384,7 @@ fn deleted_sessions_lose_their_rows_and_unused_content_in_one_transaction() {
         worktree_name: "deleted-child".to_owned(),
         branch_name: "loom/deleted-child".to_owned(),
         base_revision: "base-sha".to_owned(),
+        base_refresh: None,
         result_revision: None,
         integrated_revision: None,
         status: ProjectWorktreeStatus::Creating,

@@ -124,6 +124,117 @@ pub enum ProjectWorktreeCleanupDisposition {
     DiscardChanges,
 }
 
+/// The revision a delegated child checkout was created from, together with how
+/// far that revision is from the default branch of the remote that was fetched
+/// for it.
+///
+/// A record exists only for a refresh that ran while the checkout was created,
+/// so a stale `refs/remotes/origin/*` ref is never presented as the current
+/// upstream tip. When that fetch fails the record states the failure and leaves
+/// the drift unknown instead of reporting a cached answer.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum ProjectWorktreeBaseRefresh {
+    /// The fetch performed for this record resolved the default-branch tip.
+    Fetched {
+        /// Remote that was fetched.
+        remote: String,
+        /// Revision the child checkout was created from.
+        base_revision: String,
+        /// Default branch that the fetch resolved for that remote.
+        default_branch: String,
+        /// Default-branch tip that the fetch resolved.
+        default_branch_revision: String,
+        /// Commits the base revision has that the tip does not.
+        ahead: u32,
+        /// Commits the tip has that the base revision does not.
+        behind: u32,
+        /// When that fetch finished.
+        fetched_at: Timestamp,
+    },
+    /// The refresh failed, so the base revision's drift is unknown.
+    Unavailable {
+        /// Remote whose refresh failed.
+        remote: String,
+        /// Revision the child checkout was created from.
+        base_revision: String,
+        /// When the failed refresh was attempted.
+        attempted_at: Timestamp,
+        /// Why the refresh failed, as reported by the VCS layer.
+        warning: String,
+    },
+}
+
+impl ProjectWorktreeBaseRefresh {
+    /// When the refresh behind this record finished or was attempted.
+    pub fn reported_at(&self) -> Timestamp {
+        match self {
+            Self::Fetched { fetched_at, .. } => *fetched_at,
+            Self::Unavailable { attempted_at, .. } => *attempted_at,
+        }
+    }
+
+    /// One-line, manager-facing description of the base and its drift from the
+    /// default branch resolved by the fetch behind this record.
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Fetched {
+                remote,
+                base_revision,
+                default_branch,
+                default_branch_revision,
+                ahead,
+                behind,
+                ..
+            } => {
+                let base = short_revision(base_revision);
+                let tip = short_revision(default_branch_revision);
+                let upstream = format!("{remote}/{default_branch}");
+                match (*ahead, *behind) {
+                    (0, 0) => {
+                        format!("created from {base}; {upstream} is at the same revision {tip}")
+                    }
+                    (0, behind) => format!(
+                        "created from {base}; {upstream} is {} ahead at {tip}",
+                        commit_count(behind)
+                    ),
+                    (ahead, 0) => format!(
+                        "created from {base}; {upstream} is {} behind the base at {tip}",
+                        commit_count(ahead)
+                    ),
+                    (ahead, behind) => format!(
+                        "created from {base}, which has diverged from {upstream} at {tip}: {} only in the base, {} only upstream",
+                        commit_count(ahead),
+                        commit_count(behind)
+                    ),
+                }
+            }
+            Self::Unavailable {
+                remote,
+                base_revision,
+                warning,
+                ..
+            } => format!(
+                "created from {}; {remote} could not be refreshed, so the base's drift from its default branch is unknown ({warning})",
+                short_revision(base_revision)
+            ),
+        }
+    }
+}
+
+/// Shortens a Git revision for display; shorter revisions are unchanged.
+fn short_revision(revision: &str) -> &str {
+    revision.get(..8).unwrap_or(revision)
+}
+
+fn commit_count(count: u32) -> String {
+    if count == 1 {
+        "1 commit".to_owned()
+    } else {
+        format!("{count} commits")
+    }
+}
+
 /// Durable identity and disposition of the isolated code checkout assigned to
 /// a delegated task. The path is relative to the child's session filesystem.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -138,6 +249,10 @@ pub struct ProjectWorktreeRecord {
     pub worktree_name: String,
     pub branch_name: String,
     pub base_revision: String,
+    /// Base freshness reported when this checkout was created. `None` only for
+    /// records written before the refresh existed.
+    #[serde(default)]
+    pub base_refresh: Option<ProjectWorktreeBaseRefresh>,
     pub result_revision: Option<String>,
     pub integrated_revision: Option<String>,
     pub status: ProjectWorktreeStatus,
@@ -343,5 +458,94 @@ mod tests {
         });
         let legacy_spec: DelegatedTaskSpec = serde_json::from_value(legacy_spec).unwrap();
         assert_eq!(legacy_spec.permissions, ProjectAgentPermissions::default());
+    }
+
+    #[test]
+    fn worktree_base_refresh_summarizes_drift_from_a_fetch() {
+        use super::{ProjectWorktreeBaseRefresh, ProjectWorktreeRecord, ProjectWorktreeStatus};
+        use crate::{RepositoryId, TaskId};
+
+        let base = "0123456789abcdef0123456789abcdef01234567";
+        let tip = "fedcba9876543210fedcba9876543210fedcba98";
+        let fetched_at = Timestamp::from_unix_millis(1_760_000_000_000);
+        let fetched = |ahead: u32, behind: u32| ProjectWorktreeBaseRefresh::Fetched {
+            remote: "origin".into(),
+            base_revision: base.into(),
+            default_branch: "main".into(),
+            default_branch_revision: tip.into(),
+            ahead,
+            behind,
+            fetched_at,
+        };
+
+        assert_eq!(fetched(0, 0).reported_at(), fetched_at);
+        assert_eq!(
+            fetched(0, 0).summary(),
+            "created from 01234567; origin/main is at the same revision fedcba98"
+        );
+        assert_eq!(
+            fetched(0, 1).summary(),
+            "created from 01234567; origin/main is 1 commit ahead at fedcba98"
+        );
+        assert_eq!(
+            fetched(0, 15).summary(),
+            "created from 01234567; origin/main is 15 commits ahead at fedcba98"
+        );
+        assert_eq!(
+            fetched(2, 0).summary(),
+            "created from 01234567; origin/main is 2 commits behind the base at fedcba98"
+        );
+        assert_eq!(
+            fetched(2, 3).summary(),
+            "created from 01234567, which has diverged from origin/main at fedcba98: 2 commits only in the base, 3 commits only upstream"
+        );
+
+        let unavailable = ProjectWorktreeBaseRefresh::Unavailable {
+            remote: "origin".into(),
+            base_revision: base.into(),
+            attempted_at: fetched_at,
+            warning: "could not fetch the 'origin' remote: connection timed out".into(),
+        };
+        assert_eq!(unavailable.reported_at(), fetched_at);
+        assert_eq!(
+            unavailable.summary(),
+            "created from 01234567; origin could not be refreshed, so the base's drift from its default branch is unknown (could not fetch the 'origin' remote: connection timed out)"
+        );
+
+        // The record round-trips with the refresh, and a record written before
+        // the refresh existed decodes with the drift simply unknown.
+        let record = ProjectWorktreeRecord {
+            project_id: ProjectId::new(),
+            task_id: TaskId::new(),
+            parent_session_id: AgentSessionId::new(),
+            child_session_id: AgentSessionId::new(),
+            parent_repository_id: RepositoryId::new(),
+            child_repository_id: RepositoryId::new(),
+            relative_path: "project-worktrees/child".into(),
+            worktree_name: "loom-child".into(),
+            branch_name: "loom/project-child".into(),
+            base_revision: base.into(),
+            base_refresh: Some(fetched(0, 15)),
+            result_revision: None,
+            integrated_revision: None,
+            status: ProjectWorktreeStatus::Ready,
+            conflict_paths: vec![],
+            error: None,
+            cleanup_disposition: None,
+            created_at: fetched_at,
+            updated_at: fetched_at,
+        };
+        let encoded = serde_json::to_value(&record).unwrap();
+        assert_eq!(encoded["base_refresh"]["state"], "fetched");
+        assert_eq!(encoded["base_refresh"]["behind"], 15);
+        assert_eq!(
+            serde_json::from_value::<ProjectWorktreeRecord>(encoded).unwrap(),
+            record
+        );
+
+        let mut legacy = serde_json::to_value(&record).unwrap();
+        legacy.as_object_mut().unwrap().remove("base_refresh");
+        let legacy: ProjectWorktreeRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.base_refresh, None);
     }
 }

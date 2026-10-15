@@ -2,6 +2,9 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Component, Path, PathBuf},
+    sync::mpsc,
+    thread,
+    time::Duration,
 };
 
 use git2::{
@@ -33,6 +36,36 @@ pub enum MergeIntegrationOutcome {
     /// The parent and child conflict; no branch, index, or working tree change
     /// was made and the conflicting paths are reported.
     Conflicted(Vec<String>),
+}
+
+/// Deadline applied by callers that have no tighter requirement for a bounded
+/// remote refresh.
+pub const DEFAULT_REMOTE_REFRESH_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How far one local revision is ahead of and behind the default branch a
+/// remote fetch resolved.
+///
+/// `default_branch_revision` is the tip that the fetch performed for this
+/// report resolved, so the report is a statement about `fetched_at` and never
+/// about a cached `refs/remotes/origin/*` ref. A caller that needs to decide
+/// whether a checkout is current can therefore trust the answer without
+/// fetching again itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteRefreshReport {
+    /// Remote that was fetched; currently always `origin`.
+    pub remote: String,
+    /// Default branch name the fetch resolved for that remote.
+    pub default_branch: String,
+    /// Tip of the default branch as resolved by that fetch.
+    pub default_branch_revision: String,
+    /// Local revision the drift was measured against.
+    pub local_revision: String,
+    /// Commits the local revision has that the default branch does not.
+    pub ahead: usize,
+    /// Commits the default branch has that the local revision does not.
+    pub behind: usize,
+    /// When the fetch behind this report finished.
+    pub fetched_at: Timestamp,
 }
 
 impl GitService {
@@ -442,6 +475,52 @@ impl GitService {
             Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(None),
             Err(error) => Err(git_error("could not read Git remote", error)),
         }
+    }
+
+    /// Fetches `origin` with a bounded deadline and reports the remote's
+    /// default-branch tip together with how far `local_revision` (the
+    /// checkout's `HEAD` when omitted) is ahead of and behind it.
+    ///
+    /// The report describes the fetch performed by this call, never a cached
+    /// `refs/remotes/origin/*` ref, so a checkout that has been idle for hours
+    /// cannot conclude from this report that its base matches upstream. A
+    /// failed or expired refresh returns an error instead of a cached answer;
+    /// the caller decides how to degrade.
+    ///
+    /// The fetch runs on a worker thread that the caller waits at most
+    /// `deadline` for, so a stalled remote delays the caller by at most that
+    /// deadline and then reports [`ErrorCode::DeadlineExceeded`]. The worker is
+    /// detached when the deadline expires; it holds no lock and its eventual
+    /// result is discarded.
+    ///
+    /// `token` authenticates HTTPS remotes the same way as
+    /// [`Self::push_branch_authenticated`] and is never written to the
+    /// repository configuration.
+    pub fn refresh_origin_default_branch(
+        &self,
+        local_revision: Option<&str>,
+        token: Option<&str>,
+        deadline: Duration,
+    ) -> Result<RemoteRefreshReport> {
+        let root = self.root.clone();
+        let local_revision = local_revision.map(str::to_owned);
+        let token = token.map(str::to_owned);
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("loom-vcs-remote-refresh".to_owned())
+            .spawn(move || {
+                let report =
+                    fetch_origin_default_branch(&root, local_revision.as_deref(), token.as_deref());
+                let _ = sender.send(report);
+            })
+            .map_err(|error| {
+                LoomError::new(
+                    ErrorCode::Internal,
+                    format!("could not start the bounded remote refresh: {error}"),
+                    false,
+                )
+            })?;
+        await_remote_refresh(&receiver, deadline)
     }
 
     /// Pushes a local branch to the `origin` remote using the supplied access
@@ -1685,8 +1764,195 @@ fn credential_for(
     )))
 }
 
+/// Answers a credential request when no token is available: SSH keys come from
+/// the agent, and any other request fails explicitly instead of replaying the
+/// callback with an empty credential.
+fn credential_without_token(
+    url: &str,
+    username_from_url: Option<&str>,
+    allowed_types: git2::CredentialType,
+) -> std::result::Result<Cred, git2::Error> {
+    if allowed_types.contains(git2::CredentialType::SSH_KEY) {
+        return Cred::ssh_key_from_agent(username_from_url.unwrap_or("git"));
+    }
+    Err(git2::Error::from_str(&format!(
+        "remote '{url}' requested credentials but Loom holds no token for it"
+    )))
+}
+
 fn git_error(operation: &str, error: git2::Error) -> LoomError {
     LoomError::new(ErrorCode::Vcs, format!("{operation}: {error}"), false)
+}
+
+/// Waits up to `deadline` for a bounded remote refresh worker to report.
+fn await_remote_refresh(
+    receiver: &mpsc::Receiver<Result<RemoteRefreshReport>>,
+    deadline: Duration,
+) -> Result<RemoteRefreshReport> {
+    match receiver.recv_timeout(deadline) {
+        Ok(report) => report,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(LoomError::new(
+            ErrorCode::DeadlineExceeded,
+            format!(
+                "refreshing the 'origin' remote did not finish within {} ms; the drift from its default branch is unknown and no cached remote ref was used instead",
+                deadline.as_millis()
+            ),
+            false,
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(LoomError::new(
+            ErrorCode::Internal,
+            "the bounded remote refresh stopped without reporting a result",
+            false,
+        )),
+    }
+}
+
+/// Fetches every head of `origin` into `refs/remotes/origin/*` and resolves the
+/// default-branch tip from that fetch.
+///
+/// Runs on the refresh worker thread, so it never opens a second repository
+/// handle on the caller's behalf.
+fn fetch_origin_default_branch(
+    root: &Path,
+    local_revision: Option<&str>,
+    token: Option<&str>,
+) -> Result<RemoteRefreshReport> {
+    let repository = Repository::open(root)
+        .map_err(|error| git_error("could not open Git repository", error))?;
+    let mut remote = repository.find_remote("origin").map_err(|error| {
+        if error.code() == git2::ErrorCode::NotFound {
+            LoomError::not_found("Git remote", "origin")
+        } else {
+            git_error("could not look up the 'origin' Git remote", error)
+        }
+    })?;
+    let token = token.map(str::to_owned);
+    let mut callbacks = RemoteCallbacks::new();
+    callbacks.credentials(
+        move |url, username_from_url, allowed_types| match token.as_deref() {
+            Some(token) => credential_for(url, username_from_url, allowed_types, token),
+            None => credential_without_token(url, username_from_url, allowed_types),
+        },
+    );
+    let mut fetch_options = FetchOptions::new();
+    fetch_options.remote_callbacks(callbacks);
+    remote
+        .fetch(
+            &["+refs/heads/*:refs/remotes/origin/*"],
+            Some(&mut fetch_options),
+            None,
+        )
+        .map_err(|error| git_error("could not fetch the 'origin' remote", error))?;
+
+    let default_branch = resolve_remote_default_branch(&repository, &remote)?;
+    let default_branch_refname = format!("refs/remotes/origin/{default_branch}");
+    let default_branch_commit = repository
+        .find_reference(&default_branch_refname)
+        .and_then(|reference| reference.peel_to_commit())
+        .map_err(|error| {
+            git_error(
+                &format!(
+                    "the fetch left no default branch at '{default_branch_refname}' to compare against"
+                ),
+                error,
+            )
+        })?;
+    let local_commit = match local_revision {
+        Some(revision) => repository
+            .revparse_single(revision)
+            .and_then(|object| object.peel_to_commit())
+            .map_err(|error| {
+                git_error(
+                    &format!("could not resolve local revision '{revision}'"),
+                    error,
+                )
+            })?,
+        None => repository
+            .head()
+            .and_then(|head| head.peel_to_commit())
+            .map_err(|error| {
+                git_error(
+                    "could not resolve the checkout HEAD for the remote refresh",
+                    error,
+                )
+            })?,
+    };
+    let (ahead, behind) = repository
+        .graph_ahead_behind(local_commit.id(), default_branch_commit.id())
+        .map_err(|error| {
+            git_error(
+                "could not compare the local revision with the fetched default branch",
+                error,
+            )
+        })?;
+    Ok(RemoteRefreshReport {
+        remote: "origin".to_owned(),
+        default_branch,
+        default_branch_revision: default_branch_commit.id().to_string(),
+        local_revision: local_commit.id().to_string(),
+        ahead,
+        behind,
+        fetched_at: Timestamp::now(),
+    })
+}
+
+/// Resolves the default branch name of a fetched remote.
+///
+/// The name is taken from the live connection when the remote advertises its
+/// default branch, and otherwise from the cached `refs/remotes/origin/HEAD`
+/// (or the conventional `main`/`master`). Only the name may come from a cached
+/// ref; the revision compared against is always read from the remote-tracking
+/// ref that this fetch just updated.
+fn resolve_remote_default_branch(repository: &Repository, remote: &git2::Remote) -> Result<String> {
+    let advertised = remote
+        .default_branch()
+        .ok()
+        .and_then(|name| name.as_str().ok().map(str::to_owned));
+    if let Some(name) = advertised.as_deref() {
+        // The advertised name is normally a full ref name such as
+        // `refs/heads/main`, but a short name is accepted as-is because the
+        // caller verifies that the fetched ref exists before using it.
+        let name = strip_heads_prefix(name).unwrap_or(name);
+        if !name.is_empty() {
+            return Ok(name.to_owned());
+        }
+    }
+    if let Some(name) = repository
+        .find_reference("refs/remotes/origin/HEAD")
+        .ok()
+        .and_then(|reference| {
+            reference
+                .symbolic_target()
+                .ok()
+                .flatten()
+                .map(str::to_owned)
+        })
+        .as_deref()
+        .and_then(strip_origin_prefix)
+    {
+        return Ok(name.to_owned());
+    }
+    for candidate in ["main", "master"] {
+        if repository
+            .find_reference(&format!("refs/remotes/origin/{candidate}"))
+            .is_ok()
+        {
+            return Ok(candidate.to_owned());
+        }
+    }
+    Err(LoomError::new(
+        ErrorCode::Vcs,
+        "the 'origin' remote did not report a default branch and no origin/main or origin/master ref exists after the fetch",
+        false,
+    ))
+}
+
+fn strip_heads_prefix(refname: &str) -> Option<&str> {
+    refname.strip_prefix("refs/heads/")
+}
+
+fn strip_origin_prefix(refname: &str) -> Option<&str> {
+    refname.strip_prefix("refs/remotes/origin/")
 }
 
 /// Points the `origin` remote at `origin_url`, creating it if the repository
@@ -1828,6 +2094,144 @@ mod tests {
         );
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(bare).unwrap();
+    }
+
+    #[test]
+    fn remote_refresh_reports_drift_from_the_fetched_default_branch() {
+        let (git, root) = repository();
+        let branch = git.current_branch().unwrap().unwrap();
+        let base = git
+            .repository()
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string();
+        let bare = origin_remote(&git, &root, &branch);
+
+        let report = git
+            .refresh_origin_default_branch(Some(&base), None, DEFAULT_REMOTE_REFRESH_DEADLINE)
+            .unwrap();
+        assert_eq!(report.remote, "origin");
+        assert_eq!(report.default_branch, branch);
+        assert_eq!(report.default_branch_revision, base);
+        assert_eq!(report.local_revision, base);
+        assert_eq!((report.ahead, report.behind), (0, 0));
+
+        advance_origin(&bare, &branch, 3);
+        // The cached remote ref still points at the tip the checkout started
+        // from until a fetch updates it, which is the trap this API closes.
+        assert_eq!(
+            git.repository()
+                .unwrap()
+                .find_reference(&format!("refs/remotes/origin/{branch}"))
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .id()
+                .to_string(),
+            base
+        );
+
+        let report = git
+            .refresh_origin_default_branch(Some(&base), None, DEFAULT_REMOTE_REFRESH_DEADLINE)
+            .unwrap();
+        assert_eq!((report.ahead, report.behind), (0, 3));
+        assert_ne!(report.default_branch_revision, base);
+
+        write_commit(&root, "local.txt", "local change\n", "local change");
+        let report = git
+            .refresh_origin_default_branch(None, None, DEFAULT_REMOTE_REFRESH_DEADLINE)
+            .unwrap();
+        assert_eq!((report.ahead, report.behind), (1, 3));
+        assert_eq!(
+            report.local_revision,
+            git.repository()
+                .unwrap()
+                .head()
+                .unwrap()
+                .target()
+                .unwrap()
+                .to_string()
+        );
+
+        fs::remove_dir_all(bare).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_refresh_reports_a_deadline_and_never_a_cached_ref() {
+        let (git, root) = repository();
+        let branch = git.current_branch().unwrap().unwrap();
+        let bare = origin_remote(&git, &root, &branch);
+        git.refresh_origin_default_branch(None, None, DEFAULT_REMOTE_REFRESH_DEADLINE)
+            .unwrap();
+
+        // A worker that only reports after the deadline is surfaced as a
+        // deadline instead of as an answer.
+        let (_sender, receiver) = mpsc::channel();
+        assert_eq!(
+            await_remote_refresh(&receiver, Duration::from_millis(5))
+                .unwrap_err()
+                .code,
+            ErrorCode::DeadlineExceeded
+        );
+        // A worker that stops without reporting is an internal failure rather
+        // than an empty report.
+        let (sender, receiver) = mpsc::channel();
+        drop(sender);
+        assert_eq!(
+            await_remote_refresh(&receiver, Duration::from_millis(5))
+                .unwrap_err()
+                .code,
+            ErrorCode::Internal
+        );
+
+        // The public refresh degrades on a deadline instead of waiting for the
+        // remote indefinitely.
+        assert_eq!(
+            git.refresh_origin_default_branch(None, None, Duration::ZERO)
+                .unwrap_err()
+                .code,
+            ErrorCode::DeadlineExceeded
+        );
+
+        fs::remove_dir_all(bare).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_refresh_fails_instead_of_reporting_a_cached_remote_ref() {
+        let (git, root) = repository();
+        let branch = git.current_branch().unwrap().unwrap();
+        let bare = origin_remote(&git, &root, &branch);
+        git.refresh_origin_default_branch(None, None, DEFAULT_REMOTE_REFRESH_DEADLINE)
+            .unwrap();
+
+        // With an unusable remote the refresh fails even though
+        // origin/<branch> is cached locally and looks current.
+        run(
+            &root,
+            &["remote", "set-url", "origin", "/nonexistent/loom-origin"],
+        );
+        assert_eq!(
+            git.refresh_origin_default_branch(None, None, DEFAULT_REMOTE_REFRESH_DEADLINE)
+                .unwrap_err()
+                .code,
+            ErrorCode::Vcs
+        );
+
+        run(&root, &["remote", "remove", "origin"]);
+        assert_eq!(
+            git.refresh_origin_default_branch(None, None, DEFAULT_REMOTE_REFRESH_DEADLINE)
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+
+        fs::remove_dir_all(bare).unwrap();
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2248,6 +2652,56 @@ mod tests {
         fs::write(root.join(file), content).unwrap();
         run(root, &["add", "--", file]);
         run(root, &["commit", "-qm", message]);
+    }
+
+    /// Points the checkout's `origin` at a fresh bare repository that already
+    /// holds `branch` at the checkout's current revision, and records the
+    /// remote's default branch the way a clone would.
+    fn origin_remote(git: &GitService, root: &Path, branch: &str) -> PathBuf {
+        let bare = std::env::temp_dir().join(format!(
+            "loom-git-origin-{}",
+            loom_core::RepositoryId::new()
+        ));
+        let repository = Repository::init_bare(&bare).unwrap();
+        repository
+            .set_head(&format!("refs/heads/{branch}"))
+            .unwrap();
+        drop(repository);
+        run(root, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git.push_branch_authenticated(branch, "test-token").unwrap();
+        git.repository()
+            .unwrap()
+            .reference_symbolic(
+                "refs/remotes/origin/HEAD",
+                &format!("refs/remotes/origin/{branch}"),
+                true,
+                "loom test: record the remote default branch",
+            )
+            .unwrap();
+        bare
+    }
+
+    /// Adds `count` commits to `branch` on the origin through a second clone,
+    /// so a checkout that does not fetch falls behind by exactly that many
+    /// commits without any network access.
+    fn advance_origin(bare: &Path, branch: &str, count: usize) {
+        let work = std::env::temp_dir().join(format!(
+            "loom-git-origin-work-{}",
+            loom_core::RepositoryId::new()
+        ));
+        GitService::clone_from(bare.to_str().unwrap(), &work, None).unwrap();
+        run(&work, &["config", "user.email", "loom@example.test"]);
+        run(&work, &["config", "user.name", "Loom Test"]);
+        for index in 0..count {
+            write_commit(
+                &work,
+                &format!("upstream-{index}.txt"),
+                "upstream change\n",
+                &format!("upstream change {index}"),
+            );
+        }
+        run(&work, &["push", "-q", "origin", branch]);
+        fs::remove_dir_all(work).unwrap();
     }
 
     #[test]

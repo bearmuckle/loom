@@ -696,6 +696,7 @@ fn project_worktree_updates_are_included_in_project_workspace_refreshes() {
         worktree_name: "loom-child-example".to_owned(),
         branch_name: "loom/project-child-example".to_owned(),
         base_revision: "base".to_owned(),
+        base_refresh: None,
         result_revision: None,
         integrated_revision: None,
         status: loom_core::ProjectWorktreeStatus::Ready,

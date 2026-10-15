@@ -251,6 +251,7 @@ fn project_child_worktree_can_be_reviewed_fast_forwarded_and_cleaned_up() {
         worktree_name: format!("loom-child-{task_id}"),
         branch_name: format!("loom/project-child-{task_id}"),
         base_revision,
+        base_refresh: None,
         result_revision: None,
         integrated_revision: None,
         status: ProjectWorktreeStatus::Creating,
@@ -749,6 +750,106 @@ fn project_child_integration_surfaces_an_in_progress_git_operation() {
     assert_eq!(
         integrated_worktree(&fixture).status,
         ProjectWorktreeStatus::RecoveryRequired
+    );
+    fixture.shutdown();
+}
+
+#[test]
+fn child_creation_reports_how_far_its_base_is_behind_the_remote() {
+    let mut fixture = pending_project_code_child_fixture();
+    // Upstream moves after the parent checkout was cloned, which is the case
+    // where the cached `origin/*` ref still looks current.
+    commit_file(
+        &fixture.source,
+        "upstream.txt",
+        "upstream change\n",
+        "upstream change",
+    );
+
+    create_project_code_child_checkout(&mut fixture);
+
+    assert_eq!(fixture.worktree.status, ProjectWorktreeStatus::Ready);
+    let refresh = fixture
+        .worktree
+        .base_refresh
+        .clone()
+        .expect("child creation should record its base refresh");
+    let ProjectWorktreeBaseRefresh::Fetched {
+        remote,
+        base_revision,
+        ahead,
+        behind,
+        default_branch_revision,
+        ..
+    } = refresh
+    else {
+        panic!("expected a fetched base refresh, found {refresh:?}");
+    };
+    assert_eq!(remote, "origin");
+    assert_eq!(base_revision, fixture.worktree.base_revision);
+    assert_eq!((ahead, behind), (0, 1));
+    assert_ne!(
+        default_branch_revision, base_revision,
+        "the report must name the fetched tip, not the base"
+    );
+
+    // The manager sees the drift in the delegation result, not only in storage.
+    let base = project_completion_guard(&fixture)
+        .child_checkout_base(fixture.task_id)
+        .expect("the recorded base refresh should be reported to the manager");
+    assert_eq!(base["base_revision"], serde_json::json!(base_revision));
+    assert!(
+        base["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("is 1 commit ahead")),
+        "summary should name the drift: {base}"
+    );
+    fixture.shutdown();
+}
+
+#[test]
+fn child_creation_proceeds_with_a_warning_when_the_refresh_fails() {
+    let mut fixture = pending_project_code_child_fixture();
+    // The remote the parent checkout was cloned from is no longer reachable, so
+    // the bounded refresh cannot resolve the default-branch tip.
+    git_in(
+        fixture.parent_git.root(),
+        &["remote", "set-url", "origin", "/nonexistent/loom-origin"],
+    );
+
+    create_project_code_child_checkout(&mut fixture);
+
+    assert_eq!(fixture.worktree.status, ProjectWorktreeStatus::Ready);
+    let refresh = fixture
+        .worktree
+        .base_refresh
+        .clone()
+        .expect("child creation should record its base refresh attempt");
+    let ProjectWorktreeBaseRefresh::Unavailable {
+        remote,
+        base_revision,
+        warning,
+        ..
+    } = refresh
+    else {
+        panic!("expected an unavailable base refresh, found {refresh:?}");
+    };
+    assert_eq!(remote, "origin");
+    assert_eq!(base_revision, fixture.worktree.base_revision);
+    assert!(
+        warning.contains("origin"),
+        "the warning should name the remote that failed: {warning}"
+    );
+
+    // The child checkout still exists on the durable branch and base revision.
+    let child_git = GitService::open(&fixture.child_checkout).unwrap();
+    assert_eq!(
+        child_git.status().unwrap().head.as_deref(),
+        Some(fixture.worktree.base_revision.as_str())
+    );
+    assert_eq!(
+        child_git.current_branch().unwrap().as_deref(),
+        Some(fixture.worktree.branch_name.as_str())
     );
     fixture.shutdown();
 }

@@ -23,9 +23,10 @@ use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy,
     Capability, CapabilitySet, DelegatedTaskSpec, ErrorCode, EventSequence, LoomError,
     MAX_PROJECT_AGENT_DEPTH, ProjectAgentRecord, ProjectId, ProjectSnapshot,
-    ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord, ProjectWorktreeStatus,
-    ProtocolVersion, RepositoryId, RequestId, Result, RunAttemptId, SessionEventRecord,
-    TaskContextReference, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
+    ProjectWorktreeBaseRefresh, ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord,
+    ProjectWorktreeStatus, ProtocolVersion, RepositoryId, RequestId, Result, RunAttemptId,
+    SessionEventRecord, TaskContextReference, Timestamp, UsageSnapshot, WorkspaceId,
+    WorkspaceRecord,
 };
 use loom_model::{
     ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId, ToolCall, ToolDefinition,

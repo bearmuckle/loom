@@ -712,6 +712,15 @@ impl InProcessConnection {
         let worktree_service = if destination.exists() {
             parent_git.open_linked_worktree(&worktree.worktree_name, &destination)
         } else if worktree.status == ProjectWorktreeStatus::Creating {
+            // Refresh the remote before the checkout is materialized, so the
+            // base the child is actually created from is reported against the
+            // fetched default-branch tip. A refresh recorded moments ago for
+            // this same creation is reused instead of fetching twice.
+            if !base_refresh_is_recent(worktree.base_refresh.as_ref(), Timestamp::now()) {
+                worktree.base_refresh =
+                    Some(self.refresh_child_base_revision(&parent_git, &worktree.base_revision));
+                worktree.updated_at = Timestamp::now();
+            }
             parent_git.create_linked_worktree_at_revision(
                 &worktree.worktree_name,
                 &worktree.branch_name,

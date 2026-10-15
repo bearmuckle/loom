@@ -98,7 +98,7 @@ pub(crate) fn load_project_worktree(
                     parent_repository_id, child_repository_id, relative_path,
                     worktree_name, branch_name, base_revision, result_revision,
                     integrated_revision, status, error, cleanup_disposition,
-                    created_at, updated_at
+                    base_refresh, created_at, updated_at
              FROM project_worktrees WHERE task_id=?1",
             [task_id.as_bytes().as_slice()],
             |row| {
@@ -118,8 +118,9 @@ pub(crate) fn load_project_worktree(
                     row.get::<_, String>(12)?,
                     row.get::<_, Option<String>>(13)?,
                     row.get::<_, Option<String>>(14)?,
-                    row.get::<_, i64>(15)?,
+                    row.get::<_, Option<String>>(15)?,
                     row.get::<_, i64>(16)?,
+                    row.get::<_, i64>(17)?,
                 ))
             },
         )
@@ -143,6 +144,7 @@ pub(crate) fn load_project_worktree(
         status,
         error,
         cleanup_disposition,
+        base_refresh,
         created_at,
         updated_at,
     )) = row
@@ -207,6 +209,7 @@ pub(crate) fn load_project_worktree(
         status: parse_project_worktree_status(&status)?,
         conflict_paths,
         error,
+        base_refresh: decode_project_worktree_base_refresh(base_refresh)?,
         cleanup_disposition: cleanup_disposition
             .as_deref()
             .map(parse_project_worktree_cleanup)
@@ -639,9 +642,9 @@ pub(crate) fn persist_initial_project_worktree(
                 parent_repository_id, child_repository_id, relative_path,
                 worktree_name, branch_name, base_revision, result_revision,
                 integrated_revision, status, error, cleanup_disposition,
-                created_at, updated_at
+                base_refresh, created_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL,
-                       'creating', NULL, NULL, ?11, ?12)",
+                       'creating', NULL, NULL, ?11, ?12, ?13)",
             params![
                 worktree.task_id.as_uuid().as_bytes().as_slice(),
                 worktree.project_id.as_uuid().as_bytes().as_slice(),
@@ -657,6 +660,7 @@ pub(crate) fn persist_initial_project_worktree(
                 worktree.worktree_name,
                 worktree.branch_name,
                 worktree.base_revision,
+                encode_project_worktree_base_refresh(worktree.base_refresh.as_ref())?,
                 encode_timestamp(worktree.created_at)?,
                 encode_timestamp(worktree.updated_at)?,
             ],
@@ -668,6 +672,38 @@ pub(crate) fn persist_initial_project_worktree(
             )
         })?;
     Ok(())
+}
+
+/// Encodes the recorded base refresh as the versioned JSON payload the
+/// worktree row stores.
+pub(crate) fn encode_project_worktree_base_refresh(
+    refresh: Option<&ProjectWorktreeBaseRefresh>,
+) -> Result<Option<String>> {
+    refresh
+        .map(|refresh| {
+            serde_json::to_string(refresh).map_err(|error| {
+                persistence_error(
+                    format!("could not encode the project worktree base refresh: {error}"),
+                    false,
+                )
+            })
+        })
+        .transpose()
+}
+
+pub(crate) fn decode_project_worktree_base_refresh(
+    payload: Option<String>,
+) -> Result<Option<ProjectWorktreeBaseRefresh>> {
+    payload
+        .map(|payload| {
+            serde_json::from_str(&payload).map_err(|error| {
+                persistence_error(
+                    format!("persisted project worktree base refresh is invalid: {error}"),
+                    false,
+                )
+            })
+        })
+        .transpose()
 }
 
 pub(crate) fn same_project_worktree_identity(

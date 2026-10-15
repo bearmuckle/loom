@@ -745,6 +745,7 @@ CREATE TABLE IF NOT EXISTS project_worktrees (
         'cleanup_pending', 'retained', 'removed'
     )),
     error TEXT CHECK(error IS NULL OR length(error) <= 8192),
+    base_refresh TEXT CHECK(base_refresh IS NULL OR length(base_refresh) <= 8192),
     cleanup_disposition TEXT CHECK(cleanup_disposition IS NULL OR cleanup_disposition IN (
         'retain', 'remove_clean', 'discard_changes'
     )),
@@ -937,6 +938,50 @@ pub(crate) fn schema_status_from_header(path: &Path) -> Result<SchemaStatus> {
     Ok(map_schema_version(version))
 }
 
+/// Reports whether the migrated database already holds a table. Older
+/// revision fixtures in the migration tests contain only the tables that their
+/// own revision knew about, so a column step must not assume the baseline
+/// batches have already created every table.
+fn migration_table_exists(transaction: &Transaction<'_>, table: &str) -> Result<bool> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [table],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not inspect the '{table}' table during migration: {error}"),
+                true,
+            )
+        })
+}
+
+/// Reports whether a migrated table already carries a column, so a repeated
+/// upgrade step stays idempotent.
+fn migration_column_exists(
+    transaction: &Transaction<'_>,
+    table: &str,
+    column: &str,
+) -> Result<bool> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info(?1) WHERE name=?2
+            )",
+            params![table, column],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!(
+                    "could not inspect the '{table}.{column}' column during migration: {error}"
+                ),
+                true,
+            )
+        })
+}
+
 /// Upgrades an older supported schema in place without discarding state. Steps
 /// are added only for changes we choose not to wipe for and may be removed
 /// again before 1.0, so keep them small and self-contained. After the ladder
@@ -1015,6 +1060,28 @@ fn migrate_schema(connection: &Connection, from_version: u32) -> Result<()> {
             // those indexes, so this step only advances the version, and a
             // database already at v5 gains them as well.
             5 => version = 6,
+            // v7 adds the recorded base refresh of a project child checkout,
+            // so a manager can see whether the checkout was created from a
+            // moved default branch. A database from an older revision may not
+            // have the worktree table yet; the baseline batches add it with the
+            // new column, so the ALTER applies only where it is needed.
+            6 => {
+                if migration_table_exists(&transaction, "project_worktrees")?
+                    && !migration_column_exists(&transaction, "project_worktrees", "base_refresh")?
+                {
+                    transaction
+                        .execute_batch(
+                            "ALTER TABLE project_worktrees ADD COLUMN base_refresh TEXT;",
+                        )
+                        .map_err(|error| {
+                            persistence_error(
+                                format!("could not migrate persistence schema to v7: {error}"),
+                                true,
+                            )
+                        })?;
+                }
+                version = 7;
+            }
             other => return Err(unsupported_database_error(other)),
         }
     }

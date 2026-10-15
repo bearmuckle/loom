@@ -164,6 +164,7 @@ pub(super) fn nested_project_view(focus_handle: gpui_kit::FocusHandle) -> LoomVi
         worktree_name: "worker".to_owned(),
         branch_name: "agent/worker".to_owned(),
         base_revision: "parent-base".to_owned(),
+        base_refresh: None,
         result_revision: Some("child-result".to_owned()),
         integrated_revision: None,
         status: ProjectWorktreeStatus::Ready,

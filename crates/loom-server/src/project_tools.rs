@@ -467,6 +467,32 @@ impl ProjectAgentTools {
             .is_ancestor_revision(result_revision, integrated_revision)
     }
 
+    /// Manager-facing summary of the revision a delegated child checkout was
+    /// created from, together with its drift from the default-branch tip that
+    /// the recorded refresh resolved.
+    ///
+    /// The value is the refresh recorded when the checkout was created, so a
+    /// cached `origin/*` ref is never presented as a current tip. `None` means
+    /// the child has no durable worktree record yet.
+    pub(crate) fn child_checkout_base(
+        &self,
+        task_id: loom_core::TaskId,
+    ) -> Option<serde_json::Value> {
+        let backend = self.backend.upgrade()?;
+        let worktree = backend
+            .persistence
+            .as_ref()?
+            .load_project_worktree_by_task(task_id)
+            .ok()??;
+        let refresh = worktree.base_refresh?;
+        Some(serde_json::json!({
+            "base_revision": worktree.base_revision,
+            "summary": refresh.summary(),
+            "reported_at": refresh.reported_at(),
+            "refresh": refresh,
+        }))
+    }
+
     pub(crate) fn load_wait_child_tasks(
         &self,
         task_ids: &[loom_core::TaskId],
@@ -691,6 +717,7 @@ impl ProjectAgentTools {
                         "status": task.status,
                         "child_name": task.child_name,
                         "intent": task.intent,
+                        "checkout_base": self.child_checkout_base(task.task_id),
                     }))
                     .unwrap_or_else(|error| format!("could not encode delegation result: {error}")),
                 }
