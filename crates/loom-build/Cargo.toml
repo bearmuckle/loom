@@ -1,0 +1,7 @@
+[package]
+name = "loom-build"
+description = "Shared build-script stamping of the release version and git revision."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true

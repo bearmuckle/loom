@@ -4328,6 +4328,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-build"
+version = "0.1.0"
+
+[[package]]
 name = "loom-cli"
 version = "0.1.0"
 dependencies = [
@@ -4370,6 +4374,7 @@ name = "loom-local"
 version = "0.1.0"
 dependencies = [
  "keyring",
+ "loom-build",
  "loom-core",
  "loom-model",
  "loom-persistence",
@@ -4449,6 +4454,7 @@ dependencies = [
  "futures-util",
  "log",
  "loom-agent",
+ "loom-build",
  "loom-context",
  "loom-core",
  "loom-model",
@@ -4515,6 +4521,7 @@ dependencies = [
  "gpui-kit",
  "js-sys",
  "log",
+ "loom-build",
  "loom-core",
  "loom-local",
  "loom-model",

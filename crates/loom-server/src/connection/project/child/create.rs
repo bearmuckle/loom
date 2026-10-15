@@ -246,7 +246,7 @@ impl InProcessConnection {
             self.schedule_project_task_if_ready(&mut existing_task)?;
             return Ok(ServerResponse::Project(
                 ProjectResponse::ProjectChildCreated {
-                    task: existing_task,
+                    task: Box::new(existing_task),
                     child,
                 },
             ));
@@ -575,7 +575,7 @@ impl InProcessConnection {
         drop(workspace_admission_guard);
         Ok(ServerResponse::Project(
             ProjectResponse::ProjectChildCreated {
-                task: persisted_task,
+                task: Box::new(persisted_task),
                 child,
             },
         ))

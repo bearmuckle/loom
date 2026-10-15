@@ -189,7 +189,7 @@ impl InProcessConnection {
         }
         Ok(ServerResponse::Project(
             ProjectResponse::ProjectChildReview {
-                worktree,
+                worktree: Box::new(worktree),
                 status,
                 diff,
             },
@@ -235,7 +235,7 @@ impl InProcessConnection {
         }
         if worktree.status == ProjectWorktreeStatus::Integrated {
             return Ok(ServerResponse::Project(
-                ProjectResponse::ProjectChildWorktreeUpdated(worktree),
+                ProjectResponse::ProjectChildWorktreeUpdated(Box::new(worktree)),
             ));
         }
         if !matches!(
@@ -371,7 +371,7 @@ impl InProcessConnection {
             worktree.updated_at = Timestamp::now();
             self.save_project_worktree_state(&worktree)?;
             return Ok(ServerResponse::Project(
-                ProjectResponse::ProjectChildWorktreeUpdated(worktree),
+                ProjectResponse::ProjectChildWorktreeUpdated(Box::new(worktree)),
             ));
         }
 
@@ -436,7 +436,7 @@ impl InProcessConnection {
         worktree.updated_at = Timestamp::now();
         self.save_project_worktree_state(worktree)?;
         Ok(ServerResponse::Project(
-            ProjectResponse::ProjectChildWorktreeUpdated(worktree.clone()),
+            ProjectResponse::ProjectChildWorktreeUpdated(Box::new(worktree.clone())),
         ))
     }
 
@@ -487,7 +487,7 @@ impl InProcessConnection {
         }
         if worktree.status == ProjectWorktreeStatus::Removed {
             return Ok(ServerResponse::Project(
-                ProjectResponse::ProjectChildWorktreeUpdated(worktree),
+                ProjectResponse::ProjectChildWorktreeUpdated(Box::new(worktree)),
             ));
         }
         if worktree.status == ProjectWorktreeStatus::CleanupPending
@@ -507,7 +507,7 @@ impl InProcessConnection {
             worktree.status = ProjectWorktreeStatus::Retained;
             self.save_project_worktree_state(&worktree)?;
             return Ok(ServerResponse::Project(
-                ProjectResponse::ProjectChildWorktreeUpdated(worktree),
+                ProjectResponse::ProjectChildWorktreeUpdated(Box::new(worktree)),
             ));
         }
 
@@ -553,7 +553,7 @@ impl InProcessConnection {
             },
         );
         Ok(ServerResponse::Project(
-            ProjectResponse::ProjectChildWorktreeUpdated(worktree),
+            ProjectResponse::ProjectChildWorktreeUpdated(Box::new(worktree)),
         ))
     }
 

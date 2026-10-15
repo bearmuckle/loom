@@ -6,6 +6,9 @@ edition.workspace = true
 license = "AGPL-3.0-only"
 rust-version.workspace = true
 
+[build-dependencies]
+loom-build.workspace = true
+
 [dependencies]
 loom-core.workspace = true
 loom-model.workspace = true
