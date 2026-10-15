@@ -111,6 +111,13 @@ CREATE TABLE IF NOT EXISTS runtime_configurations (
     input_cost_micros_per_1k INTEGER NOT NULL CHECK(input_cost_micros_per_1k >= 0),
     output_cost_micros_per_1k INTEGER NOT NULL CHECK(output_cost_micros_per_1k >= 0)
 ) WITHOUT ROWID, STRICT;
+-- Instruction hashes are probed by content garbage collection.
+CREATE INDEX IF NOT EXISTS runtime_configurations_by_system_instructions
+    ON runtime_configurations(system_instructions_hash)
+    WHERE system_instructions_hash IS NOT NULL;
+CREATE INDEX IF NOT EXISTS runtime_configurations_by_repository_instructions
+    ON runtime_configurations(repository_instructions_hash)
+    WHERE repository_instructions_hash IS NOT NULL;
 CREATE TABLE IF NOT EXISTS run_runtime_config (
     run_id BLOB PRIMARY KEY NOT NULL REFERENCES run_summaries(run_id) ON DELETE CASCADE,
     configuration_hash BLOB NOT NULL REFERENCES runtime_configurations(configuration_hash) ON DELETE RESTRICT
@@ -269,8 +276,13 @@ CREATE TABLE IF NOT EXISTS run_context_checkpoints (
 ) WITHOUT ROWID, STRICT;
 CREATE INDEX IF NOT EXISTS run_context_checkpoints_by_session
     ON run_context_checkpoints(session_id, run_id);
+-- Summary and transcript hashes are probed by content garbage collection.
+CREATE INDEX IF NOT EXISTS run_context_checkpoints_by_summary
+    ON run_context_checkpoints(summary_hash);
 CREATE INDEX IF NOT EXISTS run_messages_by_session
     ON run_messages(session_id, run_id, ordinal);
+CREATE INDEX IF NOT EXISTS run_messages_by_content
+    ON run_messages(content_hash) WHERE content_hash IS NOT NULL;
 CREATE TABLE IF NOT EXISTS run_queued_directions (
     run_id BLOB NOT NULL,
     session_id BLOB NOT NULL CHECK(length(session_id) = 16),
@@ -308,6 +320,9 @@ CREATE INDEX IF NOT EXISTS run_activities_by_session_time
     ON run_activities(session_id, started_at DESC, activity_id DESC);
 CREATE INDEX IF NOT EXISTS run_activities_by_tool_call
     ON run_activities(run_id, tool_call_id, ordinal) WHERE tool_call_id IS NOT NULL;
+-- Activity payload hashes are probed by content garbage collection.
+CREATE INDEX IF NOT EXISTS run_activities_by_content
+    ON run_activities(data_hash);
 CREATE TABLE IF NOT EXISTS run_tool_calls (
     run_id BLOB NOT NULL,
     session_id BLOB NOT NULL CHECK(length(session_id) = 16),
@@ -323,6 +338,9 @@ CREATE TABLE IF NOT EXISTS run_tool_calls (
     FOREIGN KEY(run_id, session_id)
         REFERENCES run_summaries(run_id, session_id) ON DELETE CASCADE
 ) WITHOUT ROWID, STRICT;
+-- Tool argument hashes are probed by content garbage collection.
+CREATE INDEX IF NOT EXISTS run_tool_calls_by_arguments
+    ON run_tool_calls(arguments_hash);
 CREATE TABLE IF NOT EXISTS session_filesystems (
     session_id BLOB PRIMARY KEY NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
         CHECK(length(session_id) = 16),
@@ -913,7 +931,9 @@ pub(crate) fn schema_status_from_header(path: &Path) -> Result<SchemaStatus> {
 
 /// Upgrades an older supported schema in place without discarding state. Steps
 /// are added only for changes we choose not to wipe for and may be removed
-/// again before 1.0, so keep them small and self-contained.
+/// again before 1.0, so keep them small and self-contained. After the ladder
+/// the idempotent baseline batches run again, so an upgraded database also
+/// gains baseline objects that its own revision predates.
 fn migrate_schema(connection: &Connection, from_version: u32) -> Result<()> {
     let transaction = connection.unchecked_transaction().map_err(|error| {
         persistence_error(
@@ -963,9 +983,17 @@ fn migrate_schema(connection: &Connection, from_version: u32) -> Result<()> {
                     })?;
                 version = 4;
             }
+            // v5 indexes the hash columns that content garbage collection
+            // probes. The baseline batches applied after the ladder create
+            // those indexes, so this step only advances the version.
+            4 => version = 5,
             other => return Err(unsupported_database_error(other)),
         }
     }
+    // Baseline objects were only assumed to exist for databases written by a
+    // revision that already had them, so re-apply the idempotent batches to
+    // fill in anything an older database is missing.
+    apply_baseline_schema(&transaction)?;
     transaction
         .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
         .map_err(|error| {
@@ -980,6 +1008,27 @@ fn migrate_schema(connection: &Connection, from_version: u32) -> Result<()> {
             true,
         )
     })?;
+    Ok(())
+}
+
+/// Applies every baseline schema batch. Each batch only uses `IF NOT EXISTS`
+/// statements, so the same batches both create a fresh database and fill in
+/// baseline objects that an older database is missing.
+fn apply_baseline_schema(connection: &Connection) -> Result<()> {
+    for (batch, name) in [
+        (DATABASE_SCHEMA, "persistence schema"),
+        (PROJECT_TASK_SCHEMA, "project task schema"),
+        (PROJECT_WORKTREE_SCHEMA, "project worktree schema"),
+        (PROJECT_MANAGER_WAIT_SCHEMA, "project manager wait schema"),
+        (
+            PROJECT_CANCELLATION_CASCADE_SCHEMA,
+            "project cancellation recovery schema",
+        ),
+    ] {
+        connection.execute_batch(batch).map_err(|error| {
+            persistence_error(format!("could not create {name}: {error}"), true)
+        })?;
+    }
     Ok(())
 }
 
@@ -1041,46 +1090,7 @@ pub(crate) fn initialize_schema(connection: &Connection) -> Result<()> {
             true,
         )
     })?;
-    transaction
-        .execute_batch(DATABASE_SCHEMA)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not create persistence schema: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .execute_batch(PROJECT_TASK_SCHEMA)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not create project task schema: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .execute_batch(PROJECT_WORKTREE_SCHEMA)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not create project worktree schema: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .execute_batch(PROJECT_MANAGER_WAIT_SCHEMA)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not create project manager wait schema: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .execute_batch(PROJECT_CANCELLATION_CASCADE_SCHEMA)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not create project cancellation recovery schema: {error}"),
-                true,
-            )
-        })?;
+    apply_baseline_schema(&transaction)?;
     transaction
         .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
         .map_err(|error| {

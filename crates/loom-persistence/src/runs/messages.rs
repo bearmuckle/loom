@@ -577,5 +577,5 @@ pub(crate) fn save_run_message_rows(
                 })?;
         }
     }
-    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)
+    Ok(())
 }

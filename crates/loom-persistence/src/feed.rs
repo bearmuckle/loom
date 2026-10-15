@@ -640,6 +640,9 @@ pub(crate) fn save_feed_rows_with_limits_and_pruning(
         )
     })?;
     let mut previous = 0;
+    // Events of one checkpoint usually belong to a single session, so resolve
+    // each session's workspace once instead of once per event.
+    let mut workspaces: BTreeMap<AgentSessionId, Vec<u8>> = BTreeMap::new();
     for event in &feed.events {
         let sequence = i64::try_from(event.sequence.value()).map_err(|_| {
             LoomError::new(
@@ -658,26 +661,36 @@ pub(crate) fn save_feed_rows_with_limits_and_pruning(
             ));
         }
         previous = sequence;
-        let workspace_id = transaction
-            .query_row(
-                "SELECT workspace_id FROM sessions WHERE id=?1",
-                [event.session_id.as_uuid().as_bytes().as_slice()],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()
-            .map_err(|error| {
-                persistence_error(format!("could not resolve event workspace: {error}"), true)
-            })?
-            .ok_or_else(|| {
-                LoomError::new(
-                    ErrorCode::Persistence,
-                    format!(
-                        "cannot persist event for unknown session {}",
-                        event.session_id
-                    ),
-                    false,
-                )
-            })?;
+        let workspace_id = match workspaces.get(&event.session_id) {
+            Some(workspace_id) => workspace_id.clone(),
+            None => {
+                let workspace_id = transaction
+                    .query_row(
+                        "SELECT workspace_id FROM sessions WHERE id=?1",
+                        [event.session_id.as_uuid().as_bytes().as_slice()],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        persistence_error(
+                            format!("could not resolve event workspace: {error}"),
+                            true,
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        LoomError::new(
+                            ErrorCode::Persistence,
+                            format!(
+                                "cannot persist event for unknown session {}",
+                                event.session_id
+                            ),
+                            false,
+                        )
+                    })?;
+                workspaces.insert(event.session_id, workspace_id.clone());
+                workspace_id
+            }
+        };
         let raw_payload = serde_json::to_vec(event).map_err(|error| {
             persistence_error(format!("could not encode event feed entry: {error}"), false)
         })?;
