@@ -20,6 +20,11 @@ pub enum AgentRunState {
     Cancelled,
 }
 
+/// Prefix of the summary a failed run records, followed by the reason the run
+/// failed. The producer writes it and the client reads it, so both use this
+/// constant instead of repeating the literal.
+pub const AGENT_RUN_FAILURE_SUMMARY_PREFIX: &str = "Agent failed: ";
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentRunSnapshot {
     pub id: RunId,

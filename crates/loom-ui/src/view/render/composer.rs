@@ -134,13 +134,29 @@ impl LoomView {
                     .border_color(rgb(0x3b4555))
                     .text_color(rgb(0xe5e7eb))
                     .child(
-                        div().p_3().child(
-                            Textarea::new(composer)
-                                .aria_label(placeholder)
-                                .h(px(height))
-                                .appearance(false)
-                                .bordered(false),
-                        ),
+                        div()
+                            .id("composer-field")
+                            .test_support()
+                            .p_3()
+                            // The wrapper, not only the text element, is the
+                            // field's tap target: a tap on the padding must
+                            // start editing, and the keyboard request has to
+                            // happen inside that tap's user gesture because
+                            // the web platform raises the virtual keyboard
+                            // only from its own `pointerup` heuristic, which
+                            // requires the tap to be inside the text element.
+                            .cursor_text()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| this.focus_composer(window, cx)),
+                            )
+                            .child(
+                                Textarea::new(composer)
+                                    .aria_label(placeholder)
+                                    .h(px(height))
+                                    .appearance(false)
+                                    .bordered(false),
+                            ),
                     )
                     .child(
                         div()

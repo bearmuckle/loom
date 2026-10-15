@@ -467,6 +467,52 @@ fn opens_and_migrates_an_older_schema_in_place() {
 }
 
 #[test]
+fn migrates_a_v4_database_by_adding_the_archive_retention_policy_table() {
+    let path =
+        std::env::temp_dir().join(format!("loom-persistence-migrate-v4-{}.db", Uuid::new_v4()));
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sentinel(value TEXT);
+                 INSERT INTO sentinel(value) VALUES ('keep');
+                 PRAGMA user_version = 4;",
+            )
+            .unwrap();
+    }
+
+    // Opening the database runs the ladder; a v4 database has no retention row
+    // yet.
+    let store = FilePersistence::open(&path).unwrap();
+    assert_eq!(store.load_archive_retention_policy().unwrap(), None);
+    drop(store);
+
+    let connection = Connection::open(&path).unwrap();
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, DATABASE_SCHEMA_VERSION);
+    let has_table: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master
+             WHERE type='table' AND name='archive_retention_policy')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        has_table,
+        "the v5 migration adds the retention policy table"
+    );
+    let sentinel: String = connection
+        .query_row("SELECT value FROM sentinel", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(sentinel, "keep", "a migration keeps unrelated tables");
+    drop(connection);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn schema_status_detects_incompatible_state_and_resets_only_on_request() {
     let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
     assert_eq!(

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use super::*;
 
 pub trait CatalogRepository: Send + Sync {
+    fn load_archive_retention_policy(&self) -> Result<Option<DurableArchiveRetentionPolicy>>;
     fn load_idempotency_records(&self) -> Result<BTreeMap<RequestId, DurableIdempotencyRecord>>;
     fn load_provider_configs(&self) -> Result<Vec<ProviderConfig>>;
     fn load_provider_health(&self) -> Result<BTreeMap<ProviderId, ProviderHealth>>;
@@ -16,6 +17,9 @@ pub trait CatalogRepository: Send + Sync {
 }
 
 impl CatalogRepository for FilePersistence {
+    fn load_archive_retention_policy(&self) -> Result<Option<DurableArchiveRetentionPolicy>> {
+        FilePersistence::load_archive_retention_policy(self)
+    }
     fn load_idempotency_records(&self) -> Result<BTreeMap<RequestId, DurableIdempotencyRecord>> {
         FilePersistence::load_idempotency_records(self)
     }
@@ -49,6 +53,9 @@ impl CatalogRepository for FilePersistence {
 }
 
 impl<T: CatalogRepository + ?Sized> CatalogRepository for Arc<T> {
+    fn load_archive_retention_policy(&self) -> Result<Option<DurableArchiveRetentionPolicy>> {
+        (**self).load_archive_retention_policy()
+    }
     fn load_idempotency_records(&self) -> Result<BTreeMap<RequestId, DurableIdempotencyRecord>> {
         (**self).load_idempotency_records()
     }
@@ -82,6 +89,8 @@ impl<T: CatalogRepository + ?Sized> CatalogRepository for Arc<T> {
 }
 
 pub trait SessionRepository: Send + Sync {
+    /// Permanently removes sessions and everything they own in one transaction.
+    fn delete_sessions(&self, session_ids: &BTreeSet<AgentSessionId>) -> Result<usize>;
     fn load_latest_run_summary_for_session(
         &self,
         session_id: AgentSessionId,
@@ -96,6 +105,9 @@ pub trait SessionRepository: Send + Sync {
 }
 
 impl SessionRepository for FilePersistence {
+    fn delete_sessions(&self, session_ids: &BTreeSet<AgentSessionId>) -> Result<usize> {
+        FilePersistence::delete_sessions(self, session_ids)
+    }
     fn load_latest_run_summary_for_session(
         &self,
         session_id: AgentSessionId,
@@ -118,6 +130,9 @@ impl SessionRepository for FilePersistence {
 }
 
 impl<T: SessionRepository + ?Sized> SessionRepository for Arc<T> {
+    fn delete_sessions(&self, session_ids: &BTreeSet<AgentSessionId>) -> Result<usize> {
+        (**self).delete_sessions(session_ids)
+    }
     fn load_latest_run_summary_for_session(
         &self,
         session_id: AgentSessionId,

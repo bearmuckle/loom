@@ -95,6 +95,64 @@ Reconnect notifications are disposable indexed feeds with per-session and per-wo
 
 Transcript, checkpoint, and edit/undo history have no automatic retention limit. Archived sessions remain available, and undo history is not silently capped. Any future retention policy must protect active rollback dependencies and make loss of rollback capability explicit.
 
+## Session deletion
+
+Archived sessions remain in durable state until they are deleted. `Archived` is
+terminal: there is no restore or unarchive, an archived session is immutable,
+and deletion or retention-based auto-delete is the only way to remove it. A
+session that is not a project root can only be deleted once it is archived.
+
+A project root is deletable in any state. Its live work is cancelled first: the
+manager's own run is interrupted, then every non-terminal sub-agent subtree is
+cancelled through the child cancellation cascade. Deleting the root then removes
+every descendant session of that project in one operation, resolved from the
+same project snapshot and in the same cascade order as archiving. A request only
+proceeds with every delegated task of the project terminal and no run that is
+loaded in this process left non-terminal, so it either deletes the whole tree or
+changes nothing. A run checkpoint without a loaded handle has no executor that
+could keep writing, so it does not refuse the deletion; refusing on one would
+make an archived session permanently undeletable after a crash between the
+archive write and its run checkpoint. The session catalog removes a session in
+any state, so no archive transition is synthesized for a tree on its way out.
+
+A deletion removes physical state before it removes rows, in a fixed order:
+
+1. Linked worktrees, deepest-first, through the parent session's `GitService`,
+   so the parent's `.git/worktrees/<name>` registration is pruned with the
+   checkout.
+2. The deleted sessions' filesystem roots under
+   `<session-root-base>/<workspace>/<session>/fs`.
+3. The database rows.
+
+Rows are deleted in an order that respects the `ON DELETE RESTRICT` edges:
+`project_agent_messages` and `delegated_task_dependencies` before
+`delegated_tasks`. Feed rows are deleted explicitly (`feed_events`,
+`feed_session_meta`, and the matching `workspace_feed_events` rows, which carry
+no session foreign key), because the feed is a disposable notification feed
+rather than a cascade child. The `sessions` rows are deleted last; their
+foreign keys cascade to runs, messages, activities, checkpoints, filesystem
+records, hierarchy, tasks, and worktrees. Content queued by the cascade
+triggers is reclaimed by the content garbage collector in the same
+transaction.
+
+A linked worktree with changes or a lock refuses the deletion unless the caller
+forces it. The automatic retention sweep skips such a project, logs the reason,
+and retries later. The node-level repository clone cache
+(`<session-root-base>.clone-cache`) is shared between sessions and is never
+deleted with a session.
+
+The archive-retention policy the sweep applies is one `archive_retention_policy`
+row per database: a `retention_ms` window (`NULL` when retention is disabled)
+and the `force_discard_worktrees` flag. It is written in the same transaction as
+the session settings, so a startup flag that overrides the stored policy, or a
+`SetArchiveRetentionPolicy` request, is durable as soon as it is answered. A
+restart applies the stored policy unless an explicit
+`--archive-retention`/`LOOM_ARCHIVE_RETENTION` overrides and replaces it.
+
+Deletions are durable across restarts. A restart does not recreate a deleted
+filesystem root, re-register a deleted worktree, or restore deleted rows, so a
+session that is absent from the database stays absent.
+
 ## Performance evidence
 
 Synthetic warm same-process restore measured 6.03 ms p50 for 10,000 sessions/runs and 55.40 ms p50 for 100,000 sessions/runs. Those fixtures contain sparse filesystem/checkpoint rows and do not measure cold disk startup, UI construction, or dense active histories.

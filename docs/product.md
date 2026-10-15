@@ -103,7 +103,7 @@ The first release should optimize for this exact loop:
 | --- | --- |
 | Workspaces | Create, rename, configure, and navigate durable containers for sessions; no repository or directory is required |
 | Session repositories | Attach one or more repository sources and revisions to a session; create isolated clones or worktrees under its filesystem root |
-| Agent sessions | Create, rename, pause, resume, interrupt, retry, archive, fork, and compare persistent sessions |
+| Agent sessions | Create, rename, pause, resume, interrupt, retry, archive, permanently delete archived sessions, fork, and compare persistent sessions |
 | Agent orchestration | Plans, steps, dependencies, child agents, parallel tasks, retries, cancellation, budgets, and durable event history |
 | Model providers | Multiple hosted providers, OpenAI-compatible endpoints, local model servers, model discovery, per-session selection, fallback, and usage reporting |
 | Agent context | Repository instructions, conversation history, file references, tool results, summaries, compaction, token budgets, and context inspection |
@@ -131,6 +131,30 @@ timeline in the main canvas, and the composer at the point of control.
 Approvals, changed-file diffs, task results, and evidence open as focused review
 surfaces. File contents and repository state are read-only projections in
 M5; the client is not a general-purpose editor.
+
+## Archived session management
+
+Archiving retains a session permanently: it becomes terminal and immutable,
+and its runs, transcripts, checkpoints, filesystem root, and child worktrees
+stay in durable state. There is no restore or unarchive, and only an archived
+session or a project root can be deleted, so archived sessions accumulate until
+a user or an operator deletes them.
+
+The client provides an archived management view for that. It lists one row per
+project, with the tree's session count and the newest archive age, plus a row for
+each archived session that belongs to no project, and it offers a delete action;
+deleting a project removes its sub-agents with it, and the project context menu
+offers Delete project with a confirmation. Deleting a project root deletes the
+whole project tree, including every descendant session and its worktrees, and it
+does not have to be archived first: the backend cancels the live work first,
+interrupting the project manager's own run and then every running sub-agent, so
+a project can be removed while its manager and children are still working. Deleting a descendant
+removes only that session and still requires it to be archived. The delete
+action carries a force choice for a linked worktree that has changes or a lock:
+without it, the deletion is refused and the worktree is preserved. The retention
+policy is editable in that view rather than read-only: a user sets the window and
+the force-discard switch, the worker stores that policy durably, and it applies
+from the next sweep.
 
 ## Guiding principles
 

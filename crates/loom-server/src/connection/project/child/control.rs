@@ -276,281 +276,369 @@ impl InProcessConnection {
                 }
             }
             ProjectChildControlAction::Cancel => {
-                let admission = self.backend.admissions.project(project_id)?;
-                let admission_guard = admission.lock().map_err(|_| {
-                    LoomError::new(
-                        ErrorCode::Internal,
-                        "project scheduling lock was poisoned",
-                        true,
-                    )
-                })?;
-                // Child creation uses this same lock. Refresh the hierarchy
-                // after acquiring it so a descendant committed while this
-                // cancellation was waiting is included in the subtree walk.
-                let project = self.load_project_snapshot(project_id)?;
-                task = persistence
-                    .load_delegated_task(task_id)?
-                    .ok_or_else(|| LoomError::not_found("delegated task", task_id))?;
-                run = persistence
-                    .load_latest_run_summary_for_session(task.target_session_id)?
-                    .as_ref()
-                    .map(|summary| {
-                        self.run_summary(summary.snapshot.id)
-                            .map(|summary| summary.snapshot)
-                    })
-                    .transpose()?;
-                if let Some(snapshot) = &run {
-                    if snapshot.state == AgentRunState::Completed {
-                        drop(admission_guard);
-                        return Err(LoomError::new(
-                            ErrorCode::InvalidState,
-                            "the child run is already completed",
-                            false,
-                        ));
-                    }
-                } else if !matches!(
-                    task.status,
-                    loom_core::DelegatedTaskStatus::Queued
-                        | loom_core::DelegatedTaskStatus::Blocked
-                        | loom_core::DelegatedTaskStatus::Failed
-                        | loom_core::DelegatedTaskStatus::Cancelled
-                ) {
-                    drop(admission_guard);
-                    return Err(LoomError::new(
-                        ErrorCode::InvalidState,
-                        "the delegated task has no cancellable child run",
-                        false,
-                    ));
-                }
-
-                // Use the persisted hierarchy rather than depth alone: older or
-                // repaired snapshots may not be ordered by depth. Post-order
-                // traversal also guards against malformed cycles and duplicates.
-                let cancellation_order =
-                    project_subtree_deepest_first(&project, task.target_session_id);
-                let cascade = ProjectCancellationCascadeRecord {
-                    project_id,
-                    root_task_id: task.task_id,
-                    manager_session_id,
-                    members: cancellation_order
-                        .iter()
-                        .map(|session_id| {
-                            persistence
-                                .load_delegated_task_for_target(*session_id)?
-                                .map(|task| (task.task_id, *session_id))
-                                .ok_or_else(|| {
-                                    LoomError::new(
-                                        ErrorCode::RecoveryRequired,
-                                        "project cancellation member has no delegated task",
-                                        false,
-                                    )
-                                })
-                        })
-                        .collect::<Result<Vec<_>>>()?,
-                    created_at: Timestamp::now(),
-                };
-                let cascade = persistence.begin_project_cancellation_cascade(&cascade)?;
-                #[cfg(test)]
-                if self
-                    .backend
-                    .project_cancellation_failpoint
-                    .compare_exchange(usize::MAX, 0, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    return Err(LoomError::new(
-                        ErrorCode::RecoveryRequired,
-                        "test interruption after persisting project cancellation intent",
-                        true,
-                    ));
-                }
-                let workspace_id = self
-                    .backend
-                    .sessions()?
-                    .get(task.target_session_id)?
-                    .workspace_id;
-                let workspace_admission =
-                    self.backend.admissions.workspace_project(workspace_id)?;
-                let workspace_admission_guard = workspace_admission.lock().map_err(|_| {
-                    LoomError::new(
-                        ErrorCode::Internal,
-                        "workspace project scheduling lock was poisoned",
-                        true,
-                    )
-                })?;
-                self.abandon_project_manager_waits_owned_by(persistence, &cancellation_order)?;
-
-                // Prevent queued descendants from being started by the task
-                // reconciler triggered as active runs are interrupted.
-                for session_id in &cancellation_order {
-                    let Some(mut queued_task) =
-                        persistence.load_delegated_task_for_target(*session_id)?
-                    else {
-                        continue;
-                    };
-                    if !matches!(
-                        queued_task.status,
-                        loom_core::DelegatedTaskStatus::Completed
-                            | loom_core::DelegatedTaskStatus::Failed
-                            | loom_core::DelegatedTaskStatus::Cancelled
-                    ) && persistence
-                        .load_latest_run_summary_for_session(*session_id)?
-                        .is_none()
-                    {
-                        self.set_project_task_status(
-                            persistence,
-                            &mut queued_task,
-                            loom_core::DelegatedTaskStatus::Cancelled,
-                        )?;
-                    }
-                }
-                drop(workspace_admission_guard);
-
-                // Keep project admission locked until every run in the captured
-                // subtree has stopped. This prevents a manager from creating a
-                // new descendant after the subtree snapshot. The workspace
-                // admission lock was released above because stop_run reconciles
-                // queued tasks and waits synchronously.
-
-                for session_id in cancellation_order {
-                    let is_selected_child = session_id == task.target_session_id;
-                    let mut descendant_task =
-                        persistence.load_delegated_task_for_target(session_id)?;
-                    let latest_run = persistence.load_latest_run_summary_for_session(session_id)?;
-                    let mut descendant_run = latest_run
-                        .as_ref()
-                        .map(|summary| {
-                            self.run_summary(summary.snapshot.id)
-                                .map(|summary| summary.snapshot)
-                        })
-                        .transpose()?;
-
-                    if let Some(snapshot) = descendant_run.clone() {
-                        match snapshot.state {
-                            AgentRunState::Cancelled => {
-                                if let Some(descendant_task) = descendant_task.as_mut()
-                                    && descendant_task.status
-                                        != loom_core::DelegatedTaskStatus::Cancelled
-                                {
-                                    self.set_project_task_status(
-                                        persistence,
-                                        descendant_task,
-                                        loom_core::DelegatedTaskStatus::Cancelled,
-                                    )?;
-                                }
-                            }
-                            AgentRunState::Completed | AgentRunState::Failed => {
-                                if is_selected_child && snapshot.state == AgentRunState::Completed {
-                                    return Err(LoomError::new(
-                                        ErrorCode::InvalidState,
-                                        "the child run is already completed",
-                                        false,
-                                    ));
-                                }
-                                if let Some(descendant_task) = descendant_task.as_mut() {
-                                    let status = match snapshot.state {
-                                        AgentRunState::Completed => {
-                                            loom_core::DelegatedTaskStatus::Completed
-                                        }
-                                        AgentRunState::Failed => {
-                                            loom_core::DelegatedTaskStatus::Failed
-                                        }
-                                        _ => unreachable!("terminal state matched above"),
-                                    };
-                                    if descendant_task.status != status {
-                                        self.set_project_task_status(
-                                            persistence,
-                                            descendant_task,
-                                            status,
-                                        )?;
-                                    }
-                                }
-                            }
-                            _ => {
-                                let response = self.stop_run(snapshot.id, RunStop::Interrupt)?;
-                                let ServerResponse::Run(RunResponse::AgentRun(stopped)) = response
-                                else {
-                                    return Err(LoomError::new(
-                                        ErrorCode::Internal,
-                                        "project child cancel returned an unexpected response",
-                                        false,
-                                    ));
-                                };
-                                descendant_run = Some(stopped);
-                                if let Some(descendant_task) = descendant_task.as_mut()
-                                    && let Some(run) = descendant_run.as_ref()
-                                    && is_terminal_agent_run_state(run.state)
-                                {
-                                    self.set_project_task_status(
-                                        persistence,
-                                        descendant_task,
-                                        delegated_task_status_for_run_state(run.state),
-                                    )?;
-                                }
-                            }
-                        }
-                    } else if let Some(descendant_task) = descendant_task.as_mut()
-                        && !matches!(
-                            descendant_task.status,
-                            loom_core::DelegatedTaskStatus::Completed
-                                | loom_core::DelegatedTaskStatus::Failed
-                                | loom_core::DelegatedTaskStatus::Cancelled
-                        )
-                    {
-                        // Queued, blocked, or stale running records without a
-                        // run have no worker to interrupt and can be terminalized
-                        // directly.
-                        self.set_project_task_status(
-                            persistence,
-                            descendant_task,
-                            loom_core::DelegatedTaskStatus::Cancelled,
-                        )?;
-                    }
-
-                    if is_selected_child {
-                        task = persistence
-                            .load_delegated_task(task_id)?
-                            .ok_or_else(|| LoomError::not_found("delegated task", task_id))?;
-                        run = descendant_run;
-                    }
-
-                    #[cfg(test)]
-                    if consume_project_cancellation_failpoint(
-                        &self.backend.project_cancellation_failpoint,
-                    ) {
-                        return Err(LoomError::new(
-                            ErrorCode::RecoveryRequired,
-                            "test interruption after a durable project cancellation member update",
-                            true,
-                        ));
-                    }
-                }
-
-                // Queued direct children can become terminal without a run
-                // checkpoint, so reconcile joins and newly unblocked work once
-                // the complete subtree has been updated.
-                self.backend
-                    .reconcile_project_tasks_and_resume_queued(false)?;
-                self.backend.persist_state()?;
-                if !persistence.complete_project_cancellation_cascade(
-                    cascade.project_id,
-                    cascade.root_task_id,
-                )? {
-                    return Err(LoomError::new(
-                        ErrorCode::RecoveryRequired,
-                        "project cancellation intent disappeared before completion",
-                        true,
-                    ));
-                }
-                // The first reconciliation was fenced by the pending intent so
-                // callbacks could not admit work from this project mid-cascade.
-                self.backend
-                    .reconcile_project_tasks_and_resume_queued(false)?;
+                run = self.cancel_project_child_subtree(project_id, manager_session_id, task_id)?;
             }
         }
         task = persistence
             .load_delegated_task(task_id)?
             .ok_or_else(|| LoomError::not_found("delegated task", task_id))?;
         Ok((task, run))
+    }
+
+    /// Cancels one direct child task and its descendants, returning the
+    /// cancelled task's latest run.
+    ///
+    /// The cancellation intent is persisted for the captured subtree, every
+    /// live run in it is interrupted, its tasks are terminalized, and the
+    /// manager waits it owns are abandoned. Callers must not hold the project
+    /// admission lock: it is acquired here and the hierarchy is refreshed
+    /// afterwards, so a descendant committed while this waited is included in
+    /// the subtree walk.
+    pub(crate) fn cancel_project_child_subtree(
+        &self,
+        project_id: ProjectId,
+        manager_session_id: AgentSessionId,
+        task_id: loom_core::TaskId,
+    ) -> Result<Option<AgentRunSnapshot>> {
+        let persistence = self.backend.persistence.as_ref().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::UnsupportedCapability,
+                "project child cancellation requires durable storage",
+                false,
+            )
+        })?;
+        let admission = self.backend.admissions.project(project_id)?;
+        let _admission_guard = admission.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "project scheduling lock was poisoned",
+                true,
+            )
+        })?;
+        // Child creation uses this same lock. Refresh the hierarchy after
+        // acquiring it so a descendant committed while this cancellation was
+        // waiting is included in the subtree walk.
+        let project = self.load_project_snapshot(project_id)?;
+        let task = persistence
+            .load_delegated_task(task_id)?
+            .ok_or_else(|| LoomError::not_found("delegated task", task_id))?;
+        let mut run = persistence
+            .load_latest_run_summary_for_session(task.target_session_id)?
+            .as_ref()
+            .map(|summary| {
+                self.run_summary(summary.snapshot.id)
+                    .map(|summary| summary.snapshot)
+            })
+            .transpose()?;
+        if let Some(snapshot) = &run {
+            if snapshot.state == AgentRunState::Completed {
+                return Err(LoomError::new(
+                    ErrorCode::InvalidState,
+                    "the child run is already completed",
+                    false,
+                ));
+            }
+        } else if !matches!(
+            task.status,
+            loom_core::DelegatedTaskStatus::Queued
+                | loom_core::DelegatedTaskStatus::Blocked
+                | loom_core::DelegatedTaskStatus::Failed
+                | loom_core::DelegatedTaskStatus::Cancelled
+        ) {
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "the delegated task has no cancellable child run",
+                false,
+            ));
+        }
+
+        // Use the persisted hierarchy rather than depth alone: older or
+        // repaired snapshots may not be ordered by depth. Post-order
+        // traversal also guards against malformed cycles and duplicates.
+        let cancellation_order = project_subtree_deepest_first(&project, task.target_session_id);
+        let cascade = ProjectCancellationCascadeRecord {
+            project_id,
+            root_task_id: task.task_id,
+            manager_session_id,
+            members: cancellation_order
+                .iter()
+                .map(|session_id| {
+                    persistence
+                        .load_delegated_task_for_target(*session_id)?
+                        .map(|task| (task.task_id, *session_id))
+                        .ok_or_else(|| {
+                            LoomError::new(
+                                ErrorCode::RecoveryRequired,
+                                "project cancellation member has no delegated task",
+                                false,
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            created_at: Timestamp::now(),
+        };
+        let cascade = persistence.begin_project_cancellation_cascade(&cascade)?;
+        #[cfg(test)]
+        if self
+            .backend
+            .project_cancellation_failpoint
+            .compare_exchange(usize::MAX, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Err(LoomError::new(
+                ErrorCode::RecoveryRequired,
+                "test interruption after persisting project cancellation intent",
+                true,
+            ));
+        }
+        let workspace_id = self
+            .backend
+            .sessions()?
+            .get(task.target_session_id)?
+            .workspace_id;
+        let workspace_admission = self.backend.admissions.workspace_project(workspace_id)?;
+        let workspace_admission_guard = workspace_admission.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "workspace project scheduling lock was poisoned",
+                true,
+            )
+        })?;
+        self.abandon_project_manager_waits_owned_by(persistence, &cancellation_order)?;
+
+        // Prevent queued descendants from being started by the task
+        // reconciler triggered as active runs are interrupted.
+        for session_id in &cancellation_order {
+            let Some(mut queued_task) = persistence.load_delegated_task_for_target(*session_id)?
+            else {
+                continue;
+            };
+            if !matches!(
+                queued_task.status,
+                loom_core::DelegatedTaskStatus::Completed
+                    | loom_core::DelegatedTaskStatus::Failed
+                    | loom_core::DelegatedTaskStatus::Cancelled
+            ) && persistence
+                .load_latest_run_summary_for_session(*session_id)?
+                .is_none()
+            {
+                self.set_project_task_status(
+                    persistence,
+                    &mut queued_task,
+                    loom_core::DelegatedTaskStatus::Cancelled,
+                )?;
+            }
+        }
+        drop(workspace_admission_guard);
+
+        // Keep project admission locked until every run in the captured
+        // subtree has stopped. This prevents a manager from creating a
+        // new descendant after the subtree snapshot. The workspace
+        // admission lock was released above because stop_run reconciles
+        // queued tasks and waits synchronously.
+
+        for session_id in cancellation_order {
+            let is_selected_child = session_id == task.target_session_id;
+            let mut descendant_task = persistence.load_delegated_task_for_target(session_id)?;
+            let latest_run = persistence.load_latest_run_summary_for_session(session_id)?;
+            let mut descendant_run = latest_run
+                .as_ref()
+                .map(|summary| {
+                    self.run_summary(summary.snapshot.id)
+                        .map(|summary| summary.snapshot)
+                })
+                .transpose()?;
+
+            if let Some(snapshot) = descendant_run.clone() {
+                match snapshot.state {
+                    AgentRunState::Cancelled => {
+                        if let Some(descendant_task) = descendant_task.as_mut()
+                            && descendant_task.status != loom_core::DelegatedTaskStatus::Cancelled
+                        {
+                            self.set_project_task_status(
+                                persistence,
+                                descendant_task,
+                                loom_core::DelegatedTaskStatus::Cancelled,
+                            )?;
+                        }
+                    }
+                    AgentRunState::Completed | AgentRunState::Failed => {
+                        if is_selected_child && snapshot.state == AgentRunState::Completed {
+                            return Err(LoomError::new(
+                                ErrorCode::InvalidState,
+                                "the child run is already completed",
+                                false,
+                            ));
+                        }
+                        if let Some(descendant_task) = descendant_task.as_mut() {
+                            let status = match snapshot.state {
+                                AgentRunState::Completed => {
+                                    loom_core::DelegatedTaskStatus::Completed
+                                }
+                                AgentRunState::Failed => loom_core::DelegatedTaskStatus::Failed,
+                                _ => unreachable!("terminal state matched above"),
+                            };
+                            if descendant_task.status != status {
+                                self.set_project_task_status(persistence, descendant_task, status)?;
+                            }
+                        }
+                    }
+                    _ => {
+                        let response = self.stop_run(snapshot.id, RunStop::Interrupt)?;
+                        let ServerResponse::Run(RunResponse::AgentRun(stopped)) = response else {
+                            return Err(LoomError::new(
+                                ErrorCode::Internal,
+                                "project child cancel returned an unexpected response",
+                                false,
+                            ));
+                        };
+                        descendant_run = Some(stopped);
+                        if let Some(descendant_task) = descendant_task.as_mut()
+                            && let Some(run) = descendant_run.as_ref()
+                            && is_terminal_agent_run_state(run.state)
+                        {
+                            self.set_project_task_status(
+                                persistence,
+                                descendant_task,
+                                delegated_task_status_for_run_state(run.state),
+                            )?;
+                        }
+                    }
+                }
+            } else if let Some(descendant_task) = descendant_task.as_mut()
+                && !matches!(
+                    descendant_task.status,
+                    loom_core::DelegatedTaskStatus::Completed
+                        | loom_core::DelegatedTaskStatus::Failed
+                        | loom_core::DelegatedTaskStatus::Cancelled
+                )
+            {
+                // Queued, blocked, or stale running records without a
+                // run have no worker to interrupt and can be terminalized
+                // directly.
+                self.set_project_task_status(
+                    persistence,
+                    descendant_task,
+                    loom_core::DelegatedTaskStatus::Cancelled,
+                )?;
+            }
+
+            if is_selected_child {
+                run = descendant_run;
+            }
+
+            #[cfg(test)]
+            if consume_project_cancellation_failpoint(&self.backend.project_cancellation_failpoint)
+            {
+                return Err(LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    "test interruption after a durable project cancellation member update",
+                    true,
+                ));
+            }
+        }
+
+        // Queued direct children can become terminal without a run
+        // checkpoint, so reconcile joins and newly unblocked work once
+        // the complete subtree has been updated.
+        self.backend
+            .reconcile_project_tasks_and_resume_queued(false)?;
+        self.backend.persist_state()?;
+        if !persistence
+            .complete_project_cancellation_cascade(cascade.project_id, cascade.root_task_id)?
+        {
+            return Err(LoomError::new(
+                ErrorCode::RecoveryRequired,
+                "project cancellation intent disappeared before completion",
+                true,
+            ));
+        }
+        // The first reconciliation was fenced by the pending intent so
+        // callbacks could not admit work from this project mid-cascade.
+        self.backend
+            .reconcile_project_tasks_and_resume_queued(false)?;
+        Ok(run)
+    }
+
+    /// Cancels the live work of `project` before the deletion path removes it.
+    ///
+    /// The deletion path uses this so a project with live sub-agents can be
+    /// deleted immediately instead of waiting for its tree to finish. A project
+    /// whose top-level tasks are all terminal and whose root session has no
+    /// loaded live run has no live work and needs nothing here.
+    ///
+    /// The manager's own run of the root session is interrupted first, because a
+    /// manager that is running or parked in `wait_for_project_children` owns a
+    /// non-terminal run that the backend deletion guard refuses. Stopping it
+    /// first also stops it from committing new children while the tree is
+    /// cancelled. The project admission lock is deliberately not held across
+    /// that call: `stop_run` reconciles the project and takes the same lock
+    /// itself.
+    ///
+    /// The project snapshot is re-read afterwards, so a child the manager
+    /// committed before it stopped is still cancelled, and each non-terminal
+    /// top-level task subtree is cancelled through `cancel_project_child_subtree`,
+    /// which takes the project admission lock itself and refreshes the hierarchy
+    /// under it. A task created after that last reload is refused by the backend
+    /// task guard; the race is retryable, and a retried request observes and
+    /// cancels the newer task.
+    pub(crate) fn cancel_project_live_work(&self, project: &ProjectSnapshot) -> Result<()> {
+        self.interrupt_project_root_runs(project.root_session_id)?;
+        let project = self.load_project_snapshot(project.project_id)?;
+        let live_tasks = project
+            .tasks
+            .iter()
+            .filter(|task| task.requester_session_id == project.root_session_id)
+            .filter(|task| {
+                !matches!(
+                    task.status,
+                    loom_core::DelegatedTaskStatus::Completed
+                        | loom_core::DelegatedTaskStatus::Failed
+                        | loom_core::DelegatedTaskStatus::Cancelled
+                )
+            })
+            .map(|task| task.task_id)
+            .collect::<Vec<_>>();
+        if live_tasks.is_empty() {
+            return Ok(());
+        }
+        log::info!(
+            "[loom-server] cancelling {} live top-level task(s) of project {} before its deletion",
+            live_tasks.len(),
+            project.project_id
+        );
+        for task_id in live_tasks {
+            self.cancel_project_child_subtree(
+                project.project_id,
+                project.root_session_id,
+                task_id,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Interrupts every non-terminal run that this process has loaded for
+    /// `session_id`, which is the project manager's own run for a project root.
+    ///
+    /// A persisted run summary without a loaded handle is left alone: it has no
+    /// executor that could keep working, so it cannot commit new children and
+    /// the deletion guard ignores it.
+    fn interrupt_project_root_runs(&self, session_id: AgentSessionId) -> Result<()> {
+        let run_ids = self
+            .backend
+            .runs()?
+            .iter()
+            .filter(|(_, handle)| handle.session_id == session_id)
+            .filter(|(_, handle)| !is_terminal_agent_run_state(handle.snapshot().state))
+            .map(|(run_id, _)| *run_id)
+            .collect::<Vec<_>>();
+        for run_id in run_ids {
+            log::info!(
+                "[loom-server] interrupting run {run_id} of project root {session_id} before its deletion"
+            );
+            self.stop_run(run_id, RunStop::Interrupt)?;
+        }
+        Ok(())
     }
 }
 

@@ -8,6 +8,7 @@ gpui_kit::assets::icon_assets!(
     pub(crate) LoomAssets,
     [
         // Loom controls and timeline.
+        Archive,
         ArrowDown,
         ArrowUp,
         BotMessageSquare,

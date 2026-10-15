@@ -136,9 +136,11 @@ impl LoomView {
         if let Some(projection) = fallback.as_ref() {
             self.seed_plan_from_projection(projection);
         }
-        if self.timeline.is_empty()
-            && let Some(projection) = fallback
-        {
+        // The durable run projection is applied whether or not the batch
+        // produced timeline items. Suppressing it would drop the run's control
+        // state, the transcript page that rebuilds the conversation, and the
+        // run polling that keeps it streaming.
+        if let Some(projection) = fallback {
             self.apply_run_projection(projection);
         }
     }

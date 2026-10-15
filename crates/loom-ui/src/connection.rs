@@ -297,6 +297,8 @@ const SHARED_NEGOTIATION_CAPABILITIES: &[Capability] = &[
     Capability::CreateAgentSession,
     Capability::ReadAgentSession,
     Capability::ControlAgentSession,
+    Capability::DeleteAgentSession,
+    Capability::ConfigureArchiveRetention,
     Capability::ManageWorkspaces,
     Capability::ManageSessionRepositories,
     Capability::ReadSessionFilesystem,
@@ -403,6 +405,7 @@ pub(crate) async fn worker_node_status_async(
     let response = request_with_timeout(
         connection,
         RequestEnvelope::new(ClientRequest::Control(ControlRequest::GetWorkerNodeStatus)),
+        BROWSER_REQUEST_TIMEOUT_MILLIS,
     )
     .await?;
     match response.result? {
@@ -411,10 +414,42 @@ pub(crate) async fn worker_node_status_async(
     }
 }
 
+/// Confirms that a browser transport which still looks open really answers.
+///
+/// A page that was hidden can leave a socket that never reports its close, so
+/// the view asks for the worker node status over the same connection and only
+/// treats the connection as usable when a well-formed status arrives in time.
+#[cfg(target_family = "wasm")]
+pub(crate) async fn probe_worker_connection(
+    connection: &ClientConnection,
+) -> Result<(), LoomError> {
+    let response = request_with_timeout(
+        connection,
+        RequestEnvelope::new(ClientRequest::Control(ControlRequest::GetWorkerNodeStatus)),
+        BROWSER_PROBE_TIMEOUT_MILLIS,
+    )
+    .await?;
+    match response.result? {
+        ServerResponse::Control(ControlResponse::WorkerNodeStatus(_)) => Ok(()),
+        response => Err(unexpected_response("worker node status", response)),
+    }
+}
+
+/// How long a browser request waits for its response before the caller treats
+/// the worker as unreachable.
+#[cfg(target_family = "wasm")]
+const BROWSER_REQUEST_TIMEOUT_MILLIS: i32 = 15_000;
+
+/// How long the resume probe waits for the worker to confirm a socket that
+/// still looks open, kept short so returning to a tab answers quickly.
+#[cfg(target_family = "wasm")]
+const BROWSER_PROBE_TIMEOUT_MILLIS: i32 = 5_000;
+
 #[cfg(target_family = "wasm")]
 async fn request_with_timeout(
     connection: &ClientConnection,
     request: RequestEnvelope,
+    timeout_millis: i32,
 ) -> Result<ResponseEnvelope, LoomError> {
     let request = Box::pin(connection.request(request));
     let (timeout_sender, timeout_receiver) = oneshot::channel::<()>();
@@ -431,7 +466,7 @@ async fn request_with_timeout(
     let timeout_handle = window
         .set_timeout_with_callback_and_timeout_and_arguments_0(
             timeout_callback.as_ref().unchecked_ref(),
-            15_000,
+            timeout_millis,
         )
         .map_err(|_| {
             LoomError::new(
@@ -543,6 +578,7 @@ pub(crate) async fn negotiate_async(
             client_version: CURRENT_PROTOCOL_VERSION,
             capabilities: negotiation_capabilities(),
         })),
+        BROWSER_REQUEST_TIMEOUT_MILLIS,
     )
     .await?;
     match response.result? {

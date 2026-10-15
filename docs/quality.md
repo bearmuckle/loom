@@ -24,6 +24,7 @@ representative slices of real work:
 | `inspect_workspace` | Read-only exploration (`list_files`, `read_file`) then a summary turn | Read-only concurrency and the exploration loop |
 | `edit_and_validate` | A mutating `apply_patch`, then `run_command` validation, then a summary turn | The write/execute path and multi-turn completion |
 | `recover_from_tool_error` | A failing `apply_patch`, then a corrected call, then a summary turn | Tool-error feedback and recovery rather than a stuck run |
+| `recover_from_undecodable_call` | An `InvalidToolCall` whose argument payload cannot be decoded, a valid call in the same turn, then a summary turn | In-turn tool error for an undecodable call so the model resends it instead of the run failing |
 
 A separate search fixture writes a bounded workspace and measures
 `search_text` latency, and asserts the search actually returns the needle so the

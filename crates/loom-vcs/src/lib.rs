@@ -314,6 +314,30 @@ impl GitService {
     }
 
     pub fn diff(&self, path: Option<&str>, staged: bool) -> Result<GitDiff> {
+        self.render_diff(path, staged, None)
+    }
+
+    /// Renders a diff bounded to `max_bytes`.
+    ///
+    /// The bound keeps whole lines and ends on a line boundary. Where it cuts
+    /// through a hunk, that hunk declares the lines it actually carries, so a
+    /// bounded render stays a valid patch and `hunks` describes exactly what
+    /// `patch` contains.
+    pub fn diff_limited(
+        &self,
+        path: Option<&str>,
+        staged: bool,
+        max_bytes: usize,
+    ) -> Result<GitDiff> {
+        self.render_diff(path, staged, Some(max_bytes))
+    }
+
+    fn render_diff(
+        &self,
+        path: Option<&str>,
+        staged: bool,
+        max_bytes: Option<usize>,
+    ) -> Result<GitDiff> {
         let normalized = path.map(|path| self.validate_path(path)).transpose()?;
         let repository = self.repository()?;
         let mut options = DiffOptions::new();
@@ -337,7 +361,7 @@ impl GitService {
                 .diff_index_to_workdir(None, Some(&mut options))
                 .map_err(|error| git_error("could not create Git diff", error))?
         };
-        render_git_diff(diff, normalized, staged, None)
+        render_git_diff(diff, normalized, staged, max_bytes)
     }
 
     /// Compares a base commit with the current index and working tree.
@@ -1037,6 +1061,30 @@ impl GitService {
         Self::open(registered_path)
     }
 
+    /// Reports whether a named linked worktree is locked.
+    ///
+    /// A worktree that is no longer registered is reported as unlocked so a
+    /// caller can treat a missing registration as an already removed checkout.
+    pub fn linked_worktree_is_locked(&self, worktree_name: &str) -> Result<bool> {
+        validate_worktree_name(worktree_name)?;
+        let repository = self.repository()?;
+        let worktree = match repository.find_worktree(worktree_name) {
+            Ok(worktree) => worktree,
+            Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(git_error("could not find registered Git worktree", error));
+            }
+        };
+        match worktree.is_locked() {
+            Ok(WorktreeLockStatus::Locked(_)) => Ok(true),
+            Ok(WorktreeLockStatus::Unlocked) => Ok(false),
+            Err(error) => Err(git_error(
+                "could not inspect Git worktree lock state",
+                error,
+            )),
+        }
+    }
+
     /// Removes a named linked worktree and prunes its Git metadata.
     ///
     /// A worktree with tracked, untracked, ignored, or staged changes is kept
@@ -1194,17 +1242,29 @@ fn render_git_diff(
     let mut patch = Vec::new();
     let mut hunks: Vec<GitDiffHunk> = Vec::new();
     let mut truncated = false;
+    // Where the open hunk's header starts in the patch, so a hunk whose body
+    // did not fit at all can be removed whole, and the end of the last hunk
+    // that arrived complete, so a cut between hunks keeps only whole output.
+    let mut hunk_patch_start = 0usize;
+    let mut whole_patch_len = 0usize;
+    let mut whole_hunks = 0usize;
+    let mut old_used = 0u32;
+    let mut new_used = 0u32;
     let print_result = diff.print(DiffFormat::Patch, |_delta, hunk, line| {
         let new_hunk = hunk.and_then(|hunk| {
             let is_new = hunks.last().is_none_or(|last| {
                 last.old_start != hunk.old_start() || last.new_start != hunk.new_start()
             });
-            is_new.then(|| GitDiffHunk {
-                old_start: hunk.old_start(),
-                old_lines: hunk.old_lines(),
-                new_start: hunk.new_start(),
-                new_lines: hunk.new_lines(),
-                lines: Vec::new(),
+            is_new.then(|| {
+                old_used = 0;
+                new_used = 0;
+                GitDiffHunk {
+                    old_start: hunk.old_start(),
+                    old_lines: hunk.old_lines(),
+                    new_start: hunk.new_start(),
+                    new_lines: hunk.new_lines(),
+                    lines: Vec::new(),
+                }
             })
         });
         let origin = line.origin();
@@ -1213,9 +1273,30 @@ fn render_git_diff(
         let output_line_len = contents.len() + usize::from(has_prefix);
         if max_bytes.is_some_and(|limit| output_line_len > limit.saturating_sub(patch.len())) {
             truncated = true;
+            if has_prefix && new_hunk.is_none() {
+                // The cut landed in the open hunk's body: keep the lines that
+                // fit under counts that describe them.
+                match hunks.last_mut() {
+                    Some(hunk) if hunk.lines.is_empty() => {
+                        patch.truncate(hunk_patch_start);
+                        hunks.pop();
+                    }
+                    Some(hunk) => {
+                        hunk.old_lines = old_used;
+                        hunk.new_lines = new_used;
+                    }
+                    None => {}
+                }
+            } else {
+                // The cut landed between hunks or inside a file header, so drop
+                // the partial tail and keep the last whole hunk.
+                patch.truncate(whole_patch_len);
+                hunks.truncate(whole_hunks);
+            }
             return false;
         }
         if let Some(hunk) = new_hunk {
+            hunk_patch_start = patch.len();
             hunks.push(hunk);
         }
         if has_prefix {
@@ -1235,9 +1316,25 @@ fn render_git_diff(
                         .trim_end_matches('\r')
                         .to_owned(),
                 });
+                match origin {
+                    '+' => new_used += 1,
+                    '-' => old_used += 1,
+                    _ => {
+                        old_used += 1;
+                        new_used += 1;
+                    }
+                }
             }
         }
         patch.extend_from_slice(contents);
+        if has_prefix
+            && hunks
+                .last()
+                .is_some_and(|hunk| old_used == hunk.old_lines && new_used == hunk.new_lines)
+        {
+            whole_patch_len = patch.len();
+            whole_hunks = hunks.len();
+        }
         true
     });
     if let Err(error) = print_result
@@ -1710,6 +1807,66 @@ mod tests {
         assert_eq!(diff.hunks[0].lines[1].kind, GitDiffLineKind::Added);
         let untracked = git.diff(Some("new.txt"), false).unwrap();
         assert_eq!(untracked.hunks[0].lines[0].content, "new");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_bounded_diff_keeps_whole_lines_under_counts_that_match_them() {
+        let (git, root) = repository();
+        let before = (1..=40)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        fs::write(root.join("README.md"), &before).unwrap();
+        run(&root, &["add", "--", "README.md"]);
+        run(&root, &["commit", "-qm", "many lines"]);
+        let after = before
+            .replace("line 1\n", "first\n")
+            .replace("line 40\n", "last\n");
+        fs::write(root.join("README.md"), &after).unwrap();
+
+        let full = git.diff(Some("README.md"), false).unwrap();
+        assert_eq!(full.hunks.len(), 2, "patch: {}", full.patch);
+        // A budget that lets the last hunk's header and part of its body in.
+        let budget = full.patch.rfind("@@ ").unwrap() + 40;
+        let limited = git.diff_limited(Some("README.md"), false, budget).unwrap();
+        assert!(limited.truncated);
+        assert!(full.patch.starts_with(&limited.patch));
+        assert_eq!(limited.hunks.len(), 2);
+        assert_eq!(
+            limited.hunks[0].lines.len(),
+            full.hunks[0].lines.len(),
+            "a hunk that arrived whole is kept whole"
+        );
+        assert!(limited.hunks[1].lines.len() < full.hunks[1].lines.len());
+
+        let hunk = limited.hunks.last().unwrap();
+        let mut counted = (0u32, 0u32);
+        let mut body = String::new();
+        for line in &hunk.lines {
+            let marker = match line.kind {
+                GitDiffLineKind::Added => {
+                    counted.1 += 1;
+                    '+'
+                }
+                GitDiffLineKind::Removed => {
+                    counted.0 += 1;
+                    '-'
+                }
+                GitDiffLineKind::Context => {
+                    counted.0 += 1;
+                    counted.1 += 1;
+                    ' '
+                }
+            };
+            body.push(marker);
+            body.push_str(&line.content);
+            body.push('\n');
+        }
+        // The cut hunk declares exactly the lines its patch carries, and those
+        // lines end the patch, so the bounded render is a patch a client can
+        // display as sent.
+        assert_eq!((hunk.old_lines, hunk.new_lines), counted);
+        assert!(limited.patch.ends_with(&body));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2332,6 +2489,49 @@ mod tests {
                 .iter()
                 .any(|branch| branch.name == branch_name)
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linked_worktree_lock_state_gates_removal() {
+        let (git, root) = repository();
+        let base_commit = git.repository().unwrap().head().unwrap().target().unwrap();
+        let id = loom_core::RepositoryId::new();
+        let worktree_name = format!("child-{id}");
+        let branch_name = format!("codex/child-{id}");
+        let path = std::env::temp_dir().join(format!("loom-linked-{id}"));
+        git.create_linked_worktree(&worktree_name, &branch_name, &path, base_commit)
+            .unwrap();
+        assert!(!git.linked_worktree_is_locked(&worktree_name).unwrap());
+        assert!(
+            !git.linked_worktree_is_locked(&format!("missing-{id}"))
+                .unwrap()
+        );
+
+        git.repository()
+            .unwrap()
+            .find_worktree(&worktree_name)
+            .unwrap()
+            .lock(Some("loom test"))
+            .unwrap();
+        assert!(git.linked_worktree_is_locked(&worktree_name).unwrap());
+        assert_eq!(
+            git.remove_linked_worktree(&worktree_name, false)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        assert!(path.exists());
+
+        git.repository()
+            .unwrap()
+            .find_worktree(&worktree_name)
+            .unwrap()
+            .unlock()
+            .unwrap();
+        assert!(!git.linked_worktree_is_locked(&worktree_name).unwrap());
+        git.remove_linked_worktree(&worktree_name, false).unwrap();
+        assert!(!path.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

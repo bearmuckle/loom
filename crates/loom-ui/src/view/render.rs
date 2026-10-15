@@ -1,5 +1,6 @@
 use super::*;
 
+mod archive;
 mod composer;
 mod dialogs;
 mod inspector;

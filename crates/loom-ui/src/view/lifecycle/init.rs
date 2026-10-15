@@ -260,7 +260,10 @@ impl LoomView {
             project_poll_scheduled: false,
             session_trees: BTreeMap::new(),
             session_tree_entries: BTreeMap::new(),
+            session_tree_active: BTreeMap::new(),
             collapsed_worker_nodes: BTreeSet::new(),
+            session_sources: BTreeMap::new(),
+            session_source_lookups: BTreeMap::new(),
             node_session_load_errors: BTreeMap::new(),
             active_session: session.clone(),
             active_run: run.clone(),
@@ -283,6 +286,7 @@ impl LoomView {
                 model_provider_names,
             )]),
             model_catalog_node_id: Some(default_backend_node_id.clone()),
+            archived_sessions: ArchivedSessionsState::default(),
             model_refreshes_in_flight: BTreeSet::new(),
             model_catalog_refreshed_at: BTreeMap::new(),
             model_select: None,
@@ -359,6 +363,7 @@ impl LoomView {
             selected_repository_id: None,
             session_drawer_open: false,
             rename_dialog: None,
+            project_delete_dialog: None,
             source_dialog: None,
             #[cfg(target_family = "wasm")]
             welcome_dialog_dismissed: false,
@@ -456,7 +461,10 @@ impl LoomView {
             project_poll_scheduled: false,
             session_trees: BTreeMap::new(),
             session_tree_entries: BTreeMap::new(),
+            session_tree_active: BTreeMap::new(),
             collapsed_worker_nodes: BTreeSet::new(),
+            session_sources: BTreeMap::new(),
+            session_source_lookups: BTreeMap::new(),
             node_session_load_errors: BTreeMap::new(),
             active_session,
             active_run: None,
@@ -505,6 +513,7 @@ impl LoomView {
             model_select_choices: BTreeMap::new(),
             default_model_select_choices: BTreeMap::new(),
             settings_open: options.is_configured(),
+            archived_sessions: ArchivedSessionsState::default(),
             settings_section: SettingsSection::Agents,
             providers: Vec::new(),
             providers_node_id: None,
@@ -577,6 +586,7 @@ impl LoomView {
             selected_repository_id: None,
             session_drawer_open: false,
             rename_dialog: None,
+            project_delete_dialog: None,
             source_dialog: None,
             #[cfg(target_family = "wasm")]
             welcome_dialog_dismissed: false,
@@ -597,6 +607,8 @@ impl LoomView {
             browser_workspace: options.workspace().map(str::to_owned),
             browser_model: options.model().cloned(),
             browser_window_initialized: true,
+            visibility_subscription: None,
+            browser_resume_in_flight: false,
             browser_startup_error: startup_error,
             browser_connection_lost: None,
         }
@@ -736,7 +748,10 @@ impl LoomView {
             project_poll_scheduled: false,
             session_trees: BTreeMap::new(),
             session_tree_entries: BTreeMap::new(),
+            session_tree_active: BTreeMap::new(),
             collapsed_worker_nodes: BTreeSet::new(),
+            session_sources: BTreeMap::new(),
+            session_source_lookups: BTreeMap::new(),
             node_session_load_errors: BTreeMap::new(),
             active_session: session.clone(),
             active_run: None,
@@ -835,10 +850,12 @@ impl LoomView {
             selected_repository_id: None,
             session_drawer_open: false,
             rename_dialog: None,
+            project_delete_dialog: None,
             source_dialog: None,
             #[cfg(target_family = "wasm")]
             welcome_dialog_dismissed: false,
             demo_workspace: false,
+            archived_sessions: ArchivedSessionsState::default(),
             login_enabled: true,
             github_connected: false,
             github_repository_connected: false,
@@ -855,6 +872,8 @@ impl LoomView {
             browser_workspace: options.workspace().map(str::to_owned),
             browser_model: options.model().cloned(),
             browser_window_initialized: false,
+            visibility_subscription: None,
+            browser_resume_in_flight: false,
             browser_startup_error: None,
             browser_connection_lost: None,
         };
@@ -1319,6 +1338,87 @@ impl LoomView {
         }
     }
 
+    /// Registers the page-visibility observer that resumes the worker
+    /// connection once the browser tab becomes visible again. Called from the
+    /// wasm-only window-initialization block; a no-op once registered.
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn observe_browser_visibility(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.visibility_subscription.is_some() {
+            return;
+        }
+        let view = cx.entity().downgrade();
+        self.visibility_subscription = Some(window.observe_window_visibility(
+            move |visibility, _window, cx| {
+                if !visibility.is_visible() {
+                    return;
+                }
+                let _ = view.update(cx, |view, cx| view.resume_browser_connection(cx));
+            },
+        ));
+    }
+
+    /// Restores the browser connection after the page became visible again.
+    ///
+    /// A close the browser reported while the tab was hidden is folded in
+    /// first, because nothing observed it at the time, and then the recorded
+    /// state decides between reconnecting, confirming a socket that still
+    /// looks open, and doing nothing.
+    #[cfg(target_family = "wasm")]
+    fn resume_browser_connection(&mut self, cx: &mut Context<Self>) {
+        self.detect_browser_connection_loss(cx);
+        let configured = match BrowserOptions::from_location() {
+            Ok(options) => options.is_configured(),
+            Err(error) => {
+                log::warn!("[loom-ui] could not read saved worker settings: {error}");
+                false
+            }
+        };
+        match browser_resumption(
+            self.browser_demo_mode,
+            self.connected,
+            self.browser_connection_lost.is_some(),
+            configured,
+        ) {
+            BrowserResumption::Ignore => {}
+            BrowserResumption::Reconnect => self.reconnect_browser(cx),
+            BrowserResumption::Verify => self.verify_browser_connection(cx),
+        }
+    }
+
+    /// Probes a connection the view still believes is open, and reconnects when
+    /// the probe fails. A socket that died while the tab was hidden reports no
+    /// close, so without the probe every later request would wait out its
+    /// timeout before the view noticed.
+    #[cfg(target_family = "wasm")]
+    fn verify_browser_connection(&mut self, cx: &mut Context<Self>) {
+        if self.browser_resume_in_flight {
+            return;
+        }
+        self.browser_resume_in_flight = true;
+        let connection = self.connection.clone();
+        let view = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let result = probe_worker_connection(&connection).await;
+            view.update(cx, |view, cx| {
+                view.browser_resume_in_flight = false;
+                match result {
+                    Ok(()) => log::debug!("[loom-ui] the worker answered the resume probe"),
+                    Err(error) => {
+                        log::warn!("[loom-ui] the worker did not answer the resume probe: {error}");
+                        view.record_status("Worker did not answer; reconnecting");
+                        view.on_browser_connection_lost(error.to_string(), cx);
+                        view.reconnect_browser(cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
     #[cfg(target_family = "wasm")]
     fn on_browser_connection_lost(&mut self, reason: String, cx: &mut Context<Self>) {
         if !self.connected {
@@ -1335,9 +1435,14 @@ impl LoomView {
 
     /// Reconnects the browser client to the saved worker by re-running the same
     /// bootstrap as a first connect, so projects, sessions, and models reload
-    /// from the backend instead of from client state that may be stale.
+    /// from the backend instead of from client state that may be stale. Refuses
+    /// to start a second bootstrap while one is already in flight.
     #[cfg(target_family = "wasm")]
     pub(crate) fn reconnect_browser(&mut self, cx: &mut Context<Self>) {
+        if self.browser_resume_in_flight {
+            log::debug!("[loom-ui] a browser reconnect attempt is already in flight");
+            return;
+        }
         let options = match BrowserOptions::from_location() {
             Ok(options) if options.is_configured() && !options.demo() => options,
             Ok(_) => {
@@ -1354,6 +1459,7 @@ impl LoomView {
             }
         };
         let focus_handle = self.composer_focus_handle.clone();
+        self.browser_resume_in_flight = true;
         let view = cx.entity();
         cx.spawn(async move |_, cx| {
             let result = LoomView::try_new_browser(&options, focus_handle).await;
@@ -1369,6 +1475,7 @@ impl LoomView {
                     }
                 }
                 Err(error) => {
+                    view.browser_resume_in_flight = false;
                     view.connected = false;
                     view.browser_connection_lost = Some(error.to_string());
                     view.record_status(format!("Reconnect failed: {error}"));

@@ -120,9 +120,21 @@ impl AgentRuntime {
 
     pub(crate) fn finish_failed(&mut self, reason: impl Into<String>) -> Vec<AgentEvent> {
         let reason = reason.into();
+        // Every producer of a failed run routes through here, so this one line
+        // reports the failure reason for the whole runtime.
+        log::warn!(
+            "agent run {} failed in session {} (attempt {}, model {}): {reason}",
+            self.run.id,
+            self.run.session_id,
+            self.run.attempt_id,
+            self.run.model.as_str()
+        );
         let mut events = self.set_state(AgentRunState::Failed);
         self.run.completed_at = Some(Timestamp::now());
-        self.run.summary = Some(format!("Agent failed: {reason}"));
+        self.run.summary = Some(format!(
+            "{}{reason}",
+            loom_model::AGENT_RUN_FAILURE_SUMMARY_PREFIX
+        ));
         events.push(AgentEvent::RunCompleted {
             snapshot: self.run.clone(),
         });

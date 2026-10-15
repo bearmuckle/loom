@@ -325,6 +325,31 @@ stable for that instance, and its display name includes the host name plus a
 short ID suffix so separate backend processes on one host remain distinguishable.
 Clients should render unavailable values as `n/a`.
 
+`GetArchiveRetentionPolicy` is read-only and returns
+`archive_retention_policy { retention_ms, force_discard_worktrees }`. It
+requires the `read_worker_node_status` capability. `retention_ms` is `null` or
+zero when retention is disabled.
+
+`SetArchiveRetentionPolicy { policy }` replaces that policy and answers with the
+normalized policy that was stored, so the caller sees exactly what the worker
+will apply from its next sweep. It is a retryable mutation and requires the
+separate `configure_archive_retention` capability, so a client that may only
+read the worker status cannot turn automatic deletion on. A zero or absent
+`retention_ms` disables retention while `force_discard_worktrees` is kept as
+sent. The policy is stored in durable state and survives a restart; changing it
+takes effect at the next sweep, because a change does not start one, and it
+requires durable storage, so an in-memory worker refuses the request with
+`unsupported_capability`.
+
+A worker resolves its retention policy at startup in one order: an explicit
+`--archive-retention`/`LOOM_ARCHIVE_RETENTION` window (with
+`--archive-retention-force-discard`/`LOOM_ARCHIVE_RETENTION_FORCE_DISCARD`) wins
+over the persisted policy and is persisted in turn, otherwise the policy loaded
+when the durable state was opened applies, otherwise retention is disabled. The
+startup log names the source that won. Automatic deletion itself remains an
+internal backend operation rather than a client request: a client reads or sets
+the active policy and observes the resulting session removals.
+
 Session-card indicators pulse smoothly only while CPU usage is above the
 workspace-configured threshold. The online color changes to red only after
 three consecutive 10-second status polls report both CPU and RAM above 90%;
@@ -335,6 +360,7 @@ The existing M1-M4 mutations remain the control surface:
 
 ```text
 CreateAgentSession / RenameAgentSession / ArchiveAgentSession
+DeleteAgentSession
 StartAgentRun / SendAgentMessage
 PauseAgentRun / ResumeAgentRun / InterruptAgentRun
 ApproveAgentAction / RejectAgentAction / RetryAgentStep
@@ -342,6 +368,17 @@ ApproveAgentAction / RejectAgentAction / RetryAgentStep
 
 `ArchiveAgentSession` interrupts a non-terminal run for the session before
 archiving it, so clients do not need to issue a separate interrupt request.
+
+`DeleteAgentSession { session_id, force }` deletes an archived session and
+returns `agent_session_deleted { session_id }`. It is a retryable mutation and
+requires the separate `delete_agent_session` capability. Only archived sessions
+can be deleted, and `Archived` is terminal: there is no restore or unarchive,
+so an archived session is immutable until it is deleted. Deleting a project
+root deletes every descendant session of that project in one operation, using
+the same project snapshot and cascade order as archiving. The `force` flag
+allows discarding a dirty or locked linked worktree that would otherwise
+refuse the deletion; without it, such a project is refused, and the caller
+decides whether to force it.
 
 Session and run snapshots must be sufficient to render the active
 conversation, plan, step state, tool calls, approvals, bounded output,

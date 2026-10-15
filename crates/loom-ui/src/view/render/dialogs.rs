@@ -1,6 +1,145 @@
 use super::*;
+use crate::view::archive::{PROJECT_DELETE_CANCELLATION, project_deletion_consequence};
+use gpui_kit::component::checkbox::Checkbox;
 
 impl LoomView {
+    /// The confirmation an archived project deletion goes through.
+    ///
+    /// It covers the whole window, so it also covers the full-screen
+    /// archived-sessions surface that usually opens it. Nothing is submitted
+    /// until Delete is pressed, and a refusal keeps the dialog open with the
+    /// backend's reason so the deletion can be retried.
+    pub(crate) fn render_project_delete_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(dialog) = &self.project_delete_dialog else {
+            return div().into_any();
+        };
+        let in_flight = dialog.in_flight;
+        let consequence = project_deletion_consequence(&dialog.name, dialog.session_count);
+        let mut card = div()
+            .id("project-delete-card")
+            .test_support()
+            .w(px(460.))
+            .p_4()
+            .rounded_lg()
+            .bg(rgb(0x1b1d24))
+            .border_1()
+            .border_color(rgb(0x3b4555))
+            .shadow_lg()
+            .text_color(rgb(0xe5e7eb))
+            .child(
+                div()
+                    .id("project-delete-title")
+                    .test_support()
+                    .aria_label("Delete project")
+                    .text_sm()
+                    .text_color(rgb(0xf3f4f6))
+                    .child("Delete project"),
+            )
+            .child(
+                div()
+                    .id("project-delete-project")
+                    .test_support()
+                    .aria_label(dialog.name.clone())
+                    .mt_2()
+                    .text_sm()
+                    .child(dialog.name.clone()),
+            )
+            .child(
+                div()
+                    .id("project-delete-consequence")
+                    .test_support()
+                    .aria_label(consequence.clone())
+                    .mt_1()
+                    .text_xs()
+                    .text_color(rgb(0x8f98a6))
+                    .child(consequence),
+            )
+            .child(
+                div()
+                    .id("project-delete-cancellation")
+                    .test_support()
+                    .aria_label(PROJECT_DELETE_CANCELLATION)
+                    .mt_1()
+                    .text_xs()
+                    .text_color(rgb(0x8f98a6))
+                    .child(PROJECT_DELETE_CANCELLATION),
+            )
+            .child(
+                div().mt_3().child(
+                    Checkbox::new("project-delete-force")
+                        .checked(dialog.force)
+                        .disabled(in_flight)
+                        .label("Discard checkouts that have changes or a lock")
+                        .on_change({
+                            let view = cx.entity();
+                            move |checked, _, cx| {
+                                let checked = *checked;
+                                view.update(cx, |view, cx| {
+                                    view.set_project_delete_force(checked, cx);
+                                });
+                            }
+                        }),
+                ),
+            );
+        if let Some(refusal) = dialog.refusal.clone() {
+            card = card.child(
+                div()
+                    .id("project-delete-refusal")
+                    .test_support()
+                    .aria_label(format!("Delete refused: {refusal}"))
+                    .mt_3()
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
+                    .bg(rgb(ERROR_CARD_SURFACE))
+                    .border_1()
+                    .border_color(rgb(ERROR_CARD_ACCENT))
+                    .text_sm()
+                    .text_color(rgb(ERROR_CARD_ACCENT))
+                    .child(format!("Delete refused: {refusal}")),
+            );
+        }
+        div()
+            .id("project-delete-dialog")
+            .test_support()
+            .occlude()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui_kit::hsla(0., 0., 0., 0.55))
+            .child(
+                card.child(
+                    div()
+                        .mt_3()
+                        .flex()
+                        .justify_end()
+                        .gap_1()
+                        .child(
+                            Button::new("project-delete-cancel")
+                                .label("Cancel")
+                                .disabled(in_flight)
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.cancel_project_delete(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("project-delete-confirm")
+                                .label("Delete")
+                                .danger()
+                                .disabled(in_flight)
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.confirm_project_delete(cx);
+                                })),
+                        ),
+                ),
+            )
+            .into_any()
+    }
+
     pub(crate) fn render_rename_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(dialog) = &self.rename_dialog else {
             return div().into_any();
@@ -450,51 +589,97 @@ impl LoomView {
             );
         }
 
-        let mut source_choices = ButtonGroup::new("session-source-choices")
-            .outline()
-            .small()
-            .when(phone, |group| {
-                group.w_full().layout(gpui_kit::Axis::Vertical)
-            });
+        // The choices used to be a joined button group, which read as one
+        // segmented control and left no room to explain a choice. Each choice is
+        // its own full-width row instead: an icon, the choice title, and one line
+        // saying what it does. The rows match the repository rows in this pane,
+        // and stacking them keeps each one a full-width target on phones.
+        let mut choices = Vec::new();
         if is_start {
-            source_choices = source_choices.child(
-                Button::new("source-empty")
-                    .label("Empty project")
-                    .small()
-                    .when(phone, |button| button.w_full())
-                    .selected(dialog.choice == SessionSourceChoice::Empty)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.choose_source(SessionSourceChoice::Empty, cx)
-                    })),
-            );
+            choices.push((
+                "source-empty",
+                AssetIconName::Sparkles,
+                "Empty project",
+                "Start a new project with no files or repositories.",
+                SessionSourceChoice::Empty,
+            ));
         }
         if dialog.local_directory_available {
+            choices.push((
+                "source-local-directory",
+                AssetIconName::FolderOpen,
+                "Local folder",
+                "Attach a folder that is already on this machine.",
+                SessionSourceChoice::LocalDirectory,
+            ));
+        }
+        choices.push((
+            "source-github",
+            AssetIconName::GitBranch,
+            "GitHub repository",
+            "Clone or pick a repository from GitHub.",
+            SessionSourceChoice::GitHub,
+        ));
+        let mut source_choices = div().w_full().flex().flex_col().gap_2();
+        for (id, icon, choice_title, description, choice) in choices {
+            let selected = dialog.choice == choice;
             source_choices = source_choices.child(
-                Button::new("source-local-directory")
-                    .label("Local folder")
-                    .small()
-                    .when(phone, |button| button.w_full())
-                    .selected(dialog.choice == SessionSourceChoice::LocalDirectory)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.choose_source(SessionSourceChoice::LocalDirectory, cx)
-                    })),
+                div()
+                    .id(id)
+                    .test_support()
+                    .aria_selected(selected)
+                    .w_full()
+                    .min_h(px(44.))
+                    .p_2()
+                    .rounded_sm()
+                    .bg(if selected {
+                        rgb(0x263b58)
+                    } else {
+                        rgb(0x171c25)
+                    })
+                    .border_1()
+                    .border_color(if selected {
+                        rgb(0x2563eb)
+                    } else {
+                        rgb(0x293244)
+                    })
+                    .cursor_pointer()
+                    .when(!selected, |row| row.hover(|style| style.bg(rgb(0x20242c))))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(Icon::new(icon).size_4().text_color(if selected {
+                        rgb(0x93c5fd)
+                    } else {
+                        rgb(0x8f98a6)
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0xf3f4f6))
+                                    .child(choice_title),
+                            )
+                            .child(div().text_xs().text_color(rgb(0x8f98a6)).child(description)),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| this.choose_source(choice, cx))),
             );
         }
-        source_choices = source_choices.child(
-            Button::new("source-github")
-                .label("GitHub repository")
-                .small()
-                .when(phone, |button| button.w_full())
-                .selected(dialog.choice == SessionSourceChoice::GitHub)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.choose_source(SessionSourceChoice::GitHub, cx)
-                })),
-        );
 
         let title = if is_start {
             "New project"
         } else {
             "Add to this session"
+        };
+        let subtitle = if is_start {
+            "Set up a new project on the selected worker."
+        } else {
+            "Add a repository or folder to the active session."
         };
         let confirm_label = if is_start {
             if selected_is_cached {
@@ -510,6 +695,8 @@ impl LoomView {
         let mut run_on = div().w_full().flex().flex_col().gap_1();
         if is_start && worker_choices.len() > 1 {
             run_on = run_on.child(div().text_xs().text_color(rgb(0x8f98a6)).child("Run on"));
+            // One button per worker: they stay separate controls rather than a
+            // joined group, and wrap or stack full width on phones.
             let mut row = div().flex().flex_wrap().items_center().gap_1();
             for (node_id, label) in &worker_choices {
                 let selected = *node_id == dialog.target_node_id;
@@ -519,6 +706,7 @@ impl LoomView {
                     Button::new(format!("source-worker-node-{node_id}"))
                         .label(label.clone())
                         .small()
+                        .when(phone, |button| button.w_full())
                         .selected(selected)
                         .disabled(!online)
                         .on_click(cx.listener(move |view, _, _, cx| {
@@ -546,8 +734,8 @@ impl LoomView {
 
         // The fixed-width modal clipped its contents on phones and wasted space
         // on desktop. Use a full-height pane in the central area (like
-        // Settings) at every width, with the actions pinned to the bottom.
-        div()
+        // Settings) at every width.
+        let mut pane = div()
             .id("source-dialog-pane")
             .test_support()
             .occlude()
@@ -565,11 +753,36 @@ impl LoomView {
                     .flex()
                     .items_center()
                     .justify_between()
+                    .gap_3()
                     .px_4()
                     .py_3()
                     .border_b_1()
                     .border_color(rgb(0x242833))
-                    .child(div().text_sm().text_color(rgb(0xf3f4f6)).child(title))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .id("source-dialog-title")
+                                    .test_support()
+                                    .text_lg()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xf3f4f6))
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .id("source-dialog-subtitle")
+                                    .test_support()
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(rgb(0x8f98a6))
+                                    .child(subtitle),
+                            ),
+                    )
                     .child(
                         div()
                             .id("close-source-dialog")
@@ -596,77 +809,93 @@ impl LoomView {
                                 cx.notify();
                             })),
                     ),
-            )
-            .child(
-                div()
-                    .id("source-dialog-content")
-                    .test_support()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .when(phone, |element| element.p_4())
-                    .when(!phone, |element| element.px_6().py_5())
-                    .overflow_y_scroll()
-                    // Keep the form readable when the pane is much wider than
-                    // a phone instead of stretching controls edge to edge.
-                    .child(
-                        div()
-                            .id("source-dialog-form")
-                            .test_support()
-                            .w_full()
-                            .max_w(px(640.))
-                            .child(form),
-                    ),
-            )
-            .child(
-                // Keep the actions under the form instead of pinning them to
-                // the window's lower-right corner: the footer shares the same
-                // centered max-width container as the body on desktop.
+            );
+        let mut form_container = div()
+            .id("source-dialog-form")
+            .test_support()
+            .w_full()
+            .max_w(px(640.))
+            .child(form);
+        if !phone {
+            // Desktop keeps the actions next to the content they act on, inside
+            // the same centered max-width container as the form.
+            form_container =
+                form_container.child(Self::source_dialog_action_row(confirm_label, false, cx));
+        }
+        pane = pane.child(
+            div()
+                .id("source-dialog-content")
+                .test_support()
+                .flex_1()
+                .min_h(px(0.))
+                .w_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .when(phone, |element| element.p_4())
+                .when(!phone, |element| element.px_6().py_5())
+                .overflow_y_scroll()
+                // Keep the form readable when the pane is much wider than
+                // a phone instead of stretching controls edge to edge.
+                .child(form_container),
+        );
+        if phone {
+            // Phone keeps the actions pinned below the scrollable body so they
+            // stay reachable while the repository list scrolls.
+            pane = pane.child(
                 div()
                     .flex()
                     .justify_center()
                     .border_t_1()
                     .border_color(rgb(0x242833))
-                    .when(phone, |element| element.p_3())
-                    .when(!phone, |element| element.px_6().py_3())
-                    .child(
-                        div()
-                            .id("source-dialog-actions")
-                            .test_support()
-                            .flex()
-                            .w_full()
-                            .max_w(px(640.))
-                            .gap_2()
-                            .when(!phone, |element| element.justify_end())
-                            .child(
-                                div().when(phone, |element| element.flex_1()).child(
-                                    Button::new("cancel-session-source")
-                                        .label("Cancel")
-                                        .when(phone, |button| button.w_full().h(px(44.)))
-                                        .when(!phone, |button| button.small())
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.source_dialog = None;
-                                            cx.notify();
-                                        })),
-                                ),
-                            )
-                            .child(
-                                div().when(phone, |element| element.flex_1()).child(
-                                    Button::new("confirm-session-source")
-                                        .label(confirm_label)
-                                        .primary()
-                                        .when(phone, |button| button.w_full().h(px(44.)))
-                                        .when(!phone, |button| button.small())
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.confirm_source_dialog(cx);
-                                            cx.notify();
-                                        })),
-                                ),
-                            ),
-                    ),
+                    .p_3()
+                    .child(Self::source_dialog_action_row(confirm_label, true, cx)),
+            );
+        }
+        pane.into_any_element()
+    }
+
+    /// The cancel/confirm row of the new-project pane.
+    ///
+    /// Phone renders it in a footer below the scrollable body so it stays
+    /// reachable while the repository list scrolls; desktop renders it inside
+    /// the form, next to the content the actions apply to.
+    fn source_dialog_action_row(
+        confirm_label: &str,
+        phone: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        div()
+            .id("source-dialog-actions")
+            .test_support()
+            .w_full()
+            .flex()
+            .gap_2()
+            .when(!phone, |row| row.justify_end())
+            .child(
+                div().when(phone, |element| element.flex_1()).child(
+                    Button::new("cancel-session-source")
+                        .label("Cancel")
+                        .when(phone, |button| button.w_full().h(px(44.)))
+                        .when(!phone, |button| button.small())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.source_dialog = None;
+                            cx.notify();
+                        })),
+                ),
+            )
+            .child(
+                div().when(phone, |element| element.flex_1()).child(
+                    Button::new("confirm-session-source")
+                        .label(confirm_label)
+                        .primary()
+                        .when(phone, |button| button.w_full().h(px(44.)))
+                        .when(!phone, |button| button.small())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.confirm_source_dialog(cx);
+                            cx.notify();
+                        })),
+                ),
             )
             .into_any_element()
     }

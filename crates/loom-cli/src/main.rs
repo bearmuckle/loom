@@ -25,8 +25,11 @@ use loom_providers::{
     CredentialRef, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF, GitHubCopilotAuthenticator,
 };
 use loom_server::{
+    ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FORCE_DISCARD_ENV, ARCHIVE_RETENTION_SWEEP_INTERVAL,
     AuthTokenStore, AuthorizationScope, InProcessBackend, InProcessConnection, Instance,
     InstanceOptions, RemoteServer, RemoteServerConfig, WebSocketConnection, WebSocketTransport,
+    apply_startup_archive_retention, resolve_archive_retention, run_archive_retention_sweeps,
+    sweep_archive_retention_at_startup,
 };
 
 /// How long the shell waits between event polls while a run is executing.
@@ -137,22 +140,73 @@ struct CliOptions {
     login_provider: Option<String>,
     reset_state: bool,
     allow_insecure_remote: bool,
+    /// Raw `--archive-retention` value, before it is resolved into a policy.
+    archive_retention: Option<String>,
+    /// Raw `--archive-retention-force-discard` value.
+    archive_retention_force_discard: Option<String>,
 }
 
 impl CliOptions {
+    /// The archive-retention policy this start asks for, resolving the
+    /// environment fallback exactly like `loom-server` does. `None` means no
+    /// retention input was given, so the persisted policy applies.
+    fn retention_policy(&self) -> Result<Option<loom_protocol::ArchiveRetentionPolicy>, LoomError> {
+        resolve_archive_retention(
+            self.archive_retention.as_deref(),
+            self.archive_retention_force_discard.as_deref(),
+            env::var(ARCHIVE_RETENTION_ENV).ok().as_deref(),
+            env::var(ARCHIVE_RETENTION_FORCE_DISCARD_ENV)
+                .ok()
+                .as_deref(),
+        )
+    }
+
     /// The settings [`Instance`] applies its defaults to when `--serve` runs, so
     /// the standalone shell mode resolves its state directory and token exactly
     /// like the `loom-server` binary does.
-    fn instance_options(&self) -> InstanceOptions {
-        InstanceOptions {
+    fn instance_options(&self) -> Result<InstanceOptions, LoomError> {
+        Ok(InstanceOptions {
             bind: self.bind,
             instance_name: self.instance_name.clone(),
             persistence: self.persistence.clone(),
             token: self.token.clone(),
             token_file: self.token_file.clone(),
             reset_state: self.reset_state,
-        }
+            archive_retention: self.retention_policy()?,
+        })
     }
+}
+
+/// The usage text `--help` prints.
+fn help_text() -> String {
+    [
+        "Usage: loom [--name <name>] [--task <task>] [--model <id>] [--root <path>] \
+         [--manual-approval] [--m3-demo] [--persistence <path>] [--reset-state] \
+         [--serve --bind <addr> --instance-name <name> \
+         [--token <token> | --token-file <path>] [--archive-retention <duration>] \
+         [--archive-retention-force-discard <bool>]] [--m4-demo] [--login github-copilot] \
+         [--allow-insecure-remote]",
+        "Add --m2-demo to exercise workspace, terminal, and task APIs.",
+        "Add --m3-demo to persist the run, list deterministic/Ollama providers, and reopen the \
+         backend.",
+        "The default workspace is an isolated directory in the system temp folder.",
+        "Use --serve with an explicit bearer --token to expose the standalone WebSocket backend.",
+        "Without --persistence, --serve keeps its state in \
+         <state-dir>/<instance-name or bind-key>/state.db and reads or generates \
+         <instance-dir>/token, exactly like the loom-server binary.",
+        "A --serve --bind address that is not loopback needs --allow-insecure-remote to accept \
+         sending the bearer token in plaintext, because this shell serves plain ws:// only.",
+        "Use --m4-demo to exercise a second reconnecting remote client.",
+        "Use --login github-copilot to authenticate GitHub Copilot.",
+        "Use --reset-state to wipe an incompatible state database instead of being prompted.",
+        "Use --archive-retention <duration> (or LOOM_ARCHIVE_RETENTION) to delete archived \
+         projects once the archive time is older than <n><unit> with unit ms, s, m, h, d, or w, \
+         a bare number of seconds, or off. It is a startup default that overrides and replaces \
+         the policy stored in durable state, and a client can change that policy at runtime. \
+         --archive-retention-force-discard <bool> (or LOOM_ARCHIVE_RETENTION_FORCE_DISCARD) \
+         lets the sweep discard dirty or locked worktrees.",
+    ]
+    .join("\n")
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOptions>, LoomError> {
@@ -176,6 +230,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
         login_provider: None,
         reset_state: false,
         allow_insecure_remote: false,
+        archive_retention: None,
+        archive_retention_force_discard: None,
     };
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -190,6 +246,15 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
             "--m4-demo" => options.m4_demo = true,
             "--reset-state" => options.reset_state = true,
             "--allow-insecure-remote" => options.allow_insecure_remote = true,
+            "--archive-retention" => {
+                options.archive_retention = Some(required_value(&mut args, "--archive-retention")?);
+            }
+            "--archive-retention-force-discard" => {
+                options.archive_retention_force_discard = Some(required_value(
+                    &mut args,
+                    "--archive-retention-force-discard",
+                )?);
+            }
             "--bind" => {
                 options.bind = required_value(&mut args, "--bind")?
                     .parse()
@@ -215,43 +280,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
                     Some(PathBuf::from(required_value(&mut args, "--persistence")?));
             }
             "--help" | "-h" => {
-                println!(
-                    "Usage: loom [--name <name>] [--task <task>] [--model <id>] \
-                     [--root <path>] [--manual-approval] [--m3-demo] \
-                     [--persistence <path>] [--reset-state] \
-                     [--serve --bind <addr> --instance-name <name> \
-                     [--token <token> | --token-file <path>]] \
-                     [--m4-demo] [--login github-copilot] \
-                     [--allow-insecure-remote]"
-                );
-                println!("Add --m2-demo to exercise workspace, terminal, and task APIs.");
-                println!(
-                    "Add --m3-demo to persist the run, list deterministic/Ollama providers, \
-                     and reopen the backend."
-                );
-                println!(
-                    "The default workspace is an isolated directory in the system temp folder."
-                );
-                println!(
-                    "Use --serve with an explicit bearer --token to expose the standalone \
-                     WebSocket backend."
-                );
-                println!(
-                    "Without --persistence, --serve keeps its state in \
-                     <state-dir>/<instance-name or bind-key>/state.db and reads or generates \
-                     <instance-dir>/token, exactly like the loom-server binary."
-                );
-                println!(
-                    "A --serve --bind address that is not loopback needs --allow-insecure-remote to \
-                     accept sending the bearer token in plaintext, because this shell serves \
-                     plain ws:// only."
-                );
-                println!("Use --m4-demo to exercise a second reconnecting remote client.");
-                println!("Use --login github-copilot to authenticate GitHub Copilot.");
-                println!(
-                    "Use --reset-state to wipe an incompatible state database instead of \
-                     being prompted."
-                );
+                println!("{}", help_text());
                 return Ok(None);
             }
             value if value.starts_with("--name=") => {
@@ -283,6 +312,13 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
             }
             value if value.starts_with("--instance-name=") => {
                 options.instance_name = Some(value["--instance-name=".len()..].to_owned());
+            }
+            value if value.starts_with("--archive-retention=") => {
+                options.archive_retention = Some(value["--archive-retention=".len()..].to_owned());
+            }
+            value if value.starts_with("--archive-retention-force-discard=") => {
+                options.archive_retention_force_discard =
+                    Some(value["--archive-retention-force-discard=".len()..].to_owned());
             }
             value if value.starts_with("--login=") => {
                 options.login_provider = Some(value["--login=".len()..].to_owned());
@@ -338,10 +374,18 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
             "--root is only available for one-shot sessions; server sessions manage their own repositories",
         ));
     }
-    let instance = Instance::prepare(&options.instance_options(), &loom_core::state_dir())?;
+    let instance_options = options.instance_options()?;
+    let instance = Instance::prepare(&instance_options, &loom_core::state_dir())?;
     instance.token().log_source();
     instance.token().print_generated();
     let backend = loom_server::open_backend(instance.state_db())?;
+    // An explicit flag or variable wins over the persisted policy and is
+    // persisted in turn; otherwise the policy loaded when the durable state was
+    // opened applies; otherwise retention stays disabled. The startup sweep runs
+    // before the listener accepts clients, and a failed sweep is reported
+    // without stopping the server.
+    apply_startup_archive_retention(&backend, instance_options.archive_retention)?;
+    sweep_archive_retention_at_startup(&backend);
     let config = RemoteServerConfig {
         bind_addr: options.bind,
         allow_insecure_remote: options.allow_insecure_remote,
@@ -358,6 +402,7 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
             )
         })?;
     runtime.block_on(async move {
+        let sweep_backend = Arc::clone(&backend);
         let server =
             loom_server::start_remote_server(backend, instance.token().token(), config).await?;
         println!(
@@ -365,13 +410,19 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
             server.websocket_url()
         );
         println!("Health endpoint: {}", server.health_url());
-        tokio::signal::ctrl_c().await.map_err(|error| {
-            LoomError::new(
-                ErrorCode::Internal,
-                format!("could not wait for shutdown: {error}"),
-                false,
-            )
-        })?;
+        let sweeps = run_archive_retention_sweeps(sweep_backend, ARCHIVE_RETENTION_SWEEP_INTERVAL);
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.map_err(|error| {
+                LoomError::new(
+                    ErrorCode::Internal,
+                    format!("could not wait for shutdown: {error}"),
+                    false,
+                )
+            })?,
+            // The driver sweeps immediately and then on every interval until it
+            // is dropped by the shutdown branch.
+            () = sweeps => {}
+        }
         server.stop().await
     })
 }
@@ -1445,7 +1496,8 @@ mod tests {
     };
     use loom_core::{AgentSessionState, RunId};
     use loom_model::ModelId;
-    use loom_server::{InProcessBackend, ensure_state_database_with};
+    use loom_protocol::ArchiveRetentionPolicy;
+    use loom_server::{InProcessBackend, ensure_state_database_with, resolve_archive_retention};
     use std::net::SocketAddr;
 
     fn arguments<'a>(values: &'a [&str]) -> impl Iterator<Item = String> + 'a {
@@ -1539,6 +1591,112 @@ mod tests {
     }
 
     #[test]
+    fn archive_retention_flags_and_environment_resolve_one_policy() {
+        let defaults = parse_args(arguments(&[])).unwrap().unwrap();
+        assert_eq!(defaults.archive_retention, None);
+        assert_eq!(defaults.archive_retention_force_discard, None);
+
+        let spaced = parse_args(arguments(&[
+            "--archive-retention",
+            "14d",
+            "--archive-retention-force-discard",
+            "yes",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(spaced.archive_retention.as_deref(), Some("14d"));
+        assert_eq!(
+            spaced.archive_retention_force_discard.as_deref(),
+            Some("yes")
+        );
+        assert_eq!(
+            spaced.instance_options().unwrap().archive_retention,
+            Some(ArchiveRetentionPolicy {
+                retention_ms: Some(1_209_600_000),
+                force_discard_worktrees: true,
+            })
+        );
+
+        let equals = parse_args(arguments(&[
+            "--archive-retention=30m",
+            "--archive-retention-force-discard=0",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(equals.archive_retention.as_deref(), Some("30m"));
+        assert_eq!(equals.archive_retention_force_discard.as_deref(), Some("0"));
+        assert_eq!(
+            equals.instance_options().unwrap().archive_retention,
+            Some(ArchiveRetentionPolicy {
+                retention_ms: Some(1_800_000),
+                force_discard_worktrees: false,
+            })
+        );
+
+        // The environment is the fallback, and a flag always wins over it.
+        assert_eq!(
+            resolve_archive_retention(None, None, Some("off"), Some("no")).unwrap(),
+            Some(ArchiveRetentionPolicy::disabled())
+        );
+        assert_eq!(
+            resolve_archive_retention(Some("1h"), Some("1"), Some("off"), Some("no")).unwrap(),
+            Some(ArchiveRetentionPolicy {
+                retention_ms: Some(3_600_000),
+                force_discard_worktrees: true,
+            })
+        );
+        if std::env::var("LOOM_ARCHIVE_RETENTION").is_err()
+            && std::env::var("LOOM_ARCHIVE_RETENTION_FORCE_DISCARD").is_err()
+        {
+            // No input at all leaves the policy to the durable state, so a
+            // start neither enables nor disables retention by itself.
+            assert_eq!(defaults.instance_options().unwrap().archive_retention, None);
+            assert_eq!(
+                resolve_archive_retention(None, None, None, None).unwrap(),
+                None
+            );
+        }
+
+        // A rejected value names the flag it came from.
+        let error = parse_args(arguments(&["--archive-retention", "soon"]))
+            .unwrap()
+            .unwrap()
+            .instance_options()
+            .unwrap_err();
+        assert_eq!(error.code, super::ErrorCode::InvalidRequest);
+        assert!(error.message.contains("--archive-retention"), "{error}");
+        let error = parse_args(arguments(&["--archive-retention-force-discard=maybe"]))
+            .unwrap()
+            .unwrap()
+            .instance_options()
+            .unwrap_err();
+        assert!(
+            error.message.contains("--archive-retention-force-discard"),
+            "{error}"
+        );
+        assert!(
+            parse_error(&["--archive-retention"])
+                .message
+                .contains("requires a value")
+        );
+        assert!(
+            parse_error(&["--archive-retention-force-discard"])
+                .message
+                .contains("requires a value")
+        );
+    }
+
+    #[test]
+    fn help_text_documents_archive_retention() {
+        let help = super::help_text();
+        assert!(help.contains("--archive-retention <duration>"));
+        assert!(help.contains("--archive-retention-force-discard <bool>"));
+        assert!(help.contains("LOOM_ARCHIVE_RETENTION"));
+        assert!(help.contains("LOOM_ARCHIVE_RETENTION_FORCE_DISCARD"));
+        assert!(help.contains("--serve"));
+    }
+
+    #[test]
     fn native_cli_workflow_uses_the_protocol_for_session_run_and_services() {
         let connection = InProcessBackend::new().connect();
         negotiate(&connection).unwrap();
@@ -1565,6 +1723,8 @@ mod tests {
             login_provider: None,
             reset_state: false,
             allow_insecure_remote: false,
+            archive_retention: None,
+            archive_retention_force_discard: None,
         };
         let run_id = start_run(&connection, session.id, &options).unwrap();
         stream_run(&connection, session.id, run_id, false).unwrap();
@@ -1595,6 +1755,8 @@ mod tests {
             login_provider: None,
             reset_state: false,
             allow_insecure_remote: false,
+            archive_retention: None,
+            archive_retention_force_discard: None,
         };
 
         let result = run_m4_demo(options);
@@ -1628,6 +1790,8 @@ mod tests {
             login_provider: None,
             reset_state: false,
             allow_insecure_remote: false,
+            archive_retention: None,
+            archive_retention_force_discard: None,
         };
         let run_id = start_run(&connection, session.id, &options).unwrap();
         stream_run(&connection, session.id, run_id, false).unwrap();
@@ -1739,7 +1903,7 @@ mod tests {
 
             // `--serve` resolves its defaults through the same settings the
             // standalone server binary uses.
-            let instance = options.instance_options();
+            let instance = options.instance_options().unwrap();
             assert_eq!(instance.bind.to_string(), "127.0.0.1:9002");
             assert_eq!(instance.instance_name.as_deref(), Some("worker"));
             assert_eq!(
@@ -1750,7 +1914,11 @@ mod tests {
             assert_eq!(instance.persistence, None);
             assert!(instance.reset_state);
 
-            let defaults = parse(&["--serve"]).unwrap().unwrap().instance_options();
+            let defaults = parse(&["--serve"])
+                .unwrap()
+                .unwrap()
+                .instance_options()
+                .unwrap();
             assert_eq!(defaults.bind.to_string(), "127.0.0.1:8765");
             assert_eq!(defaults.instance_name, None);
             assert_eq!(defaults.token_file, None);

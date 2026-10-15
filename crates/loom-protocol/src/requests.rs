@@ -11,6 +11,15 @@ pub enum ControlRequest {
     DiscoverCapabilities,
 
     GetWorkerNodeStatus,
+
+    GetArchiveRetentionPolicy,
+
+    /// Replaces the archive-retention policy this worker applies. The policy is
+    /// stored in durable state, so it survives a restart, and the sweep reads
+    /// it at the start of every round.
+    SetArchiveRetentionPolicy {
+        policy: ArchiveRetentionPolicy,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -209,6 +218,12 @@ pub enum SessionRequest {
 
     ArchiveAgentSession {
         session_id: AgentSessionId,
+    },
+
+    /// Permanently removes an archived session and its stored history.
+    DeleteAgentSession {
+        session_id: AgentSessionId,
+        force: bool,
     },
 
     ForkAgentSession {

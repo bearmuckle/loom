@@ -1,16 +1,16 @@
 use super::{
     AboutBackend, AboutLink, AgentActivityData, AgentActivityRecord, AgentActivityStatus,
-    CompletionKind, FileActivityOperation, LOOM_REPOSITORY_URL, ToolPart, ToolPartStatus,
-    about_backend, about_backend_label, about_build_version, about_git_revision, about_links,
-    about_platform_label, about_protocol, about_version_label, activity_output, change_kind_label,
-    command_line, command_purpose, commands_matching, completion_for_value, composer_height,
-    disconnected_screen, endpoint_host, endpoint_label, format_bytes, format_duration,
-    format_percentage, has_block_markdown, humanize_tool_output, is_redundant_completion_summary,
-    relative_time, replace_command_token, replace_last_token, rgb, run_state_color,
-    run_state_label, session_is_active, session_status_pill, source_mount_path, tool_detail,
-    tool_failure_count, tool_group_label, tool_group_status, tool_icon, tool_needs_attention,
-    tool_part_from_activity, tool_status, tool_title, tool_title_for_activity, tool_usage_label,
-    tool_usage_summary,
+    CompletionKind, FileActivityOperation, LOOM_REPOSITORY_URL, MAX_RUN_FAILURE_REASON_CHARS,
+    ToolPart, ToolPartStatus, about_backend, about_backend_label, about_build_version,
+    about_git_revision, about_links, about_platform_label, about_protocol, about_version_label,
+    activity_output, change_kind_label, command_line, command_purpose, commands_matching,
+    completion_for_value, composer_height, disconnected_screen, endpoint_host, endpoint_label,
+    format_bytes, format_duration, format_percentage, has_block_markdown, humanize_tool_output,
+    is_redundant_completion_summary, relative_time, replace_command_token, replace_last_token, rgb,
+    run_failure_reason, run_state_color, run_state_label, session_is_active, session_status_pill,
+    source_mount_path, tool_detail, tool_failure_count, tool_group_label, tool_group_status,
+    tool_icon, tool_needs_attention, tool_part_from_activity, tool_status, tool_title,
+    tool_title_for_activity, tool_usage_label, tool_usage_summary,
 };
 use gpui_kit::assets::IconName as AssetIconName;
 use loom_core::{ActivityId, AgentSessionState, ProtocolVersion, RunId, Timestamp};
@@ -702,6 +702,37 @@ fn relative_times_cover_every_bucket() {
     assert_eq!(relative_time(now - 3_600_000, now), "1h ago");
     assert_eq!(relative_time(now - 172_800_000, now), "2d ago");
     assert_eq!(relative_time(now - 1_209_600_000, now), "2w ago");
+}
+
+#[test]
+fn failed_run_reasons_are_stripped_collapsed_and_bounded() {
+    let failed = |reason: &str| format!("{}{reason}", loom_model::AGENT_RUN_FAILURE_SUMMARY_PREFIX);
+
+    assert_eq!(
+        run_failure_reason(Some(&failed("the provider refused the request"))),
+        Some("the provider refused the request".to_owned())
+    );
+    // An absent summary and a summary that is not a failure record show no
+    // reason at all.
+    assert_eq!(run_failure_reason(None), None);
+    assert_eq!(
+        run_failure_reason(Some("Completed task: fixed the bug")),
+        None
+    );
+    // The prefix alone is not a reason.
+    assert_eq!(run_failure_reason(Some(&failed(""))), None);
+    assert_eq!(run_failure_reason(Some(&failed(" \n\t "))), None);
+
+    assert_eq!(
+        run_failure_reason(Some(&failed("first line\n\nsecond\tline"))),
+        Some("first line second line".to_owned())
+    );
+
+    let long = failed(&"x".repeat(MAX_RUN_FAILURE_REASON_CHARS + 1));
+    let bounded = run_failure_reason(Some(&long)).expect("a long reason is still a reason");
+    assert_eq!(bounded.chars().count(), MAX_RUN_FAILURE_REASON_CHARS + 1);
+    assert!(bounded.starts_with(&"x".repeat(MAX_RUN_FAILURE_REASON_CHARS)));
+    assert!(bounded.ends_with('…'));
 }
 
 #[test]

@@ -70,7 +70,7 @@ pub use schema::*;
 /// column where the payload column already exists. The upgrade path
 /// additionally re-applies the idempotent baseline batches, so a bump is what
 /// hands new baseline objects (such as indexes) to existing databases.
-const DATABASE_SCHEMA_VERSION: u32 = 5;
+const DATABASE_SCHEMA_VERSION: u32 = 6;
 /// Oldest schema version that the migration ladder can upgrade in place.
 const DATABASE_MIN_MIGRATABLE_VERSION: u32 = 2;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
@@ -155,6 +155,24 @@ pub struct DurableFeedWorkspaceCursor {
 pub struct DurableSessionSettings {
     pub approval_policies: BTreeMap<AgentSessionId, ApprovalPolicy>,
     pub auto_approve_actions: BTreeMap<AgentSessionId, bool>,
+    /// Archive-retention policy of the whole worker node.
+    ///
+    /// It is not keyed by session, but it is stored and read with the settings
+    /// bucket so one state save writes it in the same transaction as the
+    /// settings it sits beside.
+    pub archive_retention: DurableArchiveRetentionPolicy,
+}
+
+/// Durable form of the worker node's archive-retention policy.
+///
+/// A zero `retention_ms` is stored as `None`, so a stored policy is either
+/// disabled or a positive window.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DurableArchiveRetentionPolicy {
+    /// Retention window in milliseconds; `None` leaves retention disabled.
+    pub retention_ms: Option<u64>,
+    /// Whether an automatic sweep may discard dirty or locked worktrees.
+    pub force_discard_worktrees: bool,
 }
 
 #[derive(Clone, Debug, Default)]

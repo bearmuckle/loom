@@ -11,7 +11,7 @@ use gpui_kit::TestSupportExt as _;
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::base::{Disableable, Selectable, TextSelectionLayer};
 use gpui_kit::component::bubble::{Bubble, BubbleContent, BubbleVariant};
-use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants};
+use gpui_kit::component::button::{Button, ButtonVariants};
 // Only the wasm disconnected screen still uses the dialog component.
 #[cfg(target_family = "wasm")]
 use gpui_kit::component::dialog::Dialog;
@@ -38,7 +38,7 @@ use gpui_kit::component::{
 use gpui_kit::{
     Animation, AnimationExt, App, ClickEvent, ClipboardItem, Context, Element, Entity, FocusHandle,
     Focusable, FontWeight, HighlightStyle, MouseButton, Pixels, Render, Rgba, StyledText,
-    Subscription, Window, WindowAppearance, WindowControlArea, div, list, prelude::*, px,
+    Subscription, Window, WindowAppearance, WindowControlArea, div, prelude::*, px,
 };
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, ErrorCode,
@@ -55,16 +55,15 @@ use loom_protocol::GitHubCopilotLoginStatus;
 use loom_protocol::{
     AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent, AgentRunSnapshot,
     AgentRunSnapshotProjection, AgentRunState, CURRENT_PROTOCOL_VERSION, ClientRequest,
-    ClonedRepository, ContextRequest, ContextResponse, EventsRequest, EventsResponse,
-    FileActivityOperation, FilesystemRequest, FilesystemResponse,
-    GITHUB_REPOSITORY_QUERY_MIN_CHARS, GitDiffLineKind, GitFileStatusKind, GitHubRepository,
-    GitRepositoryStatus, MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, ProjectChildControlAction,
-    ProjectRequest, ProjectResponse, ProviderRequest, ProviderResponse, RepositoryRequest,
-    RepositoryResponse, RequestEnvelope, ResponseEnvelope, RunRequest, RunResponse, ServerEvent,
-    ServerResponse, SessionDirectory, SessionRepository, SessionRequest, SessionResponse,
-    TaskRequest, TerminalRequest, UsageRequest, UsageResponse, WorkerNodeConfig,
-    WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, WorkspaceEntryKind, WorkspaceFeedEvent,
-    WorkspaceRequest, WorkspaceResponse,
+    ClonedRepository, ContextRequest, ContextResponse, ControlRequest, ControlResponse,
+    EventsRequest, EventsResponse, FileActivityOperation, FilesystemRequest, FilesystemResponse,
+    GITHUB_REPOSITORY_QUERY_MIN_CHARS, GitFileStatusKind, GitHubRepository, GitRepositoryStatus,
+    MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, ProjectChildControlAction, ProjectRequest, ProjectResponse,
+    ProviderRequest, ProviderResponse, RepositoryRequest, RepositoryResponse, RequestEnvelope,
+    ResponseEnvelope, RunRequest, RunResponse, ServerEvent, ServerResponse, SessionDirectory,
+    SessionRepository, SessionRequest, SessionResponse, TaskRequest, TerminalRequest, UsageRequest,
+    UsageResponse, WorkerNodeConfig, WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig,
+    WorkspaceEntryKind, WorkspaceFeedEvent, WorkspaceRequest, WorkspaceResponse,
 };
 #[cfg(not(target_family = "wasm"))]
 #[cfg(not(target_family = "wasm"))]
@@ -76,10 +75,11 @@ use crate::{
     connection::{BackendWorker, ClientConnection, ConnectionCleanupGuard},
     state::{
         AssistantPart, AssistantTurn, EvidenceText, FilesState, GitHubLoginKind, GitHubLoginState,
-        InspectorTab, PlanState, PlanStepStatus, RenameDialogState, ReviewRow, ReviewState,
-        SystemNote, SystemTone, ThemeChoice, TimelineItem, ToolPart, ToolPartStatus, UsageState,
-        bounded, bounded_to, finish_assistant_turn, has_tool_part, push_assistant_evidence,
-        push_assistant_reasoning, push_assistant_text, session_state_for_run, upsert_tool_part,
+        InspectorTab, PlanState, PlanStepStatus, ProjectDeleteDialogState, RenameDialogState,
+        ReviewState, SystemNote, SystemTone, ThemeChoice, TimelineItem, ToolPart, ToolPartStatus,
+        UsageState, bounded, bounded_to, finish_assistant_turn, has_tool_part,
+        push_assistant_evidence, push_assistant_reasoning, push_assistant_text,
+        session_state_for_run, upsert_tool_part,
     },
     syntax::{self, Language},
     theme::{
@@ -98,6 +98,7 @@ use crate::connection::{
 use crate::connection::{
     attach_session_repository_async, create_session_in_workspace_async, create_workspace_async,
     list_models_from_backend, list_workspace_sessions_async, list_workspaces_async,
+    probe_worker_connection,
 };
 #[cfg(target_family = "wasm")]
 use crate::connection::{redact_secret, unexpected_response};
@@ -194,6 +195,12 @@ const COMMANDS: &[CommandSpec] = &[
         shortcut: Some("esc"),
     },
     CommandSpec {
+        name: "archived",
+        title: "Archived sessions",
+        description: "Review and delete archived sessions",
+        shortcut: None,
+    },
+    CommandSpec {
         name: "providers",
         title: "Providers",
         description: "Connect and configure model providers",
@@ -266,6 +273,7 @@ use crate::{
 #[cfg(not(target_family = "wasm"))]
 use log::info;
 
+use archive::ArchivedSessionsState;
 use helpers::*;
 #[cfg(not(target_family = "wasm"))]
 use loom_local::{
@@ -469,8 +477,18 @@ pub(crate) struct LoomView {
     session_trees: BTreeMap<String, Entity<TreeState>>,
     /// Last rendered tree nodes per worker node, used to skip redundant updates.
     session_tree_entries: BTreeMap<String, Vec<SessionTreeNode>>,
+    /// Active session each worker's tree was last synchronized to. Navigation
+    /// reveals the active session, but a chevron toggle must not force the
+    /// active session's ancestors back open.
+    session_tree_active: BTreeMap<String, AgentSessionId>,
     /// Worker node groups the user has collapsed in the sidebar.
     collapsed_worker_nodes: BTreeSet<String>,
+    /// The main source of each known project, shown as the second line of a
+    /// project row: `owner/repository` for a clone, a short path for a folder.
+    session_sources: BTreeMap<AgentSessionId, String>,
+    /// Sources reported per session while its lookup is in flight, and the set
+    /// of sessions already asked about, so a project is only looked up once.
+    session_source_lookups: BTreeMap<AgentSessionId, (Option<String>, Option<String>)>,
     /// Last session-list error per worker node, so a worker that failed to load
     /// is distinguishable from one that simply has no projects.
     node_session_load_errors: BTreeMap<String, String>,
@@ -549,6 +567,9 @@ pub(crate) struct LoomView {
     pub(crate) approval_request_in_flight: bool,
     approval_settings_request_in_flight: bool,
     pub(crate) archive_request_in_flight: bool,
+    /// The archived-sessions management surface: whether it is open, what it
+    /// loaded, and the user's force choice per row.
+    pub(crate) archived_sessions: ArchivedSessionsState,
     pub(crate) pending_approval: Option<ToolCall>,
     pub(crate) pending_input: Option<String>,
     composer_input: Option<Entity<TextareaState>>,
@@ -585,6 +606,9 @@ pub(crate) struct LoomView {
     selected_repository_id: Option<RepositoryId>,
     session_drawer_open: bool,
     pub(crate) rename_dialog: Option<RenameDialogState>,
+    /// The confirmation an archived project deletion goes through. A whole tree
+    /// is never removed without it.
+    pub(crate) project_delete_dialog: Option<ProjectDeleteDialogState>,
     source_dialog: Option<SessionSourceDialog>,
     #[cfg(target_family = "wasm")]
     welcome_dialog_dismissed: bool,
@@ -608,6 +632,14 @@ pub(crate) struct LoomView {
     browser_model: Option<ModelId>,
     #[cfg(target_family = "wasm")]
     browser_window_initialized: bool,
+    /// Keeps the page-visibility observer alive; a set value also marks the
+    /// observer as registered so it is never registered twice.
+    #[cfg(target_family = "wasm")]
+    visibility_subscription: Option<Subscription>,
+    /// Single-flight guard for the resume probe and the reconnect bootstrap,
+    /// so overlapping visibility changes cannot start two of either.
+    #[cfg(target_family = "wasm")]
+    browser_resume_in_flight: bool,
     browser_startup_error: Option<String>,
     /// Set when the browser transport is known to be closed so the disconnected
     /// screen can offer a reconnect instead of a settings prompt. A plain field
@@ -829,6 +861,8 @@ fn task_activity_indicator(index: usize, status: SessionStatusPill) -> gpui_kit:
             )
     };
     div()
+        .id(("session-tree-activity", index))
+        .test_support()
         .h(px(12.))
         .flex_shrink_0()
         .flex()
@@ -876,6 +910,53 @@ pub(crate) fn disconnected_screen(connection_lost: Option<&str>) -> Disconnected
             footer: "Not connected  ·  Connect a worker in Settings",
             reconnect: false,
         },
+    }
+}
+
+/// What the browser client should do once the page becomes visible again.
+///
+/// Kept as a pure decision so the table below can be tested on native builds,
+/// where no browser window exists to report a visibility change.
+#[cfg(any(target_family = "wasm", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BrowserResumption {
+    /// Do nothing. Either the page is a demo that never talks to a worker, or
+    /// it never connected and has no saved worker settings to reconnect with,
+    /// so becoming visible changes nothing. This arm never opens the settings
+    /// dialog, because a page becoming visible is not a user request.
+    Ignore,
+    /// Bootstrap the worker connection again. The view recorded a lost
+    /// connection, or it never connected but saved worker settings are
+    /// available to connect with.
+    Reconnect,
+    /// Confirm the connection the view still believes is open. A hidden page
+    /// can leave a socket that never reports its close, so the socket has to
+    /// answer a probe before the view trusts it again.
+    Verify,
+}
+
+/// Chooses a [`BrowserResumption`] for a page that just became visible.
+///
+/// A demo is ignored because it has no worker to reach. A connection the view
+/// still believes is open is only verified, never re-bootstrapped, so
+/// returning to a tab cannot tear down a working connection. Otherwise the
+/// view reconnects when it recorded a loss or has saved worker settings to
+/// reconnect with, and leaves a page without a worker alone.
+#[cfg(any(target_family = "wasm", test))]
+pub(crate) fn browser_resumption(
+    demo: bool,
+    connected: bool,
+    connection_lost: bool,
+    configured: bool,
+) -> BrowserResumption {
+    if demo {
+        BrowserResumption::Ignore
+    } else if connected {
+        BrowserResumption::Verify
+    } else if connection_lost || configured {
+        BrowserResumption::Reconnect
+    } else {
+        BrowserResumption::Ignore
     }
 }
 
@@ -1470,7 +1551,10 @@ impl LoomView {
             project_poll_scheduled: false,
             session_trees: BTreeMap::new(),
             session_tree_entries: BTreeMap::new(),
+            session_tree_active: BTreeMap::new(),
             collapsed_worker_nodes: BTreeSet::new(),
+            session_sources: BTreeMap::new(),
+            session_source_lookups: BTreeMap::new(),
             node_session_load_errors: BTreeMap::new(),
             active_session: active_session.clone(),
             active_run: None,
@@ -1534,6 +1618,7 @@ impl LoomView {
             approval_request_in_flight: false,
             approval_settings_request_in_flight: false,
             archive_request_in_flight: false,
+            archived_sessions: ArchivedSessionsState::default(),
             pending_approval: None,
             pending_input: None,
             composer_input: None,
@@ -1566,6 +1651,7 @@ impl LoomView {
             selected_repository_id: None,
             session_drawer_open: false,
             rename_dialog: None,
+            project_delete_dialog: None,
             source_dialog: None,
             #[cfg(target_family = "wasm")]
             welcome_dialog_dismissed: false,
@@ -1657,6 +1743,7 @@ impl LoomView {
     }
 }
 
+mod archive;
 mod composer;
 mod helpers;
 mod lifecycle;

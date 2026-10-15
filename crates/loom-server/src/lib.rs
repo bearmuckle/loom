@@ -31,8 +31,9 @@ use loom_model::{
     ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId, ToolCall, ToolDefinition,
 };
 use loom_persistence::{
-    DurableFeedSessionCursor, DurableFeedState, DurableFeedWorkspaceCursor, DurableFilesystemDelta,
-    DurableFilesystemEdit, DurableFilesystemRecord, DurableIdempotencyRecord, DurableProviderState,
+    DurableArchiveRetentionPolicy, DurableFeedSessionCursor, DurableFeedState,
+    DurableFeedWorkspaceCursor, DurableFilesystemDelta, DurableFilesystemEdit,
+    DurableFilesystemRecord, DurableIdempotencyRecord, DurableProviderState,
     DurableRunCheckpointWrite, DurableRunContextCheckpoint, DurableRunMessage,
     DurableRunMessageDelta, DurableRunRuntimeConfig, DurableRunSummary,
     DurableSessionProjectionRead, DurableSessionSettings, DurableStateWrite, FilePersistence,
@@ -85,6 +86,7 @@ mod instance;
 mod project_tools;
 mod remote;
 mod resource_monitor;
+mod retention;
 mod run_executor;
 mod run_handle;
 mod serve;
@@ -134,6 +136,13 @@ pub use instance::{
 pub use remote::{
     RemoteServer, RemoteServerConfig, RunningRemoteServer, ServerTlsConfig,
     WEBSOCKET_TLS_SUPPORTED, WebSocketConnection, WebSocketTransport,
+};
+pub use retention::{
+    ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FLAG, ARCHIVE_RETENTION_FORCE_DISCARD_ENV,
+    ARCHIVE_RETENTION_FORCE_DISCARD_FLAG, ARCHIVE_RETENTION_SWEEP_INTERVAL, ArchiveRetentionSource,
+    ArchiveRetentionSweepDriver, ArchiveSweepReport, ArchiveSweepSkip,
+    apply_startup_archive_retention, parse_force_discard, parse_retention_window,
+    resolve_archive_retention, run_archive_retention_sweeps, sweep_archive_retention_at_startup,
 };
 pub use serve::{
     ServingBackend, bind_exposure_warning, ensure_state_database, ensure_state_database_with,
@@ -320,12 +329,22 @@ pub struct InProcessBackend {
     persistence: Option<Arc<dyn Persistence>>,
     run_executor: RunExecutor,
     session_root_base: PathBuf,
+    /// Configured archive-retention policy; read through
+    /// [`InProcessBackend::archive_retention`].
+    archive_retention: Mutex<loom_protocol::ArchiveRetentionPolicy>,
+    /// Whether the policy in effect is the one stored in durable state, either
+    /// loaded when this backend opened or written by a later change; read
+    /// through [`InProcessBackend::archive_retention_is_stored`].
+    archive_retention_stored: AtomicBool,
     idempotency_store: IdempotencyStore,
     admissions: AdmissionService,
     self_reference: Mutex<Weak<InProcessBackend>>,
     request_lifecycle: RwLock<u8>,
     persistence_failed: AtomicBool,
     state_persist_gate: Mutex<()>,
+    /// Serializes session deletion with the retention sweep, so no caller ever
+    /// observes a partially deleted session.
+    archive_gate: Mutex<()>,
     #[cfg(test)]
     fail_next_state_save: AtomicBool,
     #[cfg(test)]

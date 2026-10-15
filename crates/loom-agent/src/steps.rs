@@ -406,6 +406,7 @@ impl AgentRuntime {
                 self.usage.add_tool_call();
                 self.append_assistant_tool_call(call.clone());
                 self.output_truncation_retries = 0;
+                self.invalid_tool_call_retries = 0;
                 ctx.events.push(AgentEvent::RunUsageUpdated {
                     run_id: self.run.id,
                     usage: self.usage.clone(),
@@ -731,6 +732,94 @@ impl AgentRuntime {
                 // call so consecutive read-only calls in this model turn can run
                 // concurrently once the completion is fully received.
                 ctx.buffered_tools.push(call);
+                return Ok(StreamFlow::Continue);
+            }
+            ModelStreamEvent::InvalidToolCall { name, reason } => {
+                // The provider could not decode this call's arguments. Answer it
+                // with a tool error inside the same turn instead of failing the
+                // run, so the model can resend the call with valid arguments.
+                self.active_message_id = None;
+                if self.invalid_tool_call_retries >= MAX_INVALID_TOOL_CALL_RETRIES {
+                    // The model kept sending undecodable arguments. Record the
+                    // degraded call (no arguments) so an explicit
+                    // `retry_failed_step` re-dispatches it: the tool then reports
+                    // an argument error and the model reads that feedback from
+                    // the transcript instead of the parent having to delegate
+                    // the task again from scratch.
+                    let call = ToolCall {
+                        id: loom_core::ToolCallId::new(),
+                        name: name.clone(),
+                        arguments: serde_json::json!({}),
+                    };
+                    let reason_message = format!(
+                        "the model sent undecodable arguments for tool '{name}' \
+                         {} times in a row; the last reason was: {reason}",
+                        self.invalid_tool_call_retries,
+                    );
+                    log::warn!(
+                        "giving up after {} undecodable argument payloads for tool '{name}' \
+                         (run {}): {reason}",
+                        self.invalid_tool_call_retries,
+                        self.run.id,
+                    );
+                    self.last_failed_call = Some(call);
+                    ctx.events.extend(self.finish_failed(reason_message));
+                    self.step_id = None;
+                    ctx.finished = true;
+                    return Ok(StreamFlow::Stop);
+                }
+                self.usage.add_tool_call();
+                ctx.events.push(AgentEvent::RunUsageUpdated {
+                    run_id: self.run.id,
+                    usage: self.usage.clone(),
+                });
+                let call = ToolCall {
+                    id: loom_core::ToolCallId::new(),
+                    name: name.clone(),
+                    arguments: serde_json::json!({}),
+                };
+                // Record the call on the assistant turn so transcript repair
+                // keeps the tool answer below instead of dropping it as
+                // orphaned, which would hide the error from the model.
+                self.append_assistant_tool_call(call.clone());
+                ctx.events
+                    .push(self.start_tool_activity(&call, Some(ctx.activity_id)));
+                ctx.events.push(AgentEvent::ToolCallRequested {
+                    run_id: self.run.id,
+                    call: call.clone(),
+                });
+                let output = format!(
+                    "tool '{name}' was not called because its arguments could not be read: \
+                     {reason} Resend the call with valid, complete JSON arguments."
+                );
+                let result = ToolResult {
+                    tool_call_id: call.id,
+                    name: call.name.clone(),
+                    success: false,
+                    output: output.clone(),
+                };
+                ctx.events.push(AgentEvent::ToolCallCompleted {
+                    run_id: self.run.id,
+                    result: result.clone(),
+                });
+                ctx.events
+                    .push(self.complete_tool_activity(&result, AgentActivityStatus::Failed));
+                self.push_message(ModelMessage {
+                    role: MessageRole::Tool,
+                    content: output,
+                    name: Some(call.name.clone()),
+                    tool_call_id: Some(call.id),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                });
+                self.invalid_tool_call_retries = self.invalid_tool_call_retries.saturating_add(1);
+                log::warn!(
+                    "tool '{name}' arguments could not be decoded; answered the call with a tool \
+                     error (run {}, attempt {} of {MAX_INVALID_TOOL_CALL_RETRIES}): {reason}",
+                    self.run.id,
+                    self.invalid_tool_call_retries,
+                );
+                ctx.saw_tool_call = true;
                 return Ok(StreamFlow::Continue);
             }
             ModelStreamEvent::Usage { usage } => {

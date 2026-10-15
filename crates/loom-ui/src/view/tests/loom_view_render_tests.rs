@@ -5,7 +5,6 @@ use super::{
 use crate::state::GitHubLoginState;
 use crate::state::InspectorTab;
 use crate::state::RenameDialogState;
-use crate::state::ReviewRow;
 use crate::state::ThemeChoice;
 use crate::state::TimelineItem;
 use crate::state::{
@@ -26,20 +25,40 @@ use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, ClientRequest,
     ClonedRepository, ContextBudget, ContextInspection, ContextItem, ContextItemKind,
     ContextSummary, EventsResponse, FileActivityOperation, FilesystemRequest, FilesystemResponse,
-    GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus, GitFileStatusKind,
-    GitHubRepository, GitRepositoryStatus, ProviderRequest, RequestEnvelope, RunRequest,
-    RunResponse, ServerResponse, SessionFilesystemChange, SessionFilesystemFile, SessionRepository,
-    SessionRequest, SessionResponse, WorkerNodeResources, WorkerNodeStatus, WorkspaceChangeKind,
-    WorkspaceEntry, WorkspaceEntryKind, WorkspaceRequest,
+    GitDiff, GitFileStatus, GitFileStatusKind, GitHubRepository, GitRepositoryStatus,
+    ProviderRequest, RequestEnvelope, RunRequest, RunResponse, ServerResponse,
+    SessionFilesystemChange, SessionFilesystemFile, SessionRepository, SessionRequest,
+    SessionResponse, WorkerNodeResources, WorkerNodeStatus, WorkspaceChangeKind, WorkspaceEntry,
+    WorkspaceEntryKind, WorkspaceRequest,
 };
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-fn render_scenario(cx: &mut TestAppContext, configure: impl FnOnce(&mut LoomView)) {
+/// Shared by the other view test modules, so each area can render a scenario
+/// without re-deriving the harness.
+pub(super) fn render_scenario(cx: &mut TestAppContext, configure: impl FnOnce(&mut LoomView)) {
     render_scenario_at(cx, size(px(1280.), px(800.)), configure);
 }
 
-fn render_scenario_at(
+/// Renders a scenario whose configuration also needs the view's own context,
+/// for example to build the diff surface before rendering it.
+pub(super) fn render_scenario_with_context(
+    cx: &mut TestAppContext,
+    configure: impl FnOnce(&mut LoomView, &mut gpui_kit::Context<LoomView>),
+) {
+    let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            configure(&mut view, cx);
+            view
+        });
+        gpui_kit::component::Root::new(view, window, cx)
+    });
+    cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
+}
+
+pub(super) fn render_scenario_at(
     cx: &mut TestAppContext,
     window_size: gpui_kit::Size<gpui_kit::Pixels>,
     configure: impl FnOnce(&mut LoomView),
@@ -56,7 +75,7 @@ fn render_scenario_at(
         .unwrap();
 }
 
-fn nested_project_view(focus_handle: gpui_kit::FocusHandle) -> LoomView {
+pub(super) fn nested_project_view(focus_handle: gpui_kit::FocusHandle) -> LoomView {
     use loom_core::{
         AgentSessionSnapshot, AgentSessionState, DelegatedTaskRecord, DelegatedTaskStatus,
         ProjectAgentPermissions, ProjectAgentRecord, ProjectSnapshot, ProjectWorktreeRecord,
@@ -374,14 +393,38 @@ fn nested_project_tree_selects_grandchild_session_by_click(cx: &mut TestAppConte
         // Projects with sub-agents start collapsed.
         assert!(window.find(("session-tree-root", 0usize)).visible());
         assert!(window.try_find(("session-tree-root", 1usize)).is_none());
-        // Expanding the project, then its agent, reveals the grandchild.
+        // Clicking the project name selects it without expanding its agents.
         window.click(("session-tree-root", 0usize), cx);
         window.render_frame(cx);
+        assert_eq!(view.read(cx).active_session.name, "Project");
+        assert!(
+            window.try_find(("session-tree-root", 1usize)).is_none(),
+            "selecting a project name must not expand its sub-agents"
+        );
+        // The chevron expands the project, then the agent, revealing the grandchild.
+        window.click(("session-tree-disclosure", 0usize), cx);
+        window.render_frame(cx);
         assert!(window.find(("session-tree-root", 1usize)).visible());
-        window.click(("session-tree-root", 1usize), cx);
+        window.click(("session-tree-disclosure", 1usize), cx);
         window.render_frame(cx);
         assert!(window.find(("session-tree-root", 2usize)).visible());
+        // A plain click on the deepest agent still selects it.
         window.click(("session-tree-root", 2usize), cx);
+        assert_eq!(view.read(cx).active_session.name, "Worker");
+        // Collapsing an ancestor of the active agent keeps it collapsed
+        // instead of forcing the selection back into view.
+        window.click(("session-tree-disclosure", 1usize), cx);
+        window.render_frame(cx);
+        assert!(window.try_find(("session-tree-root", 2usize)).is_none());
+        assert_eq!(
+            view.read(cx).active_session.name,
+            "Worker",
+            "a chevron toggle must not change the active session"
+        );
+        // Re-expanding reveals the selected agent again.
+        window.click(("session-tree-disclosure", 1usize), cx);
+        window.render_frame(cx);
+        assert!(window.find(("session-tree-root", 2usize)).visible());
         assert_eq!(view.read(cx).active_session.name, "Worker");
     })
     .unwrap();
@@ -769,37 +812,18 @@ fn session_activation_resets_projection_and_resolves_backend_ownership(cx: &mut 
             .is_ok()
         );
 
-        view.review.rows = vec![
-            ReviewRow::Hunk {
-                old_start: 1,
-                old_lines: 1,
-                new_start: 1,
-                new_lines: 1,
+        view.review.show_diff(
+            GitDiff {
+                path: Some("src/lib.rs".to_owned()),
+                staged: false,
+                patch: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n-removed\n+added\n context\n".to_owned(),
+                binary: false,
+                truncated: false,
+                hunks: Vec::new(),
             },
-            ReviewRow::Line(GitDiffLine {
-                kind: GitDiffLineKind::Removed,
-                old_line: Some(1),
-                new_line: None,
-                content: "removed".to_owned(),
-            }),
-            ReviewRow::Line(GitDiffLine {
-                kind: GitDiffLineKind::Added,
-                old_line: None,
-                new_line: Some(1),
-                content: "added".to_owned(),
-            }),
-            ReviewRow::Line(GitDiffLine {
-                kind: GitDiffLineKind::Context,
-                old_line: Some(2),
-                new_line: Some(2),
-                content: "context".to_owned(),
-            }),
-        ];
-        view.review.hunk_rows = vec![0];
-        view.review.collapsed_hunks.insert(0);
-        for index in 0..=view.review.rows.len() {
-            let _ = view.render_review_row(index);
-        }
+            cx,
+        );
+        assert!(view.review.diff_view.is_some());
         view
     });
     cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
@@ -1264,15 +1288,28 @@ fn session_source_and_review_actions_cover_empty_invalid_and_missing_states(
             view.review.open = false;
             view.toggle_review_pane(cx);
             assert!(view.review.open);
-            view.jump_review_hunk(true, cx);
-            view.review.hunk_rows = vec![2, 5];
-            view.jump_review_hunk(true, cx);
-            assert_eq!(view.review.selected_hunk, 0);
-            view.jump_review_hunk(false, cx);
-            assert_eq!(view.review.selected_hunk, 0);
+            // Diff and hunk actions without a diff surface leave the pane alone.
             view.open_review_diff("missing.txt".to_owned(), false, cx);
             assert!(view.review.selected_path.is_none());
+            assert!(view.review.diff_view.is_none());
+            view.jump_review_hunk(true, cx);
+            view.jump_review_hunk(false, cx);
+            view.review.show_diff(
+                GitDiff {
+                    path: Some("src/lib.rs".to_owned()),
+                    staged: false,
+                    patch: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,0 @@\n-old\n@@ -20,0 +20,1 @@\n+new\n".to_owned(),
+                    binary: false,
+                    truncated: false,
+                    hunks: Vec::new(),
+                },
+                cx,
+            );
+            assert!(view.review.diff_view.is_some());
+            view.jump_review_hunk(true, cx);
+            view.jump_review_hunk(false, cx);
             view.open_review_file("missing.txt".to_owned(), cx);
+            assert!(view.review.diff_view.is_none());
             assert_eq!(view.review.selected_path.as_deref(), Some("missing.txt"));
             view
         });
@@ -2455,6 +2492,51 @@ fn completing_a_run_stops_the_streaming_cursor(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn a_failed_run_status_row_names_its_reason(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.run_state = Some(loom_protocol::AgentRunState::Failed);
+        view.active_run = Some(loom_protocol::AgentRunSnapshot {
+            id: RunId::new(),
+            attempt_id: loom_core::RunAttemptId::new(),
+            control_revision: 0,
+            session_id: view.active_session.id,
+            task: "explain the failure".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            state: loom_protocol::AgentRunState::Failed,
+            started_at: Timestamp::from_unix_millis(1),
+            updated_at: Timestamp::from_unix_millis(2),
+            completed_at: Some(Timestamp::from_unix_millis(2)),
+            summary: Some(format!(
+                "{}the provider refused the request",
+                loom_model::AGENT_RUN_FAILURE_SUMMARY_PREFIX
+            )),
+            evidence: Vec::new(),
+        });
+        view
+    });
+    cx.update_window(handle.into(), |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        window.render_frame(cx);
+        assert!(window.try_find("run-failure-reason").is_some());
+
+        // The reason belongs to a failed run only, so another run state keeps
+        // the row to its label.
+        view.update(cx, |view, cx| {
+            view.run_state = Some(loom_protocol::AgentRunState::Completed);
+            let run = view.active_run.as_mut().expect("the run stays active");
+            run.state = loom_protocol::AgentRunState::Completed;
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("run-failure-reason").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn agent_event_projection_handles_the_run_lifecycle_and_tool_fallback(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
@@ -3301,6 +3383,52 @@ fn phone_composer_reserves_space_for_the_on_screen_keyboard(cx: &mut TestAppCont
 }
 
 #[gpui_kit::test]
+fn phone_tap_on_composer_field_padding_focuses_the_composer(cx: &mut TestAppContext) {
+    use gpui_kit::Focusable as _;
+
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(390.), px(844.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view
+    });
+    cx.update_window(handle.into(), |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        window.render_frame(cx);
+        // The view focuses the composer as soon as it creates it, so focus has
+        // to move away first for the tap to be the cause of the refocus.
+        view.update(cx, |view, cx| {
+            if let Some(filter) = view.session_filter_input.clone() {
+                filter.update(cx, |state, cx| state.focus(window, cx));
+            }
+        });
+        window.render_frame(cx);
+        view.update(cx, |view, cx| {
+            let input = view.composer_input.clone().expect("composer input");
+            assert!(!input.read(cx).focus_handle(cx).is_focused(window));
+        });
+        // (4, 4) is inside the `composer-field` wrapper's `p_3` padding but
+        // outside the `Textarea` bounds, so only the wrapper handler can
+        // route focus back into the composer.
+        window.click_at("composer-field", gpui_kit::point(px(4.), px(4.)), cx);
+        window.render_frame(cx);
+        view.update(cx, |view, cx| {
+            let input = view.composer_input.clone().expect("composer input");
+            assert!(
+                input.read(cx).focus_handle(cx).is_focused(window),
+                "a tap on the composer field's padding should focus the field"
+            );
+        });
+        window.input("hi", cx);
+        view.update(cx, |view, cx| {
+            let input = view.composer_input.clone().expect("composer input");
+            assert_eq!(input.read(cx).value().to_string(), "hi");
+        });
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 async fn session_creation_uses_worker_model_catalog_and_selects_the_created_session(
     cx: &mut TestAppContext,
 ) {
@@ -3940,7 +4068,7 @@ fn rename_and_source_dialogs_render(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn review_panel_renders_workspace_and_git_changes(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    render_scenario(cx, |view| {
+    render_scenario_with_context(cx, |view, cx| {
         view.review.open = true;
         view.sessions = vec![view.active_session.clone()];
         view.review.repositories_loaded = true;
@@ -3971,41 +4099,56 @@ fn review_panel_renders_workspace_and_git_changes(cx: &mut TestAppContext) {
             captured_at: Timestamp::from_unix_millis(0),
         });
         view.review.selected_path = Some("src/lib.rs".to_owned());
-        view.review.selected_diff = Some(GitDiff {
-            path: Some("src/lib.rs".to_owned()),
-            staged: false,
-            patch: String::new(),
-            binary: false,
-            hunks: vec![GitDiffHunk {
-                old_start: 1,
-                old_lines: 1,
-                new_start: 1,
-                new_lines: 2,
-                lines: vec![GitDiffLine {
-                    kind: GitDiffLineKind::Added,
-                    old_line: None,
-                    new_line: Some(1),
-                    content: "new line".to_owned(),
-                }],
-            }],
-            truncated: false,
-        });
-        view.review.rows = vec![
-            ReviewRow::Hunk {
-                old_start: 1,
-                old_lines: 1,
-                new_start: 1,
-                new_lines: 2,
+        view.review.show_diff(
+            GitDiff {
+                path: Some("src/lib.rs".to_owned()),
+                staged: false,
+                patch: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,2 @@\n context\n+new line\n"
+                    .to_owned(),
+                binary: false,
+                hunks: Vec::new(),
+                truncated: false,
             },
-            ReviewRow::Line(GitDiffLine {
-                kind: GitDiffLineKind::Added,
-                old_line: None,
-                new_line: Some(1),
-                content: "new line".to_owned(),
-            }),
-        ];
-        view.review.hunk_rows = vec![0];
+            cx,
+        );
+        assert!(view.review.diff_view.is_some());
     });
+}
+
+/// The selected diff renders inside the pane at a real height, which is what
+/// tells the component's own scrolling has a viewport to work with.
+#[gpui_kit::test]
+fn review_pane_gives_the_diff_surface_the_remaining_height(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.review.open = true;
+            view.sessions = vec![view.active_session.clone()];
+            view.review.selected_path = Some("src/lib.rs".to_owned());
+            view.review.show_diff(
+                GitDiff {
+                    path: Some("src/lib.rs".to_owned()),
+                    staged: false,
+                    patch: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,0 +1,1 @@\n+added\n"
+                        .to_owned(),
+                    binary: false,
+                    truncated: false,
+                    hunks: Vec::new(),
+                },
+                cx,
+            );
+            view
+        });
+        gpui_kit::component::Root::new(view, window, cx)
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let surface = window.find("review-diff-surface");
+        assert!(surface.visible());
+        assert!(surface.bounds().size.height > px(0.));
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]
@@ -4059,7 +4202,6 @@ fn review_panel_renders_loading_file_and_binary_diff_states(cx: &mut TestAppCont
     render_scenario(cx, |view| {
         view.review.open = true;
         view.sessions = vec![view.active_session.clone()];
-        view.review.repositories_loaded = true;
         view.session_repositories = vec![
             SessionRepository {
                 id: loom_core::RepositoryId::new(),

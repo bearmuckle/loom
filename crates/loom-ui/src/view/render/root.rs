@@ -10,6 +10,7 @@ impl Render for LoomView {
         if !self.browser_window_initialized {
             self.browser_window_initialized = true;
             self.observe_system_appearance(window, cx);
+            self.observe_browser_visibility(window, cx);
             self.composer_focus_handle.focus(window, cx);
             self.select_theme(ThemeChoice::System, window, cx);
         }
@@ -242,6 +243,10 @@ impl Render for LoomView {
             }
         }
         self.schedule_worker_node_poll(cx);
+        // Project rows show the source each project was created from, so ask for
+        // the ones the client does not know yet. The call is idempotent and
+        // bounded, and issues nothing once every project has been asked about.
+        self.refresh_session_source_labels(cx);
         self.sync_model_select_states(window, cx);
         self.schedule_run_poll(cx);
         self.schedule_project_poll(cx);
@@ -621,6 +626,9 @@ impl Render for LoomView {
             })
             .when(self.source_dialog.is_some(), |element| {
                 element.child(self.render_source_dialog(layout, cx))
+            })
+            .when(self.archived_sessions.open, |element| {
+                element.child(self.render_archived_sessions(layout, cx))
             }),
             ),
                 resizable_panel()
@@ -764,6 +772,11 @@ impl Render for LoomView {
             )
             .when(self.command_palette_open, |element| {
                 element.child(self.render_command_palette(cx))
+            })
+            // Rendered last so the confirmation covers the full-screen
+            // archived-sessions surface it is usually opened from.
+            .when(self.project_delete_dialog.is_some(), |element| {
+                element.child(self.render_project_delete_dialog(cx))
             });
         content.into_any()
     }

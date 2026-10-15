@@ -61,6 +61,10 @@ impl LoomView {
                     directories,
                 })) => {
                     view.session_directories = directories;
+                    // The directory list carries the project's folder source, so
+                    // the project row's second line fills in with the rest of
+                    // the review projections.
+                    view.remember_active_session_source();
                 }
                 Err(error) => view.record_backend_error("list session directories", error),
                 Ok(response) => view.record_backend_error(
@@ -89,6 +93,7 @@ impl LoomView {
                             .or_else(|| repositories.first())
                             .cloned();
                         view.session_repositories = repositories;
+                        view.remember_active_session_source();
                         view.selected_repository_id =
                             repository.as_ref().map(|repository| repository.id);
                         if let Some(repository) = repository {
@@ -351,13 +356,6 @@ impl LoomView {
         cx.notify();
     }
 
-    /// Collapses or expands the hunk whose header row is at `row`.
-    pub(crate) fn toggle_review_hunk(&mut self, row: usize, cx: &mut Context<Self>) {
-        if self.review.toggle_hunk(row) {
-            cx.notify();
-        }
-    }
-
     pub(crate) fn close_review(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.review.open = false;
         self.project_child_review = None;
@@ -371,10 +369,7 @@ impl LoomView {
         self.review.selection_revision += 1;
         let selection_revision = self.review.selection_revision;
         self.review.selected_staged = false;
-        self.review.selected_diff = None;
-        self.review.rows.clear();
-        self.review.hunk_rows.clear();
-        self.review.list_state.reset(0);
+        self.review.clear_diff();
         self.review.loading_diff = true;
         self.review.diff_error = None;
         let session_id = self.active_session.id;
@@ -420,29 +415,18 @@ impl LoomView {
         );
     }
 
+    /// Moves the diff surface to the next or previous changed group.
     pub(crate) fn jump_review_hunk(&mut self, forward: bool, cx: &mut Context<Self>) {
-        if self.review.hunk_rows.is_empty() {
+        let Some(diff_view) = self.review.diff_view.clone() else {
             return;
-        }
-        let visible_row = self.review.list_state.logical_scroll_top().item_ix;
-        self.review.selected_hunk = if forward {
-            self.review
-                .hunk_rows
-                .iter()
-                .position(|row| *row > visible_row)
-                .unwrap_or(self.review.hunk_rows.len() - 1)
-        } else {
-            self.review
-                .hunk_rows
-                .iter()
-                .rposition(|row| *row < visible_row)
-                .unwrap_or(0)
         };
-        self.review.list_state.scroll_to(gpui_kit::ListOffset {
-            item_ix: self.review.hunk_rows[self.review.selected_hunk],
-            offset_in_item: px(0.),
+        diff_view.update(cx, |state, cx| {
+            if forward {
+                state.next_change(cx);
+            } else {
+                state.previous_change(cx);
+            }
         });
-        cx.notify();
     }
 
     pub(crate) fn open_review_diff(&mut self, path: String, staged: bool, cx: &mut Context<Self>) {
@@ -455,10 +439,7 @@ impl LoomView {
         let selection_revision = self.review.selection_revision;
         self.review.selected_staged = staged;
         self.review.selected_file = None;
-        self.review.selected_diff = None;
-        self.review.rows.clear();
-        self.review.hunk_rows.clear();
-        self.review.list_state.reset(0);
+        self.review.clear_diff();
         self.review.loading_diff = true;
         self.review.diff_error = None;
         let session_id = self.active_session.id;
@@ -470,7 +451,7 @@ impl LoomView {
                 path: Some(path.clone()),
                 staged,
             }),
-            move |view, response, _| {
+            move |view, response, cx| {
                 if view.active_session.id != session_id
                     || view.review.selected_path.as_deref() != Some(&path)
                     || view.review.selected_staged != staged
@@ -480,7 +461,7 @@ impl LoomView {
                 }
                 match response.result {
                     Ok(ServerResponse::Repository(RepositoryResponse::VcsDiff(diff))) => {
-                        view.review.show_diff(diff)
+                        view.review.show_diff(diff, cx)
                     }
                     Err(error) => {
                         view.review.loading_diff = false;
