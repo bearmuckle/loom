@@ -20,6 +20,11 @@ impl LoomView {
             .get(&self.active_session.id)
             .copied()
             .unwrap_or(true);
+        self.ask_before_destructive_actions = self
+            .session_ask_before_destructive_actions
+            .get(&self.active_session.id)
+            .copied()
+            .unwrap_or(false);
         self.approval_settings_request_in_flight = false;
         self.model = self
             .session_models
@@ -86,6 +91,10 @@ impl LoomView {
                 self.auto_approve_actions = projection.auto_approve_actions;
                 self.session_auto_approve_actions
                     .insert(self.active_session.id, projection.auto_approve_actions);
+                self.ask_before_destructive_actions =
+                    destructive_actions_require_approval(projection.approval_policy.destructive);
+                self.session_ask_before_destructive_actions
+                    .insert(self.active_session.id, self.ask_before_destructive_actions);
                 if let Some(run) = &projection.active_run {
                     self.model = run.run.model.clone();
                     self.session_task_cache
@@ -300,6 +309,8 @@ impl LoomView {
             self.session_task_cache.remove(session_id);
             self.session_models.remove(session_id);
             self.session_auto_approve_actions.remove(session_id);
+            self.session_ask_before_destructive_actions
+                .remove(session_id);
         }
         // Drop the archived sessions from every cached project snapshot so the
         // tree view stops rendering them without waiting for a refresh.
@@ -532,6 +543,10 @@ impl LoomView {
                 self.auto_approve_actions = projection.auto_approve_actions;
                 self.session_auto_approve_actions
                     .insert(session_id, projection.auto_approve_actions);
+                self.ask_before_destructive_actions =
+                    destructive_actions_require_approval(projection.approval_policy.destructive);
+                self.session_ask_before_destructive_actions
+                    .insert(session_id, self.ask_before_destructive_actions);
                 if let Some(run) = &projection.active_run {
                     self.session_task_cache
                         .insert(session_id, run.run.task.clone());

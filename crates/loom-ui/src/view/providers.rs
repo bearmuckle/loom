@@ -636,11 +636,8 @@ impl LoomView {
         }
         let session_id = self.active_session.id;
         let auto_approve_actions = !self.auto_approve_actions;
-        let policy = if auto_approve_actions {
-            loom_core::ApprovalPolicy::auto_approve()
-        } else {
-            loom_core::ApprovalPolicy::default()
-        };
+        let policy =
+            session_approval_policy(auto_approve_actions, self.ask_before_destructive_actions);
         self.approval_settings_request_in_flight = true;
         self.dispatch(
             cx,
@@ -663,6 +660,57 @@ impl LoomView {
                             "Automatic approvals enabled for this session".to_owned()
                         } else {
                             "Automatic approvals disabled for this session".to_owned()
+                        });
+                    }
+                    Err(error) => {
+                        view.record_backend_error("update session approval settings", error)
+                    }
+                    Ok(response) => view.record_backend_error(
+                        "update session approval settings",
+                        unexpected_response("approval policy", response),
+                    ),
+                }
+            },
+        );
+        cx.notify();
+    }
+
+    /// Toggles whether destructive actions pause for approval in this session.
+    pub(crate) fn toggle_ask_before_destructive_actions(&mut self, cx: &mut Context<Self>) {
+        if self.approval_settings_request_in_flight || !self.is_connected() {
+            return;
+        }
+        let session_id = self.active_session.id;
+        let auto_approve_actions = self.auto_approve_actions;
+        let ask_before_destructive_actions = !self.ask_before_destructive_actions;
+        let policy = session_approval_policy(auto_approve_actions, ask_before_destructive_actions);
+        self.approval_settings_request_in_flight = true;
+        self.dispatch(
+            cx,
+            ClientRequest::Session(SessionRequest::SetSessionApprovalPolicy {
+                session_id,
+                policy,
+                // The policy replaces every kind decision, so automatic
+                // approvals are resent alongside it unchanged rather than
+                // silently reset by this control.
+                auto_approve_actions: Some(auto_approve_actions),
+            }),
+            move |view, response, _| {
+                if view.active_session.id != session_id {
+                    return;
+                }
+                view.approval_settings_request_in_flight = false;
+                match response.result {
+                    Ok(ServerResponse::Session(SessionResponse::ApprovalPolicy(policy))) => {
+                        view.ask_before_destructive_actions =
+                            destructive_actions_require_approval(policy.destructive);
+                        view.session_ask_before_destructive_actions
+                            .insert(session_id, view.ask_before_destructive_actions);
+                        view.record_status(if view.ask_before_destructive_actions {
+                            "Destructive actions will ask for approval in this session".to_owned()
+                        } else {
+                            "Destructive actions will run without approval in this session"
+                                .to_owned()
                         });
                     }
                     Err(error) => {
