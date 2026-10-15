@@ -179,7 +179,7 @@ pub(crate) fn save_run_runtime_config_rows(
                 )
             })?;
     }
-    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)
+    Ok(())
 }
 
 pub(crate) fn save_run_summary_rows(
@@ -486,7 +486,6 @@ pub(crate) fn save_run_context_checkpoint_rows(
                 persistence_error(format!("could not save run context checkpoint: {error}"), true)
             })?;
     }
-    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)?;
     Ok(())
 }
 

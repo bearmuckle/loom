@@ -204,7 +204,7 @@ pub(crate) fn save_run_activity_rows(
                 persistence_error(format!("could not prune run activities: {error}"), true)
             })?;
     }
-    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)
+    Ok(())
 }
 
 /// Persist only worker-reported activity changes. Existing activity ordinals
@@ -345,7 +345,7 @@ pub(crate) fn save_run_activity_deltas(
             )?;
         }
     }
-    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)
+    Ok(())
 }
 
 pub(crate) fn save_run_tool_activity_delta(
@@ -760,5 +760,5 @@ pub(crate) fn save_run_tool_rows(
                 )
             })?;
     }
-    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)
+    Ok(())
 }
