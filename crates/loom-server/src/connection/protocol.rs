@@ -421,6 +421,48 @@ impl InProcessConnection {
         }))
     }
 
+    /// Workspace ids the connection's token may reach.
+    ///
+    /// `None` means every workspace, which is what an unauthenticated or
+    /// unrestricted scope grants. A workspace-scoped token names its workspaces
+    /// directly. A session-scoped token names only session ids:
+    /// [`AuthorizationScope::for_sessions`] holds no workspace, because the
+    /// workspace of a session is runtime state held by the session manager,
+    /// which is not available where a scope is built. The reachable workspaces
+    /// of a session-scoped token are therefore derived here, at the
+    /// authorization site that owns the session manager, instead of being
+    /// sampled into the scope when the token is issued. A session-scoped token
+    /// whose sessions are gone reaches no workspace.
+    pub(crate) fn authorized_workspaces(&self) -> Result<Option<BTreeSet<WorkspaceId>>> {
+        let Some(auth) = &self.auth else {
+            return Ok(None);
+        };
+        let scope = auth.scope();
+        let session_workspaces = match &scope.sessions {
+            None => None,
+            Some(sessions) => Some(
+                self.backend
+                    .sessions()?
+                    .list_in_workspace(None, true)
+                    .into_iter()
+                    .filter(|session| sessions.contains(&session.id))
+                    .map(|session| session.workspace_id)
+                    .collect::<BTreeSet<_>>(),
+            ),
+        };
+        Ok(match (&scope.workspaces, session_workspaces) {
+            (None, None) => None,
+            (Some(workspaces), None) => Some(workspaces.clone()),
+            (None, Some(session_workspaces)) => Some(session_workspaces),
+            (Some(workspaces), Some(session_workspaces)) => Some(
+                workspaces
+                    .intersection(&session_workspaces)
+                    .copied()
+                    .collect(),
+            ),
+        })
+    }
+
     pub(crate) fn authorize_request(&self, request: &ClientRequest) -> Result<()> {
         let Some(auth) = &self.auth else {
             return Ok(());
@@ -913,7 +955,8 @@ impl InProcessConnection {
         }
 
         if let Some(workspace_id) = workspace_id
-            && !auth.scope().allows_workspace(workspace_id)
+            && let Some(authorized) = self.authorized_workspaces()?
+            && !authorized.contains(&workspace_id)
         {
             return Err(LoomError::new(
                 ErrorCode::AuthorizationDenied,

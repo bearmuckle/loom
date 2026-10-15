@@ -183,3 +183,158 @@ fn session_scoped_tokens_are_limited_to_their_sessions_and_source_roots() {
 
     fs::remove_dir_all(&backend.session_root_base).unwrap();
 }
+
+#[test]
+fn session_scoped_tokens_cannot_read_or_list_other_workspaces() {
+    let backend = InProcessBackend::new();
+    let unrestricted = backend.connect();
+    negotiate(&unrestricted);
+    let create_workspace = |name: &str| match unrestricted
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: name.to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace.id,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let create_session = |workspace_id: WorkspaceId, name: &str| match unrestricted
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id,
+                name: name.to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    let allowed_workspace = create_workspace("Allowed workspace");
+    let other_workspace = create_workspace("Other workspace");
+    let allowed_session = create_session(allowed_workspace, "Allowed session");
+    let other_session = create_session(other_workspace, "Other session");
+
+    let tokens = AuthTokenStore::new();
+    let issued = tokens
+        .issue(AuthorizationScope::for_sessions(
+            [allowed_session],
+            backend.supported_capabilities.clone(),
+        ))
+        .unwrap();
+    let scoped = backend.connect_authenticated(tokens.authenticate(&issued.token).unwrap());
+    negotiate(&scoped);
+
+    // The workspace the token's session lives in stays reachable.
+    assert!(matches!(
+        scoped
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::GetWorkspaceConfigForWorkspace {
+                    workspace_id: allowed_workspace,
+                }
+            )))
+            .result,
+        Ok(ServerResponse::Workspace(
+            WorkspaceResponse::WorkspaceConfig(_)
+        ))
+    ));
+    assert!(matches!(
+        scoped
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::ListWorkspaceSessions {
+                    workspace_id: allowed_workspace,
+                    include_archived: false,
+                }
+            )))
+            .result,
+        Ok(ServerResponse::Session(
+            SessionResponse::AgentSessions { .. }
+        ))
+    ));
+
+    // Listing workspaces returns only that workspace, not the other one.
+    let listed = scoped
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::ListWorkspaces,
+        )))
+        .result
+        .unwrap();
+    let ServerResponse::Workspace(WorkspaceResponse::Workspaces { workspaces }) = listed else {
+        panic!("unexpected workspace listing response: {listed:?}");
+    };
+    assert_eq!(
+        workspaces
+            .iter()
+            .map(|workspace| workspace.id)
+            .collect::<Vec<_>>(),
+        [allowed_workspace]
+    );
+
+    // Reading another workspace is denied, whether or not it exists.
+    for workspace_id in [other_workspace, WorkspaceId::new()] {
+        assert_eq!(
+            scoped
+                .request(RequestEnvelope::new(ClientRequest::Workspace(
+                    WorkspaceRequest::GetWorkspaceConfigForWorkspace { workspace_id }
+                )))
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::AuthorizationDenied
+        );
+    }
+    assert_eq!(
+        scoped
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::ListWorkspaceSessions {
+                    workspace_id: other_workspace,
+                    include_archived: false,
+                }
+            )))
+            .result
+            .unwrap_err()
+            .code,
+        ErrorCode::AuthorizationDenied
+    );
+    assert_eq!(
+        scoped
+            .request(RequestEnvelope::new(ClientRequest::Session(
+                SessionRequest::GetAgentSession {
+                    session_id: other_session,
+                }
+            )))
+            .result
+            .unwrap_err()
+            .code,
+        ErrorCode::AuthorizationDenied
+    );
+
+    // A hand-built scope that names workspaces and sessions reaches only their
+    // intersection.
+    let combined = tokens
+        .issue(AuthorizationScope {
+            sessions: Some(BTreeSet::from([allowed_session])),
+            workspaces: Some(BTreeSet::from([other_workspace])),
+            ..AuthorizationScope::default()
+        })
+        .unwrap();
+    let combined_connection =
+        backend.connect_authenticated(tokens.authenticate(&combined.token).unwrap());
+    negotiate(&combined_connection);
+    let listed = combined_connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::ListWorkspaces,
+        )))
+        .result
+        .unwrap();
+    let ServerResponse::Workspace(WorkspaceResponse::Workspaces { workspaces }) = listed else {
+        panic!("unexpected workspace listing response: {listed:?}");
+    };
+    assert!(workspaces.is_empty());
+
+    fs::remove_dir_all(&backend.session_root_base).unwrap();
+}

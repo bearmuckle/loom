@@ -18,15 +18,19 @@ impl InProcessConnection {
                 ))
             }
             ClientRequest::Workspace(WorkspaceRequest::ListWorkspaces) => {
+                // A session-scoped token reaches only the workspaces its
+                // sessions live in, so the listing is filtered by the same set
+                // the authorization check uses.
+                let authorized = self.authorized_workspaces()?;
                 let workspaces = self
                     .backend
                     .workspace_records()?
                     .list()
                     .into_iter()
                     .filter(|workspace| {
-                        self.auth
+                        authorized
                             .as_ref()
-                            .is_none_or(|auth| auth.scope().allows_workspace(workspace.id))
+                            .is_none_or(|authorized| authorized.contains(&workspace.id))
                     })
                     .collect();
                 Ok(ServerResponse::Workspace(WorkspaceResponse::Workspaces {
