@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt, fs, io,
     net::{IpAddr, SocketAddr},
     path::Path,
@@ -47,6 +47,20 @@ const DEFAULT_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_OUTGOING_CAPACITY: usize = 128;
 /// How long an incoming TLS handshake may take before the listener drops it.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the client waits for the next frame while it is waiting for a
+/// response.
+///
+/// The server heartbeats every [`DEFAULT_HEARTBEAT`] and answers every request
+/// within its own configured request timeout, so a longer silence means the
+/// socket is half-open rather than merely busy. Without this bound a stalled
+/// socket left the calling thread waiting forever.
+const CLIENT_FRAME_DEADLINE: Duration = Duration::from_secs(30);
+/// Most events buffered while a request is in flight.
+///
+/// Events that arrive while a request is being answered are buffered for the
+/// event stream, so the buffer is capped instead of growing with a session that
+/// streams faster than the caller drains it.
+const CLIENT_EVENT_BUFFER_CAPACITY: usize = 1024;
 
 /// Whether this build's WebSocket transport can negotiate TLS (`wss://`).
 ///
@@ -887,7 +901,7 @@ impl WebSocketTransport {
         Ok(WebSocketConnection {
             socket,
             max_frame_bytes: self.max_frame_bytes,
-            events: Vec::new(),
+            events: VecDeque::new(),
         })
     }
 }
@@ -895,7 +909,9 @@ impl WebSocketTransport {
 pub struct WebSocketConnection {
     socket: tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
     max_frame_bytes: usize,
-    events: Vec<ServerEventEnvelope>,
+    /// Events read while a request was in flight, oldest first and bounded by
+    /// [`CLIENT_EVENT_BUFFER_CAPACITY`].
+    events: VecDeque<ServerEventEnvelope>,
 }
 
 impl WebSocketConnection {
@@ -930,12 +946,26 @@ impl WebSocketConnection {
             .await
             .map_err(socket_error)?;
         loop {
-            let Some(message) = self.socket.next().await else {
-                return Err(LoomError::new(
-                    ErrorCode::RequestCancelled,
-                    "remote server disconnected",
-                    true,
-                ));
+            // A half-open socket never yields a frame, so each individual wait
+            // is bounded instead of blocking the calling thread forever.
+            let next = timeout(CLIENT_FRAME_DEADLINE, self.socket.next()).await;
+            let message = match next {
+                Ok(Some(message)) => message,
+                Ok(None) => {
+                    return Err(LoomError::new(
+                        ErrorCode::RequestCancelled,
+                        "remote server disconnected",
+                        true,
+                    ));
+                }
+                Err(_) => {
+                    return Err(LoomError::new(
+                        ErrorCode::DeadlineExceeded,
+                        "remote server sent no frame within the read deadline; the connection may \
+                         be stalled",
+                        true,
+                    ));
+                }
             };
             match message.map_err(socket_error)? {
                 ClientMessage::Text(text) => {
@@ -953,7 +983,7 @@ impl WebSocketConnection {
                         continue;
                     }
                     if let Ok(event) = decode_event(text.as_bytes()) {
-                        self.events.push(event);
+                        self.buffer_event(event);
                         continue;
                     }
                     return Err(LoomError::malformed_payload(
@@ -975,7 +1005,7 @@ impl WebSocketConnection {
                         continue;
                     }
                     if let Ok(event) = decode_event(&bytes) {
-                        self.events.push(event);
+                        self.buffer_event(event);
                         continue;
                     }
                     return Err(LoomError::malformed_payload(
@@ -1001,8 +1031,27 @@ impl WebSocketConnection {
         }
     }
 
+    /// Buffers an event read while a request was in flight.
+    ///
+    /// The buffer is capped: when a session streams faster than the caller
+    /// drains it, the oldest events are dropped so the process cannot grow
+    /// without limit. Events carry a sequence, so a resuming caller can detect
+    /// the gap and re-sync instead of silently skipping it.
+    fn buffer_event(&mut self, event: ServerEventEnvelope) {
+        let capacity = CLIENT_EVENT_BUFFER_CAPACITY;
+        if self.events.len() >= capacity {
+            let dropped = self.events.len() - capacity / 2;
+            self.events.drain(..dropped);
+            log::warn!(
+                "dropped {dropped} buffered remote events: more than {capacity} events arrived \
+                 while a request was in flight"
+            );
+        }
+        self.events.push_back(event);
+    }
+
     pub fn take_events(&mut self) -> Vec<ServerEventEnvelope> {
-        std::mem::take(&mut self.events)
+        self.events.drain(..).collect()
     }
 
     pub async fn cancel_request(&mut self, request_id: RequestId) -> Result<()> {
@@ -1030,8 +1079,8 @@ impl WebSocketConnection {
     }
 
     pub async fn next_event(&mut self) -> Result<Option<ServerEventEnvelope>> {
-        if !self.events.is_empty() {
-            return Ok(Some(self.events.remove(0)));
+        if let Some(event) = self.events.pop_front() {
+            return Ok(Some(event));
         }
         loop {
             let Some(message) = self.socket.next().await else {

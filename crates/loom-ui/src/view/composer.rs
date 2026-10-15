@@ -70,6 +70,72 @@ impl LoomView {
         cx.notify();
     }
 
+    /// Handles the escape key: dismisses the innermost open dialog or pane, and
+    /// otherwise interrupts the active run when it can still be interrupted.
+    ///
+    /// Escape is advertised as the "Stop run" shortcut, so an open surface wins
+    /// only because dismissing it is the smaller, reversible action. Returns
+    /// whether the keystroke was consumed, so a caller can stop propagation
+    /// only when something actually changed.
+    pub(crate) fn handle_escape(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.dismiss_open_surface(cx) {
+            return true;
+        }
+        if !self.run_can_interrupt() {
+            return false;
+        }
+        self.interrupt_active_run(cx);
+        true
+    }
+
+    /// Dismisses the innermost open dialog or pane, returning whether one was
+    /// open.
+    ///
+    /// Split out of the escape handler so the dismissal decision is testable
+    /// without sending a run-control request.
+    pub(crate) fn dismiss_open_surface(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.command_palette_open {
+            self.close_command_palette(cx);
+            return true;
+        }
+        if self.source_dialog.is_some() {
+            self.source_dialog = None;
+            self.pending_source_path = None;
+            self.source_path_input = None;
+            self.repository_filter_input = None;
+            cx.notify();
+            return true;
+        }
+        if self.rename_dialog.is_some() {
+            self.rename_dialog = None;
+            self.rename_input_state = None;
+            cx.notify();
+            return true;
+        }
+        if self.github_login.is_some() {
+            self.github_login = None;
+            cx.notify();
+            return true;
+        }
+        if self.settings_open {
+            self.settings_open = false;
+            cx.notify();
+            return true;
+        }
+        if self.session_drawer_open {
+            self.session_drawer_open = false;
+            cx.notify();
+            return true;
+        }
+        if self.review.open {
+            self.review.open = false;
+            self.project_child_review = None;
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
     /// Recomputes the composer's inline completion from the current text.
     pub(crate) fn refresh_composer_completion(&mut self, cx: &mut Context<Self>) {
         if self.suppress_completion_once {

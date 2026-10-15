@@ -20,7 +20,10 @@ use sha2::{Digest, Sha256};
 
 mod connection;
 
-pub use connection::{LocalConnection, OwnedBackend, RemoteConnection, RemoteConnectionOptions};
+pub use connection::{
+    DEFAULT_REQUEST_TIMEOUT, LocalConnection, OwnedBackend, RemoteConnection,
+    RemoteConnectionOptions,
+};
 
 /// Whether the native WebSocket transport can negotiate TLS (`wss://`).
 ///
