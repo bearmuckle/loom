@@ -1545,7 +1545,9 @@ pub(crate) fn tool_usage_summary(tools: &[&ToolPart]) -> String {
 /// pending calls keep the group from reading as done until every call has
 /// settled. At that point a failure only dominates when nothing succeeded: a
 /// response that recovered from a failed call reads as done, with the failures
-/// called out by `tool_failure_count` instead of condemning the whole run.
+/// called out by `tool_failure_count` instead of condemning the whole run. A
+/// policy denial settles the group the same way: it is the outcome only when
+/// nothing succeeded, and otherwise it is reported as a denial note.
 pub(crate) fn tool_group_status(tools: &[&ToolPart]) -> ToolPartStatus {
     let has = |status| tools.iter().any(|tool| tool.status == status);
     let active = tools.iter().any(|tool| {
@@ -1562,6 +1564,8 @@ pub(crate) fn tool_group_status(tools: &[&ToolPart]) -> ToolPartStatus {
         ToolPartStatus::Queued
     } else if has(ToolPartStatus::Failed) && !has(ToolPartStatus::Completed) {
         ToolPartStatus::Failed
+    } else if has(ToolPartStatus::Denied) && !has(ToolPartStatus::Completed) {
+        ToolPartStatus::Denied
     } else if has(ToolPartStatus::Cancelled) && !has(ToolPartStatus::Completed) {
         ToolPartStatus::Cancelled
     } else {
@@ -1576,6 +1580,34 @@ pub(crate) fn tool_failure_count(tools: &[&ToolPart]) -> usize {
         .iter()
         .filter(|tool| tool.status == ToolPartStatus::Failed)
         .count()
+}
+
+/// How many calls in a run the workspace policy denied. A denial is a decision,
+/// not a failure, so it is counted separately and never reported as a failure.
+pub(crate) fn tool_denial_count(tools: &[&ToolPart]) -> usize {
+    tools
+        .iter()
+        .filter(|tool| tool.status == ToolPartStatus::Denied)
+        .count()
+}
+
+/// The notes a collapsed run's aggregate status does not already report: how
+/// many calls failed and how many the policy denied. A run that recovered still
+/// says what happened to the calls that did not succeed.
+pub(crate) fn tool_outcome_notes(
+    tools: &[&ToolPart],
+    status: ToolPartStatus,
+) -> Vec<(ToolPartStatus, String)> {
+    let mut notes = Vec::new();
+    let failed = tool_failure_count(tools);
+    if failed > 0 && status != ToolPartStatus::Failed {
+        notes.push((ToolPartStatus::Failed, format!("{failed} failed")));
+    }
+    let denied = tool_denial_count(tools);
+    if denied > 0 && status != ToolPartStatus::Denied {
+        notes.push((ToolPartStatus::Denied, format!("{denied} denied by policy")));
+    }
+    notes
 }
 
 /// Whether a run of tool calls contains one that is blocked on the user. The
@@ -1894,9 +1926,11 @@ pub(crate) fn tool_display_detail(part: &ToolPart) -> Option<String> {
 /// no disclosure control.
 /// Whether a successful result that exists nowhere else is shown. Failed output
 /// is never shown: the row reports the failed status, and whether the failure
-/// matters is the agent's judgement, reported in its answer.
+/// matters is the agent's judgement, reported in its answer. A denial's reason
+/// is the policy's own statement and is shown by `tool_policy_note` instead of
+/// as tool output.
 pub(crate) fn tool_shows_output(part: &ToolPart) -> bool {
-    part.status != ToolPartStatus::Failed
+    !matches!(part.status, ToolPartStatus::Failed | ToolPartStatus::Denied)
         && part
             .output
             .as_deref()
@@ -2221,7 +2255,61 @@ pub(crate) fn tool_part_from_call(call: &loom_model::ToolCall, status: ToolPartS
         output: None,
         elapsed_ms: None,
         approval_pending: status == ToolPartStatus::AwaitingApproval,
+        policy: None,
     }
+}
+
+/// The tool block for a policy decision, which the backend journals before it
+/// acts on the decision.
+///
+/// A denial is projected as its own status as soon as the decision arrives, so
+/// a refusal the policy made is never presented as a tool that merely failed.
+/// A decision the run still has to act on keeps the call's pending status; the
+/// start, approval and completion events that follow settle it.
+pub(crate) fn tool_part_from_policy(
+    call: &loom_model::ToolCall,
+    evaluation: &loom_core::PolicyEvaluation,
+) -> ToolPart {
+    let status = match evaluation.decision {
+        loom_core::PolicyDecision::Deny => ToolPartStatus::Denied,
+        loom_core::PolicyDecision::Allow | loom_core::PolicyDecision::RequireApproval => {
+            ToolPartStatus::Queued
+        }
+    };
+    let mut part = tool_part_from_call(call, status);
+    part.policy = Some(evaluation.clone());
+    part
+}
+
+/// The lowercase name of an action kind, for the policy note a denied call
+/// shows next to the reason the policy gave.
+pub(crate) const fn action_kind_label(action: loom_core::ActionKind) -> &'static str {
+    match action {
+        loom_core::ActionKind::Read => "read",
+        loom_core::ActionKind::Write => "write",
+        loom_core::ActionKind::Command => "command",
+        loom_core::ActionKind::Network => "network",
+        loom_core::ActionKind::Destructive => "destructive",
+    }
+}
+
+/// The policy note for a call the policy denied: the action kind that was
+/// evaluated and the reason the policy gave. Nothing else records the action
+/// kind, and a denial is the decision rather than a failure, so the note is
+/// what makes the refusal legible. A call with no denial has no note, which is
+/// how a failure without a prior evaluation keeps its plain failed rendition.
+pub(crate) fn tool_policy_note(part: &ToolPart) -> Option<String> {
+    let policy = part
+        .policy
+        .as_ref()
+        .filter(|policy| policy.decision == loom_core::PolicyDecision::Deny)?;
+    let mut note = format!("{} action", action_kind_label(policy.action));
+    let reason = policy.reason.trim();
+    if !reason.is_empty() {
+        note.push_str(" · ");
+        note.push_str(reason);
+    }
+    Some(note)
 }
 
 pub(crate) fn tool_part_from_activity(activity: &AgentActivityRecord) -> Option<ToolPart> {
@@ -2260,6 +2348,7 @@ pub(crate) fn tool_part_from_activity(activity: &AgentActivityRecord) -> Option<
             .map(|output| bounded(&humanize_tool_output(&call.name, output))),
         elapsed_ms: activity.elapsed_ms,
         approval_pending: activity.status == AgentActivityStatus::AwaitingApproval,
+        policy: None,
     })
 }
 
@@ -2716,6 +2805,7 @@ mod tests {
             output: output.map(str::to_owned),
             elapsed_ms: None,
             approval_pending: false,
+            policy: None,
         };
 
         assert_eq!(
@@ -2754,6 +2844,7 @@ mod tests {
             output: Some("test result: ok".to_owned()),
             elapsed_ms: None,
             approval_pending: false,
+            policy: None,
         };
 
         assert_eq!(
@@ -2783,6 +2874,7 @@ mod tests {
             output: None,
             elapsed_ms: None,
             approval_pending: false,
+            policy: None,
         };
         assert_eq!(tool_display_detail(&read).as_deref(), Some("Lines 10–20"));
     }
@@ -2800,6 +2892,7 @@ mod tests {
                     output: output.map(str::to_owned),
                     elapsed_ms: None,
                     approval_pending: false,
+                    policy: None,
                 }
             };
 

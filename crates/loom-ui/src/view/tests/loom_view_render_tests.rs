@@ -1386,6 +1386,7 @@ fn repeated_tool_calls_collapse_into_a_group(cx: &mut TestAppContext) {
                     output: None,
                     elapsed_ms: Some(1),
                     approval_pending: false,
+                    policy: None,
                 }))
             })
             .collect();
@@ -1429,6 +1430,7 @@ fn tool_usage_summary_lines_collapse_by_default(cx: &mut TestAppContext) {
             output: None,
             elapsed_ms: Some(4),
             approval_pending: false,
+            policy: None,
         }))
     };
     let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
@@ -1488,6 +1490,7 @@ fn a_running_tool_usage_stays_collapsed_until_expanded(cx: &mut TestAppContext) 
                 output: Some("running tests".to_owned()),
                 elapsed_ms: None,
                 approval_pending: false,
+                policy: None,
             }))],
             streaming: false,
         })];
@@ -1532,6 +1535,7 @@ fn a_running_tool_group_stays_collapsed_until_expanded(cx: &mut TestAppContext) 
                     output: None,
                     elapsed_ms: None,
                     approval_pending: false,
+                    policy: None,
                 }))
             })
             .collect();
@@ -1580,6 +1584,7 @@ fn an_approval_gated_tool_usage_opens_for_the_decision(cx: &mut TestAppContext) 
                 output: None,
                 elapsed_ms: None,
                 approval_pending: true,
+                policy: None,
             }))],
             streaming: false,
         })];
@@ -1608,6 +1613,7 @@ fn recovered_failures_do_not_condemn_the_tool_summary(cx: &mut TestAppContext) {
             output: None,
             elapsed_ms: Some(1),
             approval_pending: false,
+            policy: None,
         }))
     };
     let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
@@ -1655,6 +1661,7 @@ fn reasoning_and_tool_cycles_gather_into_one_agent_entry(cx: &mut TestAppContext
             output: None,
             elapsed_ms: Some(3),
             approval_pending: false,
+            policy: None,
         }))
     };
     let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
@@ -1725,6 +1732,7 @@ fn tool_groups_render_pending_active_and_failed_statuses(cx: &mut TestAppContext
                         output: None,
                         elapsed_ms: None,
                         approval_pending: false,
+                        policy: None,
                     }))
                 })
                 .collect();
@@ -2256,6 +2264,7 @@ fn action_only_tools_hide_their_result_body(cx: &mut TestAppContext) {
                     output: Some("fn main() {}".to_owned()),
                     elapsed_ms: Some(4),
                     approval_pending: false,
+                    policy: None,
                 })),
                 AssistantPart::Tool(Box::new(ToolPart {
                     id: command_id,
@@ -2266,6 +2275,7 @@ fn action_only_tools_hide_their_result_body(cx: &mut TestAppContext) {
                     output: Some("test result: ok".to_owned()),
                     elapsed_ms: Some(8),
                     approval_pending: false,
+                    policy: None,
                 })),
                 AssistantPart::Tool(Box::new(ToolPart {
                     id: failed_command_id,
@@ -2276,6 +2286,7 @@ fn action_only_tools_hide_their_result_body(cx: &mut TestAppContext) {
                     output: Some("test result: FAILED".to_owned()),
                     elapsed_ms: Some(9),
                     approval_pending: false,
+                    policy: None,
                 })),
                 AssistantPart::Tool(Box::new(ToolPart {
                     id: search_id,
@@ -2286,6 +2297,7 @@ fn action_only_tools_hide_their_result_body(cx: &mut TestAppContext) {
                     output: Some(r#"{"results":[]}"#.to_owned()),
                     elapsed_ms: Some(3),
                     approval_pending: false,
+                    policy: None,
                 })),
             ],
             streaming: false,
@@ -2341,6 +2353,7 @@ fn bodyless_tools_have_no_disclosure_and_failures_start_collapsed(cx: &mut TestA
                     output: Some("fn main() {}".to_owned()),
                     elapsed_ms: Some(4),
                     approval_pending: false,
+                    policy: None,
                 })),
                 // A failed read is the same: the row reports the failure and
                 // the agent decides whether it matters.
@@ -2353,6 +2366,7 @@ fn bodyless_tools_have_no_disclosure_and_failures_start_collapsed(cx: &mut TestA
                     output: Some("No such file or directory".to_owned()),
                     elapsed_ms: Some(2),
                     approval_pending: false,
+                    policy: None,
                 })),
                 // A successful result that exists nowhere else is shown, but
                 // starts collapsed.
@@ -2365,6 +2379,7 @@ fn bodyless_tools_have_no_disclosure_and_failures_start_collapsed(cx: &mut TestA
                     output: Some(r#"{"results":[]}"#.to_owned()),
                     elapsed_ms: Some(3),
                     approval_pending: false,
+                    policy: None,
                 })),
             ],
             streaming: false,
@@ -4281,6 +4296,7 @@ fn inspector_renders_agent_context_and_files_tabs(cx: &mut TestAppContext) {
                 output: Some("contents".to_owned()),
                 elapsed_ms: Some(12),
                 approval_pending: false,
+                policy: None,
             }))],
             streaming: false,
         })];
@@ -4802,6 +4818,7 @@ fn transcript_renders_all_message_and_activity_variants(cx: &mut TestAppContext)
                         output: Some("updated file".to_owned()),
                         elapsed_ms: Some(1500),
                         approval_pending: false,
+                        policy: None,
                     })),
                     AssistantPart::Evidence(vec![EvidenceText {
                         label: "src/lib.rs".to_owned(),

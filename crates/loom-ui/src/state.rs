@@ -10,8 +10,8 @@ use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::component::diff::{DiffFile, DiffState};
 use gpui_kit::{AppContext, Entity};
 use loom_core::{
-    AgentSessionId, AgentSessionSnapshot, AgentSessionState, EventSequence, ToolCallId,
-    UsageSnapshot,
+    AgentSessionId, AgentSessionSnapshot, AgentSessionState, EventSequence, PolicyEvaluation,
+    ToolCallId, UsageSnapshot,
 };
 use loom_model::ProviderUsageSummary;
 use loom_protocol::{
@@ -578,6 +578,14 @@ pub(crate) struct ToolPart {
     pub(crate) output: Option<String>,
     pub(crate) elapsed_ms: Option<u64>,
     pub(crate) approval_pending: bool,
+    /// The workspace policy's decision for this call, when the event stream
+    /// carried one.
+    ///
+    /// A denial is reported from the decision rather than inferred from the
+    /// failed result the backend journals for the same call, so a policy
+    /// refusal stays distinct from an operational failure and keeps the action
+    /// kind it was evaluated under.
+    pub(crate) policy: Option<PolicyEvaluation>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -588,6 +596,9 @@ pub(crate) enum ToolPartStatus {
     AwaitingInput,
     Completed,
     Failed,
+    /// The workspace policy denied the call. It is a decision rather than a
+    /// failure, so it is labelled, coloured and counted separately.
+    Denied,
     Cancelled,
 }
 
@@ -600,6 +611,7 @@ impl ToolPartStatus {
             Self::AwaitingInput => "waiting for input",
             Self::Completed => "done",
             Self::Failed => "failed",
+            Self::Denied => "denied by policy",
             Self::Cancelled => "cancelled",
         }
     }
@@ -757,7 +769,12 @@ fn merge_tool_part(target: &mut ToolPart, update: ToolPart) {
     if !update.name.is_empty() {
         target.name = update.name;
     }
-    target.status = update.status;
+    // A denial is terminal: the backend completes the denied call as a failed
+    // tool result carrying the same reason, and that result must not turn the
+    // row back into an operational failure.
+    if target.status != ToolPartStatus::Denied {
+        target.status = update.status;
+    }
     if update.detail.is_some() {
         target.detail = update.detail;
     }
@@ -766,6 +783,9 @@ fn merge_tool_part(target: &mut ToolPart, update: ToolPart) {
     }
     if update.elapsed_ms.is_some() {
         target.elapsed_ms = update.elapsed_ms;
+    }
+    if update.policy.is_some() {
+        target.policy = update.policy;
     }
     target.approval_pending = update.approval_pending;
 }
@@ -1194,6 +1214,7 @@ mod tests {
             output: None,
             elapsed_ms: None,
             approval_pending: false,
+            policy: None,
         }
     }
 
@@ -1331,9 +1352,38 @@ mod tests {
             (ToolPartStatus::AwaitingInput, "waiting for input"),
             (ToolPartStatus::Completed, "done"),
             (ToolPartStatus::Failed, "failed"),
+            (ToolPartStatus::Denied, "denied by policy"),
             (ToolPartStatus::Cancelled, "cancelled"),
         ] {
             assert_eq!(status.label(), label);
         }
+    }
+
+    #[test]
+    fn a_policy_denial_survives_the_failed_result_it_completes_with() {
+        let id = ToolCallId::new();
+        let evaluation = PolicyEvaluation {
+            action: loom_core::ActionKind::Destructive,
+            decision: loom_core::PolicyDecision::Deny,
+            reason: "github_push_branch is denied by the workspace policy".to_owned(),
+        };
+        let mut denied = tool(id, "github_push_branch", ToolPartStatus::Denied);
+        denied.policy = Some(evaluation.clone());
+        let mut timeline = Vec::new();
+        upsert_tool_part(&mut timeline, denied);
+
+        let mut failed = tool(id, "github_push_branch", ToolPartStatus::Failed);
+        failed.output = Some(evaluation.reason.clone());
+        upsert_tool_part(&mut timeline, failed);
+
+        let TimelineItem::Assistant(turn) = &timeline[0] else {
+            panic!("expected the tool block in an assistant turn");
+        };
+        let AssistantPart::Tool(part) = &turn.parts[0] else {
+            panic!("expected a tool part");
+        };
+        assert_eq!(part.status, ToolPartStatus::Denied);
+        assert_eq!(part.policy.as_ref(), Some(&evaluation));
+        assert_eq!(part.output.as_deref(), Some(evaluation.reason.as_str()));
     }
 }

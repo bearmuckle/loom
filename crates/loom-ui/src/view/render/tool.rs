@@ -187,6 +187,7 @@ impl LoomView {
         let status = tool_group_status(&tools);
         let status_color = match status {
             ToolPartStatus::Failed => rgb(0xfca5a5),
+            ToolPartStatus::Denied => rgb(0xfbbf24),
             ToolPartStatus::Running => rgb(0x93c5fd),
             ToolPartStatus::Queued | ToolPartStatus::Cancelled => rgb(0x94a3b8),
             ToolPartStatus::Completed
@@ -199,13 +200,11 @@ impl LoomView {
         let total_ms = tools.iter().filter_map(|tool| tool.elapsed_ms).sum::<u64>();
         let duration = (total_ms > 0).then(|| format_duration(total_ms));
         let summary = tool_usage_summary(&tools);
-        let failed = tool_failure_count(&tools);
-        let failure_note =
-            (failed > 0 && status != ToolPartStatus::Failed).then(|| format!("{failed} failed"));
-        let accessibility_failure = failure_note
-            .as_deref()
-            .map(|note| format!(", {note}"))
-            .unwrap_or_default();
+        let notes = tool_outcome_notes(&tools, status);
+        let accessibility_notes = notes
+            .iter()
+            .map(|(_, note)| format!(", {note}"))
+            .collect::<String>();
         let parent_for_toggle = parent.clone();
         let mut block = div()
             .id(("tool-usage", key))
@@ -222,7 +221,7 @@ impl LoomView {
                     .small()
                     .w_full()
                     .accessibility_label(format!(
-                        "Tools used: {summary}, {status_label}{accessibility_failure}"
+                        "Tools used: {summary}, {status_label}{accessibility_notes}"
                     ))
                     .on_click(move |_, _, cx| {
                         parent_for_toggle.update(cx, |this, cx| this.toggle_tool_usage(key, cx));
@@ -250,9 +249,7 @@ impl LoomView {
                                     .child(summary),
                             )
                             .child(div().text_color(status_color).child(status_label))
-                            .when_some(failure_note, |element, note| {
-                                element.child(div().text_color(rgb(0xfca5a5)).child(note))
-                            })
+                            .children(notes.into_iter().map(outcome_note))
                             .when_some(duration, |element, duration| {
                                 element.child(div().text_color(rgb(0x64748b)).child(duration))
                             }),
@@ -340,6 +337,7 @@ impl LoomView {
         let status = tool_group_status(&tools);
         let status_color = match status {
             ToolPartStatus::Failed => rgb(0xfca5a5),
+            ToolPartStatus::Denied => rgb(0xfbbf24),
             ToolPartStatus::Running => rgb(0x93c5fd),
             ToolPartStatus::Queued | ToolPartStatus::Cancelled => rgb(0x94a3b8),
             ToolPartStatus::Completed
@@ -355,13 +353,11 @@ impl LoomView {
         let total_ms = tools.iter().filter_map(|tool| tool.elapsed_ms).sum::<u64>();
         let duration = (total_ms > 0).then(|| format_duration(total_ms));
         let label = tool_group_label(&first.name, tools.len());
-        let failed = tool_failure_count(&tools);
-        let failure_note =
-            (failed > 0 && status != ToolPartStatus::Failed).then(|| format!("{failed} failed"));
-        let accessibility_failure = failure_note
-            .as_deref()
-            .map(|note| format!(", {note}"))
-            .unwrap_or_default();
+        let notes = tool_outcome_notes(&tools, status);
+        let accessibility_notes = notes
+            .iter()
+            .map(|(_, note)| format!(", {note}"))
+            .collect::<String>();
         let parent_for_toggle = parent.clone();
         let mut group = div()
             .id(("tool-group", key))
@@ -377,7 +373,7 @@ impl LoomView {
                     .ghost()
                     .small()
                     .w_full()
-                    .accessibility_label(format!("{label}, {status_label}{accessibility_failure}"))
+                    .accessibility_label(format!("{label}, {status_label}{accessibility_notes}"))
                     .on_click(move |_, _, cx| {
                         parent_for_toggle.update(cx, |this, cx| this.toggle_tool_group(key, cx));
                     })
@@ -404,9 +400,7 @@ impl LoomView {
                                     .child(label),
                             )
                             .child(div().text_color(status_color).child(status_label))
-                            .when_some(failure_note, |element, note| {
-                                element.child(div().text_color(rgb(0xfca5a5)).child(note))
-                            })
+                            .children(notes.into_iter().map(outcome_note))
                             .when_some(duration, |element, duration| {
                                 element.child(div().text_color(rgb(0x64748b)).child(duration))
                             }),
@@ -474,6 +468,7 @@ impl LoomView {
     ) -> gpui_kit::AnyElement {
         let status_color = match part.status {
             ToolPartStatus::Failed => rgb(0xfca5a5),
+            ToolPartStatus::Denied => rgb(0xfbbf24),
             ToolPartStatus::Completed => rgb(0x9ad7bd),
             ToolPartStatus::AwaitingApproval | ToolPartStatus::AwaitingInput => rgb(0xfef3c7),
             ToolPartStatus::Running => rgb(0x93c5fd),
@@ -565,6 +560,21 @@ impl LoomView {
                             }),
                     ),
             );
+        if let Some(note) = tool_policy_note(part) {
+            // The decision is the point of the row, so the action kind and the
+            // reason are always visible instead of sitting behind a disclosure.
+            block = block.child(
+                div()
+                    .id(("tool-policy-note", tool_element_id(index, part_index)))
+                    .test_support()
+                    .ml(px(20.))
+                    .pt_1()
+                    .text_xs()
+                    .text_color(rgb(0xfbbf24))
+                    .aria_label(note.clone())
+                    .child(note),
+            );
+        }
         if expanded {
             if let Some(detail) = tool_display_detail(part) {
                 block = block.child(
@@ -925,4 +935,21 @@ impl LoomView {
             .saturating_sub(run.started_at.as_unix_millis());
         Some(format_duration(milliseconds))
     }
+}
+
+/// The colour of a collapsed run's outcome note: a policy denial is amber like
+/// the denied row, and an operational failure is the failure red.
+fn outcome_note_color(condition: ToolPartStatus) -> Rgba {
+    match condition {
+        ToolPartStatus::Denied => rgb(0xfbbf24),
+        _ => rgb(0xfca5a5),
+    }
+}
+
+/// One note appended to a collapsed run's aggregate status.
+fn outcome_note((condition, note): (ToolPartStatus, String)) -> gpui_kit::AnyElement {
+    div()
+        .text_color(outcome_note_color(condition))
+        .child(note)
+        .into_any()
 }

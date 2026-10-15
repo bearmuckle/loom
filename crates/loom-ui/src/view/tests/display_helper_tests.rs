@@ -3,17 +3,22 @@ use super::{
     CompletionKind, FileActivityOperation, LOOM_REPOSITORY_URL, MAX_RUN_FAILURE_REASON_CHARS,
     ToolPart, ToolPartStatus, about_backend, about_backend_label, about_build_version,
     about_git_revision, about_links, about_platform_label, about_protocol, about_version_label,
-    activity_output, change_kind_label, command_line, command_purpose, commands_matching,
-    completion_for_value, composer_height, disconnected_screen, endpoint_host, endpoint_label,
-    format_bytes, format_duration, format_percentage, has_block_markdown, humanize_tool_output,
-    is_redundant_completion_summary, relative_time, replace_command_token, replace_last_token, rgb,
-    run_failure_reason, run_state_color, run_state_label, session_is_active, session_status_pill,
-    source_mount_path, tool_detail, tool_failure_count, tool_group_label, tool_group_status,
-    tool_icon, tool_needs_attention, tool_part_from_activity, tool_status, tool_title,
-    tool_title_for_activity, tool_usage_label, tool_usage_summary,
+    action_kind_label, activity_output, change_kind_label, command_line, command_purpose,
+    commands_matching, completion_for_value, composer_height, disconnected_screen, endpoint_host,
+    endpoint_label, format_bytes, format_duration, format_percentage, has_block_markdown,
+    humanize_tool_output, is_redundant_completion_summary, relative_time, replace_command_token,
+    replace_last_token, rgb, run_failure_reason, run_state_color, run_state_label,
+    session_is_active, session_status_pill, source_mount_path, tool_denial_count, tool_detail,
+    tool_failure_count, tool_group_label, tool_group_status, tool_icon, tool_needs_attention,
+    tool_outcome_notes, tool_part_from_activity, tool_part_from_policy, tool_policy_note,
+    tool_shows_output, tool_status, tool_title, tool_title_for_activity, tool_usage_label,
+    tool_usage_summary,
 };
 use gpui_kit::assets::IconName as AssetIconName;
-use loom_core::{ActivityId, AgentSessionState, ProtocolVersion, RunId, Timestamp};
+use loom_core::{
+    ActionKind, ActivityId, AgentSessionState, PolicyDecision, PolicyEvaluation, ProtocolVersion,
+    RunId, Timestamp,
+};
 use loom_model::{ModelId, ToolCall};
 use loom_protocol::{AgentActivityKind, AgentRunState, ToolResult};
 use serde_json::json;
@@ -413,6 +418,7 @@ fn tool_usage_summary_counts_calls_by_type_in_first_seen_order() {
         output: None,
         elapsed_ms: None,
         approval_pending: false,
+        policy: None,
     };
     let parts = [
         part("read_file"),
@@ -585,12 +591,67 @@ fn grouped_part(status: ToolPartStatus) -> ToolPart {
         output: None,
         elapsed_ms: None,
         approval_pending: false,
+        policy: None,
     }
+}
+
+/// A call the workspace policy denied, with the evaluation recorded against it.
+fn denied_part(action: ActionKind, reason: &str) -> ToolPart {
+    tool_part_from_policy(
+        &call("github_push_branch"),
+        &PolicyEvaluation {
+            action,
+            decision: PolicyDecision::Deny,
+            reason: reason.to_owned(),
+        },
+    )
+}
+
+#[test]
+fn a_denied_call_is_a_policy_decision_with_its_action_kind_and_reason() {
+    let denied = denied_part(ActionKind::Destructive, "pushing is denied by policy");
+    assert_eq!(denied.status, ToolPartStatus::Denied);
+    assert_eq!(denied.status.label(), "denied by policy");
+    assert_ne!(denied.status.label(), ToolPartStatus::Failed.label());
+    assert_eq!(
+        tool_policy_note(&denied).as_deref(),
+        Some("destructive action · pushing is denied by policy")
+    );
+    // The reason is the policy's own statement, not tool output to expand.
+    assert!(!tool_shows_output(&denied));
+
+    // A decision the run still has to act on keeps the call pending, and only a
+    // denial produces the note.
+    let allowed = tool_part_from_policy(
+        &call("read_file"),
+        &PolicyEvaluation {
+            action: ActionKind::Read,
+            decision: PolicyDecision::Allow,
+            reason: "read_file is allowed by the workspace policy".to_owned(),
+        },
+    );
+    assert_eq!(allowed.status, ToolPartStatus::Queued);
+    assert_eq!(tool_policy_note(&allowed), None);
+
+    // A reason the policy did not provide leaves the action kind on its own.
+    assert_eq!(
+        tool_policy_note(&denied_part(ActionKind::Network, "  ")).as_deref(),
+        Some("network action")
+    );
+}
+
+#[test]
+fn action_kind_labels_name_every_evaluated_kind() {
+    assert_eq!(action_kind_label(ActionKind::Read), "read");
+    assert_eq!(action_kind_label(ActionKind::Write), "write");
+    assert_eq!(action_kind_label(ActionKind::Command), "command");
+    assert_eq!(action_kind_label(ActionKind::Network), "network");
+    assert_eq!(action_kind_label(ActionKind::Destructive), "destructive");
 }
 
 #[test]
 fn tool_group_status_reflects_unfinished_children() {
-    use ToolPartStatus::{AwaitingApproval, Cancelled, Completed, Failed, Queued, Running};
+    use ToolPartStatus::{AwaitingApproval, Cancelled, Completed, Denied, Failed, Queued, Running};
 
     let status = |statuses: &[ToolPartStatus]| {
         let parts = statuses
@@ -616,15 +677,54 @@ fn tool_group_status_reflects_unfinished_children() {
     assert_eq!(status(&[Cancelled, Cancelled]), Cancelled);
     assert_eq!(status(&[Failed, Running]), Running);
     assert_eq!(status(&[Failed, Queued]), Queued);
+    // A denial is a decision rather than a failure, so it settles the group as
+    // its own status while nothing has succeeded.
+    assert_eq!(status(&[Denied]), Denied);
+    assert_eq!(status(&[Denied, Denied]), Denied);
+    assert_eq!(status(&[Denied, Completed]), Completed);
+    assert_eq!(status(&[Denied, AwaitingApproval]), Running);
+    // A failure outranks a denial when nothing succeeded; the denial is then
+    // reported as an outcome note instead.
+    assert_eq!(status(&[Denied, Failed]), Failed);
 }
 
 #[test]
 fn tool_failure_count_only_counts_failed_calls() {
     let failed = grouped_part(ToolPartStatus::Failed);
+    let denied = grouped_part(ToolPartStatus::Denied);
     let completed = grouped_part(ToolPartStatus::Completed);
     let parts = [&failed, &completed, &failed];
     assert_eq!(tool_failure_count(&parts), 2);
     assert_eq!(tool_failure_count(&[&completed]), 0);
+    // A policy denial is never counted as a failure.
+    assert_eq!(tool_failure_count(&[&denied, &denied]), 0);
+    assert_eq!(tool_denial_count(&[&denied, &denied, &failed]), 2);
+    assert_eq!(tool_denial_count(&[&completed]), 0);
+}
+
+#[test]
+fn tool_outcome_notes_report_what_the_aggregate_status_does_not() {
+    let failed = grouped_part(ToolPartStatus::Failed);
+    let denied = grouped_part(ToolPartStatus::Denied);
+    let completed = grouped_part(ToolPartStatus::Completed);
+
+    let notes = |parts: &[&ToolPart]| {
+        tool_outcome_notes(parts, tool_group_status(parts))
+            .into_iter()
+            .map(|(_, note)| note)
+            .collect::<Vec<_>>()
+    };
+    assert!(notes(&[&completed, &completed]).is_empty());
+    assert_eq!(notes(&[&completed, &failed]), ["1 failed"]);
+    // The aggregate status already reports the failure.
+    assert!(notes(&[&failed, &failed]).is_empty());
+    assert_eq!(notes(&[&completed, &denied]), ["1 denied by policy"]);
+    assert!(notes(&[&denied]).is_empty());
+    // A denial is neither counted nor worded as a failure.
+    assert_eq!(
+        notes(&[&completed, &failed, &denied, &denied]),
+        ["1 failed", "2 denied by policy"]
+    );
 }
 
 #[test]

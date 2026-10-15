@@ -361,7 +361,15 @@ impl LoomView {
                     tool_part_from_call(call, ToolPartStatus::AwaitingApproval),
                 );
             }
-            AgentEvent::ToolPolicyEvaluated { .. } => {}
+            AgentEvent::ToolPolicyEvaluated {
+                call, evaluation, ..
+            } => {
+                // The decision is recorded against the call as soon as it
+                // arrives: a denial is then already a policy decision while the
+                // run is still completing the call, and the failed result the
+                // backend sends for it cannot present the refusal as a failure.
+                upsert_tool_part(&mut self.timeline, tool_part_from_policy(call, evaluation));
+            }
             AgentEvent::ToolApprovalDecided {
                 run_id,
                 attempt_id,
@@ -389,6 +397,7 @@ impl LoomView {
                         output: None,
                         elapsed_ms: None,
                         approval_pending: false,
+                        policy: None,
                     },
                 );
             }
@@ -414,6 +423,7 @@ impl LoomView {
                         output: Some(bounded(chunk)),
                         elapsed_ms: None,
                         approval_pending: false,
+                        policy: None,
                     },
                 );
             }
