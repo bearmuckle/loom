@@ -501,6 +501,11 @@ pub(crate) struct LoomView {
     pub(crate) session_models: BTreeMap<AgentSessionId, ModelId>,
     pub(crate) auto_approve_actions: bool,
     session_auto_approve_actions: BTreeMap<AgentSessionId, bool>,
+    /// Whether destructive actions pause for approval in this session. Off by
+    /// default, so a destructive action runs automatically unless the user asks
+    /// to be prompted.
+    pub(crate) ask_before_destructive_actions: bool,
+    session_ask_before_destructive_actions: BTreeMap<AgentSessionId, bool>,
     pub(crate) session_task_cache: BTreeMap<AgentSessionId, String>,
     pub(crate) optimistic_messages: Vec<String>,
     pub(crate) sending_message: bool,
@@ -1019,6 +1024,37 @@ fn settings_row(
                 ),
         )
         .child(control)
+}
+
+/// The approval policy a session's settings row sends.
+///
+/// One request replaces every kind decision, so the destructive dimension is
+/// always set explicitly: toggling either control must not silently reset the
+/// other one's choice.
+fn session_approval_policy(
+    auto_approve_actions: bool,
+    ask_before_destructive_actions: bool,
+) -> loom_core::ApprovalPolicy {
+    let mut policy = if auto_approve_actions {
+        loom_core::ApprovalPolicy::auto_approve()
+    } else {
+        loom_core::ApprovalPolicy::default()
+    };
+    policy.destructive = if ask_before_destructive_actions {
+        loom_core::PolicyDecision::RequireApproval
+    } else {
+        loom_core::PolicyDecision::Allow
+    };
+    policy
+}
+
+/// Whether a stored destructive decision prompts the user.
+///
+/// The setting only distinguishes prompting from running automatically, so a
+/// decision that denies destructive actions reads as prompting: the user still
+/// has to change the policy before one can run.
+fn destructive_actions_require_approval(decision: loom_core::PolicyDecision) -> bool {
+    decision != loom_core::PolicyDecision::Allow
 }
 
 /// A read-only value shown on the right of an About row, with a stable
@@ -1566,6 +1602,8 @@ impl LoomView {
             session_models: BTreeMap::new(),
             auto_approve_actions: true,
             session_auto_approve_actions: BTreeMap::new(),
+            ask_before_destructive_actions: false,
+            session_ask_before_destructive_actions: BTreeMap::new(),
             session_task_cache: BTreeMap::new(),
             optimistic_messages: Vec::new(),
             sending_message: false,

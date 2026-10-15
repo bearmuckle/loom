@@ -59,6 +59,11 @@ impl LoomView {
                         self.auto_approve_actions = initial.projection.auto_approve_actions;
                         self.session_auto_approve_actions
                             .insert(session_id, initial.projection.auto_approve_actions);
+                        self.ask_before_destructive_actions = destructive_actions_require_approval(
+                            initial.projection.approval_policy.destructive,
+                        );
+                        self.session_ask_before_destructive_actions
+                            .insert(session_id, self.ask_before_destructive_actions);
                         let _ = events;
                         continue;
                     }

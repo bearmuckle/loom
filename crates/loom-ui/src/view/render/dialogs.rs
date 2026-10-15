@@ -1139,6 +1139,27 @@ impl LoomView {
                             phone,
                         ))
                         .child(settings_row(
+                            "Ask before destructive actions",
+                            "Deletes, pushes, and other irreversible actions prompt first",
+                            Switch::new("session-ask-before-destructive-toggle")
+                                .checked(self.ask_before_destructive_actions)
+                                .disabled(
+                                    !self.is_connected()
+                                        || self.approval_settings_request_in_flight,
+                                )
+                                .accessibility_label("Ask before destructive actions")
+                                .on_change({
+                                    let view = cx.entity();
+                                    move |_checked, _window, cx| {
+                                        view.update(cx, |view, cx| {
+                                            view.toggle_ask_before_destructive_actions(cx);
+                                        });
+                                    }
+                                }),
+                            false,
+                            phone,
+                        ))
+                        .child(settings_row(
                             "Default model for new sessions",
                             "Used when a session has no model of its own",
                             if phone {
