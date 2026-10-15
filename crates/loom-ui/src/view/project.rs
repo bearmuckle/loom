@@ -249,7 +249,7 @@ impl LoomView {
                     diff,
                 })) => {
                     view.project_child_review =
-                        Some((worktree.clone(), status.clone(), diff.clone()));
+                        Some((worktree.as_ref().clone(), status.clone(), diff.clone()));
                     view.project_snapshot_stale = true;
                     view.review.open = true;
                     view.review.tab = InspectorTab::Changes;
@@ -308,7 +308,7 @@ impl LoomView {
                     diff,
                 })) => {
                     view.project_child_review =
-                        Some((worktree.clone(), status.clone(), diff.clone()));
+                        Some((worktree.as_ref().clone(), status.clone(), diff.clone()));
                     view.project_snapshot_stale = true;
                     view.review.open = true;
                     view.review.tab = InspectorTab::Changes;

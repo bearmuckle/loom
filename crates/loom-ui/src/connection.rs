@@ -249,13 +249,14 @@ impl ClientConnection {
     ///
     /// Only used natively, where callers either run this on a dedicated
     /// worker thread (`BackendWorker`) or, during the synchronous startup
-    /// bootstrap, before any window exists.
+    /// bootstrap, before any window exists. A remote request is bounded by
+    /// [`loom_local::DEFAULT_REQUEST_TIMEOUT`] so a half-open socket cannot
+    /// stall the worker thread — and with it every later request — forever;
+    /// in-process requests are unbounded because they do not depend on a
+    /// socket staying alive.
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn request(&self, request: RequestEnvelope) -> ResponseEnvelope {
-        match self {
-            Self::InProcess(connection) => connection.request(request),
-            Self::Remote(connection) => connection.request(request),
-        }
+        self.request_with_timeout(request, loom_local::DEFAULT_REQUEST_TIMEOUT)
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -286,52 +287,86 @@ impl ClientConnection {
     }
 }
 
+/// The capabilities every client transport negotiates.
+///
+/// One list for both transports so a capability added for the native client is
+/// never silently missing from the browser client (or the reverse). The
+/// transport-specific entries live in `NATIVE_ONLY_NEGOTIATION_CAPABILITIES`,
+/// each with the reason it is native-only.
+const SHARED_NEGOTIATION_CAPABILITIES: &[Capability] = &[
+    Capability::CreateAgentSession,
+    Capability::ReadAgentSession,
+    Capability::ControlAgentSession,
+    Capability::DeleteAgentSession,
+    Capability::ConfigureArchiveRetention,
+    Capability::ManageWorkspaces,
+    Capability::ManageSessionRepositories,
+    Capability::ReadSessionFilesystem,
+    Capability::WriteSessionFilesystem,
+    Capability::SubscribeSessionEvents,
+    Capability::SubscribeWorkspaceEvents,
+    Capability::StartAgentRun,
+    Capability::ReadAgentRun,
+    Capability::ReadAgentRunMessages,
+    Capability::ControlAgentRun,
+    Capability::PauseAgentRun,
+    Capability::ResumeAgentRun,
+    Capability::ApproveAgentAction,
+    Capability::ListProviders,
+    Capability::ConfigureProviders,
+    Capability::ReadWorkspaceConfig,
+    Capability::BrowseGitHubRepositories,
+    Capability::ConfigureApprovalPolicy,
+    Capability::ReadVcsStatus,
+    Capability::ReadVcsDiff,
+    Capability::ReadUsage,
+    Capability::InspectContext,
+    Capability::ReadSessionTask,
+    Capability::StartSessionTask,
+    Capability::ControlSessionTask,
+    Capability::ReadSessionTaskEvidence,
+    Capability::ReadWorkerNodeStatus,
+    Capability::ReadProject,
+    Capability::SendProjectBranchMessage,
+    Capability::ReadProjectAgentMessages,
+    Capability::ControlProjectChild,
+    Capability::CreateProjectWorktree,
+    Capability::ReadProjectChildReview,
+    Capability::IntegrateProjectChild,
+    Capability::CleanupProjectChildWorktree,
+    Capability::JsonProtocol,
+];
+
+/// Capabilities only the native transports negotiate, each with the reason the
+/// browser transport does not.
+///
+/// A documented difference is allowed; an undocumented one is not, which is
+/// what the `capability_lists_agree_except_for_documented_transport_differences`
+/// test checks.
 #[cfg(not(target_family = "wasm"))]
+const NATIVE_ONLY_NEGOTIATION_CAPABILITIES: &[(Capability, &str)] = &[(
+    Capability::ManageCheckpoints,
+    "checkpoint management is implemented by the native transports; the browser client has no \
+     checkpoint surface",
+)];
+
+/// The capabilities this build advertises to a worker during negotiation.
 pub(crate) fn negotiation_capabilities() -> CapabilitySet {
-    CapabilitySet::new([
-        Capability::CreateAgentSession,
-        Capability::ReadAgentSession,
-        Capability::ControlAgentSession,
-        Capability::DeleteAgentSession,
-        Capability::ConfigureArchiveRetention,
-        Capability::ManageWorkspaces,
-        Capability::ManageSessionRepositories,
-        Capability::ReadSessionFilesystem,
-        Capability::WriteSessionFilesystem,
-        Capability::SubscribeSessionEvents,
-        Capability::SubscribeWorkspaceEvents,
-        Capability::StartAgentRun,
-        Capability::ReadAgentRun,
-        Capability::ReadAgentRunMessages,
-        Capability::ControlAgentRun,
-        Capability::PauseAgentRun,
-        Capability::ResumeAgentRun,
-        Capability::ApproveAgentAction,
-        Capability::ListProviders,
-        Capability::ConfigureProviders,
-        Capability::ReadWorkspaceConfig,
-        Capability::BrowseGitHubRepositories,
-        Capability::ConfigureApprovalPolicy,
-        Capability::ManageCheckpoints,
-        Capability::ReadVcsStatus,
-        Capability::ReadVcsDiff,
-        Capability::ReadUsage,
-        Capability::InspectContext,
-        Capability::ReadSessionTask,
-        Capability::StartSessionTask,
-        Capability::ControlSessionTask,
-        Capability::ReadSessionTaskEvidence,
-        Capability::ReadWorkerNodeStatus,
-        Capability::ReadProject,
-        Capability::SendProjectBranchMessage,
-        Capability::ReadProjectAgentMessages,
-        Capability::ControlProjectChild,
-        Capability::CreateProjectWorktree,
-        Capability::ReadProjectChildReview,
-        Capability::IntegrateProjectChild,
-        Capability::CleanupProjectChildWorktree,
-        Capability::JsonProtocol,
-    ])
+    // Chained rather than extended so the list needs no `mut` on the target
+    // whose transport-specific entries are compiled out.
+    #[cfg(not(target_family = "wasm"))]
+    let transport_specific = NATIVE_ONLY_NEGOTIATION_CAPABILITIES
+        .iter()
+        .map(|(capability, _)| *capability);
+    #[cfg(target_family = "wasm")]
+    let transport_specific = std::iter::empty::<Capability>();
+
+    CapabilitySet::new(
+        SHARED_NEGOTIATION_CAPABILITIES
+            .iter()
+            .copied()
+            .chain(transport_specific),
+    )
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -347,53 +382,6 @@ pub(crate) fn negotiate(connection: &ClientConnection) -> Result<NegotiationResu
         ServerResponse::Control(ControlResponse::Negotiated(result)) => Ok(result),
         response => Err(unexpected_response("negotiation", response)),
     }
-}
-
-#[cfg(target_family = "wasm")]
-pub(crate) fn negotiation_capabilities() -> CapabilitySet {
-    CapabilitySet::new([
-        Capability::CreateAgentSession,
-        Capability::ReadAgentSession,
-        Capability::ControlAgentSession,
-        Capability::DeleteAgentSession,
-        Capability::ConfigureArchiveRetention,
-        Capability::SubscribeSessionEvents,
-        Capability::SubscribeWorkspaceEvents,
-        Capability::StartAgentRun,
-        Capability::ReadAgentRun,
-        Capability::ReadAgentRunMessages,
-        Capability::ControlAgentRun,
-        Capability::PauseAgentRun,
-        Capability::ResumeAgentRun,
-        Capability::ApproveAgentAction,
-        Capability::ListProviders,
-        Capability::ConfigureProviders,
-        Capability::ReadWorkspaceConfig,
-        Capability::BrowseGitHubRepositories,
-        Capability::ConfigureApprovalPolicy,
-        Capability::ManageWorkspaces,
-        Capability::ManageSessionRepositories,
-        Capability::ReadSessionFilesystem,
-        Capability::WriteSessionFilesystem,
-        Capability::ReadVcsStatus,
-        Capability::ReadVcsDiff,
-        Capability::ReadUsage,
-        Capability::InspectContext,
-        Capability::ReadSessionTask,
-        Capability::StartSessionTask,
-        Capability::ControlSessionTask,
-        Capability::ReadSessionTaskEvidence,
-        Capability::ReadWorkerNodeStatus,
-        Capability::ReadProject,
-        Capability::SendProjectBranchMessage,
-        Capability::ReadProjectAgentMessages,
-        Capability::ControlProjectChild,
-        Capability::CreateProjectWorktree,
-        Capability::ReadProjectChildReview,
-        Capability::IntegrateProjectChild,
-        Capability::CleanupProjectChildWorktree,
-        Capability::JsonProtocol,
-    ])
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -992,7 +980,8 @@ pub(crate) fn unexpected_response(operation: &str, response: ServerResponse) -> 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::{
-        ClientConnection, ClientRequest, LoomError, RequestEnvelope, WorkspaceRequest,
+        ClientConnection, ClientRequest, LoomError, NATIVE_ONLY_NEGOTIATION_CAPABILITIES,
+        RequestEnvelope, SHARED_NEGOTIATION_CAPABILITIES, WorkspaceRequest,
         create_session_in_workspace, create_workspace, describe_startup_connection_error,
         include_discovered_models, list_models, list_workspace_sessions, list_workspaces,
         negotiate, negotiation_capabilities, provider_name_for_id, redact_secret,
@@ -1000,7 +989,8 @@ mod tests {
         worker_node_status, workspace_config,
     };
     use loom_core::{
-        Capability, ErrorCode, LoomError as CoreLoomError, Timestamp, WorkspaceId, WorkspaceRecord,
+        Capability, CapabilitySet, ErrorCode, LoomError as CoreLoomError, Timestamp, WorkspaceId,
+        WorkspaceRecord,
     };
     use loom_model::ModelId;
     use loom_protocol::{RepositoryResponse, ServerResponse, WorkspaceConfig};
@@ -1017,6 +1007,49 @@ mod tests {
         let capabilities = negotiation_capabilities();
         assert!(capabilities.contains(Capability::ReadUsage));
         assert!(capabilities.contains(Capability::InspectContext));
+    }
+
+    #[test]
+    fn capability_lists_agree_except_for_documented_transport_differences() {
+        let native = negotiation_capabilities();
+        // What the browser client advertises: the shared list alone.
+        let wasm = CapabilitySet::new(SHARED_NEGOTIATION_CAPABILITIES.iter().copied());
+
+        let mut documented_native_only = Vec::new();
+        for (capability, reason) in NATIVE_ONLY_NEGOTIATION_CAPABILITIES {
+            assert!(
+                !reason.trim().is_empty(),
+                "every native-only capability must document why the browser omits it"
+            );
+            assert!(
+                !wasm.contains(*capability),
+                "{capability:?} is documented as native-only but is also negotiated by the \
+                 browser client"
+            );
+            assert!(
+                native.contains(*capability),
+                "{capability:?} is documented as native-only but the native client omits it"
+            );
+            documented_native_only.push(*capability);
+        }
+
+        // The transports agree on everything except the documented entries.
+        assert_eq!(
+            CapabilitySet::new(
+                SHARED_NEGOTIATION_CAPABILITIES
+                    .iter()
+                    .chain(documented_native_only.iter())
+                    .copied()
+            ),
+            native
+        );
+        // A duplicated entry would hide a capability the other transport omits.
+        let unique = SHARED_NEGOTIATION_CAPABILITIES
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(unique.len(), SHARED_NEGOTIATION_CAPABILITIES.len());
+        assert_eq!(unique.len(), wasm.iter().count());
     }
 
     #[test]

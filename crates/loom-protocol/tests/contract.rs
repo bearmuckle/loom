@@ -694,7 +694,7 @@ fn m5_session_run_review_and_evidence_contracts_round_trip() {
     };
     let run_snapshot = ResponseEnvelope::success(
         loom_core::RequestId::new(),
-        ServerResponse::Run(RunResponse::AgentRunSnapshot(
+        ServerResponse::Run(RunResponse::AgentRunSnapshot(Box::new(
             loom_protocol::AgentRunSnapshotProjection {
                 run,
                 plan: vec![AgentPlanStep {
@@ -712,7 +712,7 @@ fn m5_session_run_review_and_evidence_contracts_round_trip() {
                 activities: Vec::new(),
                 message_timeline_ordinals: Vec::new(),
             },
-        )),
+        ))),
     );
     assert_eq!(
         decode_response(&encode_response(&run_snapshot).unwrap()).unwrap(),

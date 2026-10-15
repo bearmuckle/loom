@@ -153,6 +153,16 @@ pub struct RemoteConnection {
     secure_for_secrets: bool,
 }
 
+/// Deadline applied to a remote request that does not name its own.
+///
+/// A remote transport can stall on a half-open socket, and the native client
+/// runs its requests on a single worker thread, so an unanswered request would
+/// block every later request forever. This default is larger than the server's
+/// own default request timeout, so a healthy but slow request is still answered
+/// before the client gives up; a caller with a different bound uses
+/// [`RemoteConnection::request_with_timeout`].
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
 impl RemoteConnection {
     pub fn connect(
         url: &str,
@@ -202,14 +212,7 @@ impl RemoteConnection {
     }
 
     pub fn request(&self, request: RequestEnvelope) -> ResponseEnvelope {
-        let request_id = request.request_id;
-        let result = self
-            .lock()
-            .and_then(|mut connection| self.runtime.block_on(connection.request(request)));
-        match result {
-            Ok(response) => response,
-            Err(error) => ResponseEnvelope::failure(request_id, error),
-        }
+        self.request_with_timeout(request, DEFAULT_REQUEST_TIMEOUT)
     }
 
     pub fn request_with_timeout(
@@ -224,7 +227,10 @@ impl RemoteConnection {
                     Ok(result) => result,
                     Err(_) => Err(LoomError::new(
                         ErrorCode::DeadlineExceeded,
-                        "worker request timed out",
+                        format!(
+                            "worker did not answer within {}s; it may be stalled or unreachable",
+                            timeout.as_secs()
+                        ),
                         true,
                     )),
                 }

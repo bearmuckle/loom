@@ -69,7 +69,7 @@ impl LoomView {
             Ok(ServerResponse::Session(SessionResponse::AgentSessionInitialState(initial))) => {
                 event_cursor = Some(initial.cursor);
                 Ok(ServerResponse::Session(
-                    SessionResponse::AgentSessionSnapshot(initial.projection),
+                    SessionResponse::AgentSessionSnapshot(Box::new(initial.projection)),
                 ))
             }
             result => result,
@@ -107,6 +107,9 @@ impl LoomView {
         };
         if let Err(error) = self.collect_events_since(
             event_cursor,
+            fallback_projection
+                .as_ref()
+                .map(|projection| projection.latest_sequence),
             fallback_projection.and_then(|projection| projection.active_run),
         ) {
             self.record_backend_error("load session events", error);
@@ -428,7 +431,7 @@ impl LoomView {
                     .wait()
                     .await;
             }
-            let cursor = match &snapshot.result {
+            let mut request_cursor = match &snapshot.result {
                 Ok(ServerResponse::Session(SessionResponse::AgentSessionInitialState(initial))) => {
                     Some(initial.cursor)
                 }
@@ -438,14 +441,14 @@ impl LoomView {
                 snapshot.result.clone()
             {
                 snapshot.result = Ok(ServerResponse::Session(
-                    SessionResponse::AgentSessionSnapshot(initial.projection),
+                    SessionResponse::AgentSessionSnapshot(Box::new(initial.projection)),
                 ));
             }
             let events_request = backend.submit(RequestEnvelope::new(ClientRequest::Events(
                 EventsRequest::GetSessionEvents {
                     session_id: Some(session_id),
                     workspace_id: None,
-                    after_sequence: cursor,
+                    after_sequence: request_cursor,
                     stream_epoch: event_stream_epoch.clone(),
                 },
             )));
@@ -477,7 +480,7 @@ impl LoomView {
                 {
                     let refreshed_cursor = initial.cursor;
                     refreshed.result = Ok(ServerResponse::Session(
-                        SessionResponse::AgentSessionSnapshot(initial.projection),
+                        SessionResponse::AgentSessionSnapshot(Box::new(initial.projection)),
                     ));
                     let retry_request = backend.submit(RequestEnvelope::new(
                         ClientRequest::Events(EventsRequest::GetSessionEvents {
@@ -487,6 +490,7 @@ impl LoomView {
                             stream_epoch: event_stream_epoch.clone(),
                         }),
                     ));
+                    request_cursor = Some(refreshed_cursor);
                     snapshot = refreshed;
                     events = cx
                         .background_spawn(async move { retry_request.wait().await })
@@ -494,7 +498,7 @@ impl LoomView {
                 }
             }
             view.update(cx, |view, cx| {
-                view.finish_async_session_load(session_id, snapshot, events, cx);
+                view.finish_async_session_load(session_id, request_cursor, snapshot, events, cx);
             })
             .ok();
         })
@@ -504,6 +508,7 @@ impl LoomView {
     pub(crate) fn finish_async_session_load(
         &mut self,
         session_id: AgentSessionId,
+        request_cursor: Option<EventSequence>,
         snapshot_response: ResponseEnvelope,
         events_response: ResponseEnvelope,
         cx: &mut Context<Self>,
@@ -523,6 +528,7 @@ impl LoomView {
         let fallback_projection = match snapshot_response.result {
             Ok(ServerResponse::Session(SessionResponse::AgentSessionSnapshot(projection))) => {
                 self.active_session = projection.session.clone();
+                self.session_state = self.active_session.state;
                 self.auto_approve_actions = projection.auto_approve_actions;
                 self.session_auto_approve_actions
                     .insert(session_id, projection.auto_approve_actions);
@@ -547,30 +553,23 @@ impl LoomView {
                 None
             }
         };
-        self.reset_projection();
         let fallback_latest_sequence = fallback_projection
             .as_ref()
             .map(|projection| projection.latest_sequence);
+        let fallback_run = fallback_projection
+            .as_ref()
+            .and_then(|projection| projection.active_run.clone());
         match events_response.result {
             Ok(ServerResponse::Events(EventsResponse::SessionEvents {
                 events,
                 stream_epoch,
             })) => {
                 self.event_stream_epoch = stream_epoch;
-                // The projection is empty again, so the whole batch is applied
-                // and the cursor ends at the later of the batch and the
-                // projection this rebuild started from.
-                self.apply_event_batch(events, fallback_latest_sequence);
-                // The durable run projection is applied whether or not the
-                // batch produced timeline items. Suppressing it would drop the
-                // run's control state, the transcript page that rebuilds the
-                // conversation, and the run polling that keeps it streaming.
-                if let Some(projection) = fallback_projection
-                    .as_ref()
-                    .and_then(|projection| projection.active_run.clone())
-                {
-                    self.apply_run_projection(projection);
-                }
+                self.rebuild_projection_from_events(
+                    events,
+                    Self::rebuild_cursor_floor(request_cursor, fallback_latest_sequence),
+                    fallback_run,
+                );
             }
             Ok(ServerResponse::Events(EventsResponse::SessionEventsSnapshot {
                 session,
@@ -581,35 +580,23 @@ impl LoomView {
             })) => {
                 self.event_stream_epoch = stream_epoch;
                 self.active_session = session;
-                self.reset_projection();
-                self.apply_event_batch(events, Some(latest_sequence));
-                // The durable run projection is applied whether or not the
-                // batch produced timeline items. Suppressing it would drop the
-                // run's control state, the transcript page that rebuilds the
-                // conversation, and the run polling that keeps it streaming.
-                if let Some(projection) = fallback_projection
-                    .as_ref()
-                    .and_then(|projection| projection.active_run.clone())
-                {
-                    self.apply_run_projection(projection);
-                }
+                self.session_state = self.active_session.state;
+                self.rebuild_projection_from_events(events, Some(latest_sequence), fallback_run);
             }
             Err(error) => {
-                // The events request failed, so the durable projection is the
-                // only source of the run's control state and of the transcript
-                // page that rebuilds the conversation.
-                if let Some(projection) = fallback_projection
-                    .as_ref()
-                    .and_then(|projection| projection.active_run.clone())
-                {
-                    self.apply_run_projection(projection);
-                }
+                self.rebuild_projection_from_events(Vec::new(), None, fallback_run);
                 self.record_backend_error("load session events", error);
             }
-            Ok(response) => self.record_backend_error(
-                "load session events",
-                unexpected_response("session event stream", response),
-            ),
+            Ok(response) => {
+                // The response is unusable, so the projection stays reset
+                // rather than mixing whatever is on screen with a batch the
+                // backend did not send.
+                self.reset_projection();
+                self.record_backend_error(
+                    "load session events",
+                    unexpected_response("session event stream", response),
+                )
+            }
         }
         self.ensure_session_task_message(session_id);
         if needs_transcript_page && self.active_run_id.is_some() {
