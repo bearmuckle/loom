@@ -1852,6 +1852,15 @@ fn primary_shortcut(key: &str) -> gpui_kit::Keystroke {
     }
 }
 
+/// The native full-screen toggle, which takes no modifier of its own.
+fn full_screen_shortcut() -> gpui_kit::Keystroke {
+    gpui_kit::Keystroke {
+        modifiers: gpui_kit::Modifiers::default(),
+        key: "f11".to_owned(),
+        key_char: None,
+    }
+}
+
 #[gpui_kit::test]
 fn escape_dismisses_each_open_surface(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
@@ -2027,6 +2036,42 @@ fn advertised_primary_shortcuts_dispatch_their_commands(cx: &mut TestAppContext)
     cx.update_window(window, |view, _, cx| {
         let view = view.downcast::<LoomView>().unwrap();
         assert!(!view.read(cx).settings_open);
+    })
+    .unwrap();
+}
+
+/// F11 makes the window full screen on its own, without a modifier, and the
+/// view stops drawing the client-side window title while it is.
+#[gpui_kit::test]
+fn f11_toggles_window_full_screen_and_hides_the_title_bar(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        LoomView::new_for_test(cx.focus_handle())
+    });
+    let window: gpui_kit::AnyWindowHandle = handle.into();
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(!window.is_fullscreen());
+        assert!(window.find("window-titlebar").visible());
+    })
+    .unwrap();
+
+    cx.dispatch_keystroke(window, full_screen_shortcut());
+    cx.update_window(window, |_, window, cx| {
+        assert!(window.is_fullscreen());
+        window.render_frame(cx);
+        assert!(
+            window.try_find("window-titlebar").is_none(),
+            "a full-screen window has no title, so the strip must be gone"
+        );
+    })
+    .unwrap();
+
+    cx.dispatch_keystroke(window, full_screen_shortcut());
+    cx.update_window(window, |_, window, cx| {
+        assert!(!window.is_fullscreen());
+        window.render_frame(cx);
+        assert!(window.find("window-titlebar").visible());
     })
     .unwrap();
 }

@@ -6,6 +6,10 @@ impl Render for LoomView {
             BASE_FONT_SIZE * self.font_scale_percent as f32 / DEFAULT_FONT_SCALE_PERCENT as f32
         ));
         window.set_window_title(&format!("Loom - {}", self.active_session.name));
+        // The client-drawn strip below is this window's title bar, so full
+        // screen removes it. Simple (borderless) full screen removes it too.
+        let window_title_bar_visible = !cfg!(target_family = "wasm")
+            && !(window.is_fullscreen() || window.is_simple_fullscreen());
         #[cfg(target_family = "wasm")]
         if !self.browser_window_initialized {
             self.browser_window_initialized = true;
@@ -20,10 +24,17 @@ impl Render for LoomView {
             // the command palette input is torn down). Intercept them globally
             // so these shortcuts always fire.
             let view = cx.entity().downgrade();
-            self.shortcut_interceptor = Some(cx.intercept_keystrokes(move |event, _window, cx| {
+            self.shortcut_interceptor = Some(cx.intercept_keystrokes(move |event, window, cx| {
                 let modifiers = event.keystroke.modifiers;
                 let primary = modifiers.platform || modifiers.control;
                 let key = event.keystroke.key.as_str();
+                // The browser client draws no native window chrome, so it
+                // leaves F11 to the browser's own full screen.
+                #[cfg(not(target_family = "wasm"))]
+                let full_screen_shortcut =
+                    key == "f11" && !primary && !modifiers.alt && !modifiers.shift;
+                #[cfg(target_family = "wasm")]
+                let full_screen_shortcut = false;
                 if primary && modifiers.shift && key.eq_ignore_ascii_case("p") {
                     let _ = view.update(cx, |view, cx| view.toggle_command_palette(cx));
                     cx.stop_propagation();
@@ -40,6 +51,12 @@ impl Render for LoomView {
                 } else if primary && key == "," {
                     // Advertised by the "Settings" command.
                     let _ = view.update(cx, |view, cx| view.run_command("settings", None, cx));
+                    cx.stop_propagation();
+                } else if full_screen_shortcut {
+                    window.toggle_fullscreen();
+                    // The view hides its own title-bar strip in full screen, so
+                    // it redraws without waiting for the platform's resize frame.
+                    let _ = view.update(cx, |_, cx| cx.notify());
                     cx.stop_propagation();
                 }
             }));
@@ -651,9 +668,11 @@ impl Render for LoomView {
             // Initializes the per-frame selection registry before selectable
             // text participants prepaint and register themselves.
             .child(TextSelectionLayer)
-            .when(!cfg!(target_family = "wasm"), |element| {
+            .when(window_title_bar_visible, |element| {
                 element.child(
                     div()
+                        .id("window-titlebar")
+                        .test_support()
                         .h(px(26.))
                         .w_full()
                         .px_3()
