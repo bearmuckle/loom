@@ -149,8 +149,8 @@ filesystem or process primitives directly:
 
 ```text
 AttachSessionRepository / DetachSessionRepository / ListSessionRepositories
-GetSessionFilesystemSnapshot / GetSessionFilesystemEvents
-ReadSessionFile / ApplySessionEdit / TakeSessionFilesystemControl
+GetSessionFilesystemSnapshot / GetSessionFilesystemChanges
+ReadSessionFile / ApplySessionFilesystemEdit / TakeSessionFilesystemControl
 CreateSessionCheckpoint / RevertSessionCheckpoint / UndoSessionEdit
 SetSessionApprovalPolicy
 OpenSessionTerminal / WriteSessionTerminalInput / ResizeSessionTerminal
@@ -159,7 +159,11 @@ StartSessionTask / GetSessionTask / GetSessionTaskEvents / CancelSessionTask
 ```
 
 Session filesystem edits carry an optional content revision and return a
-structured conflict when it no longer matches. Terminal and task output is
+structured conflict when it no longer matches. A session's filesystem change
+history is polled with `GetSessionFilesystemChanges` and an `after_sequence`
+cursor; the same changes also arrive as `SessionFilesystemChanged` events on
+the session event stream (`crates/loom-protocol/src/requests.rs`,
+`crates/loom-model/src/events.rs`). Terminal and task output is
 delivered as bounded, sequence-numbered records; snapshots remain available
 after a client disconnects. Policy evaluations are agent events before a
 tool executes, and the existing approval request/decision events remain
