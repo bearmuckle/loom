@@ -22,7 +22,7 @@ https://bearmuckle.github.io/loom/?demo=true
 
 ## Build and run
 
-Install Rust 1.95 or newer. On Linux, the native UI also needs the system
+Install Rust 1.99 or newer. On Linux, the native UI also needs the system
 packages listed in [CI](.github/workflows/ci.yml).
 
 ```sh

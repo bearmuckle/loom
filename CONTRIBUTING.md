@@ -15,7 +15,7 @@ develops.
 
 ## Development
 
-Install Rust 1.95 or newer and the native system dependencies listed in the
+Install Rust 1.99 or newer and the native system dependencies listed in the
 [CI workflow](.github/workflows/ci.yml). Use the locked workspace checks for local
 verification:
 

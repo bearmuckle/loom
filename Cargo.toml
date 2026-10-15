@@ -32,7 +32,7 @@ debug = "line-tables-only"
 [workspace.package]
 edition = "2024"
 license = "GPL-3.0-only"
-rust-version = "1.95"
+rust-version = "1.99"
 version = "0.1.0"
 
 [workspace.dependencies]
