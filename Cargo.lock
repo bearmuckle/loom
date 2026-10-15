@@ -4441,6 +4441,7 @@ dependencies = [
  "loom-protocol",
  "loom-providers",
  "loom-server",
+ "loom-vcs",
  "serde_json",
  "tokio",
 ]
@@ -4628,6 +4629,7 @@ dependencies = [
  "loom-model",
  "loom-protocol",
  "loom-server",
+ "loom-vcs",
  "open",
  "serde_json",
  "tokio",

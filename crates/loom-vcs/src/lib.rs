@@ -5,8 +5,8 @@ use std::{
 };
 
 use git2::{
-    BranchType, Cred, DiffFormat, DiffOptions, FetchOptions, MergeOptions, Oid, PushOptions,
-    RemoteCallbacks, Repository, RepositoryState, Signature, Status, StatusOptions,
+    BranchType, Cred, DiffFormat, DiffOptions, FetchOptions, MergeOptions, Oid, ProxyOptions,
+    PushOptions, RemoteCallbacks, Repository, RepositoryState, Signature, Status, StatusOptions,
     WorktreeAddOptions, WorktreeLockStatus, WorktreePruneOptions,
     build::{CheckoutBuilder, RepoBuilder},
 };
@@ -57,23 +57,21 @@ impl GitService {
                 destination.display()
             )));
         }
-        let repository = if let Some(token) = token {
+        let mut fetch_options = FetchOptions::new();
+        if let Some(token) = token {
             let token = token.to_owned();
             let mut callbacks = RemoteCallbacks::new();
             callbacks.credentials(move |url, username_from_url, allowed_types| {
                 credential_for(url, username_from_url, allowed_types, &token)
             });
-            let mut fetch_options = FetchOptions::new();
             fetch_options.remote_callbacks(callbacks);
-            let mut builder = RepoBuilder::new();
-            builder.fetch_options(fetch_options);
-            builder
-                .clone(source.as_ref(), destination)
-                .map_err(|error| git_error("could not clone repository", error))?
-        } else {
-            Repository::clone(source.as_ref(), destination)
-                .map_err(|error| git_error("could not clone repository", error))?
-        };
+        }
+        fetch_options.proxy_options(remote_proxy_options());
+        let mut builder = RepoBuilder::new();
+        builder.fetch_options(fetch_options);
+        let repository = builder
+            .clone(source.as_ref(), destination)
+            .map_err(|error| git_error("could not clone repository", error))?;
         Self::checkout_cloned_revision(&repository, revision)?;
         Self::open(destination)
     }
@@ -496,6 +494,7 @@ impl GitService {
         });
         let mut push_options = PushOptions::new();
         push_options.remote_callbacks(callbacks);
+        push_options.proxy_options(remote_proxy_options());
         let refspec = format!("{refname}:{refname}");
         remote
             .push(&[refspec.as_str()], Some(&mut push_options))
@@ -1590,6 +1589,78 @@ fn with_worktree_setup_cleanup(original: LoomError, cleanup: Result<()>) -> Loom
     }
 }
 
+/// Connect timeout, in milliseconds, that [`configure_remote_timeouts`] applies
+/// to libgit2's socket transports.
+///
+/// It is chosen to fail well before the operating system's own TCP connect
+/// timeout (about 130 seconds on Linux), because a stalled remote otherwise
+/// holds the backend thread that issued the Git operation, and the project
+/// admission slot that thread serves, for that whole time.
+pub const REMOTE_CONNECT_TIMEOUT_MS: i32 = 30_000;
+
+/// Idle timeout, in milliseconds, that [`configure_remote_timeouts`] applies to
+/// reads and writes on libgit2's socket transports.
+///
+/// It bounds a transfer that has stopped making progress, not the total duration
+/// of a transfer: a large clone on a slow but working link is not cut off.
+pub const REMOTE_TRANSFER_TIMEOUT_MS: i32 = 120_000;
+
+/// Applies libgit2's process-wide connect and transfer timeouts to the remote
+/// operations that start after this call.
+///
+/// `git2` 0.21 exposes no per-operation bound: libgit2 carries one in
+/// `git_remote_connect_options.connect_timeout`, but that structure is not part
+/// of the bindings, so the only reachable knobs are the `git_libgit2_opts`
+/// options `GIT_OPT_SET_SERVER_CONNECT_TIMEOUT` (read when a socket stream is
+/// created) and `GIT_OPT_SET_SERVER_TIMEOUT` (read per stalled read or write).
+/// Both write C globals. This is a process-wide stop-gap, not a per-operation
+/// deadline:
+///
+/// - The values belong to the whole process and to every libgit2 caller in it.
+/// - They apply to connections opened afterwards; one already in flight keeps
+///   the values it was created with.
+/// - They cover libgit2's own socket transports (HTTP and HTTPS, whose TLS
+///   stream wraps the plain socket). Transports that delegate to an external
+///   program, such as SSH, use no socket stream and are unaffected.
+/// - They bound a stalled remote, they do not retry: nothing here repeats an
+///   operation, so a push that reached the remote is never sent twice.
+///
+/// # Safety
+///
+/// git2 marks the underlying setters unsafe because they write C globals
+/// without synchronisation, and documents that they are only safe before any
+/// thread is spawned. Each binary therefore calls this from `main`, before its
+/// async runtime is built. Calling it later is a silent no-op at best: a
+/// concurrent connection may have copied the previous value, and the write
+/// itself races with those copies.
+pub unsafe fn configure_remote_timeouts() {
+    // SAFETY: the caller's obligation is the ordering documented above, and the
+    // timeouts cannot be rejected: libgit2 only refuses a negative value.
+    unsafe {
+        git2::opts::set_server_connect_timeout_in_milliseconds(REMOTE_CONNECT_TIMEOUT_MS)
+            .expect("libgit2 rejects only negative connect timeouts");
+        git2::opts::set_server_timeout_in_milliseconds(REMOTE_TRANSFER_TIMEOUT_MS)
+            .expect("libgit2 rejects only negative transfer timeouts");
+    }
+}
+
+/// The proxy options every Loom remote operation passes explicitly.
+///
+/// libgit2 defaults an operation's proxy options to `GIT_PROXY_NONE`, which for
+/// the builtin HTTP transport means no proxy at all: neither `http.<url>.proxy`
+/// from Git configuration nor the `http_proxy`/`https_proxy`/`no_proxy`
+/// environment variables that the `git` command line honours are consulted, so
+/// no clone, fetch, or push succeeds on a network that is only reachable
+/// through a proxy. Auto-detection restores that behaviour.
+///
+/// Unlike the timeout knobs above this is per-operation: the options travel with
+/// the single fetch or push that carries them and need no process-global state.
+fn remote_proxy_options() -> ProxyOptions<'static> {
+    let mut proxy = ProxyOptions::new();
+    proxy.auto();
+    proxy
+}
+
 /// Resolves a credential request from a remote against the configured token.
 ///
 /// SSH-key requests are answered with an SSH agent credential, user/password
@@ -1693,6 +1764,33 @@ mod tests {
         fs::remove_dir_all(source_root).unwrap();
     }
 
+    /// The token path builds its own fetch options, with the credential callback
+    /// and the shared proxy options attached. A local source never asks for
+    /// credentials, so this cannot prove the callback answers a real remote, but
+    /// it does prove the options still clone over the local transport, and that
+    /// the token is not required to reach the checkout.
+    #[test]
+    fn clone_with_a_supplied_token_clones_a_local_source() {
+        let (source, source_root) = repository();
+        let destination =
+            std::env::temp_dir().join(format!("loom-git-token-{}", loom_core::RepositoryId::new()));
+        let cloned = GitService::clone_from_authenticated(
+            source.root().to_string_lossy(),
+            &destination,
+            Some("HEAD"),
+            Some("test-token"),
+        )
+        .unwrap();
+        // The requested revision was resolved and checked out by the clone.
+        assert_eq!(
+            cloned.status().unwrap().head.as_deref(),
+            source.status().unwrap().head.as_deref()
+        );
+        assert!(cloned.status().unwrap().clean);
+        fs::remove_dir_all(destination).unwrap();
+        fs::remove_dir_all(source_root).unwrap();
+    }
+
     #[test]
     fn pushing_a_branch_updates_the_origin_remote() {
         let (git, root) = repository();
@@ -1779,6 +1877,56 @@ mod tests {
                 .contains("ssh://example.test/owner/repo.git")
         );
         assert!(!error.message().contains("test-token"));
+    }
+
+    /// The startup hook writes libgit2's two process-global socket timeouts.
+    ///
+    /// This asserts that the values a binary applies are the documented ones and
+    /// that applying them again changes nothing. The test reads them back through
+    /// git2's getters, which are the only observable effect: there is no way to
+    /// inspect a live connection's timeout without a network, and the ordering
+    /// the safety contract requires (before any thread is spawned) cannot be
+    /// reproduced inside a test binary that already runs tests in parallel. The
+    /// write is therefore the same benign, identical-value write the binaries
+    /// perform at startup.
+    #[test]
+    fn remote_timeout_configuration_applies_and_repeats_its_documented_values() {
+        // SAFETY: no test in this crate opens a network connection, and every
+        // write below stores the same values, so no concurrent socket stream can
+        // observe an inconsistent pair.
+        unsafe {
+            configure_remote_timeouts();
+            assert_eq!(
+                git2::opts::get_server_connect_timeout_in_milliseconds().unwrap(),
+                REMOTE_CONNECT_TIMEOUT_MS
+            );
+            assert_eq!(
+                git2::opts::get_server_timeout_in_milliseconds().unwrap(),
+                REMOTE_TRANSFER_TIMEOUT_MS
+            );
+        }
+
+        // Applying it a second time is idempotent.
+        // SAFETY: as above; the second call stores the same two values.
+        unsafe {
+            configure_remote_timeouts();
+            assert_eq!(
+                git2::opts::get_server_connect_timeout_in_milliseconds().unwrap(),
+                REMOTE_CONNECT_TIMEOUT_MS
+            );
+            assert_eq!(
+                git2::opts::get_server_timeout_in_milliseconds().unwrap(),
+                REMOTE_TRANSFER_TIMEOUT_MS
+            );
+        }
+
+        // Both bounds are non-zero: libgit2 treats 0 as "no timeout", which is
+        // exactly the behaviour this hook replaces. These two relations are
+        // properties of the constants, so they are checked when the test is
+        // compiled.
+        const { assert!(REMOTE_CONNECT_TIMEOUT_MS > 0) };
+        const { assert!(REMOTE_TRANSFER_TIMEOUT_MS > 0) };
+        const { assert!(REMOTE_CONNECT_TIMEOUT_MS < REMOTE_TRANSFER_TIMEOUT_MS) };
     }
 
     #[test]

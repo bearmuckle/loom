@@ -56,6 +56,17 @@ pub(crate) const MAX_REVIEW_DIFF: usize = 48 * 1024;
 #[cfg(not(target_family = "wasm"))]
 fn main() {
     init_logging();
+    // Bound how long a stalled remote may hold the thread that serves a Git
+    // clone, fetch, or push for an embedded local backend. libgit2's socket
+    // timeouts are process globals that are only safe to write before any thread
+    // exists, so this must stay here, before GPUI starts its threads and before
+    // the embedded backend builds an async runtime; later it would be a silent
+    // no-op at best. See `loom_vcs::configure_remote_timeouts`. The browser build
+    // has no libgit2: its Git work runs on whatever backend it connects to.
+    //
+    // SAFETY: this is the first statement after logging setup and no thread has
+    // been spawned yet.
+    unsafe { loom_vcs::configure_remote_timeouts() };
     let options = match UiOptions::parse(std::env::args()) {
         Ok(Some(options)) => options,
         // `--help` and `--version` printed what was asked for; exit 0.

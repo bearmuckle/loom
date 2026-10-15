@@ -50,6 +50,15 @@ fn init_logging() {
 
 fn main() -> Result<(), LoomError> {
     init_logging();
+    // Bound how long a stalled remote may hold the thread that serves a Git
+    // clone, fetch, or push. libgit2's socket timeouts are process globals that
+    // are only safe to write before any thread exists, so this must stay before
+    // the `--serve`/`--m4-demo` paths build their async runtimes; later it would
+    // be a silent no-op at best. See `loom_vcs::configure_remote_timeouts`.
+    //
+    // SAFETY: no thread has been spawned yet: this is the first statement after
+    // logging setup, and every runtime in this binary is built further down.
+    unsafe { loom_vcs::configure_remote_timeouts() };
     let Some(options) = parse_args(env::args().skip(1))? else {
         return Ok(());
     };

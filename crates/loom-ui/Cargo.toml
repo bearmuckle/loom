@@ -87,6 +87,10 @@ ttf-parser.workspace = true
 env_logger.workspace = true
 open.workspace = true
 loom-local.workspace = true
+# The native client hosts embedded backends that clone, fetch, and push, so it
+# applies libgit2's process-wide socket timeouts at startup. The browser build
+# has no libgit2 (its Git work runs on a remote backend), hence the target gate.
+loom-vcs.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 console_log.workspace = true

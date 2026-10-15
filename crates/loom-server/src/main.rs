@@ -31,6 +31,15 @@ const DEFAULT_BIND: &str = "127.0.0.1:8765";
 
 fn main() -> std::process::ExitCode {
     init_logging();
+    // Bound how long a stalled remote may hold the backend thread that serves a
+    // Git clone, fetch, or push. libgit2's socket timeouts are process globals
+    // that are only safe to write before any thread exists, so this must stay
+    // before `run` builds the async runtime; later it would be a silent no-op at
+    // best. See `loom_vcs::configure_remote_timeouts`.
+    //
+    // SAFETY: no thread has been spawned yet: this is the first statement after
+    // logging setup, and the runtime starts inside `run`.
+    unsafe { loom_vcs::configure_remote_timeouts() };
     match run(env::args().skip(1)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {

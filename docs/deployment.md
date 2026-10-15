@@ -184,6 +184,21 @@ egress: there is no proxy, allow-list, or per-command network restriction in the
 backend. Outbound access from the execution context is what the deployment
 grants, and restricting it is the operator's boundary.
 
+Git remote operations are bounded and follow the deployment's proxy:
+
+- Every binary sets libgit2's process-wide socket connect and transfer timeouts
+  at startup, before its async runtime exists. A remote that cannot be reached
+  within 30 seconds, or that stops transferring for 120 seconds, fails with a Git
+  error instead of holding the backend thread that issued the operation until the
+  operating system's own TCP timeout. The transfer bound is per stalled read or
+  write, so a large clone on a slow but working link still finishes. It bounds a
+  stalled remote, it does not retry one, and SSH remotes, which libgit2 runs
+  through an external `ssh` process, are not covered.
+- A clone, fetch, or push auto-detects the proxy from Git configuration
+  (`http.<url>.proxy`) and from `http_proxy`, `https_proxy`, and `no_proxy`,
+  exactly as the `git` command line does. This is proxy configuration, not an
+  egress filter: Loom still does not restrict what the backend may reach.
+
 The listener side is separate from egress:
 
 - The default bind is loopback, `127.0.0.1:8765`.
