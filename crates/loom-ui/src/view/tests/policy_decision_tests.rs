@@ -5,9 +5,9 @@
 //! reason. The projection records the evaluation against the call, so a denial
 //! renders as a policy decision with the action kind it was evaluated under and
 //! the reason the policy gave, while a failed call the policy never evaluated
-//! keeps its plain failed row.
+//! reports the reason its result carried in a note under the row.
 
-use super::{LoomView, tool_element_id, tool_policy_note};
+use super::{LoomView, tool_element_id, tool_failure_reason, tool_policy_note, tool_shows_output};
 use crate::state::{AssistantPart, TimelineItem, ToolPart, ToolPartStatus};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AnyWindowHandle, AppContext, Entity, TestAppContext, px, size};
@@ -26,6 +26,16 @@ fn push_branch_call() -> ToolCall {
         id: ToolCallId::new(),
         name: "github_push_branch".to_owned(),
         arguments: serde_json::json!({"repository": "owner/name", "branch": "fix"}),
+    }
+}
+
+/// A call whose result exists nowhere else, so its output is shown as well as
+/// summarized by the failure note.
+fn web_search_call() -> ToolCall {
+    ToolCall {
+        id: ToolCallId::new(),
+        name: "web_search".to_owned(),
+        arguments: serde_json::json!({"query": "needle"}),
     }
 }
 
@@ -182,6 +192,10 @@ fn a_policy_denial_renders_its_action_kind_and_reason(cx: &mut TestAppContext) {
         // The failed result's output body stays hidden: the reason is the
         // policy's own statement rather than tool output.
         assert!(window.try_find(("copy-tool-output", key)).is_none());
+        assert!(
+            window.try_find(("tool-failure-note", key)).is_none(),
+            "a denial is a decision, not a failure with a reason to report"
+        );
     })
     .unwrap();
 }
@@ -226,6 +240,102 @@ fn a_failure_without_a_policy_evaluation_still_renders_as_a_failure(cx: &mut Tes
             window.try_find(("tool-policy-note", key)).is_none(),
             "a failure the policy never evaluated has no policy note"
         );
+
+        // The reason is what the row lacked: it is visible without opening the
+        // disclosure.
+        let note = window.find(("tool-failure-note", key));
+        assert!(note.visible());
+        assert_eq!(note.label(), tool_failure_reason(&part).as_deref());
+        let note = note.label().unwrap_or_default().to_owned();
+        assert!(
+            note.contains("No such file or directory"),
+            "note was {note:?}"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_failed_call_without_a_reason_renders_no_note(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (handle, view) = open_scenario(cx, |view| {
+        let call = web_search_call();
+        let run_id = RunId::new();
+        view.consume_agent_event(&AgentEvent::ToolCallRequested {
+            run_id,
+            call: call.clone(),
+        });
+        view.consume_agent_event(&AgentEvent::ToolCallCompleted {
+            run_id,
+            result: ToolResult::failure(&call, ""),
+        });
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let part = projected_parts(view.read(cx))
+            .pop()
+            .expect("the failed call is projected");
+        assert_eq!(part.status, ToolPartStatus::Failed);
+        assert!(part.output.is_none(), "an empty result carries no reason");
+        assert_eq!(tool_failure_reason(&part), None);
+
+        let key = tool_element_id(0, 0);
+        assert!(
+            window.try_find(("tool-failure-note", key)).is_none(),
+            "a failure with no reason must not render an empty note"
+        );
+        let label = window
+            .find(("tool-header", key))
+            .label()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(label.contains("failed"), "header was {label:?}");
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_long_failure_reads_as_a_summary_while_its_output_stays_reachable(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let reason = format!(
+        "search backend refused the query\n{}",
+        "retry later ".repeat(40)
+    );
+    let (handle, view) = open_scenario(cx, |view| {
+        let call = web_search_call();
+        let run_id = RunId::new();
+        view.consume_agent_event(&AgentEvent::ToolCallRequested {
+            run_id,
+            call: call.clone(),
+        });
+        view.consume_agent_event(&AgentEvent::ToolCallCompleted {
+            run_id,
+            result: ToolResult::failure(&call, reason.clone()),
+        });
+        // The note summarizes the reason, so the disclosure has to hold the
+        // rest of it.
+        view.expanded_tools.insert(call.id);
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let part = projected_parts(view.read(cx))
+            .pop()
+            .expect("the failed call is projected");
+        assert!(tool_shows_output(&part));
+        let key = tool_element_id(0, 0);
+
+        let note = window.find(("tool-failure-note", key));
+        assert!(note.visible());
+        let note = note.label().unwrap_or_default().to_owned();
+        assert!(
+            note.contains("search backend refused the query"),
+            "note was {note:?}"
+        );
+        assert!(!note.contains('\n'), "the note is one line: {note:?}");
+        assert!(note.contains("[output truncated]"), "note was {note:?}");
+
+        // The whole reason stays reachable by expanding the row.
+        assert!(window.try_find(("copy-tool-output", key)).is_some());
     })
     .unwrap();
 }

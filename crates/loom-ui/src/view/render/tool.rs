@@ -560,6 +560,22 @@ impl LoomView {
                             }),
                     ),
             );
+        if let Some(reason) = tool_failure_reason(part) {
+            // The reason is the point of the row, so it is always visible
+            // instead of sitting behind the disclosure that holds the whole
+            // output.
+            block = block.child(
+                div()
+                    .id(("tool-failure-note", tool_element_id(index, part_index)))
+                    .test_support()
+                    .ml(px(20.))
+                    .pt_1()
+                    .text_xs()
+                    .text_color(rgb(0xfca5a5))
+                    .aria_label(reason.clone())
+                    .child(reason),
+            );
+        }
         if let Some(note) = tool_policy_note(part) {
             // The decision is the point of the row, so the action kind and the
             // reason are always visible instead of sitting behind a disclosure.

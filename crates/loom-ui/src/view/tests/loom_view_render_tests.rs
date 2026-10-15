@@ -2361,8 +2361,9 @@ fn bodyless_tools_have_no_disclosure_and_failures_start_collapsed(cx: &mut TestA
                     approval_pending: false,
                     policy: None,
                 })),
-                // A failed read is the same: the row reports the failure and
-                // the agent decides whether it matters.
+                // A failed read is the same: the file's contents are the
+                // workspace's, so only the reason note under the row reports
+                // the failure.
                 AssistantPart::Tool(Box::new(ToolPart {
                     id: failed_read_id,
                     name: "read_file".to_owned(),
@@ -2407,7 +2408,7 @@ fn bodyless_tools_have_no_disclosure_and_failures_start_collapsed(cx: &mut TestA
             );
             assert!(
                 !view.expanded_tools.contains(&failed_read_id),
-                "a failed tool has nothing to reveal; the agent reports it"
+                "a failed read has no workspace-independent body to reveal"
             );
             assert!(
                 !view.expanded_tools.contains(&search_id),

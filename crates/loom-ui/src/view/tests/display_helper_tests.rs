@@ -9,10 +9,10 @@ use super::{
     humanize_tool_output, is_redundant_completion_summary, relative_time, replace_command_token,
     replace_last_token, rgb, run_failure_reason, run_state_color, run_state_label,
     session_is_active, session_status_pill, source_mount_path, tool_denial_count, tool_detail,
-    tool_failure_count, tool_group_label, tool_group_status, tool_icon, tool_needs_attention,
-    tool_outcome_notes, tool_part_from_activity, tool_part_from_policy, tool_policy_note,
-    tool_shows_output, tool_status, tool_title, tool_title_for_activity, tool_usage_label,
-    tool_usage_summary,
+    tool_failure_count, tool_failure_reason, tool_group_label, tool_group_status, tool_icon,
+    tool_needs_attention, tool_outcome_notes, tool_part_from_activity, tool_part_from_policy,
+    tool_policy_note, tool_shows_output, tool_status, tool_title, tool_title_for_activity,
+    tool_usage_label, tool_usage_summary,
 };
 use gpui_kit::assets::IconName as AssetIconName;
 use loom_core::{
@@ -638,6 +638,58 @@ fn a_denied_call_is_a_policy_decision_with_its_action_kind_and_reason() {
         tool_policy_note(&denied_part(ActionKind::Network, "  ")).as_deref(),
         Some("network action")
     );
+}
+
+#[test]
+fn a_failed_call_reports_its_reason_as_one_bounded_line() {
+    let part = |status: ToolPartStatus, output: Option<&str>| ToolPart {
+        id: loom_core::ToolCallId::new(),
+        name: "web_search".to_owned(),
+        title: "Web search".to_owned(),
+        status,
+        detail: None,
+        output: output.map(str::to_owned),
+        elapsed_ms: None,
+        approval_pending: false,
+        policy: None,
+    };
+
+    // Only a failure has a reason to report.
+    assert_eq!(
+        tool_failure_reason(&part(ToolPartStatus::Completed, Some("all clear"))),
+        None
+    );
+    assert_eq!(
+        tool_failure_reason(&part(ToolPartStatus::Failed, None)),
+        None
+    );
+    assert_eq!(
+        tool_failure_reason(&part(ToolPartStatus::Failed, Some("  \n  "))),
+        None
+    );
+    // A denial is the policy's own decision, not a failed call.
+    let mut denied = denied_part(ActionKind::Destructive, "pushing is denied by policy");
+    denied.output = Some("pushing is denied by policy".to_owned());
+    assert_eq!(tool_failure_reason(&denied), None);
+
+    // A multi-line error reads as one line.
+    assert_eq!(
+        tool_failure_reason(&part(
+            ToolPartStatus::Failed,
+            Some("search backend refused the query\n  retry later   ")
+        ))
+        .as_deref(),
+        Some("search backend refused the query retry later")
+    );
+
+    // A long error is summarized; the whole output stays expandable.
+    let long = "detail ".repeat(80);
+    let failed = part(ToolPartStatus::Failed, Some(&long));
+    let note = tool_failure_reason(&failed).expect("the failure carries a reason");
+    assert!(note.contains("[output truncated]"), "note was {note:?}");
+    assert!(!note.contains('\n'), "note was {note:?}");
+    assert!(note.len() < long.len(), "note was {note:?}");
+    assert!(tool_shows_output(&failed));
 }
 
 #[test]
