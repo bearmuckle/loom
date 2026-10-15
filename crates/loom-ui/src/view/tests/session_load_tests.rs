@@ -21,7 +21,7 @@ fn async_session_load_and_creation_paths(cx: &mut TestAppContext) {
             loom_core::RequestId::new(),
             loom_core::LoomError::new(loom_core::ErrorCode::Internal, "stale", false),
         );
-        view.finish_async_session_load(session_id, failure.clone(), failure, cx);
+        view.finish_async_session_load(session_id, None, failure.clone(), failure, cx);
         view.begin_transcript_page(Some(5), cx);
         view
     });

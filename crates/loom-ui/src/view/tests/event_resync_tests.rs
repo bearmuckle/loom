@@ -84,6 +84,252 @@ fn re_applying_an_event_batch_is_a_no_op(cx: &mut TestAppContext) {
     });
 }
 
+/// The durable run projection a completed run is restored from, with the run's
+/// own state completed while the session that carries it still reads as
+/// executing.
+#[cfg(not(target_family = "wasm"))]
+fn completed_run_projection(
+    session_id: AgentSessionId,
+    task: &str,
+) -> loom_protocol::AgentRunSnapshotProjection {
+    loom_protocol::AgentRunSnapshotProjection {
+        run: loom_protocol::AgentRunSnapshot {
+            id: RunId::new(),
+            attempt_id: loom_core::RunAttemptId::new(),
+            control_revision: 0,
+            session_id,
+            task: task.to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            state: AgentRunState::Completed,
+            started_at: Timestamp::from_unix_millis(1),
+            updated_at: Timestamp::from_unix_millis(2),
+            completed_at: Some(Timestamp::from_unix_millis(2)),
+            summary: Some("Recovered run".to_owned()),
+            evidence: Vec::new(),
+        },
+        plan: Vec::new(),
+        plan_progress: Default::default(),
+        messages: vec![loom_model::ModelMessage::new(
+            loom_model::MessageRole::User,
+            task.to_owned(),
+        )],
+        pending_approval: None,
+        pending_input: None,
+        usage: Default::default(),
+        activities: Vec::new(),
+        message_timeline_ordinals: vec![0],
+    }
+}
+
+/// The session state must follow the run state, because the inspector's session
+/// row and the run row read them separately.
+#[cfg(not(target_family = "wasm"))]
+fn assert_session_state_follows_run_state(view: &LoomView) {
+    let run_state = view
+        .run_state
+        .expect("the run projection established a run state");
+    assert_eq!(
+        view.session_state,
+        session_state_for_run(run_state),
+        "the session state must derive from the run state"
+    );
+    assert_eq!(view.active_session.state, view.session_state);
+}
+
+/// A run projection must leave the session state and the run state agreeing on
+/// both the synchronous and the asynchronous path.
+///
+/// The Agent inspector shows the session state as "Working" while the run row
+/// shows the run state as "Done" when a projection only updates the run state,
+/// which is what the asynchronous session load and the interactive path used to
+/// do.
+#[cfg(not(target_family = "wasm"))]
+#[gpui_kit::test]
+fn a_run_projection_updates_the_session_state_on_both_paths(cx: &mut TestAppContext) {
+    let view = cx.new(|cx| LoomView::new_for_test(cx.focus_handle()));
+    view.update(cx, |view, cx| {
+        let session_id = view.active_session.id;
+        let run_projection = completed_run_projection(session_id, "finish the job");
+
+        // The session the rebuild reads still reports the run as executing
+        // while the run's own snapshot reports it as done.
+        view.session_state = AgentSessionState::Executing;
+        view.active_session.state = AgentSessionState::Executing;
+
+        // The asynchronous path: interactive session selection and the
+        // poll-driven snapshot resync.
+        let snapshot = loom_protocol::AgentSessionSnapshotProjection {
+            session: view.active_session.clone(),
+            active_run: Some(run_projection.clone()),
+            latest_sequence: EventSequence::new(3),
+            approval_policy: Default::default(),
+            auto_approve_actions: true,
+        };
+        view.finish_async_session_load(
+            session_id,
+            None,
+            loom_protocol::ResponseEnvelope::success(
+                loom_core::RequestId::new(),
+                ServerResponse::Session(SessionResponse::AgentSessionSnapshot(snapshot)),
+            ),
+            loom_protocol::ResponseEnvelope::success(
+                loom_core::RequestId::new(),
+                ServerResponse::Events(EventsResponse::SessionEvents {
+                    events: Vec::new(),
+                    stream_epoch: None,
+                }),
+            ),
+            cx,
+        );
+        assert_session_state_follows_run_state(view);
+
+        // The synchronous path: the startup bootstrap and the fallback after a
+        // resync both apply a snapshot's batch directly.
+        view.session_state = AgentSessionState::Executing;
+        view.active_session.state = AgentSessionState::Executing;
+        view.apply_event_snapshot(Vec::new(), EventSequence::new(3), Some(run_projection));
+        assert_session_state_follows_run_state(view);
+    });
+}
+
+/// A rebuilt projection must not end below the durable cursor it resumed from.
+///
+/// The synchronous path floored the cursor with the cursor the events request
+/// was made with and the asynchronous path with the durable projection's
+/// `latest_sequence`, so a rebuild that resumed from durable state without a
+/// request cursor ended at two different cursors depending on the path.
+#[cfg(not(target_family = "wasm"))]
+#[gpui_kit::test]
+fn a_rebuild_ends_at_the_durable_cursor_on_both_paths(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let view = cx.new(|cx| LoomView::new_for_test(cx.focus_handle()));
+    view.update(cx, |view, cx| {
+        crate::connection::negotiate(&view.connection).unwrap();
+        let connection = view.connection.clone();
+        let workspace = crate::connection::create_workspace(&connection, "Cursor floor").unwrap();
+        let session = crate::connection::create_session_in_workspace(
+            &connection,
+            workspace.id,
+            "Cursor floor session",
+        )
+        .unwrap();
+        view.activate_session(session.clone());
+
+        let batch = match connection
+            .request(RequestEnvelope::new(ClientRequest::Events(
+                EventsRequest::GetSessionEvents {
+                    session_id: Some(session.id),
+                    workspace_id: None,
+                    after_sequence: None,
+                    stream_epoch: None,
+                },
+            )))
+            .result
+        {
+            Ok(ServerResponse::Events(EventsResponse::SessionEvents { events, .. }))
+            | Ok(ServerResponse::Events(EventsResponse::SessionEventsSnapshot {
+                events, ..
+            })) => events,
+            response => panic!("unexpected event response: {response:?}"),
+        };
+        assert!(!batch.is_empty(), "the created session journaled no events");
+        // The durable read is ahead of the tail the batch carries, which is the
+        // shape a rebuild has once the journal's retention window has moved.
+        let durable_cursor = EventSequence::new(
+            batch
+                .iter()
+                .map(|event| event.sequence.value())
+                .max()
+                .expect("the batch carries at least one event")
+                + 7,
+        );
+
+        // One floor rule for both paths: the request cursor (absent here)
+        // raised to the durable projection's `latest_sequence`.
+        assert_eq!(
+            LoomView::rebuild_cursor_floor(None, Some(durable_cursor)),
+            Some(durable_cursor)
+        );
+        assert_eq!(
+            LoomView::rebuild_cursor_floor(Some(EventSequence::new(2)), Some(durable_cursor)),
+            Some(durable_cursor)
+        );
+
+        // Synchronous path: the whole batch is applied and the cursor is raised
+        // to the durable cursor the rebuild resumed from.
+        //
+        // The backend answered with an incremental batch (a snapshot would have
+        // sent the rebuild through its own retry), so the batch carries the
+        // session's own creation event and applying it replaces the active
+        // session snapshot with the journaled one.
+        view.active_session.name = "stale".to_owned();
+        view.collect_events_since(None, Some(durable_cursor), None)
+            .unwrap();
+        assert_eq!(view.after_sequence, Some(durable_cursor));
+        assert_eq!(view.active_session.name, "Cursor floor session");
+
+        // Asynchronous path: the same batch and the same durable cursor end at
+        // the same cursor through the shared ladder.
+        let snapshot = loom_protocol::AgentSessionSnapshotProjection {
+            session: view.active_session.clone(),
+            active_run: None,
+            latest_sequence: durable_cursor,
+            approval_policy: Default::default(),
+            auto_approve_actions: true,
+        };
+        view.active_session.name = "stale".to_owned();
+        view.finish_async_session_load(
+            session.id,
+            None,
+            loom_protocol::ResponseEnvelope::success(
+                loom_core::RequestId::new(),
+                ServerResponse::Session(SessionResponse::AgentSessionSnapshot(snapshot)),
+            ),
+            loom_protocol::ResponseEnvelope::success(
+                loom_core::RequestId::new(),
+                ServerResponse::Events(EventsResponse::SessionEvents {
+                    events: batch,
+                    stream_epoch: None,
+                }),
+            ),
+            cx,
+        );
+        assert_eq!(view.after_sequence, Some(durable_cursor));
+        assert_eq!(view.active_session.name, "Cursor floor session");
+
+        // A snapshot response goes through the same ladder with the snapshot's
+        // own head as the floor.
+        let snapshot_head = EventSequence::new(durable_cursor.value() + 5);
+        let snapshot = loom_protocol::AgentSessionSnapshotProjection {
+            session: view.active_session.clone(),
+            active_run: None,
+            latest_sequence: snapshot_head,
+            approval_policy: Default::default(),
+            auto_approve_actions: true,
+        };
+        view.finish_async_session_load(
+            session.id,
+            Some(snapshot_head),
+            loom_protocol::ResponseEnvelope::success(
+                loom_core::RequestId::new(),
+                ServerResponse::Session(SessionResponse::AgentSessionSnapshot(snapshot)),
+            ),
+            loom_protocol::ResponseEnvelope::success(
+                loom_core::RequestId::new(),
+                ServerResponse::Events(EventsResponse::SessionEventsSnapshot {
+                    session: view.active_session.clone(),
+                    events: Vec::new(),
+                    oldest_sequence: EventSequence::new(1),
+                    latest_sequence: snapshot_head,
+                    stream_epoch: None,
+                }),
+            ),
+            cx,
+        );
+        assert_eq!(view.after_sequence, Some(snapshot_head));
+    });
+}
+
 #[cfg(not(target_family = "wasm"))]
 fn wait_for_session_state(
     connection: &ClientConnection,
