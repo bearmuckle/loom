@@ -2573,7 +2573,9 @@ fn async_session_load_falls_back_to_run_projection_and_ignores_stale_responses(
                 Some(loom_core::EventSequence::new(7)),
                 loom_protocol::ResponseEnvelope::success(
                     loom_core::RequestId::new(),
-                    loom_protocol::ServerResponse::Session(SessionResponse::AgentSessionSnapshot(snapshot)),
+                    loom_protocol::ServerResponse::Session(SessionResponse::AgentSessionSnapshot(
+                        Box::new(snapshot),
+                    )),
                 ),
                 loom_protocol::ResponseEnvelope::success(
                     loom_core::RequestId::new(),

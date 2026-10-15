@@ -72,7 +72,7 @@ impl LoomView {
             Ok(ServerResponse::Session(SessionResponse::AgentSessionInitialState(initial))) => {
                 event_cursor = Some(initial.cursor);
                 Ok(ServerResponse::Session(
-                    SessionResponse::AgentSessionSnapshot(initial.projection),
+                    SessionResponse::AgentSessionSnapshot(Box::new(initial.projection)),
                 ))
             }
             result => result,
@@ -415,7 +415,7 @@ impl LoomView {
                 snapshot.result.clone()
             {
                 snapshot.result = Ok(ServerResponse::Session(
-                    SessionResponse::AgentSessionSnapshot(initial.projection),
+                    SessionResponse::AgentSessionSnapshot(Box::new(initial.projection)),
                 ));
             }
             let events_request = backend.submit(RequestEnvelope::new(ClientRequest::Events(
@@ -454,7 +454,7 @@ impl LoomView {
                 {
                     let refreshed_cursor = initial.cursor;
                     refreshed.result = Ok(ServerResponse::Session(
-                        SessionResponse::AgentSessionSnapshot(initial.projection),
+                        SessionResponse::AgentSessionSnapshot(Box::new(initial.projection)),
                     ));
                     let retry_request = backend.submit(RequestEnvelope::new(
                         ClientRequest::Events(EventsRequest::GetSessionEvents {

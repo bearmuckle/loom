@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    io::{self, IsTerminal, Write},
+    io::{self, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -35,57 +35,6 @@ const EVENT_POLL_INTERVAL_MS: u64 = 20;
 /// stalled.
 const MAX_IDLE_EVENT_POLLS: u32 = 1_500;
 
-/// Ensures the state database can be opened by this build. An incompatible
-/// database is wiped only when the operator asked for it (`--reset-state`) or
-/// explicitly confirms the interactive prompt; otherwise the error is returned.
-fn ensure_state_database(path: &Path, reset_requested: bool) -> Result<(), LoomError> {
-    ensure_state_database_with(path, reset_requested, confirm_state_wipe)
-}
-
-/// The decision logic for [`ensure_state_database`] with the interactive
-/// confirmation injected, so it can be exercised without a terminal.
-fn ensure_state_database_with(
-    path: &Path,
-    reset_requested: bool,
-    confirm: impl FnOnce(&Path, loom_persistence::SchemaStatus) -> Result<bool, LoomError>,
-) -> Result<(), LoomError> {
-    let status = loom_persistence::FilePersistence::schema_status(path)?;
-    if status.is_compatible() {
-        return Ok(());
-    }
-    let wipe = reset_requested || confirm(path, status)?;
-    if !wipe {
-        return Err(loom_persistence::incompatible_database_error(path, status));
-    }
-    loom_persistence::FilePersistence::reset_database(path)
-}
-
-fn confirm_state_wipe(
-    path: &Path,
-    status: loom_persistence::SchemaStatus,
-) -> Result<bool, LoomError> {
-    if !io::stdin().is_terminal() {
-        return Ok(false);
-    }
-    eprintln!(
-        "Loom state database '{}' uses {} and cannot be opened by this build.",
-        path.display(),
-        status.description()
-    );
-    eprint!("Wipe it and start with an empty database? [y/N] ");
-    io::stderr()
-        .flush()
-        .map_err(|error| LoomError::new(ErrorCode::Internal, format!("{error}"), true))?;
-    let mut answer = String::new();
-    io::stdin()
-        .read_line(&mut answer)
-        .map_err(|error| LoomError::new(ErrorCode::Internal, format!("{error}"), true))?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
-}
-
 /// Initializes the `log` facade so server and agent diagnostics are visible when
 /// running the native CLI, including `serve`.
 fn init_logging() {
@@ -118,7 +67,7 @@ fn main() -> Result<(), LoomError> {
             .then(|| env::temp_dir().join(format!("loom-m3-demo-{}.db", AgentSessionId::new())))
     });
     if let Some(path) = persistence_path.as_deref() {
-        ensure_state_database(path, options.reset_state)?;
+        loom_server::ensure_state_database(path, options.reset_state)?;
     }
     let backend = match persistence_path.as_deref() {
         Some(path) if options.model.as_str() != "deterministic/demo" => {
@@ -392,12 +341,7 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
     let instance = Instance::prepare(&options.instance_options(), &loom_core::state_dir())?;
     instance.token().log_source();
     instance.token().print_generated();
-    let backend = match instance.state_db() {
-        Some(path) => InProcessBackend::new_persistent_with_github_copilot(path)?,
-        None => InProcessBackend::new_with_github_copilot()?,
-    };
-    let auth = Arc::new(AuthTokenStore::new());
-    let _issued = auth.insert(instance.token().token(), AuthorizationScope::all())?;
+    let backend = loom_server::open_backend(instance.state_db())?;
     let config = RemoteServerConfig {
         bind_addr: options.bind,
         allow_insecure_remote: options.allow_insecure_remote,
@@ -414,14 +358,13 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
             )
         })?;
     runtime.block_on(async move {
-        let server = RemoteServer::new(backend.clone(), auth, config)
-            .bind()
-            .await?;
+        let server =
+            loom_server::start_remote_server(backend, instance.token().token(), config).await?;
         println!(
             "Loom remote backend listening at {}",
             server.websocket_url()
         );
-        println!("Health endpoint: http://{}/health", server.local_addr());
+        println!("Health endpoint: {}", server.health_url());
         tokio::signal::ctrl_c().await.map_err(|error| {
             LoomError::new(
                 ErrorCode::Internal,
@@ -429,8 +372,7 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
                 false,
             )
         })?;
-        server.stop().await?;
-        backend.shutdown()
+        server.stop().await
     })
 }
 
@@ -1499,12 +1441,11 @@ const fn run_state_name(state: AgentRunState) -> &'static str {
 mod tests {
     use super::{
         CliOptions, create_session, create_workspace, demonstrate_m2_services,
-        demonstrate_m3_recovery, ensure_state_database_with, negotiate, parse_args, run_m4_demo,
-        start_run, stream_run,
+        demonstrate_m3_recovery, negotiate, parse_args, run_m4_demo, start_run, stream_run,
     };
     use loom_core::{AgentSessionState, RunId};
     use loom_model::ModelId;
-    use loom_server::InProcessBackend;
+    use loom_server::{InProcessBackend, ensure_state_database_with};
     use std::net::SocketAddr;
 
     fn arguments<'a>(values: &'a [&str]) -> impl Iterator<Item = String> + 'a {

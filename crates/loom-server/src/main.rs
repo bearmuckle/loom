@@ -17,9 +17,9 @@ use std::{
 
 use loom_core::{ErrorCode, LoomError};
 use loom_server::{
-    AuthTokenStore, AuthorizationScope, DiagnosticsSettings, InProcessBackend, Instance,
-    InstanceLayout, InstanceOptions, ProcessContext, RemoteServer, RemoteServerConfig,
-    RunningRemoteServer, ServerTlsConfig, TlsState, diagnostics_lines, startup_summary,
+    DiagnosticsSettings, InProcessBackend, Instance, InstanceLayout, InstanceOptions,
+    ProcessContext, RemoteServerConfig, ServerTlsConfig, ServingBackend, TlsState,
+    diagnostics_lines, open_backend, start_remote_server, startup_summary,
 };
 
 /// The bind address used when `--bind` is not supplied.
@@ -334,96 +334,23 @@ fn version_label(version: &str, revision: &str) -> String {
     }
 }
 
-/// Opens the backend the operator asked for: the path [`Instance`] resolved, or
-/// the in-memory backend when this instance has no durable database. This
-/// mirrors the standalone server mode of the native `loom` shell.
-fn build_backend(persistence: Option<&Path>) -> Result<Arc<InProcessBackend>, LoomError> {
-    match persistence {
-        Some(path) => InProcessBackend::new_persistent_with_github_copilot(path),
-        None => InProcessBackend::new_with_github_copilot(),
-    }
-}
-
-/// The running standalone backend. It is owned by the caller so a test can stop
-/// it without raising a process signal.
-struct RunningServer {
-    remote: RunningRemoteServer,
-    backend: Arc<InProcessBackend>,
-}
-
-impl RunningServer {
-    /// The WebSocket URL clients connect to, using the scheme the listener
-    /// serves (`ws://` or `wss://`).
-    fn websocket_url(&self) -> &str {
-        self.remote.websocket_url()
-    }
-
-    /// The health endpoint URL of the listener.
-    fn health_url(&self) -> String {
-        self.remote.health_url()
-    }
-
-    /// Stops accepting connections and shuts the backend down.
-    async fn stop(self) -> Result<(), LoomError> {
-        self.remote.stop().await?;
-        self.backend.shutdown()
-    }
-}
-
-/// Binds the backend and returns the running server.
+/// Binds the backend through the shared serve bootstrap, after resolving the
+/// TLS material `--tls-cert` and `--tls-key` ask for. The bootstrap itself —
+/// the bearer token store, the plaintext-exposure warning, and the URL logging —
+/// is the same one the native shell's `--serve` mode uses.
 async fn start(
     options: &ServerOptions,
     backend: Arc<InProcessBackend>,
     instance: &Instance,
-) -> Result<RunningServer, LoomError> {
+) -> Result<ServingBackend, LoomError> {
     let tls = resolve_tls(options)?;
-    let tls_configured = tls.is_some();
-    let auth = Arc::new(AuthTokenStore::new());
-    let _issued = auth.insert(instance.token().token(), AuthorizationScope::all())?;
     let config = RemoteServerConfig {
         bind_addr: options.bind,
         tls,
         allow_insecure_remote: options.allow_insecure_remote,
         ..RemoteServerConfig::default()
     };
-    if let Some(warning) = bind_exposure_warning(
-        config.bind_addr,
-        tls_configured,
-        options.allow_insecure_remote,
-    ) {
-        log::warn!("{warning}");
-    }
-    let remote = RemoteServer::new(backend.clone(), auth, config)
-        .bind()
-        .await?;
-    let server = RunningServer { remote, backend };
-    log::info!(
-        "Loom remote backend listening at {}",
-        server.websocket_url()
-    );
-    log::info!("Health endpoint: {}", server.health_url());
-    Ok(server)
-}
-
-/// A warning when `--bind` publishes the backend beyond the local machine
-/// without TLS. The listener then speaks plain `ws://` with a single shared
-/// bearer token, which the library only allows because the operator passed
-/// `--allow-insecure-remote`; this warns loudly so it cannot happen quietly.
-/// Without that opt-in the bind is refused, so there is nothing to warn about
-/// and the message must not claim a flag that was never given.
-fn bind_exposure_warning(
-    bind: SocketAddr,
-    tls_configured: bool,
-    allow_insecure_remote: bool,
-) -> Option<String> {
-    if bind.ip().is_loopback() || tls_configured || !allow_insecure_remote {
-        return None;
-    }
-    Some(format!(
-        "loom-server is bound to {bind} without TLS: because --allow-insecure-remote was given, \
-         the bearer token and every protocol frame are sent in plaintext; do not expose this \
-         listener to an untrusted network"
-    ))
+    start_remote_server(backend, instance.token().token(), config).await
 }
 
 fn serve_blocking(options: ServerOptions) -> Result<(), LoomError> {
@@ -466,7 +393,7 @@ async fn serve_in(
         state_directory,
     );
     log::info!("{}", startup_summary(&ProcessContext::detect(), &settings));
-    let backend = build_backend(instance.state_db())?;
+    let backend = open_backend(instance.state_db())?;
     let server = start(&options, backend, &instance).await?;
     shutdown.await?;
     log::info!("Shutting down loom-server");
@@ -535,12 +462,13 @@ mod tests {
         path::{Path, PathBuf},
     };
 
-    use loom_server::{InProcessBackend, Instance, TokenSource};
+    use loom_server::{
+        InProcessBackend, Instance, TokenSource, bind_exposure_warning, open_backend,
+    };
 
     use super::{
-        ParsedArgs, ServerOptions, bind_exposure_warning, build_version, diagnostics_report_in,
-        help_text, parse_args, prepare_instance, resolve_tls, run, serve_in, start, version_label,
-        version_text,
+        ParsedArgs, ServerOptions, build_version, diagnostics_report_in, help_text, parse_args,
+        prepare_instance, resolve_tls, run, serve_in, start, version_label, version_text,
     };
 
     fn arguments<'a>(values: &'a [&str]) -> impl Iterator<Item = String> + 'a {
@@ -833,7 +761,7 @@ mod tests {
         assert!(server.websocket_url().starts_with("wss://127.0.0.1:"));
         assert_eq!(
             server.health_url(),
-            format!("https://{}/health", server.remote.local_addr())
+            format!("https://{}/health", server.local_addr())
         );
         server.stop().await.unwrap();
     }
@@ -859,7 +787,7 @@ mod tests {
         let server = start(&opted_in, InProcessBackend::new(), &instance(&opted_in))
             .await
             .unwrap();
-        assert!(!server.remote.tls_enabled());
+        assert!(!server.tls_enabled());
         assert!(server.websocket_url().starts_with("ws://0.0.0.0:"));
         server.stop().await.unwrap();
     }
@@ -1107,7 +1035,7 @@ mod tests {
         assert!(server.websocket_url().ends_with("/ws"));
         assert_eq!(
             server.health_url(),
-            format!("http://{}/health", server.remote.local_addr())
+            format!("http://{}/health", server.local_addr())
         );
 
         let response = health_body(&server.health_url()).await;
@@ -1154,7 +1082,7 @@ mod tests {
     fn backend_selection_reports_errors_for_an_unusable_persistence_path() {
         let directory = temporary_path("state-dir");
         std::fs::create_dir_all(&directory).unwrap();
-        assert!(super::build_backend(Some(&directory)).is_err());
+        assert!(open_backend(Some(&directory)).is_err());
         std::fs::remove_dir_all(directory).ok();
     }
 

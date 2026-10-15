@@ -87,6 +87,7 @@ mod remote;
 mod resource_monitor;
 mod run_executor;
 mod run_handle;
+mod serve;
 mod services;
 mod util;
 
@@ -133,6 +134,10 @@ pub use instance::{
 pub use remote::{
     RemoteServer, RemoteServerConfig, RunningRemoteServer, ServerTlsConfig,
     WEBSOCKET_TLS_SUPPORTED, WebSocketConnection, WebSocketTransport,
+};
+pub use serve::{
+    ServingBackend, bind_exposure_warning, ensure_state_database, ensure_state_database_with,
+    open_backend, start_remote_server,
 };
 
 const DEFAULT_EVENT_RETENTION: usize = 4096;

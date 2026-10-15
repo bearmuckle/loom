@@ -40,7 +40,10 @@ impl InProcessConnection {
                 let (task, run) =
                     self.control_project_child(manager_session_id, project_id, task_id, action)?;
                 Ok(ServerResponse::Project(
-                    ProjectResponse::ProjectChildControlled { task, run },
+                    ProjectResponse::ProjectChildControlled {
+                        task: Box::new(task),
+                        run: run.map(Box::new),
+                    },
                 ))
             }
             ClientRequest::Project(ProjectRequest::GetProjectChildReview {
