@@ -254,7 +254,7 @@ impl InProcessBackend {
                 .load_feed_header()?
                 .map(|feed| EventJournal {
                     next_sequence: feed.next_sequence,
-                    events: Vec::new(),
+                    events: BTreeMap::new(),
                     pending_events: Vec::new(),
                     workspace_events: Vec::new(),
                     pending_workspace_events: Vec::new(),
@@ -294,17 +294,9 @@ impl InProcessBackend {
         }
         {
             let mut target = self.journal()?;
-            if state
-                .journal
-                .events
-                .windows(2)
-                .any(|events| events[0].sequence >= events[1].sequence)
-                || state
-                    .journal
-                    .events
-                    .last()
-                    .is_some_and(|event| event.sequence != state.journal.next_sequence)
-            {
+            // Retained events are rebuilt from the durable feed, so only the
+            // header is restored here.
+            if !state.journal.sequences_are_valid() {
                 return Err(LoomError::new(
                     ErrorCode::MalformedPayload,
                     "persisted event journal sequences are invalid",

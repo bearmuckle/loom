@@ -38,6 +38,7 @@ use support::*;
 
 mod feed;
 mod filesystem;
+mod idempotency;
 mod project_child;
 mod project_child_reliability;
 mod project_integration;
@@ -50,5 +51,6 @@ mod runs;
 mod session;
 mod session_deletion;
 mod session_workspace;
+mod shutdown;
 mod support;
 mod util;

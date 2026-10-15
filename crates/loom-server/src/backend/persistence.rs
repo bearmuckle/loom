@@ -687,6 +687,10 @@ impl InProcessBackend {
     /// Stops active run workers, persists their paused continuation state,
     /// joins all worker threads, and releases exclusive database ownership.
     /// Requests through existing connections are rejected after shutdown.
+    ///
+    /// Teardown always runs to completion: a run that failed while it settled
+    /// is reported after the owner lock is released and the backend reached
+    /// its terminal shutdown state, so a restart can reopen the database.
     pub fn shutdown(&self) -> Result<()> {
         let mut shutting_down = self.request_lifecycle.write().map_err(|_| {
             LoomError::new(
@@ -704,6 +708,10 @@ impl InProcessBackend {
             .values()
             .cloned()
             .collect::<Vec<Arc<RunHandle>>>();
+        // Teardown must not be abandoned when a run fails while it settles.
+        // Keep the first failure and keep going, so every run is settled and
+        // the persist, release, and state transitions below always run.
+        let mut settle_error: Option<LoomError> = None;
         for handle in handles {
             let mut settled = true;
             if handle.is_running() {
@@ -711,9 +719,8 @@ impl InProcessBackend {
                 match handle.wait_until_idle_for(SHUTDOWN_SETTLE_TIMEOUT) {
                     Ok(()) => {
                         if let Some(error) = handle.take_failure() {
-                            return Err(error);
-                        }
-                        if handle.control.is_stopping() {
+                            settle_error.get_or_insert(error);
+                        } else if handle.control.is_stopping() {
                             let state = handle.state().run.state;
                             // Only active runs need to be parked. Awaiting
                             // approval and waiting for input are already durable,
@@ -725,9 +732,14 @@ impl InProcessBackend {
                                     | AgentRunState::Executing
                                     | AgentRunState::Evaluating
                             ) {
-                                let mut runtime = handle.try_runtime()?;
-                                runtime.pause()?;
-                                handle.refresh(&runtime);
+                                let pause_result = handle.try_runtime().and_then(|mut runtime| {
+                                    runtime.pause()?;
+                                    handle.refresh(&runtime);
+                                    Ok(())
+                                });
+                                if let Err(error) = pause_result {
+                                    settle_error.get_or_insert(error);
+                                }
                             }
                             handle.control.clear_request();
                         }
@@ -746,8 +758,8 @@ impl InProcessBackend {
                     }
                 }
             }
-            if settled {
-                handle.join_worker()?;
+            if settled && let Err(error) = handle.join_worker() {
+                settle_error.get_or_insert(error);
             }
         }
         // A fail-stopped backend must not write more state, but shutdown still
@@ -757,11 +769,16 @@ impl InProcessBackend {
         } else {
             self.persist_state()
         };
-        if let Some(persistence) = self.persistence.as_ref() {
-            persistence.release_exclusive_writer()?;
+        if let Some(persistence) = self.persistence.as_ref()
+            && let Err(error) = persistence.release_exclusive_writer()
+        {
+            settle_error.get_or_insert(error);
         }
         *shutting_down = 2;
-        persist_result
+        match settle_error {
+            Some(error) => Err(error),
+            None => persist_result,
+        }
     }
 
     pub(crate) fn append_recovery_events(
