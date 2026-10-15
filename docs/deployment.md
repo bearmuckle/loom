@@ -172,6 +172,13 @@ rather than by a network check. Auto approve mode allows non-destructive writes,
 commands, and network actions without prompting, so approval gating does not
 restrict egress either.
 
+Destructive actions are denied in both modes, so they are never an egress path:
+`github_push_branch` and `github_remove_labels` are classified as destructive
+and are refused by the default policy and by auto approve. Using either one
+requires an operator to permit destructive actions for the session with the
+`SetSessionApprovalPolicy` request; `run_command` stays a command action so
+builds and tests keep working under both policies.
+
 An operator can verify the policy inside the execution context:
 
 ```sh

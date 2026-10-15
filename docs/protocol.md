@@ -67,8 +67,8 @@ to upgrade; old-client forward compatibility is not supported.
 
 Approval policies are scoped to an agent session. Session snapshots
 include the effective approval policy and the session's `auto_approve_actions`
-preference; the session-scoped `SetApprovalPolicy` form updates both for
-subsequent runs.
+preference; the session-scoped `SetSessionApprovalPolicy` request updates both
+for subsequent runs.
 
 The WebSocket service authenticates during the HTTP upgrade using a bearer
 token supplied in the `Authorization` header, or in a `loom.bearer.<token>`
@@ -172,7 +172,11 @@ authoritative for approval-required actions.
 Agent and Edit modes allow read, write, command, and network actions without
 prompting by default; the session settings can opt out, which restores explicit
 approval for writes, commands, and network actions. **Auto approve** remains an
-explicit mode. Destructive actions remain denied in every mode.
+explicit mode. Destructive actions remain denied in every mode; exactly two
+built-in tools are classified as destructive, `github_push_branch` and
+`github_remove_labels`, so they are denied by the default policy and by auto
+approve instead of prompting. `run_command` is a command action and stays
+runnable in automatic mode.
 
 M3 adds typed provider and durable-orchestration requests:
 
