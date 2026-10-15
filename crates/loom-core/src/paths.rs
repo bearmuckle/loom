@@ -109,13 +109,33 @@ fn instance_name_key(name: &str) -> Result<String, LoomError> {
 /// Creates `path` and its parents and restricts it to the owner (mode `0700`),
 /// because an instance directory holds transcripts, session roots, cached
 /// clones, and credential references.
+///
+/// A leaf that already exists as a symlink is refused instead of followed, so
+/// the state directory and everything written below it can never end up behind
+/// a link the caller did not name.
 pub fn create_private_dir(path: &Path) -> io::Result<()> {
-    fs::create_dir_all(path)?;
+    if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("refusing to use '{}': it is a symlink", path.display()),
+        ));
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
+        // The mode is applied while the directory is created, so a new
+        // directory is never briefly readable to other users.
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path)?;
+        // An existing directory keeps the mode it already had, so restrict it
+        // explicitly as well; it is not a symlink at this point.
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)?;
     }
     Ok(())
 }
@@ -205,12 +225,61 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
 
-            let mode = fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o700, "instance directory mode");
+            fn mode(path: &Path) -> u32 {
+                fs::metadata(path).unwrap().permissions().mode() & 0o777
+            }
+
+            // The directories created on the way are restricted as well, not
+            // only the leaf.
+            assert_eq!(mode(&root), 0o700, "state root mode");
+            assert_eq!(mode(&root.join("loom")), 0o700, "state directory mode");
+            assert_eq!(mode(&nested), 0o700, "instance directory mode");
+
+            // An existing directory that is broader than owner-only is
+            // restricted too, because it is not a symlink.
+            fs::set_permissions(&nested, fs::Permissions::from_mode(0o755)).unwrap();
         }
         // Creating an existing directory again is not an error and keeps the
         // owner-only mode.
         create_private_dir(&nested).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "existing directory mode");
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A symlink leaf would redirect the chmod and everything later written
+    /// below the state directory into the link target, so it is refused.
+    #[test]
+    #[cfg(unix)]
+    fn symlink_leafs_are_refused_and_the_target_is_left_alone() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = env::temp_dir().join(format!("loom-core-paths-{}", crate::RunId::new()));
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o750)).unwrap();
+        let link = root.join("loom");
+        symlink(&target, &link).unwrap();
+
+        let error = create_private_dir(&link).expect_err("a symlink leaf must be refused");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert_eq!(
+            fs::symlink_metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o750,
+            "the link target must not be chmodded"
+        );
+
+        // A dangling link is refused as well instead of being created through.
+        let dangling = root.join("dangling");
+        symlink(root.join("missing"), &dangling).unwrap();
+        assert!(create_private_dir(&dangling).is_err());
+        assert!(fs::symlink_metadata(&dangling).unwrap().file_type().is_symlink());
         fs::remove_dir_all(&root).unwrap();
     }
 }

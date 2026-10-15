@@ -147,28 +147,15 @@ impl ToolKind {
         }
     }
 
+    /// Whether this tool is expected to prompt for approval instead of running
+    /// unapproved. Derived from [`ToolKind::action_kind`] so the action
+    /// classification is the only place a tool is decided about: only reads are
+    /// allowed outright by the default policy, and every other kind is either
+    /// approved by the user or denied.
     pub const fn requires_approval(self) -> bool {
-        matches!(
-            self,
-            Self::ApplyPatch
-                | Self::RunCommand
-                | Self::WebSearch
-                | Self::GitHubListPullRequests
-                | Self::GitHubGetPullRequest
-                | Self::GitHubCreatePullRequest
-                | Self::GitHubPushBranch
-                | Self::GitHubListIssues
-                | Self::GitHubGetIssue
-                | Self::GitHubGetComments
-                | Self::GitHubCreateIssue
-                | Self::GitHubUpdateIssue
-                | Self::GitHubComment
-                | Self::GitHubUpdatePullRequest
-                | Self::GitHubMarkPullRequestReadyForReview
-                | Self::GitHubConvertPullRequestToDraft
-                | Self::GitHubAddLabels
-                | Self::GitHubRemoveLabels
-        )
+        // Expressed as "not a read" rather than as a list of kinds, so a kind
+        // added later has to be classified as a read to run unapproved.
+        !matches!(self.action_kind(), ActionKind::Read)
     }
 
     pub const fn action_kind(self) -> ActionKind {
@@ -4793,5 +4780,109 @@ mod helper_tests {
         assert_eq!(encode_github_path_segment("needs triage"), "needs%20triage");
         assert_eq!(encode_github_path_segment("area/ui"), "area%2Fui");
         assert_eq!(encode_github_path_segment("café"), "caf%C3%A9");
+    }
+
+    /// Every `ToolKind` variant. The exhaustive match is a compile-time guard:
+    /// a variant that is added without being classified here fails to build, so
+    /// the classification test below cannot stop being exhaustive.
+    fn every_tool_kind() -> Vec<ToolKind> {
+        let kinds = [
+            ToolKind::ListFiles,
+            ToolKind::ReadFile,
+            ToolKind::SearchText,
+            ToolKind::Glob,
+            ToolKind::WebSearch,
+            ToolKind::ProposePlan,
+            ToolKind::AskUser,
+            ToolKind::ApplyPatch,
+            ToolKind::RunCommand,
+            ToolKind::GitHubListPullRequests,
+            ToolKind::GitHubGetPullRequest,
+            ToolKind::GitHubCreatePullRequest,
+            ToolKind::GitHubPushBranch,
+            ToolKind::GitHubListIssues,
+            ToolKind::GitHubGetIssue,
+            ToolKind::GitHubGetComments,
+            ToolKind::GitHubCreateIssue,
+            ToolKind::GitHubUpdateIssue,
+            ToolKind::GitHubComment,
+            ToolKind::GitHubUpdatePullRequest,
+            ToolKind::GitHubMarkPullRequestReadyForReview,
+            ToolKind::GitHubConvertPullRequestToDraft,
+            ToolKind::GitHubAddLabels,
+            ToolKind::GitHubRemoveLabels,
+        ];
+        let mut classified = Vec::with_capacity(kinds.len());
+        for kind in kinds {
+            match kind {
+                ToolKind::ListFiles
+                | ToolKind::ReadFile
+                | ToolKind::SearchText
+                | ToolKind::Glob
+                | ToolKind::WebSearch
+                | ToolKind::ProposePlan
+                | ToolKind::AskUser
+                | ToolKind::ApplyPatch
+                | ToolKind::RunCommand
+                | ToolKind::GitHubListPullRequests
+                | ToolKind::GitHubGetPullRequest
+                | ToolKind::GitHubCreatePullRequest
+                | ToolKind::GitHubPushBranch
+                | ToolKind::GitHubListIssues
+                | ToolKind::GitHubGetIssue
+                | ToolKind::GitHubGetComments
+                | ToolKind::GitHubCreateIssue
+                | ToolKind::GitHubUpdateIssue
+                | ToolKind::GitHubComment
+                | ToolKind::GitHubUpdatePullRequest
+                | ToolKind::GitHubMarkPullRequestReadyForReview
+                | ToolKind::GitHubConvertPullRequestToDraft
+                | ToolKind::GitHubAddLabels
+                | ToolKind::GitHubRemoveLabels => classified.push(kind),
+            }
+        }
+        classified
+    }
+
+    /// Every tool must be classified and must agree with the policy that decides
+    /// on it, so the approval expectation cannot drift away from `action_kind`.
+    #[test]
+    fn every_tool_kind_is_classified_and_agrees_with_the_default_policy() {
+        let policy = ApprovalPolicy::default();
+        for kind in every_tool_kind() {
+            // An unclassified variant would also be unreachable by name.
+            assert_eq!(
+                ToolKind::from_name(kind.name()),
+                Some(kind),
+                "{} is not reachable by its own name",
+                kind.name()
+            );
+            let decision = policy.decision(kind.action_kind());
+            assert_eq!(
+                kind.requires_approval(),
+                decision != loom_core::PolicyDecision::Allow,
+                "{} is {:?}, requires_approval={}, default policy decides {decision:?}",
+                kind.name(),
+                kind.action_kind(),
+                kind.requires_approval()
+            );
+        }
+        // The tools that are allowed to run without a prompt must stay exactly
+        // the read-only and control tools: no tool may become unapproved that
+        // was approved before, or the other way round.
+        let unapproved = every_tool_kind()
+            .into_iter()
+            .filter(|kind| !kind.requires_approval())
+            .map(ToolKind::name)
+            .collect::<Vec<_>>();
+        let expected_unapproved = [
+            "list_files",
+            "read_file",
+            "search_text",
+            "glob",
+            "propose_plan",
+            "ask_user",
+        ];
+        assert_eq!(unapproved, expected_unapproved.to_vec());
     }
 }
