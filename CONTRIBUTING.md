@@ -42,7 +42,9 @@ cargo test -p loom-ui --features visual-tests --locked --bins visual_render_test
 CI does not run full coverage or visual render tests. Coverage should be
 focused on changed code when needed; there is no workspace-wide coverage gate.
 `./scripts/ci-check.sh` runs routine formatting, Clippy, and build checks. CI
-runs formatting, Clippy, workspace tests, and benchmarks on pushes to `main`.
+runs formatting, Clippy, and workspace tests for pull requests and pushes to
+`main`; tests provide the workspace compilation check, so CI does not run a
+separate `cargo build --workspace` step.
 
 ### Faster builds with sccache
 

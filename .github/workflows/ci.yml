@@ -71,8 +71,6 @@ jobs:
         # software Vulkan/GL driver. The dedicated step below runs that feature
         # explicitly instead.
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Build workspace
-        run: cargo build --workspace --locked
       - name: Run tests
         run: cargo test --workspace --locked --lib --bins --tests
       - name: Run benchmarks
