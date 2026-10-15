@@ -107,10 +107,33 @@ impl InProcessConnection {
         } else {
             None
         };
-        let _request_guard = slot
-            .as_ref()
-            .map(|slot| slot.lock().unwrap_or_else(PoisonError::into_inner));
-        let request_for_cache = request.request.clone();
+        let response = {
+            let _request_guard = slot
+                .as_ref()
+                .map(|slot| slot.lock().unwrap_or_else(PoisonError::into_inner));
+            self.request_with_slot(request.request, request_id, retryable)
+        };
+        if retryable {
+            drop(slot);
+            self.backend
+                .idempotency_store
+                .release_request_slot(request_id);
+        }
+        response
+    }
+
+    /// Handles one request while its idempotency slot is held.
+    ///
+    /// `retryable` marks a durable mutation that participates in the
+    /// idempotency cache. The caller releases the slot after this returns, on
+    /// every exit path, so the request guard must not outlive the call.
+    fn request_with_slot(
+        &self,
+        request: ClientRequest,
+        request_id: RequestId,
+        retryable: bool,
+    ) -> ResponseEnvelope {
+        let request_for_cache = request.clone();
         if retryable {
             if let Err(error) = self.authorize_request_access(&request_for_cache) {
                 return ResponseEnvelope::failure(request_id, error);
@@ -126,7 +149,7 @@ impl InProcessConnection {
             }
         }
 
-        let result = match request.request {
+        let result = match request {
             ClientRequest::Control(ControlRequest::Negotiate {
                 client_version,
                 capabilities,
@@ -142,42 +165,23 @@ impl InProcessConnection {
                     let response_envelope = ResponseEnvelope::success(request_id, response.clone());
                     let record =
                         IdempotencyRecord::new(request_id, request_for_cache, response_envelope);
-                    if durable_mutation {
-                        self.backend
-                            .persist_state_with_idempotency_candidate((request_id, record.clone()))
-                            .and_then(|()| {
-                                self.backend.idempotency_store.publish(request_id, record)?;
-                                Ok(response)
-                            })
-                    } else {
-                        self.backend
-                            .idempotency_store
-                            .publish(request_id, record)
-                            .map(|()| response)
-                    }
+                    self.backend
+                        .persist_state_with_idempotency_candidate((request_id, record.clone()))
+                        .and_then(|()| {
+                            self.backend.idempotency_store.publish(request_id, record)?;
+                            Ok(response)
+                        })
                 } else {
-                    if durable_mutation {
-                        self.backend.persist_state().map(|()| response)
-                    } else {
-                        Ok(response)
-                    }
+                    Ok(response)
                 }
             }
             Err(error) => Err(error),
         };
 
-        let response = match result {
+        match result {
             Ok(response) => ResponseEnvelope::success(request_id, response),
             Err(error) => ResponseEnvelope::failure(request_id, error),
-        };
-        if retryable {
-            drop(_request_guard);
-            drop(slot);
-            self.backend
-                .idempotency_store
-                .release_request_slot(request_id);
         }
-        response
     }
 
     pub(crate) fn negotiate(

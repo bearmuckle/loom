@@ -6,7 +6,7 @@
 //! API used by the desktop client lives behind the re-exports below.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -89,6 +89,7 @@ mod resource_monitor;
 mod retention;
 mod run_executor;
 mod run_handle;
+mod serve;
 mod services;
 mod util;
 
@@ -143,6 +144,10 @@ pub use retention::{
     apply_startup_archive_retention, parse_force_discard, parse_retention_window,
     resolve_archive_retention, run_archive_retention_sweeps, sweep_archive_retention_at_startup,
 };
+pub use serve::{
+    ServingBackend, bind_exposure_warning, ensure_state_database, ensure_state_database_with,
+    open_backend, start_remote_server,
+};
 
 const DEFAULT_EVENT_RETENTION: usize = 4096;
 const MAX_REVIEW_CHANGES: usize = 512;
@@ -154,7 +159,14 @@ const MAX_RUN_MESSAGE_BYTES: usize = 32 * 1024;
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct EventJournal {
     next_sequence: EventSequence,
-    events: Vec<ServerEventEnvelope>,
+    /// Retained session events, indexed by session so append, retention
+    /// pruning and range reads only touch one session's window instead of the
+    /// whole journal. Each deque is ordered by ascending global sequence,
+    /// which keeps the head as that session's oldest and the tail as its
+    /// latest retained sequence.
+    events: BTreeMap<AgentSessionId, VecDeque<ServerEventEnvelope>>,
+    /// Unpersisted session events, kept in one globally ordered vector because
+    /// the durable feed requires strictly increasing sequences.
     #[serde(skip)]
     pending_events: Vec<ServerEventEnvelope>,
     #[serde(default)]

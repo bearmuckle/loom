@@ -77,10 +77,13 @@ impl EventJournal {
     }
 
     fn append_event(&mut self, event: ServerEventEnvelope) {
-        self.events.push(event.clone());
-        self.pending_events.push(event);
-        Self::prune_events(&mut self.events, self.retention_limit);
-        Self::prune_events(&mut self.pending_events, self.retention_limit);
+        self.pending_events.push(event.clone());
+        self.events
+            .entry(event.session_id)
+            .or_default()
+            .push_back(event);
+        self.prune_events();
+        Self::prune_pending_events(&mut self.pending_events, self.retention_limit);
     }
 
     pub(crate) fn append_workspace(
@@ -129,7 +132,25 @@ impl EventJournal {
         }
     }
 
-    pub(crate) fn prune_events(events: &mut Vec<ServerEventEnvelope>, limit: usize) {
+    /// Drops retained events beyond the per-session retention limit.
+    ///
+    /// Every session owns a separate window, so pruning one session never
+    /// evicts another session's events, and the work is proportional to the
+    /// number of sessions instead of to the total retained history.
+    fn prune_events(&mut self) {
+        let limit = self.retention_limit;
+        self.events.retain(|_, events| {
+            while events.len() > limit {
+                events.pop_front();
+            }
+            !events.is_empty()
+        });
+    }
+
+    /// Retention pruning for the globally ordered pending feed. That vector is
+    /// the unpersisted durable feed prefix, so it stays sequence ordered and is
+    /// only ever a few flushes long.
+    fn prune_pending_events(events: &mut Vec<ServerEventEnvelope>, limit: usize) {
         let mut counts = BTreeMap::<AgentSessionId, usize>::new();
         for event in events.iter() {
             *counts.entry(event.session_id).or_default() += 1;
@@ -149,6 +170,48 @@ impl EventJournal {
         }
     }
 
+    /// Whether `sequence` is newer than the optional resume cursor.
+    fn is_after(sequence: EventSequence, after_sequence: Option<EventSequence>) -> bool {
+        after_sequence.is_none_or(|after| sequence > after)
+    }
+
+    /// Retained events of one session in ascending sequence order.
+    fn session_events(
+        &self,
+        session_id: AgentSessionId,
+    ) -> impl Iterator<Item = &ServerEventEnvelope> {
+        self.events.get(&session_id).into_iter().flatten()
+    }
+
+    /// Oldest retained event of one session, if any.
+    fn session_oldest(&self, session_id: AgentSessionId) -> Option<&ServerEventEnvelope> {
+        self.events
+            .get(&session_id)
+            .and_then(|events| events.front())
+    }
+
+    /// Latest retained event of one session, if any.
+    fn session_latest(&self, session_id: AgentSessionId) -> Option<&ServerEventEnvelope> {
+        self.events
+            .get(&session_id)
+            .and_then(|events| events.back())
+    }
+
+    /// Whether every retained window is sequence ordered and stays inside the
+    /// global cursor. Restored journals carry no retained window because the
+    /// durable feed owns the events, so this only rejects a malformed journal.
+    pub(crate) fn sequences_are_valid(&self) -> bool {
+        self.events.values().all(|events| {
+            events
+                .iter()
+                .zip(events.range(1..))
+                .all(|(previous, next)| previous.sequence < next.sequence)
+                && events
+                    .back()
+                    .is_none_or(|event| event.sequence <= self.next_sequence)
+        })
+    }
+
     pub(crate) fn oldest_sequence(
         &self,
         session_id: Option<AgentSessionId>,
@@ -160,20 +223,31 @@ impl EventJournal {
         &self,
         session_id: Option<AgentSessionId>,
     ) -> Option<&ServerEventEnvelope> {
-        self.events
-            .iter()
-            .find(|event| session_id.is_none_or(|id| event.session_id == id))
+        match session_id {
+            Some(session_id) => self.session_oldest(session_id),
+            // The un-scoped feed is ordered by global sequence, so a global
+            // read merges the per-session windows instead of one flat vector.
+            None => self
+                .events
+                .values()
+                .filter_map(|events| events.front())
+                .min_by_key(|event| event.sequence),
+        }
     }
 
     pub(crate) fn latest_sequence(
         &self,
         session_id: Option<AgentSessionId>,
     ) -> Option<EventSequence> {
-        self.events
-            .iter()
-            .rev()
-            .find(|event| session_id.is_none_or(|id| event.session_id == id))
-            .map(|event| event.sequence)
+        match session_id {
+            Some(session_id) => self.session_latest(session_id).map(|event| event.sequence),
+            None => self
+                .events
+                .values()
+                .filter_map(|events| events.back())
+                .map(|event| event.sequence)
+                .max(),
+        }
     }
 
     pub(crate) fn is_cursor_stale(
@@ -203,8 +277,8 @@ impl EventJournal {
 
     pub(crate) fn set_retention(&mut self, limit: usize) {
         self.retention_limit = limit;
-        Self::prune_events(&mut self.events, limit);
-        Self::prune_events(&mut self.pending_events, limit);
+        self.prune_events();
+        Self::prune_pending_events(&mut self.pending_events, limit);
         Self::prune_workspace_events(&mut self.workspace_events, limit);
         Self::prune_workspace_events(&mut self.pending_workspace_events, limit);
     }
@@ -214,14 +288,24 @@ impl EventJournal {
         session_id: Option<AgentSessionId>,
         after_sequence: Option<EventSequence>,
     ) -> Vec<ServerEventEnvelope> {
-        self.events
-            .iter()
-            .filter(|event| {
-                session_id.is_none_or(|id| event.session_id == id)
-                    && after_sequence.is_none_or(|sequence| event.sequence > sequence)
-            })
-            .cloned()
-            .collect()
+        match session_id {
+            Some(session_id) => self
+                .session_events(session_id)
+                .filter(|event| Self::is_after(event.sequence, after_sequence))
+                .cloned()
+                .collect(),
+            None => {
+                let mut events = self
+                    .events
+                    .values()
+                    .flatten()
+                    .filter(|event| Self::is_after(event.sequence, after_sequence))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                events.sort_by_key(|event| event.sequence);
+                events
+            }
+        }
     }
 
     pub(crate) fn workspace_events_since(
@@ -230,13 +314,10 @@ impl EventJournal {
         workspace_id: WorkspaceId,
         after_sequence: Option<EventSequence>,
     ) -> Vec<WorkspaceFeedEvent> {
-        let mut events = self
-            .events
+        let mut events = session_ids
             .iter()
-            .filter(|event| {
-                session_ids.contains(&event.session_id)
-                    && after_sequence.is_none_or(|sequence| event.sequence > sequence)
-            })
+            .flat_map(|session_id| self.session_events(*session_id))
+            .filter(|event| Self::is_after(event.sequence, after_sequence))
             .cloned()
             .map(WorkspaceFeedEvent::Session)
             .collect::<Vec<_>>();
@@ -262,10 +343,11 @@ impl EventJournal {
         session_ids: &BTreeSet<AgentSessionId>,
         workspace_id: WorkspaceId,
     ) -> Option<EventSequence> {
-        self.events
+        session_ids
             .iter()
-            .find(|event| session_ids.contains(&event.session_id))
+            .filter_map(|session_id| self.session_oldest(*session_id))
             .map(|event| event.sequence)
+            .min()
             .into_iter()
             .chain(
                 self.workspace_events
@@ -281,11 +363,11 @@ impl EventJournal {
         session_ids: &BTreeSet<AgentSessionId>,
         workspace_id: WorkspaceId,
     ) -> Option<EventSequence> {
-        self.events
+        session_ids
             .iter()
-            .rev()
-            .find(|event| session_ids.contains(&event.session_id))
+            .filter_map(|session_id| self.session_latest(*session_id))
             .map(|event| event.sequence)
+            .max()
             .into_iter()
             .chain(
                 self.workspace_events
@@ -317,15 +399,12 @@ impl EventJournal {
         session_id: AgentSessionId,
         limit: usize,
     ) -> Vec<ServerEventEnvelope> {
-        self.events
-            .iter()
-            .filter(|event| event.session_id == session_id)
-            .rev()
-            .take(limit)
+        let Some(events) = self.events.get(&session_id) else {
+            return Vec::new();
+        };
+        events
+            .range(events.len().saturating_sub(limit)..)
             .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
             .collect()
     }
 }

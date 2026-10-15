@@ -52,7 +52,7 @@ impl InProcessConnection {
             )),
             ClientRequest::Run(RunRequest::GetAgentRunSnapshot { run_id }) => {
                 Ok(ServerResponse::Run(RunResponse::AgentRunSnapshot(
-                    self.run_snapshot_projection(run_id)?,
+                    Box::new(self.run_snapshot_projection(run_id)?),
                 )))
             }
             ClientRequest::Run(RunRequest::GetRunCheckpoint { run_id }) => {

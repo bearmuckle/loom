@@ -217,10 +217,10 @@ impl InProcessBackend {
             let mut journal = self.journal()?;
             // A reconnecting client must never receive events for a session that
             // no longer exists. The global sequence deliberately keeps its
-            // high-water mark so retained cursors stay valid.
-            journal
-                .events
-                .retain(|event| !deleted_ids.contains(&event.session_id));
+            // high-water mark so retained cursors stay valid, and retained
+            // events are indexed per session, so deleting a session drops its
+            // whole window.
+            journal.events.retain(|id, _| !deleted_ids.contains(id));
             journal
                 .pending_events
                 .retain(|event| !deleted_ids.contains(&event.session_id));

@@ -14,22 +14,22 @@ impl InProcessConnection {
                 )))
             }
             ClientRequest::Session(SessionRequest::GetAgentSessionSnapshot { session_id }) => Ok(
-                ServerResponse::Session(SessionResponse::AgentSessionSnapshot(
+                ServerResponse::Session(SessionResponse::AgentSessionSnapshot(Box::new(
                     self.session_snapshot_projection(session_id, true)?,
-                )),
+                ))),
             ),
             ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata {
                 session_id,
             }) => Ok(ServerResponse::Session(
-                SessionResponse::AgentSessionSnapshot(
+                SessionResponse::AgentSessionSnapshot(Box::new(
                     self.session_snapshot_projection(session_id, false)?,
-                ),
+                )),
             )),
             ClientRequest::Session(SessionRequest::GetAgentSessionInitialState { session_id }) => {
                 Ok(ServerResponse::Session(
-                    SessionResponse::AgentSessionInitialState(
+                    SessionResponse::AgentSessionInitialState(Box::new(
                         self.session_initial_state(session_id)?,
-                    ),
+                    )),
                 ))
             }
             ClientRequest::Session(SessionRequest::RenameAgentSession { session_id, name }) => {
@@ -136,14 +136,15 @@ impl InProcessConnection {
                     .backend
                     .journal()?
                     .events
-                    .iter()
+                    .get(&session_id)
+                    .into_iter()
+                    .flatten()
                     .filter(|event| {
-                        event.session_id == session_id
-                            && !matches!(
-                                &event.event,
-                                loom_protocol::ServerEvent::AgentSessionCreated { .. }
-                                    | loom_protocol::ServerEvent::AgentSessionForked { .. }
-                            )
+                        !matches!(
+                            &event.event,
+                            loom_protocol::ServerEvent::AgentSessionCreated { .. }
+                                | loom_protocol::ServerEvent::AgentSessionForked { .. }
+                        )
                     })
                     .cloned()
                     .collect::<Vec<_>>();
