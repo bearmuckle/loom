@@ -6,7 +6,7 @@
 //! API used by the desktop client lives behind the re-exports below.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -145,7 +145,14 @@ const MAX_RUN_MESSAGE_BYTES: usize = 32 * 1024;
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct EventJournal {
     next_sequence: EventSequence,
-    events: Vec<ServerEventEnvelope>,
+    /// Retained session events, indexed by session so append, retention
+    /// pruning and range reads only touch one session's window instead of the
+    /// whole journal. Each deque is ordered by ascending global sequence,
+    /// which keeps the head as that session's oldest and the tail as its
+    /// latest retained sequence.
+    events: BTreeMap<AgentSessionId, VecDeque<ServerEventEnvelope>>,
+    /// Unpersisted session events, kept in one globally ordered vector because
+    /// the durable feed requires strictly increasing sequences.
     #[serde(skip)]
     pending_events: Vec<ServerEventEnvelope>,
     #[serde(default)]
