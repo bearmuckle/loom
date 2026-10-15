@@ -3,8 +3,11 @@ name = "loom-local"
 description = "Native launcher and local backend embedding for Loom clients."
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "AGPL-3.0-only"
 rust-version.workspace = true
+
+[build-dependencies]
+loom-build.workspace = true
 
 [dependencies]
 loom-core.workspace = true
