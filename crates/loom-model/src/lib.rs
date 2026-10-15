@@ -10,10 +10,10 @@ pub use activity::{
     FileActivityOperation,
 };
 pub use agent::{
-    AgentEvent, AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
-    AgentInteractionStatus, AgentPlan, AgentPlanStep, AgentRunAttemptRecord, AgentRunSnapshot,
-    AgentRunState, AgentToolAttemptRecord, AgentToolAttemptState, AgentToolCallRecord,
-    ApprovalDecision, ProjectJoinContinuation,
+    AGENT_RUN_FAILURE_SUMMARY_PREFIX, AgentEvent, AgentExecutionStateRecord, AgentInteractionKind,
+    AgentInteractionRecord, AgentInteractionStatus, AgentPlan, AgentPlanStep,
+    AgentRunAttemptRecord, AgentRunSnapshot, AgentRunState, AgentToolAttemptRecord,
+    AgentToolAttemptState, AgentToolCallRecord, ApprovalDecision, ProjectJoinContinuation,
 };
 pub use config::{
     CredentialRef, CredentialReference, DEEPSEEK_API_ENDPOINT, DEEPSEEK_DEFAULT_MODEL,
