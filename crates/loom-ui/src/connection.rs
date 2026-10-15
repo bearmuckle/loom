@@ -350,14 +350,21 @@ const NATIVE_ONLY_NEGOTIATION_CAPABILITIES: &[(Capability, &str)] = &[(
 
 /// The capabilities this build advertises to a worker during negotiation.
 pub(crate) fn negotiation_capabilities() -> CapabilitySet {
-    let mut capabilities = SHARED_NEGOTIATION_CAPABILITIES.to_vec();
+    // Chained rather than extended so the list needs no `mut` on the target
+    // whose transport-specific entries are compiled out.
     #[cfg(not(target_family = "wasm"))]
-    capabilities.extend(
-        NATIVE_ONLY_NEGOTIATION_CAPABILITIES
+    let transport_specific = NATIVE_ONLY_NEGOTIATION_CAPABILITIES
+        .iter()
+        .map(|(capability, _)| *capability);
+    #[cfg(target_family = "wasm")]
+    let transport_specific = std::iter::empty::<Capability>();
+
+    CapabilitySet::new(
+        SHARED_NEGOTIATION_CAPABILITIES
             .iter()
-            .map(|(capability, _)| *capability),
-    );
-    CapabilitySet::new(capabilities)
+            .copied()
+            .chain(transport_specific),
+    )
 }
 
 #[cfg(not(target_family = "wasm"))]
