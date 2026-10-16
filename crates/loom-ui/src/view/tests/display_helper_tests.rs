@@ -3,16 +3,16 @@ use super::{
     CompletionKind, FileActivityOperation, LOOM_REPOSITORY_URL, MAX_RUN_FAILURE_REASON_CHARS,
     ToolPart, ToolPartStatus, about_backend, about_backend_label, about_build_version,
     about_git_revision, about_links, about_platform_label, about_protocol, about_version_label,
-    action_kind_label, activity_output, change_kind_label, command_line, command_purpose,
-    commands_matching, completion_for_value, composer_height, disconnected_screen, endpoint_host,
-    endpoint_label, format_bytes, format_duration, format_percentage, has_block_markdown,
-    humanize_tool_output, is_redundant_completion_summary, relative_time, replace_command_token,
-    replace_last_token, rgb, run_failure_reason, run_state_color, run_state_label,
-    session_is_active, session_status_pill, source_mount_path, tool_denial_count, tool_detail,
-    tool_failure_count, tool_failure_reason, tool_group_label, tool_group_status, tool_icon,
-    tool_needs_attention, tool_outcome_notes, tool_part_from_activity, tool_part_from_policy,
-    tool_policy_note, tool_shows_output, tool_status, tool_title, tool_title_for_activity,
-    tool_usage_label, tool_usage_summary,
+    action_kind_label, activity_output, approval_policy_status_text, change_kind_label,
+    command_line, command_purpose, commands_matching, completion_for_value, composer_height,
+    disconnected_screen, endpoint_host, endpoint_label, format_bytes, format_duration,
+    format_percentage, has_block_markdown, humanize_tool_output, is_redundant_completion_summary,
+    relative_time, replace_command_token, replace_last_token, rgb, run_failure_reason,
+    run_state_color, run_state_label, session_is_active, session_status_pill, source_mount_path,
+    tool_denial_count, tool_detail, tool_failure_count, tool_failure_reason, tool_group_label,
+    tool_group_status, tool_icon, tool_needs_attention, tool_outcome_notes,
+    tool_part_from_activity, tool_part_from_policy, tool_policy_note, tool_shows_output,
+    tool_status, tool_title, tool_title_for_activity, tool_usage_label, tool_usage_summary,
 };
 use gpui_kit::assets::IconName as AssetIconName;
 use loom_core::{
@@ -20,7 +20,7 @@ use loom_core::{
     RunId, Timestamp,
 };
 use loom_model::{ModelId, ToolCall};
-use loom_protocol::{AgentActivityKind, AgentRunState, ToolResult};
+use loom_protocol::{AgentActivityKind, AgentRunState, ApprovalPolicyApplyScope, ToolResult};
 use serde_json::json;
 
 fn activity(data: AgentActivityData) -> AgentActivityRecord {
@@ -1058,4 +1058,31 @@ fn block_markdown_is_detected_for_definite_bubble_widths() {
     assert!(!has_block_markdown("Run the tests"));
     assert!(!has_block_markdown("Release 2.0 shipped"));
     assert!(!has_block_markdown("inline **bold** only"));
+}
+
+/// The approval-settings status text the client reports, which follows the
+/// scope the backend gave rather than the local run state.
+#[test]
+fn approval_policy_status_text_follows_the_scope_the_backend_reported() {
+    use ApprovalPolicyApplyScope::{NextRun, RunningRun};
+
+    let base = "Automatic approvals enabled for this session";
+
+    // Nothing is executing that could miss the change, so the wording stays as
+    // it was whatever scope the backend reported.
+    assert_eq!(approval_policy_status_text(base, NextRun, false), base);
+    assert_eq!(approval_policy_status_text(base, RunningRun, false), base);
+
+    // A change that does reach the running run needs no note either.
+    assert_eq!(approval_policy_status_text(base, RunningRun, true), base);
+
+    // `next_run` with a run executing: the running run keeps the policy it
+    // pinned, so the point is that the change is not in effect yet.
+    let text = approval_policy_status_text(base, NextRun, true);
+    assert_eq!(
+        text,
+        "Automatic approvals enabled for this session · the change applies from the next run; \
+         the running run keeps the policy it started with"
+    );
+    assert!(text.starts_with(base));
 }

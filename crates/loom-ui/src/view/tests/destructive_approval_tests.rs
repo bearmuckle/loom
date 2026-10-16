@@ -151,6 +151,95 @@ fn toggling_either_switch_keeps_the_other_choice(cx: &mut TestAppContext) {
     });
 }
 
+/// The text of the view's status banner, which reports the last settings
+/// change.
+fn status_text(cx: &mut TestAppContext, view: &Entity<LoomView>) -> String {
+    cx.update(|cx| {
+        view.read(cx)
+            .status_banner
+            .as_ref()
+            .map(|note| note.text.clone())
+            .unwrap_or_default()
+    })
+}
+
+/// A change with no run executing keeps its existing wording, and a change made
+/// while a run is executing reports the scope the backend gave: the change
+/// reaches the next run, and the running run keeps the policy it pinned.
+///
+/// The worker stores the change for the session, so it answers `next_run` and
+/// the client must say so instead of acknowledging a change the running run
+/// never evaluates.
+#[cfg(not(target_family = "wasm"))]
+#[gpui_kit::test]
+fn a_change_during_a_run_reports_the_scope_the_backend_gave(cx: &mut TestAppContext) {
+    let view = view_with_worker_session(cx);
+    view.update(cx, |view, _| {
+        view.auto_approve_actions = false;
+        view.ask_before_destructive_actions = false;
+    });
+
+    // No run is executing, so nothing about the wording changes.
+    view.update(cx, |view, cx| view.toggle_auto_approve_actions(cx));
+    cx.run_until_parked();
+    assert_eq!(
+        status_text(cx, &view),
+        "Automatic approvals enabled for this session"
+    );
+    view.update(cx, |view, cx| view.toggle_auto_approve_actions(cx));
+    cx.run_until_parked();
+    assert_eq!(
+        status_text(cx, &view),
+        "Automatic approvals disabled for this session"
+    );
+    view.update(cx, |view, cx| {
+        view.toggle_ask_before_destructive_actions(cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        status_text(cx, &view),
+        "Destructive actions will ask for approval in this session"
+    );
+    view.update(cx, |view, cx| {
+        view.toggle_ask_before_destructive_actions(cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        status_text(cx, &view),
+        "Destructive actions will run without approval in this session"
+    );
+
+    // A run is executing, so the same two switches report the scope the worker
+    // answered with.
+    view.update(cx, |view, _| {
+        view.active_run_id = Some(RunId::new());
+        view.run_state = Some(AgentRunState::Executing);
+    });
+    view.update(cx, |view, cx| view.toggle_auto_approve_actions(cx));
+    cx.run_until_parked();
+    assert_eq!(
+        status_text(cx, &view),
+        "Automatic approvals enabled for this session · the change applies from the next \
+         run; the running run keeps the policy it started with"
+    );
+    view.update(cx, |view, cx| {
+        view.toggle_ask_before_destructive_actions(cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        status_text(cx, &view),
+        "Destructive actions will ask for approval in this session · the change applies \
+         from the next run; the running run keeps the policy it started with"
+    );
+
+    // The test app keeps polling an interruptible run, which outlives the test
+    // body.
+    view.update(cx, |view, _| {
+        view.active_run_id = None;
+        view.run_state = None;
+    });
+}
+
 /// A loaded session reports its stored destructive decision on the switch.
 #[gpui_kit::test]
 fn a_loaded_snapshot_shows_its_destructive_decision(cx: &mut TestAppContext) {

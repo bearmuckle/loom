@@ -1126,6 +1126,31 @@ pub(crate) fn run_failure_reason(summary: Option<&str>) -> Option<String> {
     Some(reason)
 }
 
+/// Appended to an approval-settings status text when the backend reports that
+/// the change only reaches the next run while a run is executing.
+const APPROVAL_POLICY_NEXT_RUN_NOTE: &str =
+    " · the change applies from the next run; the running run keeps the policy it started with";
+
+/// The status text a session approval-settings change reports.
+///
+/// The backend decides which steps a change reaches and reports it as
+/// `applies_from`: a run evaluates the approval policy it pinned when it was
+/// created, so a change made while a run executes is stored for the session and
+/// reaches the next run. The note therefore comes from the reported scope rather
+/// than from local state; `run_is_active` only decides whether a note is needed
+/// at all, so a change with no run executing keeps the plain wording.
+pub(crate) fn approval_policy_status_text(
+    base: &str,
+    applies_from: loom_protocol::ApprovalPolicyApplyScope,
+    run_is_active: bool,
+) -> String {
+    if run_is_active && applies_from == loom_protocol::ApprovalPolicyApplyScope::NextRun {
+        format!("{base}{APPROVAL_POLICY_NEXT_RUN_NOTE}")
+    } else {
+        base.to_owned()
+    }
+}
+
 pub(crate) fn change_kind_label(kind: loom_protocol::WorkspaceChangeKind) -> &'static str {
     match kind {
         loom_protocol::WorkspaceChangeKind::Created => "New",
