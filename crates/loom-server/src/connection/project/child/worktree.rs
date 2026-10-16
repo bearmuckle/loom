@@ -382,11 +382,43 @@ impl InProcessConnection {
         worktree.updated_at = Timestamp::now();
         self.save_project_worktree_state(&worktree)?;
 
-        let message = format!(
-            "loom: integrate project child task {} ({})",
-            task.task_id, task.child_name
-        );
-        match parent_git.integrate_merge_revisions(&parent_revision, &child_revision, &message) {
+        let message = project_child_integration_message(&child_git, &child_revision, &task);
+
+        // The parent must end up holding the child's own commit rather than a
+        // bookkeeping commit of Loom's own. When the child does not already
+        // descend from the parent tip, its own commits are replayed onto the
+        // parent tip first, so the parent fast-forwards to them.
+        let outcome = if parent_git.is_ancestor_revision(&parent_revision, &child_revision)? {
+            parent_git.integrate_merge_revisions(&parent_revision, &child_revision, &message)
+        } else {
+            match child_git.rebase_onto_revision(&parent_revision) {
+                Ok(loom_vcs::RebaseIntegrationOutcome::Rebased(revision)) => {
+                    let revision = revision.to_string();
+                    if revision != child_revision {
+                        // The child's branch now points at the replayed revision,
+                        // so the reviewed revision recorded for recovery and for
+                        // the completion guard follows it.
+                        worktree.result_revision = Some(revision.clone());
+                        worktree.updated_at = Timestamp::now();
+                        self.save_project_worktree_state(&worktree)?;
+                    }
+                    parent_git.integrate_merge_revisions(&parent_revision, &revision, &message)
+                }
+                // A child branch whose own commits contain a merge cannot be
+                // replayed without dropping that merge, so it is integrated
+                // with a merge that carries the child's own message.
+                Ok(loom_vcs::RebaseIntegrationOutcome::MergeRequired) => parent_git
+                    .integrate_merge_revisions(&parent_revision, &child_revision, &message),
+                // A conflicted replay never touched the child checkout, so it is
+                // reported exactly like a conflicted merge.
+                Ok(loom_vcs::RebaseIntegrationOutcome::Conflicted(paths)) => {
+                    Ok(loom_vcs::MergeIntegrationOutcome::Conflicted(paths))
+                }
+                Err(error) => Err(error),
+            }
+        };
+
+        match outcome {
             Ok(loom_vcs::MergeIntegrationOutcome::AlreadyPresent) => {
                 self.finish_project_child_integration(&mut worktree, &parent_revision)
             }
@@ -786,5 +818,39 @@ impl InProcessConnection {
             self.save_project_worktree_state(worktree)?;
         }
         Ok(())
+    }
+}
+
+/// Message for an integration that has to create a commit of its own.
+///
+/// The child's own message describes the change, so the commit carries it
+/// together with a trailer naming the task, instead of a bookkeeping subject
+/// that says nothing about what landed. A child with no message of its own
+/// falls back to a conventional subject that describes the integration.
+fn project_child_integration_message(
+    child_git: &GitService,
+    child_revision: &str,
+    task: &loom_core::DelegatedTaskRecord,
+) -> String {
+    let trailer = format!("Loom-Task: {}", task.task_id);
+    let child_message = match child_git.commit_message(child_revision) {
+        Ok(message) => message,
+        Err(error) => {
+            log::warn!(
+                "could not read the message of project child task {} revision {child_revision}: {}",
+                task.task_id,
+                error.message,
+            );
+            String::new()
+        }
+    };
+    let child_message = child_message.trim();
+    if child_message.is_empty() {
+        format!(
+            "chore(project): integrate code child {} ({})\n\n{trailer}",
+            task.child_name, task.task_id
+        )
+    } else {
+        format!("{child_message}\n\n{trailer}")
     }
 }

@@ -38,6 +38,21 @@ pub enum MergeIntegrationOutcome {
     Conflicted(Vec<String>),
 }
 
+/// Outcome of replaying a checkout's own commits onto another revision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RebaseIntegrationOutcome {
+    /// The own commits were replayed and the checked-out branch now points at
+    /// the replayed tip. The tip is the target itself when every replayed
+    /// commit had no change left to apply.
+    Rebased(Oid),
+    /// The own commits include a merge, so replaying them would drop that
+    /// merge's resolution; the caller must integrate with a merge instead.
+    MergeRequired,
+    /// A replayed change does not apply cleanly; the branch, index, and
+    /// working tree are untouched and the conflicting paths are reported.
+    Conflicted(Vec<String>),
+}
+
 /// Deadline applied by callers that have no tighter requirement for a bounded
 /// remote refresh.
 pub const DEFAULT_REMOTE_REFRESH_DEADLINE: Duration = Duration::from_secs(30);
@@ -951,21 +966,9 @@ impl GitService {
             .merge_commits(&parent, &child, Some(&MergeOptions::new()))
             .map_err(|error| git_error("could not compute project child merge", error))?;
         if index.has_conflicts() {
-            let conflicts = index.conflicts().map_err(|error| {
-                git_error("could not inspect project child merge conflicts", error)
-            })?;
-            let mut paths = Vec::new();
-            for conflict in conflicts {
-                let conflict = conflict.map_err(|error| {
-                    git_error("could not read project child merge conflict", error)
-                })?;
-                if let Some(entry) = conflict.our.or(conflict.their).or(conflict.ancestor) {
-                    paths.push(String::from_utf8_lossy(&entry.path).replace('\\', "/"));
-                }
-            }
-            paths.sort();
-            paths.dedup();
-            return Ok(MergeIntegrationOutcome::Conflicted(paths));
+            return Ok(MergeIntegrationOutcome::Conflicted(index_conflict_paths(
+                &index,
+            )?));
         }
 
         let tree_oid = index
@@ -1069,6 +1072,239 @@ impl GitService {
             ))
         })?;
         self.integrate_merge(expected_parent_oid, child_commit_oid, message)
+    }
+
+    /// Message of a committed revision, including its subject and body.
+    ///
+    /// A commit with no message, or one that is not valid UTF-8, is reported as
+    /// an empty message so a caller that reuses the message can fall back to its
+    /// own wording instead of failing.
+    pub fn commit_message(&self, revision: &str) -> Result<String> {
+        let repository = self.repository()?;
+        let revision_oid = Oid::from_str(revision).map_err(|error| {
+            LoomError::invalid_request(format!(
+                "invalid Git revision '{revision}' whose message was requested: {error}"
+            ))
+        })?;
+        let commit = repository.find_commit(revision_oid).map_err(|error| {
+            git_error(
+                "could not resolve the commit whose message was requested",
+                error,
+            )
+        })?;
+        Ok(commit.message().unwrap_or_default().to_owned())
+    }
+
+    /// Replays the commits this checkout has and `onto` does not, then moves the
+    /// checked-out branch to the replayed tip.
+    ///
+    /// The replayed commits keep their own messages and authors; only the
+    /// committer is this checkout's Git identity. Their revisions change, so the
+    /// checkout ends on its own branch at a revision that descends from `onto`.
+    ///
+    /// Nothing is written until every commit has been replayed, so a replay that
+    /// does not apply cleanly reports the conflicting paths and leaves the
+    /// branch, index, and working tree exactly as they were, with no rebase in
+    /// progress. A checkout whose own commits contain a merge cannot be replayed
+    /// without dropping that merge, so the caller is told to merge instead.
+    pub fn rebase_onto_revision(&self, onto: &str) -> Result<RebaseIntegrationOutcome> {
+        let repository = self.repository()?;
+        if repository.state() != RepositoryState::Clean {
+            return Err(LoomError::new(
+                ErrorCode::RecoveryRequired,
+                "cannot replay committed changes while another Git operation is in progress",
+                true,
+            ));
+        }
+        let head = repository
+            .head()
+            .map_err(|error| git_error("could not read Git HEAD", error))?;
+        if !head.is_branch() {
+            return Err(LoomError::invalid_state(
+                "cannot replay the committed changes of a detached or non-local Git HEAD",
+            ));
+        }
+        let branch_refname = head
+            .name()
+            .map_err(|error| git_error("could not read the Git branch name", error))?
+            .to_owned();
+        let head_target = head.target().ok_or_else(|| {
+            LoomError::invalid_state("the checked-out Git branch does not point to a commit")
+        })?;
+        let onto_revision = Oid::from_str(onto).map_err(|error| {
+            LoomError::invalid_request(format!(
+                "invalid Git replay target revision '{onto}': {error}"
+            ))
+        })?;
+        let onto_commit = repository
+            .find_commit(onto_revision)
+            .map_err(|error| git_error("could not resolve the replay target commit", error))?;
+
+        let merge_base = match repository.merge_base(head_target, onto_revision) {
+            Ok(merge_base) => merge_base,
+            // Unrelated histories share nothing to replay, so the caller has to
+            // integrate them with a merge.
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {
+                return Ok(RebaseIntegrationOutcome::MergeRequired);
+            }
+            Err(error) => {
+                return Err(git_error(
+                    "could not find the merge base of the checkout and its replay target",
+                    error,
+                ));
+            }
+        };
+        if merge_base == head_target {
+            // The target already contains the checked-out revision.
+            return Ok(RebaseIntegrationOutcome::Rebased(head_target));
+        }
+
+        let mut commits = Vec::new();
+        let mut walk = repository
+            .revwalk()
+            .map_err(|error| git_error("could not walk the commits to replay", error))?;
+        walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)
+            .map_err(|error| git_error("could not order the commits to replay", error))?;
+        walk.push(head_target)
+            .map_err(|error| git_error("could not walk the checked-out revision", error))?;
+        walk.hide(merge_base).map_err(|error| {
+            git_error("could not exclude the already-integrated history", error)
+        })?;
+        for id in walk {
+            let id =
+                id.map_err(|error| git_error("could not walk the commits to replay", error))?;
+            let commit = repository
+                .find_commit(id)
+                .map_err(|error| git_error("could not read a commit to replay", error))?;
+            if commit.parent_count() > 1 {
+                return Ok(RebaseIntegrationOutcome::MergeRequired);
+            }
+            commits.push(commit);
+        }
+
+        let committer = repository
+            .signature()
+            .or_else(|_| Signature::now("loom", "loom@localhost"))
+            .map_err(|error| {
+                git_error("could not resolve a Git signature for the replay", error)
+            })?;
+
+        let mut replayed = onto_commit;
+        for commit in &commits {
+            let our_tree = replayed
+                .tree()
+                .map_err(|error| git_error("could not read the replay target tree", error))?;
+            let their_tree = commit
+                .tree()
+                .map_err(|error| git_error("could not read a replayed commit tree", error))?;
+            // The change a commit introduces is its own tree against its parent
+            // tree, which is what applying it to the replayed tip has to use.
+            let mut index = match commit.parent(0) {
+                Ok(parent) => parent.tree().map_err(|error| {
+                    git_error("could not read a replayed commit's parent tree", error)
+                }),
+                // A commit without a parent introduces its whole tree.
+                Err(_) => empty_tree(&repository),
+            }
+            .and_then(|ancestor| {
+                repository
+                    .merge_trees(
+                        &ancestor,
+                        &our_tree,
+                        &their_tree,
+                        Some(&MergeOptions::new()),
+                    )
+                    .map_err(|error| git_error("could not replay a committed change", error))
+            })?;
+            if index.has_conflicts() {
+                return Ok(RebaseIntegrationOutcome::Conflicted(index_conflict_paths(
+                    &index,
+                )?));
+            }
+            let tree_oid = index
+                .write_tree_to(&repository)
+                .map_err(|error| git_error("could not write a replayed tree", error))?;
+            if tree_oid == our_tree.id() {
+                // The change is already in the target; the replay drops it the
+                // way `git rebase` drops a commit that becomes empty.
+                continue;
+            }
+            let tree = repository
+                .find_tree(tree_oid)
+                .map_err(|error| git_error("could not read a replayed tree", error))?;
+            let author = commit.author();
+            let message = commit.message().unwrap_or_default();
+            let replayed_oid = repository
+                .commit(None, &author, &committer, message, &tree, &[&replayed])
+                .map_err(|error| git_error("could not create a replayed commit", error))?;
+            replayed = repository
+                .find_commit(replayed_oid)
+                .map_err(|error| git_error("could not read a replayed commit", error))?;
+        }
+
+        let tip = replayed.id();
+        if tip == head_target {
+            // Every replayed change was already in the target.
+            return Ok(RebaseIntegrationOutcome::Rebased(tip));
+        }
+
+        let mut transaction = repository
+            .transaction()
+            .map_err(|error| git_error("could not start the replay branch update", error))?;
+        transaction
+            .lock_ref(&branch_refname)
+            .map_err(|error| git_error("could not lock the branch for the replay", error))?;
+        let locked_target = repository
+            .find_reference(&branch_refname)
+            .map_err(|error| git_error("could not re-read the locked branch", error))?
+            .target()
+            .ok_or_else(|| LoomError::invalid_state("the locked branch has no target commit"))?;
+        if locked_target != head_target {
+            return Err(LoomError::conflict(format!(
+                "Git branch changed before the replay: expected {head_target}, found {locked_target}"
+            )));
+        }
+
+        let mut checkout = CheckoutBuilder::new();
+        checkout.safe().update_index(true);
+        repository
+            .checkout_tree(replayed.as_object(), Some(&mut checkout))
+            .map_err(|error| {
+                LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    format!(
+                        "safe checkout of the replayed revision {tip} failed; the branch remains at {head_target} and checkout state was preserved: {error}"
+                    ),
+                    true,
+                )
+            })?;
+        transaction
+            .set_target(
+                &branch_refname,
+                tip,
+                None,
+                "loom: replay committed changes onto their integration target",
+            )
+            .map_err(|error| {
+                LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    format!(
+                        "could not update the branch to the replayed revision {tip}; checkout state was preserved for recovery: {error}"
+                    ),
+                    true,
+                )
+            })?;
+        transaction.commit().map_err(|error| {
+            LoomError::new(
+                ErrorCode::RecoveryRequired,
+                format!(
+                    "could not commit the branch update to the replayed revision {tip}; checkout state was preserved for recovery: {error}"
+                ),
+                true,
+            )
+        })?;
+
+        Ok(RebaseIntegrationOutcome::Rebased(tip))
     }
 
     /// Creates a linked worktree at `path`, based on `base_commit`, and checks
@@ -1604,6 +1840,35 @@ fn blocking_parent_checkout_paths(repository: &Repository) -> Result<Vec<String>
     paths.sort();
     paths.dedup();
     Ok(paths)
+}
+
+/// Conflicting paths of a merge or replay index, in a stable order.
+fn index_conflict_paths(index: &git2::Index) -> Result<Vec<String>> {
+    let conflicts = index
+        .conflicts()
+        .map_err(|error| git_error("could not inspect Git conflict paths", error))?;
+    let mut paths = Vec::new();
+    for conflict in conflicts {
+        let conflict =
+            conflict.map_err(|error| git_error("could not read a Git conflict path", error))?;
+        if let Some(entry) = conflict.our.or(conflict.their).or(conflict.ancestor) {
+            paths.push(String::from_utf8_lossy(&entry.path).replace('\\', "/"));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
+
+/// The empty tree, which is the parent tree of a commit without a parent.
+fn empty_tree<'repo>(repository: &'repo Repository) -> Result<git2::Tree<'repo>> {
+    let oid = repository
+        .treebuilder(None)
+        .and_then(|builder| builder.write())
+        .map_err(|error| git_error("could not write the empty Git tree", error))?;
+    repository
+        .find_tree(oid)
+        .map_err(|error| git_error("could not read the empty Git tree", error))
 }
 
 fn status_kind(status: Status, index: bool) -> GitFileStatusKind {
@@ -3040,6 +3305,216 @@ mod tests {
         let status = git.status().unwrap();
         assert!(status.clean);
         assert!(status.conflicts.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rebase_replays_a_child_branch_onto_the_target_and_keeps_its_message() {
+        let (git, root) = repository();
+        let parent_branch = git.current_branch().unwrap().unwrap();
+        let child_branch = format!("codex/replay-{}", loom_core::RepositoryId::new());
+        run(&root, &["checkout", "-qb", &child_branch]);
+        write_commit(
+            &root,
+            "child.txt",
+            "child\n",
+            "feat: child change\n\nwhy the child changed",
+        );
+        let child = git.repository().unwrap().head().unwrap().target().unwrap();
+        run(&root, &["checkout", "-q", &parent_branch]);
+        write_commit(&root, "parent.txt", "parent\n", "parent change");
+        let parent_advanced = git.repository().unwrap().head().unwrap().target().unwrap();
+        run(&root, &["checkout", "-q", &child_branch]);
+
+        let RebaseIntegrationOutcome::Rebased(tip) = git
+            .rebase_onto_revision(&parent_advanced.to_string())
+            .unwrap()
+        else {
+            panic!("expected the child branch to be replayed");
+        };
+        assert_ne!(tip, child, "the replayed revision is a new commit");
+        let repository = git.repository().unwrap();
+        assert_eq!(repository.head().unwrap().target(), Some(tip));
+        assert_eq!(
+            git.current_branch().unwrap().as_deref(),
+            Some(child_branch.as_str())
+        );
+        let commit = repository.find_commit(tip).unwrap();
+        assert_eq!(commit.parent_count(), 1);
+        assert_eq!(commit.parent_id(0).unwrap(), parent_advanced);
+        assert_eq!(commit.author().name().unwrap(), "Loom Test");
+        assert_eq!(
+            git.commit_message(&tip.to_string()).unwrap(),
+            "feat: child change\n\nwhy the child changed\n"
+        );
+        assert!(
+            git.is_ancestor_revision(&parent_advanced.to_string(), &tip.to_string())
+                .unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("child.txt")).unwrap(),
+            "child\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("parent.txt")).unwrap(),
+            "parent\n"
+        );
+        let status = git.status().unwrap();
+        assert!(status.clean);
+        assert!(status.conflicts.is_empty());
+        assert!(!git.operation_in_progress().unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rebase_reports_conflicts_without_touching_the_checkout() {
+        let (git, root) = repository();
+        let parent_branch = git.current_branch().unwrap().unwrap();
+        let child_branch = format!("codex/replay-conflict-{}", loom_core::RepositoryId::new());
+        run(&root, &["checkout", "-qb", &child_branch]);
+        write_commit(&root, "README.md", "child version\n", "child change");
+        let child = git.repository().unwrap().head().unwrap().target().unwrap();
+        run(&root, &["checkout", "-q", &parent_branch]);
+        write_commit(&root, "README.md", "parent version\n", "parent change");
+        let parent_advanced = git.repository().unwrap().head().unwrap().target().unwrap();
+        run(&root, &["checkout", "-q", &child_branch]);
+
+        assert_eq!(
+            git.rebase_onto_revision(&parent_advanced.to_string())
+                .unwrap(),
+            RebaseIntegrationOutcome::Conflicted(vec!["README.md".to_owned()])
+        );
+        let repository = git.repository().unwrap();
+        assert_eq!(repository.head().unwrap().target(), Some(child));
+        assert_eq!(repository.state(), RepositoryState::Clean);
+        assert!(!root.join(".git").join("rebase-merge").exists());
+        assert!(!root.join(".git").join("REBASE_HEAD").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("README.md")).unwrap(),
+            "child version\n"
+        );
+        let status = git.status().unwrap();
+        assert!(status.clean);
+        assert!(status.conflicts.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rebase_leaves_a_branch_that_merges_its_own_history_to_the_caller() {
+        let (git, root) = repository();
+        let parent_branch = git.current_branch().unwrap().unwrap();
+        let child_branch = format!("codex/replay-merge-{}", loom_core::RepositoryId::new());
+        let side_branch = format!("codex/replay-side-{}", loom_core::RepositoryId::new());
+        run(&root, &["checkout", "-qb", &child_branch]);
+        write_commit(&root, "child.txt", "child\n", "child change");
+        run(&root, &["checkout", "-qb", &side_branch]);
+        write_commit(&root, "side.txt", "side\n", "side change");
+        run(&root, &["checkout", "-q", &child_branch]);
+        run(
+            &root,
+            &[
+                "merge",
+                "-q",
+                "--no-ff",
+                "-m",
+                "merge side work",
+                &side_branch,
+            ],
+        );
+        let child = git.repository().unwrap().head().unwrap().target().unwrap();
+        run(&root, &["checkout", "-q", &parent_branch]);
+        write_commit(&root, "parent.txt", "parent\n", "parent change");
+        let parent_advanced = git.repository().unwrap().head().unwrap().target().unwrap();
+        run(&root, &["checkout", "-q", &child_branch]);
+
+        assert_eq!(
+            git.rebase_onto_revision(&parent_advanced.to_string())
+                .unwrap(),
+            RebaseIntegrationOutcome::MergeRequired
+        );
+        assert_eq!(
+            git.repository().unwrap().head().unwrap().target(),
+            Some(child)
+        );
+        let status = git.status().unwrap();
+        assert!(status.clean);
+        assert!(status.conflicts.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rebase_drops_a_change_the_target_already_has() {
+        let (git, root) = repository();
+        let parent_branch = git.current_branch().unwrap().unwrap();
+        let child_branch = format!("codex/replay-empty-{}", loom_core::RepositoryId::new());
+        run(&root, &["checkout", "-qb", &child_branch]);
+        write_commit(&root, "README.md", "child version\n", "child change");
+        let child = git.repository().unwrap().head().unwrap().target().unwrap();
+        run(&root, &["checkout", "-q", &parent_branch]);
+        // The parent reaches the same content through its own commit.
+        write_commit(&root, "README.md", "child version\n", "parent change");
+        let parent_advanced = git.repository().unwrap().head().unwrap().target().unwrap();
+        run(&root, &["checkout", "-q", &child_branch]);
+
+        let RebaseIntegrationOutcome::Rebased(tip) = git
+            .rebase_onto_revision(&parent_advanced.to_string())
+            .unwrap()
+        else {
+            panic!("expected the already-applied change to be dropped");
+        };
+        assert_ne!(tip, child);
+        assert_eq!(tip, parent_advanced);
+        assert_eq!(
+            git.repository().unwrap().head().unwrap().target(),
+            Some(parent_advanced)
+        );
+        assert!(git.status().unwrap().clean);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rebase_leaves_a_branch_the_target_already_contains_alone() {
+        let (git, root) = repository();
+        let parent_branch = git.current_branch().unwrap().unwrap();
+        let base = git.repository().unwrap().head().unwrap().target().unwrap();
+        let child_branch = format!("codex/replay-contained-{}", loom_core::RepositoryId::new());
+        run(
+            &root,
+            &["checkout", "-qb", &child_branch, &base.to_string()],
+        );
+        run(&root, &["checkout", "-q", &parent_branch]);
+        write_commit(&root, "parent.txt", "parent\n", "parent change");
+        let parent_advanced = git.repository().unwrap().head().unwrap().target().unwrap();
+        run(&root, &["checkout", "-q", &child_branch]);
+
+        assert_eq!(
+            git.rebase_onto_revision(&parent_advanced.to_string())
+                .unwrap(),
+            RebaseIntegrationOutcome::Rebased(base)
+        );
+        assert_eq!(
+            git.repository().unwrap().head().unwrap().target(),
+            Some(base)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rebase_refuses_an_unrelated_history() {
+        let (git, root) = repository();
+        let base = git.repository().unwrap().head().unwrap().target().unwrap();
+        run(&root, &["checkout", "-q", "--orphan", "unrelated"]);
+        write_commit(&root, "orphan.txt", "orphan\n", "orphan change");
+
+        assert_eq!(
+            git.rebase_onto_revision(&base.to_string()).unwrap(),
+            RebaseIntegrationOutcome::MergeRequired
+        );
+        assert_ne!(
+            git.repository().unwrap().head().unwrap().target(),
+            Some(base)
+        );
+        assert!(git.status().unwrap().clean);
         fs::remove_dir_all(root).unwrap();
     }
 

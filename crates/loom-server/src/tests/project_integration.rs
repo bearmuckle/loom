@@ -432,13 +432,13 @@ fn project_child_worktree_can_be_reviewed_fast_forwarded_and_cleaned_up() {
 }
 
 #[test]
-fn project_child_integrates_a_merge_over_an_advanced_parent() {
+fn project_child_replays_its_own_commit_onto_an_advanced_parent() {
     let fixture = project_code_child_fixture();
     commit_file(
         &fixture.child_checkout,
         "child.txt",
         "child\n",
-        "child change",
+        "feat: child change\n\nwhy the child changed",
     );
     complete_project_code_child(&fixture);
     let child_revision = review_project_code_child(&fixture);
@@ -468,11 +468,51 @@ fn project_child_integrates_a_merge_over_an_advanced_parent() {
     };
     assert_eq!(integrated.status, ProjectWorktreeStatus::Integrated);
     let integrated_revision = integrated.integrated_revision.clone().unwrap();
+    // The parent tip is the child's own replayed commit: neither Loom's
+    // bookkeeping commit nor a merge commit of Loom's own.
     assert_ne!(integrated_revision, parent_advanced);
     assert_ne!(integrated_revision, child_revision);
     assert_eq!(
         fixture.parent_git.status().unwrap().head.as_deref(),
         Some(integrated_revision.as_str())
+    );
+    assert_eq!(
+        integrated.result_revision.as_deref(),
+        Some(integrated_revision.as_str()),
+        "the replayed revision is the reviewed revision the child is on"
+    );
+    assert_eq!(
+        git_output(fixture.parent_git.root(), &["rev-parse", "HEAD~1"]),
+        parent_advanced
+    );
+    assert_eq!(
+        git_output(
+            fixture.parent_git.root(),
+            &["rev-list", "--parents", "-n1", &integrated_revision]
+        ),
+        format!("{integrated_revision} {parent_advanced}"),
+        "the landed commit is a single-parent commit on the parent tip"
+    );
+    assert_eq!(
+        git_output(
+            fixture.parent_git.root(),
+            &["log", "-1", "--format=%B", &integrated_revision]
+        ),
+        "feat: child change\n\nwhy the child changed",
+        "the landed commit carries the child's own message"
+    );
+    assert_eq!(
+        git_output(
+            fixture.parent_git.root(),
+            &["log", "-1", "--format=%an <%ae>", &integrated_revision]
+        ),
+        "Loom Test <loom@example.test>",
+        "the landed commit keeps the child's author"
+    );
+    let subjects = git_output(fixture.parent_git.root(), &["log", "--format=%s"]);
+    assert!(
+        !subjects.contains("loom: integrate project child task"),
+        "no bookkeeping integration commit may reach the parent history: {subjects}"
     );
     assert_eq!(
         fs::read_to_string(fixture.parent_git.root().join("README.md")).unwrap(),
@@ -482,29 +522,112 @@ fn project_child_integrates_a_merge_over_an_advanced_parent() {
         fs::read_to_string(fixture.parent_git.root().join("child.txt")).unwrap(),
         "child\n"
     );
-    let parents = Command::new("git")
-        .args([
-            "-C",
-            fixture.parent_git.root().to_str().unwrap(),
-            "rev-list",
-            "--parents",
-            "-n1",
-            &integrated_revision,
-        ])
-        .output()
-        .unwrap();
-    assert!(parents.status.success());
-    let parents = String::from_utf8(parents.stdout).unwrap();
-    let parents: Vec<&str> = parents.split_whitespace().collect();
-    assert_eq!(parents.len(), 3, "expected a two-parent merge commit");
-    assert!(parents.contains(&parent_advanced.as_str()));
-    assert!(parents.contains(&child_revision.as_str()));
+    // The child's branch is the replayed revision, which is what the parent
+    // fast-forwarded to, so its checkout carries the parent's advance too.
+    assert_eq!(
+        git_output(&fixture.child_checkout, &["rev-parse", "HEAD"]),
+        integrated_revision
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.child_checkout.join("README.md")).unwrap(),
+        "parent advanced\n"
+    );
+    let child_git = GitService::open(&fixture.child_checkout).unwrap();
+    assert!(child_git.status().unwrap().clean);
 
     // The guard's intent is that the reviewed result is contained in what was
-    // integrated. A merge records the merge commit rather than the child
-    // revision, so a merge integration must still satisfy `completion_blocker`.
+    // integrated. A replay moves the child's branch, so the recorded reviewed
+    // revision follows it and a replay integration still satisfies it.
     let completion_guard = project_completion_guard(&fixture);
     assert_eq!(completion_guard.completion_blocker(), None);
+    fixture.shutdown();
+}
+
+#[test]
+fn project_child_with_a_merge_in_its_branch_carries_its_own_message() {
+    let fixture = project_code_child_fixture();
+    // Replaying this child would flatten its own merge, so it is integrated
+    // with a merge whose message is the child's own with a task trailer.
+    let side_branch = "child-side";
+    git_in(&fixture.child_checkout, &["branch", side_branch]);
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    git_in(&fixture.child_checkout, &["checkout", "-q", side_branch]);
+    commit_file(&fixture.child_checkout, "side.txt", "side\n", "side change");
+    git_in(
+        &fixture.child_checkout,
+        &["checkout", "-q", &fixture.worktree.branch_name],
+    );
+    git_in(
+        &fixture.child_checkout,
+        &["merge", "--no-ff", "-m", "merge side work", side_branch],
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+    assert_eq!(
+        git_output(
+            &fixture.child_checkout,
+            &["log", "-1", "--format=%s", &child_revision]
+        ),
+        "merge side work",
+        "the child's own commit should be the merge it made"
+    );
+
+    commit_file(
+        fixture.parent_git.root(),
+        "README.md",
+        "parent advanced\n",
+        "parent change",
+    );
+    let parent_advanced = fixture.parent_git.status().unwrap().head.unwrap();
+
+    let integration = fixture
+        .connection
+        .request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::IntegrateProjectChild {
+                project_id: fixture.project_id,
+                manager_session_id: fixture.root_id,
+                task_id: fixture.task_id,
+                expected_parent_revision: fixture.worktree.base_revision.clone(),
+            },
+        )));
+    let ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(integrated)) =
+        integration.result.unwrap()
+    else {
+        panic!("unexpected child integration response");
+    };
+    assert_eq!(integrated.status, ProjectWorktreeStatus::Integrated);
+    let integrated_revision = integrated.integrated_revision.clone().unwrap();
+    assert_ne!(integrated_revision, parent_advanced);
+    assert_ne!(integrated_revision, child_revision);
+    assert_eq!(
+        git_output(
+            fixture.parent_git.root(),
+            &["rev-list", "--parents", "-n1", &integrated_revision]
+        ),
+        format!("{integrated_revision} {parent_advanced} {child_revision}"),
+        "expected a two-parent merge commit"
+    );
+    assert_eq!(
+        git_output(
+            fixture.parent_git.root(),
+            &["log", "-1", "--format=%B", &integrated_revision]
+        ),
+        format!("merge side work\n\nLoom-Task: {}", fixture.task_id),
+        "the merge carries the child's own message and the task trailer"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.parent_git.root().join("child.txt")).unwrap(),
+        "child\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.parent_git.root().join("side.txt")).unwrap(),
+        "side\n"
+    );
     fixture.shutdown();
 }
 
@@ -596,7 +719,7 @@ fn project_child_completion_guard_explains_why_a_reviewed_result_is_unintegrated
 }
 
 #[test]
-fn project_child_integration_conflict_is_refused_and_preserved() {
+fn project_child_replay_conflict_is_refused_and_preserved() {
     let fixture = project_code_child_fixture();
     commit_file(
         &fixture.child_checkout,
@@ -647,19 +770,36 @@ fn project_child_integration_conflict_is_refused_and_preserved() {
         fs::read_to_string(fixture.child_checkout.join("README.md")).unwrap(),
         "child result\n"
     );
-    let child_head = Command::new("git")
-        .args([
-            "-C",
-            fixture.child_checkout.to_str().unwrap(),
-            "rev-parse",
-            "HEAD",
-        ])
-        .output()
-        .unwrap();
-    assert!(child_head.status.success());
+    // The refused replay leaves the child where it was: same revision, same
+    // branch, a clean checkout, and no rebase in progress.
     assert_eq!(
-        String::from_utf8(child_head.stdout).unwrap().trim(),
+        git_output(&fixture.child_checkout, &["rev-parse", "HEAD"]),
         child_revision
+    );
+    assert_eq!(
+        git_output(&fixture.child_checkout, &["branch", "--show-current"]),
+        fixture.worktree.branch_name
+    );
+    let child_git = GitService::open(&fixture.child_checkout).unwrap();
+    assert!(!child_git.operation_in_progress().unwrap());
+    let child_status = child_git.status().unwrap();
+    assert!(child_status.clean);
+    assert!(child_status.conflicts.is_empty());
+    let child_git_dir = git_output(
+        &fixture.child_checkout,
+        &["rev-parse", "--absolute-git-dir"],
+    );
+    assert!(
+        !std::path::Path::new(&child_git_dir)
+            .join("rebase-merge")
+            .exists(),
+        "a refused replay must not leave the child branch mid-rebase"
+    );
+    assert!(
+        !std::path::Path::new(&child_git_dir)
+            .join("REBASE_HEAD")
+            .exists(),
+        "a refused replay must not leave the child branch mid-rebase"
     );
     fixture.shutdown();
 }
