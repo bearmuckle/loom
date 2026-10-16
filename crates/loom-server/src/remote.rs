@@ -611,8 +611,16 @@ struct RemoteState {
     config: RemoteServerConfig,
 }
 
-async fn health_handler() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+/// Reports whether the backend can still serve durable requests.
+///
+/// A backend that latched its persistence fail-stop refuses every write until
+/// it is reopened, so an unhealthy listener must not keep answering `ok`: an
+/// uptime check or orchestrator uses this to restart it instead.
+async fn health_handler(State(state): State<RemoteState>) -> impl IntoResponse {
+    match state.backend.ensure_persistence_healthy() {
+        Ok(()) => (StatusCode::OK, "ok"),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "persistence fail-stop"),
+    }
 }
 
 /// Subprotocol prefix used by browser clients that cannot set an
@@ -1734,15 +1742,15 @@ mod unit_tests {
         CLOSE_MESSAGE_TOO_BIG, ConnectionControl, ConnectionLimits, DEFAULT_MAX_FRAME_BYTES,
         DEFAULT_MAX_IN_FLIGHT_CONTROL_REQUESTS, DEFAULT_MAX_IN_FLIGHT_REQUESTS, InFlightLimits,
         MAX_FRAME_BYTES_ENV, MAX_FRAME_BYTES_FLAG, OversizedFrameAction, RemoteServer,
-        RemoteServerConfig, RequestClass, ServerTlsConfig, WEBSOCKET_TLS_SUPPORTED,
+        RemoteServerConfig, RemoteState, RequestClass, ServerTlsConfig, WEBSOCKET_TLS_SUPPORTED,
         WebSocketTransport, abandoned_request_error, auth_error_response, bearer_token,
         client_tls_config, execute_request_with, frame_request_id, frame_too_large_close_reason,
-        frame_too_large_error, insecure_remote_host, is_control_or_interrupt_request,
-        oversized_inbound_frame_action, process_text, request_auth, resolve_max_frame_bytes,
-        try_send_response, websocket_connect_error,
+        frame_too_large_error, health_handler, insecure_remote_host,
+        is_control_or_interrupt_request, oversized_inbound_frame_action, process_text,
+        request_auth, resolve_max_frame_bytes, try_send_response, websocket_connect_error,
     };
     use axum::{
-        extract::ws::Message,
+        extract::{State, ws::Message},
         http::{
             HeaderMap, HeaderValue,
             header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL},
@@ -2782,6 +2790,25 @@ mod unit_tests {
 
         drop(connection);
         server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_reports_a_persistence_fail_stop() {
+        let backend = InProcessBackend::new();
+        let state = RemoteState {
+            backend: Arc::clone(&backend),
+            auth: Arc::new(AuthTokenStore::new()),
+            config: RemoteServerConfig::local_ephemeral(),
+        };
+        let healthy = health_handler(State(state.clone())).await.into_response();
+        assert_eq!(healthy.status(), StatusCode::OK);
+
+        // A backend that latched its persistence fail-stop refuses durable
+        // writes, so the listener must stop reporting health and let an
+        // orchestrator restart it.
+        backend.persistence_failed.store(true, Ordering::SeqCst);
+        let stopped = health_handler(State(state)).await.into_response();
+        assert_eq!(stopped.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
