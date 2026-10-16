@@ -278,6 +278,123 @@ fn archiving_a_session_with_a_deferred_run_stops_it() {
 }
 
 #[test]
+fn archiving_a_session_repairs_a_streamed_messages_stale_ordinal() {
+    let persistence = std::env::temp_dir().join(format!(
+        "loom-stale-ordinal-archive-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    let (session_id, run_id) = {
+        let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+        let connection = backend.connect();
+        negotiate_m3(&connection);
+        let workspace = match connection
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::CreateWorkspace {
+                    name: "Stale ordinal archive".to_owned(),
+                },
+            )))
+            .result
+            .unwrap()
+        {
+            ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+            response => panic!("unexpected workspace response: {response:?}"),
+        };
+        let session_id = match connection
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "stale ordinal".to_owned(),
+                },
+            )))
+            .result
+            .unwrap()
+        {
+            ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+            response => panic!("unexpected session response: {response:?}"),
+        };
+        assert!(
+            connection
+                .request(RequestEnvelope::new(ClientRequest::Session(
+                    SessionRequest::SetSessionApprovalPolicy {
+                        session_id,
+                        policy: ApprovalPolicy::default(),
+                        auto_approve_actions: Some(false),
+                    },
+                )))
+                .result
+                .is_ok()
+        );
+        let run_id = match connection
+            .request(RequestEnvelope::new(ClientRequest::Run(
+                RunRequest::StartSessionAgentRun {
+                    session_id,
+                    task: "create a demo file".to_owned(),
+                    model: ModelId::new("deterministic/demo"),
+                    system_instructions: None,
+                    repository_instructions: None,
+                },
+            )))
+            .result
+            .unwrap()
+        {
+            ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
+            response => panic!("unexpected run response: {response:?}"),
+        };
+        await_settled_run(&connection, run_id);
+        backend.flush().unwrap();
+        backend.shutdown().unwrap();
+        (session_id, run_id)
+    };
+    let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+    assert!(
+        backend.runs().unwrap().is_empty(),
+        "a non-terminal run is deferred on restore, so no handle is registered"
+    );
+    // Simulate a streamed assistant row flushed to disk before the run assigned
+    // the finished message a timeline ordinal: the column defaults to zero, so
+    // it collides with the transcript's first message.
+    {
+        let persistence = backend.persistence.as_ref().unwrap();
+        let next_ordinal = persistence.load_run_messages(run_id).unwrap().len() as u64;
+        persistence
+            .append_run_message_fragment(run_id, session_id, next_ordinal, 0, 0, b"partial reply")
+            .unwrap();
+    }
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+    let archived = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::ArchiveAgentSession { session_id },
+    )));
+    assert!(
+        matches!(
+            &archived.result,
+            Ok(ServerResponse::Session(
+                SessionResponse::AgentSessionArchived(_)
+            ))
+        ),
+        "a transcript with a stale streamed ordinal must still archive, not be stranded: {:?}",
+        archived.result
+    );
+    assert_eq!(
+        backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_run_summary(run_id)
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .state,
+        AgentRunState::Cancelled,
+        "the deferred run must be stopped before the session is archived"
+    );
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    let _ = fs::remove_file(&persistence);
+}
+
+#[test]
 fn archiving_a_session_with_a_stale_active_state_recovers() {
     let persistence =
         std::env::temp_dir().join(format!("loom-stale-archive-{}.db", uuid::Uuid::new_v4()));
