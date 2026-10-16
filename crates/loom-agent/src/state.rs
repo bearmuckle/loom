@@ -140,13 +140,24 @@ impl AgentRuntime {
                 false,
             ));
         }
-        let has_timeline_metadata = !message_timeline_ordinals.is_empty()
+        // Timeline metadata is absent when nothing carries a non-zero ordinal.
+        // A transcript written before the ordinal field existed reads every
+        // message and activity back as zero (the column and serialized state
+        // both default to zero), so an all-zero transcript is as metadata-free
+        // as an empty one and must be seeded rather than treated as collisions.
+        let has_timeline_metadata = message_timeline_ordinals
+            .iter()
+            .any(|ordinal| *ordinal != 0)
             || activities
                 .iter()
                 .any(|activity| activity.timeline_ordinal != 0);
-        let next_timeline_ordinal = if !has_timeline_metadata
+        let mut next_timeline_ordinal = if !has_timeline_metadata
             && (!state.messages.is_empty() || !activities.is_empty())
         {
+            // Re-seed from zero: an all-zero vector is metadata-free, so any
+            // length it already carries is stale and must be replaced rather
+            // than appended to.
+            message_timeline_ordinals.clear();
             let mut next_timeline_ordinal = 0;
             for _ in &state.messages {
                 message_timeline_ordinals.push(next_timeline_ordinal);
@@ -197,18 +208,54 @@ impl AgentRuntime {
             }
             next
         };
+        // A streamed assistant turn is flushed to durable storage as soon as its
+        // text arrives, before the run assigns the finished message a timeline
+        // ordinal. If the process stops mid-turn, that row is restored still
+        // reading back as ordinal zero and collides with the transcript's first
+        // message. The ordinal is presentation metadata, so repair the collision
+        // instead of refusing the state: rescuing a paused or deferred run is
+        // exactly when it is restored, so a bare rejection would strand the run
+        // (it could not be resumed, and an archive that stops its run first could
+        // not archive either). Keep the first item that claims an ordinal and
+        // renumber later collisions above every existing ordinal, in
+        // transcript-then-activity order, so the repaired order stays deterministic.
         let mut seen_timeline_ordinals = BTreeSet::new();
-        if message_timeline_ordinals
-            .iter()
-            .copied()
-            .chain(activities.iter().map(|activity| activity.timeline_ordinal))
-            .any(|ordinal| !seen_timeline_ordinals.insert(ordinal))
-        {
-            return Err(LoomError::new(
-                ErrorCode::MalformedPayload,
-                "agent runtime state contains duplicate timeline ordinals",
-                false,
-            ));
+        let mut repaired_timeline_ordinals = false;
+        for ordinal in &mut message_timeline_ordinals {
+            if seen_timeline_ordinals.insert(*ordinal) {
+                continue;
+            }
+            *ordinal = next_timeline_ordinal;
+            seen_timeline_ordinals.insert(*ordinal);
+            next_timeline_ordinal = next_timeline_ordinal.checked_add(1).ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "run timeline ordinal space is exhausted",
+                    false,
+                )
+            })?;
+            repaired_timeline_ordinals = true;
+        }
+        for activity in &mut activities {
+            if seen_timeline_ordinals.insert(activity.timeline_ordinal) {
+                continue;
+            }
+            activity.timeline_ordinal = next_timeline_ordinal;
+            seen_timeline_ordinals.insert(activity.timeline_ordinal);
+            next_timeline_ordinal = next_timeline_ordinal.checked_add(1).ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "run timeline ordinal space is exhausted",
+                    false,
+                )
+            })?;
+            repaired_timeline_ordinals = true;
+        }
+        if repaired_timeline_ordinals {
+            log::warn!(
+                "run {} timeline carried duplicate ordinals; the colliding messages and activities were renumbered",
+                state.run.id
+            );
         }
         Ok(Self {
             session_id: state.session_id,

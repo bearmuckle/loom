@@ -2335,6 +2335,121 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    fn completed_model_activity(run_id: RunId) -> AgentActivityRecord {
+        let started_at = Timestamp::now();
+        AgentActivityRecord {
+            id: ActivityId::new(),
+            run_id,
+            timeline_ordinal: 0,
+            parent_id: None,
+            step_id: None,
+            kind: AgentActivityKind::ModelTurn,
+            status: AgentActivityStatus::Completed,
+            started_at,
+            completed_at: Some(started_at),
+            elapsed_ms: Some(1),
+            data: AgentActivityData::ModelTurn {
+                model: ModelId::new("deterministic/demo"),
+            },
+        }
+    }
+
+    #[test]
+    fn restoring_a_streamed_message_with_a_stale_ordinal_repairs_the_timeline() {
+        let root = workspace();
+        let task =
+            AgentTask::new("repair the timeline", ModelId::new("deterministic/demo")).unwrap();
+        let runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            task,
+            Box::new(DeterministicProvider::demo()),
+            ToolExecutor::new(&root).unwrap(),
+        );
+        let mut state = runtime.export_state();
+        state
+            .messages
+            .push(ModelMessage::new(MessageRole::Assistant, "streamed reply"));
+        state.message_timeline_ordinals.push(2);
+        // A streamed assistant row is flushed before its run assigns the
+        // finished message an ordinal, so it restores still reading back as zero
+        // and collides with the transcript's first message.
+        let collided = state.message_timeline_ordinals.len() - 1;
+        state.message_timeline_ordinals[collided] = 0;
+        // Activities share the same ordinal space, so one that collides with a
+        // message is repaired after the messages.
+        let run_id = state.run.id;
+        let mut colliding_activity = completed_model_activity(run_id);
+        colliding_activity.timeline_ordinal = 1;
+        let mut later_activity = completed_model_activity(run_id);
+        later_activity.timeline_ordinal = 5;
+        state.activities = vec![colliding_activity, later_activity];
+
+        let restored = AgentRuntime::from_state(
+            state,
+            Box::new(DeterministicProvider::demo()),
+            ToolExecutor::new(&root).unwrap(),
+        )
+        .unwrap()
+        .export_state();
+
+        assert_eq!(
+            restored.message_timeline_ordinals.len(),
+            restored.messages.len()
+        );
+        let mut ordinals = restored.message_timeline_ordinals.clone();
+        ordinals.extend(
+            restored
+                .activities
+                .iter()
+                .map(|activity| activity.timeline_ordinal),
+        );
+        ordinals.sort_unstable();
+        assert!(ordinals.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(
+            restored.message_timeline_ordinals[collided] > restored.message_timeline_ordinals[0],
+            "the rescued streamed message keeps its position after the repaired ordinal"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restoring_a_legacy_zeroed_timeline_seeds_unique_ordinals() {
+        let root = workspace();
+        let task = AgentTask::new("legacy timeline", ModelId::new("deterministic/demo")).unwrap();
+        let runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            task,
+            Box::new(DeterministicProvider::demo()),
+            ToolExecutor::new(&root).unwrap(),
+        );
+        let mut state = runtime.export_state();
+        let run_id = state.run.id;
+        // A database written before the ordinal field existed reads every row
+        // back as zero, for both messages and activities.
+        state.message_timeline_ordinals.fill(0);
+        state.activities = vec![
+            completed_model_activity(run_id),
+            completed_model_activity(run_id),
+        ];
+        let message_count = state.messages.len() as u64;
+
+        let restored = AgentRuntime::from_state(
+            state,
+            Box::new(DeterministicProvider::demo()),
+            ToolExecutor::new(&root).unwrap(),
+        )
+        .unwrap()
+        .export_state();
+
+        assert_eq!(
+            restored.message_timeline_ordinals,
+            (0..message_count).collect::<Vec<_>>()
+        );
+        assert_eq!(restored.activities[0].timeline_ordinal, message_count);
+        assert_eq!(restored.activities[1].timeline_ordinal, message_count + 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn recovery_discards_waiting_state_from_finished_runs() {
         let root = workspace();
