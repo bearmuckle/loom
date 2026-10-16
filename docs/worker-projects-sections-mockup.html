@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loom · #299 sidebar worker sections (mockup)</title>
+<style>
+  :root {
+    --bg: #111318;
+    --sidebar: #17191f;
+    --border: #242833;
+    --border-2: #30343f;
+    --text: #e5e7eb;
+    --text-strong: #f3f4f6;
+    --muted: #8f98a6;
+    --muted-2: #64748b;
+    --muted-3: #b7c0d0;
+    --accent: #2563eb;
+    --accent-light: #93c5fd;
+    --ok: #34d399;
+    --warn: #fcd34d;
+    --err: #fca5a5;
+    --pulse: #fbbf24;
+    --legacy: #f87171;
+    --legacy-bg: #241417;
+    --fixed: #4ade80;
+    --fixed-bg: #10241a;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; min-height: 100%;
+    background: #0b0d11; color: var(--text);
+    font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .mock-toolbar {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 14px; background: #0e1014; border-bottom: 1px solid var(--border);
+  }
+  .mock-toolbar .mock-title { font-weight: 600; color: var(--text-strong); margin-right: 6px; }
+  .mock-toolbar .mock-title small { color: var(--muted); font-weight: 400; }
+  .seg { display: inline-flex; background: #171a20; border: 1px solid var(--border); border-radius: 7px; padding: 2px; }
+  .seg button {
+    appearance: none; border: 0; background: transparent; color: var(--muted-3);
+    padding: 5px 11px; border-radius: 5px; font-size: 12px; cursor: pointer;
+  }
+  .seg button.active { background: #263b58; color: var(--text-strong); }
+  .seg.legacy button.active { background: #4a2226; color: #fecaca; }
+  .seg.fixed button.active { background: #1c3f2e; color: #bbf7d0; }
+  .caption {
+    padding: 8px 14px; background: #0e1014; border-bottom: 1px solid var(--border);
+    color: var(--muted); font-size: 12px;
+  }
+  .caption b { color: var(--accent-light); font-weight: 600; }
+  .caption .bad { color: var(--legacy); }
+  .caption .good { color: var(--fixed); }
+
+  .stage { padding: 18px; }
+  .app {
+    position: relative; display: flex; height: 760px; max-width: 1180px; margin: 0 auto;
+    background: var(--bg); border: 1px solid var(--border-2); border-radius: 12px;
+    overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,.45);
+    transition: height .18s ease;
+  }
+  .app.short { height: 400px; }
+
+  /* ---------- sidebar ---------- */
+  .sidebar {
+    width: 320px; flex: 0 0 320px; background: var(--sidebar);
+    border-right: 1px solid var(--border-2); display: flex; flex-direction: column;
+    padding: 10px; gap: 8px; min-height: 0;
+  }
+  .sidebar-head { display: flex; align-items: center; justify-content: space-between; }
+  .sidebar-head .label { color: var(--muted); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+  .head-actions { display: flex; gap: 4px; }
+  .icon-btn {
+    width: 26px; height: 26px; display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 7px; color: var(--muted-3); background: transparent; border: 0; cursor: pointer;
+  }
+  .icon-btn:hover { background: #293244; color: var(--text-strong); }
+  .icon-btn svg { width: 15px; height: 15px; }
+  .filter {
+    width: 100%; background: #0f1115; border: 1px solid var(--border-2); color: var(--text);
+    border-radius: 7px; padding: 7px 9px; font: inherit; font-size: 12.5px;
+  }
+  .filter::placeholder { color: var(--muted-2); }
+
+  /* The single, pane-wide scroll region. */
+  .tree { flex: 1; overflow-y: auto; margin: 0 -2px; min-height: 0; padding: 0 2px; }
+  .tree.probe-fixed { outline: 1px dashed rgba(74,222,128,.5); outline-offset: 2px; }
+  .tree.probe-legacy { outline: 1px dashed rgba(248,113,113,.5); outline-offset: 2px; }
+
+  /* ---------- fixed: worker sections in one list ---------- */
+  .section { padding-bottom: 2px; }
+  .section + .section { border-top: 1px solid var(--border); margin-top: 8px; padding-top: 4px; }
+  .section-head {
+    display: flex; flex-direction: column; gap: 2px; padding: 8px 8px 4px;
+    user-select: none; cursor: default;
+  }
+  .section-head .line1 { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .section-head .name {
+    flex: 1; min-width: 0; color: var(--text-strong); font-size: 12px; font-weight: 600;
+    letter-spacing: .02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .section-head .count {
+    flex: 0 0 auto; font-size: 10px; color: var(--muted-2); border: 1px solid var(--border-2);
+    border-radius: 999px; padding: 0 6px; line-height: 15px;
+  }
+  .section-head .sub {
+    padding-left: 16px; color: var(--muted-2); font-size: 10.5px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .section-head .sub.error { color: var(--err); }
+  .section-body { padding: 0 0 2px 6px; }
+
+  /* ---------- legacy: per-worker full-height trees ---------- */
+  .legacy-column { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+  .legacy-group { display: flex; flex-direction: column; flex: 1 1 0; min-height: 0; }
+  .legacy-group + .legacy-group { border-top: 1px solid var(--border); }
+  .legacy-body { flex: 1 1 0; min-height: 0; overflow-y: auto; padding: 0 0 2px 6px; }
+  .legacy-flag {
+    font-size: 9px; color: var(--legacy); border: 1px dashed rgba(248,113,113,.5);
+    border-radius: 4px; padding: 0 4px; line-height: 14px; margin-left: auto; flex: 0 0 auto;
+  }
+
+  /* legacy group header keeps the disclosure affordance */
+  .legacy-head {
+    display: flex; flex-direction: column; gap: 2px; padding: 7px 8px 4px; border-radius: 7px;
+    cursor: pointer; user-select: none;
+  }
+  .legacy-head:hover { background: #1d2028; }
+  .legacy-head .line1 { display: flex; align-items: center; gap: 7px; min-width: 0; }
+  .legacy-head .name { flex: 1; min-width: 0; color: var(--text-strong); font-size: 12.5px; font-weight: 600;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .legacy-head .sub { padding-left: 26px; color: var(--muted-2); font-size: 10.5px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chev { width: 11px; color: var(--muted); transition: transform .12s ease; }
+  .chev.collapsed { transform: rotate(-90deg); }
+
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 8px; }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 0 3px rgba(52,211,153,.12); }
+  .dot.off { background: var(--muted-2); box-shadow: none; }
+  .dot.warn { background: var(--warn); box-shadow: 0 0 0 3px rgba(252,211,77,.14); }
+
+  /* ---------- project rows ---------- */
+  .row {
+    display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 7px; cursor: pointer;
+    color: var(--muted-3);
+  }
+  .row:hover { background: #1d2028; }
+  .row.selected { background: #20242c; color: var(--text-strong); }
+  .row .caret { width: 12px; flex: 0 0 12px; color: var(--muted); display: inline-flex; }
+  .row .caret svg { width: 10px; height: 10px; }
+  .row .picon { width: 15px; flex: 0 0 15px; display: inline-flex; color: #8f98a6; }
+  .row.selected .picon, .row .picon.active { color: var(--accent-light); }
+  .row .picon svg { width: 15px; height: 15px; }
+  .row .plabel { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
+  .row.child { padding-left: 30px; color: var(--muted-3); font-size: 12.5px; }
+  .row.child .dot-sm { width: 6px; height: 6px; border-radius: 50%; background: var(--pulse); box-shadow: 0 0 0 3px rgba(251,191,36,.14); }
+  .count {
+    flex: 0 0 auto; font-size: 10.5px; color: var(--muted-2); border: 1px solid var(--border-2);
+    border-radius: 999px; padding: 0 6px;
+  }
+  .row.selected .count { border-color: var(--accent); color: var(--accent-light); }
+  .row.offline { opacity: .55; }
+  .empty-hint { padding: 6px 8px 8px 30px; color: var(--muted-2); font-size: 11.5px; }
+  .empty-hint a { color: var(--accent-light); cursor: pointer; }
+
+  /* floating scroll-region probe */
+  .probe {
+    position: absolute; right: 10px; bottom: 10px; z-index: 5;
+    font-size: 10.5px; border-radius: 999px; padding: 3px 9px; pointer-events: none;
+    border: 1px solid; background: #0e1014;
+  }
+  .probe.legacy { color: var(--legacy); border-color: rgba(248,113,113,.5); }
+  .probe.fixed { color: var(--fixed); border-color: rgba(74,222,128,.5); }
+
+  /* ---------- main canvas ---------- */
+  .canvas { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .canvas-head {
+    display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+    border-bottom: 1px solid var(--border); background: #13151b;
+  }
+  .canvas-head .proj { font-size: 14px; color: var(--text-strong); font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .canvas-head .meta { margin-left: auto; color: var(--muted-2); font-size: 11.5px; display: flex; gap: 12px; align-items: center; }
+  .worker-chip {
+    font-size: 10px; color: var(--accent-light); background: #1b2b43; border: 1px solid #2b4b78;
+    border-radius: 999px; padding: 0 7px; line-height: 16px;
+  }
+  .canvas-body { flex: 1; overflow: hidden; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  .bubble { border: 1px solid var(--border); background: #15171d; border-radius: 10px; padding: 10px 12px; max-width: 560px; }
+  .bubble .who { color: var(--muted); font-size: 11px; margin-bottom: 4px; }
+  .bubble.agent { background: #141a22; border-color: #1f2b3c; }
+  .bubble .steps { color: var(--muted-3); font-size: 12.5px; }
+  .bubble code { background: #0f1115; border: 1px solid var(--border); border-radius: 4px; padding: 1px 4px; font-size: 12px; }
+  .composer {
+    margin-top: auto; border: 1px solid var(--border-2); background: #0f1115; border-radius: 10px;
+    padding: 10px 12px; color: var(--muted-2); display: flex; justify-content: space-between; align-items: center;
+  }
+  .composer .send { background: var(--accent); color: #fff; border-radius: 7px; padding: 4px 10px; font-size: 12px; }
+
+  .legend {
+    max-width: 1180px; margin: 14px auto 0; padding: 14px 16px;
+    border: 1px solid var(--border); border-radius: 10px; background: #0e1014; color: var(--muted);
+    font-size: 12px; display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px 24px;
+  }
+  .legend b { color: var(--accent-light); }
+  .legend .bad { color: var(--legacy); }
+  .legend .good { color: var(--fixed); }
+  @media (max-width: 940px) { .sidebar { width: 270px; flex-basis: 270px; } .legend { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+  <div class="mock-toolbar">
+    <div class="mock-title">Loom · sidebar worker sections <small>— issue #299 mockup</small></div>
+    <div class="seg" id="workerSeg">
+      <button data-workers="3" class="active">3 workers</button>
+      <button data-workers="1">1 worker</button>
+    </div>
+    <div class="seg fixed" id="layoutSeg">
+      <button data-layout="fixed" class="active">Proposed · one list</button>
+      <button data-layout="legacy">Today · per‑worker trees</button>
+    </div>
+    <div class="seg" id="sizeSeg">
+      <button data-size="tall" class="active">Tall pane</button>
+      <button data-size="short">Short pane</button>
+    </div>
+  </div>
+  <div class="caption" id="caption"></div>
+
+  <div class="stage">
+    <div class="app" id="app">
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <span class="label">Projects</span>
+          <div class="head-actions">
+            <button class="icon-btn" title="New project">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 3v10M3 8h10" stroke-linecap="round"/></svg>
+            </button>
+            <button class="icon-btn" title="Settings">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.8M8 12.6v1.8M1.6 8h1.8M12.6 8h1.8M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3" stroke-linecap="round"/></svg>
+            </button>
+          </div>
+        </div>
+        <input class="filter" placeholder="Filter projects…">
+        <div class="tree" id="tree"></div>
+      </aside>
+
+      <main class="canvas">
+        <div class="canvas-head">
+          <div class="proj">
+            <svg viewBox="0 0 16 16" fill="none" stroke="#93c5fd" stroke-width="1.3"><path d="M1.8 4.2c0-.7.5-1.2 1.2-1.2h3l1.4 1.6h6.6c.7 0 1.2.5 1.2 1.2v6.4c0 .7-.5 1.2-1.2 1.2H3c-.7 0-1.2-.5-1.2-1.2z"/></svg>
+            api-gateway
+            <span class="worker-chip">build-01</span>
+          </div>
+          <div class="meta">
+            <span>1 agent</span>
+            <span>Model · deepseek-flash</span>
+            <span style="color:var(--ok)">● Working</span>
+          </div>
+        </div>
+        <div class="canvas-body">
+          <div class="bubble"><div class="who">You</div>Add request-id propagation to the gateway and cover it with a test.</div>
+          <div class="bubble agent"><div class="who">api-gateway · manager</div>
+            <div class="steps">Reading <code>src/proxy.rs</code>, then updating the middleware chain and adding a focused test.</div>
+          </div>
+          <div class="composer"><span>Message api-gateway…</span><span class="send">Send</span></div>
+        </div>
+      </main>
+
+      <div class="probe" id="probe"></div>
+    </div>
+  </div>
+
+  <div class="legend">
+    <div><b>One scroll region</b> — every worker section lives in the pane's single <code>.tree</code> scroller. There is no per-worker scroll area and no per-worker height split.</div>
+    <div><b>Sections, not tree roots</b> — the worker heading is a section header (dot · name, then resources or the last load error). No chevron, no collapse state.</div>
+    <div><b>Always shown</b> — a single connected worker gets the same section heading as a fleet of many; the flat fallback is gone.</div>
+    <div><b>Unchanged</b> — projects still nest with their session tree, delegated children keep nesting, offline workers keep their last-known projects, and the filter spans all workers.</div>
+  </div>
+
+  <script>
+    const ALL_WORKERS = [
+      { id: 'local', dot: 'ok', name: 'Local backend · this machine',
+        sub: 'CPU 12% of 8 cores · RAM 41% of 32 GiB · disk 118 GiB available',
+        projects: [ { name: 'loom', agents: 3, live: true }, { name: 'scratch', agents: 0 } ] },
+      { id: 'build-01', dot: 'ok', name: 'External worker · build-01',
+        sub: 'CPU 71% of 16 cores · RAM 39% of 64 GiB · disk 402 GiB available',
+        projects: [ { name: 'api-gateway', agents: 1, live: true, selected: true, child: true },
+                    { name: 'infra-terraform', agents: 2 } ] },
+      { id: 'gpu-box', dot: 'off', name: 'External worker · gpu-box',
+        sub: 'offline · last seen 2h ago', offline: true,
+        projects: [ { name: 'voice-lab', agents: 4, offline: true } ] }
+    ];
+
+    const state = { workers: '3', layout: 'fixed', size: 'tall', collapsed: new Set() };
+
+    const svg = {
+      chev: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6l4 4 4-4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+      folder: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M1.8 4.2c0-.7.5-1.2 1.2-1.2h3l1.4 1.6h6.6c.7 0 1.2.5 1.2 1.2v6.4c0 .7-.5 1.2-1.2 1.2H3c-.7 0-1.2-.5-1.2-1.2z"/></svg>',
+      bot: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="2.6" y="4.4" width="10.8" height="8" rx="2.2"/><path d="M5.6 8h.01M10.4 8h.01" stroke-linecap="round"/><path d="M8 4.4V2.6" stroke-linecap="round"/></svg>'
+    };
+
+    function visibleWorkers() {
+      return state.workers === '1' ? ALL_WORKERS.slice(0, 1) : ALL_WORKERS;
+    }
+
+    function projectRows(w) {
+      return w.projects.map(p => {
+        const sel = p.selected ? ' selected' : '';
+        const off = p.offline ? ' offline' : '';
+        const count = p.agents ? `<span class="count">${p.agents}</span>` : '';
+        const caret = p.agents ? `<span class="caret" style="visibility:hidden">${svg.chev}</span>` : '';
+        let row = `<div class="row${sel}${off}">
+            ${caret}
+            <span class="picon${p.live ? ' active' : ''}">${svg.folder}</span>
+            <span class="plabel">${p.name}${off ? '  <span style="color:var(--muted-2)">(offline)</span>' : ''}</span>
+            ${count}
+          </div>`;
+        if (p.selected && p.child) {
+          row += `<div class="row child"><span class="dot-sm"></span><span class="picon">${svg.bot}</span><span class="plabel">reviewer · delegated task</span></div>`;
+          row += `<div class="row child"><span class="dot-sm" style="background:#64748b;box-shadow:none"></span><span class="picon">${svg.bot}</span><span class="plabel">tester · completed</span></div>`;
+        }
+        return row;
+      }).join('');
+    }
+
+    function sectionHead(w, extra) {
+      const count = `<span class="count">${w.projects.length} project${w.projects.length === 1 ? '' : 's'}</span>`;
+      const subClass = w.sub.startsWith('offline') ? 'sub' : (w.error ? 'sub error' : 'sub');
+      return `<div class="section-head">
+          <div class="line1">
+            <span class="dot ${w.dot}"></span>
+            <span class="name">${w.name}</span>
+            ${extra || ''}${count}
+          </div>
+          <div class="${subClass}">${w.sub}</div>
+        </div>`;
+    }
+
+    function renderFixed(workers) {
+      return workers.map(w => {
+        const offlineHint = w.offline
+          ? `<div class="empty-hint">Loading stopped — worker is offline. <a>Reconnect</a></div>`
+          : '';
+        return `<div class="section">
+            ${sectionHead(w)}
+            <div class="section-body">${projectRows(w)}${offlineHint}</div>
+          </div>`;
+      }).join('');
+    }
+
+    function renderLegacy(workers) {
+      // A single worker keeps the old flat list with no worker heading at all.
+      if (workers.length === 1) {
+        return `<div class="legacy-column"><div class="legacy-group">
+            <div class="legacy-body" style="padding-left:6px">${projectRows(workers[0])}</div>
+          </div></div>`;
+      }
+      const groups = workers.map(w => {
+        const isCollapsed = state.collapsed.has(w.id);
+        const flag = `<span class="legacy-flag">own scroll region</span>`;
+        const head = `<div class="legacy-head" onclick="toggleGroup('${w.id}')">
+            <div class="line1">
+              <span class="chev${isCollapsed ? ' collapsed' : ''}">${svg.chev}</span>
+              <span class="dot ${w.dot}"></span>
+              <span class="name">${w.name}</span>
+            </div>
+            <div class="sub">${w.sub}</div>
+          </div>`;
+        const body = isCollapsed ? '' : `<div class="legacy-body">${projectRows(w)}</div>`;
+        return `<div class="legacy-group">${head}${body}</div>`;
+      }).join('');
+      return `<div class="legacy-column">${groups}</div>`;
+    }
+
+    function render() {
+      const workers = visibleWorkers();
+      const tree = document.getElementById('tree');
+      tree.className = 'tree ' + (state.layout === 'fixed' ? 'probe-fixed' : 'probe-legacy');
+      tree.innerHTML = state.layout === 'fixed' ? renderFixed(workers) : renderLegacy(workers);
+      document.getElementById('app').classList.toggle('short', state.size === 'short');
+
+      const probe = document.getElementById('probe');
+      if (state.layout === 'fixed') {
+        probe.className = 'probe fixed';
+        probe.textContent = '1 scroll region';
+      } else if (workers.length === 1) {
+        probe.className = 'probe legacy';
+        probe.textContent = 'no worker section';
+      } else {
+        probe.className = 'probe legacy';
+        probe.textContent = workers.length + ' scroll regions';
+      }
+      setCaption(workers.length);
+    }
+
+    function toggleGroup(id) {
+      if (state.collapsed.has(id)) state.collapsed.delete(id); else state.collapsed.add(id);
+      render();
+    }
+
+    function setCaption(n) {
+      const cap = document.getElementById('caption');
+      const one = n === 1;
+      if (state.layout === 'fixed') {
+        cap.innerHTML = `Proposed: <span class="good">one scrolling list</span> of worker <b>sections</b>. ` +
+          (one
+            ? `With a single worker the section heading is still shown — name, dot, and resources or the last load error — above its projects.`
+            : `Scrolling to the last worker's projects is one scroll of the whole pane; shrinking the pane does not squash sections into fractions of it.`);
+      } else {
+        cap.innerHTML = `<span class="bad">Today:</span> ` +
+          (one
+            ? `a single worker skips grouping entirely, so its name, dot, resources, and last load error are <span class="bad">not visible at all</span>.`
+            : `each worker owns a full-height tree, so the pane splits into one scroll region per worker and shrinking the pane squashes each section. Worker headings are expandable tree roots.`);
+      }
+    }
+
+    function wire(id, key) {
+      document.getElementById(id).addEventListener('click', e => {
+        const b = e.target.closest('button'); if (!b) return;
+        state[key] = b.dataset[key];
+        document.querySelectorAll('#' + id + ' button').forEach(x => x.classList.toggle('active', x === b));
+        render();
+      });
+    }
+    wire('workerSeg', 'workers');
+    wire('layoutSeg', 'layout');
+    wire('sizeSeg', 'size');
+
+    render();
+  </script>
+</body>
+</html>

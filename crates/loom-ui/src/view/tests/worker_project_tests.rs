@@ -99,10 +99,15 @@ fn connected_workers_without_sessions_keep_an_empty_group() {
     assert!(groups[1].1.is_empty());
 }
 
+/// Worker sections are rows in one list, not independent full-height trees:
+/// the peer's section sits below the local worker's rows, and the heading is a
+/// section title with no expand/collapse control.
 #[gpui_kit::test]
-fn sidebar_groups_projects_by_worker_and_collapses(cx: &mut TestAppContext) {
+fn sidebar_shows_worker_sections_in_one_scrolling_list(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+    let rendered = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let rendered_for_window = rendered.clone();
+    let handle = cx.open_window(size(px(1280.), px(800.)), move |window, cx| {
         let view = cx.new(|cx| {
             let mut view = LoomView::new_for_test(cx.focus_handle());
             let local_node_id = view.default_backend_node_id.clone();
@@ -122,23 +127,116 @@ fn sidebar_groups_projects_by_worker_and_collapses(cx: &mut TestAppContext) {
             view.active_session = local_session;
             view
         });
+        *rendered_for_window.borrow_mut() = Some(view.clone());
         gpui_kit::component::Root::new(view, window, cx)
     });
+    let view = rendered.borrow().as_ref().unwrap().clone();
+    let local_node_id = cx.update(|cx| view.read(cx).default_backend_node_id.clone());
+    let local_section_id = format!("worker-section:{local_node_id}");
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
         window.render_frame(cx);
-        assert!(window.find(("worker-group", 0usize)).visible());
-        assert!(window.find(("worker-group", 1usize)).visible());
-        assert!(window.find(("session-tree-root", 0usize)).visible());
-        assert!(window.find(("session-tree-root", 1_000_000usize)).visible());
-
-        // Collapsing the first worker hides its tree but keeps the second.
-        window.click(("worker-group", 0usize), cx);
+        let local_section = window.find(local_section_id.clone());
+        let peer_section = window.find("worker-section:peer-node");
+        assert!(local_section.visible());
+        assert!(peer_section.visible());
+        // Sessions keep stable ids that do not depend on the section headings.
+        let local_row = window.find(("session-tree-root", 0usize));
+        let peer_row = window.find(("session-tree-root", 1usize));
+        assert!(local_row.visible());
+        assert!(peer_row.visible());
+        // One list, read top to bottom: the peer's section follows the local
+        // worker's rows instead of being squashed into a fraction of the pane.
+        assert!(local_section.bounds().origin.y < local_row.bounds().origin.y);
+        assert!(local_row.bounds().origin.y < peer_section.bounds().origin.y);
+        assert!(peer_section.bounds().origin.y < peer_row.bounds().origin.y);
+        // The heading is a section title, not an expand/collapse control, so
+        // clicking it leaves every row in place.
+        window.click(local_section_id.clone(), cx);
         window.render_frame(cx);
-        assert!(window.try_find(("session-tree-root", 0usize)).is_none());
-        assert!(window.find(("session-tree-root", 1_000_000usize)).visible());
+        assert!(window.find(local_section_id.clone()).visible());
+        assert!(window.find(("session-tree-root", 0usize)).visible());
+        assert!(window.find(("session-tree-root", 1usize)).visible());
     })
     .unwrap();
+}
+
+/// A single connected worker still gets the section heading, so the projects
+/// say which worker they belong to even without a second worker to compare to.
+#[gpui_kit::test]
+fn sidebar_shows_the_worker_section_with_a_single_worker(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let rendered = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let rendered_for_window = rendered.clone();
+    let handle = cx.open_window(size(px(1280.), px(800.)), move |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            let local_node_id = view.default_backend_node_id.clone();
+            view.worker_nodes = vec![worker_node(0, &local_node_id, "this machine", true)];
+            let session = view.active_session.clone();
+            view.sessions = vec![session.clone()];
+            view.session_node_ids.insert(session.id, local_node_id);
+            view
+        });
+        *rendered_for_window.borrow_mut() = Some(view.clone());
+        gpui_kit::component::Root::new(view, window, cx)
+    });
+    let view = rendered.borrow().as_ref().unwrap().clone();
+    let local_node_id = cx.update(|cx| view.read(cx).default_backend_node_id.clone());
+    let local_section_id = format!("worker-section:{local_node_id}");
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let section = window.find(local_section_id.clone());
+        assert!(section.visible());
+        let row = window.find(("session-tree-root", 0usize));
+        assert!(row.visible());
+        assert!(
+            section.bounds().origin.y < row.bounds().origin.y,
+            "the worker section must sit above its projects"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn worker_section_header_reports_resources_offline_and_load_errors(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let view = cx.new(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.worker_nodes = vec![worker_node(0, "peer-node", "build-01", false)];
+        view
+    });
+
+    let online = cx.update(|cx| view.read(cx).worker_section_header("peer-node").subtitle);
+    assert!(online.contains("CPU"), "online subtitle: {online}");
+
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            let mut node = worker_node(0, "peer-node", "build-01", false);
+            node.connection_state = WorkerConnectionState::Disconnected;
+            view.worker_nodes = vec![node];
+        });
+    });
+    let offline = cx.update(|cx| view.read(cx).worker_section_header("peer-node").subtitle);
+    assert_eq!(offline, "offline");
+
+    // A failed listing is more useful than the connection state on its own.
+    cx.update(|cx| {
+        view.update(cx, |view, _| {
+            view.node_session_load_errors
+                .insert("peer-node".to_owned(), "listing failed".to_owned());
+        });
+    });
+    let error = cx.update(|cx| view.read(cx).worker_section_header("peer-node").subtitle);
+    assert_eq!(error, "listing failed");
+
+    let unknown = cx.update(|cx| {
+        let header = view.read(cx).worker_section_header("gone");
+        (header.name, header.subtitle)
+    });
+    assert_eq!(unknown.0, "Removed worker");
+    assert_eq!(unknown.1, "No worker is connected");
 }
 
 #[gpui_kit::test]
