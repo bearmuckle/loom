@@ -32,6 +32,7 @@ fn durable_projection(
             completed_at: Some(Timestamp::from_unix_millis(2)),
             summary: None,
             evidence: Vec::new(),
+            approval_policy: None,
         },
         plan: Vec::new(),
         plan_progress: Default::default(),
