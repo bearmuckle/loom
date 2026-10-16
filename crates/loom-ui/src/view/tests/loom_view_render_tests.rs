@@ -695,6 +695,7 @@ fn run_projection_maps_messages_plan_and_completion_evidence(cx: &mut TestAppCon
                     label: "readme".to_owned(),
                     uri: "file:///README.md".to_owned(),
                 }],
+                approval_policy: None,
             },
             plan: vec![loom_protocol::AgentPlanStep {
                 id: "step-1".to_owned(),
@@ -748,6 +749,7 @@ fn run_projection_keeps_existing_timeline_and_suppresses_redundant_summary(
                 completed_at: Some(Timestamp::from_unix_millis(2)),
                 summary: Some("Completed task: task".to_owned()),
                 evidence: Vec::new(),
+                approval_policy: None,
             },
             plan: vec![
                 loom_protocol::AgentPlanStep {
@@ -2591,6 +2593,7 @@ fn a_failed_run_status_row_names_its_reason(cx: &mut TestAppContext) {
                 loom_model::AGENT_RUN_FAILURE_SUMMARY_PREFIX
             )),
             evidence: Vec::new(),
+            approval_policy: None,
         });
         view
     });
@@ -2639,6 +2642,7 @@ fn agent_event_projection_handles_the_run_lifecycle_and_tool_fallback(cx: &mut T
                 completed_at: None,
                 summary: None,
                 evidence: Vec::new(),
+                approval_policy: None,
             };
             let inspection = loom_protocol::ContextInspection {
                 items: Vec::new(),
@@ -2894,6 +2898,7 @@ fn async_session_load_falls_back_to_run_projection_and_ignores_stale_responses(
                 completed_at: Some(Timestamp::from_unix_millis(2)),
                 summary: Some("Recovered run".to_owned()),
                 evidence: Vec::new(),
+                approval_policy: None,
             };
             let projection = loom_protocol::AgentRunSnapshotProjection {
                 run: run.clone(),
@@ -4329,6 +4334,7 @@ fn inspector_renders_agent_context_and_files_tabs(cx: &mut TestAppContext) {
                 label: "pr".to_owned(),
                 uri: "https://example.com/pr/1".to_owned(),
             }],
+            approval_policy: None,
         });
         view.review.usage.session = Some(UsageSnapshot {
             input_tokens: 1_200,
@@ -4537,6 +4543,7 @@ fn plan_progress_tracks_steps_and_resets_with_a_new_run(cx: &mut TestAppContext)
                 completed_at: None,
                 summary: None,
                 evidence: Vec::new(),
+                approval_policy: None,
             },
         });
         assert!(view.plan.is_none());

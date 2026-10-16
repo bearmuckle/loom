@@ -106,6 +106,7 @@ fn completed_run_projection(
             completed_at: Some(Timestamp::from_unix_millis(2)),
             summary: Some("Recovered run".to_owned()),
             evidence: Vec::new(),
+            approval_policy: None,
         },
         plan: Vec::new(),
         plan_progress: Default::default(),
