@@ -11,7 +11,7 @@ use axum::{
     Router,
     extract::{
         State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
     http::{
         HeaderMap, StatusCode,
@@ -43,7 +43,29 @@ use super::{AuthSession, AuthTokenStore, InProcessBackend, InProcessConnection};
 const DEFAULT_WS_PATH: &str = "/ws";
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(15);
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+/// The largest single WebSocket frame either side accepts, in bytes (4 MiB).
+///
+/// The protocol has no chunking, so a result that grows with workspace or
+/// content size can cross this bound. Both sides then report
+/// [`ErrorCode::PayloadTooLarge`] naming the frame size, the configured limit,
+/// and the request, instead of implying that the frame was malformed. Raise the
+/// bound with [`MAX_FRAME_BYTES_FLAG`] or [`MAX_FRAME_BYTES_ENV`] on a server and
+/// on the clients that reach it, or per connection with
+/// [`WebSocketTransport::with_max_frame_bytes`].
+pub const DEFAULT_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+/// The flag that carries the frame-size limit, named in parse errors.
+pub const MAX_FRAME_BYTES_FLAG: &str = "--max-frame-bytes";
+/// Environment variable that sets the frame-size limit when the flag is absent.
+///
+/// A server start and a native client resolve their limit from the same input,
+/// so one value bounds both sides of the remote transport.
+pub const MAX_FRAME_BYTES_ENV: &str = "LOOM_MAX_FRAME_BYTES";
+/// WebSocket close code 1009, "message too big".
+///
+/// An oversized frame that names no request is closed with this code and a
+/// reason carrying the same size-and-limit explanation, because there is no
+/// request id to answer under.
+const CLOSE_MESSAGE_TOO_BIG: u16 = 1009;
 const DEFAULT_OUTGOING_CAPACITY: usize = 128;
 /// How long an incoming TLS handshake may take before the listener drops it.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -70,6 +92,89 @@ const CLIENT_EVENT_BUFFER_CAPACITY: usize = 1024;
 /// instead of trusting the URL scheme, so a build that cannot do TLS never
 /// claims a `wss://` endpoint is secure.
 pub const WEBSOCKET_TLS_SUPPORTED: bool = true;
+
+/// Parses a frame-size limit in bytes.
+///
+/// `source` names the flag or environment variable the value came from, so an
+/// operator is told which input to fix.
+pub fn parse_max_frame_bytes(value: &str, source: &str) -> Result<usize> {
+    let bytes = value.trim().parse::<usize>().map_err(|_| {
+        LoomError::invalid_request(format!(
+            "{source} must be a whole number of bytes such as 4194304; got '{value}'"
+        ))
+    })?;
+    if bytes == 0 {
+        return Err(LoomError::invalid_request(format!(
+            "{source} must be greater than zero"
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Resolves the frame-size limit from an explicit flag and its environment
+/// fallback, defaulting to [`DEFAULT_MAX_FRAME_BYTES`].
+///
+/// An explicit flag always wins over the variable it falls back to, exactly
+/// like the archive-retention inputs. The standalone server, `loom --serve`, and
+/// the native client all resolve their limit here, so the flag and the variable
+/// mean the same thing on either side of the transport.
+pub fn resolve_max_frame_bytes(flag: Option<&str>, env: Option<&str>) -> Result<usize> {
+    match (flag, env) {
+        (Some(value), _) => parse_max_frame_bytes(value, MAX_FRAME_BYTES_FLAG),
+        (None, Some(value)) => parse_max_frame_bytes(value, MAX_FRAME_BYTES_ENV),
+        (None, None) => Ok(DEFAULT_MAX_FRAME_BYTES),
+    }
+}
+
+/// The diagnostic for a frame above the configured limit.
+///
+/// It names what the frame was, the request it belongs to, the received size,
+/// and the configured limit, because the failure is a size bound rather than
+/// corruption and the caller cannot otherwise tell which result to narrow.
+fn frame_too_large_error(
+    context: &str,
+    request_id: RequestId,
+    received: usize,
+    limit: usize,
+) -> LoomError {
+    LoomError::payload_too_large(format!(
+        "{context} of {received} bytes for request {request_id} is above the configured frame \
+         size limit of {limit} bytes"
+    ))
+}
+
+/// The close reason for an oversized frame that names no request.
+///
+/// A WebSocket close reason is limited to 123 bytes, so this carries the two
+/// numbers and nothing else.
+fn frame_too_large_close_reason(received: usize, limit: usize) -> String {
+    format!("frame of {received} bytes over the configured {limit}-byte limit")
+}
+
+/// Decides which request an inbound frame above the configured limit fails.
+///
+/// A frame that decodes as the response the caller awaits belongs to that
+/// request, so only that request fails. Anything else cannot be that answer, so
+/// it is drained and the wait continues; see
+/// [`WebSocketConnection::oversized_inbound_frame`] for the rule and its
+/// reasoning.
+fn oversized_inbound_frame_action(frame: &[u8], request_id: RequestId) -> OversizedFrameAction {
+    match loom_protocol::decode_response(frame) {
+        Ok(response) if response.request_id == request_id => {
+            OversizedFrameAction::FailAwaitedRequest
+        }
+        Ok(_) | Err(_) => OversizedFrameAction::Drain,
+    }
+}
+
+/// How an over-limit inbound frame is treated while a request is awaited.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OversizedFrameAction {
+    /// Fail the awaited request with the payload-too-large diagnostic.
+    FailAwaitedRequest,
+    /// Drop the frame and keep waiting for the awaited response.
+    Drain,
+}
 
 /// Server-side TLS material for the remote WebSocket listener.
 ///
@@ -168,6 +273,9 @@ pub struct RemoteServerConfig {
     pub path: String,
     pub heartbeat_interval: Duration,
     pub request_timeout: Duration,
+    /// Most bytes the listener accepts in one inbound WebSocket frame. It
+    /// defaults to [`DEFAULT_MAX_FRAME_BYTES`] (4 MiB) and is raised with
+    /// [`MAX_FRAME_BYTES_FLAG`] or [`MAX_FRAME_BYTES_ENV`].
     pub max_frame_bytes: usize,
     pub outgoing_capacity: usize,
     /// TLS material for the listener. `Some` serves `wss://` and `/health` over
@@ -607,7 +715,7 @@ async fn handle_socket(socket: WebSocket, state: RemoteState, auth: AuthSession)
                 match incoming {
                     Ok(Message::Text(text)) => {
                         last_activity = Instant::now();
-                        process_text(
+                        if let Some(close) = process_text(
                             text.as_bytes(),
                             &connection,
                             &message_sender,
@@ -615,11 +723,17 @@ async fn handle_socket(socket: WebSocket, state: RemoteState, auth: AuthSession)
                             &mut pending,
                             state.config.max_frame_bytes,
                             state.config.request_timeout,
-                        ).await;
+                        ).await {
+                            // The reason is the only explanation an oversized
+                            // frame that named no request can carry, so it is
+                            // sent before the writer is dropped below.
+                            let _ = message_sender.send(Message::Close(Some(close))).await;
+                            break;
+                        }
                     }
                     Ok(Message::Binary(bytes)) => {
                         last_activity = Instant::now();
-                        process_text(
+                        if let Some(close) = process_text(
                             &bytes,
                             &connection,
                             &message_sender,
@@ -627,7 +741,10 @@ async fn handle_socket(socket: WebSocket, state: RemoteState, auth: AuthSession)
                             &mut pending,
                             state.config.max_frame_bytes,
                             state.config.request_timeout,
-                        ).await;
+                        ).await {
+                            let _ = message_sender.send(Message::Close(Some(close))).await;
+                            break;
+                        }
                     }
                     Ok(Message::Ping(payload)) => {
                         last_activity = Instant::now();
@@ -650,6 +767,15 @@ async fn handle_socket(socket: WebSocket, state: RemoteState, auth: AuthSession)
     let _ = writer.await;
 }
 
+/// Handles one inbound frame, returning the close frame that ends the
+/// connection when one must be sent.
+///
+/// An oversized frame is rejected as [`ErrorCode::PayloadTooLarge`] rather than
+/// as a malformed payload, because the bytes it rejected are well formed. When
+/// the frame still decodes, the rejection is answered under the request id it
+/// names, so the client sees the failure on the request it sent. A frame that
+/// names no request cannot be answered that way, so the connection closes with
+/// a reason carrying the same size-and-limit explanation.
 async fn process_text(
     bytes: &[u8],
     connection: &InProcessConnection,
@@ -658,18 +784,23 @@ async fn process_text(
     pending: &mut HashMap<RequestId, JoinHandle<()>>,
     max_frame_bytes: usize,
     request_timeout: Duration,
-) {
+) -> Option<CloseFrame> {
     if bytes.len() > max_frame_bytes {
-        let response = ResponseEnvelope::failure(
-            RequestId::new(),
-            LoomError::new(
-                ErrorCode::MalformedPayload,
-                "WebSocket frame exceeds the configured size limit",
-                false,
-            ),
-        );
-        let _ = try_send_response(outgoing, response, control);
-        return;
+        let received = bytes.len();
+        if let Some(request_id) = frame_request_id(bytes) {
+            let response = ResponseEnvelope::failure(
+                request_id,
+                frame_too_large_error("WebSocket frame", request_id, received, max_frame_bytes),
+            );
+            let _ = try_send_response(outgoing, response, control);
+            return None;
+        }
+        let reason = frame_too_large_close_reason(received, max_frame_bytes);
+        log::warn!("closing remote connection: {reason}");
+        return Some(CloseFrame {
+            code: CLOSE_MESSAGE_TOO_BIG,
+            reason: reason.into(),
+        });
     }
     let request = match decode_request(bytes) {
         Ok(request) => request,
@@ -688,7 +819,7 @@ async fn process_text(
                     ),
                 );
                 let _ = try_send_response(outgoing, response, control);
-                return;
+                return None;
             }
             Err(_) => {
                 let response = ResponseEnvelope::failure(
@@ -696,7 +827,7 @@ async fn process_text(
                     LoomError::malformed_payload("WebSocket payload is not a Loom request"),
                 );
                 let _ = try_send_response(outgoing, response, control);
-                return;
+                return None;
             }
         },
     };
@@ -710,6 +841,22 @@ async fn process_text(
     });
     pending.retain(|_, task| !task.is_finished());
     pending.insert(request_id, task);
+    None
+}
+
+/// The request id an inbound frame names, when it can still be decoded.
+///
+/// The oversized branch uses this to correlate its rejection, so a frame that
+/// names no request is never answered under a fabricated id.
+fn frame_request_id(bytes: &[u8]) -> Option<RequestId> {
+    if let Ok(request) = decode_request(bytes) {
+        return Some(request.request_id);
+    }
+    match decode_client_frame(bytes) {
+        Ok(ClientFrame::Request(request)) => Some(request.request_id),
+        Ok(ClientFrame::Cancel { request_id }) => Some(request_id),
+        Err(_) => None,
+    }
 }
 
 async fn execute_request(
@@ -925,10 +1072,11 @@ impl WebSocketConnection {
             )
         })?;
         if bytes.len() > self.max_frame_bytes {
-            return Err(LoomError::new(
-                ErrorCode::MalformedPayload,
-                "remote request exceeds the configured frame size",
-                false,
+            return Err(frame_too_large_error(
+                "remote request",
+                request_id,
+                bytes.len(),
+                self.max_frame_bytes,
             ));
         }
         self.socket
@@ -970,11 +1118,18 @@ impl WebSocketConnection {
             match message.map_err(socket_error)? {
                 ClientMessage::Text(text) => {
                     if text.len() > self.max_frame_bytes {
-                        return Err(LoomError::new(
-                            ErrorCode::MalformedPayload,
-                            "remote response exceeds the configured frame size",
-                            false,
-                        ));
+                        // The check runs before decoding, so it sees every frame
+                        // on the socket, including events and other requests'
+                        // responses. An over-limit frame therefore only fails
+                        // the request it decodes as the response for; anything
+                        // else is drained and the wait continues, so concurrent
+                        // traffic cannot fail a request that did not cause it.
+                        if let Some(error) =
+                            self.oversized_inbound_frame(text.as_bytes(), request_id)
+                        {
+                            return Err(error);
+                        }
+                        continue;
                     }
                     if let Ok(response) = loom_protocol::decode_response(text.as_bytes()) {
                         if response.request_id == request_id {
@@ -992,11 +1147,11 @@ impl WebSocketConnection {
                 }
                 ClientMessage::Binary(bytes) => {
                     if bytes.len() > self.max_frame_bytes {
-                        return Err(LoomError::new(
-                            ErrorCode::MalformedPayload,
-                            "remote response exceeds the configured frame size",
-                            false,
-                        ));
+                        // Same rule as the text arm above.
+                        if let Some(error) = self.oversized_inbound_frame(&bytes, request_id) {
+                            return Err(error);
+                        }
+                        continue;
                     }
                     if let Ok(response) = loom_protocol::decode_response(&bytes) {
                         if response.request_id == request_id {
@@ -1027,6 +1182,47 @@ impl WebSocketConnection {
                     ));
                 }
                 ClientMessage::Frame(_) => {}
+            }
+        }
+    }
+
+    /// Decides what an inbound frame above the configured limit does to the
+    /// request being awaited.
+    ///
+    /// The size check runs before decoding, so it applies to every frame on the
+    /// socket, including events and other requests' responses. Deciding by
+    /// content keeps an over-limit frame from failing a request it has nothing
+    /// to do with:
+    ///
+    /// - a frame that decodes as the awaited response fails exactly that
+    ///   request with [`ErrorCode::PayloadTooLarge`], naming the received size,
+    ///   the configured limit, and the request, because its answer can never be
+    ///   delivered;
+    /// - anything else — an event, another request's response, or a frame that
+    ///   does not decode at all — is drained and the wait continues. A drained
+    ///   event is dropped rather than buffered, because buffering it would
+    ///   defeat the limit; events carry a sequence, so a caller that drains the
+    ///   stream can detect the gap.
+    ///
+    /// Returns the error the awaited request fails with, or `None` when the
+    /// frame was drained.
+    fn oversized_inbound_frame(&self, frame: &[u8], request_id: RequestId) -> Option<LoomError> {
+        match oversized_inbound_frame_action(frame, request_id) {
+            OversizedFrameAction::FailAwaitedRequest => Some(frame_too_large_error(
+                "remote response",
+                request_id,
+                frame.len(),
+                self.max_frame_bytes,
+            )),
+            OversizedFrameAction::Drain => {
+                log::warn!(
+                    "dropped a remote frame of {} bytes while waiting for request {request_id}: it \
+                     is above the configured frame size limit of {} bytes and is not that \
+                     request's response",
+                    frame.len(),
+                    self.max_frame_bytes
+                );
+                None
             }
         }
     }
@@ -1290,9 +1486,12 @@ fn tls_failure_detail(error: &TungsteniteError) -> Option<String> {
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        ConnectionControl, RemoteServer, RemoteServerConfig, ServerTlsConfig,
-        WEBSOCKET_TLS_SUPPORTED, WebSocketTransport, auth_error_response, bearer_token,
-        client_tls_config, execute_request_with, insecure_remote_host, process_text, request_auth,
+        CLOSE_MESSAGE_TOO_BIG, ConnectionControl, DEFAULT_MAX_FRAME_BYTES, MAX_FRAME_BYTES_ENV,
+        MAX_FRAME_BYTES_FLAG, OversizedFrameAction, RemoteServer, RemoteServerConfig,
+        ServerTlsConfig, WEBSOCKET_TLS_SUPPORTED, WebSocketTransport, auth_error_response,
+        bearer_token, client_tls_config, execute_request_with, frame_request_id,
+        frame_too_large_close_reason, frame_too_large_error, insecure_remote_host,
+        oversized_inbound_frame_action, process_text, request_auth, resolve_max_frame_bytes,
         try_send_response, websocket_connect_error,
     };
     use axum::{
@@ -1307,6 +1506,7 @@ mod unit_tests {
     use loom_protocol::{
         ClientFrame, ClientRequest, ControlRequest, ControlResponse, RequestEnvelope,
         ResponseEnvelope, ServerResponse, decode_response, encode_client_frame, encode_request,
+        encode_response,
     };
     use std::{
         collections::HashMap,
@@ -1549,7 +1749,7 @@ mod unit_tests {
         let (control, _) = mpsc::channel(1);
         let mut pending = HashMap::new();
 
-        process_text(
+        let close = process_text(
             b"too large",
             &connection,
             &outgoing,
@@ -1558,17 +1758,40 @@ mod unit_tests {
             1,
             Duration::from_secs(1),
         )
-        .await;
-        let Some(axum::extract::ws::Message::Text(text)) = received.recv().await else {
-            panic!("expected oversized-frame response")
-        };
+        .await
+        .expect("a frame that names no request must close the connection");
+        assert_eq!(close.code, CLOSE_MESSAGE_TOO_BIG);
         assert_eq!(
-            decode_response(text.as_bytes())
-                .unwrap()
-                .result
-                .unwrap_err()
-                .code,
-            ErrorCode::MalformedPayload
+            close.reason,
+            frame_too_large_close_reason(b"too large".len(), 1)
+        );
+        assert!(received.try_recv().is_err());
+
+        // A frame that still decodes is answered under the request id it names,
+        // so the client sees the failure on the request it sent.
+        let request =
+            RequestEnvelope::new(ClientRequest::Control(ControlRequest::DiscoverCapabilities));
+        let encoded = encode_request(&request).unwrap();
+        let limit = encoded.len() - 1;
+        let close = process_text(
+            &encoded,
+            &connection,
+            &outgoing,
+            &control,
+            &mut pending,
+            limit,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(close.is_none());
+        let Some(axum::extract::ws::Message::Text(text)) = received.recv().await else {
+            panic!("expected an oversized-request response")
+        };
+        let response = decode_response(text.as_bytes()).unwrap();
+        assert_eq!(response.request_id, request.request_id);
+        assert_eq!(
+            response.result.unwrap_err(),
+            frame_too_large_error("WebSocket frame", request.request_id, encoded.len(), limit)
         );
 
         process_text(
@@ -1632,6 +1855,101 @@ mod unit_tests {
             panic!("expected wrapped request response")
         };
         assert!(decode_response(text.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn frame_size_diagnostics_name_the_request_size_and_limit() {
+        let request_id = RequestId::new();
+        let error = frame_too_large_error("remote response", request_id, 5120, 4096);
+        assert_eq!(error.code, ErrorCode::PayloadTooLarge);
+        assert_eq!(
+            error.message,
+            format!(
+                "remote response of 5120 bytes for request {request_id} is above the configured \
+                 frame size limit of 4096 bytes"
+            )
+        );
+        assert!(!error.retryable);
+        assert_eq!(
+            frame_too_large_close_reason(5120, 4096),
+            "frame of 5120 bytes over the configured 4096-byte limit"
+        );
+        // A close reason has to fit the 123-byte WebSocket close payload.
+        assert!(frame_too_large_close_reason(usize::MAX, 1).len() <= 123);
+    }
+
+    #[test]
+    fn the_frame_limit_resolves_from_a_flag_then_the_environment() {
+        assert_eq!(DEFAULT_MAX_FRAME_BYTES, 4 * 1024 * 1024);
+        assert_eq!(
+            resolve_max_frame_bytes(None, None).unwrap(),
+            DEFAULT_MAX_FRAME_BYTES
+        );
+        assert_eq!(resolve_max_frame_bytes(Some(" 8192 "), None).unwrap(), 8192);
+        assert_eq!(resolve_max_frame_bytes(None, Some("4096")).unwrap(), 4096);
+        // An explicit flag wins over the environment it falls back to.
+        assert_eq!(
+            resolve_max_frame_bytes(Some("8192"), Some("4096")).unwrap(),
+            8192
+        );
+
+        let error = resolve_max_frame_bytes(None, Some("many")).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains(MAX_FRAME_BYTES_ENV), "{error}");
+        let error = resolve_max_frame_bytes(Some("0"), None).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains(MAX_FRAME_BYTES_FLAG), "{error}");
+        assert!(error.message.contains("greater than zero"), "{error}");
+    }
+
+    #[test]
+    fn oversized_inbound_frames_fail_only_the_request_they_answer() {
+        let awaited = RequestId::new();
+        let awaited_response = encode_response(&ResponseEnvelope::failure(
+            awaited,
+            loom_core::LoomError::invalid_request("await"),
+        ))
+        .unwrap();
+        assert_eq!(
+            oversized_inbound_frame_action(&awaited_response, awaited),
+            OversizedFrameAction::FailAwaitedRequest
+        );
+
+        // Another request's response, a payload that is not a response at all,
+        // and bytes that decode as nothing are drained instead.
+        let other_response = encode_response(&ResponseEnvelope::failure(
+            RequestId::new(),
+            loom_core::LoomError::invalid_request("other"),
+        ))
+        .unwrap();
+        assert_eq!(
+            oversized_inbound_frame_action(&other_response, awaited),
+            OversizedFrameAction::Drain
+        );
+        for frame in [b"{not-json".as_slice(), b"too large".as_slice()] {
+            assert_eq!(
+                oversized_inbound_frame_action(frame, awaited),
+                OversizedFrameAction::Drain
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_frames_are_correlated_when_they_name_a_request() {
+        let request =
+            RequestEnvelope::new(ClientRequest::Control(ControlRequest::DiscoverCapabilities));
+        assert_eq!(
+            frame_request_id(&encode_request(&request).unwrap()),
+            Some(request.request_id)
+        );
+        let wrapped =
+            encode_client_frame(&ClientFrame::Request(Box::new(request.clone()))).unwrap();
+        assert_eq!(frame_request_id(&wrapped), Some(request.request_id));
+
+        let request_id = RequestId::new();
+        let cancel = encode_client_frame(&ClientFrame::Cancel { request_id }).unwrap();
+        assert_eq!(frame_request_id(&cancel), Some(request_id));
+        assert_eq!(frame_request_id(b"too large"), None);
     }
 
     #[tokio::test]

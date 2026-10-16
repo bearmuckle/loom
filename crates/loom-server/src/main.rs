@@ -19,11 +19,11 @@ use loom_core::{ErrorCode, LoomError};
 use loom_protocol::ArchiveRetentionPolicy;
 use loom_server::{
     ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FORCE_DISCARD_ENV, ARCHIVE_RETENTION_SWEEP_INTERVAL,
-    DiagnosticsSettings, InProcessBackend, Instance, InstanceLayout, InstanceOptions,
-    ProcessContext, RemoteServerConfig, ServerTlsConfig, ServingBackend, TlsState,
-    apply_startup_archive_retention, diagnostics_lines, open_backend, resolve_archive_retention,
-    run_archive_retention_sweeps, start_remote_server, startup_summary,
-    sweep_archive_retention_at_startup,
+    DEFAULT_MAX_FRAME_BYTES, DiagnosticsSettings, InProcessBackend, Instance, InstanceLayout,
+    InstanceOptions, MAX_FRAME_BYTES_ENV, ProcessContext, RemoteServerConfig, ServerTlsConfig,
+    ServingBackend, TlsState, apply_startup_archive_retention, diagnostics_lines, open_backend,
+    resolve_archive_retention, resolve_max_frame_bytes, run_archive_retention_sweeps,
+    start_remote_server, startup_summary, sweep_archive_retention_at_startup,
 };
 
 /// The bind address used when `--bind` is not supplied.
@@ -82,6 +82,8 @@ struct ServerOptions {
     archive_retention: Option<String>,
     /// Raw `--archive-retention-force-discard` value.
     archive_retention_force_discard: Option<String>,
+    /// Raw `--max-frame-bytes` value, before it is resolved into a byte count.
+    max_frame_bytes: Option<String>,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     allow_insecure_remote: bool,
@@ -98,6 +100,7 @@ impl Default for ServerOptions {
             reset_state: false,
             archive_retention: None,
             archive_retention_force_discard: None,
+            max_frame_bytes: None,
             tls_cert: None,
             tls_key: None,
             allow_insecure_remote: false,
@@ -118,6 +121,16 @@ impl ServerOptions {
             env::var(ARCHIVE_RETENTION_FORCE_DISCARD_ENV)
                 .ok()
                 .as_deref(),
+        )
+    }
+
+    /// The most bytes the listener accepts in one inbound WebSocket frame:
+    /// `--max-frame-bytes`, `LOOM_MAX_FRAME_BYTES`, or the documented 4 MiB
+    /// default. An unusable value fails the start and names the input to fix.
+    fn max_frame_bytes(&self) -> Result<usize, LoomError> {
+        resolve_max_frame_bytes(
+            self.max_frame_bytes.as_deref(),
+            env::var(MAX_FRAME_BYTES_ENV).ok().as_deref(),
         )
     }
 
@@ -187,6 +200,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
                     "--archive-retention-force-discard",
                 )?);
             }
+            "--max-frame-bytes" => {
+                options.max_frame_bytes = Some(required_value(&mut args, "--max-frame-bytes")?);
+            }
             "--diagnostics" => diagnostics = true,
             "--tls-cert" => {
                 options.tls_cert = Some(PathBuf::from(required_value(&mut args, "--tls-cert")?));
@@ -218,6 +234,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
             value if value.starts_with("--archive-retention-force-discard=") => {
                 options.archive_retention_force_discard =
                     Some(value["--archive-retention-force-discard=".len()..].to_owned());
+            }
+            value if value.starts_with("--max-frame-bytes=") => {
+                options.max_frame_bytes = Some(value["--max-frame-bytes=".len()..].to_owned());
             }
             value if value.starts_with("--tls-cert=") => {
                 options.tls_cert = Some(PathBuf::from(&value["--tls-cert=".len()..]));
@@ -277,6 +296,7 @@ fn help_text() -> String {
          [--token <token> | --token-file <path>] [--persistence <path>] \
          [--reset-state] [--archive-retention <duration>] \
          [--archive-retention-force-discard <bool>] \
+         [--max-frame-bytes <bytes>] \
          [--tls-cert <pem> --tls-key <pem>] \
          [--allow-insecure-remote] [--diagnostics]\n\
          \n\
@@ -297,6 +317,9 @@ fn help_text() -> String {
          \x20 --archive-retention-force-discard <bool>\n\
          \x20                        let the retention sweep discard dirty or locked \
          worktrees (LOOM_ARCHIVE_RETENTION_FORCE_DISCARD is the fallback)\n\
+         \x20 --max-frame-bytes <bytes>\n\
+         \x20                        accept at most this many bytes in one WebSocket frame \
+         (default {DEFAULT_MAX_FRAME_BYTES}; LOOM_MAX_FRAME_BYTES is the fallback)\n\
          \x20 --tls-cert <pem>      serve wss:// with this PEM certificate chain\n\
          \x20 --tls-key <pem>       PEM private key matching --tls-cert\n\
          \x20 --allow-insecure-remote\n\
@@ -321,13 +344,21 @@ fn help_text() -> String {
          integer means seconds, and off and never mean disabled. The sweep runs once at \
          startup and every {} minutes while the server runs.\n\
          \n\
+         One WebSocket frame is limited to {} bytes ({} MiB) by default; \
+         --max-frame-bytes or LOOM_MAX_FRAME_BYTES raises or lowers that bound for this \
+         listener, and a client that reaches it sets its own limit. The protocol has no \
+         chunking, so a frame above the limit is reported as payload_too_large naming the \
+         request, the received size, and the limit.\n\
+         \n\
          A bind address that is not loopback needs TLS; --allow-insecure-remote accepts \
          the risk of sending the bearer token and all traffic in plaintext instead.\n\
          \n\
          --diagnostics prints where agent commands would execute, as which account, which \
          state a start would use, and the intended egress policy, without printing the \
          token value.",
-        ARCHIVE_RETENTION_SWEEP_INTERVAL.as_secs() / 60
+        ARCHIVE_RETENTION_SWEEP_INTERVAL.as_secs() / 60,
+        DEFAULT_MAX_FRAME_BYTES,
+        DEFAULT_MAX_FRAME_BYTES / (1024 * 1024)
     )
 }
 
@@ -413,6 +444,7 @@ async fn start(
     let tls = resolve_tls(options)?;
     let config = RemoteServerConfig {
         bind_addr: options.bind,
+        max_frame_bytes: options.max_frame_bytes()?,
         tls,
         allow_insecure_remote: options.allow_insecure_remote,
         ..RemoteServerConfig::default()
@@ -545,7 +577,8 @@ mod tests {
 
     use loom_protocol::ArchiveRetentionPolicy;
     use loom_server::{
-        InProcessBackend, Instance, TokenSource, bind_exposure_warning, open_backend,
+        DEFAULT_MAX_FRAME_BYTES, InProcessBackend, Instance, TokenSource, bind_exposure_warning,
+        open_backend,
     };
 
     use super::{
@@ -776,6 +809,48 @@ mod tests {
                 .message
                 .contains("requires a value")
         );
+        assert!(
+            parse_error(&["--max-frame-bytes"])
+                .message
+                .contains("requires a value")
+        );
+    }
+
+    #[test]
+    fn the_frame_limit_resolves_from_the_flag_then_the_environment() {
+        assert_eq!(
+            ServerOptions::default().max_frame_bytes().unwrap(),
+            DEFAULT_MAX_FRAME_BYTES
+        );
+
+        let spaced = ServerOptions {
+            max_frame_bytes: Some("8192".to_owned()),
+            ..ServerOptions::default()
+        };
+        assert_eq!(spaced.max_frame_bytes().unwrap(), 8192);
+
+        let equals = serve_options(&["--max-frame-bytes=16384"]);
+        assert_eq!(equals.max_frame_bytes.as_deref(), Some("16384"));
+        assert_eq!(equals.max_frame_bytes().unwrap(), 16384);
+
+        // A rejected value names the input to fix.
+        let rejected = ServerOptions {
+            max_frame_bytes: Some("several".to_owned()),
+            ..ServerOptions::default()
+        };
+        let error = rejected.max_frame_bytes().unwrap_err();
+        assert_eq!(error.code, loom_core::ErrorCode::InvalidRequest);
+        assert!(error.message.contains("--max-frame-bytes"), "{error}");
+        let zero = ServerOptions {
+            max_frame_bytes: Some("0".to_owned()),
+            ..ServerOptions::default()
+        };
+        assert!(
+            zero.max_frame_bytes()
+                .unwrap_err()
+                .message
+                .contains("greater than zero")
+        );
     }
 
     #[test]
@@ -802,6 +877,9 @@ mod tests {
         assert!(help.contains("--archive-retention-force-discard <bool>"));
         assert!(help.contains("LOOM_ARCHIVE_RETENTION"));
         assert!(help.contains("LOOM_ARCHIVE_RETENTION_FORCE_DISCARD"));
+        assert!(help.contains("--max-frame-bytes <bytes>"));
+        assert!(help.contains("LOOM_MAX_FRAME_BYTES"));
+        assert!(help.contains("4194304"));
         assert!(help.contains("127.0.0.1:8765"));
         assert!(version_text().starts_with("loom-server "));
         assert!(version_text().contains(build_version()));

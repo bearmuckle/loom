@@ -9,6 +9,10 @@ pub enum ErrorCode {
     InvalidRequest,
     InvalidState,
     MalformedPayload,
+    /// A frame or payload larger than the configured size limit. It reports a
+    /// size bound rather than corruption, because the bytes it rejected were
+    /// well formed.
+    PayloadTooLarge,
     AuthenticationRequired,
     AuthenticationFailed,
     AuthorizationDenied,
@@ -45,6 +49,7 @@ impl fmt::Display for ErrorCode {
             Self::InvalidRequest => "invalid_request",
             Self::InvalidState => "invalid_state",
             Self::MalformedPayload => "malformed_payload",
+            Self::PayloadTooLarge => "payload_too_large",
             Self::AuthenticationRequired => "authentication_required",
             Self::AuthenticationFailed => "authentication_failed",
             Self::AuthorizationDenied => "authorization_denied",
@@ -120,6 +125,14 @@ impl LoomError {
         Self::new(ErrorCode::MalformedPayload, message, false)
     }
 
+    /// A payload or frame above the configured size limit.
+    ///
+    /// It is not retryable: the same request produces the same payload, so only
+    /// a raised limit or a smaller result makes it succeed.
+    pub fn payload_too_large(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::PayloadTooLarge, message, false)
+    }
+
     pub fn not_found(resource: &str, id: impl fmt::Display) -> Self {
         Self::new(
             ErrorCode::NotFound,
@@ -153,6 +166,7 @@ mod tests {
             (ErrorCode::InvalidRequest, "invalid_request"),
             (ErrorCode::InvalidState, "invalid_state"),
             (ErrorCode::MalformedPayload, "malformed_payload"),
+            (ErrorCode::PayloadTooLarge, "payload_too_large"),
             (ErrorCode::AuthenticationRequired, "authentication_required"),
             (ErrorCode::AuthenticationFailed, "authentication_failed"),
             (ErrorCode::AuthorizationDenied, "authorization_denied"),
@@ -206,6 +220,11 @@ mod tests {
             LoomError::malformed_payload("bad").code,
             ErrorCode::MalformedPayload
         );
+        assert_eq!(
+            LoomError::payload_too_large("bad").code,
+            ErrorCode::PayloadTooLarge
+        );
+        assert!(!LoomError::payload_too_large("bad").retryable);
         assert_eq!(
             LoomError::unsupported_protocol("bad").code,
             ErrorCode::UnsupportedProtocol

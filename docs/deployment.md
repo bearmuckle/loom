@@ -205,6 +205,14 @@ The listener side is separate from egress:
 - A non-loopback bind needs TLS (`--tls-cert` with `--tls-key`) or the explicit
   `--allow-insecure-remote` opt-in, which logs a warning naming the flag that
   permitted the bind.
+- One WebSocket frame is limited to 4 MiB per side. `--max-frame-bytes <bytes>`,
+  or `LOOM_MAX_FRAME_BYTES`, changes that bound for the listener and for a
+  native client that reads the same variable. The protocol has no chunking, so a
+  request or response above the limit fails as `payload_too_large` naming the
+  request, the received byte size, and the configured limit; a frame that names
+  no request closes the connection with the same explanation. Raise the limit
+  when a workspace listing, file read, transcript page, or tool result
+  legitimately exceeds it.
 - A container's network namespace is whatever the runtime gives it, which is
   the `--network` the container was started with.
 

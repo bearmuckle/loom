@@ -4,6 +4,7 @@
 //! the native launcher (`loom-local`) rather than the backend implementation.
 
 use std::{
+    env,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
@@ -125,6 +126,12 @@ impl LocalConnection {
 /// and `allow_insecure_remote` is the only way to reach a plaintext `ws://`
 /// worker that is not on the local machine. Both are operator decisions, so
 /// neither has a silent default.
+///
+/// The frame-size limit is not a field here: it is an argument of
+/// [`RemoteConnection::connect_with_max_frame_bytes`], which
+/// [`RemoteConnection::connect`] defaults from
+/// [`loom_server::MAX_FRAME_BYTES_ENV`] and
+/// [`loom_server::DEFAULT_MAX_FRAME_BYTES`].
 #[derive(Clone, Debug, Default)]
 pub struct RemoteConnectionOptions {
     /// PEM file whose certificates are trusted in addition to the OS roots.
@@ -134,9 +141,18 @@ pub struct RemoteConnectionOptions {
 }
 
 impl RemoteConnectionOptions {
-    /// Builds the transport for one endpoint.
-    fn transport(&self, url: &str, token: &str) -> Result<loom_server::WebSocketTransport> {
+    /// Builds the transport for one endpoint with `max_frame_bytes` applied.
+    ///
+    /// [`loom_server::WebSocketTransport::with_max_frame_bytes`] validates the
+    /// limit, so an unusable value fails before a connection is attempted.
+    fn transport(
+        &self,
+        url: &str,
+        token: &str,
+        max_frame_bytes: usize,
+    ) -> Result<loom_server::WebSocketTransport> {
         let transport = loom_server::WebSocketTransport::new(url, token)
+            .with_max_frame_bytes(max_frame_bytes)?
             .with_insecure_remote_allowed(self.allow_insecure_remote);
         match self.ca_certificate.as_deref() {
             Some(certificate) => transport.with_ca_certificate_file(certificate),
@@ -164,13 +180,41 @@ pub struct RemoteConnection {
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl RemoteConnection {
+    /// Connects to `url`, limiting every WebSocket frame to the limit this
+    /// process resolves from [`loom_server::MAX_FRAME_BYTES_ENV`], or to the
+    /// documented [`loom_server::DEFAULT_MAX_FRAME_BYTES`] (4 MiB) when the
+    /// variable is unset.
+    ///
+    /// The variable is the surface a launcher and a deployment already have for
+    /// the remote settings it does not carry as options; a caller that wants an
+    /// explicit bound uses [`RemoteConnection::connect_with_max_frame_bytes`].
     pub fn connect(
         url: &str,
         token: &str,
         secure_for_secrets: bool,
         options: &RemoteConnectionOptions,
     ) -> Result<Self> {
-        let transport = options.transport(url, token)?;
+        let max_frame_bytes = loom_server::resolve_max_frame_bytes(
+            None,
+            env::var(loom_server::MAX_FRAME_BYTES_ENV).ok().as_deref(),
+        )?;
+        Self::connect_with_max_frame_bytes(url, token, secure_for_secrets, options, max_frame_bytes)
+    }
+
+    /// Connects to `url` with an explicit frame-size limit.
+    ///
+    /// A request or response above `max_frame_bytes` fails as
+    /// `payload_too_large`, naming the request, the received size, and the
+    /// limit, instead of reading as a malformed payload. The limit must be
+    /// greater than zero, and an over-limit frame is still rejected.
+    pub fn connect_with_max_frame_bytes(
+        url: &str,
+        token: &str,
+        secure_for_secrets: bool,
+        options: &RemoteConnectionOptions,
+        max_frame_bytes: usize,
+    ) -> Result<Self> {
+        let transport = options.transport(url, token, max_frame_bytes)?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

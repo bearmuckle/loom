@@ -135,8 +135,9 @@ pub use instance::{
     TokenSource,
 };
 pub use remote::{
-    RemoteServer, RemoteServerConfig, RunningRemoteServer, ServerTlsConfig,
-    WEBSOCKET_TLS_SUPPORTED, WebSocketConnection, WebSocketTransport,
+    DEFAULT_MAX_FRAME_BYTES, MAX_FRAME_BYTES_ENV, MAX_FRAME_BYTES_FLAG, RemoteServer,
+    RemoteServerConfig, RunningRemoteServer, ServerTlsConfig, WEBSOCKET_TLS_SUPPORTED,
+    WebSocketConnection, WebSocketTransport, parse_max_frame_bytes, resolve_max_frame_bytes,
 };
 pub use retention::{
     ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FLAG, ARCHIVE_RETENTION_FORCE_DISCARD_ENV,
