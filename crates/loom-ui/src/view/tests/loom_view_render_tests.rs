@@ -397,19 +397,28 @@ fn nested_project_tree_selects_grandchild_session_by_click(cx: &mut TestAppConte
     let view = rendered_view.borrow().as_ref().unwrap().clone();
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
-        // Projects with sub-agents start collapsed.
+        // Projects with sub-agents start collapsed behind one summary row.
         assert!(window.find(("session-tree-root", 0usize)).visible());
-        assert!(window.try_find(("session-tree-root", 1usize)).is_none());
+        assert!(window.try_find(("session-tree-agents", 0usize)).is_none());
         // Clicking the project name selects it without expanding its agents.
         window.click(("session-tree-root", 0usize), cx);
         window.render_frame(cx);
         assert_eq!(view.read(cx).active_session.name, "Project");
         assert!(
-            window.try_find(("session-tree-root", 1usize)).is_none(),
+            window.try_find(("session-tree-agents", 0usize)).is_none(),
             "selecting a project name must not expand its sub-agents"
         );
-        // The chevron expands the project, then the agent, revealing the grandchild.
+        // The chevron expands the project, revealing the single agent summary.
         window.click(("session-tree-disclosure", 0usize), cx);
+        window.render_frame(cx);
+        assert!(window.find(("session-tree-agents", 0usize)).visible());
+        assert!(
+            window.try_find(("session-tree-root", 1usize)).is_none(),
+            "individual agents stay behind the summary until it is expanded"
+        );
+        // Expanding the summary reveals the agents, then the manager reveals the
+        // grandchild.
+        window.click(("session-tree-agents", 0usize), cx);
         window.render_frame(cx);
         assert!(window.find(("session-tree-root", 1usize)).visible());
         window.click(("session-tree-disclosure", 1usize), cx);
@@ -550,13 +559,16 @@ fn project_session_popup_menu_dispatches_child_control_review_and_integration(
         window.render_frame(cx);
         assert!(window.find("popup-menu").visible());
         let mut menu = window.within("popup-menu");
-        assert_eq!(menu.find(2usize).label(), Some("Pause child"));
-        assert_eq!(menu.find(3usize).label(), Some("Interrupt child"));
+        // A sub agent's menu opens its transcript first, then its manager-scoped
+        // controls; it carries no manual rename or archive.
+        assert_eq!(menu.find(0usize).label(), Some("Open transcript"));
+        assert_eq!(menu.find(1usize).label(), Some("Pause child"));
+        assert_eq!(menu.find(2usize).label(), Some("Interrupt child"));
         assert_eq!(
-            menu.find(4usize).label(),
+            menu.find(3usize).label(),
             Some("Cancel child and descendants")
         );
-        menu.click(2usize, cx);
+        menu.click(1usize, cx);
     })
     .unwrap();
     cx.run_until_parked();
@@ -583,15 +595,16 @@ fn project_session_popup_menu_dispatches_child_control_review_and_integration(
         let mut menu = window.within("popup-menu");
         // A completed child now offers its abandonment first, because that is
         // the only control action left for a finished task.
-        assert_eq!(menu.find(2usize).label(), Some("Abandon completed result"));
-        assert_eq!(menu.find(3usize).label(), Some("Review child changes"));
-        assert_eq!(menu.find(4usize).label(), Some("Integrate child changes"));
-        assert_eq!(menu.find(5usize).label(), Some("Keep child checkout"));
+        assert_eq!(menu.find(0usize).label(), Some("Open transcript"));
+        assert_eq!(menu.find(1usize).label(), Some("Abandon completed result"));
+        assert_eq!(menu.find(2usize).label(), Some("Review child changes"));
+        assert_eq!(menu.find(3usize).label(), Some("Integrate child changes"));
+        assert_eq!(menu.find(4usize).label(), Some("Keep child checkout"));
         assert_eq!(
-            menu.find(6usize).label(),
+            menu.find(5usize).label(),
             Some("Remove clean child checkout")
         );
-        menu.click(3usize, cx);
+        menu.click(2usize, cx);
     })
     .unwrap();
     cx.run_until_parked();
@@ -615,9 +628,9 @@ fn project_session_popup_menu_dispatches_child_control_review_and_integration(
     let (integration_window, integration_view) = open_nested_project_menu(cx, 2);
     cx.update_window(integration_window, |_, window, cx| {
         window.render_frame(cx);
-        // Index 4 is "Integrate child changes": the abandonment action a
-        // completed child now offers shifted every later item by one.
-        window.within("popup-menu").click(4usize, cx);
+        // Index 3 is "Integrate child changes": the transcript action and the
+        // abandonment action a completed child offers shift later items.
+        window.within("popup-menu").click(3usize, cx);
     })
     .unwrap();
     cx.run_until_parked();

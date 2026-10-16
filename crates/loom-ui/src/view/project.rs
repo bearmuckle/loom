@@ -425,12 +425,13 @@ impl LoomView {
         menu_view: Entity<LoomView>,
     ) -> PopupMenu {
         let rename_view = menu_view.clone();
-        let archive_view = menu_view.clone();
         let rename_session = session.clone();
+        // A project root carries the lifecycle actions. A delegated sub agent is
+        // managed by its manager, so it only offers opening its transcript here;
+        // its archive is automatic and its controls are manager-scoped.
         let is_project = menu_project
             .as_ref()
             .is_none_or(|project| project.root_session_id == session.id);
-        let archive_session = session.clone();
         let archive_label = menu_project
             .as_ref()
             .filter(|project| project.root_session_id == session.id)
@@ -440,18 +441,39 @@ impl LoomView {
         let is_project_root = menu_project
             .as_ref()
             .is_some_and(|project| project.root_session_id == session.id);
-        menu = menu
-            .item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
-                let rename_session = rename_session.clone();
-                rename_view.update(cx, |view, cx| {
-                    view.begin_session_rename(rename_session, is_project, window, cx);
-                });
-            }))
-            .item(PopupMenuItem::new(archive_label).on_click(move |_, _, cx| {
-                archive_view.update(cx, |view, cx| {
-                    view.archive_session(archive_session.id, cx);
-                });
-            }));
+        if is_project {
+            let archive_view = menu_view.clone();
+            let archive_session = session.clone();
+            menu = menu
+                .item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
+                    let rename_session = rename_session.clone();
+                    rename_view.update(cx, |view, cx| {
+                        view.begin_session_rename(rename_session, true, window, cx);
+                    });
+                }))
+                .item(PopupMenuItem::new(archive_label).on_click(move |_, _, cx| {
+                    archive_view.update(cx, |view, cx| {
+                        view.archive_session(archive_session.id, cx);
+                    });
+                }));
+        } else {
+            let open_view = menu_view.clone();
+            let open_session = session.clone();
+            menu = menu.item(
+                PopupMenuItem::new("Open transcript").on_click(move |_, _, cx| {
+                    let open_session = open_session.clone();
+                    open_view.update(cx, |view, cx| {
+                        view.session_drawer_open = false;
+                        if view.active_session.id != open_session.id {
+                            view.select_session(open_session, cx);
+                        } else {
+                            view.dismiss_surfaces();
+                        }
+                        cx.notify();
+                    });
+                }),
+            );
+        }
         if let Some(project) = menu_project.as_ref()
             && let Some(child) = project.agents.iter().find(|agent| {
                 agent.session_id == session.id

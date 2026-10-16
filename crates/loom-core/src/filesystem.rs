@@ -18,6 +18,11 @@ pub struct WorkspaceConfig {
     /// workspace. Queued tasks start as an active child finishes.
     #[serde(default = "default_project_agent_concurrency")]
     pub project_agent_concurrency: u8,
+    /// Archive a delegated agent automatically once its task completes and any
+    /// code result is integrated. Disabled by default so finished agents stay
+    /// visible for inspection until the workspace opts in.
+    #[serde(default)]
+    pub auto_archive_completed_agents: bool,
 }
 
 pub const MIN_PROJECT_AGENT_CONCURRENCY: u8 = 1;
@@ -38,6 +43,7 @@ impl Default for WorkspaceConfig {
             worker_nodes: Vec::new(),
             cpu_pulse_threshold_percent: default_cpu_pulse_threshold_percent(),
             project_agent_concurrency: default_project_agent_concurrency(),
+            auto_archive_completed_agents: false,
         }
     }
 }
@@ -223,5 +229,6 @@ mod tests {
         assert_eq!(config.revision, 3);
         assert_eq!(config.cpu_pulse_threshold_percent, 15);
         assert_eq!(config.project_agent_concurrency, 4);
+        assert!(!config.auto_archive_completed_agents);
     }
 }

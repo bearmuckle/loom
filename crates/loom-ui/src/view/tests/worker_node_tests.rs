@@ -1,15 +1,15 @@
 use super::{
-    ACTIVE_BACKEND_NODE_ENTRY_ID, SessionSourceChoice, SessionSourceDialogPurpose, SessionTreeNode,
-    WorkerConnectionStage, WorkerConnectionState, WorkerNodeEntry, adjusted_cpu_pulse_threshold,
-    adjusted_project_agent_concurrency, assigned_node_id, classify_connectivity_failure,
-    connection_placeholder, filter_session_tree, format_percentage, format_worker_node_resources,
-    initial_worker_nodes, local_source_available, mark_worker_connection_failed,
-    merge_node_sessions, next_severe_load_streak, order_session_nodes,
-    project_child_control_actions, project_session_list_projection,
-    project_session_list_projection_for_projects, project_snapshot_has_unloaded_agent_sessions,
-    remove_worker_node_entry, safe_worker_url_label, session_id_for_request,
-    session_list_projection, session_status_pill, session_tree_descendant_count,
-    source_choice_is_allowed, source_dialog_initial_state,
+    ACTIVE_BACKEND_NODE_ENTRY_ID, AGENT_GROUP_ID_PREFIX, SessionSourceChoice,
+    SessionSourceDialogPurpose, SessionTreeNode, WorkerConnectionStage, WorkerConnectionState,
+    WorkerNodeEntry, adjusted_cpu_pulse_threshold, adjusted_project_agent_concurrency,
+    agent_group_summary, assigned_node_id, classify_connectivity_failure, connection_placeholder,
+    filter_session_tree, format_percentage, format_worker_node_resources, initial_worker_nodes,
+    local_source_available, mark_worker_connection_failed, merge_node_sessions,
+    next_severe_load_streak, order_session_nodes, project_child_control_actions,
+    project_session_list_projection, project_session_list_projection_for_projects,
+    project_snapshot_has_unloaded_agent_sessions, project_tree_item, remove_worker_node_entry,
+    safe_worker_url_label, session_id_for_request, session_list_projection, session_status_pill,
+    session_tree_descendant_count, source_choice_is_allowed, source_dialog_initial_state,
     transition_worker_connection_to_connecting, uncovered_session_ids, update_worker_node_status,
     validate_model_for_node, worker_connection_failure_detail, worker_node_display_name,
     worker_url_embeds_credential,
@@ -1346,4 +1346,91 @@ fn active_backend_and_external_worker_labels_do_not_collide() {
         worker_node_display_name(&external_worker),
         "External worker · local"
     );
+}
+
+#[test]
+fn project_tree_items_group_agents_under_one_summary_node() {
+    let root = AgentSessionId::new();
+    let child = AgentSessionId::new();
+    let grandchild = AgentSessionId::new();
+    let node = SessionTreeNode {
+        session_id: root,
+        label: "Project".to_owned(),
+        children: vec![SessionTreeNode {
+            session_id: child,
+            label: "Researcher".to_owned(),
+            children: vec![SessionTreeNode {
+                session_id: grandchild,
+                label: "Analyst".to_owned(),
+                children: Vec::new(),
+            }],
+        }],
+    };
+
+    let item = project_tree_item(&node);
+    // The project keeps its own row; every agent sits behind one summary node.
+    assert_eq!(item.id.as_ref(), root.to_string());
+    assert_eq!(item.children.len(), 1);
+    let group = &item.children[0];
+    assert_eq!(group.id.as_ref(), format!("{AGENT_GROUP_ID_PREFIX}{root}"));
+    assert_eq!(group.label.as_ref(), "2 agents");
+    assert_eq!(group.children.len(), 1);
+    assert_eq!(group.children[0].id.as_ref(), child.to_string());
+
+    // A project with no agents stays a plain leaf row.
+    let bare = SessionTreeNode {
+        session_id: AgentSessionId::new(),
+        label: "Empty project".to_owned(),
+        children: Vec::new(),
+    };
+    assert!(project_tree_item(&bare).children.is_empty());
+}
+
+#[test]
+fn agent_group_summary_counts_active_and_completed_agents() {
+    let root = AgentSessionId::new();
+    let running = AgentSessionId::new();
+    let done = AgentSessionId::new();
+    let grandchild = AgentSessionId::new();
+    let node = SessionTreeNode {
+        session_id: root,
+        label: "Project".to_owned(),
+        children: vec![
+            SessionTreeNode {
+                session_id: running,
+                label: "Running".to_owned(),
+                children: vec![SessionTreeNode {
+                    session_id: grandchild,
+                    label: "Blocked".to_owned(),
+                    children: Vec::new(),
+                }],
+            },
+            SessionTreeNode {
+                session_id: done,
+                label: "Done".to_owned(),
+                children: Vec::new(),
+            },
+        ],
+    };
+    let snapshot = |id, state| AgentSessionSnapshot {
+        id,
+        workspace_id: WorkspaceId::new(),
+        name: "agent".to_owned(),
+        state,
+        created_at: Timestamp::from_unix_millis(1),
+        updated_at: Timestamp::from_unix_millis(1),
+    };
+    let sessions = vec![
+        snapshot(running, AgentSessionState::Executing),
+        snapshot(grandchild, AgentSessionState::Planning),
+        snapshot(done, AgentSessionState::Completed),
+    ];
+
+    assert_eq!(
+        agent_group_summary(&node, &sessions),
+        "3 agents · 2 running · 1 done"
+    );
+
+    // Unknown sessions are not counted as active or complete, but stay counted.
+    assert_eq!(agent_group_summary(&node, &[]), "3 agents");
 }

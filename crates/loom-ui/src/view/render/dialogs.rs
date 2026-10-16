@@ -1235,6 +1235,24 @@ impl LoomView {
                             ),
                             false,
                             phone,
+                        ))
+                        .child(settings_row(
+                            "Auto-archive completed sub agents",
+                            "Archive a delegated agent once its task is done and any code change is integrated",
+                            Switch::new("auto-archive-completed-agents-toggle")
+                                .checked(self.workspace_config.auto_archive_completed_agents)
+                                .disabled(!self.is_connected())
+                                .accessibility_label("Auto-archive completed sub agents")
+                                .on_change({
+                                    let view = cx.entity();
+                                    move |checked, _window, cx| {
+                                        view.update(cx, |view, cx| {
+                                            view.set_auto_archive_completed_agents(*checked, cx);
+                                        });
+                                    }
+                                }),
+                            false,
+                            phone,
                         )),
                 )
                 .into_any_element(),

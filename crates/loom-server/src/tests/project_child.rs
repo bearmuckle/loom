@@ -1550,3 +1550,316 @@ fn delegated_children_require_durable_storage_on_ephemeral_backends() {
     );
     fs::remove_dir_all(&backend.session_root_base).unwrap();
 }
+
+/// A workspace that opts in archives a completed delegated sub agent, while an
+/// opted-out workspace keeps it visible. Code work is archived only after its
+/// result is integrated, which the project integration tests cover.
+#[test]
+fn auto_archive_policy_archives_a_completed_child_agent() {
+    let temp = std::env::temp_dir().join(format!("loom-auto-archive-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&temp).unwrap();
+    let path = temp.join("state.sqlite");
+    let backend = InProcessBackend::new_persistent(&path).unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Auto archive".into(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let root = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Manager".into(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+
+    // Creates a durable delegated child session and its task, like the manager
+    // tool does, and returns the child's id.
+    let delegate = |name: &str| {
+        let child_id = AgentSessionId::new();
+        let created_at = Timestamp::now();
+        let child = AgentSessionSnapshot {
+            id: child_id,
+            workspace_id: workspace.id,
+            name: name.to_owned(),
+            state: AgentSessionState::Idle,
+            created_at,
+            updated_at: created_at,
+        };
+        let task = loom_core::DelegatedTaskRecord {
+            task_id: loom_core::TaskId::new(),
+            project_id: ProjectId::from_uuid(*root.id.as_uuid()),
+            requester_session_id: root.id,
+            target_session_id: child_id,
+            child_name: child.name.clone(),
+            intent: "Report the current state".into(),
+            model_id: "deterministic/demo".into(),
+            context_references: vec![],
+            dependencies: vec![],
+            code_change: false,
+            permissions: loom_core::ProjectAgentPermissions::default(),
+            status: loom_core::DelegatedTaskStatus::Queued,
+            created_at,
+            updated_at: created_at,
+        };
+        backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .create_project_child(
+                RequestId::new(),
+                &child,
+                backend.sessions().unwrap().next_sequence().next(),
+                &task,
+            )
+            .unwrap();
+        let (_, created_event) = backend
+            .sessions()
+            .unwrap()
+            .create_in_workspace_with_id(workspace.id, child_id, child.name.clone())
+            .unwrap();
+        backend.journal().unwrap().append_session(created_event);
+        child_id
+    };
+
+    // Finishing a child run transitions its session, then reconciles the task;
+    // that reconciliation is what reclaims an opted-in completed agent.
+    let complete = |child_id: AgentSessionId| {
+        let (_, record) = backend
+            .sessions()
+            .unwrap()
+            .transition(child_id, AgentSessionState::Completed)
+            .unwrap();
+        backend.journal().unwrap().append_session(record);
+        backend
+            .update_project_task_for_session_state(child_id, AgentSessionState::Completed)
+            .unwrap();
+    };
+
+    backend
+        .set_workspace_config(
+            workspace.id,
+            WorkspaceConfig {
+                revision: 1,
+                auto_archive_completed_agents: true,
+                ..WorkspaceConfig::default()
+            },
+        )
+        .unwrap();
+    let archived_child = delegate("Archived child");
+    complete(archived_child);
+    assert_eq!(
+        backend
+            .sessions()
+            .unwrap()
+            .get(archived_child)
+            .unwrap()
+            .state,
+        AgentSessionState::Archived
+    );
+    assert_eq!(
+        backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_delegated_task_for_target(archived_child)
+            .unwrap()
+            .unwrap()
+            .status,
+        loom_core::DelegatedTaskStatus::Completed
+    );
+
+    backend
+        .set_workspace_config(
+            workspace.id,
+            WorkspaceConfig {
+                revision: 2,
+                auto_archive_completed_agents: false,
+                ..WorkspaceConfig::default()
+            },
+        )
+        .unwrap();
+    let visible_child = delegate("Visible child");
+    complete(visible_child);
+    assert_eq!(
+        backend
+            .sessions()
+            .unwrap()
+            .get(visible_child)
+            .unwrap()
+            .state,
+        AgentSessionState::Completed,
+        "an opted-out workspace keeps a finished child visible"
+    );
+
+    drop(connection);
+    drop(backend);
+    let _ = fs::remove_dir_all(&temp);
+    let _ = fs::remove_file(path.with_extension("credentials.json"));
+}
+
+/// A code child is reclaimed only after its result is integrated, so an
+/// unreviewed checkout never disappears when the policy is on.
+#[test]
+fn auto_archive_waits_for_code_integration() {
+    let temp =
+        std::env::temp_dir().join(format!("loom-auto-archive-code-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&temp).unwrap();
+    let path = temp.join("state.sqlite");
+    let backend = InProcessBackend::new_persistent(&path).unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Auto archive code".into(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let root = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Manager".into(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+
+    let child_id = AgentSessionId::new();
+    let created_at = Timestamp::now();
+    let child = AgentSessionSnapshot {
+        id: child_id,
+        workspace_id: workspace.id,
+        name: "Code child".into(),
+        state: AgentSessionState::Idle,
+        created_at,
+        updated_at: created_at,
+    };
+    let task = loom_core::DelegatedTaskRecord {
+        task_id: loom_core::TaskId::new(),
+        project_id: ProjectId::from_uuid(*root.id.as_uuid()),
+        requester_session_id: root.id,
+        target_session_id: child_id,
+        child_name: child.name.clone(),
+        intent: "Change the checkout".into(),
+        model_id: "deterministic/demo".into(),
+        context_references: vec![],
+        dependencies: vec![],
+        code_change: true,
+        permissions: loom_core::ProjectAgentPermissions::default(),
+        status: loom_core::DelegatedTaskStatus::Queued,
+        created_at,
+        updated_at: created_at,
+    };
+    let mut worktree = loom_core::ProjectWorktreeRecord {
+        project_id: task.project_id,
+        task_id: task.task_id,
+        parent_session_id: root.id,
+        child_session_id: child_id,
+        parent_repository_id: loom_core::RepositoryId::new(),
+        child_repository_id: loom_core::RepositoryId::new(),
+        relative_path: "project-worktrees/child".into(),
+        worktree_name: "loom-child".into(),
+        branch_name: "loom/project-child".into(),
+        base_revision: "0123456789abcdef0123456789abcdef01234567".into(),
+        base_refresh: None,
+        result_revision: None,
+        integrated_revision: None,
+        status: loom_core::ProjectWorktreeStatus::Creating,
+        conflict_paths: vec![],
+        error: None,
+        cleanup_disposition: None,
+        created_at,
+        updated_at: created_at,
+    };
+    let persistence = backend.persistence.as_ref().unwrap();
+    persistence
+        .create_project_child_with_worktree(
+            RequestId::new(),
+            &child,
+            backend.sessions().unwrap().next_sequence().next(),
+            &task,
+            &worktree,
+        )
+        .unwrap();
+    let (_, created_event) = backend
+        .sessions()
+        .unwrap()
+        .create_in_workspace_with_id(workspace.id, child_id, child.name.clone())
+        .unwrap();
+    backend.journal().unwrap().append_session(created_event);
+    worktree.status = loom_core::ProjectWorktreeStatus::Ready;
+    persistence.save_project_worktree(&worktree).unwrap();
+    persistence
+        .update_delegated_task_status(
+            task.task_id,
+            loom_core::DelegatedTaskStatus::Completed,
+            Timestamp::now(),
+        )
+        .unwrap();
+    let (_, record) = backend
+        .sessions()
+        .unwrap()
+        .transition(child_id, AgentSessionState::Completed)
+        .unwrap();
+    backend.journal().unwrap().append_session(record);
+
+    backend
+        .set_workspace_config(
+            workspace.id,
+            WorkspaceConfig {
+                revision: 1,
+                auto_archive_completed_agents: true,
+                ..WorkspaceConfig::default()
+            },
+        )
+        .unwrap();
+
+    // A ready but un-integrated result keeps the child visible.
+    backend.auto_archive_completed_child(child_id).unwrap();
+    assert_eq!(
+        backend.sessions().unwrap().get(child_id).unwrap().state,
+        AgentSessionState::Completed,
+        "an un-integrated code result must stay visible"
+    );
+
+    // Once integrated, the policy reclaims it.
+    worktree.status = loom_core::ProjectWorktreeStatus::Integrated;
+    worktree.integrated_revision = Some("fedcba9876543210fedcba9876543210fedcba98".into());
+    persistence.save_project_worktree(&worktree).unwrap();
+    backend.auto_archive_completed_child(child_id).unwrap();
+    assert_eq!(
+        backend.sessions().unwrap().get(child_id).unwrap().state,
+        AgentSessionState::Archived
+    );
+
+    drop(connection);
+    drop(backend);
+    let _ = fs::remove_dir_all(&temp);
+    let _ = fs::remove_file(path.with_extension("credentials.json"));
+}

@@ -97,6 +97,50 @@ fn render_worker_section_row(
         )
 }
 
+/// Renders the collapsed agent-group row nested under a project. It is a quiet,
+/// indented summary that expands to the individual sub agents; it opens no
+/// session, so it has no click guard and the tree's own toggle handles it.
+fn render_agent_group_row(
+    label: &str,
+    active: bool,
+    expanded: bool,
+    row_index: usize,
+    layout: ResponsiveLayout,
+) -> ListItem {
+    let mut content = div().flex().items_center().gap_2().min_w(px(0.)).child(
+        div()
+            .w(px(12.))
+            .flex_shrink_0()
+            .child(disclosure_chevron(expanded, rgb(0x8f98a6)).size(px(12.))),
+    );
+    if active {
+        content = content.child(
+            div()
+                .w(px(6.))
+                .h(px(6.))
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(rgb(0xfbbf24)),
+        );
+    }
+    content = content.child(
+        div()
+            .flex_1()
+            .min_w(px(0.))
+            .truncate()
+            .text_xs()
+            .text_color(rgb(0x8f98a6))
+            .child(label.to_owned()),
+    );
+    ListItem::new(("session-tree-agents", row_index))
+        .mx_1()
+        .rounded_md()
+        .pl(px(if layout.phone { 24. } else { 18. }))
+        .pr_2()
+        .py(layout.nav_row_padding())
+        .child(content)
+}
+
 impl LoomView {
     pub(crate) fn render_new_session_button(
         &self,
@@ -305,11 +349,27 @@ impl LoomView {
                 SessionTreeRow::WorkerHeader { .. } => None,
             })
             .collect::<BTreeMap<_, _>>();
+        // Collapsed agent-group rows carry a live summary instead of the
+        // generic tree label, so a project communicates its agent activity at a
+        // glance without listing every sub agent.
+        let agent_groups = rows
+            .iter()
+            .filter_map(|row| match row {
+                SessionTreeRow::Project(node) if !node.children.is_empty() => Some((
+                    format!("{AGENT_GROUP_ID_PREFIX}{}", node.session_id),
+                    (
+                        agent_group_summary(node, &self.sessions),
+                        session_subtree_is_active(node, &active_sessions),
+                    ),
+                )),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
         let tree_items = rows
             .iter()
             .map(|row| match row {
                 SessionTreeRow::WorkerHeader { node_id } => worker_section_tree_item(node_id),
-                SessionTreeRow::Project(node) => session_tree_item(node),
+                SessionTreeRow::Project(node) => project_tree_item(node),
             })
             .collect::<Vec<_>>();
         let selected_session_id = self.active_session.id.to_string();
@@ -366,6 +426,22 @@ impl LoomView {
             let entry_id = entry.item().id.to_string();
             if let Some(node_id) = entry_id.strip_prefix(WORKER_SECTION_ID_PREFIX) {
                 return render_worker_section_row(headers.get(node_id), node_id, layout);
+            }
+            if let Some(root_session_id) = entry_id.strip_prefix(AGENT_GROUP_ID_PREFIX) {
+                let (label, active) = agent_groups
+                    .get(&entry_id)
+                    .cloned()
+                    .unwrap_or_else(|| ("Agents".to_owned(), false));
+                // Key the group row to its project's stable ordinal so its
+                // element id does not shuffle as the tree changes.
+                let row_index = ordinals.get(root_session_id).copied().unwrap_or(index);
+                return render_agent_group_row(
+                    &label,
+                    active,
+                    entry.is_expanded(),
+                    row_index,
+                    layout,
+                );
             }
             let session_id = entry_id;
             let row_index = ordinals.get(&session_id).copied().unwrap_or(index);
