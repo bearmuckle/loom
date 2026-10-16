@@ -79,6 +79,7 @@ pub enum ToolKind {
     GitHubCreatePullRequest,
     GitHubPushBranch,
     GitHubListIssues,
+    GitHubListIssueTypes,
     GitHubGetIssue,
     GitHubGetComments,
     GitHubCreateIssue,
@@ -109,6 +110,7 @@ impl ToolKind {
             "github_create_pull_request" => Some(Self::GitHubCreatePullRequest),
             "github_push_branch" => Some(Self::GitHubPushBranch),
             "github_list_issues" => Some(Self::GitHubListIssues),
+            "github_list_issue_types" => Some(Self::GitHubListIssueTypes),
             "github_get_issue" => Some(Self::GitHubGetIssue),
             "github_get_comments" => Some(Self::GitHubGetComments),
             "github_create_issue" => Some(Self::GitHubCreateIssue),
@@ -142,6 +144,7 @@ impl ToolKind {
             Self::GitHubCreatePullRequest => "github_create_pull_request",
             Self::GitHubPushBranch => "github_push_branch",
             Self::GitHubListIssues => "github_list_issues",
+            Self::GitHubListIssueTypes => "github_list_issue_types",
             Self::GitHubGetIssue => "github_get_issue",
             Self::GitHubGetComments => "github_get_comments",
             Self::GitHubCreateIssue => "github_create_issue",
@@ -182,6 +185,7 @@ impl ToolKind {
             | Self::GitHubListPullRequests
             | Self::GitHubGetPullRequest
             | Self::GitHubListIssues
+            | Self::GitHubListIssueTypes
             | Self::GitHubGetIssue
             | Self::GitHubGetComments
             | Self::GitHubGetBranchChecks => ActionKind::Network,
@@ -510,6 +514,7 @@ impl ToolExecutor {
                 ToolKind::GitHubListPullRequests
                 | ToolKind::GitHubGetPullRequest
                 | ToolKind::GitHubListIssues
+                | ToolKind::GitHubListIssueTypes
                 | ToolKind::GitHubGetIssue
                 | ToolKind::GitHubGetComments
                 | ToolKind::GitHubGetBranchChecks
@@ -635,6 +640,7 @@ impl ToolExecutor {
             ToolKind::GitHubCreatePullRequest => self.github_create_pull_request(call),
             ToolKind::GitHubPushBranch => self.github_push_branch(call),
             ToolKind::GitHubListIssues => self.github_list_issues(call),
+            ToolKind::GitHubListIssueTypes => self.github_list_issue_types(call),
             ToolKind::GitHubGetIssue => self.github_get_issue(call),
             ToolKind::GitHubGetComments => self.github_get_comments(call),
             ToolKind::GitHubCreateIssue => self.github_create_issue(call),
@@ -1378,6 +1384,45 @@ impl ToolExecutor {
         }
     }
 
+    /// Reads the issue types the organization defines, so a caller can pick a
+    /// name before writing one. Each entry is reduced to the `id` and `name`
+    /// that `github_create_issue` and `github_update_issue` accept; the rest of
+    /// the payload is organization metadata a caller does not need.
+    fn github_list_issue_types(&self, call: &ToolCall) -> ToolResult {
+        let arguments: GitHubListIssueTypesArguments = match parse_arguments(call) {
+            Ok(arguments) => arguments,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let owner = arguments.owner.trim();
+        if owner.is_empty() {
+            return ToolResult::failure(call, "owner must not be empty");
+        }
+        if !valid_github_owner(owner) {
+            return ToolResult::failure(call, "owner must be a GitHub organization login");
+        }
+        let path = format!("issue-types?per_page={GITHUB_PAGE_SIZE}");
+        match self.github_org_get(owner, &path) {
+            Ok(value) => {
+                let types = value.as_array().cloned().unwrap_or_default();
+                if types.len() > GITHUB_PAGE_SIZE {
+                    log::warn!(
+                        "the issue types defined by {owner} exceeded {GITHUB_PAGE_SIZE} entries and were truncated"
+                    );
+                }
+                let mapped = types
+                    .iter()
+                    .take(GITHUB_PAGE_SIZE)
+                    .map(github_issue_type_entry)
+                    .collect::<Vec<_>>();
+                ToolResult::success(
+                    call,
+                    self.limit_output(serde_json::Value::Array(mapped).to_string()),
+                )
+            }
+            Err(error) => ToolResult::failure(call, error),
+        }
+    }
+
     fn github_get_issue(&self, call: &ToolCall) -> ToolResult {
         let arguments: GitHubIssueArguments = match parse_arguments(call) {
             Ok(arguments) => arguments,
@@ -1446,14 +1491,29 @@ impl ToolExecutor {
         if let Some(labels) = arguments.labels.filter(|labels| !labels.is_empty()) {
             body.insert("labels".to_owned(), serde_json::json!(labels));
         }
+        let mut issue_type = None;
+        if let Some(requested) = arguments.issue_type {
+            match normalize_github_issue_type(&requested) {
+                Ok(normalized) => {
+                    body.insert("type".to_owned(), serde_json::json!(normalized));
+                    issue_type = Some(normalized);
+                }
+                Err(error) => return ToolResult::failure(call, error),
+            }
+        }
         match self.github_api(
             "POST",
             &arguments.repository,
             "issues",
             Some(serde_json::Value::Object(body)),
         ) {
-            Ok(value) => ToolResult::success(call, self.limit_output(value.to_string())),
-            Err(error) => ToolResult::failure(call, error),
+            Ok(value) => ToolResult::success(
+                call,
+                self.limit_output(github_issue_result(&value, issue_type.as_deref())),
+            ),
+            Err(error) => {
+                ToolResult::failure(call, github_issue_type_error(error, issue_type.as_deref()))
+            }
         }
     }
 
@@ -1484,10 +1544,20 @@ impl ToolExecutor {
         if let Some(labels) = arguments.labels {
             body.insert("labels".to_owned(), serde_json::json!(labels));
         }
+        let mut issue_type = None;
+        if let Some(requested) = arguments.issue_type {
+            match normalize_github_issue_type(&requested) {
+                Ok(normalized) => {
+                    body.insert("type".to_owned(), serde_json::json!(normalized));
+                    issue_type = Some(normalized);
+                }
+                Err(error) => return ToolResult::failure(call, error),
+            }
+        }
         if body.is_empty() {
             return ToolResult::failure(
                 call,
-                "provide at least one of title, body, state, or labels",
+                "provide at least one of title, body, state, labels, or type",
             );
         }
         match self.github_api(
@@ -1496,8 +1566,13 @@ impl ToolExecutor {
             &format!("issues/{}", arguments.number),
             Some(serde_json::Value::Object(body)),
         ) {
-            Ok(value) => ToolResult::success(call, self.limit_output(value.to_string())),
-            Err(error) => ToolResult::failure(call, error),
+            Ok(value) => ToolResult::success(
+                call,
+                self.limit_output(github_issue_result(&value, issue_type.as_deref())),
+            ),
+            Err(error) => {
+                ToolResult::failure(call, github_issue_type_error(error, issue_type.as_deref()))
+            }
         }
     }
 
@@ -1820,6 +1895,13 @@ impl ToolExecutor {
         }
     }
 
+    /// The connected account's token, or the shared "not connected" failure.
+    fn github_token(&self) -> std::result::Result<&str, String> {
+        self.github_token
+            .as_deref()
+            .ok_or_else(|| GITHUB_NOT_CONNECTED.to_owned())
+    }
+
     fn github_api(
         &self,
         method: &str,
@@ -1827,18 +1909,38 @@ impl ToolExecutor {
         path: &str,
         body: Option<serde_json::Value>,
     ) -> std::result::Result<serde_json::Value, String> {
-        let token = self
-            .github_token
-            .as_deref()
-            .ok_or_else(|| GITHUB_NOT_CONNECTED.to_owned())?;
+        let token = self.github_token()?;
         if !valid_github_repository(repository) {
             return Err("repository must be in owner/name format".to_owned());
         }
-        let url = format!(
-            "{}/repos/{repository}/{path}",
-            self.github_api_base.trim_end_matches('/')
-        );
-        let request = format!("{method} /repos/{repository}/{path}");
+        self.github_rest(token, method, &format!("repos/{repository}/{path}"), body)
+    }
+
+    /// Reads one organization-scoped path below `/orgs`. An organization has no
+    /// `owner/name` repository, so those routes cannot go through
+    /// [`Self::github_api`]; this shares the transport, the token check, the
+    /// status handling, and the decoding with it.
+    fn github_org_get(
+        &self,
+        owner: &str,
+        path: &str,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let token = self.github_token()?;
+        self.github_rest(token, "GET", &format!("orgs/{owner}/{path}"), None)
+    }
+
+    /// Performs one REST call below the API base. The request is named in every
+    /// failure, which is what makes a rejected or invented route
+    /// distinguishable from a genuinely missing resource.
+    fn github_rest(
+        &self,
+        token: &str,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let url = format!("{}/{path}", self.github_api_base.trim_end_matches('/'));
+        let request = format!("{method} /{path}");
         let (status, body) = github_request(&request, method, &url, token, body)?;
         if status >= 400 {
             return Err(format!(
@@ -2301,21 +2403,22 @@ fn parse_arguments<T: for<'de> Deserialize<'de>>(
         .map_err(|error| format!("invalid arguments for '{}': {error}", call.name))
 }
 
+/// A single GitHub owner or repository name: non-empty and limited to the
+/// characters a login or repository name may use, so it cannot change the shape
+/// of a request path.
+fn valid_github_owner(owner: &str) -> bool {
+    !owner.is_empty()
+        && owner
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
 fn valid_github_repository(repository: &str) -> bool {
     let mut parts = repository.split('/');
-    let Some(owner) = parts.next() else {
+    let (Some(owner), Some(name)) = (parts.next(), parts.next()) else {
         return false;
     };
-    let Some(name) = parts.next() else {
-        return false;
-    };
-    parts.next().is_none()
-        && !owner.is_empty()
-        && !name.is_empty()
-        && [owner, name].iter().all(|part| {
-            part.bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        })
+    parts.next().is_none() && valid_github_owner(owner) && valid_github_owner(name)
 }
 
 /// Performs one GitHub HTTP request and returns its status and raw body.
@@ -2464,6 +2567,72 @@ fn github_entry_text<'a>(value: &'a serde_json::Value, key: &str) -> &'a str {
         .unwrap_or_default()
 }
 
+/// Shortens one organization issue type to the name a caller writes and the id
+/// that identifies it.
+fn github_issue_type_entry(issue_type: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "id": issue_type.get("id").cloned().unwrap_or(serde_json::Value::Null),
+        "name": github_entry_text(issue_type, "name"),
+    })
+}
+
+/// Trims an issue type name and rejects an empty one, so a blank name never
+/// reaches the API as a silent no-op. Which names exist is the organization's
+/// decision, so the API stays the only authority on them: a name it rejects is
+/// reported from its own response, and [`ToolExecutor::github_list_issue_types`]
+/// lists the names it accepts.
+fn normalize_github_issue_type(value: &str) -> std::result::Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("type must not be empty".to_owned());
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// The issue type a create or update response carries, flattened to its name.
+/// GitHub reports the type either as the name itself or as the type object with
+/// a `name`, and a caller needs one of them to confirm what is set.
+fn github_issue_type_name(value: &serde_json::Value) -> Option<String> {
+    let issue_type = value.get("type")?;
+    if let Some(name) = issue_type.as_str() {
+        return (!name.is_empty()).then(|| name.to_owned());
+    }
+    issue_type
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+/// Renders a created or updated issue for the tool result: the issue object the
+/// API returned, unchanged, plus its `type` so a caller can confirm the type it
+/// set without reading the issue again. `requested` covers a response that does
+/// not carry a type at all, which would otherwise leave the caller unable to
+/// tell whether the write took effect.
+fn github_issue_result(value: &serde_json::Value, requested: Option<&str>) -> String {
+    let Some(fields) = value.as_object() else {
+        return value.to_string();
+    };
+    let mut result = fields.clone();
+    if let Some(name) = github_issue_type_name(value).or_else(|| requested.map(str::to_owned)) {
+        result.insert("type".to_owned(), serde_json::json!(name));
+    }
+    serde_json::Value::Object(result).to_string()
+}
+
+/// Keeps the API's rejection verbatim and adds where a valid name comes from.
+/// An issue type is the one rejected field whose accepted values belong to the
+/// organization rather than to the API's own vocabulary, so a `422` on a write
+/// that carried a type must also say how to find a name that works.
+fn github_issue_type_error(error: String, requested: Option<&str>) -> String {
+    match requested {
+        Some(name) if error.contains("HTTP 422") => format!(
+            "{error}\nHint: the organization may not define the issue type '{name}'; github_list_issue_types lists the names it does define."
+        ),
+        _ => error,
+    }
+}
+
 /// The link to a check entry's details: check runs expose `html_url` and
 /// `details_url`, commit statuses expose `target_url`.
 fn github_entry_link(value: &serde_json::Value) -> &str {
@@ -2577,6 +2746,16 @@ struct GitHubListIssuesArguments {
     labels: Option<Vec<String>>,
 }
 
+/// Arguments of the organization-scoped issue-type read. Issue types are
+/// defined by an organization, not by a repository, so this tool takes the
+/// owner directly: that is the path segment `GET /orgs/{org}/issue-types`
+/// needs, and it stays usable for an organization a session has no repository
+/// in.
+#[derive(Debug, Deserialize)]
+struct GitHubListIssueTypesArguments {
+    owner: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct GitHubIssueArguments {
     repository: String,
@@ -2589,6 +2768,10 @@ struct GitHubCreateIssueArguments {
     title: String,
     body: Option<String>,
     labels: Option<Vec<String>>,
+    /// The organization-defined issue type name. GitHub writes and reports it
+    /// as `type`, so the argument keeps that name.
+    #[serde(rename = "type")]
+    issue_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2599,6 +2782,10 @@ struct GitHubUpdateIssueArguments {
     body: Option<String>,
     state: Option<String>,
     labels: Option<Vec<String>>,
+    /// The organization-defined issue type name. GitHub writes and reports it
+    /// as `type`, so the argument keeps that name.
+    #[serde(rename = "type")]
+    issue_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2959,6 +3146,18 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: ToolKind::GitHubListIssueTypes.name().to_owned(),
+            description: "List the issue types an organization defines, so a `type` name can be picked before creating or updating an issue. Each entry carries only the type's id and name; the list is bounded. Requires a connected GitHub account and approval for network access.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "owner": {"type": "string", "description": "Organization login: the owner part of a repository in owner/name format."}
+                },
+                "required": ["owner"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
             name: ToolKind::GitHubGetIssue.name().to_owned(),
             description: "Read an issue's details, labels, state, and conversation comments by number. Requires a connected GitHub account and approval for network access.".to_owned(),
             input_schema: serde_json::json!({
@@ -2986,14 +3185,15 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolKind::GitHubCreateIssue.name().to_owned(),
-            description: "Create an issue in a GitHub repository, optionally with labels. Returns the created issue, including its number and URL. Requires explicit write approval.".to_owned(),
+            description: "Create an issue in a GitHub repository, optionally with labels and an organization issue type. Returns the created issue, including its number, URL, and type. Requires explicit write approval.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "repository": {"type": "string", "description": "Repository in owner/name format."},
                     "title": {"type": "string"},
                     "body": {"type": "string"},
-                    "labels": {"type": "array", "items": {"type": "string"}}
+                    "labels": {"type": "array", "items": {"type": "string"}},
+                    "type": {"type": "string", "description": "Name of an issue type the organization defines (see github_list_issue_types); the API rejects an unknown name."}
                 },
                 "required": ["repository", "title"],
                 "additionalProperties": false
@@ -3001,7 +3201,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolKind::GitHubUpdateIssue.name().to_owned(),
-            description: "Update an issue's title, body, state, or labels by number. Provide at least one field; when both title and body are given they are applied in a single request. Requires explicit write approval.".to_owned(),
+            description: "Update an issue's title, body, state, labels, or organization issue type by number. Provide at least one field; when both title and body are given they are applied in a single request. The result reports the issue's type. Requires explicit write approval.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -3010,7 +3210,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "title": {"type": "string"},
                     "body": {"type": "string"},
                     "state": {"type": "string", "enum": ["open", "closed"]},
-                    "labels": {"type": "array", "items": {"type": "string"}, "description": "Replaces the issue's labels when present."}
+                    "labels": {"type": "array", "items": {"type": "string"}, "description": "Replaces the issue's labels when present."},
+                    "type": {"type": "string", "description": "Name of an issue type the organization defines (see github_list_issue_types); the API rejects an unknown name."}
                 },
                 "required": ["repository", "number"],
                 "additionalProperties": false
@@ -4025,6 +4226,7 @@ mod tests {
             "github_get_branch_checks",
             "github_create_pull_request",
             "github_list_issues",
+            "github_list_issue_types",
             "github_get_issue",
             "github_get_comments",
             "github_create_issue",
@@ -4717,6 +4919,295 @@ mod tests {
         assert!(!bad_state.success);
         assert!(bad_state.output.contains("open or closed"));
         assert_eq!(mock.requests().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_update_issue_sends_and_reports_the_issue_type() {
+        let root = workspace();
+        let mock = MockGitHub::start(vec![
+            MockResponse::json(serde_json::json!({
+                "number": 5,
+                "state": "open",
+                "type": {"id": 1, "name": "Bug"}
+            })),
+            MockResponse::json(serde_json::json!({"number": 5, "state": "closed"})),
+        ]);
+        let executor = github_executor(&root, &mock);
+        let typed = executor.execute(&call(
+            "github_update_issue",
+            serde_json::json!({"repository": "owner/name", "number": 5, "type": " Bug "}),
+        ));
+        assert!(typed.success, "{}", typed.output);
+        // A response that carries the type as an object still reports the name,
+        // so the caller can confirm what is set without reading the issue.
+        let updated: serde_json::Value = serde_json::from_str(&typed.output).unwrap();
+        assert_eq!(updated["state"], "open");
+        assert_eq!(updated["type"], "Bug");
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_str(&requests[0].2).unwrap();
+        assert_eq!(body["type"], "Bug");
+
+        // An absent type omits the key rather than sending a null, and a
+        // response without a type reports none instead of inventing one.
+        let plain = executor.execute(&call(
+            "github_update_issue",
+            serde_json::json!({"repository": "owner/name", "number": 5, "state": "closed"}),
+        ));
+        assert!(plain.success, "{}", plain.output);
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        let body: serde_json::Value = serde_json::from_str(&requests[1].2).unwrap();
+        assert!(body.get("type").is_none(), "{body}");
+        let plain_result: serde_json::Value = serde_json::from_str(&plain.output).unwrap();
+        assert!(plain_result.get("type").is_none(), "{plain_result}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_create_issue_sends_and_reports_the_issue_type() {
+        let root = workspace();
+        let mock = MockGitHub::start(vec![MockResponse::body(
+            201,
+            r#"{"number": 7, "html_url": "https://github.com/owner/name/issues/7", "type": "Bug"}"#,
+        )]);
+        let executor = github_executor(&root, &mock);
+        let created = executor.execute(&call(
+            "github_create_issue",
+            serde_json::json!({
+                "repository": "owner/name",
+                "title": "Gap",
+                "type": "Bug"
+            }),
+        ));
+        assert!(created.success, "{}", created.output);
+        let result: serde_json::Value = serde_json::from_str(&created.output).unwrap();
+        assert_eq!(result["number"], 7);
+        assert_eq!(result["type"], "Bug");
+        let requests = mock.requests();
+        assert_eq!(requests[0].0, "POST");
+        assert_eq!(requests[0].1, "/repos/owner/name/issues");
+        let body: serde_json::Value = serde_json::from_str(&requests[0].2).unwrap();
+        assert_eq!(body["title"], "Gap");
+        assert_eq!(body["type"], "Bug");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_issue_type_must_not_be_blank() {
+        let root = workspace();
+        let mock = MockGitHub::start(Vec::new());
+        let executor = github_executor(&root, &mock);
+        for (name, arguments) in [
+            (
+                "github_update_issue",
+                serde_json::json!({"repository": "owner/name", "number": 5, "type": "  "}),
+            ),
+            (
+                "github_create_issue",
+                serde_json::json!({"repository": "owner/name", "title": "Gap", "type": ""}),
+            ),
+        ] {
+            let result = executor.execute(&call(name, arguments));
+            assert!(!result.success, "{}", result.output);
+            assert!(
+                result.output.contains("type must not be empty"),
+                "{}",
+                result.output
+            );
+        }
+        assert!(mock.requests().is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_issue_type_write_reports_the_api_rejection() {
+        let root = workspace();
+        let rejected = r#"{"message":"Issue type 'Nope' is not a valid type","status":"422"}"#;
+        let mock = MockGitHub::start(vec![
+            MockResponse::body(422, rejected),
+            MockResponse::body(422, rejected),
+            MockResponse::body(500, r#"{"message":"Server Error"}"#),
+        ]);
+        let executor = github_executor(&root, &mock);
+        for (name, arguments) in [
+            (
+                "github_update_issue",
+                serde_json::json!({"repository": "owner/name", "number": 5, "type": "Nope"}),
+            ),
+            (
+                "github_create_issue",
+                serde_json::json!({"repository": "owner/name", "title": "Gap", "type": "Nope"}),
+            ),
+        ] {
+            let result = executor.execute(&call(name, arguments));
+            assert!(!result.success);
+            // The API's own words reach the caller, so an unknown name is not
+            // reported as a failed request, and the hint says where valid names
+            // are listed.
+            assert!(
+                result
+                    .output
+                    .contains("Issue type 'Nope' is not a valid type"),
+                "{}",
+                result.output
+            );
+            assert!(result.output.contains("HTTP 422"), "{}", result.output);
+            assert!(
+                result.output.contains("github_list_issue_types"),
+                "{}",
+                result.output
+            );
+        }
+        let requests = mock.requests();
+        let body: serde_json::Value = serde_json::from_str(&requests[0].2).unwrap();
+        assert_eq!(body["type"], "Nope");
+        let body: serde_json::Value = serde_json::from_str(&requests[1].2).unwrap();
+        assert_eq!(body["type"], "Nope");
+
+        // A failure that is not tied to the type keeps the API's error alone.
+        let other = executor.execute(&call(
+            "github_update_issue",
+            serde_json::json!({"repository": "owner/name", "number": 5, "state": "closed"}),
+        ));
+        assert!(!other.success);
+        assert!(other.output.contains("HTTP 500"), "{}", other.output);
+        assert!(!other.output.contains("Hint:"), "{}", other.output);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_list_issue_types_requires_an_owner() {
+        let root = workspace();
+        let result = github_executor(&root, &MockGitHub::start(Vec::new()))
+            .execute(&call("github_list_issue_types", serde_json::json!({})));
+        assert!(!result.success);
+        assert!(
+            result
+                .output
+                .contains("invalid arguments for 'github_list_issue_types'"),
+            "{}",
+            result.output
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_list_issue_types_maps_the_response_and_bounds_it() {
+        let root = workspace();
+        let many = (0..GITHUB_PAGE_SIZE + 5)
+            .map(|index| {
+                serde_json::json!({
+                    "id": index + 1,
+                    "node_id": format!("IT_{index}"),
+                    "name": format!("Type{index}"),
+                    "description": "dropped",
+                    "color": "red",
+                    "is_enabled": true
+                })
+            })
+            .collect::<Vec<_>>();
+        let mock = MockGitHub::start(vec![
+            MockResponse::json(serde_json::Value::Array(many)),
+            MockResponse::json(serde_json::json!([
+                {"id": 3, "name": "Task", "description": "dropped"},
+                {"id": 4, "name": "Feature"}
+            ])),
+        ]);
+        let executor = github_executor(&root, &mock);
+        let result = executor.execute(&call(
+            "github_list_issue_types",
+            serde_json::json!({"owner": " owner "}),
+        ));
+
+        assert!(result.success, "{}", result.output);
+        let types: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        let entries = types.as_array().unwrap();
+        assert_eq!(entries.len(), GITHUB_PAGE_SIZE);
+        assert_eq!(entries[0]["id"], 1);
+        assert_eq!(entries[0]["name"], "Type0");
+        // Only the id and the name a caller needs stay in the bounded result.
+        assert_eq!(entries[0].as_object().unwrap().len(), 2);
+
+        // A list within the page size comes back whole, with the fields a
+        // caller does not need dropped.
+        let short = executor.execute(&call(
+            "github_list_issue_types",
+            serde_json::json!({"owner": "owner"}),
+        ));
+        assert!(short.success, "{}", short.output);
+        let types: serde_json::Value = serde_json::from_str(&short.output).unwrap();
+        let entries = types.as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1]["name"], "Feature");
+        assert_eq!(entries[1].as_object().unwrap().len(), 2);
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert_eq!(request.0, "GET");
+            assert_eq!(request.1, "/orgs/owner/issue-types?per_page=100");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_list_issue_types_validates_the_owner_and_reports_api_errors() {
+        let root = workspace();
+        let mock = MockGitHub::start(vec![MockResponse::body(404, r#"{"message":"Not Found"}"#)]);
+        let executor = github_executor(&root, &mock);
+        let missing = executor.execute(&call(
+            "github_list_issue_types",
+            serde_json::json!({"owner": "owner"}),
+        ));
+        assert!(!missing.success);
+        assert!(missing.output.contains("HTTP 404"), "{}", missing.output);
+        // An invented route must stay distinguishable from a missing resource.
+        assert!(
+            missing
+                .output
+                .contains("for GET /orgs/owner/issue-types?per_page=100"),
+            "{}",
+            missing.output
+        );
+
+        let blank = executor.execute(&call(
+            "github_list_issue_types",
+            serde_json::json!({"owner": "  "}),
+        ));
+        assert!(!blank.success);
+        assert!(
+            blank.output.contains("owner must not be empty"),
+            "{}",
+            blank.output
+        );
+        let malformed = executor.execute(&call(
+            "github_list_issue_types",
+            serde_json::json!({"owner": "owner/name"}),
+        ));
+        assert!(!malformed.success);
+        assert!(
+            malformed
+                .output
+                .contains("owner must be a GitHub organization login"),
+            "{}",
+            malformed.output
+        );
+        // Neither locally rejected call reaches the network.
+        assert_eq!(mock.requests().len(), 1);
+
+        let disconnected = ToolExecutor::new(&root).unwrap().execute(&call(
+            "github_list_issue_types",
+            serde_json::json!({"owner": "owner"}),
+        ));
+        assert!(!disconnected.success);
+        assert!(
+            disconnected.output.contains("GitHub is not connected"),
+            "{}",
+            disconnected.output
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -5740,6 +6231,7 @@ mod helper_tests {
             ToolKind::GitHubCreatePullRequest,
             ToolKind::GitHubPushBranch,
             ToolKind::GitHubListIssues,
+            ToolKind::GitHubListIssueTypes,
             ToolKind::GitHubGetIssue,
             ToolKind::GitHubGetComments,
             ToolKind::GitHubCreateIssue,
@@ -5769,6 +6261,7 @@ mod helper_tests {
                 | ToolKind::GitHubCreatePullRequest
                 | ToolKind::GitHubPushBranch
                 | ToolKind::GitHubListIssues
+                | ToolKind::GitHubListIssueTypes
                 | ToolKind::GitHubGetIssue
                 | ToolKind::GitHubGetComments
                 | ToolKind::GitHubCreateIssue
