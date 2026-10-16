@@ -110,6 +110,55 @@ fn reasoning_visibility_toggle_round_trips(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+#[gpui_kit::test]
+fn output_detail_choices_round_trip(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        assert_eq!(view.output_detail, crate::state::OutputDetail::Medium);
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Appearance));
+        view
+    });
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window
+            .within("settings-dialog")
+            .click(("output-detail", 0usize), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let view = window.root::<LoomView>().unwrap().unwrap();
+        view.update(cx, |view, _| {
+            assert_eq!(view.output_detail, crate::state::OutputDetail::Low);
+        });
+        window
+            .within("settings-dialog")
+            .click(("output-detail", 2usize), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let view = window.root::<LoomView>().unwrap().unwrap();
+        view.update(cx, |view, cx| {
+            assert_eq!(view.output_detail, crate::state::OutputDetail::High);
+            view.set_output_detail(crate::state::OutputDetail::Low, cx);
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        let view = window.root::<LoomView>().unwrap().unwrap();
+        view.update(cx, |view, _| {
+            assert_eq!(view.output_detail, crate::state::OutputDetail::Low);
+        });
+    })
+    .unwrap();
+}
+
 #[test]
 fn github_login_kind_secure_messages_differ() {
     assert!(

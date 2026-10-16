@@ -10,6 +10,7 @@ use super::{
 };
 use crate::state::GitHubLoginState;
 use crate::state::InspectorTab;
+use crate::state::OutputDetail;
 use crate::state::RenameDialogState;
 use crate::state::ThemeChoice;
 use crate::state::TimelineItem;
@@ -4968,4 +4969,150 @@ fn reasoning_visibility_follows_the_settings_toggle(cx: &mut TestAppContext) {
         })
         .unwrap();
     }
+}
+
+/// One agent entry holding a tool call with a body, gathered reasoning, and
+/// text, so every disclosure a detail level controls applies to it.
+fn output_detail_turn() -> TimelineItem {
+    TimelineItem::Assistant(AssistantTurn {
+        parts: vec![
+            AssistantPart::Tool(Box::new(ToolPart {
+                id: ToolCallId::new(),
+                name: "web_search".to_owned(),
+                title: "Web search \"needle\"".to_owned(),
+                status: ToolPartStatus::Completed,
+                detail: None,
+                output: Some(r#"{"results":[]}"#.to_owned()),
+                elapsed_ms: Some(12),
+                approval_pending: false,
+                policy: None,
+            })),
+            AssistantPart::Reasoning("weighed the options".to_owned()),
+            AssistantPart::Text("the answer".to_owned()),
+        ],
+        streaming: false,
+    })
+}
+
+#[gpui_kit::test]
+fn medium_output_detail_keeps_tool_activity_collapsed(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.output_detail = OutputDetail::Medium;
+            view.sessions = vec![view.active_session.clone()];
+            view.timeline = vec![output_detail_turn()];
+            view
+        });
+        gpui_kit::component::Root::new(view, window, cx)
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        // Medium is today's transcript: the run stays behind its usage summary,
+        // and reasoning stays behind the Show model reasoning switch.
+        assert!(window.try_find(("tool-usage-header", 0u64)).is_some());
+        assert!(window.try_find(("tool", 0u64)).is_none());
+        assert!(window.try_find(("copy-tool-output", 0u64)).is_none());
+        assert!(window.try_find(("reasoning-header", 1u64)).is_none());
+        assert!(window.try_find(("assistant-text", 2u64)).is_some());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn low_output_detail_shows_only_the_agent_replies(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.output_detail = OutputDetail::Low;
+            // Even with reasoning switched on, Low shows the replies only.
+            view.show_reasoning = true;
+            view.sessions = vec![view.active_session.clone()];
+            view.timeline = vec![output_detail_turn()];
+            view
+        });
+        gpui_kit::component::Root::new(view, window, cx)
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find(("tool-usage-header", 0u64)).is_none());
+        assert!(window.try_find(("reasoning-header", 1u64)).is_none());
+        assert!(window.try_find(("assistant-text", 2u64)).is_some());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn low_output_detail_keeps_a_blocked_tool_run_reachable(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let call = loom_model::ToolCall {
+        id: ToolCallId::new(),
+        name: "run_command".to_owned(),
+        arguments: serde_json::Value::Null,
+    };
+    let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.output_detail = OutputDetail::Low;
+            view.sessions = vec![view.active_session.clone()];
+            view.pending_approval = Some(call.clone());
+            view.timeline = vec![TimelineItem::Assistant(AssistantTurn {
+                parts: vec![AssistantPart::Tool(Box::new(ToolPart {
+                    id: call.id,
+                    name: "run_command".to_owned(),
+                    title: "Run cargo test".to_owned(),
+                    status: ToolPartStatus::AwaitingApproval,
+                    detail: Some("cargo test".to_owned()),
+                    output: None,
+                    elapsed_ms: None,
+                    approval_pending: true,
+                    policy: None,
+                }))],
+                streaming: false,
+            })];
+            view
+        });
+        gpui_kit::component::Root::new(view, window, cx)
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        // A run blocked on the user keeps its usage block at every level, so the
+        // decision control stays reachable without a click.
+        assert!(window.try_find(("tool-usage-header", 0u64)).is_some());
+        assert!(window.try_find(("tool-header", 0u64)).is_some());
+        assert!(window.try_find(("approve-tool", 0u64)).is_some());
+        assert!(window.try_find(("reject-tool", 0u64)).is_some());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn high_output_detail_opens_the_disclosures_without_a_click(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.output_detail = OutputDetail::High;
+        view.show_reasoning = true;
+        view.sessions = vec![view.active_session.clone()];
+        view.timeline = vec![output_detail_turn()];
+        view
+    });
+    cx.update_window(handle.into(), |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        window.render_frame(cx);
+        assert!(window.try_find(("reasoning-header", 1u64)).is_some());
+        assert!(window.try_find(("reasoning-body", 1u64)).is_some());
+        assert!(window.try_find(("tool-usage-header", 0u64)).is_some());
+        assert!(window.try_find(("copy-tool-output", 0u64)).is_some());
+        // The disclosures are open because the level is High, not because a
+        // click was recorded: High is a display default, not a lock.
+        view.update(cx, |view, _| {
+            assert!(view.expanded_reasoning.is_empty());
+            assert!(view.expanded_tool_usage.is_empty());
+            assert!(view.expanded_tools.is_empty());
+        });
+    })
+    .unwrap();
 }

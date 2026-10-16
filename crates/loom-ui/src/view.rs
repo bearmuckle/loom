@@ -75,10 +75,10 @@ use crate::{
     connection::{BackendWorker, ClientConnection, ConnectionCleanupGuard},
     state::{
         AssistantPart, AssistantTurn, EvidenceText, FilesState, GitHubLoginKind, GitHubLoginState,
-        InspectorTab, PlanState, PlanStepStatus, ProjectDeleteDialogState, RenameDialogState,
-        ReviewState, SystemNote, SystemTone, ThemeChoice, TimelineItem, ToolPart, ToolPartStatus,
-        UsageState, bounded, bounded_to, finish_assistant_turn, has_tool_part,
-        push_assistant_evidence, push_assistant_reasoning, push_assistant_text,
+        InspectorTab, OutputDetail, PlanState, PlanStepStatus, ProjectDeleteDialogState,
+        RenameDialogState, ReviewState, SystemNote, SystemTone, ThemeChoice, TimelineItem,
+        ToolPart, ToolPartStatus, UsageState, bounded, bounded_to, finish_assistant_turn,
+        has_tool_part, push_assistant_evidence, push_assistant_reasoning, push_assistant_text,
         session_state_for_run, upsert_tool_part,
     },
     syntax::{self, Language},
@@ -618,6 +618,10 @@ pub(crate) struct LoomView {
     /// Whether provider reasoning is shown in the transcript. Off by default;
     /// this is presentation-only and never changes what is sent to providers.
     pub(crate) show_reasoning: bool,
+    /// How much agent activity the transcript shows. `Medium` is the default and
+    /// matches the transcript without this setting; like `show_reasoning` it is
+    /// presentation-only and never changes what is sent to providers.
+    pub(crate) output_detail: OutputDetail,
     appearance_subscription: Option<Subscription>,
     /// App-wide keystroke interceptor for shortcuts that must work regardless
     /// of which element (if any) holds focus.
@@ -1253,6 +1257,50 @@ fn settings_stepper(
         .child(increase)
 }
 
+/// The pill container shared by the appearance choice rows, so the theme and
+/// output detail rows read as one kind of control.
+fn appearance_choice_container(children: Vec<gpui_kit::AnyElement>) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap_1()
+        .p_1()
+        .rounded_md()
+        .bg(rgb(0x20242c))
+        .children(children)
+}
+
+/// One choice chip of an appearance row. The id carries test support so render
+/// tests can click a specific choice.
+fn appearance_choice_chip(
+    id: (&'static str, usize),
+    label: &str,
+    selected: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .test_support()
+        .px_3()
+        .py_1()
+        .rounded_sm()
+        .cursor_pointer()
+        .bg(if selected {
+            rgb(0x263b58)
+        } else {
+            rgb(0x20242c)
+        })
+        .text_xs()
+        .text_color(if selected {
+            rgb(0xe5e7eb)
+        } else {
+            rgb(0xb7c0d0)
+        })
+        .child(label.to_owned())
+        .on_click(on_click)
+}
+
 /// The settings dialog's section navigation. On phone layouts the sections
 /// become a wrapping tab strip above the content; on larger screens they stay
 /// a vertical sidebar.
@@ -1805,6 +1853,7 @@ impl LoomView {
             theme_choice: ThemeChoice::System,
             font_scale_percent: DEFAULT_FONT_SCALE_PERCENT,
             show_reasoning: false,
+            output_detail: OutputDetail::default(),
             appearance_subscription: None,
             shortcut_interceptor: None,
             after_sequence: None,

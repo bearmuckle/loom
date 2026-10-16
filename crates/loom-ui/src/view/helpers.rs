@@ -1761,6 +1761,17 @@ pub(crate) fn tool_needs_attention(tools: &[&ToolPart]) -> bool {
     })
 }
 
+/// The tool calls of one gathered run, in the order they arrived.
+pub(crate) fn run_tool_parts(parts: &[AssistantPart]) -> Vec<&ToolPart> {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            AssistantPart::Tool(tool) => Some(tool.as_ref()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Renders a tool result as a patch when it looks like one, otherwise as code.
 pub(crate) fn render_tool_output(
     id: impl Into<gpui_kit::ElementId>,

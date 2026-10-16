@@ -17,7 +17,8 @@ impl LoomView {
 
         // Every reasoning part in the response is gathered into one disclosure
         // at the top of the agent entry, so a tool-using model that thinks
-        // before each call still reads as a single turn.
+        // before each call still reads as a single turn. Low hides reasoning
+        // entirely, like tool activity; High starts the disclosure expanded.
         let reasoning = turn
             .parts
             .iter()
@@ -29,7 +30,7 @@ impl LoomView {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        if self.show_reasoning && !reasoning.is_empty() {
+        if self.output_detail.shows_activity() && self.show_reasoning && !reasoning.is_empty() {
             let first_part_index = reasoning[0].0;
             let combined = reasoning
                 .iter()
@@ -41,7 +42,8 @@ impl LoomView {
                 first_part_index,
                 &combined,
                 self.expanded_reasoning
-                    .contains(&tool_element_id(index, first_part_index)),
+                    .contains(&tool_element_id(index, first_part_index))
+                    || self.output_detail.expands_activity(),
                 parent,
             ));
         }
@@ -58,11 +60,19 @@ impl LoomView {
                         if turn.streaming && part_index + 1 == turn.parts.len() {
                             display.push('▮');
                         }
-                        body = body.child(render_timeline_text(
-                            format!("transcript-assistant-{index}-{part_index}"),
-                            display,
-                            0xf3f4f6,
-                        ));
+                        // The wrapper carries the part's id so a transcript test
+                        // can tell which parts a detail level renders.
+                        body = body.child(
+                            div()
+                                .id(("assistant-text", tool_element_id(index, part_index)))
+                                .test_support()
+                                .w_full()
+                                .child(render_timeline_text(
+                                    format!("transcript-assistant-{index}-{part_index}"),
+                                    display,
+                                    0xf3f4f6,
+                                )),
+                        );
                     }
                     part_index += 1;
                 }
@@ -78,12 +88,15 @@ impl LoomView {
                             _ => break,
                         }
                     }
-                    body = body.child(self.render_tool_usage(
-                        &turn.parts[part_index..end],
-                        index,
-                        part_index,
-                        parent,
-                    ));
+                    let parts = &turn.parts[part_index..end];
+                    // Low hides the agent's work, except for a run blocked on the
+                    // user: its usage block holds the approval and input
+                    // controls, so it stays reachable at every level.
+                    if self.output_detail.shows_activity()
+                        || tool_needs_attention(&run_tool_parts(parts))
+                    {
+                        body = body.child(self.render_tool_usage(parts, index, part_index, parent));
+                    }
                     part_index = end;
                 }
                 AssistantPart::Evidence(links) => {
@@ -153,20 +166,30 @@ impl LoomView {
                     ),
             );
         if expanded {
-            block = block.child(div().mt_1().child(render_timeline_text(
-                format!("transcript-reasoning-{index}-{first_part_index}"),
-                text.to_owned(),
-                0x94a3b8,
-            )));
+            // The wrapper carries the body's id so a transcript test can tell
+            // whether the disclosure was open without clicking.
+            block = block.child(
+                div()
+                    .id(("reasoning-body", key))
+                    .test_support()
+                    .mt_1()
+                    .child(render_timeline_text(
+                        format!("transcript-reasoning-{index}-{first_part_index}"),
+                        text.to_owned(),
+                        0x94a3b8,
+                    )),
+            );
         }
         block.into_any()
     }
 
     /// One collapsed line for a run of tool calls, summarizing the tools by type
     /// and invocation count. Expanding it shows the existing per-tool
-    /// presentation. The line starts collapsed and only opens on click; a run
-    /// that is blocked on an approval or an input decision opens automatically
-    /// so the control stays reachable.
+    /// presentation. A run that is blocked on an approval or an input decision
+    /// opens automatically so the control stays reachable, and the High output
+    /// detail level opens it because the level says so. The latter is a display
+    /// default rather than a lock: clicking the line still records the user's
+    /// own expansion state.
     pub(crate) fn render_tool_usage(
         &self,
         parts: &[AssistantPart],
@@ -174,13 +197,7 @@ impl LoomView {
         first_part_index: usize,
         parent: &Entity<LoomView>,
     ) -> gpui_kit::AnyElement {
-        let tools = parts
-            .iter()
-            .filter_map(|part| match part {
-                AssistantPart::Tool(tool) => Some(tool.as_ref()),
-                _ => None,
-            })
-            .collect::<Vec<&ToolPart>>();
+        let tools = run_tool_parts(parts);
         if tools.is_empty() {
             return div().into_any();
         }
@@ -196,7 +213,9 @@ impl LoomView {
         };
         let status_label = status.label();
         let key = tool_element_id(index, first_part_index);
-        let expanded = self.expanded_tool_usage.contains(&key) || tool_needs_attention(&tools);
+        let expanded = self.expanded_tool_usage.contains(&key)
+            || tool_needs_attention(&tools)
+            || self.output_detail.expands_activity();
         let total_ms = tools.iter().filter_map(|tool| tool.elapsed_ms).sum::<u64>();
         let duration = (total_ms > 0).then(|| format_duration(total_ms));
         let summary = tool_usage_summary(&tools);
@@ -324,13 +343,7 @@ impl LoomView {
         first_part_index: usize,
         parent: &Entity<LoomView>,
     ) -> gpui_kit::AnyElement {
-        let tools = parts
-            .iter()
-            .filter_map(|part| match part {
-                AssistantPart::Tool(tool) => Some(tool.as_ref()),
-                _ => None,
-            })
-            .collect::<Vec<&ToolPart>>();
+        let tools = run_tool_parts(parts);
         let Some(first) = tools.first() else {
             return div().into_any();
         };
@@ -348,8 +361,12 @@ impl LoomView {
         let key = tool_element_id(index, first_part_index);
         // A group starts collapsed like the summary above it; only a call that
         // needs the user opens it, so a running group does not flicker open and
-        // shut as each call settles.
-        let expanded = self.expanded_tool_groups.contains(&key) || tool_needs_attention(&tools);
+        // shut as each call settles. The High output detail level also opens it
+        // because the level says so, which is a display default rather than a
+        // lock on the click state.
+        let expanded = self.expanded_tool_groups.contains(&key)
+            || tool_needs_attention(&tools)
+            || self.output_detail.expands_activity();
         let total_ms = tools.iter().filter_map(|tool| tool.elapsed_ms).sum::<u64>();
         let duration = (total_ms > 0).then(|| format_duration(total_ms));
         let label = tool_group_label(&first.name, tools.len());
@@ -477,10 +494,13 @@ impl LoomView {
         let duration = part.elapsed_ms.map(format_duration);
         // Active and approval-gated work stays open; finished successes collapse
         // so the transcript stays scannable. A failure is collapsed too, and a
-        // block with nothing to reveal has no disclosure control at all.
+        // block with nothing to reveal has no disclosure control at all. The
+        // High output detail level opens every block because the level says so;
+        // that is a display default rather than a lock on the click state.
         let expandable = tool_has_body(part);
         let expanded = expandable
             && (self.expanded_tools.contains(&part.id)
+                || self.output_detail.expands_activity()
                 || matches!(
                     part.status,
                     ToolPartStatus::Running

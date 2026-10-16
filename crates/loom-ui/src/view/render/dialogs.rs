@@ -1557,40 +1557,24 @@ impl LoomView {
                         .child(settings_row(
                             "Theme",
                             "Follow the system or choose a palette",
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .items_center()
-                                .gap_1()
-                                .p_1()
-                                .rounded_md()
-                                .bg(rgb(0x20242c))
-                                .children(ThemeChoice::ALL.into_iter().enumerate().map(
-                                    |(index, choice)| {
+                            appearance_choice_container(
+                                ThemeChoice::ALL
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(index, choice)| {
                                         let selected = choice == self.theme_choice;
-                                        div()
-                                            .id(("theme-choice", index))
-                                            .px_3()
-                                            .py_1()
-                                            .rounded_sm()
-                                            .cursor_pointer()
-                                            .bg(if selected {
-                                                rgb(0x263b58)
-                                            } else {
-                                                rgb(0x20242c)
-                                            })
-                                            .text_xs()
-                                            .text_color(if selected {
-                                                rgb(0xe5e7eb)
-                                            } else {
-                                                rgb(0xb7c0d0)
-                                            })
-                                            .child(choice.label())
-                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                        appearance_choice_chip(
+                                            ("theme-choice", index),
+                                            choice.label(),
+                                            selected,
+                                            cx.listener(move |this, _, window, cx| {
                                                 this.select_theme(choice, window, cx);
-                                            }))
-                                    },
-                                )),
+                                            }),
+                                        )
+                                        .into_any_element()
+                                    })
+                                    .collect(),
+                            ),
                             true,
                             phone,
                         ))
@@ -1667,6 +1651,30 @@ impl LoomView {
                                         });
                                     }
                                 }),
+                            false,
+                            phone,
+                        ))
+                        .child(settings_row(
+                            "Output detail",
+                            self.output_detail.description(),
+                            appearance_choice_container(
+                                OutputDetail::ALL
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(index, detail)| {
+                                        let selected = detail == self.output_detail;
+                                        appearance_choice_chip(
+                                            ("output-detail", index),
+                                            detail.label(),
+                                            selected,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.set_output_detail(detail, cx);
+                                            }),
+                                        )
+                                        .into_any_element()
+                                    })
+                                    .collect(),
+                            ),
                             false,
                             phone,
                         )),

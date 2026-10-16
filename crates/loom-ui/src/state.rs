@@ -115,6 +115,57 @@ impl ThemeChoice {
     }
 }
 
+/// How much agent activity the transcript shows.
+///
+/// The level is presentation-only, like `show_reasoning`: it never changes what
+/// is sent to a provider. `Medium` is today's transcript, so the default keeps
+/// the existing reading experience.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum OutputDetail {
+    /// Only the agent's replies: no reasoning and no tool activity.
+    Low,
+    /// Tool activity collapsed behind one usage summary line.
+    #[default]
+    Medium,
+    /// Reasoning and tool activity disclosed without a click.
+    High,
+}
+
+impl OutputDetail {
+    pub(crate) const ALL: [Self; 3] = [Self::Low, Self::Medium, Self::High];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+        }
+    }
+
+    /// The one-sentence summary of the level shown in the settings row.
+    pub(crate) const fn description(self) -> &'static str {
+        match self {
+            Self::Low => "Only the agent's replies, without reasoning or tool activity",
+            Self::Medium => "Tool activity collapsed behind one summary line",
+            Self::High => "Reasoning and tool activity expanded without a click",
+        }
+    }
+
+    /// Whether the level shows the agent's work at all: its reasoning and its
+    /// tool activity. A run blocked on the user is shown at every level, because
+    /// its approval and input controls have to stay reachable.
+    pub(crate) const fn shows_activity(self) -> bool {
+        matches!(self, Self::Medium | Self::High)
+    }
+
+    /// Whether the level opens disclosures that the user would otherwise open
+    /// by clicking. It is a display default, not a lock: clicking a disclosure
+    /// still records a preference.
+    pub(crate) const fn expands_activity(self) -> bool {
+        matches!(self, Self::High)
+    }
+}
+
 /// Which inspector tabs hold content the user has not looked at yet.
 ///
 /// The pane toggle shows a dot while either marker is set; each tab shows its

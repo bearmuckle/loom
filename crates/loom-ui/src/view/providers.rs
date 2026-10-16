@@ -1114,6 +1114,14 @@ impl LoomView {
         cx.notify();
     }
 
+    /// Sets how much agent activity the transcript shows. The setting is
+    /// presentation-only, so it never affects the provider request; `Medium`
+    /// keeps the transcript that existed before the setting.
+    pub(crate) fn set_output_detail(&mut self, detail: OutputDetail, cx: &mut Context<Self>) {
+        self.output_detail = detail;
+        cx.notify();
+    }
+
     pub(crate) fn observe_system_appearance(
         &mut self,
         window: &mut Window,
