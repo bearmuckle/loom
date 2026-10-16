@@ -1340,10 +1340,17 @@ mod tests {
     }
 
     /// A policy that denies the destructive dimension still refuses the call,
-    /// and the completed result carries the policy reason.
+    /// and the completed result carries the policy reason with the pin and the
+    /// remedy that changes it.
     #[test]
     fn a_denied_destructive_tool_completes_with_the_policy_reason() {
         let (mut runtime, root) = destructive_tool_runtime(loom_core::PolicyDecision::Deny);
+        let run_id = runtime.run_id();
+        let pinned = runtime
+            .snapshot()
+            .approval_policy
+            .expect("a run reports the policy it pinned when it started");
+        assert_eq!(pinned.destructive, loom_core::PolicyDecision::Deny);
         let events = runtime.start().unwrap();
 
         assert!(events.iter().any(|event| matches!(
@@ -1361,12 +1368,45 @@ mod tests {
             .expect("a denied call completes as a failed result");
         assert!(!result.success);
         assert!(result.output.contains("denied by the workspace policy"));
+        // The decision is pinned to this run, and the denial says what would
+        // change it, so an operator is not left with an unavailable action.
+        assert!(result.output.contains(&run_id.to_string()));
+        assert!(
+            result
+                .output
+                .contains("fixed its approval policy when the run started")
+        );
+        assert!(result.output.contains("start a new run"));
+        assert!(result.output.contains("next run"));
         assert!(
             !events
                 .iter()
                 .any(|event| matches!(event, AgentEvent::ToolApprovalRequired { .. }))
         );
         assert!(runtime.pending_approval().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A restored runtime whose stored snapshot predates the pinned policy still
+    /// reports the policy the run pinned at creation.
+    #[test]
+    fn restoring_a_state_without_a_snapshot_policy_reports_the_pinned_policy() {
+        let (runtime, root) = destructive_tool_runtime(loom_core::PolicyDecision::Deny);
+        let pinned = runtime
+            .snapshot()
+            .approval_policy
+            .expect("a run reports the policy it pinned when it started");
+        let mut state = runtime.export_state();
+        state.run.approval_policy = None;
+
+        let restored = AgentRuntime::from_state(
+            state,
+            Box::new(DeterministicProvider::demo()),
+            ToolExecutor::new(&root).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(restored.snapshot().approval_policy, Some(pinned));
         fs::remove_dir_all(root).unwrap();
     }
 

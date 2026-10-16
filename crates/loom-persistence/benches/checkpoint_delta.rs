@@ -185,6 +185,7 @@ fn fixture(
             completed_at: None,
             summary: None,
             evidence: Vec::new(),
+            approval_policy: None,
         },
         usage: UsageSnapshot::default(),
         attempts: None,

@@ -496,6 +496,9 @@ impl FilePersistence {
                 completed_at: completed.map(decode_timestamp).transpose()?,
                 summary,
                 evidence: Vec::new(),
+                // The run's pinned approval policy is stored in its runtime
+                // configuration, not in the run summary columns.
+                approval_policy: None,
             };
             let usage = UsageSnapshot {
                 input_tokens: decode_counter(input_tokens, "input tokens")?,

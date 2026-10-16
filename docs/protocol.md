@@ -68,7 +68,13 @@ to upgrade; old-client forward compatibility is not supported.
 Approval policies are scoped to an agent session. Session snapshots
 include the effective approval policy and the session's `auto_approve_actions`
 preference; the session-scoped `SetSessionApprovalPolicy` request updates both
-for subsequent runs.
+for subsequent runs. A run resolves its policy once, when it is created, and
+evaluates every step against that pinned copy, which the run snapshot reports in
+its `approval_policy` field (absent for runs recorded before it was reported),
+so a client can compare it with the session's own policy. A policy denial states
+that pin and what changes it, and the `SetSessionApprovalPolicy` response reports
+the scope the change applies in (`applies_from: "next_run"`), because a run that
+is already executing keeps the decision it started with.
 
 The WebSocket service authenticates during the HTTP upgrade using a bearer
 token supplied in the `Authorization` header, or in a `loom.bearer.<token>`

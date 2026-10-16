@@ -101,6 +101,62 @@ pub enum FilesystemResponse {
     },
 }
 
+/// Which steps a session approval-policy change reaches.
+///
+/// A run resolves its approval policy once, when it is created, and evaluates
+/// every step against that pinned copy, so this backend answers
+/// [`ApprovalPolicyApplyScope::NextRun`]: a change made while a run executes is
+/// stored for the session and reaches a run that starts later.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPolicyApplyScope {
+    /// The change takes effect for the running run's next step.
+    RunningRun,
+
+    /// The change is stored for the session and takes effect from the next run.
+    ///
+    /// A run that is already executing keeps the approval policy it pinned when
+    /// it started, so its decisions do not change while it runs.
+    #[default]
+    NextRun,
+}
+
+/// The payload of [`SessionResponse::ApprovalPolicy`]: the stored policy and the
+/// scope the change applies in.
+///
+/// The policy is flattened into the encoded body, which stays the bare policy
+/// object a client that predates this type already deserializes; such a client
+/// ignores `applies_from`, and a body that omits it reads as
+/// [`ApprovalPolicyApplyScope::NextRun`], which is what a backend that predates
+/// the field did with a running run.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionApprovalPolicyUpdate {
+    #[serde(flatten)]
+    pub policy: loom_core::ApprovalPolicy,
+    #[serde(default)]
+    pub applies_from: ApprovalPolicyApplyScope,
+}
+
+impl SessionApprovalPolicyUpdate {
+    /// Reports a stored session policy and the scope it applies in.
+    pub fn new(policy: loom_core::ApprovalPolicy, applies_from: ApprovalPolicyApplyScope) -> Self {
+        Self {
+            policy,
+            applies_from,
+        }
+    }
+}
+
+/// Readers of this response only need the policy it carries, so the payload
+/// still dereferences to it.
+impl std::ops::Deref for SessionApprovalPolicyUpdate {
+    type Target = loom_core::ApprovalPolicy;
+
+    fn deref(&self) -> &Self::Target {
+        &self.policy
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum SessionResponse {
@@ -122,7 +178,7 @@ pub enum SessionResponse {
 
     AgentSessionDeleted { session_id: AgentSessionId },
 
-    ApprovalPolicy(loom_core::ApprovalPolicy),
+    ApprovalPolicy(SessionApprovalPolicyUpdate),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -1,6 +1,7 @@
 use loom_core::{
-    AgentSessionId, CheckpointId, ContextInspection, EvidenceLink, InteractionId, LimitStatus,
-    LoomError, PolicyEvaluation, RunAttemptId, RunId, StepId, Timestamp, ToolCallId, UsageSnapshot,
+    AgentSessionId, ApprovalPolicy, CheckpointId, ContextInspection, EvidenceLink, InteractionId,
+    LimitStatus, LoomError, PolicyEvaluation, RunAttemptId, RunId, StepId, Timestamp, ToolCallId,
+    UsageSnapshot,
 };
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +41,15 @@ pub struct AgentRunSnapshot {
     pub summary: Option<String>,
     #[serde(default)]
     pub evidence: Vec<EvidenceLink>,
+    /// The approval policy this run pinned when it was created, when known.
+    ///
+    /// A run resolves its policy once, at creation, and evaluates every step
+    /// against that copy, so a session policy change never reaches a running
+    /// run. This reports the copy the run evaluates against instead of leaving a
+    /// client to infer it from a refusal. It is `None` for a snapshot written
+    /// before the field existed, which stays loadable.
+    #[serde(default)]
+    pub approval_policy: Option<ApprovalPolicy>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

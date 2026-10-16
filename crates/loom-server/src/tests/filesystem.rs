@@ -1254,7 +1254,9 @@ fn forked_session_filesystem_and_policy_survive_restart_and_checkpoint_revert() 
         )));
         assert!(matches!(
             configured.result,
-            Ok(ServerResponse::Session(SessionResponse::ApprovalPolicy(configured))) if configured == policy
+            Ok(ServerResponse::Session(SessionResponse::ApprovalPolicy(configured)))
+                if configured.policy == policy
+                    && configured.applies_from == loom_protocol::ApprovalPolicyApplyScope::NextRun
         ));
         let attached = connection.request(RequestEnvelope::new(ClientRequest::Repository(
             RepositoryRequest::AttachSessionRepository {

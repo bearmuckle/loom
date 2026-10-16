@@ -475,7 +475,10 @@ impl AgentRuntime {
                     .policy_evaluation(&call, &self.approval_policy)
                     .unwrap_or_else(|| {
                         PolicyEvaluation::evaluate(&self.approval_policy, action_kind, &call.name)
-                    });
+                    })
+                    // The run evaluates the policy it pinned when it started, so
+                    // a denial states that pin and what would change it.
+                    .pinned_to_run(self.run.id);
                 ctx.events.push(AgentEvent::ToolPolicyEvaluated {
                     run_id: self.run.id,
                     call: call.clone(),

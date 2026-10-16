@@ -70,6 +70,13 @@ impl AgentRuntime {
                 false,
             ));
         }
+        if state.run.approval_policy.is_none() {
+            // A run snapshot written before the field existed has no policy of
+            // its own, while the runtime state records the policy this run
+            // pinned at creation. Report it so the restored snapshot stays
+            // readable instead of looking like a run without a policy.
+            state.run.approval_policy = Some(state.approval_policy.clone());
+        }
         let resolved_at = Timestamp::now();
         for interaction in &mut state.interactions {
             if interaction.status != loom_protocol::AgentInteractionStatus::Pending {

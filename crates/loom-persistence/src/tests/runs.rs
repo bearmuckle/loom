@@ -52,6 +52,7 @@ fn streamed_messages_are_append_only_and_paged_by_keyset() {
             completed_at: None,
             summary: None,
             evidence: Vec::new(),
+            approval_policy: None,
         },
         usage: UsageSnapshot::default(),
         attempts: None,
@@ -499,6 +500,7 @@ fn streamed_transcript_reuses_decoded_content_across_messages() {
             completed_at: None,
             summary: None,
             evidence: Vec::new(),
+            approval_policy: None,
         },
         usage: UsageSnapshot::default(),
         attempts: None,
@@ -753,6 +755,7 @@ fn tool_attempt_state_storage_tracks_activity_outcomes_and_intents() {
             completed_at: None,
             summary: None,
             evidence: Vec::new(),
+            approval_policy: None,
         },
         usage: UsageSnapshot::default(),
         attempts: Some(vec![AgentRunAttemptRecord {

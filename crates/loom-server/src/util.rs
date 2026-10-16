@@ -993,6 +993,11 @@ pub(crate) fn runtime_state_from_durable_config(
         project_integration_enabled: config.project_integration_enabled,
         project_branch_messaging_enabled: config.project_branch_messaging_enabled,
     };
+    let mut run = summary.snapshot.clone();
+    // A persisted run summary keeps one column per snapshot field and carries no
+    // approval policy, so the policy this run pinned at creation comes from the
+    // durable runtime configuration it was created with.
+    run.approval_policy = Some(config.approval_policy.clone());
     Ok(AgentRuntimeState {
         session_id: summary.snapshot.session_id,
         task: AgentTask {
@@ -1001,7 +1006,7 @@ pub(crate) fn runtime_state_from_durable_config(
             system_instructions: config.system_instructions,
             repository_instructions: config.repository_instructions,
         },
-        run: summary.snapshot.clone(),
+        run,
         plan: loom_agent::AgentPlan { steps: Vec::new() },
         messages: Vec::new(),
         message_timeline_ordinals: Vec::new(),

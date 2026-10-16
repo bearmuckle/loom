@@ -170,8 +170,19 @@ impl InProcessConnection {
                         .auto_approve_actions()?
                         .insert(session_id, auto_approve_actions);
                 }
+                // The policy is stored for the session and resolved when a run
+                // is created, and a run then evaluates that pinned copy for
+                // every step (see `AgentRuntime::new_with_options`). Reaching a
+                // run that is already executing would mean mutating its runtime
+                // and its durable configuration, so the smaller behaviour is
+                // kept and reported: the change applies from the next run, and
+                // the response says so instead of acknowledging the change and
+                // leaving the running run refusing the same call.
                 Ok(ServerResponse::Session(SessionResponse::ApprovalPolicy(
-                    policy,
+                    loom_protocol::SessionApprovalPolicyUpdate::new(
+                        policy,
+                        loom_protocol::ApprovalPolicyApplyScope::NextRun,
+                    ),
                 )))
             }
             _ => unreachable!("request was routed to the wrong dispatch domain"),

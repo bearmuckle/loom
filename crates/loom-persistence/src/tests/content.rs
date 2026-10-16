@@ -370,6 +370,7 @@ fn run_checkpoint_collects_content_orphaned_by_its_own_transcript_reset() {
             completed_at: None,
             summary: None,
             evidence: Vec::new(),
+            approval_policy: None,
         },
         usage: UsageSnapshot::default(),
         attempts: None,

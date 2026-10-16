@@ -300,6 +300,7 @@ fn session_and_workspace_settings_are_bounded_indexed_and_atomic() {
                 label: "Build output".to_owned(),
                 uri: "file:///workspace/build.log".to_owned(),
             }],
+            approval_policy: None,
         },
         usage: UsageSnapshot {
             input_tokens: 13,
@@ -1488,6 +1489,7 @@ fn deleted_sessions_lose_their_rows_and_unused_content_in_one_transaction() {
                     completed_at: Some(Timestamp::from_unix_millis(2_000)),
                     summary: Some("finished".to_owned()),
                     evidence: Vec::new(),
+                    approval_policy: None,
                 },
                 usage: UsageSnapshot::default(),
                 attempts: None,
@@ -1511,6 +1513,7 @@ fn deleted_sessions_lose_their_rows_and_unused_content_in_one_transaction() {
                     completed_at: Some(Timestamp::from_unix_millis(2_000)),
                     summary: None,
                     evidence: Vec::new(),
+                    approval_policy: None,
                 },
                 usage: UsageSnapshot::default(),
                 attempts: None,

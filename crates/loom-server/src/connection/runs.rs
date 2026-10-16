@@ -107,20 +107,40 @@ impl InProcessConnection {
             });
         }
         if let Some(summary) = self.backend.persisted_runs()?.get(&run_id).cloned() {
-            return Ok(summary);
+            return self.summary_with_pinned_policy(summary);
         }
         let persistence = self
             .backend
             .persistence
             .as_ref()
             .ok_or_else(|| LoomError::not_found("agent run", run_id))?;
-        persistence
+        let summary = persistence
             .load_run_summary(run_id)?
             .map(|summary| PersistedRunSummary {
                 snapshot: summary.snapshot,
                 usage: summary.usage,
             })
-            .ok_or_else(|| LoomError::not_found("agent run", run_id))
+            .ok_or_else(|| LoomError::not_found("agent run", run_id))?;
+        self.summary_with_pinned_policy(summary)
+    }
+
+    /// Reports the approval policy a persisted run pinned at creation.
+    ///
+    /// A stored run summary keeps one column per snapshot field, so a summary
+    /// written before the field existed carries no policy. The durable runtime
+    /// configuration of that run does: it is the copy the run evaluated against,
+    /// and it is what the run pinned when it started.
+    fn summary_with_pinned_policy(
+        &self,
+        mut summary: PersistedRunSummary,
+    ) -> Result<PersistedRunSummary> {
+        if summary.snapshot.approval_policy.is_none()
+            && let Some(persistence) = &self.backend.persistence
+            && let Some(config) = persistence.load_run_runtime_config(summary.snapshot.id)?
+        {
+            summary.snapshot.approval_policy = Some(config.approval_policy);
+        }
+        Ok(summary)
     }
 
     pub(crate) fn run_message_page(

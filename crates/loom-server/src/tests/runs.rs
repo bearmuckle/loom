@@ -402,7 +402,10 @@ fn policy_decisions_are_visible_and_can_stop_agent_writes() {
                     evaluation,
                     ..
                 }
-            } if *event_run == run_id && evaluation.decision == PolicyDecision::Deny
+            } if *event_run == run_id
+                && evaluation.decision == PolicyDecision::Deny
+                && evaluation.reason.contains(&run_id.to_string())
+                && evaluation.reason.contains("start a new run")
         )
     }));
     let run = connection.request(RequestEnvelope::new(ClientRequest::Run(
@@ -412,6 +415,137 @@ fn policy_decisions_are_visible_and_can_stop_agent_writes() {
         panic!("unexpected run response");
     };
     assert_eq!(snapshot.state, AgentRunState::AwaitingApproval);
+    fs::remove_dir_all(&backend.session_root_base).unwrap();
+}
+
+/// A run keeps the approval policy it pinned when it started: a session policy
+/// change made while it executes is stored for the next run, the response says
+/// so, and the run still reports the policy it evaluates against.
+#[test]
+fn a_running_run_keeps_the_policy_it_pinned_when_the_session_policy_changes() {
+    let backend = InProcessBackend::new();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Pinned policy workspace".to_owned(),
+        },
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+        workspace.result.unwrap()
+    else {
+        panic!("unexpected workspace response");
+    };
+    let session = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
+            workspace_id: workspace.id,
+            name: "Pinned policy".to_owned(),
+        },
+    )));
+    let ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) =
+        session.result.unwrap()
+    else {
+        panic!("unexpected session response");
+    };
+
+    // A policy whose write dimension requires approval leaves the run waiting
+    // for approval instead of completing, so it stays running while the session
+    // policy changes.
+    let pinned = ApprovalPolicy::default();
+    let configured = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::SetSessionApprovalPolicy {
+            session_id: session.id,
+            policy: pinned.clone(),
+            auto_approve_actions: Some(false),
+        },
+    )));
+    assert!(matches!(
+        configured.result,
+        Ok(ServerResponse::Session(SessionResponse::ApprovalPolicy(_)))
+    ));
+
+    let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id: session.id,
+            task: "create a demo file".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            system_instructions: None,
+            repository_instructions: None,
+        },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunStarted(started)) = started.result.unwrap() else {
+        panic!("unexpected run response");
+    };
+    let run_id = started.id;
+    assert_eq!(
+        started.approval_policy,
+        Some(pinned.clone()),
+        "a started run reports the policy it pinned"
+    );
+    let settled = await_settled_run(&connection, run_id);
+    assert_eq!(settled.state, AgentRunState::AwaitingApproval);
+    assert_eq!(settled.approval_policy, Some(pinned.clone()));
+
+    let changed = ApprovalPolicy::auto_approve();
+    let changed_response = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::SetSessionApprovalPolicy {
+            session_id: session.id,
+            policy: changed.clone(),
+            auto_approve_actions: Some(true),
+        },
+    )));
+    let Ok(ServerResponse::Session(SessionResponse::ApprovalPolicy(update))) =
+        changed_response.result
+    else {
+        panic!("unexpected policy response");
+    };
+    assert_eq!(update.policy, changed);
+    assert_eq!(
+        update.applies_from,
+        loom_protocol::ApprovalPolicyApplyScope::NextRun,
+        "the response says a running run is unaffected"
+    );
+
+    // The running run still reports the pinned policy while the session reports
+    // the stored one, so a client sees the difference instead of inferring it
+    // from a refusal.
+    let run = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRun { run_id },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRun(run)) = run.result.unwrap() else {
+        panic!("unexpected run response");
+    };
+    assert_eq!(run.state, AgentRunState::AwaitingApproval);
+    assert_eq!(run.approval_policy, Some(pinned.clone()));
+    assert_ne!(run.approval_policy, Some(changed.clone()));
+
+    let projection = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunSnapshot { run_id },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunSnapshot(projection)) = projection.result.unwrap()
+    else {
+        panic!("unexpected run snapshot response");
+    };
+    assert_eq!(projection.run.approval_policy, Some(pinned.clone()));
+
+    let session_snapshot = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::GetAgentSessionSnapshot {
+            session_id: session.id,
+        },
+    )));
+    let ServerResponse::Session(SessionResponse::AgentSessionSnapshot(session_snapshot)) =
+        session_snapshot.result.unwrap()
+    else {
+        panic!("unexpected session snapshot response");
+    };
+    assert_eq!(session_snapshot.approval_policy, changed);
+    assert_eq!(
+        session_snapshot
+            .active_run
+            .and_then(|active| active.run.approval_policy),
+        Some(pinned),
+        "the session snapshot separates the stored policy from the run's pinned one"
+    );
     fs::remove_dir_all(&backend.session_root_base).unwrap();
 }
 
@@ -475,7 +609,9 @@ fn completed_runs_keep_indexed_summaries_without_restoring_runtime_objects() {
     )));
     assert!(matches!(
         response.result,
-        Ok(ServerResponse::Run(RunResponse::AgentRun(snapshot))) if snapshot.state == AgentRunState::Completed
+        Ok(ServerResponse::Run(RunResponse::AgentRun(snapshot)))
+            if snapshot.state == AgentRunState::Completed
+                && snapshot.approval_policy == Some(loom_core::ApprovalPolicy::auto_approve())
     ));
     let projection = connection.request(RequestEnvelope::new(ClientRequest::Run(
         RunRequest::GetAgentRunSnapshot { run_id },
@@ -483,7 +619,9 @@ fn completed_runs_keep_indexed_summaries_without_restoring_runtime_objects() {
     assert!(matches!(
         projection.result,
         Ok(ServerResponse::Run(RunResponse::AgentRunSnapshot(snapshot)))
-            if snapshot.run.state == AgentRunState::Completed && !snapshot.messages.is_empty()
+            if snapshot.run.state == AgentRunState::Completed
+                && !snapshot.messages.is_empty()
+                && snapshot.run.approval_policy == Some(loom_core::ApprovalPolicy::auto_approve())
     ));
     assert!(backend.runs().unwrap().is_empty());
     fs::remove_dir_all(session_root_base).unwrap();

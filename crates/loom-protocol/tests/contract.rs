@@ -313,6 +313,7 @@ fn agent_event_json_round_trip_preserves_run_identity() {
         completed_at: None,
         summary: None,
         evidence: Vec::new(),
+        approval_policy: None,
     };
     let event = ServerEventEnvelope {
         protocol_version: CURRENT_PROTOCOL_VERSION,
@@ -691,6 +692,7 @@ fn m5_session_run_review_and_evidence_contracts_round_trip() {
         completed_at: Some(Timestamp::from_unix_millis(8)),
         summary: Some("done".to_owned()),
         evidence: Vec::new(),
+        approval_policy: Some(loom_core::ApprovalPolicy::auto_approve()),
     };
     let run_snapshot = ResponseEnvelope::success(
         loom_core::RequestId::new(),
@@ -727,5 +729,74 @@ fn m5_session_run_review_and_evidence_contracts_round_trip() {
     assert_eq!(
         decode_response(&encode_response(&evidence).unwrap()).unwrap(),
         evidence
+    );
+}
+
+/// A run snapshot written before it recorded a policy stays loadable and
+/// reports no known policy instead of failing to decode.
+#[test]
+fn a_run_snapshot_without_an_approval_policy_still_decodes() {
+    let snapshot = AgentRunSnapshot {
+        id: RunId::new(),
+        attempt_id: loom_core::RunAttemptId::new(),
+        control_revision: 0,
+        session_id: AgentSessionId::new(),
+        task: "older snapshot".to_owned(),
+        model: ModelId::new("deterministic/demo"),
+        state: AgentRunState::Executing,
+        started_at: Timestamp::from_unix_millis(1),
+        updated_at: Timestamp::from_unix_millis(2),
+        completed_at: None,
+        summary: None,
+        evidence: Vec::new(),
+        approval_policy: Some(loom_core::ApprovalPolicy::auto_approve()),
+    };
+    let mut older = serde_json::to_value(&snapshot).unwrap();
+    older
+        .as_object_mut()
+        .expect("a run snapshot encodes as an object")
+        .remove("approval_policy");
+
+    let decoded: AgentRunSnapshot =
+        serde_json::from_value(older).expect("a snapshot without the field stays loadable");
+
+    assert_eq!(decoded.approval_policy, None);
+    assert_eq!(decoded.state, snapshot.state);
+}
+
+/// A client that reads only the policy keeps working: the payload encodes as
+/// the bare policy object plus the apply scope, and a body without the scope
+/// reads as the next run, which is what a backend that predates the field did
+/// with a running run.
+#[test]
+fn an_approval_policy_payload_stays_readable_without_the_apply_scope() {
+    let policy = loom_core::ApprovalPolicy::default();
+    let update = loom_protocol::SessionApprovalPolicyUpdate::new(
+        policy.clone(),
+        loom_protocol::ApprovalPolicyApplyScope::NextRun,
+    );
+
+    let encoded = serde_json::to_value(&update).unwrap();
+    assert_eq!(
+        encoded["write"],
+        serde_json::to_value(policy.write).unwrap()
+    );
+    assert_eq!(encoded["applies_from"], serde_json::json!("next_run"));
+    // A reader that only needs the policy reads it through the payload.
+    assert_eq!(update.destructive, policy.destructive);
+
+    let mut older = encoded.clone();
+    older
+        .as_object_mut()
+        .expect("the payload encodes as an object")
+        .remove("applies_from");
+    assert_eq!(
+        serde_json::from_value::<loom_core::ApprovalPolicy>(older.clone()).unwrap(),
+        policy,
+        "a client that predates the scope still reads the policy"
+    );
+    assert_eq!(
+        serde_json::from_value::<loom_protocol::SessionApprovalPolicyUpdate>(older).unwrap(),
+        update
     );
 }

@@ -86,6 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             completed_at: (!active).then_some(now),
             summary: None,
             evidence: Vec::new(),
+            approval_policy: None,
         };
         run_ids.push(run_id);
         run_summaries.insert(

@@ -39,6 +39,7 @@ impl AgentRuntime {
             completed_at: None,
             summary: None,
             evidence: Vec::new(),
+            approval_policy: Some(approval_policy.clone()),
         };
         let attempts = vec![loom_protocol::AgentRunAttemptRecord {
             run_id: run.id,

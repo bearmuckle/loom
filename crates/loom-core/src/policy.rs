@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::RunId;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionKind {
@@ -99,6 +101,27 @@ impl PolicyEvaluation {
             reason,
         }
     }
+
+    /// States the remedy in a denial whose policy was pinned to a run.
+    ///
+    /// A run resolves its approval policy once, when it is created, and
+    /// evaluates every step against that copy, so a later session policy change
+    /// only reaches the next run. A caller that reads only "denied by the
+    /// workspace policy", which is already true for a policy that changed, has
+    /// no way to learn that or what would change the decision, so the denial
+    /// names the run and the remedy. Only [`PolicyDecision::Deny`] gains the
+    /// note: an allow, or a prompt the user can still answer, has no remedy to
+    /// state.
+    pub fn pinned_to_run(mut self, run_id: RunId) -> Self {
+        if self.decision == PolicyDecision::Deny {
+            self.reason.push_str(&format!(
+                ". Run {run_id} fixed its approval policy when the run started, so this decision holds \
+                 for the rest of the run; start a new run, or change the session approval policy to \
+                 apply it from the next run, to allow this action"
+            ));
+        }
+        self
+    }
 }
 
 #[cfg(test)]
@@ -160,6 +183,55 @@ mod tests {
             PolicyEvaluation::evaluate(&policy, ActionKind::Destructive, "github_push_branch");
         assert_eq!(evaluation.decision, PolicyDecision::Deny);
         assert!(evaluation.reason.contains("denied"));
+    }
+
+    /// A denial states the remedy, not only the decision: the run fixed its own
+    /// policy and only a new run (or a session policy change taken up by the
+    /// next run) changes it.
+    #[test]
+    fn a_run_pinned_denial_states_the_pin_and_the_remedy() {
+        let policy = ApprovalPolicy {
+            destructive: PolicyDecision::Deny,
+            ..Default::default()
+        };
+        let run_id = RunId::new();
+        let evaluation =
+            PolicyEvaluation::evaluate(&policy, ActionKind::Destructive, "github_push_branch")
+                .pinned_to_run(run_id);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Deny);
+        assert!(evaluation.reason.contains("denied by the workspace policy"));
+        assert!(evaluation.reason.contains(&run_id.to_string()));
+        assert!(
+            evaluation
+                .reason
+                .contains("fixed its approval policy when the run started")
+        );
+        assert!(evaluation.reason.contains("start a new run"));
+        assert!(evaluation.reason.contains("next run"));
+    }
+
+    /// An allow or an approval prompt must not gain run-pinning text: neither
+    /// decision is pinned, because the user can still answer the prompt and an
+    /// allow needs no remedy.
+    #[test]
+    fn only_a_denial_gains_the_run_pinning_note() {
+        let policy = ApprovalPolicy::default();
+        let run_id = RunId::new();
+        let reason_for = |action: ActionKind| {
+            PolicyEvaluation::evaluate(&policy, action, "a tool call")
+                .pinned_to_run(run_id)
+                .reason
+        };
+
+        assert_eq!(
+            reason_for(ActionKind::Read),
+            "a tool call is allowed by the workspace policy"
+        );
+        assert_eq!(
+            reason_for(ActionKind::Command),
+            "a tool call requires explicit user approval"
+        );
     }
 
     /// A user who wants a gate on the destructive dimension asks for a prompt

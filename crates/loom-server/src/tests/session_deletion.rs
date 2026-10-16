@@ -1938,6 +1938,7 @@ fn deleting_an_archived_session_with_a_stale_run_summary_succeeds() {
             completed_at: None,
             summary: None,
             evidence: Vec::new(),
+            approval_policy: None,
         },
         usage: UsageSnapshot::default(),
         attempts: None,
