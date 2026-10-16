@@ -14,6 +14,7 @@ fn render_new_project_pane(
 ) -> gpui_kit::AnyWindowHandle {
     cx.update(gpui_kit::init);
     render_scenario_at(cx, window_size, move |view| {
+        view.show_surface(CoveringSurface::NewProject);
         view.source_dialog = Some(SessionSourceDialog {
             purpose: SessionSourceDialogPurpose::StartSession,
             target_node_id: String::new(),

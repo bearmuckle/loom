@@ -146,6 +146,7 @@ impl LoomView {
         };
         div()
             .id("rename-dialog")
+            .test_support()
             .occlude()
             .absolute()
             .top(px(120.))
@@ -195,6 +196,7 @@ impl LoomView {
                     .child(
                         div()
                             .id("cancel-rename")
+                            .test_support()
                             .px_2()
                             .py_1()
                             .rounded_sm()
@@ -204,8 +206,7 @@ impl LoomView {
                             .cursor_pointer()
                             .child("Cancel")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.rename_dialog = None;
-                                cx.notify();
+                                this.close_rename_dialog(cx);
                             })),
                     )
                     .child(
@@ -805,8 +806,7 @@ impl LoomView {
                             })
                             .child(Icon::new(IconName::Close).size_4())
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.source_dialog = None;
-                                cx.notify();
+                                this.close_source_dialog(cx);
                             })),
                     ),
             );
@@ -879,8 +879,7 @@ impl LoomView {
                         .when(phone, |button| button.w_full().h(px(44.)))
                         .when(!phone, |button| button.small())
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.source_dialog = None;
-                            cx.notify();
+                            this.close_source_dialog(cx);
                         })),
                 ),
             )
@@ -1036,6 +1035,7 @@ impl LoomView {
         };
         div()
             .id("github-login-dialog")
+            .test_support()
             .occlude()
             .size_full()
             .absolute()
@@ -1060,6 +1060,7 @@ impl LoomView {
                     .child(
                         div()
                             .id("close-github-login")
+                            .test_support()
                             .w(px(28.))
                             .h(px(28.))
                             .flex()
@@ -1078,8 +1079,7 @@ impl LoomView {
                             })
                             .child(Icon::new(IconName::Close).size_4())
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.github_login = None;
-                                cx.notify();
+                                this.close_github_login(cx);
                             })),
                     ),
             )
@@ -1089,6 +1089,7 @@ impl LoomView {
 
     pub(crate) fn render_settings_dialog(
         &self,
+        section: SettingsSection,
         layout: ResponsiveLayout,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -1107,7 +1108,6 @@ impl LoomView {
             },
         );
 
-        let section = self.settings_section;
         let content: gpui_kit::AnyElement = match section {
             SettingsSection::Agents => div()
                 .w_full()
@@ -1761,6 +1761,7 @@ impl LoomView {
 
         div()
             .id("settings-dialog")
+            .test_support()
             .occlude()
             .size_full()
             .absolute()

@@ -753,8 +753,8 @@ fn deleting_a_project_root_cascades_descendants_out_of_client_state(cx: &mut Tes
         }
         view.project_tree_snapshots = vec![project.clone()];
         view.project_snapshot = Some(project.clone());
+        view.show_surface(CoveringSurface::ArchivedSessions);
         view.archived_sessions = ArchivedSessionsState {
-            open: true,
             loaded: true,
             entries: vec![
                 entry(session(root, "Project")),
@@ -834,8 +834,8 @@ fn archived_sessions_surface_renders_the_policy_and_the_rows(cx: &mut TestAppCon
                 created_at: Timestamp::from_unix_millis(archived_at),
                 updated_at: Timestamp::from_unix_millis(archived_at),
             };
+            view.show_surface(CoveringSurface::ArchivedSessions);
             view.archived_sessions = ArchivedSessionsState {
-                open: true,
                 loaded: true,
                 entries: vec![
                     entry(session(root, "Archived project")),
@@ -1045,7 +1045,7 @@ fn a_refused_window_change_shows_the_reason_and_keeps_the_stored_policy(cx: &mut
 fn an_unexpected_answer_to_a_policy_change_is_reported(cx: &mut TestAppContext) {
     let view = cx.new(|cx| {
         let mut view = LoomView::new_for_test(cx.focus_handle());
-        view.archived_sessions.open = true;
+        view.show_surface(CoveringSurface::ArchivedSessions);
         view.archived_sessions.loaded = true;
         view.archived_sessions.retention_editable = true;
         view.archived_sessions.retention_draft = Some(ArchiveRetentionPolicy {
@@ -1098,8 +1098,8 @@ fn choosing_a_window_edits_the_draft_without_touching_a_custom_window(cx: &mut T
     };
     let view = cx.new(|cx| {
         let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.show_surface(CoveringSurface::ArchivedSessions);
         view.archived_sessions = ArchivedSessionsState {
-            open: true,
             loaded: true,
             retention: RetentionPolicyState::Available(stored),
             retention_editable: true,
@@ -1276,6 +1276,9 @@ fn open_retention_card(
                 "local worker".to_owned(),
             );
             view.archived_sessions = state;
+            // The surface is what puts the dialog on screen, so a state built
+            // by a test does not open it by itself.
+            view.show_surface(CoveringSurface::ArchivedSessions);
             view
         });
         built = Some(view.clone());
@@ -1318,7 +1321,6 @@ fn a_worker_that_cannot_change_the_policy_renders_the_card_read_only(cx: &mut Te
     let (handle, _) = open_retention_card(
         cx,
         ArchivedSessionsState {
-            open: true,
             loaded: true,
             retention: RetentionPolicyState::Available(reported),
             ..ArchivedSessionsState::default()
@@ -1333,7 +1335,6 @@ fn a_worker_that_cannot_change_the_policy_renders_the_card_read_only(cx: &mut Te
     let (handle, _) = open_retention_card(
         cx,
         ArchivedSessionsState {
-            open: true,
             loaded: true,
             retention: RetentionPolicyState::Unavailable,
             retention_editable: true,
@@ -1356,7 +1357,6 @@ fn confirming_a_window_in_the_card_edits_the_draft_and_apply_submits_it(cx: &mut
     let (handle, view) = open_retention_card(
         cx,
         ArchivedSessionsState {
-            open: true,
             loaded: true,
             retention: RetentionPolicyState::Available(stored),
             retention_editable: true,
@@ -1430,7 +1430,6 @@ fn the_retention_card_renders_the_editor_for_a_worker_that_stores_a_policy(
     let (handle, view) = open_retention_card(
         cx,
         ArchivedSessionsState {
-            open: true,
             loaded: true,
             retention: RetentionPolicyState::Available(stored),
             retention_editable: true,
@@ -1537,7 +1536,6 @@ fn toggling_the_force_switch_in_the_card_edits_the_draft(cx: &mut TestAppContext
     let (handle, view) = open_retention_card(
         cx,
         ArchivedSessionsState {
-            open: true,
             loaded: true,
             retention: RetentionPolicyState::Available(stored),
             retention_editable: true,
@@ -1622,8 +1620,8 @@ fn view_with_an_archived_project(
         .cloned()
         .unwrap_or_else(|| sessions[0].clone());
     view.session_state = view.active_session.state;
+    view.show_surface(CoveringSurface::ArchivedSessions);
     view.archived_sessions = ArchivedSessionsState {
-        open: true,
         loaded: true,
         entries: sessions.iter().cloned().map(entry).collect(),
         projects: vec![project_snapshot(
@@ -1962,7 +1960,9 @@ fn the_project_deletion_confirmation_renders_its_consequences(cx: &mut TestAppCo
     let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
         let view = cx.new(|cx| {
             let mut view = LoomView::new_for_test(cx.focus_handle());
-            view.archived_sessions.open = true;
+            // The confirmation is opened from the archived-sessions surface,
+            // which stays behind it.
+            view.show_surface(CoveringSurface::ArchivedSessions);
             view.archived_sessions.loaded = true;
             view.project_delete_dialog = Some(ProjectDeleteDialogState {
                 session_id: root,

@@ -303,8 +303,7 @@ impl LoomView {
             default_model_select_value: None,
             model_select_choices: BTreeMap::new(),
             default_model_select_choices: BTreeMap::new(),
-            settings_open: false,
-            settings_section: SettingsSection::Agents,
+            covering_surface: None,
             providers: Vec::new(),
             providers_node_id: None,
             provider_api_key_inputs: BTreeMap::new(),
@@ -520,9 +519,12 @@ impl LoomView {
             default_model_select_value: None,
             model_select_choices: BTreeMap::new(),
             default_model_select_choices: BTreeMap::new(),
-            settings_open: options.is_configured(),
+            // An unconfigured client opens on the settings dialog, which is the
+            // covering surface on screen until the user closes it.
+            covering_surface: options
+                .is_configured()
+                .then_some(CoveringSurface::Settings(SettingsSection::Agents)),
             archived_sessions: ArchivedSessionsState::default(),
-            settings_section: SettingsSection::Agents,
             providers: Vec::new(),
             providers_node_id: None,
             provider_api_key_inputs: BTreeMap::new(),
@@ -798,8 +800,7 @@ impl LoomView {
             default_model_select_value: None,
             model_select_choices: BTreeMap::new(),
             default_model_select_choices: BTreeMap::new(),
-            settings_open: false,
-            settings_section: SettingsSection::Agents,
+            covering_surface: None,
             providers: Vec::new(),
             providers_node_id: None,
             provider_api_key_inputs: BTreeMap::new(),
@@ -1312,7 +1313,7 @@ impl LoomView {
                 match result {
                     Ok(mut initialized) if is_pending => {
                         let active_session = initialized.active_session.clone();
-                        initialized.settings_open = false;
+                        initialized.covering_surface = None;
                         initialized.browser_window_initialized = false;
                         *view = initialized;
                         view.reload_sessions(cx);
@@ -1495,7 +1496,7 @@ impl LoomView {
             view.update(cx, |view, cx| match result {
                 Ok(mut initialized) => {
                     let active_session = initialized.active_session.clone();
-                    initialized.settings_open = false;
+                    initialized.covering_surface = None;
                     initialized.browser_window_initialized = false;
                     *view = initialized;
                     view.reload_sessions(cx);

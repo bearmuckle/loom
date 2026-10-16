@@ -442,9 +442,12 @@ pub(crate) fn delete_archived_session_request(
 
 /// The archived-session surface state. `entries` and `projects` are the last
 /// successful load; a refresh keeps them on screen while it runs.
+///
+/// Whether the surface is shown is not part of this state: it is the view's
+/// single covering surface, so the listing can be cached without being on
+/// screen.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ArchivedSessionsState {
-    pub(crate) open: bool,
     pub(crate) loading: bool,
     pub(crate) loaded: bool,
     pub(crate) entries: Vec<ArchivedSessionEntry>,
@@ -480,16 +483,19 @@ pub(crate) struct ArchivedSessionsState {
 impl LoomView {
     /// Opens the archived-sessions surface and loads what it shows.
     pub(crate) fn open_archived_sessions(&mut self, cx: &mut Context<Self>) {
-        // The surface covers the central area, so a phone's session drawer goes
-        // with it, exactly as it does for Settings and the new-project pane.
-        self.session_drawer_open = false;
-        self.archived_sessions.open = true;
+        // The surface covers the central area, so opening it closes whatever
+        // else covered the conversation, including a phone's session drawer.
+        self.show_surface(CoveringSurface::ArchivedSessions);
         self.archived_sessions.refusal = None;
         self.reload_archived_sessions(cx);
     }
 
+    /// Closes the archived-sessions surface, which is the surface its own close
+    /// control belongs to.
     pub(crate) fn close_archived_sessions(&mut self, cx: &mut Context<Self>) {
-        self.archived_sessions.open = false;
+        if self.archived_sessions_open() {
+            self.close_covering_surface();
+        }
         cx.notify();
     }
 

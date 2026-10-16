@@ -23,14 +23,19 @@ impl LoomView {
 
     /// Shared entry point for the Copilot and repository device-login flows.
     pub(crate) fn begin_github_login(&mut self, kind: GitHubLoginKind, cx: &mut Context<Self>) {
-        if let Some(state) = &self.github_login {
-            if matches!(
-                state,
-                GitHubLoginState::Success | GitHubLoginState::Error(_)
-            ) {
-                self.github_login = None;
-                cx.notify();
-            }
+        // A finished login pane toggles off. Any other leftover state belongs to
+        // a flow that is not on screen, so a new one starts instead of the tap
+        // being swallowed by state the user cannot see.
+        if self.github_login_open()
+            && self.github_login.as_ref().is_some_and(|state| {
+                matches!(
+                    state,
+                    GitHubLoginState::Success | GitHubLoginState::Error(_)
+                )
+            })
+        {
+            self.close_covering_surface();
+            cx.notify();
             return;
         }
         let node_id = self
@@ -43,16 +48,35 @@ impl LoomView {
                 .get(node_id)
                 .is_some_and(BackendWorker::secure_for_secrets)
         {
-            self.github_login = Some(GitHubLoginState::Error(
+            self.show_github_login(GitHubLoginState::Error(
                 kind.secure_connection_message().to_owned(),
             ));
             cx.notify();
             return;
         }
-        self.settings_open = false;
-        self.review.open = false;
         self.github_login_kind = kind;
         self.start_github_login(cx);
+    }
+
+    /// Shows the GitHub login pane with `state`. This is how the pane starts; a
+    /// later step of a running flow writes `github_login` directly, because it
+    /// belongs to the pane the flow already put on screen.
+    pub(crate) fn show_github_login(&mut self, state: GitHubLoginState) {
+        self.show_surface(CoveringSurface::GitHubLogin);
+        self.github_login = Some(state);
+    }
+
+    /// Closes the GitHub login pane, which is the surface its own close control
+    /// belongs to. A control that fires after the pane was replaced only drops
+    /// the state it held.
+    pub(crate) fn close_github_login(&mut self, cx: &mut Context<Self>) {
+        if !self.github_login_open() {
+            self.github_login = None;
+            cx.notify();
+            return;
+        }
+        self.close_covering_surface();
+        cx.notify();
     }
 
     pub(crate) fn copy_github_login_value(
@@ -67,7 +91,7 @@ impl LoomView {
     }
 
     pub(crate) fn start_github_login(&mut self, cx: &mut Context<Self>) {
-        self.github_login = Some(GitHubLoginState::Starting);
+        self.show_github_login(GitHubLoginState::Starting);
         cx.notify();
         self.start_github_login_flow(cx);
     }
@@ -765,11 +789,22 @@ impl LoomView {
         cx.notify();
     }
 
+    /// Opens the settings dialog, on the section it already showed.
     pub(crate) fn open_settings_from_menu(&mut self, cx: &mut Context<Self>) {
-        self.github_login = None;
-        self.session_drawer_open = false;
-        self.review.open = false;
-        self.settings_open = true;
+        let section = self.settings_section().unwrap_or(SettingsSection::Agents);
+        self.open_settings_section(section, cx);
+    }
+
+    /// Opens the settings dialog on `section` and loads what that section shows.
+    ///
+    /// Opening it closes whatever covered the conversation, including the
+    /// archived-session surface and the phone's session drawer.
+    pub(crate) fn open_settings_section(
+        &mut self,
+        section: SettingsSection,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_surface(CoveringSurface::Settings(section));
         let node_id = self.default_backend_node_id.clone();
         self.refresh_github_write_access(node_id.clone(), cx);
         self.refresh_github_repository_access(node_id.clone(), cx);
@@ -915,24 +950,20 @@ impl LoomView {
     }
 
     pub(crate) fn open_providers_from_menu(&mut self, cx: &mut Context<Self>) {
-        self.settings_section = SettingsSection::Providers;
-        self.open_settings_from_menu(cx);
+        self.open_settings_section(SettingsSection::Providers, cx);
     }
 
     /// Opens the About settings pane from the command palette or `/about`.
     pub(crate) fn open_about_from_menu(&mut self, cx: &mut Context<Self>) {
-        self.settings_section = SettingsSection::About;
-        self.settings_open = true;
+        // About reads what the client already knows, so it loads no provider
+        // scope, exactly as it did before it was one section of the dialog.
+        self.show_surface(CoveringSurface::Settings(SettingsSection::About));
         cx.notify();
     }
 
     /// Opens the Providers settings pane scoped to a specific worker node.
     pub(crate) fn open_providers_for_node(&mut self, node_id: String, cx: &mut Context<Self>) {
-        self.github_login = None;
-        self.session_drawer_open = false;
-        self.review.open = false;
-        self.settings_section = SettingsSection::Providers;
-        self.settings_open = true;
+        self.show_surface(CoveringSurface::Settings(SettingsSection::Providers));
         self.refresh_github_write_access(node_id.clone(), cx);
         self.refresh_github_repository_access(node_id.clone(), cx);
         self.load_provider_scope(node_id, cx);
@@ -1033,13 +1064,17 @@ impl LoomView {
         );
     }
 
+    /// Closes the settings dialog, which is the surface its own close control
+    /// belongs to.
     pub(crate) fn close_settings(
         &mut self,
         _: &ClickEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.settings_open = false;
+        if self.settings_open() {
+            self.close_covering_surface();
+        }
         for input in self.provider_api_key_inputs.values() {
             input.update(cx, |state, cx| state.set_value("", window, cx));
         }

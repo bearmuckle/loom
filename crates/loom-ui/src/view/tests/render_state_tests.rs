@@ -25,17 +25,14 @@ fn settings_sections_and_dialogs_render(cx: &mut TestAppContext) {
         SettingsSection::Appearance,
     ] {
         render_with(cx, move |view| {
-            view.settings_open = true;
-            view.settings_section = section;
+            view.show_surface(CoveringSurface::Settings(section));
         });
     }
     render_with(cx, |view| {
-        view.settings_open = true;
-        view.settings_section = SettingsSection::Providers;
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Providers));
     });
     render_with(cx, |view| {
-        view.settings_open = true;
-        view.settings_section = SettingsSection::About;
+        view.show_surface(CoveringSurface::Settings(SettingsSection::About));
     });
     render_with(cx, |view| {
         view.command_palette_open = true;
@@ -44,20 +41,20 @@ fn settings_sections_and_dialogs_render(cx: &mut TestAppContext) {
         view.review.open = true;
     });
     render_with(cx, |view| {
-        view.github_login = Some(GitHubLoginState::Starting);
+        view.show_github_login(GitHubLoginState::Starting);
     });
     render_with(cx, |view| {
-        view.github_login = Some(GitHubLoginState::Awaiting {
+        view.show_github_login(GitHubLoginState::Awaiting {
             verification_uri: "https://github.com/login/device".to_owned(),
             user_code: "ABCD-1234".to_owned(),
             expires_in: 900,
         });
     });
     render_with(cx, |view| {
-        view.github_login = Some(GitHubLoginState::Error("failed".to_owned()));
+        view.show_github_login(GitHubLoginState::Error("failed".to_owned()));
     });
     render_with(cx, |view| {
-        view.github_login = Some(GitHubLoginState::Success);
+        view.show_github_login(GitHubLoginState::Success);
     });
 }
 
@@ -67,8 +64,12 @@ fn about_command_opens_the_about_section_and_help_lists_it(cx: &mut TestAppConte
     let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
         let mut view = LoomView::new_for_test(cx.focus_handle());
         view.run_command("about", None, cx);
-        assert!(view.settings_open);
-        assert_eq!(view.settings_section, SettingsSection::About);
+        assert!(view.settings_open());
+        assert_eq!(
+            view.settings_section(),
+            Some(SettingsSection::About),
+            "the About pane is the settings dialog on its About section"
+        );
 
         view.run_command("help", None, cx);
         let help = view

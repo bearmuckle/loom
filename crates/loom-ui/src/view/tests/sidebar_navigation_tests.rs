@@ -1,8 +1,8 @@
 //! Projects-pane navigation: overlay dismissal, touch targets, and project rows.
 
 use super::{
-    LoomView, SessionSourceChoice, SessionSourceDialog, SessionSourceDialogPurpose,
-    responsive_layout,
+    CoveringSurface, LoomView, SessionSourceChoice, SessionSourceDialog,
+    SessionSourceDialogPurpose, SettingsSection, responsive_layout,
 };
 use crate::theme::BASE_FONT_SIZE;
 use gpui_kit::component::Root;
@@ -88,6 +88,7 @@ fn source_dialog() -> SessionSourceDialog {
 fn selecting_the_open_project_dismisses_the_new_project_pane(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let (handle, view) = open_view_window(cx, |view| {
+        view.show_surface(CoveringSurface::NewProject);
         view.source_dialog = Some(source_dialog());
     });
     cx.update_window(handle.into(), |_, window, cx| {
@@ -110,7 +111,7 @@ fn selecting_the_open_project_dismisses_the_new_project_pane(cx: &mut TestAppCon
 fn selecting_the_open_project_dismisses_settings_and_the_archived_surface(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let (handle, view) = open_view_window(cx, |view| {
-        view.settings_open = true;
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Agents));
     });
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
@@ -118,7 +119,7 @@ fn selecting_the_open_project_dismisses_settings_and_the_archived_surface(cx: &m
         window.click(("session-tree-root", 0usize), cx);
         window.render_frame(cx);
         assert!(
-            !view.read(cx).settings_open,
+            !view.read(cx).settings_open(),
             "selecting the open project must close Settings"
         );
         assert!(window.try_find("settings-content").is_none());
@@ -131,7 +132,7 @@ fn selecting_the_open_project_dismisses_settings_and_the_archived_surface(cx: &m
 fn selecting_the_open_project_dismisses_the_archived_sessions_surface(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let (handle, view) = open_view_window(cx, |view| {
-        view.archived_sessions.open = true;
+        view.show_surface(CoveringSurface::ArchivedSessions);
     });
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
@@ -139,7 +140,7 @@ fn selecting_the_open_project_dismisses_the_archived_sessions_surface(cx: &mut T
         window.click(("session-tree-root", 0usize), cx);
         window.render_frame(cx);
         assert!(
-            !view.read(cx).archived_sessions.open,
+            !view.read(cx).archived_sessions_open(),
             "selecting the open project must close the archived-sessions surface"
         );
         assert!(window.try_find("archived-sessions-dialog").is_none());
@@ -166,7 +167,7 @@ fn selecting_another_project_still_switches_sessions(cx: &mut TestAppContext) {
                     .insert(session.id, view.default_backend_node_id.clone());
             }
             view.sessions = vec![view.active_session.clone(), second];
-            view.settings_open = true;
+            view.show_surface(CoveringSurface::Settings(SettingsSection::Agents));
             view
         });
         *rendered_for_window.borrow_mut() = Some(view.clone());
@@ -182,7 +183,7 @@ fn selecting_another_project_still_switches_sessions(cx: &mut TestAppContext) {
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(view.read(cx).active_session.name, "second");
-        assert!(!view.read(cx).settings_open);
+        assert!(!view.read(cx).settings_open());
     })
     .unwrap();
 }
@@ -461,7 +462,7 @@ fn pane_actions_stay_targeted_after_the_width_leaves_the_phone_layout(cx: &mut T
         );
         window.click("settings-button", cx);
         window.render_frame(cx);
-        assert!(view.read(cx).settings_open, "settings must be the action");
+        assert!(view.read(cx).settings_open(), "settings must be the action");
         assert!(
             view.read(cx).source_dialog.is_none(),
             "a tap on settings must not open the new-project pane"

@@ -24,11 +24,11 @@ impl LoomView {
             &self.default_backend_node_id,
         );
         let choice = source_dialog_initial_state(purpose, local_directory_available);
-        // The pane covers the central area, so a phone's session drawer has to go
-        // with it. Otherwise the pane is rendered behind the drawer: the tap
-        // looks like it did nothing until something else dismisses the drawer
-        // and reveals the pane that was opened first.
-        self.session_drawer_open = false;
+        // The pane covers the central area, so opening it closes whatever else
+        // covered the conversation. Otherwise the pane is rendered behind that
+        // surface: the tap looks like it did nothing until something else
+        // dismisses what was in front and reveals the pane opened first.
+        self.show_surface(CoveringSurface::NewProject);
         self.source_dialog = Some(SessionSourceDialog {
             purpose,
             target_node_id,
@@ -55,6 +55,15 @@ impl LoomView {
         }
         if choice == SessionSourceChoice::GitHub {
             self.load_cloned_repositories(cx);
+        }
+        cx.notify();
+    }
+
+    /// Closes the new-project pane, which is the surface its own close control
+    /// belongs to.
+    pub(crate) fn close_source_dialog(&mut self, cx: &mut Context<Self>) {
+        if self.source_dialog_open() {
+            self.close_covering_surface();
         }
         cx.notify();
     }
@@ -366,6 +375,12 @@ impl LoomView {
                 Some(SessionCreationSource::GitHub(source))
             }
         };
+        // The pane submitted: it gives up the surface it owns, and clears the
+        // state it held even if that surface had already been replaced. A
+        // refused path above re-opened the dialog and kept the surface.
+        if self.source_dialog_open() {
+            self.close_covering_surface();
+        }
         self.source_dialog = None;
         self.source_path_input = None;
         self.repository_filter_input = None;

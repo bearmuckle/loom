@@ -210,6 +210,12 @@ impl LoomView {
             self.rename_dialog = Some(dialog);
             return;
         }
+        // The dialog steps aside while the rename is in flight, which is what a
+        // user saw before it was the covering surface. A refusal brings it
+        // back; a success leaves the conversation uncovered.
+        if self.covering_surface() == Some(CoveringSurface::Rename) {
+            self.close_covering_surface();
+        }
         self.dispatch(
             cx,
             ClientRequest::Session(SessionRequest::RenameAgentSession {
@@ -222,6 +228,7 @@ impl LoomView {
                     view.reload_sessions(cx);
                 }
                 Err(error) => {
+                    view.show_surface(CoveringSurface::Rename);
                     view.rename_dialog = Some(dialog);
                     view.record_backend_error("rename session", error);
                 }
@@ -374,14 +381,12 @@ impl LoomView {
     ///
     /// Navigating to a project always returns to the conversation, including
     /// when the project is already the active one: otherwise a click on the
-    /// open project looks like it did nothing while Settings, the new-project
-    /// pane, the archived-sessions surface, or the GitHub login pane is in
-    /// front of it and the user has to close it by hand first.
+    /// open project looks like it did nothing while a covering surface is in
+    /// front of it and the user has to close it by hand first. The one value
+    /// that names the covering surface means no list of them has to be kept
+    /// here.
     pub(crate) fn dismiss_surfaces(&mut self) {
-        self.settings_open = false;
-        self.source_dialog = None;
-        self.github_login = None;
-        self.archived_sessions.open = false;
+        self.close_covering_surface();
         self.session_drawer_open = false;
     }
 
@@ -978,12 +983,26 @@ impl LoomView {
         cx: &mut Context<Self>,
     ) {
         self.select_session(session, cx);
+        self.show_surface(CoveringSurface::Rename);
         self.rename_dialog = Some(RenameDialogState {
             session: self.active_session.clone(),
             input: self.active_session.name.clone(),
             is_project,
         });
         self.rename_input_state = None;
+    }
+
+    /// Closes the rename dialog, which is the surface its own close control
+    /// belongs to.
+    pub(crate) fn close_rename_dialog(&mut self, cx: &mut Context<Self>) {
+        if self.covering_surface() == Some(CoveringSurface::Rename) {
+            // Closing the surface drops the dialog with its input state.
+            self.close_covering_surface();
+        } else {
+            self.rename_dialog = None;
+            self.rename_input_state = None;
+        }
+        cx.notify();
     }
 
     pub(crate) fn select_session_repository(

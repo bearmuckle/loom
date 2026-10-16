@@ -109,6 +109,10 @@ impl LoomView {
     /// Dismisses the innermost open dialog or pane, returning whether one was
     /// open.
     ///
+    /// The covering surface is one value, so Escape closes whatever that value
+    /// names, including the archived-session surface, instead of walking a
+    /// second list that can fall behind the openers.
+    ///
     /// Split out of the escape handler so the dismissal decision is testable
     /// without sending a run-control request.
     pub(crate) fn dismiss_open_surface(&mut self, cx: &mut Context<Self>) -> bool {
@@ -116,27 +120,7 @@ impl LoomView {
             self.close_command_palette(cx);
             return true;
         }
-        if self.source_dialog.is_some() {
-            self.source_dialog = None;
-            self.pending_source_path = None;
-            self.source_path_input = None;
-            self.repository_filter_input = None;
-            cx.notify();
-            return true;
-        }
-        if self.rename_dialog.is_some() {
-            self.rename_dialog = None;
-            self.rename_input_state = None;
-            cx.notify();
-            return true;
-        }
-        if self.github_login.is_some() {
-            self.github_login = None;
-            cx.notify();
-            return true;
-        }
-        if self.settings_open {
-            self.settings_open = false;
+        if self.close_covering_surface() {
             cx.notify();
             return true;
         }

@@ -250,8 +250,7 @@ fn a_loaded_snapshot_shows_its_destructive_decision(cx: &mut TestAppContext) {
         let view = cx.new(|cx| {
             let mut view = LoomView::new_for_test(cx.focus_handle());
             view.sessions = vec![view.active_session.clone()];
-            view.settings_open = true;
-            view.settings_section = SettingsSection::Agents;
+            view.show_surface(CoveringSurface::Settings(SettingsSection::Agents));
             view
         });
         *rendered_for_window.borrow_mut() = Some(view.clone());

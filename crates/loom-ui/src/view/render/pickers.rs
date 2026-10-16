@@ -241,14 +241,16 @@ impl LoomView {
                                             .child(screen.empty),
                                     ),
                             )
-                            .when(self.settings_open, |element| {
-                                element.child(self.render_settings_dialog(layout, cx))
+                            .when(self.settings_open(), |element| {
+                                let section =
+                                    self.settings_section().unwrap_or(SettingsSection::Agents);
+                                element.child(self.render_settings_dialog(section, layout, cx))
                             }),
                     ),
             )
             .child(disconnected_footer(layout).child(screen.footer))
             .when(
-                !self.settings_open
+                !self.settings_open()
                     && !self.welcome_dialog_dismissed
                     && self.browser_connection_lost.is_none(),
                 |element| {

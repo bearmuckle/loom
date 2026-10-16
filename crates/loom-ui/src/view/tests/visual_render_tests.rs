@@ -202,7 +202,8 @@ fn headless_rendering_is_deterministic_across_contexts() {
 #[test]
 fn headless_renderer_detects_a_visual_state_change() {
     let baseline = capture(|_| {});
-    let settings = capture(|view| view.settings_open = true);
+    let settings =
+        capture(|view| view.show_surface(CoveringSurface::Settings(SettingsSection::Agents)));
     assert_ne!(
         baseline.fingerprint(),
         settings.fingerprint(),
@@ -221,8 +222,7 @@ fn every_settings_section_paints_over_the_empty_view() {
         SettingsSection::About,
     ] {
         let frame = capture(move |view| {
-            view.settings_open = true;
-            view.settings_section = section;
+            view.show_surface(CoveringSurface::Settings(section));
         });
         assert_ne!(
             frame.fingerprint(),

@@ -134,7 +134,7 @@ enum CompletionKind {
 
 /// The active pane in the settings dialog's section navigation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SettingsSection {
+pub(crate) enum SettingsSection {
     Agents,
     Providers,
     Workers,
@@ -149,6 +149,63 @@ const SETTINGS_SECTIONS: [(SettingsSection, &str); 5] = [
     (SettingsSection::Appearance, "Appearance"),
     (SettingsSection::About, "About"),
 ];
+
+/// The one surface that covers the conversation, if any.
+///
+/// At most one of these is shown at a time, and which one is a property of the
+/// view's [`CoveringSurface`] value rather than a convention the openers and the
+/// renderer have to agree on: each opener sets the value, the renderer draws the
+/// surface the value names, and every check for "is this on screen" asks the
+/// same value. About and Providers are the settings dialog with another section,
+/// so they are this one surface with its section.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CoveringSurface {
+    /// The settings dialog, on the section it shows. About and Providers are
+    /// this surface; only the section differs.
+    Settings(SettingsSection),
+    /// The archived-session management surface.
+    ArchivedSessions,
+    /// The new-project pane, which is also how a source is attached to a
+    /// session.
+    NewProject,
+    /// The GitHub device-login pane.
+    GitHubLogin,
+    /// The rename dialog.
+    Rename,
+}
+
+impl CoveringSurface {
+    /// Every covering surface, so a test can open each one and each pair. The
+    /// `id` match beside it is exhaustive, so a new variant has to be named
+    /// there and here, and has to satisfy the exclusivity test.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 5] = [
+        Self::Settings(SettingsSection::Agents),
+        Self::ArchivedSessions,
+        Self::NewProject,
+        Self::GitHubLogin,
+        Self::Rename,
+    ];
+
+    /// The id of the surface's own root element, which is what a render test
+    /// looks for to tell which surface is on screen.
+    #[cfg(test)]
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::Settings(_) => "settings-dialog",
+            Self::ArchivedSessions => "archived-sessions-dialog",
+            Self::NewProject => "source-dialog-pane",
+            Self::GitHubLogin => "github-login-dialog",
+            Self::Rename => "rename-dialog",
+        }
+    }
+
+    /// Whether this surface takes the width the review column would use, so the
+    /// column stays out of the way while it is shown.
+    pub(crate) fn hides_review_panel(self) -> bool {
+        matches!(self, Self::Settings(_) | Self::GitHubLogin)
+    }
+}
 
 /// The active inline completion in the composer, derived from the text before
 /// the cursor. Slash commands and `@` file references share one popup.
@@ -547,8 +604,11 @@ pub(crate) struct LoomView {
     default_model_select_value: Option<String>,
     model_select_choices: BTreeMap<String, ModelId>,
     default_model_select_choices: BTreeMap<String, ModelId>,
-    pub(crate) settings_open: bool,
-    settings_section: SettingsSection,
+    /// The one covering surface on screen, if any. Set by the openers and read
+    /// by the renderer, so the settings dialog, the archived-session surface,
+    /// the new-project pane, the GitHub login pane, and the rename dialog can
+    /// never be shown at the same time.
+    covering_surface: Option<CoveringSurface>,
     pub(crate) providers: Vec<ProviderSummary>,
     providers_node_id: Option<String>,
     provider_api_key_inputs: BTreeMap<loom_model::ProviderId, Entity<InputState>>,
@@ -1184,8 +1244,7 @@ fn settings_nav(
                         .hover(|style| style.bg(rgb(0x20242c)))
                         .child(label)
                         .on_click(cx.listener(move |view, _, _, cx| {
-                            view.settings_section = candidate;
-                            cx.notify();
+                            view.select_settings_section(candidate, cx);
                         }))
                 }),
         )
@@ -1671,8 +1730,7 @@ impl LoomView {
             default_model_select_value: None,
             model_select_choices: BTreeMap::new(),
             default_model_select_choices: BTreeMap::new(),
-            settings_open: false,
-            settings_section: SettingsSection::Agents,
+            covering_surface: None,
             providers: Vec::new(),
             providers_node_id: None,
             provider_api_key_inputs: BTreeMap::new(),
@@ -1840,6 +1898,7 @@ mod review;
 mod runs;
 mod sessions;
 mod source;
+mod surfaces;
 mod timeline;
 mod workers;
 

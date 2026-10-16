@@ -5,7 +5,7 @@
 //! one.
 
 use super::{
-    LoomView, SETTINGS_SECTIONS, SessionSourceChoice, SessionSourceDialog,
+    CoveringSurface, LoomView, SETTINGS_SECTIONS, SessionSourceChoice, SessionSourceDialog,
     SessionSourceDialogPurpose, SettingsSection, WorkerConnectionState, WorkerNodeEntry,
 };
 use crate::state::GitHubLoginState;
@@ -847,14 +847,14 @@ fn session_activation_resets_projection_and_resolves_backend_ownership(cx: &mut 
 #[gpui_kit::test]
 fn settings_about_and_providers_panes_render(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    render_scenario(cx, |view| view.settings_open = true);
     render_scenario(cx, |view| {
-        view.settings_open = true;
-        view.settings_section = SettingsSection::About;
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Agents))
     });
     render_scenario(cx, |view| {
-        view.settings_open = true;
-        view.settings_section = SettingsSection::Providers;
+        view.show_surface(CoveringSurface::Settings(SettingsSection::About));
+    });
+    render_scenario(cx, |view| {
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Providers));
     });
 }
 
@@ -862,8 +862,7 @@ fn settings_about_and_providers_panes_render(cx: &mut TestAppContext) {
 fn settings_about_pane_renders_every_backend_mode_and_a_phone_layout(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let open_about = |view: &mut LoomView| {
-        view.settings_open = true;
-        view.settings_section = SettingsSection::About;
+        view.show_surface(CoveringSurface::Settings(SettingsSection::About));
     };
     // Local in-process backend.
     render_scenario(cx, open_about);
@@ -897,8 +896,7 @@ fn settings_about_pane_exposes_stable_test_ids(cx: &mut TestAppContext) {
     let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
         let view = cx.new(|cx| {
             let mut view = LoomView::new_for_test(cx.focus_handle());
-            view.settings_open = true;
-            view.settings_section = SettingsSection::About;
+            view.show_surface(CoveringSurface::Settings(SettingsSection::About));
             view.backend_endpoint = Some("wss://worker.example:8443/ws?token=hidden".to_owned());
             view.server_protocol_version = Some(loom_core::ProtocolVersion::new(11, 1));
             view
@@ -996,6 +994,7 @@ fn session_source_dialog_choices_and_close_button_work(cx: &mut TestAppContext) 
     let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
         let view = cx.new(|cx| {
             let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.show_surface(CoveringSurface::NewProject);
             view.source_dialog = Some(SessionSourceDialog {
                 purpose: SessionSourceDialogPurpose::StartSession,
                 target_node_id: String::new(),
@@ -1087,6 +1086,7 @@ fn phone_source_dialog_stacks_choices_and_keeps_actions_visible(cx: &mut TestApp
     let handle = cx.open_window(size(px(390.), px(520.)), |window, cx| {
         let view = cx.new(|cx| {
             let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.show_surface(CoveringSurface::NewProject);
             view.source_dialog = Some(SessionSourceDialog {
                 purpose: SessionSourceDialogPurpose::StartSession,
                 target_node_id: String::new(),
@@ -1172,6 +1172,7 @@ fn github_source_body_stacks_vertically(cx: &mut TestAppContext) {
     let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
         let view = cx.new(|cx| {
             let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.show_surface(CoveringSurface::NewProject);
             view.source_dialog = Some(SessionSourceDialog {
                 purpose: SessionSourceDialogPurpose::StartSession,
                 target_node_id: String::new(),
@@ -1339,11 +1340,10 @@ fn settings_provider_views_and_theme_actions_update_the_view_state(cx: &mut Test
     let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
         let mut view = LoomView::new_for_test(cx.focus_handle());
         view.review.open = true;
-        view.settings_open = true;
-        view.github_login = Some(GitHubLoginState::Starting);
+        view.show_github_login(GitHubLoginState::Starting);
         view.open_providers_from_menu(cx);
-        assert!(view.settings_open);
-        assert_eq!(view.settings_section, SettingsSection::Providers);
+        assert!(view.settings_open());
+        assert_eq!(view.settings_section(), Some(SettingsSection::Providers));
         assert!(!view.review.open);
         assert!(view.github_login.is_none());
         assert_eq!(view.providers_node_id.as_deref(), Some("test-node"));
@@ -1926,7 +1926,7 @@ fn escape_dismisses_each_open_surface(cx: &mut TestAppContext) {
     cx.dispatch_keystroke(window, escape_shortcut());
     cx.update_window(window, |view, window, cx| {
         let view = view.downcast::<LoomView>().unwrap();
-        assert!(!view.read(cx).settings_open);
+        assert!(!view.read(cx).settings_open());
         window.render_frame(cx);
         assert!(window.try_find("close-settings").is_none());
     })
@@ -2035,7 +2035,7 @@ fn advertised_primary_shortcuts_dispatch_their_commands(cx: &mut TestAppContext)
     cx.dispatch_keystroke(window, primary_shortcut(","));
     cx.update_window(window, |view, window, cx| {
         let view = view.downcast::<LoomView>().unwrap();
-        assert!(view.read(cx).settings_open);
+        assert!(view.read(cx).settings_open());
         window.render_frame(cx);
         assert!(window.try_find("close-settings").is_some());
     })
@@ -2043,7 +2043,7 @@ fn advertised_primary_shortcuts_dispatch_their_commands(cx: &mut TestAppContext)
     cx.dispatch_keystroke(window, escape_shortcut());
     cx.update_window(window, |view, _, cx| {
         let view = view.downcast::<LoomView>().unwrap();
-        assert!(!view.read(cx).settings_open);
+        assert!(!view.read(cx).settings_open());
     })
     .unwrap();
 }
@@ -2992,7 +2992,7 @@ fn composer_commands_and_failed_run_responses_are_projected(cx: &mut TestAppCont
         view.run_slash_command("/unknown", cx);
         view.run_slash_command("/repo", cx);
         assert!(view.source_dialog.is_some());
-        view.source_dialog = None;
+        view.close_source_dialog(cx);
         view.run_slash_command("/review", cx);
         assert!(view.review.open);
         view.approve_pending_action(cx);
@@ -3127,7 +3127,7 @@ fn server_event_projection_updates_session_and_ignores_service_streams(cx: &mut 
 fn settings_and_provider_dialogs_render_configured_entries(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     render_scenario(cx, |view| {
-        view.settings_open = true;
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Agents));
         view.browser_startup_error = Some("Workspace setup failed".to_owned());
         view.worker_nodes.push(WorkerNodeEntry {
             id: 1,
@@ -3189,8 +3189,7 @@ fn settings_and_provider_dialogs_render_configured_entries(cx: &mut TestAppConte
     render_scenario(cx, |view| {
         let local_provider_id = loom_model::ProviderId::new("company-gateway");
         let github_provider_id = loom_model::ProviderId::new("github-copilot");
-        view.settings_open = true;
-        view.settings_section = SettingsSection::Providers;
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Providers));
         view.github_connected = true;
         view.providers = vec![
             ProviderSummary {
@@ -3245,7 +3244,7 @@ fn github_login_states_and_phone_session_drawer_render(cx: &mut TestAppContext) 
         GitHubLoginState::Success,
         GitHubLoginState::Error("Unable to connect".to_owned()),
     ] {
-        render_scenario(cx, |view| view.github_login = Some(state));
+        render_scenario(cx, |view| view.show_github_login(state));
     }
     render_scenario_at(cx, size(px(390.), px(844.)), |view| {
         view.session_drawer_open = true;
@@ -3370,7 +3369,7 @@ fn phone_composer_and_settings_render_at_mobile_width(cx: &mut TestAppContext) {
             .unwrap()
             .unwrap()
             .update(cx, |view, cx| {
-                view.settings_open = true;
+                view.show_surface(CoveringSurface::Settings(SettingsSection::Agents));
                 cx.notify();
             });
         window.render_frame(cx);
@@ -4031,6 +4030,7 @@ async fn github_source_selection_reports_unconfigured_provider_and_requires_a_re
 fn rename_and_source_dialogs_render(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     render_scenario(cx, |view| {
+        view.show_surface(CoveringSurface::Rename);
         view.rename_dialog = Some(RenameDialogState {
             session: view.active_session.clone(),
             input: "Renamed session".to_owned(),
@@ -4038,6 +4038,7 @@ fn rename_and_source_dialogs_render(cx: &mut TestAppContext) {
         });
     });
     render_scenario(cx, |view| {
+        view.show_surface(CoveringSurface::NewProject);
         view.source_dialog = Some(SessionSourceDialog {
             purpose: SessionSourceDialogPurpose::StartSession,
             target_node_id: String::new(),
@@ -4051,6 +4052,7 @@ fn rename_and_source_dialogs_render(cx: &mut TestAppContext) {
         });
     });
     render_scenario(cx, |view| {
+        view.show_surface(CoveringSurface::NewProject);
         view.source_dialog = Some(SessionSourceDialog {
             purpose: SessionSourceDialogPurpose::AddToSession,
             target_node_id: String::new(),
@@ -4064,6 +4066,7 @@ fn rename_and_source_dialogs_render(cx: &mut TestAppContext) {
         });
     });
     render_scenario(cx, |view| {
+        view.show_surface(CoveringSurface::NewProject);
         view.source_dialog = Some(SessionSourceDialog {
             purpose: SessionSourceDialogPurpose::StartSession,
             target_node_id: String::new(),
@@ -4083,6 +4086,7 @@ fn rename_and_source_dialogs_render(cx: &mut TestAppContext) {
         });
     });
     render_scenario(cx, |view| {
+        view.show_surface(CoveringSurface::NewProject);
         view.source_dialog = Some(SessionSourceDialog {
             purpose: SessionSourceDialogPurpose::StartSession,
             target_node_id: String::new(),
@@ -4096,6 +4100,7 @@ fn rename_and_source_dialogs_render(cx: &mut TestAppContext) {
         });
     });
     render_scenario(cx, |view| {
+        view.show_surface(CoveringSurface::NewProject);
         view.source_dialog = Some(SessionSourceDialog {
             purpose: SessionSourceDialogPurpose::AddToSession,
             target_node_id: String::new(),
@@ -4109,6 +4114,7 @@ fn rename_and_source_dialogs_render(cx: &mut TestAppContext) {
         });
     });
     render_scenario(cx, |view| {
+        view.show_surface(CoveringSurface::NewProject);
         view.source_dialog = Some(SessionSourceDialog {
             purpose: SessionSourceDialogPurpose::StartSession,
             target_node_id: String::new(),
@@ -4129,6 +4135,7 @@ fn rename_and_source_dialogs_render(cx: &mut TestAppContext) {
             branch: Some("main".to_owned()),
             last_used_at: Timestamp::from_unix_millis(0),
         }];
+        view.show_surface(CoveringSurface::NewProject);
         view.source_dialog = Some(SessionSourceDialog {
             purpose: SessionSourceDialogPurpose::StartSession,
             target_node_id: String::new(),

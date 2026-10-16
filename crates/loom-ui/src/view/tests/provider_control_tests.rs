@@ -23,10 +23,10 @@ fn provider_model_and_mode_controls_update_state(cx: &mut TestAppContext) {
         view.observe_system_appearance(window, cx);
 
         view.open_settings_from_menu(cx);
-        assert!(view.settings_open);
+        assert!(view.settings_open());
         view.open_providers_for_node("test-node".to_owned(), cx);
-        assert!(view.settings_open);
-        assert_eq!(view.settings_section, SettingsSection::Providers);
+        assert!(view.settings_open());
+        assert_eq!(view.settings_section(), Some(SettingsSection::Providers));
 
         view.handle_github_provider_configured("test-node".to_owned(), cx);
         assert!(view.github_connected);
@@ -47,8 +47,7 @@ fn github_write_access_toggle_round_trips(cx: &mut TestAppContext) {
         crate::connection::negotiate(&view.connection).unwrap();
         assert!(!view.github_write_access);
         view.github_repository_connected = true;
-        view.settings_open = true;
-        view.settings_section = SettingsSection::Providers;
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Providers));
         view
     });
     cx.run_until_parked();
@@ -88,8 +87,7 @@ fn reasoning_visibility_toggle_round_trips(cx: &mut TestAppContext) {
     let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
         let mut view = LoomView::new_for_test(cx.focus_handle());
         assert!(!view.show_reasoning);
-        view.settings_open = true;
-        view.settings_section = SettingsSection::Appearance;
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Appearance));
         view
     });
     cx.run_until_parked();
@@ -131,12 +129,14 @@ fn begin_github_login_clears_finished_states(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
         let mut view = LoomView::new_for_test(cx.focus_handle());
-        view.github_login = Some(GitHubLoginState::Success);
+        view.show_github_login(GitHubLoginState::Success);
         view.begin_github_login(crate::state::GitHubLoginKind::Repository, cx);
         assert!(view.github_login.is_none());
-        view.github_login = Some(GitHubLoginState::Error("failed".to_owned()));
+        assert!(!view.github_login_open());
+        view.show_github_login(GitHubLoginState::Error("failed".to_owned()));
         view.begin_github_login(crate::state::GitHubLoginKind::Copilot, cx);
         assert!(view.github_login.is_none());
+        assert!(!view.github_login_open());
         view
     });
     cx.run_until_parked();
@@ -152,8 +152,7 @@ fn github_repository_access_row_renders_when_disconnected(cx: &mut TestAppContex
         crate::connection::negotiate(&view.connection).unwrap();
         view.login_enabled = true;
         view.github_repository_connected = false;
-        view.settings_open = true;
-        view.settings_section = SettingsSection::Providers;
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Providers));
         view
     });
     cx.run_until_parked();

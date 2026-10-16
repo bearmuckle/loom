@@ -134,7 +134,7 @@ impl Render for LoomView {
         if self.node_input_state.is_none() {
             let initial_value = self.node_input_initial.clone();
             let input = cx.new(|cx| InputState::new(window, cx).default_value(initial_value));
-            if self.settings_open {
+            if self.settings_open() {
                 input.update(cx, |state, cx| state.focus(window, cx));
             }
             self.input_subscriptions.push(cx.subscribe(
@@ -179,7 +179,7 @@ impl Render for LoomView {
             ));
             self.rename_input_state = Some(input);
         }
-        if self.settings_open && self.settings_section == SettingsSection::Providers {
+        if self.settings_section() == Some(SettingsSection::Providers) {
             for provider in self
                 .providers
                 .iter()
@@ -273,8 +273,7 @@ impl Render for LoomView {
             layout,
             self.review.open,
             self.sessions.len(),
-            self.settings_open,
-            self.github_login.is_some(),
+            self.covering_surface(),
         );
         let panel_layout = h_resizable("loom-workspace-panels")
             .with_handle_appearance(Rc::new(|handle, _, _| {
@@ -632,21 +631,10 @@ impl Render for LoomView {
                         ),
                 )
             })
-            .when(self.rename_dialog.is_some(), |element| {
-                element.child(self.render_rename_dialog(cx))
-            })
-            .when(self.settings_open, |element| {
-                element.child(self.render_settings_dialog(layout, cx))
-            })
-            .when(self.github_login.is_some(), |element| {
-                element.child(self.render_github_login_dialog(cx))
-            })
-            .when(self.source_dialog.is_some(), |element| {
-                element.child(self.render_source_dialog(layout, cx))
-            })
-            .when(self.archived_sessions.open, |element| {
-                element.child(self.render_archived_sessions(layout, cx))
-            }),
+            // The covering surface is a single value, so this one child is the
+            // only place a surface paints: which one it is does not depend on
+            // the order children are added in.
+            .child(self.render_covering_surface(layout, cx)),
             ),
                 resizable_panel()
                     .size(layout.review_width)
@@ -784,8 +772,9 @@ impl Render for LoomView {
                         layout.phone
                             && self.review.open
                             && !self.sessions.is_empty()
-                            && !self.settings_open
-                            && self.github_login.is_none(),
+                            && !self
+                                .covering_surface()
+                                .is_some_and(CoveringSurface::hides_review_panel),
                         |element| element.child(self.render_inspector(window, cx)),
                     ),
             )
@@ -798,5 +787,34 @@ impl Render for LoomView {
                 element.child(self.render_project_delete_dialog(cx))
             });
         content.into_any()
+    }
+}
+
+impl LoomView {
+    /// The one covering surface on screen, or an empty element when the
+    /// conversation is not covered.
+    ///
+    /// This exhaustive match is the only place a covering surface is added to
+    /// the tree, so adding one to [`CoveringSurface`] fails to compile until it
+    /// is drawn here, and two of them can never paint at once.
+    fn render_covering_surface(
+        &self,
+        layout: ResponsiveLayout,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        match self.covering_surface() {
+            None => div().into_any_element(),
+            Some(CoveringSurface::Settings(section)) => self
+                .render_settings_dialog(section, layout, cx)
+                .into_any_element(),
+            Some(CoveringSurface::ArchivedSessions) => self.render_archived_sessions(layout, cx),
+            Some(CoveringSurface::NewProject) => {
+                self.render_source_dialog(layout, cx).into_any_element()
+            }
+            Some(CoveringSurface::GitHubLogin) => {
+                self.render_github_login_dialog(cx).into_any_element()
+            }
+            Some(CoveringSurface::Rename) => self.render_rename_dialog(cx).into_any_element(),
+        }
     }
 }
