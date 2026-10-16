@@ -783,7 +783,10 @@ impl LoomView {
                             .mt_1()
                             .text_xs()
                             .text_color(accent)
-                            .child("This operation can be retried."),
+                            // The note has no control to offer, so it names the
+                            // one that does instead of promising a retry the
+                            // user cannot start from here.
+                            .child("Retry by sending another message."),
                     );
                 }
                 card.into_any()

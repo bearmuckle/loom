@@ -1,16 +1,16 @@
 use super::{
     AboutBackend, AboutLink, AgentActivityData, AgentActivityRecord, AgentActivityStatus,
-    CompletionKind, FileActivityOperation, LOOM_REPOSITORY_URL, MAX_RUN_FAILURE_REASON_CHARS,
-    ToolPart, ToolPartStatus, about_backend, about_backend_label, about_build_version,
-    about_git_revision, about_links, about_platform_label, about_protocol, about_version_label,
-    action_kind_label, activity_output, approval_policy_status_text, change_kind_label,
-    command_line, command_purpose, commands_matching, completion_for_value, composer_height,
-    disconnected_screen, endpoint_host, endpoint_label, format_bytes, format_duration,
-    format_percentage, has_block_markdown, humanize_tool_output, is_redundant_completion_summary,
-    relative_time, replace_command_token, replace_last_token, rgb, run_failure_reason,
-    run_state_color, run_state_label, session_is_active, session_status_pill, source_mount_path,
-    tool_denial_count, tool_detail, tool_failure_count, tool_failure_reason, tool_group_label,
-    tool_group_status, tool_icon, tool_needs_attention, tool_outcome_notes,
+    CONNECTION_LOST_COPY, CompletionKind, FileActivityOperation, LOOM_REPOSITORY_URL,
+    MAX_RUN_FAILURE_REASON_CHARS, ToolPart, ToolPartStatus, about_backend, about_backend_label,
+    about_build_version, about_git_revision, about_links, about_platform_label, about_protocol,
+    about_version_label, action_kind_label, activity_output, approval_policy_status_text,
+    change_kind_label, command_line, command_purpose, commands_matching, completion_for_value,
+    composer_height, disconnected_screen, endpoint_host, endpoint_label, format_bytes,
+    format_duration, format_percentage, has_block_markdown, humanize_tool_output,
+    is_redundant_completion_summary, relative_time, replace_command_token, replace_last_token, rgb,
+    run_failure_reason, run_state_color, run_state_label, session_is_active, session_status_pill,
+    source_mount_path, tool_denial_count, tool_detail, tool_failure_count, tool_failure_reason,
+    tool_group_label, tool_group_status, tool_icon, tool_needs_attention, tool_outcome_notes,
     tool_part_from_activity, tool_part_from_policy, tool_policy_note, tool_shows_output,
     tool_status, tool_title, tool_title_for_activity, tool_usage_label, tool_usage_summary,
 };
@@ -1032,6 +1032,7 @@ fn disconnected_screen_copy_distinguishes_first_connect_from_connection_loss() {
     let fresh = disconnected_screen(None);
     assert_eq!(fresh.heading, "No worker connected");
     assert!(!fresh.reconnect);
+    assert!(fresh.details.is_none());
     assert_eq!(
         fresh.footer,
         "Not connected  ·  Connect a worker in Settings"
@@ -1040,12 +1041,48 @@ fn disconnected_screen_copy_distinguishes_first_connect_from_connection_loss() {
     let lost = disconnected_screen(Some("the connection closed (code 1006)"));
     assert_eq!(lost.heading, "Connection lost");
     assert!(lost.reconnect);
-    assert!(lost.detail.contains("code 1006"));
+    // The copy says what happened and what the client is doing, in plain
+    // language: no internal code, no raw transport reason, and no nested
+    // parentheses around a reason that already has its own.
+    assert_eq!(
+        lost.detail,
+        format!("{CONNECTION_LOST_COPY} Your projects and sessions are unchanged.")
+    );
+    for raw in [
+        "1006",
+        "(code",
+        "the connection closed",
+        "request_cancelled",
+    ] {
+        assert!(
+            !lost.detail.contains(raw),
+            "the disconnected copy still shows {raw}: {}",
+            lost.detail
+        );
+    }
+    // The raw reason stays behind the details affordance so it is still
+    // available for debugging.
+    assert_eq!(
+        lost.details.as_deref(),
+        Some("the connection closed (code 1006)")
+    );
     assert_eq!(
         lost.empty,
-        "Reconnect to reload your projects and sessions."
+        "Reconnecting to reload your projects and sessions."
     );
-    assert_eq!(lost.footer, "Disconnected  ·  connection lost");
+    assert_eq!(lost.footer, "Disconnected  ·  reconnecting automatically");
+
+    // The attempt indicator is filled in from the reconnecting state, so the
+    // disconnected screen shows one progress line rather than a reason.
+    let reconnecting = disconnected_screen(Some("the connection closed (code 1006)"))
+        .with_progress(Some(
+            "Reconnecting automatically · attempt 2 of 8 · next attempt in about 1s".to_owned(),
+        ));
+    assert_eq!(
+        reconnecting.progress.as_deref(),
+        Some("Reconnecting automatically · attempt 2 of 8 · next attempt in about 1s")
+    );
+    assert_eq!(disconnected_screen(None).progress, None);
 }
 
 #[test]

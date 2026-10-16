@@ -4897,12 +4897,16 @@ fn transcript_renders_all_message_and_activity_variants(cx: &mut TestAppContext)
                 tone: SystemTone::Error,
                 heading: Some("save · persistence".to_owned()),
                 text: "write failed".to_owned(),
+                details: None,
+                progress: None,
                 retryable: true,
             }),
             TimelineItem::System(SystemNote {
                 tone: SystemTone::Input,
                 heading: Some("Agent needs input".to_owned()),
                 text: "Which branch should I use?".to_owned(),
+                details: None,
+                progress: None,
                 retryable: false,
             }),
         ];

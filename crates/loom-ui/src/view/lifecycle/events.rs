@@ -343,6 +343,10 @@ impl LoomView {
                     tone: SystemTone::Error,
                     heading: Some(format!("agent · {}", error.code)),
                     text: error.message.clone(),
+                    // The provider's own retry policy owns this failure, and the
+                    // note has no control to offer, so it stays a message.
+                    details: Some(error.to_string()),
+                    progress: None,
                     retryable: error.retryable,
                 }));
             }
@@ -467,6 +471,8 @@ impl LoomView {
                     tone: SystemTone::Input,
                     heading: Some("Agent needs input".to_owned()),
                     text: prompt.clone(),
+                    details: None,
+                    progress: None,
                     retryable: false,
                 }));
             }

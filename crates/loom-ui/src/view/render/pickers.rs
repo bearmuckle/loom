@@ -55,7 +55,9 @@ impl LoomView {
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
         let layout = responsive_layout(window.bounds().size.width);
-        let screen = disconnected_screen(self.browser_connection_lost.as_deref());
+        let screen = disconnected_screen(self.browser_connection_lost.as_deref())
+            .with_progress(self.reconnect_progress());
+        let details = screen.details.clone();
         div()
             .size_full()
             .relative()
@@ -139,7 +141,54 @@ impl LoomView {
                                                     .text_xs()
                                                     .text_color(rgb(0x8f98a6))
                                                     .child(screen.detail),
-                                            ),
+                                            )
+                                            .when_some(screen.progress.clone(), |copy, progress| {
+                                                copy.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(0x64748b))
+                                                        .child(progress),
+                                                )
+                                            })
+                                            // The raw close reason is a transport
+                                            // string, so it stays behind this
+                                            // disclosure instead of in the copy.
+                                            .when_some(details.clone(), |copy, raw| {
+                                                copy.child(
+                                                    div()
+                                                        .mt_1()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_1()
+                                                        .child(
+                                                            Button::new("disconnected-details")
+                                                                .label(
+                                                                    if self.status_details_open {
+                                                                        "Hide details"
+                                                                    } else {
+                                                                        "Details"
+                                                                    },
+                                                                )
+                                                                .ghost()
+                                                                .xsmall()
+                                                                .on_click(cx.listener(
+                                                                    |view, _, _, cx| {
+                                                                        view.toggle_status_details(
+                                                                            cx,
+                                                                        )
+                                                                    },
+                                                                )),
+                                                        )
+                                                        .when(self.status_details_open, |row| {
+                                                            row.child(
+                                                                div()
+                                                                    .text_xs()
+                                                                    .text_color(rgb(0x64748b))
+                                                                    .child(raw),
+                                                            )
+                                                        }),
+                                                )
+                                            }),
                                     )
                                     .child(
                                         disconnected_header_actions()

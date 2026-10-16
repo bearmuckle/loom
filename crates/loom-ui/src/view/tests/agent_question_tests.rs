@@ -25,6 +25,8 @@ fn question_note() -> TimelineItem {
         tone: SystemTone::Input,
         heading: Some("Agent needs input".to_owned()),
         text: QUESTION.to_owned(),
+        details: None,
+        progress: None,
         retryable: false,
     })
 }
@@ -34,6 +36,8 @@ fn error_note(text: &str) -> TimelineItem {
         tone: SystemTone::Error,
         heading: Some("save · persistence".to_owned()),
         text: text.to_owned(),
+        details: None,
+        progress: None,
         retryable: false,
     })
 }

@@ -1,14 +1,15 @@
 use super::{
     ACTIVE_BACKEND_NODE_ENTRY_ID, SessionSourceChoice, SessionSourceDialogPurpose, SessionTreeNode,
     WorkerConnectionStage, WorkerConnectionState, WorkerNodeEntry, adjusted_cpu_pulse_threshold,
-    adjusted_project_agent_concurrency, assigned_node_id, connection_placeholder,
-    filter_session_tree, format_percentage, format_worker_node_resources, initial_worker_nodes,
-    local_source_available, mark_worker_connection_failed, merge_node_sessions,
-    next_severe_load_streak, order_session_nodes, project_child_control_actions,
-    project_session_list_projection, project_session_list_projection_for_projects,
-    project_snapshot_has_unloaded_agent_sessions, remove_worker_node_entry, safe_worker_url_label,
-    session_id_for_request, session_list_projection, session_status_pill,
-    session_tree_descendant_count, source_choice_is_allowed, source_dialog_initial_state,
+    adjusted_project_agent_concurrency, assigned_node_id, classify_connectivity_failure,
+    connection_placeholder, filter_session_tree, format_percentage, format_worker_node_resources,
+    initial_worker_nodes, local_source_available, mark_worker_connection_failed,
+    merge_node_sessions, next_severe_load_streak, order_session_nodes,
+    project_child_control_actions, project_session_list_projection,
+    project_session_list_projection_for_projects, project_snapshot_has_unloaded_agent_sessions,
+    remove_worker_node_entry, safe_worker_url_label, session_id_for_request,
+    session_list_projection, session_status_pill, session_tree_descendant_count,
+    source_choice_is_allowed, source_dialog_initial_state,
     transition_worker_connection_to_connecting, uncovered_session_ids, update_worker_node_status,
     validate_model_for_node, worker_connection_failure_detail, worker_node_display_name,
     worker_url_embeds_credential,
@@ -170,6 +171,35 @@ fn connection_error_details_are_actionable_and_do_not_echo_tokens() {
     {
         assert!(bootstrap_stage.contains("could not open its workspace"));
         assert!(!bootstrap_stage.contains("secret"));
+    }
+}
+
+/// The status banner's connectivity copy is the worker-connection detail the
+/// settings pane already uses, so the same failure reads the same way in both
+/// places, and the internal code never reaches the headline.
+#[test]
+fn connectivity_copy_reuses_the_worker_connection_vocabulary_without_codes() {
+    for (code, message) in [
+        (
+            ErrorCode::DeadlineExceeded,
+            "worker did not answer within 60s; it may be stalled or unreachable",
+        ),
+        (ErrorCode::ProviderUnavailable, "connection refused"),
+    ] {
+        let error = LoomError::new(code, message, true);
+        let failure = classify_connectivity_failure(&error).expect("a transport failure");
+        let detail = failure.detail(&error);
+        assert!(
+            detail.starts_with(&worker_connection_failure_detail(
+                WorkerConnectionStage::Transport,
+                &error,
+                None
+            )),
+            "the banner invented its own wording: {detail}"
+        );
+        assert!(detail.ends_with("Loom is reconnecting automatically."));
+        assert!(!detail.contains(&code.to_string()));
+        assert!(!detail.contains(message));
     }
 }
 

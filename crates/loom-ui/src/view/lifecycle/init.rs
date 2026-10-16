@@ -278,6 +278,9 @@ impl LoomView {
             optimistic_messages: Vec::new(),
             sending_message: false,
             status_banner: None,
+            reconnecting: None,
+            connectivity_attempt_in_flight: false,
+            status_details_open: false,
             model,
             models: models.clone(),
             default_models: models,
@@ -484,6 +487,9 @@ impl LoomView {
             optimistic_messages: Vec::new(),
             sending_message: false,
             status_banner: None,
+            reconnecting: None,
+            connectivity_attempt_in_flight: false,
+            status_details_open: false,
             model: if demo_mode {
                 ModelId::new("deterministic/demo")
             } else {
@@ -768,6 +774,9 @@ impl LoomView {
             optimistic_messages: Vec::new(),
             sending_message: false,
             status_banner: None,
+            reconnecting: None,
+            connectivity_attempt_in_flight: false,
+            status_details_open: false,
             model,
             models: models.clone(),
             default_models: models,
@@ -905,10 +914,18 @@ impl LoomView {
                 }
                 Err(error) => ResponseEnvelope::failure(request_id, error),
             };
+            let answered = response.result.is_ok();
             if let Err(error) = view.update(cx, |view, cx| {
                 apply(view, response, cx);
+                // The reconnecting state follows the answers rather than the
+                // requests: an answer ends it, and a failure that did not come
+                // back starts or advances the automatic reconnect.
+                if answered {
+                    view.note_worker_answered(cx);
+                }
                 #[cfg(target_family = "wasm")]
                 view.detect_browser_connection_loss(cx);
+                view.schedule_connectivity_retry(cx);
                 cx.notify();
             }) {
                 log::warn!("[loom-ui] applying a backend response failed: {error}");
@@ -945,10 +962,15 @@ impl LoomView {
                 }
                 Err(error) => ResponseEnvelope::failure(request_id, error),
             };
+            let answered = response.result.is_ok();
             if let Err(error) = view.update(cx, |view, cx| {
                 apply(view, response, cx);
+                if answered {
+                    view.note_worker_answered(cx);
+                }
                 #[cfg(target_family = "wasm")]
                 view.detect_browser_connection_loss(cx);
+                view.schedule_connectivity_retry(cx);
                 cx.notify();
             }) {
                 log::warn!("[loom-ui] applying a backend response failed: {error}");
@@ -1432,7 +1454,9 @@ impl LoomView {
         self.run_poll_scheduled = false;
         self.project_poll_scheduled = false;
         self.worker_node_polls_scheduled.clear();
-        log::warn!("[loom-ui] worker connection lost; showing the reconnect screen");
+        log::warn!(
+            "[loom-ui] worker connection lost ({reason}); showing the reconnect screen and reconnecting automatically"
+        );
         cx.notify();
     }
 
@@ -1480,8 +1504,19 @@ impl LoomView {
                 Err(error) => {
                     view.browser_resume_in_flight = false;
                     view.connected = false;
+                    // The raw reason stays as the reconnect screen's details;
+                    // the notice itself is plain language and keeps the
+                    // automatic attempts running.
                     view.browser_connection_lost = Some(error.to_string());
-                    view.record_status(format!("Reconnect failed: {error}"));
+                    if let Some(failure) = classify_connectivity_failure(&error) {
+                        view.record_connectivity_failure(
+                            "reconnect to the worker",
+                            failure,
+                            &error,
+                        );
+                    } else {
+                        view.record_backend_error("reconnect to the worker", error);
+                    }
                     cx.notify();
                 }
             });

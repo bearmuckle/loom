@@ -13,6 +13,7 @@ use super::*;
 
 mod agent_question_tests;
 mod archived_session_tests;
+mod connectivity_tests;
 mod destructive_approval_tests;
 mod disconnected_screen_render_tests;
 mod display_helper_tests;

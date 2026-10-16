@@ -1,6 +1,20 @@
 use super::*;
 
 impl LoomView {
+    /// Delays a poll while the worker is unreachable.
+    ///
+    /// A poll against a healthy worker keeps the caller's cadence, but a poll
+    /// that is failing because the connection is gone waits the reconnect
+    /// schedule's next delay instead. The retries therefore back off with the
+    /// reconnect rather than hammering a worker that is down, and a transient
+    /// failure is retried before anything is shown to the user.
+    pub(crate) fn poll_delay_millis(&self, base_millis: u64) -> u64 {
+        match self.reconnecting.as_ref() {
+            Some(state) => state.schedule().next_delay_millis().max(base_millis),
+            None => base_millis,
+        }
+    }
+
     pub(crate) fn schedule_project_poll(&mut self, cx: &mut Context<Self>) {
         if self.project_poll_scheduled
             || !self.project_root_is_active()
@@ -9,20 +23,23 @@ impl LoomView {
             return;
         }
         self.project_poll_scheduled = true;
+        let delay = self.poll_delay_millis(1_000);
         cx.spawn(async move |view, cx| {
             #[cfg(target_family = "wasm")]
             {
                 let promise = js_sys::Promise::new(&mut |resolve, _reject| {
                     if let Some(window) = web_sys::window() {
-                        let _ = window
-                            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 1000);
+                        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                            &resolve,
+                            delay as i32,
+                        );
                     }
                 });
                 let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
             }
             #[cfg(not(target_family = "wasm"))]
-            cx.background_spawn(async {
-                std::thread::sleep(Duration::from_secs(1));
+            cx.background_spawn(async move {
+                std::thread::sleep(Duration::from_millis(delay));
             })
             .await;
             view.update(cx, |view, cx| {
@@ -217,8 +234,8 @@ impl LoomView {
         }
         self.run_poll_scheduled = true;
         let active = self.run_is_active();
+        let delay = self.poll_delay_millis(if active { 250 } else { 1_000 });
         cx.spawn(async move |view, cx| {
-            let delay = if active { 250 } else { 1_000 };
             #[cfg(target_family = "wasm")]
             {
                 let promise = js_sys::Promise::new(&mut |resolve, _reject| {
@@ -465,9 +482,11 @@ impl LoomView {
 
             view.update(cx, |view, cx| {
                 let mut recovered = false;
+                let mut answered = false;
                 if let Some(node_index) = view.worker_nodes.iter().position(|node| node.id == id) {
                     let status_message = match results {
                         Ok(status) => {
+                            answered = true;
                             recovered =
                                 !view.worker_nodes[node_index].status.online && status.online;
                             view.worker_nodes[node_index].severe_load_streak =
@@ -490,6 +509,11 @@ impl LoomView {
                     };
                     if let Some(message) = status_message {
                         view.record_status(message);
+                    }
+                    if answered {
+                        // A status answer means the connection works again,
+                        // which ends any reconnecting state.
+                        view.note_worker_answered(cx);
                     }
                     let node = &view.worker_nodes[node_index];
                     view.node_names

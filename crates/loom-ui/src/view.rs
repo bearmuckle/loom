@@ -274,6 +274,13 @@ use crate::{
 use log::info;
 
 use archive::ArchivedSessionsState;
+// Only the disconnected screen spells out the lost-connection sentence, and
+// that screen exists in the browser and in its tests.
+#[cfg(any(target_family = "wasm", test))]
+use connectivity::CONNECTION_LOST_COPY;
+use connectivity::{
+    ConnectivityFailure, Reconnecting, classify_connectivity_failure, error_details,
+};
 use helpers::*;
 #[cfg(not(target_family = "wasm"))]
 use loom_local::{
@@ -511,6 +518,16 @@ pub(crate) struct LoomView {
     /// The latest operational status or backend error, shown as a dismissible
     /// banner above the composer rather than inside the conversation.
     pub(crate) status_banner: Option<SystemNote>,
+    /// The client's single reconnecting state. `Some` while the worker is
+    /// unreachable, so repeated connectivity failures update one state instead
+    /// of replacing the banner with a series of coded errors.
+    reconnecting: Option<Reconnecting>,
+    /// Whether an automatic reconnect attempt is already waiting on its timer,
+    /// so the scheduler never stacks two attempts.
+    connectivity_attempt_in_flight: bool,
+    /// Whether the status banner's raw details are expanded. A connectivity
+    /// failure keeps its codes one disclosure away instead of in the headline.
+    pub(crate) status_details_open: bool,
     pub(crate) models: Vec<ModelId>,
     default_models: Vec<ModelId>,
     node_model_catalogs: BTreeMap<String, Vec<ModelId>>,
@@ -895,6 +912,11 @@ fn task_activity_indicator(index: usize, status: SessionStatusPill) -> gpui_kit:
 pub(crate) struct DisconnectedScreen {
     pub(crate) heading: &'static str,
     pub(crate) detail: String,
+    /// The raw transport close reason, kept behind the screen's details
+    /// affordance. The headline copy never interpolates it.
+    pub(crate) details: Option<String>,
+    /// The attempt indicator shown while an automatic reconnect is running.
+    pub(crate) progress: Option<String>,
     pub(crate) sidebar: &'static str,
     pub(crate) empty: &'static str,
     pub(crate) footer: &'static str,
@@ -902,21 +924,35 @@ pub(crate) struct DisconnectedScreen {
 }
 
 #[cfg(any(target_family = "wasm", test))]
+impl DisconnectedScreen {
+    /// Fills in the attempt indicator from the view's reconnecting state.
+    pub(crate) fn with_progress(mut self, progress: Option<String>) -> Self {
+        self.progress = progress;
+        self
+    }
+}
+
+#[cfg(any(target_family = "wasm", test))]
 pub(crate) fn disconnected_screen(connection_lost: Option<&str>) -> DisconnectedScreen {
     match connection_lost {
+        // The reason is a transport string, so it is not part of the copy: the
+        // user reads what happened and what the client is doing about it, and
+        // the raw reason stays behind the details affordance.
         Some(reason) => DisconnectedScreen {
             heading: "Connection lost",
-            detail: format!(
-                "The worker connection closed ({reason}). Reconnect to reload projects and sessions."
-            ),
-            sidebar: "Reconnect to load projects.",
-            empty: "Reconnect to reload your projects and sessions.",
-            footer: "Disconnected  ·  connection lost",
+            detail: format!("{CONNECTION_LOST_COPY} Your projects and sessions are unchanged."),
+            details: Some(reason.to_owned()),
+            progress: None,
+            sidebar: "Reconnecting to the worker.",
+            empty: "Reconnecting to reload your projects and sessions.",
+            footer: "Disconnected  ·  reconnecting automatically",
             reconnect: true,
         },
         None => DisconnectedScreen {
             heading: "No worker connected",
             detail: "Connect a worker in Settings to begin.".to_owned(),
+            details: None,
+            progress: None,
             sidebar: "Connect a worker to load projects.",
             empty: "Connect a worker to create a project.",
             footer: "Not connected  ·  Connect a worker in Settings",
@@ -1614,6 +1650,9 @@ impl LoomView {
             optimistic_messages: Vec::new(),
             sending_message: false,
             status_banner: None,
+            reconnecting: None,
+            connectivity_attempt_in_flight: false,
+            status_details_open: false,
             model: model.clone(),
             models: vec![model.clone()],
             default_models: vec![model.clone()],
@@ -1791,6 +1830,7 @@ impl LoomView {
 
 mod archive;
 mod composer;
+mod connectivity;
 mod helpers;
 mod lifecycle;
 mod project;

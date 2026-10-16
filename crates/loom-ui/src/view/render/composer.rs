@@ -243,6 +243,11 @@ impl LoomView {
 
     /// A dismissible banner for the latest operational status or backend error.
     /// Kept out of the conversation timeline so it does not read as a message.
+    ///
+    /// A connectivity failure reads as plain language here, with its raw code
+    /// and message one disclosure away and a real retry control beside it. An
+    /// operation error keeps the operation and code in its heading, because
+    /// there the worker did answer.
     fn render_status_banner(
         &self,
         note: &SystemNote,
@@ -253,6 +258,13 @@ impl LoomView {
             SystemTone::Input => (0x241f3b, 0xc4b5fd, 0xe9d5ff),
             SystemTone::Neutral => (0x191c22, 0x64748b, 0x94a3b8),
         };
+        let details = note.details.clone();
+        // The label follows the reconnecting state: a spent schedule asks for a
+        // retry rather than offering one that is already running.
+        let retry_label = self
+            .reconnecting
+            .as_ref()
+            .map_or("Retry", Reconnecting::retry_label);
         div()
             .id("status-banner")
             .test_support()
@@ -274,13 +286,68 @@ impl LoomView {
                         element.child(div().text_xs().text_color(rgb(accent)).child(heading))
                     })
                     .child(div().text_sm().child(note.text.clone()))
-                    .when(note.retryable, |element| {
+                    .when_some(note.progress.clone(), |element, progress| {
                         element.child(
                             div()
                                 .mt_1()
                                 .text_xs()
                                 .text_color(rgb(accent))
-                                .child("This operation can be retried."),
+                                .child(progress),
+                        )
+                    })
+                    .when_some(details.clone(), |element, raw| {
+                        element.child(
+                            div()
+                                .mt_1()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    Button::new("status-banner-details")
+                                        .label(if self.status_details_open {
+                                            "Hide details"
+                                        } else {
+                                            "Details"
+                                        })
+                                        .ghost()
+                                        .xsmall()
+                                        .on_click(cx.listener(|view, _, _, cx| {
+                                            view.toggle_status_details(cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("status-banner-copy-details")
+                                        .icon(Icon::new(AssetIconName::Copy))
+                                        .ghost()
+                                        .xsmall()
+                                        .tooltip("Copy error details")
+                                        .accessibility_label("Copy error details")
+                                        .on_click(move |_, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                raw.clone(),
+                                            ));
+                                        }),
+                                )
+                                .when(self.status_details_open, |row| {
+                                    row.child(
+                                        div()
+                                            .text_xs()
+                                            .font_family(mono_font())
+                                            .child(details.unwrap_or_default()),
+                                    )
+                                }),
+                        )
+                    })
+                    .when(note.retryable, |element| {
+                        element.child(
+                            div().mt_1().child(
+                                Button::new("status-banner-retry")
+                                    .label(retry_label)
+                                    .small()
+                                    .on_click(
+                                        cx.listener(|view, _, _, cx| view.retry_status_action(cx)),
+                                    ),
+                            ),
                         )
                     }),
             )

@@ -630,6 +630,17 @@ pub(crate) struct SystemNote {
     pub(crate) tone: SystemTone,
     pub(crate) heading: Option<String>,
     pub(crate) text: String,
+    /// The raw code and message, shown only behind the note's details
+    /// affordance. A connectivity failure is described in plain language in
+    /// `text`, and this keeps the internal detail one disclosure away instead
+    /// of in the headline.
+    pub(crate) details: Option<String>,
+    /// Progress copy for work the client is doing about the note, such as the
+    /// attempt indicator of the reconnecting state.
+    pub(crate) progress: Option<String>,
+    /// Whether a real retry control is attached to this note. A note that only
+    /// promises a retry in a sentence is the bug this replaces, so the flag is
+    /// set by whoever can also offer the control.
     pub(crate) retryable: bool,
 }
 
@@ -639,6 +650,8 @@ impl SystemNote {
             tone: SystemTone::Neutral,
             heading: None,
             text: text.into(),
+            details: None,
+            progress: None,
             retryable: false,
         }
     }
