@@ -182,15 +182,21 @@ impl InProcessConnection {
                         ));
                     }
                 }
+                let batch = self.bound_event_batch(events)?;
                 Ok(ServerResponse::Events(EventsResponse::SessionEvents {
-                    events,
+                    events: batch.events,
                     stream_epoch: session_id.map(|_| self.backend.node_id.clone()),
+                    next_after_sequence: batch.next_after_sequence,
                 }))
             }
             ClientRequest::Events(EventsRequest::GetRecentSessionEvents { session_id, limit }) => {
+                // This batch is a tail the caller sized with `limit`, not a batch
+                // that grows with the journal, so its own bound is the count the
+                // caller asked for; the resync path is the one that pages.
                 Ok(ServerResponse::Events(EventsResponse::SessionEvents {
                     events: self.recent_session_events(session_id, limit as usize)?,
                     stream_epoch: Some(self.backend.node_id.clone()),
+                    next_after_sequence: None,
                 }))
             }
             _ => unreachable!("request was routed to the wrong dispatch domain"),

@@ -437,6 +437,118 @@ pub(crate) fn order_session_nodes(
     nodes
 }
 
+/// The cursor and stream epoch a bounded events page names for the page after
+/// it.
+///
+/// The backend bounds one events batch to a single response frame, so a resync
+/// of a backlog larger than that arrives as a sequence of pages: every page
+/// after the first is named by the continuation cursor of the page before it,
+/// and a batch that reached the latest journaled event names none. A cursor that
+/// does not move forward cannot be followed, so it stops the caller's loop
+/// instead of asking for the same page forever.
+pub(crate) fn events_page_continuation(
+    response: &ResponseEnvelope,
+    cursor: Option<EventSequence>,
+) -> Option<(EventSequence, Option<String>)> {
+    match &response.result {
+        Ok(ServerResponse::Events(EventsResponse::SessionEvents {
+            next_after_sequence: Some(next),
+            stream_epoch,
+            ..
+        })) if Some(*next) > cursor => Some((*next, stream_epoch.clone())),
+        _ => None,
+    }
+}
+
+/// Appends one bounded events page to the batch collected so far.
+///
+/// Both halves stay one [`ResponseEnvelope`], so a caller's resync ladder keeps
+/// matching the response shape it already knows while the pages behind it are
+/// followed. A page that is not part of the batch — the stale-cursor snapshot
+/// fallback, or a failure — supersedes the collected pages, because the caller
+/// rebuilds from durable state in that case instead of replaying them.
+pub(crate) fn merged_event_page(
+    collected: ResponseEnvelope,
+    page: ResponseEnvelope,
+) -> ResponseEnvelope {
+    let ResponseEnvelope {
+        protocol_version,
+        request_id,
+        result,
+    } = page;
+    match (collected.result, result) {
+        (
+            Ok(ServerResponse::Events(EventsResponse::SessionEvents {
+                mut events,
+                stream_epoch,
+                ..
+            })),
+            Ok(ServerResponse::Events(EventsResponse::SessionEvents {
+                events: page_events,
+                stream_epoch: page_epoch,
+                next_after_sequence,
+            })),
+        ) => {
+            events.extend(page_events);
+            ResponseEnvelope {
+                protocol_version,
+                request_id,
+                result: Ok(ServerResponse::Events(EventsResponse::SessionEvents {
+                    events,
+                    stream_epoch: page_epoch.or(stream_epoch),
+                    next_after_sequence,
+                })),
+            }
+        }
+        (_, result) => ResponseEnvelope {
+            protocol_version,
+            request_id,
+            result,
+        },
+    }
+}
+
+/// Requests session events and follows every bounded page the backend answers
+/// with.
+///
+/// The returned response carries the events of all pages in sequence order and
+/// names no continuation cursor of its own, so a caller reads one complete batch
+/// however many frames it took to deliver. A response that is not a page — the
+/// stale-cursor snapshot fallback, or a failure — is returned as it arrived.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn collect_session_events_sync(
+    connection: &ClientConnection,
+    session_id: AgentSessionId,
+    after_sequence: Option<EventSequence>,
+    stream_epoch: Option<String>,
+) -> ResponseEnvelope {
+    let mut cursor = after_sequence;
+    let mut epoch = stream_epoch;
+    let mut response =
+        connection.request(session_events_request(session_id, cursor, epoch.clone()));
+    while let Some((next, page_epoch)) = events_page_continuation(&response, cursor) {
+        cursor = Some(next);
+        epoch = page_epoch.or(epoch);
+        let page = connection.request(session_events_request(session_id, cursor, epoch.clone()));
+        response = merged_event_page(response, page);
+    }
+    response
+}
+
+/// One request for the session events after `after_sequence`.
+pub(crate) fn session_events_request(
+    session_id: AgentSessionId,
+    after_sequence: Option<EventSequence>,
+    stream_epoch: Option<String>,
+) -> RequestEnvelope {
+    RequestEnvelope::new(ClientRequest::Events(EventsRequest::GetSessionEvents {
+        session_id: Some(session_id),
+        workspace_id: None,
+        after_sequence,
+        stream_epoch,
+    }))
+}
+
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn load_transcript_page_sync(
     connection: &ClientConnection,

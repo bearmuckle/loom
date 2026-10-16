@@ -145,6 +145,7 @@ fn reopening_a_session_with_a_concurrent_event_restores_durable_run_state(cx: &m
         ServerResponse::Events(EventsResponse::SessionEvents {
             events: vec![concurrent_delta],
             stream_epoch: None,
+            next_after_sequence: None,
         }),
     );
 
@@ -318,6 +319,7 @@ fn reopening_from_a_snapshot_that_carries_messages_keeps_the_conversation(cx: &m
                 ServerResponse::Events(EventsResponse::SessionEvents {
                     events: vec![tail_delta],
                     stream_epoch: None,
+                    next_after_sequence: None,
                 }),
             ),
             cx,

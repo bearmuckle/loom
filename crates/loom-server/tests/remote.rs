@@ -1349,6 +1349,120 @@ async fn a_configured_frame_limit_is_honoured_end_to_end() {
 }
 
 #[tokio::test]
+async fn a_batch_above_the_frame_limit_is_delivered_in_followable_pages() {
+    // One value bounds both sides, as an operator configures with the flag or
+    // the environment variable, so the server has to bound the events batch it
+    // sends to a frame this client accepts instead of sending one its own rule
+    // would drop.
+    let limit = 2048;
+    let (_backend, _auth, token, server) = server_with_frame_limit(limit).await;
+    let mut connection = WebSocketTransport::new(server.websocket_url(), token.token)
+        .with_max_frame_bytes(limit)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    negotiate(&mut connection).await;
+    let workspace_id = create_workspace(&mut connection).await;
+    let session = session(&mut connection, workspace_id).await;
+
+    // Every rename journals one event, so the session's backlog grows past the
+    // frame limit.
+    let renames = 40;
+    for index in 0..renames {
+        let renamed = connection
+            .request(RequestEnvelope::new(ClientRequest::Session(
+                SessionRequest::RenameAgentSession {
+                    session_id: session.id,
+                    name: format!("renamed-{index:03}"),
+                },
+            )))
+            .await
+            .unwrap();
+        assert!(renamed.result.is_ok(), "{:?}", renamed.result);
+    }
+
+    // The client follows the pages the response names until it reaches the
+    // latest event. Every frame it accepts is below its own limit, so a response
+    // that crossed the limit would fail this request instead.
+    let mut cursor = None;
+    let mut pages = 0;
+    let mut sequences = Vec::new();
+    let mut renamed = 0;
+    loop {
+        let response = connection
+            .request(RequestEnvelope::new(ClientRequest::Events(
+                EventsRequest::GetSessionEvents {
+                    session_id: Some(session.id),
+                    workspace_id: None,
+                    after_sequence: cursor,
+                    stream_epoch: None,
+                },
+            )))
+            .await
+            .unwrap();
+        let ServerResponse::Events(EventsResponse::SessionEvents {
+            events,
+            next_after_sequence,
+            ..
+        }) = response.result.unwrap()
+        else {
+            panic!("expected a bounded events page");
+        };
+        assert!(
+            !events.is_empty(),
+            "every page must make progress towards the latest event"
+        );
+        renamed += events
+            .iter()
+            .filter(|event| {
+                event.session_id == session.id
+                    && matches!(event.event, ServerEvent::AgentSessionRenamed { .. })
+            })
+            .count();
+        sequences.extend(events.iter().map(|event| event.sequence));
+        pages += 1;
+        match next_after_sequence {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert!(
+        pages > 1,
+        "a backlog above the frame limit must arrive in more than one page"
+    );
+    assert_eq!(renamed, renames);
+    assert!(
+        sequences.windows(2).all(|pair| pair[0] < pair[1]),
+        "pages must carry events in sequence order"
+    );
+
+    // The last page reached the latest journaled event, so the same cursor is
+    // answered with no further events.
+    let latest = *sequences.last().expect("the batch carried events");
+    let drained = connection
+        .request(RequestEnvelope::new(ClientRequest::Events(
+            EventsRequest::GetSessionEvents {
+                session_id: Some(session.id),
+                workspace_id: None,
+                after_sequence: Some(latest),
+                stream_epoch: None,
+            },
+        )))
+        .await
+        .unwrap();
+    assert!(matches!(
+        drained.result.unwrap(),
+        ServerResponse::Events(EventsResponse::SessionEvents {
+            events,
+            next_after_sequence: None,
+            ..
+        }) if events.is_empty()
+    ));
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn an_oversized_frame_that_is_not_the_awaited_response_does_not_fail_the_request() {
     let limit = 512;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

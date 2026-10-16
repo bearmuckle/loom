@@ -188,6 +188,19 @@ pub enum EventsResponse {
         events: Vec<ServerEventEnvelope>,
         #[serde(default)]
         stream_epoch: Option<String>,
+        /// The cursor a bounded batch stopped at, so the caller continues from
+        /// it.
+        ///
+        /// An events response is bounded to one frame, so a batch larger than
+        /// that bound is delivered as a sequence of pages. `Some(sequence)`
+        /// means this batch ended at that event because the response reached
+        /// its bound and more events follow: the caller asks again with
+        /// `after_sequence: Some(sequence)` until `None` says the batch reached
+        /// the latest journaled event. The field is additive (`serde` default),
+        /// so a body that omits it decodes as `None` and a caller that ignores
+        /// it still advances from the events it received.
+        #[serde(default)]
+        next_after_sequence: Option<EventSequence>,
     },
 
     WorkspaceEvents {

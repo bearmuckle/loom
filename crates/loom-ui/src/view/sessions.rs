@@ -473,14 +473,11 @@ impl LoomView {
                     SessionResponse::AgentSessionSnapshot(Box::new(initial.projection)),
                 ));
             }
-            let events_request = backend.submit(RequestEnvelope::new(ClientRequest::Events(
-                EventsRequest::GetSessionEvents {
-                    session_id: Some(session_id),
-                    workspace_id: None,
-                    after_sequence: request_cursor,
-                    stream_epoch: event_stream_epoch.clone(),
-                },
-            )));
+            let events_request = backend.submit(session_events_request(
+                session_id,
+                request_cursor,
+                event_stream_epoch.clone(),
+            ));
             let mut events = cx
                 .background_spawn(async move { events_request.wait().await })
                 .await;
@@ -511,20 +508,34 @@ impl LoomView {
                     refreshed.result = Ok(ServerResponse::Session(
                         SessionResponse::AgentSessionSnapshot(Box::new(initial.projection)),
                     ));
-                    let retry_request = backend.submit(RequestEnvelope::new(
-                        ClientRequest::Events(EventsRequest::GetSessionEvents {
-                            session_id: Some(session_id),
-                            workspace_id: None,
-                            after_sequence: Some(refreshed_cursor),
-                            stream_epoch: event_stream_epoch.clone(),
-                        }),
-                    ));
                     request_cursor = Some(refreshed_cursor);
                     snapshot = refreshed;
+                    let retry_request = backend.submit(session_events_request(
+                        session_id,
+                        request_cursor,
+                        event_stream_epoch.clone(),
+                    ));
                     events = cx
                         .background_spawn(async move { retry_request.wait().await })
                         .await;
                 }
+            }
+            // The backend bounds an events batch to one response frame, so a
+            // backlog larger than that arrives as pages: follow the cursor each
+            // page names until the batch reaches the latest journaled event, and
+            // hand one complete batch to the rebuild below.
+            while let Some((next, page_epoch)) = events_page_continuation(&events, request_cursor) {
+                request_cursor = Some(next);
+                event_stream_epoch = page_epoch.or(event_stream_epoch);
+                let page_request = backend.submit(session_events_request(
+                    session_id,
+                    request_cursor,
+                    event_stream_epoch.clone(),
+                ));
+                let page = cx
+                    .background_spawn(async move { page_request.wait().await })
+                    .await;
+                events = merged_event_page(events, page);
             }
             view.update(cx, |view, cx| {
                 view.finish_async_session_load(session_id, request_cursor, snapshot, events, cx);
@@ -611,6 +622,7 @@ impl LoomView {
             Ok(ServerResponse::Events(EventsResponse::SessionEvents {
                 events,
                 stream_epoch,
+                ..
             })) => {
                 self.event_stream_epoch = stream_epoch;
                 self.rebuild_projection_from_events(

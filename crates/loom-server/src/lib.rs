@@ -153,6 +153,17 @@ pub use serve::{
 };
 
 const DEFAULT_EVENT_RETENTION: usize = 4096;
+/// Most events one `SessionEvents` response carries, whatever its byte budget.
+///
+/// The batch is produced on the thread that answers the request, so a caller
+/// resuming a long journal must not wait for every retained event at once and
+/// the response must not grow with the whole backlog. The count bound applies to
+/// every caller, including an in-process one, whose connection has no frame to
+/// fit: such a caller still follows pages until the response names no
+/// continuation cursor. The byte bound the same response honours is the frame
+/// limit of the connection that sends it; see
+/// [`InProcessConnection::with_max_response_bytes`].
+const MAX_EVENT_BATCH_EVENTS: usize = 256;
 const MAX_REVIEW_CHANGES: usize = 512;
 
 const MAX_REVIEW_DIFF_BYTES: usize = 64 * 1024;
@@ -484,6 +495,15 @@ pub struct InProcessConnection {
     backend: Arc<InProcessBackend>,
     negotiated_capabilities: Arc<Mutex<Option<CapabilitySet>>>,
     auth: Option<AuthSession>,
+    /// Most bytes one response this connection sends may carry.
+    ///
+    /// The events batch is the one response that grows with journal size, so it
+    /// is bounded to this many bytes. `None` means the connection has no frame
+    /// transport to fit (an in-process caller), so the batch is bounded by event
+    /// count alone. The remote listener sets it from
+    /// [`RemoteServerConfig::max_frame_bytes`], because the server must not send
+    /// a frame larger than the limit it advertises to its clients.
+    max_response_bytes: Option<usize>,
 }
 
 impl InProcessConnection {
@@ -492,7 +512,17 @@ impl InProcessConnection {
             backend,
             negotiated_capabilities: Arc::new(Mutex::new(None)),
             auth: None,
+            max_response_bytes: None,
         }
+    }
+
+    /// Bounds every response this connection sends to `max_response_bytes`.
+    ///
+    /// A frame transport applies its own configured frame limit, so a response
+    /// this worker sends never exceeds the bound its clients check against.
+    pub(crate) fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
+        self.max_response_bytes = Some(max_response_bytes);
+        self
     }
 
     fn authorized_capabilities(&self) -> CapabilitySet {

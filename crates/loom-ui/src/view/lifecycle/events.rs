@@ -10,20 +10,20 @@ impl LoomView {
     ) -> Result<(), LoomError> {
         let session_id = self.active_session.id;
         for resync_attempt in 0..=1 {
-            let response = self
-                .connection
-                .request(RequestEnvelope::new(ClientRequest::Events(
-                    EventsRequest::GetSessionEvents {
-                        session_id: Some(session_id),
-                        workspace_id: None,
-                        after_sequence,
-                        stream_epoch: self.event_stream_epoch.clone(),
-                    },
-                )));
+            // The backend bounds an events batch to one response frame, so the
+            // pages of a larger backlog are followed here and the rebuild below
+            // sees one complete batch.
+            let response = collect_session_events_sync(
+                &self.connection,
+                session_id,
+                after_sequence,
+                self.event_stream_epoch.clone(),
+            );
             match response.result? {
                 ServerResponse::Events(EventsResponse::SessionEvents {
                     events,
                     stream_epoch,
+                    ..
                 }) => {
                     self.event_stream_epoch = stream_epoch;
                     self.rebuild_projection_from_events(

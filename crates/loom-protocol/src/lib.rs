@@ -894,6 +894,7 @@ mod run_message_protocol_tests {
             ServerResponse::Events(EventsResponse::SessionEvents {
                 events: Vec::new(),
                 stream_epoch: None,
+                next_after_sequence: None,
             }),
         );
         let mut encoded = serde_json::to_value(&response).unwrap();
@@ -901,12 +902,19 @@ mod run_message_protocol_tests {
             .as_object_mut()
             .unwrap()
             .remove("stream_epoch");
+        // A peer that predates the bounded batch omits the continuation cursor,
+        // which has to read as an unbounded batch rather than as a failure.
+        encoded["result"]["Ok"]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("next_after_sequence");
         let decoded: ResponseEnvelope = serde_json::from_value(encoded).unwrap();
         assert_eq!(
             decoded.result.unwrap(),
             ServerResponse::Events(EventsResponse::SessionEvents {
                 events: Vec::new(),
                 stream_epoch: None,
+                next_after_sequence: None,
             })
         );
     }

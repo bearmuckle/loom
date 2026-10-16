@@ -265,6 +265,7 @@ fn a_run_projection_updates_the_session_state_on_both_paths(cx: &mut TestAppCont
                 ServerResponse::Events(EventsResponse::SessionEvents {
                     events: Vec::new(),
                     stream_epoch: None,
+                    next_after_sequence: None,
                 }),
             ),
             cx,
@@ -378,6 +379,7 @@ fn a_rebuild_ends_at_the_durable_cursor_on_both_paths(cx: &mut TestAppContext) {
                 ServerResponse::Events(EventsResponse::SessionEvents {
                     events: batch,
                     stream_epoch: None,
+                    next_after_sequence: None,
                 }),
             ),
             cx,
@@ -627,5 +629,305 @@ fn session_event_snapshot_resync_keeps_the_conversation(cx: &mut TestAppContext)
             response => panic!("unexpected event response: {response:?}"),
         };
         assert_eq!(view.after_sequence, Some(latest_sequence));
+    });
+}
+
+/// The client follows the bounded pages of a resync instead of reading only the
+/// first frame of a larger backlog.
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn a_resync_follows_every_bounded_event_page() {
+    let connection =
+        ClientConnection::InProcess(Box::new(loom_local::OwnedBackend::new().connect()));
+    crate::connection::negotiate(&connection).unwrap();
+    let workspace = crate::connection::create_workspace(&connection, "Paged resync").unwrap();
+    let session = crate::connection::create_session_in_workspace(
+        &connection,
+        workspace.id,
+        "Paged resync session",
+    )
+    .unwrap();
+
+    // More renames than one bounded events response carries, so the whole batch
+    // only reaches the client when its pages are followed.
+    let renames = 300;
+    for revision in 0..renames {
+        let renamed = connection.request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::RenameAgentSession {
+                session_id: session.id,
+                name: format!("paged-{revision}"),
+            },
+        )));
+        assert!(renamed.result.is_ok(), "{:?}", renamed.result);
+    }
+    let request_page = |after_sequence| match connection
+        .request(RequestEnvelope::new(ClientRequest::Events(
+            EventsRequest::GetSessionEvents {
+                session_id: Some(session.id),
+                workspace_id: None,
+                after_sequence,
+                stream_epoch: None,
+            },
+        )))
+        .result
+    {
+        Ok(ServerResponse::Events(EventsResponse::SessionEvents {
+            events,
+            next_after_sequence,
+            ..
+        })) => (events, next_after_sequence),
+        response => panic!("unexpected event response: {response:?}"),
+    };
+
+    // One page does not carry the backlog, and it names the cursor that
+    // continues it.
+    let (first_page, continuation) = request_page(None);
+    assert!(
+        first_page.len() < renames + 1,
+        "the first page carried the whole backlog, so nothing was bounded"
+    );
+    let first_page_head = first_page.last().unwrap().sequence;
+    assert_eq!(continuation, Some(first_page_head));
+
+    // Following the pages returns the whole backlog as one batch.
+    let response = collect_session_events_sync(&connection, session.id, None, None);
+    let ServerResponse::Events(EventsResponse::SessionEvents {
+        events,
+        next_after_sequence,
+        ..
+    }) = response.result.unwrap()
+    else {
+        panic!("expected one merged events batch");
+    };
+    assert_eq!(
+        next_after_sequence, None,
+        "the batch reached the latest event"
+    );
+    assert_eq!(events.len(), renames + 1, "the creation event and renames");
+    assert!(
+        events
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence),
+        "the merged batch must be in sequence order"
+    );
+    assert!(
+        events.last().unwrap().sequence > first_page_head,
+        "the merged batch must reach past the first page"
+    );
+
+    // The merged batch ends at the latest journaled event: continuing from its
+    // head is answered with nothing further.
+    let (remaining, continuation) = request_page(Some(events.last().unwrap().sequence));
+    assert!(remaining.is_empty(), "the batch left events behind");
+    assert_eq!(continuation, None);
+}
+
+/// A bounded events batch arrives as pages, so the client follows the cursor each
+/// page names and reads one complete batch afterwards.
+#[test]
+fn event_pages_are_followed_and_merged_into_one_batch() {
+    let session_id = AgentSessionId::new();
+    let run_id = RunId::new();
+    let delta = |sequence: u64, text: &str| {
+        agent_envelope(
+            sequence,
+            session_id,
+            AgentEvent::AssistantMessageDelta {
+                run_id,
+                message_id: 1,
+                text: text.to_owned(),
+            },
+        )
+    };
+    let page = |events, next_after_sequence| {
+        loom_protocol::ResponseEnvelope::success(
+            loom_core::RequestId::new(),
+            ServerResponse::Events(EventsResponse::SessionEvents {
+                events,
+                stream_epoch: Some("node".to_owned()),
+                next_after_sequence,
+            }),
+        )
+    };
+
+    let first = page(vec![delta(1, "one")], Some(EventSequence::new(1)));
+    assert_eq!(
+        events_page_continuation(&first, None),
+        Some((EventSequence::new(1), Some("node".to_owned())))
+    );
+    // A cursor that does not move forward cannot be followed, so it stops the
+    // loop instead of asking for the same page forever.
+    assert_eq!(
+        events_page_continuation(&first, Some(EventSequence::new(1))),
+        None
+    );
+    // A page that reached the latest journaled event names none, and a response
+    // that is not a page never continues.
+    let last = page(vec![delta(2, "two")], None);
+    assert_eq!(
+        events_page_continuation(&last, Some(EventSequence::new(1))),
+        None
+    );
+    assert_eq!(
+        events_page_continuation(
+            &loom_protocol::ResponseEnvelope::failure(
+                loom_core::RequestId::new(),
+                loom_core::LoomError::not_found("agent session", session_id),
+            ),
+            None
+        ),
+        None
+    );
+
+    // Merging keeps one response shape: the pages in sequence order, the epoch
+    // the backend reported, and the last page's cursor.
+    let first_for_fallback = page(vec![delta(1, "one")], Some(EventSequence::new(1)));
+    let last = page(vec![delta(2, "two")], None);
+    let Ok(ServerResponse::Events(EventsResponse::SessionEvents {
+        events,
+        stream_epoch,
+        next_after_sequence,
+    })) = merged_event_page(first_for_fallback, last).result
+    else {
+        panic!("merged pages should stay one events batch");
+    };
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![EventSequence::new(1), EventSequence::new(2)]
+    );
+    assert_eq!(stream_epoch, Some("node".to_owned()));
+    assert_eq!(next_after_sequence, None);
+
+    // A response that is not part of the batch supersedes the collected pages:
+    // the caller rebuilds from durable state instead of replaying them.
+    let snapshot = page(vec![delta(1, "one")], Some(EventSequence::new(1)));
+    let mut fallback = page(vec![delta(2, "two")], None);
+    fallback.result = Err(loom_core::LoomError::not_found("agent session", session_id));
+    let merged = merged_event_page(snapshot, fallback);
+    assert!(
+        merged.result.is_err(),
+        "a failure must not be merged into a batch: {:?}",
+        merged.result
+    );
+}
+
+/// A poll that finds more events than one bounded response carries keeps asking
+/// for the pages that follow instead of waiting for the next poll cadence.
+#[cfg(not(target_family = "wasm"))]
+#[gpui_kit::test]
+fn a_poll_drains_every_bounded_event_page(cx: &mut TestAppContext) {
+    const TASK: &str = "drain every bounded event page";
+    cx.update(gpui_kit::init);
+
+    let backend = loom_local::OwnedBackend::new();
+    let connection = ClientConnection::InProcess(Box::new(backend.connect()));
+    let negotiation = crate::connection::negotiate(&connection).unwrap();
+    let workspace = crate::connection::create_workspace(&connection, "Polled pages").unwrap();
+    let session = crate::connection::create_session_in_workspace(
+        &connection,
+        workspace.id,
+        "Polled pages session",
+    )
+    .unwrap();
+    // More renames than one bounded events response carries, so a poll only
+    // reaches the latest event by following the pages behind the first one.
+    for revision in 0..300 {
+        let renamed = connection.request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::RenameAgentSession {
+                session_id: session.id,
+                name: format!("polled-{revision}"),
+            },
+        )));
+        assert!(renamed.result.is_ok(), "{:?}", renamed.result);
+    }
+
+    let view_connection = connection.clone();
+    let view_backend = backend;
+    let view_session = session.clone();
+    let protocol_version = negotiation.protocol_version;
+    let handle = cx.open_window(size(px(1280.), px(800.)), move |_, cx| {
+        let options = UiOptions {
+            project: None,
+            task: TASK.to_owned(),
+            demo: false,
+            model: ModelId::new("deterministic/demo"),
+            endpoint: None,
+            api_key: None,
+            remote: None,
+            token: None,
+            reset_state: false,
+            ca: None,
+            allow_insecure_remote: false,
+        };
+        let mut view = LoomView::initialize_from_connection(
+            &options,
+            view_connection,
+            PathBuf::new(),
+            false,
+            None,
+            cx.focus_handle(),
+            false,
+            Some(protocol_version),
+            None,
+        )
+        .unwrap();
+        view.owned_backend = Some(view_backend);
+        // Avoid starting the live worker's delayed status poll in this
+        // synchronous UI test.
+        view.worker_nodes.clear();
+        view.select_session(view_session, cx);
+        view
+    });
+    cx.run_until_parked();
+
+    let view = cx
+        .update_window(handle.into(), |_, window, _| {
+            window.root::<LoomView>().unwrap().unwrap()
+        })
+        .unwrap();
+
+    // The head of one bounded page, which a poll that stopped after a single
+    // response would leave the cursor at.
+    let first_page_head = connection
+        .request(RequestEnvelope::new(ClientRequest::Events(
+            EventsRequest::GetSessionEvents {
+                session_id: Some(session.id),
+                workspace_id: None,
+                after_sequence: None,
+                stream_epoch: None,
+            },
+        )))
+        .result
+        .map(|response| match response {
+            ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) => events
+                .last()
+                .map(|event| event.sequence)
+                .expect("the first page carries events"),
+            response => panic!("unexpected event response: {response:?}"),
+        })
+        .unwrap();
+
+    view.update(cx, |view, cx| {
+        // Rewind the cursor so one poll meets the whole backlog.
+        view.after_sequence = None;
+        view.run_poll_scheduled = false;
+        view.poll_run_once(cx);
+    });
+    cx.run_until_parked();
+
+    view.update(cx, |view, _| {
+        assert!(
+            view.after_sequence
+                .is_some_and(|cursor| cursor > first_page_head),
+            "the poll stopped at {:?}, before the page that follows {first_page_head}",
+            view.after_sequence
+        );
+        assert_eq!(
+            view.active_session.name, "polled-299",
+            "the poll did not apply every page"
+        );
     });
 }

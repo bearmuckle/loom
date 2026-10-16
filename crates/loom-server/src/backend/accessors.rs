@@ -6,6 +6,7 @@ impl InProcessBackend {
             backend: Arc::clone(self),
             negotiated_capabilities: Arc::new(Mutex::new(None)),
             auth: None,
+            max_response_bytes: None,
         }
     }
 
@@ -14,6 +15,7 @@ impl InProcessBackend {
             backend: Arc::clone(self),
             negotiated_capabilities: Arc::new(Mutex::new(None)),
             auth: Some(auth),
+            max_response_bytes: None,
         }
     }
 

@@ -605,9 +605,13 @@ async fn m4_demo_remote(
             )))
             .await?;
         let events = match response.result? {
+            // The loop advances its cursor from the events it received, so a
+            // batch the backend bounded into pages is followed without reading
+            // the continuation cursor.
             ServerResponse::Events(EventsResponse::SessionEvents {
                 events,
                 stream_epoch: current_epoch,
+                ..
             })
             | ServerResponse::Events(EventsResponse::SessionEventsSnapshot {
                 events,
@@ -948,18 +952,34 @@ fn demonstrate_m3_recovery(
         ServerResponse::Run(RunResponse::AgentRun(snapshot)) => snapshot,
         response => return Err(unexpected_response("recovered run", response)),
     };
-    let events = recovered.request(RequestEnvelope::new(ClientRequest::Events(
-        EventsRequest::GetSessionEvents {
-            session_id: Some(session_id),
-            workspace_id: None,
-            after_sequence: None,
-            stream_epoch: None,
-        },
-    )));
-    let event_count = match events.result? {
-        ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) => events.len(),
-        response => return Err(unexpected_response("recovered events", response)),
-    };
+    // The events response is bounded to one frame, so the pages are followed
+    // until the batch reaches the latest journaled event and the recovered
+    // count reports the whole journal rather than one page of it.
+    let mut after_sequence = None;
+    let mut event_count = 0;
+    loop {
+        let events = recovered.request(RequestEnvelope::new(ClientRequest::Events(
+            EventsRequest::GetSessionEvents {
+                session_id: Some(session_id),
+                workspace_id: None,
+                after_sequence,
+                stream_epoch: None,
+            },
+        )));
+        let (events, next_after_sequence) = match events.result? {
+            ServerResponse::Events(EventsResponse::SessionEvents {
+                events,
+                next_after_sequence,
+                ..
+            }) => (events, next_after_sequence),
+            response => return Err(unexpected_response("recovered events", response)),
+        };
+        event_count += events.len();
+        match next_after_sequence {
+            Some(next) => after_sequence = Some(next),
+            None => break,
+        }
+    }
     let filesystem = recovered.request(RequestEnvelope::new(ClientRequest::Filesystem(
         FilesystemRequest::GetSessionFilesystemSnapshot { session_id },
     )));
@@ -1194,6 +1214,7 @@ fn stream_run(
             ServerResponse::Events(EventsResponse::SessionEvents {
                 events,
                 stream_epoch: current_epoch,
+                ..
             }) => {
                 stream_epoch = current_epoch;
                 events

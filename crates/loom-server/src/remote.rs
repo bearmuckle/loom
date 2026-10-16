@@ -296,6 +296,13 @@ pub struct RemoteServerConfig {
     /// Most bytes the listener accepts in one inbound WebSocket frame. It
     /// defaults to [`DEFAULT_MAX_FRAME_BYTES`] (4 MiB) and is raised with
     /// [`MAX_FRAME_BYTES_FLAG`] or [`MAX_FRAME_BYTES_ENV`].
+    ///
+    /// It is also the bound the listener applies to the responses it sends: one
+    /// connection can never emit a frame above the limit it advertises, so an
+    /// events batch larger than this is delivered as bounded pages (see
+    /// [`loom_protocol::EventsResponse::SessionEvents`]), and an event that
+    /// cannot fit at all is reported as [`ErrorCode::PayloadTooLarge`] naming
+    /// its sequence and size rather than sent as a frame the client drops.
     pub max_frame_bytes: usize,
     /// Most ordinary requests one connection may have in flight at once.
     ///
@@ -868,7 +875,13 @@ fn abandoned_request_error(
 }
 
 async fn handle_socket(socket: WebSocket, state: RemoteState, auth: AuthSession) {
-    let connection = state.backend.connect_authenticated(auth);
+    // The connection carries the listener's frame limit, so an events batch it
+    // answers with is bounded to a frame its clients accept instead of reaching
+    // them as an over-limit frame that their own rule drains.
+    let connection = state
+        .backend
+        .connect_authenticated(auth)
+        .with_max_response_bytes(state.config.max_frame_bytes);
     let (mut sender, mut receiver) = socket.split();
     let (control_sender, mut control_receiver) = mpsc::channel::<ConnectionControl>(1);
     let (message_sender, mut message_receiver) =

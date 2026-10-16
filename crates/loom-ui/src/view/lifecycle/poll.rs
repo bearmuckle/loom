@@ -151,20 +151,29 @@ impl LoomView {
     }
 
     /// Applies newly journaled session events through the connection worker.
+    ///
+    /// The backend bounds an events batch to one response frame, so a poll that
+    /// finds more events than fit keeps asking for the pages that follow instead
+    /// of leaving the rest of the backlog for the next poll cadence.
     pub(crate) fn poll_run_once(&mut self, cx: &mut Context<Self>) {
+        let request_cursor = self.after_sequence;
         self.dispatch(
             cx,
             ClientRequest::Events(EventsRequest::GetSessionEvents {
                 session_id: Some(self.active_session.id),
                 workspace_id: None,
-                after_sequence: self.after_sequence,
+                after_sequence: request_cursor,
                 stream_epoch: self.event_stream_epoch.clone(),
             }),
-            |view, response, cx| {
+            move |view, response, cx| {
+                // Read before the response is consumed, so the page the backend
+                // names is followed on the cursor this poll answered.
+                let continuation = events_page_continuation(&response, request_cursor);
                 match response.result {
                     Ok(ServerResponse::Events(EventsResponse::SessionEvents {
                         events,
                         stream_epoch,
+                        ..
                     })) => {
                         view.event_stream_epoch = stream_epoch;
                         // Applying by sequence makes the incremental poll
@@ -204,7 +213,16 @@ impl LoomView {
                     view.refresh_active_project_snapshot(cx);
                 }
                 view.run_poll_scheduled = false;
-                view.schedule_run_poll(cx);
+                match continuation {
+                    // Keep draining the pages the backend named without waiting
+                    // for the next poll cadence; each answer advances the cursor,
+                    // so the loop ends at the latest journaled event.
+                    Some((next, _)) => {
+                        view.after_sequence = Some(next);
+                        view.poll_run_once(cx);
+                    }
+                    None => view.schedule_run_poll(cx),
+                }
             },
         );
     }

@@ -290,6 +290,7 @@ fn a_loaded_snapshot_shows_its_destructive_decision(cx: &mut TestAppContext) {
                     ServerResponse::Events(EventsResponse::SessionEvents {
                         events: Vec::new(),
                         stream_epoch: None,
+                        next_after_sequence: None,
                     }),
                 ),
                 cx,

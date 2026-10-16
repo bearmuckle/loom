@@ -2943,6 +2943,7 @@ fn async_session_load_falls_back_to_run_projection_and_ignores_stale_responses(
                     loom_protocol::ServerResponse::Events(EventsResponse::SessionEvents{
                         events: Vec::new(),
                         stream_epoch: None,
+                        next_after_sequence: None,
                     }),
                 ),
                 cx,
