@@ -652,15 +652,23 @@ impl LoomView {
                 }
                 view.approval_settings_request_in_flight = false;
                 match response.result {
-                    Ok(ServerResponse::Session(SessionResponse::ApprovalPolicy(_))) => {
+                    Ok(ServerResponse::Session(SessionResponse::ApprovalPolicy(update))) => {
                         view.auto_approve_actions = auto_approve_actions;
                         view.session_auto_approve_actions
                             .insert(session_id, auto_approve_actions);
-                        view.record_status(if auto_approve_actions {
+                        let text = if auto_approve_actions {
                             "Automatic approvals enabled for this session".to_owned()
                         } else {
                             "Automatic approvals disabled for this session".to_owned()
-                        });
+                        };
+                        // The scope comes from the response: a run that is
+                        // already executing keeps the policy it pinned.
+                        let run_is_active = view.run_is_active();
+                        view.record_status(approval_policy_status_text(
+                            &text,
+                            update.applies_from,
+                            run_is_active,
+                        ));
                     }
                     Err(error) => {
                         view.record_backend_error("update session approval settings", error)
@@ -701,17 +709,25 @@ impl LoomView {
                 }
                 view.approval_settings_request_in_flight = false;
                 match response.result {
-                    Ok(ServerResponse::Session(SessionResponse::ApprovalPolicy(policy))) => {
+                    Ok(ServerResponse::Session(SessionResponse::ApprovalPolicy(update))) => {
                         view.ask_before_destructive_actions =
-                            destructive_actions_require_approval(policy.destructive);
+                            destructive_actions_require_approval(update.policy.destructive);
                         view.session_ask_before_destructive_actions
                             .insert(session_id, view.ask_before_destructive_actions);
-                        view.record_status(if view.ask_before_destructive_actions {
+                        let text = if view.ask_before_destructive_actions {
                             "Destructive actions will ask for approval in this session".to_owned()
                         } else {
                             "Destructive actions will run without approval in this session"
                                 .to_owned()
-                        });
+                        };
+                        // The scope comes from the response: a run that is
+                        // already executing keeps the policy it pinned.
+                        let run_is_active = view.run_is_active();
+                        view.record_status(approval_policy_status_text(
+                            &text,
+                            update.applies_from,
+                            run_is_active,
+                        ));
                     }
                     Err(error) => {
                         view.record_backend_error("update session approval settings", error)
