@@ -23,12 +23,13 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use loom_core::{ErrorCode, LoomError, RequestId, Result};
 use loom_protocol::{
-    ClientFrame, RequestEnvelope, ResponseEnvelope, ServerEventEnvelope, decode_client_frame,
-    decode_event, decode_request, encode_client_frame, encode_response,
+    ClientFrame, ClientRequest, ProjectRequest, RequestEnvelope, ResponseEnvelope, RunRequest,
+    ServerEventEnvelope, TaskRequest, TerminalRequest, decode_client_frame, decode_event,
+    decode_request, encode_client_frame, encode_response,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{mpsc, oneshot},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot},
     task::{JoinHandle, spawn_blocking},
     time::{Instant, interval, timeout},
 };
@@ -67,6 +68,25 @@ pub const MAX_FRAME_BYTES_ENV: &str = "LOOM_MAX_FRAME_BYTES";
 /// request id to answer under.
 const CLOSE_MESSAGE_TOO_BIG: u16 = 1009;
 const DEFAULT_OUTGOING_CAPACITY: usize = 128;
+/// Most ordinary requests one connection may have in flight at once.
+///
+/// Every received frame runs on a blocking thread, and Tokio's blocking queue
+/// is unbounded, so without an explicit bound a client that pipelines frames
+/// can queue unlimited blocking work and occupy the pool that other clients'
+/// control and interrupt requests need. The frame that finds the limit reached
+/// is refused with [`ErrorCode::Backpressure`] naming the limit; see
+/// [`InFlightLimits`]. Set the limit with
+/// [`RemoteServerConfig::max_in_flight_requests`].
+pub const DEFAULT_MAX_IN_FLIGHT_REQUESTS: usize = 8;
+/// Most control and interrupt requests one connection may have in flight at
+/// once, counted separately from [`DEFAULT_MAX_IN_FLIGHT_REQUESTS`].
+///
+/// These requests are how a client observes a worker and stops work that is
+/// already running, so they draw on their own permits: pipelined ordinary
+/// requests cannot refuse or delay them. Set the limit with
+/// [`RemoteServerConfig::max_in_flight_control_requests`]. See
+/// [`is_control_or_interrupt_request`].
+pub const DEFAULT_MAX_IN_FLIGHT_CONTROL_REQUESTS: usize = 4;
 /// How long an incoming TLS handshake may take before the listener drops it.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the client waits for the next frame while it is waiting for a
@@ -277,6 +297,23 @@ pub struct RemoteServerConfig {
     /// defaults to [`DEFAULT_MAX_FRAME_BYTES`] (4 MiB) and is raised with
     /// [`MAX_FRAME_BYTES_FLAG`] or [`MAX_FRAME_BYTES_ENV`].
     pub max_frame_bytes: usize,
+    /// Most ordinary requests one connection may have in flight at once.
+    ///
+    /// A frame that arrives while the connection already has this many
+    /// ordinary requests running is answered with [`ErrorCode::Backpressure`]
+    /// naming the limit, instead of queueing an unbounded amount of blocking
+    /// work. It defaults to [`DEFAULT_MAX_IN_FLIGHT_REQUESTS`].
+    pub max_in_flight_requests: usize,
+    /// Most control and interrupt requests one connection may have in flight
+    /// at once.
+    ///
+    /// The permits are counted separately from
+    /// [`Self::max_in_flight_requests`], so a client that pipelines ordinary
+    /// requests cannot refuse or delay its own capability discovery,
+    /// negotiation, worker status, run interrupts, or child and terminal
+    /// cancellation. It defaults to
+    /// [`DEFAULT_MAX_IN_FLIGHT_CONTROL_REQUESTS`].
+    pub max_in_flight_control_requests: usize,
     pub outgoing_capacity: usize,
     /// TLS material for the listener. `Some` serves `wss://` and `/health` over
     /// TLS; `None` serves plain `ws://` and is only allowed on loopback unless
@@ -295,6 +332,8 @@ impl Default for RemoteServerConfig {
             heartbeat_interval: DEFAULT_HEARTBEAT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            max_in_flight_requests: DEFAULT_MAX_IN_FLIGHT_REQUESTS,
+            max_in_flight_control_requests: DEFAULT_MAX_IN_FLIGHT_CONTROL_REQUESTS,
             outgoing_capacity: DEFAULT_OUTGOING_CAPACITY,
             tls: None,
             allow_insecure_remote: false,
@@ -370,6 +409,8 @@ impl RemoteServer {
         if self.config.heartbeat_interval.is_zero()
             || self.config.request_timeout.is_zero()
             || self.config.max_frame_bytes == 0
+            || self.config.max_in_flight_requests == 0
+            || self.config.max_in_flight_control_requests == 0
             || self.config.outgoing_capacity == 0
         {
             return Err(LoomError::invalid_request(
@@ -670,6 +711,162 @@ enum ConnectionControl {
     Backpressure,
 }
 
+/// Which in-flight permit pool a request draws on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestClass {
+    /// A request that does work but is not how a client observes or stops it.
+    Ordinary,
+    /// A request that tells a client what the worker can do or stops work that
+    /// is already running; see [`is_control_or_interrupt_request`].
+    Control,
+}
+
+impl RequestClass {
+    fn of(request: &ClientRequest) -> Self {
+        if is_control_or_interrupt_request(request) {
+            Self::Control
+        } else {
+            Self::Ordinary
+        }
+    }
+}
+
+/// Whether a request is a control or interrupt request.
+///
+/// These are the requests that report what a worker can do (capability
+/// discovery and negotiation, worker status) and that stop work already running
+/// (run interrupts and action approvals, project-child control, task and
+/// terminal cancellation). They must not be refused or delayed because the
+/// connection is busy with pipelined ordinary requests, so they draw on their
+/// own in-flight permits; see [`InFlightLimits`].
+fn is_control_or_interrupt_request(request: &ClientRequest) -> bool {
+    matches!(
+        request,
+        ClientRequest::Control(_)
+            | ClientRequest::Run(RunRequest::InterruptAgentRun { .. })
+            | ClientRequest::Run(RunRequest::ApproveAgentAction { .. })
+            | ClientRequest::Run(RunRequest::RejectAgentAction { .. })
+            | ClientRequest::Project(ProjectRequest::ControlProjectChild { .. })
+            | ClientRequest::Task(TaskRequest::CancelSessionTask { .. })
+            | ClientRequest::Terminal(TerminalRequest::CancelSessionTerminal { .. })
+    )
+}
+
+/// The in-flight request permits of one connection, one pool per request class.
+///
+/// Every received frame runs its request on a blocking thread, and Tokio's
+/// blocking queue is unbounded, so the pools are what bounds how much blocking
+/// work one client can queue: a frame that finds its pool exhausted is refused
+/// with [`ErrorCode::Backpressure`] naming the limit, and the permit is held by
+/// the blocking operation itself, so aborting the waiting task does not hand
+/// the slot back early.
+struct InFlightLimits {
+    ordinary: Arc<Semaphore>,
+    control: Arc<Semaphore>,
+    max_ordinary: usize,
+    max_control: usize,
+}
+
+impl InFlightLimits {
+    /// The limits come from [`RemoteServerConfig::max_in_flight_requests`] and
+    /// [`RemoteServerConfig::max_in_flight_control_requests`], which
+    /// [`RemoteServer::bind`] requires to be greater than zero.
+    fn new(max_ordinary: usize, max_control: usize) -> Self {
+        Self {
+            ordinary: Arc::new(Semaphore::new(max_ordinary)),
+            control: Arc::new(Semaphore::new(max_control)),
+            max_ordinary,
+            max_control,
+        }
+    }
+
+    /// Reserves one in-flight slot for a request of `class`, or reports the
+    /// refusal that answers it.
+    ///
+    /// The refusal names the limit and states that the request was not started,
+    /// because a client whose request was dropped silently cannot tell a lost
+    /// frame from a slow worker.
+    fn admit(&self, request_id: RequestId, class: RequestClass) -> Result<OwnedSemaphorePermit> {
+        let (permits, limit, field, kind) = match class {
+            RequestClass::Ordinary => (
+                &self.ordinary,
+                self.max_ordinary,
+                "max_in_flight_requests",
+                "in-flight requests",
+            ),
+            RequestClass::Control => (
+                &self.control,
+                self.max_control,
+                "max_in_flight_control_requests",
+                "in-flight control requests",
+            ),
+        };
+        Arc::clone(permits).try_acquire_owned().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Backpressure,
+                format!(
+                    "request {request_id} was not started: this connection is at its configured \
+                     limit of {limit} {kind} ({field}); wait for an outstanding response before \
+                     sending another"
+                ),
+                true,
+            )
+        })
+    }
+}
+
+/// The bounds one connection applies to every frame it receives.
+///
+/// The pools are per connection, so they are built once per accepted socket and
+/// shared by every frame on it.
+struct ConnectionLimits {
+    /// Most bytes an inbound frame may carry; see [`DEFAULT_MAX_FRAME_BYTES`].
+    max_frame_bytes: usize,
+    /// How long a request may wait for its blocking operation.
+    request_timeout: Duration,
+    in_flight: InFlightLimits,
+}
+
+impl ConnectionLimits {
+    fn new(config: &RemoteServerConfig) -> Self {
+        Self {
+            max_frame_bytes: config.max_frame_bytes,
+            request_timeout: config.request_timeout,
+            in_flight: InFlightLimits::new(
+                config.max_in_flight_requests,
+                config.max_in_flight_control_requests,
+            ),
+        }
+    }
+}
+
+/// The error that answers a request whose waiting future was abandoned.
+///
+/// Cancellation and the request deadline stop only the *wait*: the operation
+/// runs on a blocking thread, and Tokio cannot cancel a blocking closure, so the
+/// mutation may still be applied and persisted after the caller is answered.
+/// Reporting plain `RequestCancelled` or `DeadlineExceeded` would claim the
+/// opposite, so the response says what actually holds: the request was
+/// abandoned rather than undone, and its effect may still land. A caller that
+/// retries with the same request id is answered from the idempotency cache once
+/// the operation committed, so retrying is safe for durable mutations.
+fn abandoned_request_error(
+    code: ErrorCode,
+    request_id: RequestId,
+    reason: &str,
+    retryable: bool,
+) -> LoomError {
+    LoomError::new(
+        code,
+        format!(
+            "request {request_id} was abandoned {reason}; the operation runs on a blocking thread \
+             that abandoning the wait does not stop, so it may still complete and its effect may \
+             still be applied; read the state again before assuming it did not happen"
+        ),
+        retryable,
+    )
+}
+
 async fn handle_socket(socket: WebSocket, state: RemoteState, auth: AuthSession) {
     let connection = state.backend.connect_authenticated(auth);
     let (mut sender, mut receiver) = socket.split();
@@ -685,6 +882,7 @@ async fn handle_socket(socket: WebSocket, state: RemoteState, auth: AuthSession)
     });
 
     let mut pending = HashMap::<RequestId, JoinHandle<()>>::new();
+    let limits = ConnectionLimits::new(&state.config);
     let mut heartbeat = interval(state.config.heartbeat_interval);
     let mut last_activity = Instant::now();
     let heartbeat_timeout = state
@@ -721,8 +919,7 @@ async fn handle_socket(socket: WebSocket, state: RemoteState, auth: AuthSession)
                             &message_sender,
                             &control_sender,
                             &mut pending,
-                            state.config.max_frame_bytes,
-                            state.config.request_timeout,
+                            &limits,
                         ).await {
                             // The reason is the only explanation an oversized
                             // frame that named no request can carry, so it is
@@ -739,8 +936,7 @@ async fn handle_socket(socket: WebSocket, state: RemoteState, auth: AuthSession)
                             &message_sender,
                             &control_sender,
                             &mut pending,
-                            state.config.max_frame_bytes,
-                            state.config.request_timeout,
+                            &limits,
                         ).await {
                             let _ = message_sender.send(Message::Close(Some(close))).await;
                             break;
@@ -776,15 +972,20 @@ async fn handle_socket(socket: WebSocket, state: RemoteState, auth: AuthSession)
 /// names, so the client sees the failure on the request it sent. A frame that
 /// names no request cannot be answered that way, so the connection closes with
 /// a reason carrying the same size-and-limit explanation.
+///
+/// A request that arrives while the connection already has its in-flight limit
+/// of requests running is answered with [`ErrorCode::Backpressure`] naming the
+/// limit, so the client learns its request was refused rather than started, and
+/// the connection stays open. See [`InFlightLimits`].
 async fn process_text(
     bytes: &[u8],
     connection: &InProcessConnection,
     outgoing: &mpsc::Sender<Message>,
     control: &mpsc::Sender<ConnectionControl>,
     pending: &mut HashMap<RequestId, JoinHandle<()>>,
-    max_frame_bytes: usize,
-    request_timeout: Duration,
+    limits: &ConnectionLimits,
 ) -> Option<CloseFrame> {
+    let max_frame_bytes = limits.max_frame_bytes;
     if bytes.len() > max_frame_bytes {
         let received = bytes.len();
         if let Some(request_id) = frame_request_id(bytes) {
@@ -812,9 +1013,10 @@ async fn process_text(
                 }
                 let response = ResponseEnvelope::failure(
                     request_id,
-                    LoomError::new(
+                    abandoned_request_error(
                         ErrorCode::RequestCancelled,
-                        "request was cancelled by the client",
+                        request_id,
+                        "by the client",
                         false,
                     ),
                 );
@@ -832,11 +1034,27 @@ async fn process_text(
         },
     };
     let request_id = request.request_id;
+    let class = RequestClass::of(&request.request);
+    let permit = match limits.in_flight.admit(request_id, class) {
+        Ok(permit) => permit,
+        Err(error) => {
+            // The refusal carries the request id, so the client sees on the
+            // request it sent that it was refused instead of started.
+            log::debug!(
+                "refused remote request {request_id}: the connection is at its {class:?} \
+                 in-flight limit"
+            );
+            let response = ResponseEnvelope::failure(request_id, error);
+            let _ = try_send_response(outgoing, response, control);
+            return None;
+        }
+    };
+    let request_timeout = limits.request_timeout;
     let connection = connection.clone();
     let outgoing = outgoing.clone();
     let control = control.clone();
     let task = tokio::spawn(async move {
-        let response = execute_request(connection, request, request_timeout).await;
+        let response = execute_request(connection, request, request_timeout, permit).await;
         let _ = try_send_response(&outgoing, response, &control);
     });
     pending.retain(|_, task| !task.is_finished());
@@ -863,14 +1081,27 @@ async fn execute_request(
     connection: InProcessConnection,
     request: RequestEnvelope,
     request_timeout: Duration,
+    permit: OwnedSemaphorePermit,
 ) -> ResponseEnvelope {
     let request_id = request.request_id;
     execute_request_with(request_id, request_timeout, move || {
+        // The in-flight permit belongs to the blocking operation, not to the
+        // task waiting for it: aborting that task (a cancel frame or the
+        // deadline below) must not hand the slot back while the operation is
+        // still running.
+        let _permit = permit;
         connection.request(request)
     })
     .await
 }
 
+/// Runs `operation` on a blocking thread with `request_timeout` as its deadline.
+///
+/// The deadline stops the *wait*, not the operation: Tokio cannot cancel a
+/// blocking closure, so an operation that outlives it keeps running and may
+/// still apply and persist its mutation. The response says so rather than
+/// reporting the request as expired while its effect lands; see
+/// [`abandoned_request_error`].
 async fn execute_request_with(
     request_id: RequestId,
     request_timeout: Duration,
@@ -888,9 +1119,10 @@ async fn execute_request_with(
         ),
         Err(_) => ResponseEnvelope::failure(
             request_id,
-            LoomError::new(
+            abandoned_request_error(
                 ErrorCode::DeadlineExceeded,
-                "remote request exceeded its deadline",
+                request_id,
+                &format!("when its {request_timeout:?} request deadline passed"),
                 true,
             ),
         ),
@@ -1486,11 +1718,13 @@ fn tls_failure_detail(error: &TungsteniteError) -> Option<String> {
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        CLOSE_MESSAGE_TOO_BIG, ConnectionControl, DEFAULT_MAX_FRAME_BYTES, MAX_FRAME_BYTES_ENV,
-        MAX_FRAME_BYTES_FLAG, OversizedFrameAction, RemoteServer, RemoteServerConfig,
-        ServerTlsConfig, WEBSOCKET_TLS_SUPPORTED, WebSocketTransport, auth_error_response,
-        bearer_token, client_tls_config, execute_request_with, frame_request_id,
-        frame_too_large_close_reason, frame_too_large_error, insecure_remote_host,
+        CLOSE_MESSAGE_TOO_BIG, ConnectionControl, ConnectionLimits, DEFAULT_MAX_FRAME_BYTES,
+        DEFAULT_MAX_IN_FLIGHT_CONTROL_REQUESTS, DEFAULT_MAX_IN_FLIGHT_REQUESTS, InFlightLimits,
+        MAX_FRAME_BYTES_ENV, MAX_FRAME_BYTES_FLAG, OversizedFrameAction, RemoteServer,
+        RemoteServerConfig, RequestClass, ServerTlsConfig, WEBSOCKET_TLS_SUPPORTED,
+        WebSocketTransport, abandoned_request_error, auth_error_response, bearer_token,
+        client_tls_config, execute_request_with, frame_request_id, frame_too_large_close_reason,
+        frame_too_large_error, insecure_remote_host, is_control_or_interrupt_request,
         oversized_inbound_frame_action, process_text, request_auth, resolve_max_frame_bytes,
         try_send_response, websocket_connect_error,
     };
@@ -1505,14 +1739,18 @@ mod unit_tests {
     use loom_core::{ErrorCode, ProtocolVersion, RequestId};
     use loom_protocol::{
         ClientFrame, ClientRequest, ControlRequest, ControlResponse, RequestEnvelope,
-        ResponseEnvelope, ServerResponse, decode_response, encode_client_frame, encode_request,
-        encode_response,
+        ResponseEnvelope, RunRequest, ServerResponse, WorkspaceRequest, decode_response,
+        encode_client_frame, encode_request, encode_response,
     };
     use std::{
         collections::HashMap,
         io,
         net::{IpAddr, Ipv6Addr, SocketAddr},
         path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
         time::Duration,
     };
     use tokio::{
@@ -1546,6 +1784,19 @@ mod unit_tests {
 
     fn test_tls() -> ServerTlsConfig {
         ServerTlsConfig::from_pem(TEST_CERT_PEM, TEST_KEY_PEM)
+    }
+
+    /// The per-connection bounds a frame-loop test applies: `max_frame_bytes` as
+    /// the inbound frame limit and the default in-flight request limits.
+    fn test_limits(max_frame_bytes: usize) -> ConnectionLimits {
+        ConnectionLimits {
+            max_frame_bytes,
+            request_timeout: Duration::from_secs(1),
+            in_flight: InFlightLimits::new(
+                DEFAULT_MAX_IN_FLIGHT_REQUESTS,
+                DEFAULT_MAX_IN_FLIGHT_CONTROL_REQUESTS,
+            ),
+        }
     }
 
     #[tokio::test]
@@ -1713,12 +1964,14 @@ mod unit_tests {
             .unwrap();
         assert_eq!(error.code, ErrorCode::InvalidRequest);
 
-        for field in 0..4 {
+        for field in 0..6 {
             let mut config = RemoteServerConfig::local_ephemeral();
             match field {
                 0 => config.heartbeat_interval = Duration::ZERO,
                 1 => config.request_timeout = Duration::ZERO,
                 2 => config.max_frame_bytes = 0,
+                3 => config.max_in_flight_requests = 0,
+                4 => config.max_in_flight_control_requests = 0,
                 _ => config.outgoing_capacity = 0,
             }
             let error = RemoteServer::new(backend.clone(), auth.clone(), config)
@@ -1755,8 +2008,7 @@ mod unit_tests {
             &outgoing,
             &control,
             &mut pending,
-            1,
-            Duration::from_secs(1),
+            &test_limits(1),
         )
         .await
         .expect("a frame that names no request must close the connection");
@@ -1779,8 +2031,7 @@ mod unit_tests {
             &outgoing,
             &control,
             &mut pending,
-            limit,
-            Duration::from_secs(1),
+            &test_limits(limit),
         )
         .await;
         assert!(close.is_none());
@@ -1800,8 +2051,7 @@ mod unit_tests {
             &outgoing,
             &control,
             &mut pending,
-            100,
-            Duration::from_secs(1),
+            &test_limits(100),
         )
         .await;
         let Some(axum::extract::ws::Message::Text(text)) = received.recv().await else {
@@ -1824,8 +2074,7 @@ mod unit_tests {
             &outgoing,
             &control,
             &mut pending,
-            100,
-            Duration::from_secs(1),
+            &test_limits(100),
         )
         .await;
         let Some(axum::extract::ws::Message::Text(text)) = received.recv().await else {
@@ -1847,8 +2096,7 @@ mod unit_tests {
             &outgoing,
             &control,
             &mut pending,
-            1024,
-            Duration::from_secs(1),
+            &test_limits(1024),
         )
         .await;
         let Some(axum::extract::ws::Message::Text(text)) = received.recv().await else {
@@ -1969,8 +2217,7 @@ mod unit_tests {
             &outgoing,
             &control,
             &mut pending,
-            1024,
-            Duration::from_secs(1),
+            &test_limits(1024),
         )
         .await;
         assert_eq!(pending.len(), 1);
@@ -1982,8 +2229,7 @@ mod unit_tests {
             &outgoing,
             &control,
             &mut pending,
-            1024,
-            Duration::from_secs(1),
+            &test_limits(1024),
         )
         .await;
         let Some(Message::Text(text)) = received.recv().await else {
@@ -2008,6 +2254,291 @@ mod unit_tests {
         assert_eq!(
             timed_out.result.unwrap_err().code,
             ErrorCode::DeadlineExceeded
+        );
+    }
+
+    #[test]
+    fn the_in_flight_limits_start_from_the_defaults() {
+        assert_eq!(DEFAULT_MAX_IN_FLIGHT_REQUESTS, 8);
+        assert_eq!(DEFAULT_MAX_IN_FLIGHT_CONTROL_REQUESTS, 4);
+        let config = RemoteServerConfig::default();
+        assert_eq!(config.max_in_flight_requests, 8);
+        assert_eq!(config.max_in_flight_control_requests, 4);
+        let limits = ConnectionLimits::new(&config);
+        assert_eq!(limits.max_frame_bytes, config.max_frame_bytes);
+        assert_eq!(limits.request_timeout, config.request_timeout);
+        assert_eq!(limits.in_flight.max_ordinary, 8);
+        assert_eq!(limits.in_flight.max_control, 4);
+    }
+
+    #[test]
+    fn control_and_interrupt_requests_are_classified_apart_from_ordinary_ones() {
+        for request in [
+            ClientRequest::Control(ControlRequest::DiscoverCapabilities),
+            ClientRequest::Run(RunRequest::InterruptAgentRun {
+                run_id: loom_core::RunId::new(),
+            }),
+        ] {
+            assert!(is_control_or_interrupt_request(&request), "{request:?}");
+            assert_eq!(RequestClass::of(&request), RequestClass::Control);
+        }
+        for request in [
+            ClientRequest::Workspace(WorkspaceRequest::CreateWorkspace {
+                name: "workspace".to_owned(),
+            }),
+            ClientRequest::Provider(loom_protocol::ProviderRequest::ListModels),
+        ] {
+            assert!(!is_control_or_interrupt_request(&request), "{request:?}");
+            assert_eq!(RequestClass::of(&request), RequestClass::Ordinary);
+        }
+    }
+
+    #[tokio::test]
+    async fn requests_past_the_in_flight_limit_are_refused_and_never_silently_dropped() {
+        let backend = InProcessBackend::new();
+        let connection = backend.connect();
+        let (outgoing, mut received) = mpsc::channel(8);
+        let (control, _) = mpsc::channel(1);
+        let mut pending = HashMap::new();
+        let limits = ConnectionLimits {
+            max_frame_bytes: 4096,
+            request_timeout: Duration::from_secs(1),
+            in_flight: InFlightLimits::new(1, 1),
+        };
+        // An in-flight ordinary request holds the connection's only ordinary
+        // permit for as long as its blocking operation runs.
+        let held = limits
+            .in_flight
+            .admit(RequestId::new(), RequestClass::Ordinary)
+            .unwrap();
+
+        let request = RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "pipelined".to_owned(),
+            },
+        ));
+        let request_id = request.request_id;
+        process_text(
+            &encode_request(&request).unwrap(),
+            &connection,
+            &outgoing,
+            &control,
+            &mut pending,
+            &limits,
+        )
+        .await;
+        let Some(Message::Text(text)) = received.recv().await else {
+            panic!("a refused request must be answered, not dropped")
+        };
+        let response = decode_response(text.as_bytes()).unwrap();
+        assert_eq!(response.request_id, request_id);
+        let error = response.result.unwrap_err();
+        assert_eq!(error.code, ErrorCode::Backpressure);
+        assert!(error.retryable);
+        assert_eq!(
+            error.message,
+            format!(
+                "request {request_id} was not started: this connection is at its configured limit \
+                 of 1 in-flight requests (max_in_flight_requests); wait for an outstanding \
+                 response before sending another"
+            )
+        );
+        // A refused request never starts, so it holds no slot and no task.
+        assert!(pending.is_empty());
+
+        // The pools are separate, so a control request is admitted and answered
+        // while the ordinary pool is exhausted.
+        let control_request =
+            RequestEnvelope::new(ClientRequest::Control(ControlRequest::DiscoverCapabilities));
+        process_text(
+            &encode_request(&control_request).unwrap(),
+            &connection,
+            &outgoing,
+            &control,
+            &mut pending,
+            &limits,
+        )
+        .await;
+        assert_eq!(pending.len(), 1);
+        let Some(Message::Text(text)) = received.recv().await else {
+            panic!("a control request must be admitted while ordinary requests are at their limit")
+        };
+        let response = decode_response(text.as_bytes()).unwrap();
+        assert_eq!(response.request_id, control_request.request_id);
+        assert!(response.result.is_ok());
+        drop(held);
+
+        // The control pool is bounded too, so no request class can queue
+        // without limit.
+        let control_held = limits
+            .in_flight
+            .admit(RequestId::new(), RequestClass::Control)
+            .unwrap();
+        let second =
+            RequestEnvelope::new(ClientRequest::Control(ControlRequest::DiscoverCapabilities));
+        let second_id = second.request_id;
+        process_text(
+            &encode_request(&second).unwrap(),
+            &connection,
+            &outgoing,
+            &control,
+            &mut pending,
+            &limits,
+        )
+        .await;
+        let Some(Message::Text(text)) = received.recv().await else {
+            panic!("a control request past its limit must be answered")
+        };
+        let error = decode_response(text.as_bytes())
+            .unwrap()
+            .result
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::Backpressure);
+        assert_eq!(
+            error.message,
+            format!(
+                "request {second_id} was not started: this connection is at its configured limit \
+                 of 1 in-flight control requests (max_in_flight_control_requests); wait for an \
+                 outstanding response before sending another"
+            )
+        );
+        drop(control_held);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_request_reports_that_its_operation_may_still_complete() {
+        let backend = InProcessBackend::new();
+        let connection = backend.connect();
+        let (outgoing, mut received) = mpsc::channel(4);
+        let (control, _) = mpsc::channel(1);
+        let mut pending = HashMap::new();
+
+        let request =
+            RequestEnvelope::new(ClientRequest::Control(ControlRequest::DiscoverCapabilities));
+        let request_id = request.request_id;
+        process_text(
+            &encode_request(&request).unwrap(),
+            &connection,
+            &outgoing,
+            &control,
+            &mut pending,
+            &test_limits(1024),
+        )
+        .await;
+
+        let cancel = encode_client_frame(&ClientFrame::Cancel { request_id }).unwrap();
+        process_text(
+            &cancel,
+            &connection,
+            &outgoing,
+            &control,
+            &mut pending,
+            &test_limits(1024),
+        )
+        .await;
+        let Some(Message::Text(text)) = received.recv().await else {
+            panic!("expected a response to the cancel frame")
+        };
+        let response = decode_response(text.as_bytes()).unwrap();
+        assert_eq!(response.request_id, request_id);
+        let error = response.result.unwrap_err();
+        // The client is told the request was abandoned rather than undone,
+        // because the blocking operation is not stopped by cancelling the wait.
+        assert_eq!(error.code, ErrorCode::RequestCancelled);
+        assert_eq!(
+            error,
+            abandoned_request_error(
+                ErrorCode::RequestCancelled,
+                request_id,
+                "by the client",
+                false
+            )
+        );
+        assert!(error.message.contains("may still complete"), "{error}");
+        assert!(error.message.contains("abandoned by the client"), "{error}");
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn aborting_a_request_does_not_stop_its_blocking_operation() {
+        // A cancel frame answers by aborting the task that waits for the
+        // operation. This pins what that abort does and does not stop: the
+        // response above says the effect may still land, and here it does.
+        let request_id = RequestId::new();
+        let started = Arc::new(AtomicBool::new(false));
+        let landed = Arc::new(AtomicBool::new(false));
+        let operation = {
+            let started = Arc::clone(&started);
+            let landed = Arc::clone(&landed);
+            move || {
+                started.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(50));
+                landed.store(true, Ordering::SeqCst);
+                ResponseEnvelope::failure(
+                    request_id,
+                    loom_core::LoomError::invalid_request("late response"),
+                )
+            }
+        };
+        let task = tokio::spawn(execute_request_with(
+            request_id,
+            Duration::from_secs(30),
+            operation,
+        ));
+        while !started.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        task.abort();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !landed.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            landed.load(Ordering::SeqCst),
+            "aborting the waiting task must not stop the blocking operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_request_reports_that_its_operation_may_still_complete() {
+        let request_id = RequestId::new();
+        let landed = Arc::new(AtomicBool::new(false));
+        let operation = {
+            let landed = Arc::clone(&landed);
+            move || {
+                std::thread::sleep(Duration::from_millis(50));
+                landed.store(true, Ordering::SeqCst);
+                ResponseEnvelope::failure(
+                    request_id,
+                    loom_core::LoomError::invalid_request("late response"),
+                )
+            }
+        };
+        let timed_out = execute_request_with(request_id, Duration::from_millis(5), operation).await;
+        let error = timed_out.result.unwrap_err();
+        assert_eq!(error.code, ErrorCode::DeadlineExceeded);
+        assert!(error.retryable);
+        assert_eq!(
+            error.message,
+            format!(
+                "request {request_id} was abandoned when its 5ms request deadline passed; the \
+                 operation runs on a blocking thread that abandoning the wait does not stop, so \
+                 it may still complete and its effect may still be applied; read the state again \
+                 before assuming it did not happen"
+            )
+        );
+        assert!(error.message.contains("may still complete"), "{error}");
+
+        // The rule is honest: the abandoned operation really does keep running
+        // and apply its effect after the caller was answered.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !landed.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            landed.load(Ordering::SeqCst),
+            "the deadline must not stop the blocking operation"
         );
     }
 

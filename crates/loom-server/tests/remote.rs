@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
 use loom_agent::AgentEvent;
@@ -15,9 +15,10 @@ use loom_protocol::{
     encode_request, encode_response,
 };
 use loom_server::{
-    AuthTokenStore, AuthorizationScope, DEFAULT_MAX_FRAME_BYTES, InProcessBackend, RemoteServer,
-    RemoteServerConfig, ServerTlsConfig, WEBSOCKET_TLS_SUPPORTED, WebSocketConnection,
-    WebSocketTransport,
+    AuthTokenStore, AuthorizationScope, DEFAULT_MAX_FRAME_BYTES,
+    DEFAULT_MAX_IN_FLIGHT_CONTROL_REQUESTS, DEFAULT_MAX_IN_FLIGHT_REQUESTS, InProcessBackend,
+    RemoteServer, RemoteServerConfig, ServerTlsConfig, WEBSOCKET_TLS_SUPPORTED,
+    WebSocketConnection, WebSocketTransport,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{
@@ -75,6 +76,27 @@ async fn server_with_backend_and_frame_limit(
     loom_server::IssuedToken,
     loom_server::RunningRemoteServer,
 ) {
+    server_with_limits(
+        backend,
+        max_frame_bytes,
+        DEFAULT_MAX_IN_FLIGHT_REQUESTS,
+        DEFAULT_MAX_IN_FLIGHT_CONTROL_REQUESTS,
+    )
+    .await
+}
+
+/// The standard test server with explicit per-connection in-flight limits.
+async fn server_with_limits(
+    backend: Arc<InProcessBackend>,
+    max_frame_bytes: usize,
+    max_in_flight_requests: usize,
+    max_in_flight_control_requests: usize,
+) -> (
+    Arc<InProcessBackend>,
+    Arc<AuthTokenStore>,
+    loom_server::IssuedToken,
+    loom_server::RunningRemoteServer,
+) {
     let auth = Arc::new(AuthTokenStore::new());
     let token = auth
         .insert("remote-test-token", AuthorizationScope::all())
@@ -86,6 +108,8 @@ async fn server_with_backend_and_frame_limit(
             heartbeat_interval: Duration::from_millis(25),
             request_timeout: Duration::from_secs(5),
             max_frame_bytes,
+            max_in_flight_requests,
+            max_in_flight_control_requests,
             ..RemoteServerConfig::local_ephemeral()
         },
     )
@@ -1439,5 +1463,166 @@ async fn terminal_execution_continues_after_client_disconnect() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert!(exited);
+    server.stop().await.unwrap();
+}
+
+/// A terminal command that never reads its input, so a large write to it cannot
+/// complete before the frames pipelined behind it are received.
+const BLOCKING_TERMINAL_COMMAND: &str = "sleep 5";
+
+#[tokio::test]
+async fn a_pipelining_client_is_refused_at_the_in_flight_limit_and_keeps_control_requests() {
+    // One in-flight request per class, so the first frame holds the
+    // connection's only ordinary permit for as long as it runs.
+    let (_backend, _auth, token, server) =
+        server_with_limits(InProcessBackend::new(), DEFAULT_MAX_FRAME_BYTES, 1, 1).await;
+    let mut setup = WebSocketTransport::new(server.websocket_url(), token.token.clone())
+        .connect()
+        .await
+        .unwrap();
+    negotiate(&mut setup).await;
+    let workspace_id = create_workspace(&mut setup).await;
+    let session = session(&mut setup, workspace_id).await;
+    let terminal = match setup
+        .request(RequestEnvelope::new(ClientRequest::Terminal(
+            TerminalRequest::OpenSessionTerminal {
+                session_id: session.id,
+                command: "sh".to_owned(),
+                args: vec!["-c".to_owned(), BLOCKING_TERMINAL_COMMAND.to_owned()],
+                cwd: None,
+            },
+        )))
+        .await
+        .unwrap()
+        .result
+        .unwrap()
+    {
+        ServerResponse::Terminal(TerminalResponse::TerminalOpened(snapshot)) => snapshot,
+        response => panic!("unexpected terminal response: {response:?}"),
+    };
+
+    // A write this large cannot complete until the terminal exits, so the
+    // first frame holds the connection's only ordinary permit while the two
+    // frames behind it are received.
+    let blocking = RequestEnvelope::new(ClientRequest::Terminal(
+        TerminalRequest::WriteSessionTerminalInput {
+            session_id: session.id,
+            terminal_id: terminal.id,
+            input: "p".repeat(1 << 20),
+        },
+    ));
+    let refused = RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "pipelined".to_owned(),
+        },
+    ));
+    let control =
+        RequestEnvelope::new(ClientRequest::Control(ControlRequest::DiscoverCapabilities));
+    let mut pipelining = raw_socket(&server, &token.token).await;
+    // The raw socket negotiates first, like any client, and waits for the
+    // answer, so its control permit is free before the pipeline is admitted.
+    let handshake = RequestEnvelope::new(ClientRequest::Control(ControlRequest::Negotiate {
+        client_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+        capabilities: support::capabilities(),
+    }));
+    pipelining
+        .send(Message::Text(
+            String::from_utf8(encode_request(&handshake).unwrap())
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let answer = tokio::time::timeout(Duration::from_secs(10), next_text_frame(&mut pipelining))
+        .await
+        .expect("the negotiating frame must be answered");
+    let answer = decode_response(&answer).unwrap();
+    assert_eq!(answer.request_id, handshake.request_id);
+    assert!(answer.result.is_ok(), "{:?}", answer.result);
+
+    for frame in [&blocking, &refused, &control] {
+        pipelining
+            .send(Message::Text(
+                String::from_utf8(encode_request(frame).unwrap())
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    // A second connection is unaffected while the first is at its limit.
+    let mut other = WebSocketTransport::new(server.websocket_url(), token.token.clone())
+        .connect()
+        .await
+        .unwrap();
+    negotiate(&mut other).await;
+    let read = other
+        .request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::GetAgentSession {
+                session_id: session.id,
+            },
+        )))
+        .await
+        .unwrap();
+    assert!(read.result.is_ok(), "{:?}", read.result);
+
+    // Every pipelined frame is answered: the refusal and the control request
+    // while the first request is still blocked, and the first request once its
+    // terminal has drained the write.
+    let mut order = Vec::new();
+    let mut answers = HashMap::new();
+    while answers.len() < 3 {
+        let frame = tokio::time::timeout(Duration::from_secs(30), next_text_frame(&mut pipelining))
+            .await
+            .expect("every pipelined frame must be answered");
+        let response = decode_response(&frame).unwrap();
+        order.push(response.request_id);
+        answers.insert(response.request_id, response.result);
+    }
+    // The blocked request is answered last, which is what held the permit while
+    // the frames behind it were received.
+    assert_eq!(order.last(), Some(&blocking.request_id), "{order:?}");
+
+    let refusal = answers
+        .remove(&refused.request_id)
+        .expect("the pipelined ordinary request must be answered")
+        .expect_err("a request past the in-flight limit must be refused");
+    assert_eq!(refusal.code, ErrorCode::Backpressure);
+    assert!(refusal.retryable);
+    assert_eq!(
+        refusal.message,
+        format!(
+            "request {} was not started: this connection is at its configured limit of 1 \
+             in-flight requests (max_in_flight_requests); wait for an outstanding response \
+             before sending another",
+            refused.request_id
+        )
+    );
+
+    let capabilities = answers
+        .remove(&control.request_id)
+        .expect("the control request must be answered")
+        .expect("pipelined ordinary requests must not starve a control request");
+    assert!(matches!(
+        capabilities,
+        ServerResponse::Control(ControlResponse::Capabilities(_))
+    ));
+
+    // The first request was started, not refused, so it really did hold the
+    // permit while the other two frames arrived.
+    let blocked = answers
+        .remove(&blocking.request_id)
+        .expect("the blocking request must be answered");
+    if let Err(error) = &blocked {
+        assert_ne!(
+            error.code,
+            ErrorCode::Backpressure,
+            "the blocking request was refused: {error}"
+        );
+    }
+
+    drop(pipelining);
+    drop(other);
     server.stop().await.unwrap();
 }

@@ -135,7 +135,8 @@ pub use instance::{
     TokenSource,
 };
 pub use remote::{
-    DEFAULT_MAX_FRAME_BYTES, MAX_FRAME_BYTES_ENV, MAX_FRAME_BYTES_FLAG, RemoteServer,
+    DEFAULT_MAX_FRAME_BYTES, DEFAULT_MAX_IN_FLIGHT_CONTROL_REQUESTS,
+    DEFAULT_MAX_IN_FLIGHT_REQUESTS, MAX_FRAME_BYTES_ENV, MAX_FRAME_BYTES_FLAG, RemoteServer,
     RemoteServerConfig, RunningRemoteServer, ServerTlsConfig, WEBSOCKET_TLS_SUPPORTED,
     WebSocketConnection, WebSocketTransport, parse_max_frame_bytes, resolve_max_frame_bytes,
 };
