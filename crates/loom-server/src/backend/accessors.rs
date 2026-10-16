@@ -83,6 +83,18 @@ impl InProcessBackend {
         self.repository_service.mirror_path(clone_url)
     }
 
+    /// When the mirror of `clone_url` was last known to match its remote, when
+    /// this node has recorded a refresh for it.
+    pub(crate) fn mirror_refresh(&self, clone_url: &str) -> Result<Option<CachedMirrorRefresh>> {
+        self.repository_service.mirror_refresh(clone_url)
+    }
+
+    /// Records when the mirror of `refresh.clone_url` was last known to match
+    /// its remote.
+    pub(crate) fn record_mirror_refresh(&self, refresh: &CachedMirrorRefresh) -> Result<()> {
+        self.repository_service.record_mirror_refresh(refresh)
+    }
+
     /// Record a cached clone so later sessions can reuse it.
     pub(crate) fn register_cloned_repository(&self, repository: &ClonedRepository) -> Result<()> {
         self.repository_service

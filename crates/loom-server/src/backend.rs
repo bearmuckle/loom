@@ -15,7 +15,7 @@ mod session_service;
 mod workspace_service;
 
 pub(crate) use process_service::ProcessService;
-pub(crate) use repository_service::RepositoryService;
+pub(crate) use repository_service::{CachedMirrorRefresh, MirrorFreshness, RepositoryService};
 pub(crate) use run_service::RunService;
 pub(crate) use session_filesystem_service::SessionFilesystemService;
 pub(crate) use session_service::SessionService;

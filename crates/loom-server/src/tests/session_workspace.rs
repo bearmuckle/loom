@@ -1981,3 +1981,323 @@ fn run_repository_instructions_omit_the_base_note_without_an_origin() {
     assert_eq!(instructions, "Keep changes focused.");
     fixture.shutdown();
 }
+
+/// Creates a workspace with one session in it and returns the session id.
+fn cached_clone_session(connection: &InProcessConnection, name: &str) -> AgentSessionId {
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: name.to_owned(),
+        },
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(space)) =
+        created.result.unwrap()
+    else {
+        panic!("unexpected workspace response");
+    };
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
+            workspace_id: space.id,
+            name: name.to_owned(),
+        },
+    )));
+    let ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) =
+        created.result.unwrap()
+    else {
+        panic!("unexpected session response");
+    };
+    session.id
+}
+
+/// Attaches `source` to `session_id` as a cached clone and returns the response.
+fn attach_cached_clone(
+    connection: &InProcessConnection,
+    session_id: AgentSessionId,
+    source: &str,
+    path: &str,
+    revision: Option<&str>,
+) -> Result<SessionRepository> {
+    let attached = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+        RepositoryRequest::AttachSessionRepository {
+            session_id,
+            source: source.to_owned(),
+            path: path.to_owned(),
+            revision: revision.map(str::to_owned),
+            reuse_local: true,
+        },
+    )));
+    match attached.result {
+        Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(
+            repository,
+        ))) => Ok(repository),
+        Ok(other) => panic!("unexpected attach response: {other:?}"),
+        Err(error) => Err(error),
+    }
+}
+
+/// A session whose node clone cache holds a mirror of a GitHub-shaped clone URL.
+struct CachedCloneFixture {
+    temp: PathBuf,
+    source: PathBuf,
+    origin: PathBuf,
+    branch: String,
+    url: String,
+    mirror: PathBuf,
+    backend: Arc<InProcessBackend>,
+    connection: InProcessConnection,
+    session_id: AgentSessionId,
+}
+
+/// `mirror_origin` is the URL the mirror's own `origin` is set to, or `None` for
+/// the local bare repository the fixture creates: the local one is reachable, so
+/// a reuse of the mirror can be refreshed without the network.
+fn cached_clone_fixture(url: &str, mirror_origin: Option<&str>) -> CachedCloneFixture {
+    let temp = workspace();
+    let source = git_repository();
+    let branch = git_output(&source, &["branch", "--show-current"]);
+    let origin = temp.join("origin.git");
+    git_in(&temp, &["init", "--bare", "-q", origin.to_str().unwrap()]);
+    git_in(
+        &source,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git_in(&source, &["push", "-q", "origin", &branch]);
+    // Record the remote default branch the way a clone does, so the mirror
+    // refresh resolves it from the first fetch onwards.
+    git_in(
+        &origin,
+        &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
+    );
+
+    let backend = InProcessBackend::new();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let mirror = backend.repository_mirror_path(url).unwrap();
+    GitService::create_mirror(
+        &source,
+        &mirror,
+        &mirror_origin.map_or_else(|| origin.display().to_string(), str::to_owned),
+    )
+    .unwrap();
+    backend
+        .register_cloned_repository(&ClonedRepository {
+            full_name: "owner/cached".to_owned(),
+            clone_url: url.to_owned(),
+            branch: Some(branch.clone()),
+            last_used_at: Timestamp::from_unix_millis(1),
+        })
+        .unwrap();
+    let session_id = cached_clone_session(&connection, "Cached clone");
+
+    CachedCloneFixture {
+        temp,
+        source,
+        origin,
+        branch,
+        url: url.to_owned(),
+        mirror,
+        backend,
+        connection,
+        session_id,
+    }
+}
+
+impl CachedCloneFixture {
+    /// Revision the mirror's own head points at, which is the tip a checkout
+    /// cloned from the mirror starts at.
+    fn mirror_revision(&self) -> String {
+        git_output(&self.mirror, &["rev-parse", "HEAD"])
+    }
+
+    /// Commits one more file on the bare origin through a second clone, so the
+    /// remote advances after the mirror was created, without any network access.
+    fn advance_origin(&self) -> String {
+        let work = self.temp.join("upstream");
+        git_in(
+            &self.temp,
+            &[
+                "clone",
+                "-q",
+                self.origin.to_str().unwrap(),
+                work.to_str().unwrap(),
+            ],
+        );
+        commit_file(
+            &work,
+            "upstream.txt",
+            "upstream change\n",
+            "upstream change",
+        );
+        git_in(&work, &["push", "-q", "origin", &self.branch]);
+        git_output(&work, &["rev-parse", "HEAD"])
+    }
+
+    fn checkout(&self, path: &str) -> PathBuf {
+        self.connection
+            .session_filesystem(self.session_id)
+            .unwrap()
+            .root()
+            .join(path)
+    }
+
+    fn recorded_refresh(&self) -> Option<CachedMirrorRefresh> {
+        self.backend.mirror_refresh(&self.url).unwrap()
+    }
+
+    fn shutdown(self) {
+        self.backend.shutdown().unwrap();
+        fs::remove_dir_all(&self.temp).unwrap();
+        fs::remove_dir_all(&self.source).unwrap();
+        let _ = fs::remove_dir_all(&self.mirror);
+    }
+}
+
+#[test]
+fn reusing_a_cached_clone_refreshes_the_mirror_before_the_checkout_is_created() {
+    let fixture = cached_clone_fixture("https://github.com/owner/cached.git", None);
+    let frozen = fixture.mirror_revision();
+    // The remote advances after the mirror was created, which is exactly the tip
+    // a frozen mirror would hand to this session.
+    let advanced = fixture.advance_origin();
+    assert_ne!(advanced, frozen);
+
+    let repository = attach_cached_clone(
+        &fixture.connection,
+        fixture.session_id,
+        &fixture.url,
+        "repo",
+        None,
+    )
+    .expect("reusing a mirror should attach the session repository");
+
+    assert_eq!(
+        repository.revision.as_deref(),
+        Some(advanced.as_str()),
+        "the checkout should start from the refreshed tip"
+    );
+    assert_eq!(
+        git_output(&fixture.checkout("repo"), &["rev-parse", "HEAD"]),
+        advanced
+    );
+    // The mirror itself moved too, so the next session does not fall back to the
+    // tip the mirror was created from either.
+    assert_eq!(fixture.mirror_revision(), advanced);
+
+    let recorded = fixture
+        .recorded_refresh()
+        .expect("a successful refresh is recorded beside the mirror");
+    assert_eq!(recorded.revision.as_deref(), Some(advanced.as_str()));
+    assert_eq!(
+        recorded.default_branch.as_deref(),
+        Some(fixture.branch.as_str())
+    );
+    assert!(
+        recorded.age_millis(Timestamp::now()) < 60_000,
+        "the recorded refresh should be the one this attach performed"
+    );
+
+    fixture.shutdown();
+}
+
+#[test]
+fn a_failed_mirror_refresh_still_attaches_and_reports_unknown_freshness() {
+    let fixture = cached_clone_fixture(
+        "https://github.com/owner/cached.git",
+        Some("/nonexistent/loom-origin"),
+    );
+    let frozen = fixture.mirror_revision();
+
+    // A revision the mirror already holds, so a refresh that did not run still
+    // leaves the mirror usable.
+    let repository = attach_cached_clone(
+        &fixture.connection,
+        fixture.session_id,
+        &fixture.url,
+        "repo",
+        Some(&frozen),
+    )
+    .expect("an unreachable mirror remote must not fail the attach");
+    assert_eq!(repository.revision.as_deref(), Some(frozen.as_str()));
+
+    // A refresh that failed records no freshness, so nothing claims the mirror's
+    // cached tip is the current upstream tip.
+    assert_eq!(fixture.recorded_refresh(), None);
+    let resolved = fixture
+        .connection
+        .resolve_reusable_mirror(&fixture.url, "cached", None)
+        .unwrap()
+        .expect("the mirror is still reusable");
+    assert!(resolved.freshness.is_unknown());
+    assert!(
+        resolved
+            .freshness
+            .summary(Timestamp::now())
+            .contains("reused, freshness unknown"),
+        "{resolved:?}"
+    );
+
+    fixture.shutdown();
+}
+
+#[test]
+fn a_stale_cached_mirror_is_not_reused_for_the_next_session() {
+    let source = git_repository();
+    let branch = git_output(&source, &["branch", "--show-current"]);
+    let url = source.display().to_string();
+
+    let backend = InProcessBackend::new();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let mirror = backend.repository_mirror_path(&url).unwrap();
+    GitService::create_mirror(&source, &mirror, "/nonexistent/loom-origin").unwrap();
+    let frozen = git_output(&mirror, &["rev-parse", "HEAD"]);
+    // The mirror is recorded as last refreshed beyond the reuse limit.
+    let stale = Timestamp::from_unix_millis(
+        Timestamp::now()
+            .as_unix_millis()
+            .saturating_sub(25 * 60 * 60 * 1000),
+    );
+    backend
+        .record_mirror_refresh(&CachedMirrorRefresh {
+            clone_url: url.clone(),
+            refreshed_at: stale,
+            default_branch: Some(branch.clone()),
+            revision: Some(frozen.clone()),
+        })
+        .unwrap();
+    backend
+        .register_cloned_repository(&ClonedRepository {
+            full_name: "cached".to_owned(),
+            clone_url: url.clone(),
+            branch: Some(branch),
+            last_used_at: stale,
+        })
+        .unwrap();
+    // The repository advances after the mirror was created, so a checkout cloned
+    // from the mirror would start from the older tip.
+    commit_file(&source, "later.txt", "later\n", "later change");
+    let advanced = git_output(&source, &["rev-parse", "HEAD"]);
+    assert_ne!(advanced, frozen);
+    let session_id = cached_clone_session(&connection, "Stale clone");
+
+    let repository = attach_cached_clone(&connection, session_id, &url, "repo", None)
+        .expect("the attach should clone from the source instead");
+
+    assert_eq!(repository.revision.as_deref(), Some(advanced.as_str()));
+    let checkout = connection
+        .session_filesystem(session_id)
+        .unwrap()
+        .root()
+        .join("repo");
+    assert_eq!(git_output(&checkout, &["rev-parse", "HEAD"]), advanced);
+    // The stale mirror was not used, so its record still describes the refresh
+    // that happened a day and an hour ago: the refresh this attach runs for the
+    // mirror itself cannot reach its origin either.
+    assert_eq!(
+        backend.mirror_refresh(&url).unwrap().unwrap().refreshed_at,
+        stale
+    );
+
+    backend.shutdown().unwrap();
+    fs::remove_dir_all(&source).unwrap();
+    let _ = fs::remove_dir_all(&mirror);
+}
