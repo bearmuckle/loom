@@ -546,6 +546,28 @@ impl InProcessConnection {
         worktree.status = ProjectWorktreeStatus::CleanupPending;
         self.save_project_worktree_state(&worktree)?;
         let force = disposition == ProjectWorktreeCleanupDisposition::DiscardChanges;
+        // A forced removal discards whatever the checkout still holds, which must
+        // not be silent: the removed record is the last place a manager can see
+        // that this work existed and was thrown away. The record's note field is
+        // used for that, exactly as the abandon path records what it left behind.
+        // A checkout that cannot be inspected is only logged, because an
+        // unreadable or already removed path leaves nothing to report.
+        let discarded = if force {
+            match project_child_worktree_status(&self.backend, &worktree) {
+                Ok(status) if !status.clean => Some(status),
+                Ok(_) => None,
+                Err(error) => {
+                    log::warn!(
+                        "project child worktree '{}' could not be inspected before discarding its changes: {}",
+                        worktree.worktree_name,
+                        error.message
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         if let Err(error) = self
             .backend
             .remove_project_worktree_checkout(&worktree, force)
@@ -556,7 +578,24 @@ impl InProcessConnection {
             return Err(error);
         }
         worktree.status = ProjectWorktreeStatus::Removed;
-        worktree.error = None;
+        worktree.error = discarded.map(|status| {
+            let additions = status
+                .files
+                .iter()
+                .map(|file| file.index_additions.saturating_add(file.worktree_additions))
+                .fold(0, u32::saturating_add);
+            let deletions = status
+                .files
+                .iter()
+                .map(|file| file.index_deletions.saturating_add(file.worktree_deletions))
+                .fold(0, u32::saturating_add);
+            format!(
+                "the manager discarded this checkout, so its {} uncommitted path(s) ({} added, {} removed line(s)) will not be landed",
+                status.files.len(),
+                additions,
+                deletions
+            )
+        });
         worktree.updated_at = Timestamp::now();
         persistence.save_project_worktree(&worktree)?;
         self.backend.journal()?.append_server_event(

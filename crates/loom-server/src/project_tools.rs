@@ -179,7 +179,7 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_control_children {
             definitions.push(ToolDefinition {
                 name: "control_project_child".to_owned(),
-                description: "Continue a paused child, retry its most recent failed tool step, cancel a live child, or abandon a finished child whose result you will not land. Address children only by delegated task_id. Retry does not restart an entire task. Abandon closes a finished child as failed, reports any uncommitted paths it left in its checkout, and releases the completion guard for that child; the checkout is preserved for inspection.".to_owned(),
+                description: "Continue a paused child, retry a failed child run, cancel a live child, or abandon a finished child whose work you will not land. Address children only by delegated task_id. Retry re-runs the failed tool step when a tool step is what failed; when the model or provider call is what failed there is no step to re-run, so the run resumes from its checkpoint and the child can finish and commit the work its checkout already holds. Abandon closes a finished child as failed, reports any uncommitted paths it left in its checkout, states that this work will not be landed, and releases the completion guard for that child; the checkout is preserved for inspection.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -429,8 +429,78 @@ impl ToolExtension for ProjectAgentTools {
     }
 }
 
+/// Live state of one finished code child's checkout, as the manager listing
+/// reports it.
+///
+/// The listing is where a manager decides whether to retry, land, or abandon a
+/// finished child, so the work that child left in its checkout has to be visible
+/// there instead of only by opening the worktree path.
+struct ProjectChildCheckoutState {
+    uncommitted_paths: u32,
+    additions: u32,
+    deletions: u32,
+    /// Whether the checkout is still on the revision it was created from, so it
+    /// holds no commit of its own yet.
+    head_is_base: bool,
+}
+
 impl ProjectAgentTools {
-    /// Reports whether the reviewed child result is contained in the parent
+    /// Reads the reportable state from a live checkout status.
+    fn project_child_checkout_state_from_status(
+        status: &loom_vcs::GitRepositoryStatus,
+        base_revision: &str,
+    ) -> ProjectChildCheckoutState {
+        ProjectChildCheckoutState {
+            uncommitted_paths: u32::try_from(status.files.len()).unwrap_or(u32::MAX),
+            additions: status
+                .files
+                .iter()
+                .map(|file| file.index_additions.saturating_add(file.worktree_additions))
+                .fold(0, u32::saturating_add),
+            deletions: status
+                .files
+                .iter()
+                .map(|file| file.index_deletions.saturating_add(file.worktree_deletions))
+                .fold(0, u32::saturating_add),
+            head_is_base: status.head.as_deref() == Some(base_revision),
+        }
+    }
+
+    /// Inspects one code child's checkout for the manager listing.
+    ///
+    /// Only a terminal task's checkout is inspected: a live child's checkout is
+    /// still moving, so a count taken now would change on its next turn and say
+    /// nothing the manager can act on. A checkout that is already removed or
+    /// being removed holds nothing to report. An inspection failure is returned
+    /// so the caller can report it rather than claim the checkout is clean.
+    fn inspect_project_child_checkout(
+        &self,
+        worktree: &ProjectWorktreeRecord,
+        task_terminal: bool,
+    ) -> Result<Option<ProjectChildCheckoutState>> {
+        if !task_terminal
+            || matches!(
+                worktree.status,
+                ProjectWorktreeStatus::Removed | ProjectWorktreeStatus::CleanupPending
+            )
+        {
+            return Ok(None);
+        }
+        let backend = self.backend.upgrade().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "project backend is no longer available",
+                true,
+            )
+        })?;
+        let status = project_child_worktree_status(&backend, worktree)?;
+        Ok(Some(Self::project_child_checkout_state_from_status(
+            &status,
+            &worktree.base_revision,
+        )))
+    }
+
+    /// Reports whether the reviewed result revision is contained in the parent
     /// revision recorded for the child's integration.
     ///
     /// Integration records the parent revision after integration, not
@@ -924,6 +994,28 @@ impl ProjectAgentTools {
                 },
                 None => None,
             };
+            // A finished code child's checkout is where its work still exists
+            // when its run failed mid-flight, so the listing states that the work
+            // is there instead of making the manager open a worktree path. A
+            // checkout that cannot be inspected is reported as such rather than
+            // claiming that the child left nothing behind.
+            let (checkout_state, worktree_note) = match worktree.as_ref() {
+                Some(worktree) => {
+                    let task_terminal =
+                        task.is_some_and(|task| delegated_task_is_terminal(task.status));
+                    match self.inspect_project_child_checkout(worktree, task_terminal) {
+                        Ok(state) => (state, None),
+                        Err(error) => (
+                            None,
+                            Some(format!(
+                                "the child checkout could not be inspected: {}",
+                                error.message
+                            )),
+                        ),
+                    }
+                }
+                None => (None, None),
+            };
             // A completed child's result is durable whether or not it ever
             // reached this manager, so every child entry reports the stored
             // result and its delivery state. Selecting one task returns the whole
@@ -967,6 +1059,14 @@ impl ProjectAgentTools {
                 "run_summary": run.as_ref().and_then(|summary| summary.snapshot.summary.as_ref()).map(|summary| summary.chars().take(256).collect::<String>()),
                 "worktree_status": worktree.as_ref().map(|worktree| worktree.status),
                 "result_revision": worktree.as_ref().and_then(|worktree| worktree.result_revision.clone()),
+                "result_revision_is_base": worktree.as_ref().map(|worktree| worktree.result_revision.as_deref().is_none_or(|revision| revision == worktree.base_revision)),
+                "worktree_uncommitted_path_count": checkout_state.as_ref().map(|state| state.uncommitted_paths),
+                "worktree_uncommitted_line_delta": checkout_state.as_ref().map(|state| serde_json::json!({
+                    "additions": state.additions,
+                    "deletions": state.deletions,
+                })),
+                "worktree_head_is_base": checkout_state.as_ref().map(|state| state.head_is_base),
+                "worktree_note": worktree_note,
                 "result_state": result_state.map(|state| state.as_str()),
                 "result_message_id": delivery.as_ref().and_then(|(_, delivery)| delivery.message.as_ref()).map(|message| message.message_id),
                 "result_project_sequence": delivery.as_ref().and_then(|(_, delivery)| delivery.message.as_ref()).map(|message| message.project_sequence),
@@ -1000,7 +1100,7 @@ impl ProjectAgentTools {
             output: serde_json::to_string(&serde_json::json!({
                 "children": children,
                 "truncated": truncated,
-                "note": "result_state reports whether each child's stored result reached this session: delivered, undelivered (accepted for delivery but not yet in your transcript), missing (a finished child never reported a result), or pending. undelivered_messages counts the durable inbox messages the child has not read yet, so a message you sent that still waits is distinguishable from one the child consumed. Pass a child's task_id to return its whole stored result."
+                "note": "result_state reports whether each child's stored result reached this session: delivered, undelivered (accepted for delivery but not yet in your transcript), missing (a finished child never reported a result), or pending. undelivered_messages counts the durable inbox messages the child has not read yet, so a message you sent that still waits is distinguishable from one the child consumed. For a finished code child, worktree_uncommitted_path_count and worktree_uncommitted_line_delta report what its checkout still holds uncommitted, worktree_head_is_base says whether that checkout has no commit of its own yet, and result_revision_is_base says whether no reviewed result revision other than its base has been recorded. Work that is never reviewed and integrated, or abandoned, is not landed. Pass a child's task_id to return its whole stored result."
             }))
             .unwrap_or_else(|error| format!("could not encode project child status: {error}")),
         }
@@ -1035,11 +1135,12 @@ impl ProjectAgentTools {
                     "run_summary": outcome.run.as_ref().and_then(|snapshot| snapshot.summary.clone()),
                 });
                 if arguments.action == ProjectChildControlAction::Abandon {
-                    // The outcome names what the manager left behind, so a closed
-                    // child with uncommitted work is actionable rather than silent.
+                    // The outcome names what the manager left behind and says
+                    // that it stays behind, so a closed child with uncommitted
+                    // work is actionable rather than silent.
                     output["uncommitted_paths"] = serde_json::json!(outcome.uncommitted_paths);
                     output["note"] = serde_json::json!(
-                        "The completed child was closed as failed; its checkout is preserved with these uncommitted paths, and the completion guard no longer requires this result."
+                        "The child was closed as failed without landing its work, so these uncommitted paths will not be integrated; its checkout is preserved for inspection and the completion guard no longer requires this result."
                     );
                 }
                 ToolResult {

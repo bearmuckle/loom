@@ -218,6 +218,19 @@ impl InProcessConnection {
                 })?;
                 match snapshot.state {
                     AgentRunState::Failed => {
+                        // One rule per failure case: a failure that recorded a
+                        // failed tool step is retried at that step, while a
+                        // failure that recorded none failed at the model or
+                        // provider call (or a run limit), where there is no step
+                        // to re-run and the run is resumed from its checkpoint
+                        // instead. `continue` keeps refusing a finished run, so
+                        // this is the only supported way to resume one; without it
+                        // a provider failure would strand the work its checkout
+                        // already holds until the manager abandons that work.
+                        let has_failed_tool_step = persistence
+                            .load_run_execution_state(snapshot.id)?
+                            .and_then(|state| state.last_failed_call)
+                            .is_some();
                         let workspace_id = self
                             .backend
                             .sessions()?
@@ -253,7 +266,10 @@ impl InProcessConnection {
                                 "project agent concurrency limit reached; the child remains failed",
                             ));
                         }
-                        let response = self.continue_run(snapshot.id, AgentRuntime::retry_entry)?;
+                        let response = self.continue_run(
+                            snapshot.id,
+                            project_child_retry_entry(has_failed_tool_step),
+                        )?;
                         let ServerResponse::Run(RunResponse::AgentRun(snapshot)) = response else {
                             return Err(LoomError::new(
                                 ErrorCode::Internal,
@@ -278,7 +294,7 @@ impl InProcessConnection {
                     | AgentRunState::Cancelled => {
                         return Err(LoomError::new(
                             ErrorCode::InvalidState,
-                            "retry_failed_step requires a failed run with a retryable tool step",
+                            "retry_failed_step requires a failed child run",
                             false,
                         ));
                     }
@@ -301,7 +317,7 @@ impl InProcessConnection {
         })
     }
 
-    /// Closes a finished direct child task without landing its result.
+    /// Closes a finished direct child task without landing its work.
     ///
     /// A code child that ends its run with uncommitted files has no committed
     /// revision to review or integrate, and every other control action refuses a
@@ -309,6 +325,10 @@ impl InProcessConnection {
     /// its completion guard. Abandoning records the live uncommitted paths on the
     /// worktree record, marks the task failed, and leaves the checkout in place
     /// for a later inspection or cleanup.
+    ///
+    /// The record and the note it writes say that this work will not be landed
+    /// and will not be integrated, so a closed child is never mistaken for one
+    /// whose result reached the parent.
     ///
     /// Returns the uncommitted paths it recorded. A task that is already closed
     /// is left as it is, so a retried request reports the same outcome.
@@ -353,17 +373,16 @@ impl InProcessConnection {
                     uncommitted_paths.sort();
                     uncommitted_paths.dedup();
                     if uncommitted_paths.is_empty() {
-                        "the manager abandoned this completed child without integrating it"
-                            .to_owned()
+                        "the manager abandoned this child without landing its work, so nothing in its checkout will be integrated".to_owned()
                     } else {
                         format!(
-                            "the manager abandoned this completed child without integrating it; uncommitted paths: {}",
+                            "the manager abandoned this child without landing its work, so these uncommitted paths will not be integrated: {}",
                             uncommitted_paths.join(", ")
                         )
                     }
                 }
                 Err(error) => format!(
-                    "the manager abandoned this completed child without integrating it; its checkout could not be inspected: {}",
+                    "the manager abandoned this child without landing its work; its checkout could not be inspected: {}",
                     error.message
                 ),
             };
@@ -732,6 +751,28 @@ impl InProcessConnection {
     }
 }
 
+/// The runtime entry a failed child run is retried through.
+type ProjectChildRetryEntry = fn(&mut AgentRuntime) -> Result<RunProgress>;
+
+/// Chooses the retry entry for one failed child run, one rule per failure case.
+///
+/// A failure that recorded a failed tool step is retried at that step, because
+/// re-running it is exactly the work that failed. A failure that recorded no
+/// tool step failed at the model or provider call (or at a run limit) instead,
+/// where there is no step to re-run: that run is resumed from its checkpoint, so
+/// the child can finish its task and commit the work its checkout already holds.
+/// Refusing a finished run stays the rule for `continue`; the point of this
+/// choice is that a finished run's written work remains reachable through the
+/// surface, because its worktree cannot be reviewed or integrated while nothing
+/// in it is committed.
+fn project_child_retry_entry(has_failed_tool_step: bool) -> ProjectChildRetryEntry {
+    if has_failed_tool_step {
+        AgentRuntime::retry_entry
+    } else {
+        AgentRuntime::checkpoint_retry_entry
+    }
+}
+
 /// Atomically decrements a positive test failpoint counter, returning whether
 /// the decrement consumed the last count.
 ///
@@ -757,8 +798,29 @@ fn consume_project_cancellation_failpoint(failpoint: &AtomicUsize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::consume_project_cancellation_failpoint;
+    use super::{consume_project_cancellation_failpoint, project_child_retry_entry};
+    use crate::{AgentRuntime, RunProgress};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The chosen entry of a failure case, comparable across the two function
+    /// items because both share one signature.
+    fn entry_address(entry: fn(&mut AgentRuntime) -> loom_core::Result<RunProgress>) -> usize {
+        entry as usize
+    }
+
+    #[test]
+    fn a_failed_step_is_retried_and_a_provider_failure_resumes_from_its_checkpoint() {
+        assert_eq!(
+            entry_address(project_child_retry_entry(true)),
+            entry_address(AgentRuntime::retry_entry),
+            "a recorded failed tool step is retried at that step"
+        );
+        assert_eq!(
+            entry_address(project_child_retry_entry(false)),
+            entry_address(AgentRuntime::checkpoint_retry_entry),
+            "a failure with no failed tool step resumes the run from its checkpoint"
+        );
+    }
 
     #[test]
     fn failpoint_consumption_reports_the_last_count() {

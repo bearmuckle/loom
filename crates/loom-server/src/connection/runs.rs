@@ -585,7 +585,7 @@ impl InProcessConnection {
                     instructions.push_str(" Use `list_project_children` to check direct-child state and task status before deciding whether to redirect, retry, or report completion.");
                 }
                 if input.options.project_child_control_enabled {
-                    instructions.push_str(" Use `control_project_child` with a child task_id to continue a paused child, retry its failed tool step, or cancel it. Retry only repeats the failed tool step; it does not start a fresh task attempt.");
+                    instructions.push_str(" Use `control_project_child` with a child task_id to continue a paused child, retry a failed child run, or cancel it. A retry re-runs the failed tool step when a tool step is what failed; when the model or provider call is what failed there is no step to re-run, so the run resumes from its checkpoint and the child can finish and commit the work its checkout already holds, which the review and integration path then lands.");
                 }
                 instructions
             } else {

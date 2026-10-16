@@ -28,25 +28,7 @@ fn a_finished_code_child_with_uncommitted_work_can_be_abandoned() {
         "the guard should name the manager's escape: {blocker}"
     );
 
-    let extension = fixture
-        .backend
-        .project_agent_tools(
-            fixture.root_id,
-            ModelId::new("deterministic/demo"),
-            ProjectAgentToolGrants {
-                child_control: true,
-                ..ProjectAgentToolGrants::default()
-            },
-        )
-        .unwrap()
-        .expect("manager child control tools");
-    let tools = ToolExecutor::new_with_workspace(
-        fixture
-            .connection
-            .session_filesystem(fixture.root_id)
-            .unwrap(),
-    )
-    .with_extension(extension);
+    let tools = code_child_manager_tools(&fixture);
     let abandon = tools.execute(&ToolCall {
         id: ToolCallId::new(),
         name: "control_project_child".to_owned(),
@@ -62,6 +44,13 @@ fn a_finished_code_child_with_uncommitted_work_can_be_abandoned() {
         abandon["uncommitted_paths"],
         serde_json::json!(["uncommitted.txt"]),
         "the outcome must name what the manager left behind"
+    );
+    assert!(
+        abandon["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("without landing its work")),
+        "the outcome must say the work will not be landed: {}",
+        abandon["note"]
     );
 
     // The task is closed, the guard no longer holds, and the uncommitted work is
@@ -84,8 +73,9 @@ fn a_finished_code_child_with_uncommitted_work_can_be_abandoned() {
         worktree
             .error
             .as_deref()
-            .is_some_and(|error| error.contains("uncommitted.txt")),
-        "the abandonment should be recorded with its uncommitted paths"
+            .is_some_and(|error| error.contains("uncommitted.txt")
+                && error.contains("will not be integrated")),
+        "the abandonment should be recorded with its uncommitted paths and state that they will not be landed"
     );
     assert_eq!(
         completion_guard.completion_blocker(),
@@ -1691,4 +1681,507 @@ fn read_only_child_receives_an_isolated_checkout() {
     drop(backend);
     fs::remove_dir_all(temp).unwrap();
     fs::remove_dir_all(source).unwrap();
+}
+
+#[test]
+fn a_provider_failed_code_child_resumes_and_its_work_is_landed() {
+    let temp = workspace();
+    let source = git_repository();
+    let mut model = ScriptedOpenAiEndpoint::start();
+    let model_endpoint = model.endpoint.clone();
+    let model_id = ModelId::new("fixture/provider-failed-child-recovery");
+    let backend = InProcessBackend::with_provider_registry_persistent(
+        scripted_project_provider_registry(&model_endpoint, model_id.clone()),
+        temp.join("state.sqlite"),
+    )
+    .unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace_record = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Provider-failed child recovery".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let root = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace_record.id,
+                name: "Manager".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    let parent_repository = match connection
+        .request(RequestEnvelope::new(ClientRequest::Repository(
+            RepositoryRequest::AttachSessionRepository {
+                session_id: root,
+                source: source.display().to_string(),
+                path: "repo".to_owned(),
+                revision: None,
+                reuse_local: false,
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(repository)) => {
+            repository
+        }
+        response => panic!("unexpected repository response: {response:?}"),
+    };
+    let parent_git = connection.session_git(root, parent_repository.id).unwrap();
+    let base_revision = parent_git.status().unwrap().head.unwrap();
+
+    let (task, child) = match connection
+        .create_project_child(
+            RequestId::new(),
+            root,
+            "recovering-code-child".to_owned(),
+            loom_core::DelegatedTaskSpec {
+                intent: "Write the change and commit it.".to_owned(),
+                model_id: model_id.as_str().to_owned(),
+                context_references: vec![],
+                dependencies: vec![],
+                code_change: true,
+                permissions: loom_core::ProjectAgentPermissions::default(),
+            },
+        )
+        .unwrap()
+    {
+        ServerResponse::Project(ProjectResponse::ProjectChildCreated { task, child }) => {
+            (*task, child)
+        }
+        response => panic!("unexpected child creation response: {response:?}"),
+    };
+    let persistence = backend.persistence.as_ref().unwrap();
+    let worktree = persistence
+        .load_project_worktree_by_task(task.task_id)
+        .unwrap()
+        .expect("a code child should have a durable worktree");
+    assert_eq!(worktree.status, ProjectWorktreeStatus::Ready);
+    assert_eq!(worktree.base_revision, base_revision);
+    let child_checkout = connection
+        .session_filesystem(child.session_id)
+        .unwrap()
+        .root()
+        .join(&worktree.relative_path);
+    let child_run_id = persistence
+        .load_latest_run_summary_for_session(child.session_id)
+        .unwrap()
+        .expect("the code child should have a durable run")
+        .snapshot
+        .id;
+
+    // The child wrote its change and then failed at the provider mid-flight, so
+    // its work is complete but uncommitted while its run is finished.
+    fs::write(child_checkout.join("recovered.txt"), "recovered work\n").unwrap();
+    fs::write(child_checkout.join("README.md"), "recovered change\n").unwrap();
+    let failing_turn = model.next_for_child();
+    model.respond_with_failure(failing_turn, 400, "deepseek transport failed");
+    assert_eq!(
+        await_settled_run(&connection, child_run_id).state,
+        AgentRunState::Failed
+    );
+    let failed_task = persistence
+        .load_delegated_task(task.task_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed_task.status, loom_core::DelegatedTaskStatus::Failed);
+
+    // The manager's own listing names the unlanded work, so the manager does not
+    // have to open the worktree path to learn that it exists.
+    let extension = backend
+        .project_agent_tools(
+            root,
+            model_id.clone(),
+            ProjectAgentToolGrants {
+                inspection: true,
+                child_control: true,
+                review: true,
+                integration: true,
+                ..ProjectAgentToolGrants::default()
+            },
+        )
+        .unwrap()
+        .expect("manager project tools");
+    let tools = ToolExecutor::new_with_workspace(connection.session_filesystem(root).unwrap())
+        .with_extension(extension);
+    let listing = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "list_project_children".to_owned(),
+        arguments: serde_json::json!({}),
+    });
+    assert!(listing.success, "{}", listing.output);
+    let listing: serde_json::Value = serde_json::from_str(&listing.output).unwrap();
+    let listed = listing["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["task_id"] == serde_json::json!(task.task_id))
+        .expect("the failed child should be listed")
+        .clone();
+    assert_eq!(listed["task_status"], serde_json::json!("failed"));
+    assert_eq!(
+        listed["worktree_uncommitted_path_count"],
+        serde_json::json!(2)
+    );
+    assert_eq!(
+        listed["worktree_uncommitted_line_delta"],
+        serde_json::json!({"additions": 2, "deletions": 1}),
+        "the listing should report the size of the uncommitted change: {listed}"
+    );
+    assert_eq!(listed["worktree_head_is_base"], serde_json::json!(true));
+    assert_eq!(listed["result_revision_is_base"], serde_json::json!(true));
+
+    // Retrying the failed run resumes it from its checkpoint through the tool
+    // surface. The provider call is what failed, so there is no tool step to
+    // re-run, and refusing a finished run stays the rule for `continue`.
+    let retry = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "control_project_child".to_owned(),
+        arguments: serde_json::json!({
+            "task_id": task.task_id,
+            "action": "retry_failed_step",
+        }),
+    });
+    assert!(retry.success, "{}", retry.output);
+    let retry: serde_json::Value = serde_json::from_str(&retry.output).unwrap();
+    assert_eq!(retry["status"], serde_json::json!("running"));
+    assert!(
+        matches!(retry["run_state"].as_str(), Some("planning" | "executing")),
+        "the provider failure should resume the run instead of refusing it: {retry}"
+    );
+
+    // The resumed child commits the work its checkout already held and finishes
+    // its turn, exactly as a child that had not failed would.
+    let resumed_turn = model.next_for_child();
+    commit_file(
+        &child_checkout,
+        "recovered.txt",
+        "recovered work\n",
+        "fix: commit the recovered change",
+    );
+    git_in(&child_checkout, &["add", "--", "README.md"]);
+    git_in(
+        &child_checkout,
+        &["commit", "-qm", "fix: recover the rewritten readme"],
+    );
+    model.respond_with_text(resumed_turn, "The recovered change is committed.");
+    assert_eq!(
+        await_settled_run(&connection, child_run_id).state,
+        AgentRunState::Completed
+    );
+    let completed_status = {
+        let mut status = failed_task.status;
+        for _ in 0..1_000 {
+            status = persistence
+                .load_delegated_task(task.task_id)
+                .unwrap()
+                .unwrap()
+                .status;
+            if status == loom_core::DelegatedTaskStatus::Completed {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        status
+    };
+    assert_eq!(completed_status, loom_core::DelegatedTaskStatus::Completed);
+
+    // Review reports the recovered revision, and integration lands it, so the
+    // resumed child's work reaches the parent through the normal path.
+    let review = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "review_project_child".to_owned(),
+        arguments: serde_json::json!({"task_id": task.task_id}),
+    });
+    assert!(review.success, "{}", review.output);
+    let review: serde_json::Value = serde_json::from_str(&review.output).unwrap();
+    let reviewed_revision = review["data"]["worktree"]["result_revision"]
+        .as_str()
+        .expect("review should report the recovered revision")
+        .to_owned();
+    assert_ne!(reviewed_revision, base_revision);
+    let integration = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "integrate_project_child".to_owned(),
+        arguments: serde_json::json!({
+            "task_id": task.task_id,
+            "expected_parent_revision": base_revision,
+        }),
+    });
+    assert!(integration.success, "{}", integration.output);
+    assert_eq!(
+        fs::read_to_string(parent_git.root().join("recovered.txt")).unwrap(),
+        "recovered work\n"
+    );
+    assert_eq!(
+        fs::read_to_string(parent_git.root().join("README.md")).unwrap(),
+        "recovered change\n"
+    );
+
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    drop(model);
+    fs::remove_dir_all(temp).unwrap();
+    fs::remove_dir_all(source).unwrap();
+}
+
+#[test]
+fn discarding_a_dirty_child_worktree_reports_what_it_removed() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "committed.txt",
+        "committed\n",
+        "child commit",
+    );
+    fs::write(fixture.child_checkout.join("README.md"), "discarded\n").unwrap();
+    complete_project_code_child(&fixture);
+
+    let cleanup = fixture
+        .connection
+        .request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::CleanupProjectChildWorktree {
+                project_id: fixture.project_id,
+                manager_session_id: fixture.root_id,
+                task_id: fixture.task_id,
+                disposition: ProjectWorktreeCleanupDisposition::DiscardChanges,
+            },
+        )));
+    let ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(removed)) =
+        cleanup.result.unwrap()
+    else {
+        panic!("unexpected child cleanup response");
+    };
+    assert_eq!(removed.status, ProjectWorktreeStatus::Removed);
+    let note = removed
+        .error
+        .expect("a discarded dirty checkout must report what it removed");
+    assert!(note.contains("will not be landed"), "{note}");
+    // The committed path is not discarded, so only the modified path is named.
+    assert!(note.contains("1 uncommitted path(s)"), "{note}");
+    assert!(note.contains("(1 added, 1 removed line(s))"), "{note}");
+    assert!(!fixture.child_checkout.exists());
+    fixture.shutdown();
+}
+
+#[test]
+fn abandoning_a_clean_or_unreadable_checkout_reports_that_nothing_will_be_landed() {
+    // A child that committed its work but whose result the manager will not
+    // land: the report says so instead of only naming no paths.
+    let clean = project_code_child_fixture();
+    commit_file(&clean.child_checkout, "kept.txt", "kept\n", "child commit");
+    complete_project_code_child(&clean);
+    let abandon = code_child_manager_tools(&clean).execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "control_project_child".to_owned(),
+        arguments: serde_json::json!({
+            "task_id": clean.task_id,
+            "action": "abandon",
+        }),
+    });
+    assert!(abandon.success, "{}", abandon.output);
+    let abandon: serde_json::Value = serde_json::from_str(&abandon.output).unwrap();
+    assert_eq!(abandon["uncommitted_paths"], serde_json::json!([]));
+    assert!(
+        abandon["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("without landing its work")),
+        "a closed child must not read as landed: {}",
+        abandon["note"]
+    );
+    let worktree = integrated_worktree(&clean);
+    assert!(
+        worktree
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("without landing its work")
+                && error.contains("nothing in its checkout will be integrated")),
+        "the record must state that nothing from this child is integrated: {:?}",
+        worktree.error
+    );
+    clean.shutdown();
+
+    // A child whose checkout is already gone is closed the same way, with the
+    // missing checkout named rather than pretending it was inspected.
+    let missing = project_code_child_fixture();
+    complete_project_code_child(&missing);
+    fs::remove_dir_all(&missing.child_checkout).unwrap();
+    let abandon = code_child_manager_tools(&missing).execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "control_project_child".to_owned(),
+        arguments: serde_json::json!({
+            "task_id": missing.task_id,
+            "action": "abandon",
+        }),
+    });
+    assert!(abandon.success, "{}", abandon.output);
+    let abandon: serde_json::Value = serde_json::from_str(&abandon.output).unwrap();
+    assert_eq!(abandon["uncommitted_paths"], serde_json::json!([]));
+    let worktree = integrated_worktree(&missing);
+    assert!(
+        worktree
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("without landing its work")
+                && error.contains("could not be inspected")),
+        "an unreadable checkout must be reported instead of assumed clean: {:?}",
+        worktree.error
+    );
+    missing.shutdown();
+}
+
+#[test]
+fn listing_a_code_child_reports_its_checkout_state_only_for_a_finished_task() {
+    let fixture = project_code_child_fixture();
+    let tools = code_child_manager_tools(&fixture);
+    let listed_child = |tools: &ToolExecutor| {
+        let listing = tools.execute(&ToolCall {
+            id: ToolCallId::new(),
+            name: "list_project_children".to_owned(),
+            arguments: serde_json::json!({}),
+        });
+        assert!(listing.success, "{}", listing.output);
+        let listing: serde_json::Value = serde_json::from_str(&listing.output).unwrap();
+        listing["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["task_id"] == serde_json::json!(fixture.task_id))
+            .expect("the child should be listed")
+            .clone()
+    };
+
+    // A child that has not finished has a checkout that is still moving, so the
+    // listing says nothing about its uncommitted work.
+    fs::write(fixture.child_checkout.join("in-progress.txt"), "work\n").unwrap();
+    let live = listed_child(&tools);
+    assert_eq!(live["task_status"], serde_json::json!("queued"));
+    assert_eq!(
+        live["worktree_uncommitted_path_count"],
+        serde_json::Value::Null
+    );
+    assert_eq!(live["result_revision_is_base"], serde_json::json!(true));
+
+    // Once the task is terminal, the same listing reports the uncommitted path
+    // count, so the manager learns the work exists without opening the path.
+    complete_project_code_child(&fixture);
+    let finished = listed_child(&tools);
+    assert_eq!(
+        finished["worktree_uncommitted_path_count"],
+        serde_json::json!(1)
+    );
+    assert_eq!(finished["worktree_head_is_base"], serde_json::json!(true));
+    assert_eq!(finished["worktree_note"], serde_json::Value::Null);
+    fixture.shutdown();
+
+    // A checkout that cannot be inspected at all is reported as such instead of
+    // reading as clean.
+    let unreadable = project_code_child_fixture();
+    complete_project_code_child(&unreadable);
+    fs::remove_dir_all(&unreadable.child_checkout).unwrap();
+    let listed = code_child_manager_tools(&unreadable).execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "list_project_children".to_owned(),
+        arguments: serde_json::json!({}),
+    });
+    assert!(listed.success, "{}", listed.output);
+    let listed: serde_json::Value = serde_json::from_str(&listed.output).unwrap();
+    let child = listed["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["task_id"] == serde_json::json!(unreadable.task_id))
+        .expect("the child should be listed")
+        .clone();
+    assert_eq!(
+        child["worktree_uncommitted_path_count"],
+        serde_json::Value::Null
+    );
+    assert!(
+        child["worktree_note"]
+            .as_str()
+            .is_some_and(|note| note.contains("could not be inspected")),
+        "an unreadable checkout must be reported: {child}"
+    );
+    unreadable.shutdown();
+
+    // A removed checkout holds nothing to report.
+    let removed = project_code_child_fixture();
+    complete_project_code_child(&removed);
+    let cleanup = removed
+        .connection
+        .request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::CleanupProjectChildWorktree {
+                project_id: removed.project_id,
+                manager_session_id: removed.root_id,
+                task_id: removed.task_id,
+                disposition: ProjectWorktreeCleanupDisposition::RemoveClean,
+            },
+        )));
+    assert!(matches!(
+        cleanup.result,
+        Ok(ServerResponse::Project(
+            ProjectResponse::ProjectChildWorktreeUpdated(worktree)
+        )) if worktree.status == ProjectWorktreeStatus::Removed
+    ));
+    let listed = code_child_manager_tools(&removed).execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "list_project_children".to_owned(),
+        arguments: serde_json::json!({}),
+    });
+    assert!(listed.success, "{}", listed.output);
+    let listed: serde_json::Value = serde_json::from_str(&listed.output).unwrap();
+    let child = listed["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["task_id"] == serde_json::json!(removed.task_id))
+        .expect("the child should be listed")
+        .clone();
+    assert_eq!(child["worktree_status"], serde_json::json!("removed"));
+    assert_eq!(
+        child["worktree_uncommitted_path_count"],
+        serde_json::Value::Null
+    );
+    assert_eq!(child["worktree_note"], serde_json::Value::Null);
+    removed.shutdown();
+}
+
+/// The manager's child-control and inspection tools for one code child fixture,
+/// so a test acts through the same surface a manager uses.
+fn code_child_manager_tools(fixture: &ProjectCodeChildFixture) -> ToolExecutor {
+    let extension = fixture
+        .backend
+        .project_agent_tools(
+            fixture.root_id,
+            ModelId::new("deterministic/demo"),
+            ProjectAgentToolGrants {
+                inspection: true,
+                child_control: true,
+                ..ProjectAgentToolGrants::default()
+            },
+        )
+        .unwrap()
+        .expect("manager child control tools");
+    ToolExecutor::new_with_workspace(
+        fixture
+            .connection
+            .session_filesystem(fixture.root_id)
+            .unwrap(),
+    )
+    .with_extension(extension)
 }
