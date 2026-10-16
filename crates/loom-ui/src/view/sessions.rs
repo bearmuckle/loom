@@ -82,10 +82,17 @@ impl LoomView {
         let mut needs_transcript_page = false;
         let fallback_projection = match snapshot_result {
             Ok(ServerResponse::Session(SessionResponse::AgentSessionSnapshot(projection))) => {
-                needs_transcript_page = projection
-                    .active_run
-                    .as_ref()
-                    .is_some_and(|run| run.messages.is_empty());
+                // Any projection that carries a run is paged, whether or not it
+                // already holds messages: a snapshot carries the messages its
+                // live run handle knows, which is not necessarily the run's
+                // whole transcript.
+                needs_transcript_page = projection.active_run.is_some();
+                // The fallback snapshot carries the durable cursor, so the
+                // events request below stays bounded to what was journaled after
+                // it instead of asking for the whole retained journal.
+                if event_cursor.is_none() {
+                    event_cursor = Some(projection.latest_sequence);
+                }
                 self.active_session = projection.session.clone();
                 self.session_state = self.active_session.state;
                 self.auto_approve_actions = projection.auto_approve_actions;
@@ -446,6 +453,12 @@ impl LoomView {
                 Ok(ServerResponse::Session(SessionResponse::AgentSessionInitialState(initial))) => {
                     Some(initial.cursor)
                 }
+                // The snapshot fallback carries the durable cursor in
+                // `latest_sequence`, so the events request stays bounded to
+                // what was journaled after the projection was read.
+                Ok(ServerResponse::Session(SessionResponse::AgentSessionSnapshot(projection))) => {
+                    Some(projection.latest_sequence)
+                }
                 _ => None,
             };
             if let Ok(ServerResponse::Session(SessionResponse::AgentSessionInitialState(initial))) =
@@ -527,15 +540,26 @@ impl LoomView {
         if self.active_session.id != session_id {
             return;
         }
+        // A projection that carries a run is always paged. The old gate only
+        // paged a projection *without* messages, so a snapshot that carried the
+        // messages its live run handle knows was never paged: when the initial
+        // event batch was non-empty, the timeline stayed exactly that batch, and
+        // a window of one event showed as the whole conversation (GitHub issue
+        // #261).
         let needs_transcript_page = match &snapshot_response.result {
             Ok(ServerResponse::Session(SessionResponse::AgentSessionSnapshot(projection))) => {
-                projection
-                    .active_run
-                    .as_ref()
-                    .is_some_and(|run| run.messages.is_empty())
+                projection.active_run.is_some()
             }
             _ => false,
         };
+        let event_batch_len = match &events_response.result {
+            Ok(ServerResponse::Events(EventsResponse::SessionEvents { events, .. }))
+            | Ok(ServerResponse::Events(EventsResponse::SessionEventsSnapshot {
+                events, ..
+            })) => events.len(),
+            _ => 0,
+        };
+        let timeline_before = self.timeline.len();
         let fallback_projection = match snapshot_response.result {
             Ok(ServerResponse::Session(SessionResponse::AgentSessionSnapshot(projection))) => {
                 self.active_session = projection.session.clone();
@@ -571,6 +595,10 @@ impl LoomView {
         let fallback_latest_sequence = fallback_projection
             .as_ref()
             .map(|projection| projection.latest_sequence);
+        let fallback_message_count = fallback_projection
+            .as_ref()
+            .and_then(|projection| projection.active_run.as_ref())
+            .map_or(0, |run| run.messages.len());
         let fallback_run = fallback_projection
             .as_ref()
             .and_then(|projection| projection.active_run.clone());
@@ -613,6 +641,13 @@ impl LoomView {
                 )
             }
         }
+        // The reopen ladder's outcome, so a live deployment shows which durable
+        // half rebuilt the conversation and what the event window added to it.
+        log::info!(
+            "[loom-ui] reopen session {session_id}: {event_batch_len} events at cursor {request_cursor:?}, durable projection {fallback_latest_sequence:?} carrying {fallback_message_count} messages, transcript page needed {needs_transcript_page}, active run {:?}, timeline {timeline_before} -> {}",
+            self.active_run_id,
+            self.timeline.len()
+        );
         self.ensure_session_task_message(session_id);
         if needs_transcript_page && self.active_run_id.is_some() {
             self.begin_transcript_page(None, cx);

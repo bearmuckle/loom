@@ -1,13 +1,141 @@
-use super::{
-    TimelineItem, timeline_items_from_messages, tool_display_title, unseen_transcript_messages,
-};
+use super::*;
 use crate::state::AssistantPart;
+use gpui_kit::test::TestWindowExt;
+use gpui_kit::{TestAppContext, px, size};
 use loom_core::{ActivityId, RunId, Timestamp, ToolCallId};
 use loom_model::{MessageRole, ModelId, ModelMessage};
 use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, ToolResult,
 };
 use std::collections::BTreeSet;
+
+/// A durable run projection carrying `messages`, which is the shape a reopen's
+/// durable half has before it requests the newest transcript page.
+#[cfg(not(target_family = "wasm"))]
+fn durable_projection(
+    session_id: AgentSessionId,
+    run_id: RunId,
+    task: &str,
+    messages: Vec<ModelMessage>,
+) -> loom_protocol::AgentRunSnapshotProjection {
+    loom_protocol::AgentRunSnapshotProjection {
+        run: loom_protocol::AgentRunSnapshot {
+            id: run_id,
+            attempt_id: loom_core::RunAttemptId::new(),
+            control_revision: 0,
+            session_id,
+            task: task.to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            state: AgentRunState::Completed,
+            started_at: Timestamp::from_unix_millis(1),
+            updated_at: Timestamp::from_unix_millis(2),
+            completed_at: Some(Timestamp::from_unix_millis(2)),
+            summary: None,
+            evidence: Vec::new(),
+        },
+        plan: Vec::new(),
+        plan_progress: Default::default(),
+        messages,
+        message_timeline_ordinals: vec![0, 1],
+        pending_approval: None,
+        pending_input: None,
+        usage: Default::default(),
+        activities: Vec::new(),
+    }
+}
+
+/// The streamed text that arrives before the first transcript page must still be
+/// on the timeline after that page is applied.
+///
+/// A reopen applies the run's durable messages (or their streamed deltas) before
+/// it requests the newest page, and that page is read from the durable store,
+/// which can lag the messages the run's own projection already holds. Treating
+/// the first page as the whole message portion dropped the newer message for
+/// good, because the event cursor had already passed it (GitHub issue #261).
+#[cfg(not(target_family = "wasm"))]
+#[gpui_kit::test]
+fn a_delta_applied_before_the_first_page_survives_that_page(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        let session_id = view.active_session.id;
+        let run_id = RunId::new();
+        let task = "restore the session and keep the streamed answer".to_owned();
+        view.active_run_id = Some(run_id);
+        view.session_task_cache.insert(session_id, task.clone());
+        // The streamed fragment of the answer, journaled before the page is
+        // requested, which leaves the timeline non-empty.
+        const STREAMED: &str = "the recovered answer";
+        view.apply_event_batch(
+            vec![loom_protocol::ServerEventEnvelope {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                sequence: EventSequence::new(1),
+                session_id,
+                event: ServerEvent::Agent {
+                    event: AgentEvent::AssistantMessageDelta {
+                        run_id,
+                        message_id: 1,
+                        text: STREAMED.to_owned(),
+                    },
+                },
+            }],
+            None,
+        );
+        // The durable half of the reopen: the message itself, whose content
+        // carries the streamed fragment.
+        view.apply_run_projection(durable_projection(
+            session_id,
+            run_id,
+            &task,
+            vec![
+                ModelMessage::new(MessageRole::User, task.clone()),
+                ModelMessage::new(MessageRole::Assistant, format!("{STREAMED} is complete")),
+            ],
+        ));
+        let streamed_is_visible = |view: &LoomView| {
+            view.timeline.iter().any(|item| {
+                matches!(
+                    item,
+                    TimelineItem::Assistant(turn)
+                        if turn.parts.iter().any(|part| matches!(
+                            part,
+                            AssistantPart::Text(text) if text.contains(STREAMED)
+                        ))
+                )
+            })
+        };
+        assert!(
+            streamed_is_visible(&view),
+            "the durable projection dropped the streamed answer before the page: {:?}",
+            view.timeline
+        );
+
+        // The newest page, read before that message reached the durable store,
+        // so it only covers the older ordinal.
+        view.apply_transcript_page(
+            run_id,
+            None,
+            vec![(0, 0, ModelMessage::new(MessageRole::User, task.clone()))],
+            Some(0),
+            true,
+        );
+        assert!(
+            streamed_is_visible(&view),
+            "the first page dropped the streamed answer: {:?}",
+            view.timeline
+        );
+        let task_rows = view
+            .timeline
+            .iter()
+            .filter(|item| matches!(item, TimelineItem::User(text) if text == &task))
+            .count();
+        assert_eq!(task_rows, 1, "the first page duplicated the task row");
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
+}
+
 #[test]
 fn transcript_pages_merge_assistant_text_and_attach_tool_output() {
     let messages = vec![

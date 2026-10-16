@@ -241,6 +241,122 @@ fn reopening_a_session_with_a_concurrent_event_restores_durable_run_state(cx: &m
     });
 }
 
+/// A reopen whose durable half is the full session snapshot must keep the run's
+/// messages even though the snapshot already carries them.
+///
+/// `GetAgentSessionInitialState` answers `Conflict` while a session's journal
+/// moves, and both load ladders then fall back to `GetAgentSessionSnapshot`,
+/// which carries the messages a live run handle knows. The reopen used to
+/// request the transcript page only for a projection whose run carried *no*
+/// messages, so a non-empty event batch left the timeline at exactly the window
+/// the backend delivered: with a window of one event the conversation showed
+/// that single event, which is GitHub issue #261.
+#[cfg(not(target_family = "wasm"))]
+#[gpui_kit::test]
+fn reopening_from_a_snapshot_that_carries_messages_keeps_the_conversation(cx: &mut TestAppContext) {
+    const TASK: &str = "reopen from a snapshot that carries the transcript";
+    cx.update(gpui_kit::init);
+    let (backend, connection, session, protocol_version) = completed_demo_session(TASK);
+
+    // The fallback the reopen uses when the initial state is unavailable: the
+    // full session snapshot, which carries the run's messages.
+    let snapshot = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::GetAgentSessionSnapshot {
+            session_id: session.id,
+        },
+    )));
+    let projection = match snapshot.result {
+        Ok(ServerResponse::Session(SessionResponse::AgentSessionSnapshot(projection))) => {
+            projection
+        }
+        response => panic!("unexpected session snapshot response: {response:?}"),
+    };
+    let run = projection
+        .active_run
+        .clone()
+        .expect("a session that ran has an active run projection");
+    assert!(
+        !run.messages.is_empty(),
+        "the session snapshot carries the transcript the initial state omits"
+    );
+    let run_id = run.run.id;
+    // A single event journaled after the snapshot's cursor, so the batch leaves
+    // the timeline non-empty before the durable projection is applied.
+    let tail_delta = loom_protocol::ServerEventEnvelope {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        sequence: projection.latest_sequence.next(),
+        session_id: session.id,
+        event: ServerEvent::Agent {
+            event: AgentEvent::AssistantMessageDelta {
+                run_id,
+                message_id: 1,
+                text: "a delta that is the whole delivered window".to_owned(),
+            },
+        },
+    };
+
+    let view = open_selected_session_view(
+        cx,
+        backend,
+        connection,
+        session.clone(),
+        TASK,
+        protocol_version,
+    );
+    view.update(cx, |view, cx| {
+        view.finish_async_session_load(
+            session.id,
+            None,
+            ResponseEnvelope::success(
+                loom_core::RequestId::new(),
+                ServerResponse::Session(SessionResponse::AgentSessionSnapshot(Box::new(
+                    *projection,
+                ))),
+            ),
+            ResponseEnvelope::success(
+                loom_core::RequestId::new(),
+                ServerResponse::Events(EventsResponse::SessionEvents {
+                    events: vec![tail_delta],
+                    stream_epoch: None,
+                }),
+            ),
+            cx,
+        );
+    });
+    // Drains the transcript page the reopen must request for this projection.
+    cx.run_until_parked();
+
+    view.update(cx, |view, _| {
+        assert_eq!(view.active_run_id, Some(run_id));
+        assert!(
+            view.timeline
+                .iter()
+                .any(|item| matches!(item, TimelineItem::User(text) if text == TASK)),
+            "the reopened conversation is missing its task question: {:?}",
+            view.timeline
+        );
+        let assistant_text = view
+            .timeline
+            .iter()
+            .filter_map(|item| match item {
+                TimelineItem::Assistant(turn) => Some(turn),
+                _ => None,
+            })
+            .flat_map(|turn| turn.parts.clone())
+            .filter_map(|part| match part {
+                AssistantPart::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            assistant_text
+                .iter()
+                .any(|text| text.contains("The task is complete")),
+            "the reopened conversation collapsed to the delivered event window: {assistant_text:?}"
+        );
+    });
+}
+
 /// Starts a real backend with one workspace and one session whose
 /// `deterministic/demo` run has already finished, plus the protocol version a
 /// view on that backend is initialized with. The rebuild tests below differ

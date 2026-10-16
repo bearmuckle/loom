@@ -620,6 +620,30 @@ impl LoomView {
         if self.timeline.is_empty() {
             let timeline = timeline_items_from_messages(messages, activity_records.clone());
             self.timeline = timeline;
+        } else if !messages.is_empty() {
+            // The projection carries the run's durable messages, so it is
+            // authoritative for the message portion of the timeline exactly like
+            // the first transcript page: the non-message items the applied events
+            // produced stay in place and the durable messages are spliced in.
+            // Merging only the activities would leave the event window the
+            // rebuild applied as the whole conversation, which is how a reopened
+            // session collapsed to the events the backend happened to deliver
+            // (GitHub issue #261). Rebuilding from the projection keeps this
+            // stable if it runs twice.
+            log::warn!(
+                "durable projection with {} messages applied over a timeline of {} items",
+                messages.len(),
+                self.timeline.len()
+            );
+            self.timeline
+                .retain(|item| !matches!(item, TimelineItem::User(_) | TimelineItem::Assistant(_)));
+            let ordered_items = timeline_items_from_messages(
+                messages,
+                self.activity_records.values().cloned().collect(),
+            );
+            let insertion_index = self.transcript_insertion_index();
+            self.timeline
+                .splice(insertion_index..insertion_index, ordered_items);
         } else {
             for activity in &activity_records {
                 if let Some(part) = tool_part_from_activity(activity) {

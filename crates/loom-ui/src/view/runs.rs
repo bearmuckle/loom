@@ -338,8 +338,17 @@ impl LoomView {
             return;
         }
         if before_ordinal.is_none() {
-            self.transcript_loaded_ordinals.clear();
-            self.transcript_messages.clear();
+            // The first page is authoritative for the messages it carries, but
+            // not for newer durable messages that are already loaded: a run
+            // projection read before the page can hold messages the durable page
+            // read has not flushed yet, and the event cursor has already passed
+            // them, so dropping them here would lose them for good. Keep the
+            // ordinals the page does not cover and rebuild from the union.
+            let page_newest = messages.iter().map(|(ordinal, _, _)| *ordinal).max();
+            self.transcript_loaded_ordinals
+                .retain(|ordinal| page_newest.is_none_or(|newest| *ordinal > newest));
+            self.transcript_messages
+                .retain(|ordinal, _| page_newest.is_none_or(|newest| *ordinal > newest));
         }
         let messages = unseen_transcript_messages(messages, &mut self.transcript_loaded_ordinals);
         for (ordinal, timeline_ordinal, message) in &messages {
@@ -348,9 +357,10 @@ impl LoomView {
         }
         let before_len = self.timeline.len();
         if before_ordinal.is_none() {
-            // The first page is authoritative for the message portion of the
-            // transcript, so rebuild it from the loaded messages. Compute the
-            // insertion index after the retain: dropping the message portion can
+            // The first page replaces the message portion of the transcript with
+            // the messages loaded from it (and any newer durable message it does
+            // not cover yet), so rebuild that portion. Compute the insertion
+            // index after the retain: dropping the message portion can
             // empty the timeline, and an index derived from the pre-retain
             // first row would be out of bounds for the splice below.
             self.timeline
