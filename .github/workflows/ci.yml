@@ -1,5 +1,10 @@
 name: CI
 
+# Actions are pinned to a full commit SHA: a tag can be moved, and several jobs
+# here hold `id-token: write`/`attestations: write`. The trailing comment names
+# the version each SHA was resolved from, and `.github/dependabot.yml` keeps the
+# pins current.
+
 on:
   push:
     branches:
@@ -16,8 +21,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
       - name: Test browser entry point
@@ -28,8 +33,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt
       - name: Check formatting
@@ -44,8 +49,21 @@ jobs:
       # roughly double target/ size; disabling them avoids exhausting the
       # runner's disk on this dependency-heavy (GPUI/wgpu) workspace.
       CARGO_INCREMENTAL: "0"
+      # sccache keys every compilation unit by its inputs and flags, and its
+      # GitHub Actions backend persists those objects across runs, so the objects
+      # are reused by any build that asks for the same unit. That is what makes a
+      # coverage build affordable: `cargo llvm-cov` recompiles the whole
+      # dependency graph with `-C instrument-coverage` into its own target
+      # directory (target/llvm-cov-target), which `Swatinem/rust-cache` does not
+      # persist, so without sccache every coverage run rebuilds GPUI/wgpu (and the
+      # ~10 GB of instrumented artifacts) from scratch, while the objects this
+      # job's clippy and test builds produce are reused in return. The cache
+      # budget is shared with `rust-cache`; the stats step at the end of this job
+      # prints the hit rate so that trade-off can be measured.
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install native UI dependencies
         run: |
           sudo apt-get update
@@ -58,11 +76,13 @@ jobs:
             libxkbcommon-x11-dev
           # Loom UI links native desktop libraries; visual render tests are
           # optional local checks.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
+      - name: Configure sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
       - name: Run Clippy
@@ -79,6 +99,12 @@ jobs:
         # rather than assert thresholds, so this only keeps them compiling and
         # running instead of rotting.
         run: cargo bench -p loom-persistence -p loom-server --locked
+      # Printed even when an earlier step failed: a cold cache is one plausible
+      # reason for a slow or failed build, and the hit rate is what says whether
+      # the shared cache is paying for itself.
+      - name: Report the sccache hit rate
+        if: always()
+        run: sccache --show-stats
 
   msrv:
     runs-on: ubuntu-latest
@@ -87,7 +113,7 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install native UI build dependencies
         run: |
           # `cargo check` needs the headers and pkg-config files the client
@@ -102,10 +128,12 @@ jobs:
             libxkbcommon-dev \
             libxkbcommon-x11-dev
       # Pinned to the `rust-version` declared in the workspace manifest, so the
-      # claim is checked instead of being assumed to hold on stable.
-      - uses: dtolnay/rust-toolchain@1.99.0
+      # claim is checked instead of being assumed to hold on stable. The SHA is
+      # the head of the action's `1.99.0` branch, which is the branch that
+      # installs exactly that toolchain.
+      - uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Check the declared minimum supported Rust version
         run: cargo check --workspace --locked
 
@@ -119,14 +147,31 @@ jobs:
       RUSTC_BOOTSTRAP: "1"
       CARGO_INCREMENTAL: "0"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: wasm32-unknown-unknown
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # `pages.yml` publishes the browser client from `main` and has no
       # pre-merge counterpart, so this is the only check that the wasm target
       # still compiles before a merge.
       - name: Check the browser client for wasm32
         run: cargo check -p loom-ui --target wasm32-unknown-unknown --locked
+
+  deny:
+    # Dependency advisories, licences (see LICENSES.md), banned and duplicate
+    # crates and allowed sources, all configured in `deny.toml`. A violation
+    # fails this job.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # `--locked` so the checked graph is the lockfile the other jobs build,
+      # and `check` runs the advisories, bans, licences and sources checks.
+      # The action's image contains cargo-deny 0.20.2.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          arguments: --locked
+          command: check

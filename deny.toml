@@ -1,0 +1,115 @@
+# cargo-deny configuration: dependency advisories, licences, banned and
+# duplicate crates, and allowed sources for the workspace `Cargo.lock`.
+#
+# Run it locally with `cargo deny --locked check` (or `cargo deny list` to print
+# the licence of every crate in the graph). CI runs the same check in the
+# `deny` job of `.github/workflows/ci.yml`.
+
+[advisories]
+# The RustSec advisory database is fetched by cargo-deny itself; only the
+# failure policy is set here, so a new advisory fails the check.
+#
+# `unmaintained = "workspace"` fails for an unmaintained crate that a
+# workspace crate depends on directly, which is what `ttf-parser` and
+# `rustls-pemfile` are below. An unmaintained crate that is only reached
+# transitively is not considered: it follows from a toolkit's own choice and
+# would fail this check without an actionable fix. Unsoundness fails wherever it
+# is found.
+unmaintained = "workspace"
+unsound = "all"
+# A yanked crate must not reach a release: the lock has to be updated.
+yanked = "deny"
+# The advisories below are ones the current `Cargo.lock` cannot satisfy. Each is
+# ignored with the reason and with what clears it; cargo-deny warns when an
+# entry stops matching anything, which is the reminder to delete it.
+ignore = [
+    # `ttf-parser` is a direct dependency of `loom-ui` (and arrives again
+    # through `fontdb`/`rustybuzz` under gpui-kit). The advisory has no fixed
+    # version: the crate's author stopped maintaining it and points at
+    # `skrifa`, which the gpui toolkit does not use yet. Removing it means
+    # changing the client's dependencies, which is not part of this change.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser is pulled in by gpui-kit and has no fixed release" },
+    # `rustls-pemfile` is maintained upstream as `rustls-pki-types`'s
+    # `PemObject` trait, but it is still a direct dependency of `loom-server`
+    # and of `gpui-pre-reqwest`. Migrating is a source change.
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is used by loom-server; migrating to rustls-pki-types is a source change" },
+    # The four rustls advisories below are all fixed in rustls 0.23.46, which
+    # the workspace's `rustls = "0.23.45"` requirement already allows, so they
+    # are cleared by `cargo update -p rustls` rather than by any code change.
+    # They are ignored here only because this change is configuration-only and
+    # must not alter the locked dependency graph: remove each entry when the
+    # rustls bump lands.
+    { id = "RUSTSEC-2026-0346", reason = "fixed in rustls 0.23.46; needs `cargo update -p rustls`" },
+    { id = "RUSTSEC-2026-0347", reason = "fixed in rustls 0.23.46; needs `cargo update -p rustls`" },
+    { id = "RUSTSEC-2026-0348", reason = "fixed in rustls 0.23.46; needs `cargo update -p rustls`" },
+    { id = "RUSTSEC-2026-0349", reason = "fixed in rustls 0.23.46; needs `cargo update -p rustls`" },
+]
+
+[licenses]
+# See LICENSES.md: the applications and the crates that link them are
+# AGPL-3.0-only, and the foundational crates that do not depend on AGPL code are
+# GPL-3.0-only. Both are listed here because the workspace crates are part of the
+# graph this check walks.
+#
+# The remaining entries are the licences of the dependencies in `Cargo.lock`;
+# `cargo deny list` prints the same set. Anything outside this list is a new
+# licensing decision and must be an explicit change here.
+allow = [
+    "0BSD",
+    "AGPL-3.0-only",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "GPL-3.0-only",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+# When a crate declares no `license` field, cargo-deny reads its licence files
+# and treats a match below this confidence as no licence at all; an unlicensed
+# crate fails the check.
+confidence-threshold = 0.93
+exceptions = []
+
+[bans]
+# Duplicate versions are reported but are not fatal: this workspace carries
+# several majors of crates such as `windows-sys`, `getrandom`, `hashbrown` and
+# `itertools` transitively, and making that fatal would need a curated
+# `skip` list per crate and version. The report is printed by the `deny` job.
+multiple-versions = "warn"
+# Version wildcards are reported but are not fatal: the workspace's only
+# wildcards are its own `loom-*` path dependencies, which are declared without a
+# version because they are resolved from this tree and never from a registry.
+# cargo-deny would allow those outright only for private crates
+# (`allow-wildcard-paths` covers private crates and dev-dependencies), and the
+# workspace crates are publishable, so the report is printed instead.
+wildcards = "warn"
+allow-wildcard-paths = true
+deny = [
+    # TLS is rustls everywhere (`reqwest` and `tokio-tungstenite` are configured
+    # for it); a native TLS stack would arrive unnoticed through an indirect
+    # dependency.
+    { crate = "native-tls", reason = "the workspace uses rustls for TLS" },
+    # Superseded by `std::io::IsTerminal`; the workspace does not depend on it.
+    { crate = "atty", reason = "use std::io::IsTerminal instead" },
+    # Unmaintained YAML parsers: the workspace serialises with serde_json/toml.
+    { crate = "serde_yaml", reason = "unmaintained; use serde_json or toml" },
+    { crate = "yaml-rust", reason = "unmaintained; use serde_json or toml" },
+]
+skip = []
+skip-tree = []
+
+[sources]
+# Every crate in the lock comes from crates.io. Anything else has to be an
+# explicit decision, because a release attests provenance for these inputs.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

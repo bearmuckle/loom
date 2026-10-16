@@ -1,0 +1,34 @@
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # The GPUI/wgpu tree is large and updates arrive constantly; one grouped
+    # pull request for the compatible bumps keeps the review meaningful.
+    groups:
+      cargo-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Workflows pin actions to commit SHAs; Dependabot rewrites both the SHA and
+    # the trailing version comment, which is what keeps the pins from aging.
+    open-pull-requests-limit: 5
+
+  # The browser entry point and the build script have no dependencies yet
+  # (`scripts/*.mjs` run on Node's built-in test runner), so this entry only
+  # takes effect once an npm manifest is added.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

@@ -1,5 +1,10 @@
 name: Release
 
+# Actions are pinned to a full commit SHA: the jobs here hold `id-token: write`
+# and `attestations: write`, so a moved tag would be a release compromise. The
+# trailing comment names the version each SHA was resolved from, and
+# `.github/dependabot.yml` keeps the pins current.
+
 on:
   push:
     tags:
@@ -24,7 +29,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       # The same native packages as `.github/workflows/ci.yml`: the GPUI client
@@ -39,11 +44,11 @@ jobs:
             pkg-config \
             libxkbcommon-dev \
             libxkbcommon-x11-dev
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy, rustfmt
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
       - name: Check formatting
@@ -113,10 +118,10 @@ jobs:
             appimage_arch: ""
             archive: zip
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.rust_targets }}
       # On top of the client's native packages, `git2` builds its own libgit2
@@ -140,10 +145,10 @@ jobs:
             zlib1g-dev \
             file \
             patchelf
-      - uses: taiki-e/install-action@cargo-deb
+      - uses: taiki-e/install-action@9b9bdfc420b7f9201199638bc0b87bb35174e627 # cargo-deb
         if: runner.os == 'Linux'
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
       - name: Stamp the git revision
@@ -243,14 +248,14 @@ jobs:
             grep -Fq "$asset" <<<"$contents" \
               || { echo "$deb is missing $asset" >&2; exit 1; }
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-${{ matrix.name }}
           path: dist/*
           if-no-files-found: error
       # Attested from the job that built the files, so the provenance names the
       # workflow run that produced these exact digests.
-      - uses: actions/attest-build-provenance@v4
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*
 
@@ -262,20 +267,22 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - name: Install cargo-sbom
-        run: cargo install cargo-sbom --locked
+        # Pinned: an unpinned `cargo install` would change the SBOM generator
+        # that runs against a tagged release without review.
+        run: cargo install cargo-sbom --locked --version 0.10.0
       - name: Generate a CycloneDX SBOM from Cargo.lock
         run: |
           mkdir -p dist
           cargo sbom --output-format cyclone_dx_json_1_6 > "dist/loom-$GITHUB_REF_NAME.cdx.json"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-sbom
           path: dist/*
           if-no-files-found: error
-      - uses: actions/attest-build-provenance@v4
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*
 
@@ -291,8 +298,8 @@ jobs:
     env:
       IMAGE: ghcr.io/${{ github.repository_owner }}/loom-server
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - name: Build the server image
         run: |
           docker buildx build --load \
@@ -466,7 +473,7 @@ jobs:
               retry "reach the crates.io index" curl -fsS --max-time 20 -o /dev/null https://index.crates.io/config.json
             '
       - name: Log in to the container registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -485,7 +492,7 @@ jobs:
             --metadata-file "$RUNNER_TEMP/image.json" .
           digest="$(jq -r '."containerimage.digest"' "$RUNNER_TEMP/image.json")"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
-      - uses: actions/attest-build-provenance@v4
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/${{ github.repository_owner }}/loom-server
           subject-digest: ${{ steps.push.outputs.digest }}
@@ -500,7 +507,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: release-*
           path: release-assets
