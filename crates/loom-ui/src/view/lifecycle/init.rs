@@ -1450,13 +1450,15 @@ impl LoomView {
             return;
         }
         self.connected = false;
+        // The reason is a transport string: it is logged here and then kept for
+        // the reconnect screen's details, so the log does not need a copy.
+        log::warn!(
+            "[loom-ui] worker connection lost ({reason}); showing the reconnect screen and reconnecting automatically"
+        );
         self.browser_connection_lost = Some(reason);
         self.run_poll_scheduled = false;
         self.project_poll_scheduled = false;
         self.worker_node_polls_scheduled.clear();
-        log::warn!(
-            "[loom-ui] worker connection lost ({reason}); showing the reconnect screen and reconnecting automatically"
-        );
         cx.notify();
     }
 
