@@ -816,6 +816,73 @@ fn session_tree_item(node: &SessionTreeNode) -> TreeItem {
     TreeItem::new(node.session_id.to_string(), node.label.clone()).children(children)
 }
 
+/// Prefix that marks the single agent-group node nested under a project root,
+/// so the row renderer can tell it apart from a session row.
+pub(crate) const AGENT_GROUP_ID_PREFIX: &str = "agents:";
+
+/// The tree item for a project root. Its delegated agents are nested under one
+/// summary node so the sidebar lists projects, not every sub agent; a project
+/// with no agents keeps its plain leaf row.
+fn project_tree_item(node: &SessionTreeNode) -> TreeItem {
+    if node.children.is_empty() {
+        return TreeItem::new(node.session_id.to_string(), node.label.clone());
+    }
+    let agents = node
+        .children
+        .iter()
+        .map(session_tree_item)
+        .collect::<Vec<_>>();
+    let group = TreeItem::new(
+        format!("{AGENT_GROUP_ID_PREFIX}{}", node.session_id),
+        agent_group_label(session_tree_descendant_count(node)),
+    )
+    .children(agents);
+    TreeItem::new(node.session_id.to_string(), node.label.clone()).children(vec![group])
+}
+
+fn agent_group_label(count: usize) -> String {
+    if count == 1 {
+        "1 agent".to_owned()
+    } else {
+        format!("{count} agents")
+    }
+}
+
+/// A one-line summary of a project's delegated agents for the collapsed group
+/// row: the total, then how many are active and how many are complete.
+fn agent_group_summary(node: &SessionTreeNode, sessions: &[AgentSessionSnapshot]) -> String {
+    fn collect(node: &SessionTreeNode, out: &mut Vec<AgentSessionId>) {
+        for child in &node.children {
+            out.push(child.session_id);
+            collect(child, out);
+        }
+    }
+    let mut ids = Vec::new();
+    collect(node, &mut ids);
+    let state_of = |id: AgentSessionId| {
+        sessions
+            .iter()
+            .find(|session| session.id == id)
+            .map(|session| session.state)
+    };
+    let running = ids
+        .iter()
+        .filter(|id| state_of(**id).is_some_and(session_is_active))
+        .count();
+    let done = ids
+        .iter()
+        .filter(|id| state_of(**id) == Some(AgentSessionState::Completed))
+        .count();
+    let mut parts = vec![agent_group_label(ids.len())];
+    if running > 0 {
+        parts.push(format!("{running} running"));
+    }
+    if done > 0 {
+        parts.push(format!("{done} done"));
+    }
+    parts.join(" · ")
+}
+
 fn find_session_tree_item<'a>(items: &'a [TreeItem], session_id: &str) -> Option<&'a TreeItem> {
     for item in items {
         if item.id.as_ref() == session_id {

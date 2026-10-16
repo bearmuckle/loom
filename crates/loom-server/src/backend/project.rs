@@ -116,17 +116,78 @@ impl InProcessBackend {
         let Some(task) = persistence.load_delegated_task_for_target(session_id)? else {
             return Ok(());
         };
-        if !persistence.update_delegated_task_status(task.task_id, next_status, Timestamp::now())? {
+        let updated = persistence.update_delegated_task_status(
+            task.task_id,
+            next_status,
+            Timestamp::now(),
+        )?;
+        if updated {
+            let task = persistence
+                .load_delegated_task(task.task_id)?
+                .ok_or_else(|| LoomError::not_found("delegated task", task.task_id))?;
+            self.journal()?.append_server_event(
+                CURRENT_PROTOCOL_VERSION,
+                task.requester_session_id,
+                ServerEvent::ProjectTaskUpdated { task },
+            );
+        }
+        // A finished sub agent can be reclaimed once its result is final; the
+        // workspace must opt in, and code work waits for integration.
+        if next_status == loom_core::DelegatedTaskStatus::Completed {
+            self.auto_archive_completed_child(session_id)?;
+        }
+        Ok(())
+    }
+
+    /// Archives a completed delegated sub agent when its workspace has opted in.
+    ///
+    /// Only a task that is complete — and, for code work, already integrated —
+    /// is reclaimed, so an unreviewed result never disappears. A refusal is
+    /// logged and never fails the run checkpoint that triggered it.
+    pub(crate) fn auto_archive_completed_child(&self, session_id: AgentSessionId) -> Result<()> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        let Some(task) = persistence.load_delegated_task_for_target(session_id)? else {
+            return Ok(());
+        };
+        if task.status != loom_core::DelegatedTaskStatus::Completed {
             return Ok(());
         }
-        let task = persistence
-            .load_delegated_task(task.task_id)?
-            .ok_or_else(|| LoomError::not_found("delegated task", task.task_id))?;
-        self.journal()?.append_server_event(
-            CURRENT_PROTOCOL_VERSION,
-            task.requester_session_id,
-            ServerEvent::ProjectTaskUpdated { task },
-        );
+        let session = self.sessions()?.get(session_id)?;
+        if session.state == AgentSessionState::Archived {
+            return Ok(());
+        }
+        let enabled = self
+            .workspace_configs()?
+            .get(&session.workspace_id)
+            .is_some_and(|config| config.auto_archive_completed_agents);
+        if !enabled {
+            return Ok(());
+        }
+        if task.code_change
+            && !persistence
+                .load_project_worktree_by_task(task.task_id)?
+                .is_some_and(|worktree| {
+                    worktree.status == loom_core::ProjectWorktreeStatus::Integrated
+                })
+        {
+            // The code result still needs review and integration, so the agent
+            // stays visible until the manager lands it.
+            return Ok(());
+        }
+        match self.sessions()?.archive(session_id) {
+            Ok((_snapshot, record)) => {
+                self.journal()?.append_session(record);
+                log::info!("[loom-server] auto-archived completed sub agent {session_id}");
+            }
+            Err(error) => {
+                log::warn!(
+                    "[loom-server] could not auto-archive completed sub agent {session_id}: {}",
+                    error.message
+                );
+            }
+        }
         Ok(())
     }
 

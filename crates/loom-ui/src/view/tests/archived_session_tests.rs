@@ -1919,18 +1919,17 @@ fn the_project_context_menu_offers_delete_project_only_for_a_project_root(cx: &m
         assert_eq!(dialog.session_count, 2);
     });
 
-    // A member session is deleted with its project, never on its own, so it
-    // gets no Delete project item.
+    // A delegated sub agent is managed by its manager: the menu opens its
+    // transcript and offers no manual rename, archive, or delete.
     let (child_window, child_view) =
         open_project_menu(cx, session(child, "Researcher"), Some(project.clone()));
     cx.update_window(child_window, |_, window, cx| {
         window.render_frame(cx);
         let menu = window.within("popup-menu");
-        assert_eq!(menu.find(0usize).label(), Some("Rename"));
-        assert_eq!(menu.find(1usize).label(), Some("Archive"));
+        assert_eq!(menu.find(0usize).label(), Some("Open transcript"));
         assert!(
-            menu.try_find(2usize).is_none(),
-            "only a project root offers Delete project"
+            menu.try_find(1usize).is_none(),
+            "a sub agent offers no manual lifecycle actions"
         );
     })
     .unwrap();

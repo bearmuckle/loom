@@ -1,0 +1,570 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loom · project sub projects &amp; quieter sub agents (mockup)</title>
+<style>
+  :root {
+    --bg: #111318; --sidebar: #17191f; --border: #242833; --border-2: #30343f;
+    --text: #e5e7eb; --text-strong: #f3f4f6; --muted: #8f98a6; --muted-2: #64748b; --muted-3: #b7c0d0;
+    --accent: #2563eb; --accent-light: #93c5fd; --ok: #34d399; --ok-bg: #10291f; --ok-border: #1f6b4d;
+    --warn: #fcd34d; --err: #fca5a5; --pulse: #fbbf24;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; min-height: 100%; background: #0b0d11; color: var(--text);
+    font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* ---------- mockup chrome ---------- */
+  .mock-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 14px; background: #0e1014; border-bottom: 1px solid var(--border); }
+  .mock-toolbar .mock-title { font-weight: 600; color: var(--text-strong); margin-right: 6px; }
+  .mock-toolbar .mock-title small { color: var(--muted); font-weight: 400; }
+  .seg { display: inline-flex; background: #171a20; border: 1px solid var(--border); border-radius: 7px; padding: 2px; }
+  .seg button { appearance: none; border: 0; background: transparent; color: var(--muted-3); padding: 5px 10px; border-radius: 5px; font-size: 12px; cursor: pointer; }
+  .seg button.active { background: #263b58; color: var(--text-strong); }
+  .seg.good button.active { background: #1c3f2e; color: #bbf7d0; }
+  .seg.bad button.active { background: #4a2226; color: #fecaca; }
+  .caption { padding: 8px 14px; background: #0e1014; border-bottom: 1px solid var(--border); color: var(--muted); font-size: 12px; }
+  .caption b { color: var(--accent-light); font-weight: 600; }
+  .caption .bad { color: var(--err); }
+  .caption .good { color: var(--ok); }
+
+  /* ---------- app frame ---------- */
+  .stage { padding: 18px; }
+  .app { position: relative; display: flex; height: 760px; max-width: 1180px; margin: 0 auto; background: var(--bg); border: 1px solid var(--border-2); border-radius: 12px; overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,.45); }
+
+  /* ---------- sidebar ---------- */
+  .sidebar { width: 330px; flex: 0 0 330px; background: var(--sidebar); border-right: 1px solid var(--border-2); display: flex; flex-direction: column; padding: 10px; gap: 8px; }
+  .sidebar-head { display: flex; align-items: center; justify-content: space-between; position: relative; }
+  .sidebar-head .label { color: var(--muted); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+  .head-actions { display: flex; gap: 4px; }
+  .icon-btn { width: 26px; height: 26px; display: inline-flex; align-items: center; justify-content: center; border-radius: 7px; color: var(--muted-3); background: transparent; border: 0; cursor: pointer; }
+  .icon-btn:hover { background: #293244; color: var(--text-strong); }
+  .icon-btn svg { width: 15px; height: 15px; }
+  .filter { width: 100%; background: #0f1115; border: 1px solid var(--border-2); color: var(--text); border-radius: 7px; padding: 7px 9px; font: inherit; font-size: 12.5px; }
+  .filter::placeholder { color: var(--muted-2); }
+  .tree { flex: 1; overflow-y: auto; margin: 0 -2px; }
+
+  /* worker group */
+  .group { margin-bottom: 4px; }
+  .group-head { display: flex; flex-direction: column; gap: 2px; padding: 6px 8px; border-radius: 7px; cursor: pointer; user-select: none; }
+  .group-head:hover { background: #1d2028; }
+  .group-head .line1 { display: flex; align-items: center; gap: 7px; min-width: 0; }
+  .group-head .name { flex: 1; min-width: 0; color: var(--text-strong); font-size: 12.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .group-head .sub { padding-left: 26px; color: var(--muted-2); font-size: 10.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chev { width: 11px; color: var(--muted); display: inline-flex; transition: transform .12s ease; }
+  .chev svg { width: 11px; height: 11px; }
+  .chev.collapsed { transform: rotate(-90deg); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 8px; }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 0 3px rgba(52,211,153,.12); }
+  .dot.off { background: var(--muted-2); }
+  .group-body { padding: 1px 0 2px 6px; }
+
+  /* tree rows */
+  .row { display: flex; align-items: flex-start; gap: 7px; padding: 5px 8px; border-radius: 7px; cursor: pointer; color: var(--muted-3); }
+  .row:hover { background: #1d2028; }
+  .row.selected { background: #20242c; color: var(--text-strong); }
+  .row .caret { width: 12px; flex: 0 0 12px; color: var(--muted); display: inline-flex; margin-top: 2px; }
+  .row .caret svg { width: 10px; height: 10px; }
+  .row .picon { width: 15px; flex: 0 0 15px; display: inline-flex; color: #8f98a6; margin-top: 2px; }
+  .row.selected .picon, .row .picon.active { color: var(--accent-light); }
+  .row .picon svg { width: 15px; height: 15px; }
+  .row .col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .row .plabel { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; }
+  .row .psub { color: var(--muted-2); font-size: 10.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row.project .plabel { font-weight: 600; color: var(--text-strong); }
+  .row.subproject .plabel { font-weight: 500; color: var(--text); }
+  .row.agent-only { color: var(--muted-2); font-size: 12px; }
+  .row.agent { align-items: center; padding: 3px 8px; color: var(--muted-2); font-size: 12px; }
+  .row.dim { opacity: .72; }
+  .count { flex: 0 0 auto; font-size: 10.5px; color: var(--muted-2); border: 1px solid var(--border-2); border-radius: 999px; padding: 0 6px; line-height: 16px; }
+  .row.selected .count { border-color: var(--accent); color: var(--accent-light); }
+  .group-title { padding: 10px 8px 4px; color: var(--muted); font-size: 10.5px; letter-spacing: .05em; text-transform: uppercase; }
+  .empty-hint { padding: 8px; color: var(--muted-2); font-size: 11.5px; }
+
+  /* row add button */
+  .row-add {
+    flex: 0 0 auto; width: 20px; height: 20px; border-radius: 6px; border: 1px solid transparent;
+    background: transparent; color: var(--muted-2); cursor: pointer; font-size: 15px; line-height: 1; margin-top: 1px;
+    display: inline-flex; align-items: center; justify-content: center;
+  }
+  .row-add:hover { background: #26303d; color: var(--accent-light); border-color: var(--border-2); }
+  .ghost-add {
+    display: flex; align-items: center; gap: 7px; margin: 3px 8px 4px 30px; padding: 5px 9px;
+    border: 1px dashed var(--border-2); border-radius: 7px; color: var(--muted-2); font-size: 11.5px; cursor: pointer;
+  }
+  .ghost-add:hover { color: var(--accent-light); border-color: var(--accent); background: #141a22; }
+
+  /* inline create */
+  .row.inline { align-items: center; padding-left: 30px; gap: 6px; }
+  .inline-input {
+    flex: 1; min-width: 0; background: #0f1115; border: 1px solid var(--accent); border-radius: 7px;
+    color: var(--text); font: inherit; font-size: 12.5px; padding: 5px 8px;
+  }
+  .inline-input::placeholder { color: var(--muted-2); }
+  .inline-hint { flex: 0 0 auto; color: var(--muted-2); font-size: 10px; border: 1px solid var(--border-2); border-radius: 5px; padding: 0 5px; line-height: 16px; }
+
+  /* pills */
+  .pill { flex: 0 0 auto; font-size: 10px; border-radius: 999px; padding: 0 7px; line-height: 16px; white-space: nowrap; }
+  .pill.running { background: #1b2b43; color: var(--accent-light); border: 1px solid #2b4b78; }
+  .pill.done { background: var(--ok-bg); color: var(--ok); border: 1px solid var(--ok-border); }
+  .pill.failed { background: #2a1618; color: var(--err); border: 1px solid #6b2a2a; }
+  .pill.blocked { background: #2a2410; color: var(--warn); border: 1px solid #6b5a1f; }
+  .pill.idle { background: #1a1d24; color: var(--muted-2); border: 1px solid var(--border-2); }
+
+  /* canvas */
+  .canvas { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .canvas-head { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--border); background: #13151b; }
+  .canvas-head .proj { font-size: 14px; color: var(--text-strong); font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .canvas-head .crumb { color: var(--muted-2); font-weight: 400; font-size: 12.5px; }
+  .canvas-head .meta { margin-left: auto; color: var(--muted-2); font-size: 11.5px; display: flex; gap: 12px; align-items: center; }
+  .branch-chip { font-size: 10.5px; color: var(--muted-3); background: #171a20; border: 1px solid var(--border-2); border-radius: 6px; padding: 1px 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .canvas-body { flex: 1; overflow: hidden; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  .bubble { border: 1px solid var(--border); background: #15171d; border-radius: 10px; padding: 10px 12px; max-width: 600px; }
+  .bubble .who { color: var(--muted); font-size: 11px; margin-bottom: 4px; }
+  .bubble.agent { background: #141a22; border-color: #1f2b3c; }
+  .bubble .steps { color: var(--muted-3); font-size: 12.5px; }
+  .bubble code { background: #0f1115; border: 1px solid var(--border); border-radius: 4px; padding: 1px 4px; font-size: 12px; }
+  .composer { margin-top: auto; border: 1px solid var(--border-2); background: #0f1115; border-radius: 10px; padding: 10px 12px; color: var(--muted-2); display: flex; justify-content: space-between; align-items: center; }
+  .composer .send { background: var(--accent); color: #fff; border-radius: 7px; padding: 4px 10px; font-size: 12px; }
+
+  /* cards */
+  .scroll { overflow-y: auto; }
+  .card { border: 1px solid var(--border); background: #14161c; border-radius: 10px; padding: 14px 16px; }
+  .card h3 { margin: 0 0 10px; font-size: 12px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  .kv { display: flex; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px solid var(--border); font-size: 12.5px; }
+  .kv:last-child { border-bottom: 0; }
+  .kv .k { color: var(--muted-2); }
+  .kv .v { color: var(--text); text-align: right; }
+  .inline-choices { display: flex; gap: 6px; flex-wrap: wrap; }
+  .inline-choices button { border: 1px solid var(--border-2); background: #171a20; color: var(--muted-3); border-radius: 7px; padding: 5px 10px; font-size: 12px; cursor: pointer; }
+  .inline-choices button.active { background: #1c3f2e; border-color: var(--ok-border); color: #bbf7d0; }
+  .setting-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 8px 0; }
+  .setting-row .txt { color: var(--muted-3); font-size: 12px; max-width: 420px; }
+  .setting-row .txt b { color: var(--text-strong); }
+  .agent-line { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+  .agent-line:last-child { border-bottom: 0; }
+  .agent-line .aname { flex: 1; min-width: 0; color: var(--muted-3); font-size: 12.5px; }
+  .agent-line .sub { color: var(--muted-2); font-size: 11px; }
+  .subproj-line { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--border); }
+  .subproj-line:last-child { border-bottom: 0; }
+  .subproj-line .n { flex: 1; }
+  .subproj-line .n .goal { color: var(--muted-2); font-size: 11px; }
+
+  /* popups */
+  .popup { position: absolute; z-index: 30; min-width: 220px; background: #1b1f27; border: 1px solid var(--border-2); border-radius: 9px; padding: 5px; box-shadow: 0 16px 40px rgba(0,0,0,.5); display: none; }
+  .popup.show { display: block; }
+  .popup .mi { display: flex; align-items: center; gap: 8px; padding: 6px 9px; border-radius: 6px; color: var(--muted-3); font-size: 12.5px; }
+  .popup .mi:hover { background: #26303d; color: var(--text-strong); }
+  .popup .mi .sc { margin-left: auto; color: var(--muted-2); font-size: 11px; }
+  .popup .sep { height: 1px; background: var(--border); margin: 5px 4px; }
+  .popup .mh { padding: 4px 9px 2px; color: var(--muted-2); font-size: 10px; letter-spacing: .05em; text-transform: uppercase; }
+  .popup .mi.gone { color: var(--muted-2); text-decoration: line-through; opacity: .6; }
+  .note-badge { font-size: 9.5px; border-radius: 4px; padding: 0 5px; line-height: 14px; border: 1px solid; }
+  .note-badge.good { color: var(--ok); border-color: var(--ok-border); background: var(--ok-bg); }
+
+  .legend { max-width: 1180px; margin: 14px auto 0; padding: 12px 16px; border: 1px solid var(--border); border-radius: 10px; background: #0e1014; color: var(--muted); font-size: 12px; display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 6px 24px; }
+  .legend b { color: var(--accent-light); }
+  @media (max-width: 980px) { .sidebar { width: 285px; flex-basis: 285px; } .legend { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+  <div class="mock-toolbar">
+    <div class="mock-title">Loom · sub projects &amp; quieter sub agents <small>— #257 exploration</small></div>
+    <div class="seg good" id="modeSeg">
+      <button data-mode="proposed" class="active">Proposed</button>
+      <button data-mode="current">Current</button>
+    </div>
+    <div class="seg" id="sceneSeg">
+      <button data-scene="sidebar" class="active">Sidebar</button>
+      <button data-scene="add">Add sub project</button>
+      <button data-scene="detail">Project detail</button>
+      <button data-scene="menu">Agent menu</button>
+    </div>
+  </div>
+  <div class="caption" id="caption"></div>
+
+  <div class="stage">
+    <div class="app" id="app">
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <span class="label">Projects</span>
+          <div class="head-actions">
+            <button class="icon-btn" id="headerAdd" title="New project / sub project" onclick="toggleHeaderMenu(event)">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 3v10M3 8h10" stroke-linecap="round"/></svg>
+            </button>
+            <button class="icon-btn" title="Archived sessions">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><rect x="2.2" y="3" width="11.6" height="3" rx="1"/><path d="M3.2 6v6.2c0 .6.5 1.1 1.1 1.1h7.4c.6 0 1.1-.5 1.1-1.1V6"/><path d="M6.6 9h2.8" stroke-linecap="round"/></svg>
+            </button>
+            <button class="icon-btn" title="Settings">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.8M8 12.6v1.8M1.6 8h1.8M12.6 8h1.8M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3" stroke-linecap="round"/></svg>
+            </button>
+          </div>
+          <div class="popup" id="popupHeader" style="right:4px; top:32px;">
+            <div class="mh">Create</div>
+            <div class="mi" onclick="closeMenus()">New project…<span class="sc">repo / folder</span></div>
+            <div class="mi" onclick="beginAdd('loom')">New sub project under <b style="color:var(--text-strong)">loom</b></div>
+          </div>
+        </div>
+        <input class="filter" placeholder="Filter projects…">
+        <div class="tree" id="tree"></div>
+      </aside>
+
+      <main class="canvas">
+        <div class="canvas-head" id="canvasHead"></div>
+        <div class="canvas-body" id="canvasBody"></div>
+      </main>
+
+      <div class="popup" id="popupProject" style="left:190px; top:120px;">
+        <div class="mh">Project · loom</div>
+        <div class="mi">New sub project…<span class="sc">1 field</span></div>
+        <div class="mi">New agent task…</div>
+        <div class="sep"></div>
+        <div class="mi">Rename project</div>
+        <div class="mi">Archive project</div>
+        <div class="mi">Delete project…</div>
+      </div>
+      <div class="popup" id="popupAgent" style="left:250px; top:320px;">
+        <div class="mh">Sub agent · navigator-tests <span class="note-badge good">done</span></div>
+        <div class="mi">Open transcript</div>
+        <div class="mi">Copy output</div>
+        <div class="mi">Stop<span class="sc">while running</span></div>
+        <div class="sep"></div>
+        <div class="mi gone">Archive<span class="sc">automatic</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="legend">
+    <div><b>Initiate simply</b> — “New sub project” is one field in the sidebar: no repository, worker, or model choices, because a sub project inherits the parent's repo and settings.</div>
+    <div><b>Visible entry points</b> — a “+” on every project row, a “New sub project” line under an empty project, a context-menu item, and the sidebar header menu.</div>
+    <div><b>Sub project</b> — a nested project with its own manager and goal, on its own branch off the parent project branch.</div>
+    <div><b>Agent summary row</b> — one muted row per project; expand to inspect, never to manage. Archive is automatic, not manual.</div>
+  </div>
+
+  <script>
+    let workers = [
+      { id: 'local', name: 'Local backend · this machine', dot: 'ok', res: 'CPU 12% · RAM 4.1/32 GiB',
+        projects: [
+          { id: 'loom', name: 'loom', source: 'github.com/bearmuckle/loom', live: true, expanded: true,
+            subprojects: [
+              { id: 'web-client', name: 'web-client', goal: 'Rebuild the workspace navigator', branch: 'subproject/loom/web-client',
+                dot: 'ok', active: true, selected: true, expanded: true,
+                agents: [ { name: 'navigator-tree', state: 'running' }, { name: 'navigator-tests', state: 'done' } ] },
+              { id: 'protocol-v2', name: 'protocol-v2', goal: 'Negotiate the project protocol major', branch: 'subproject/loom/protocol-v2',
+                dot: 'ok', expanded: false,
+                agents: [ { name: 'protocol-negotiate', state: 'running' } ] },
+              { id: 'release-hardening', name: 'release-hardening', goal: 'Harden the archive retention sweep', branch: 'subproject/loom/release',
+                dot: 'off', expanded: false,
+                agents: [ { name: 'retention-sweep', state: 'done' }, { name: 'retention-tests', state: 'done' }, { name: 'sweep-docs', state: 'done' } ] }
+            ] },
+          { id: 'scratch', name: 'scratch', source: 'Empty project', live: false, expanded: true, subprojects: [] }
+        ] },
+      { id: 'build-01', name: 'External worker · build-01', dot: 'ok', res: 'CPU 71% · RAM 12.4/64 GiB',
+        projects: [
+          { id: 'api-gateway', name: 'api-gateway', source: 'github.com/acme/api-gateway', live: true, expanded: true,
+            subprojects: [
+              { id: 'request-id', name: 'request-id', goal: 'Propagate request ids through the gateway', branch: 'subproject/api-gateway/request-id',
+                dot: 'ok', active: true, expanded: false,
+                agents: [ { name: 'proxy-middleware', state: 'running' }, { name: 'gateway-tests', state: 'done' } ] }
+            ] },
+          { id: 'infra-terraform', name: 'infra-terraform', source: 'github.com/acme/infra', live: true, expanded: true, directAgents: true,
+            subprojects: [],
+            agents: [ { name: 'plan-review', state: 'running' }, { name: 'apply-gate', state: 'done' }, { name: 'cost-check', state: 'failed' } ] }
+        ] }
+    ];
+
+    const svg = {
+      chev: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M4 6l4 4 4-4" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+      folder: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M1.8 4.2c0-.7.5-1.2 1.2-1.2h3l1.4 1.6h6.6c.7 0 1.2.5 1.2 1.2v6.4c0 .7-.5 1.2-1.2 1.2H3c-.7 0-1.2-.5-1.2-1.2z"/></svg>',
+      bot: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="2.6" y="4.4" width="10.8" height="8" rx="2.2"/><path d="M5.6 8h.01M10.4 8h.01" stroke-linecap="round"/><path d="M8 4.4V2.6" stroke-linecap="round"/></svg>'
+    };
+
+    const state = { mode: 'proposed', scene: 'sidebar', inlineParent: null, headerMenu: false, parentId: 'loom' };
+    const expandedAgents = new Set(['web-client']);
+
+    function pill(s) {
+      const map = { running: 'Running', done: 'Done', failed: 'Failed', blocked: 'Blocked', idle: 'Idle' };
+      return `<span class="pill ${s}">${map[s] || s}</span>`;
+    }
+    function count(a, s) { return a.filter(x => x.state === s).length; }
+    function summaryText(a) {
+      const parts = [];
+      const r = count(a, 'running'); if (r) parts.push(`${r} running`);
+      const d = count(a, 'done'); if (d) parts.push(`${d} done`);
+      const f = count(a, 'failed'); if (f) parts.push(`${f} failed`);
+      const b = count(a, 'blocked'); if (b) parts.push(`${b} blocked`);
+      return `${a.length} agent${a.length === 1 ? '' : 's'} · ${parts.join(', ') || 'idle'}`;
+    }
+    function activeIn(a) { return a.some(x => x.state === 'running' || x.state === 'blocked'); }
+    function rows() { return document.querySelectorAll ? document.querySelectorAll('.row') : []; }
+
+    function findProject(id) {
+      let out = null;
+      workers.forEach(w => w.projects.forEach(p => { if (p.id === id) out = p; }));
+      return out;
+    }
+
+    /* ---------------- proposed tree ---------------- */
+    function agentSummaryRow(owner, agents, level) {
+      const open = expandedAgents.has(owner);
+      const dot = activeIn(agents) ? '<span class="dot ok" style="width:6px;height:6px;flex-basis:6px"></span>' : '';
+      let html = `<div class="row agent-only dim" style="padding-left:${level * 14 + 8}px" onclick="toggleAgents('${owner}')">
+          <span class="caret${open ? '' : ' collapsed'}">${svg.chev}</span>${dot}
+          <span class="col"><span class="plabel">${summaryText(agents)}</span></span>
+        </div>`;
+      if (open) {
+        html += agents.map(a => `
+          <div class="row agent dim" style="padding-left:${level * 14 + 30}px">
+            <span class="picon" style="margin-top:0">${svg.bot}</span>
+            <span class="col"><span class="plabel" style="font-size:12px">${a.name}</span></span>
+            ${pill(a.state)}
+          </div>`).join('');
+      }
+      return html;
+    }
+
+    function inlineRow(parentId) {
+      return `<div class="row inline">
+          <span class="picon active" style="margin-top:0">${svg.folder}</span>
+          <input class="inline-input" id="inlineInput" placeholder="Sub project name…"
+                 onkeydown="if(event.key==='Enter'){createInline('${parentId}')} else if(event.key==='Escape'){cancelInline()}">
+          <span class="inline-hint">⏎</span>
+        </div>`;
+    }
+
+    function proposedProject(p) {
+      const agentsAll = (p.subprojects || []).flatMap(s => s.agents || []).concat(p.agents || []);
+      const open = p.expanded;
+      const adding = state.inlineParent === p.id;
+      let html = `<div class="row project" onclick="toggleProject('${p.id}')">
+          <span class="caret${open ? '' : ' collapsed'}">${svg.chev}</span>
+          <span class="picon${p.live ? ' active' : ''}">${svg.folder}</span>
+          <span class="col">
+            <span class="plabel">${p.name}</span>
+            <span class="psub">${p.source}</span>
+          </span>
+          ${agentsAll.length ? `<span class="count">${agentsAll.length}</span>` : ''}
+          <button class="row-add" title="New sub project" onclick="event.stopPropagation();beginAdd('${p.id}')">+</button>
+        </div>`;
+      if (!open) return html;
+      (p.subprojects || []).forEach(s => {
+        const sel = s.selected ? ' selected' : '';
+        html += `<div class="row subproject${sel}" style="padding-left:22px" onclick="toggleProject('${s.id}')">
+            <span class="caret${s.expanded ? '' : ' collapsed'}">${svg.chev}</span>
+            <span class="picon${s.active ? ' active' : ''}">${svg.folder}</span>
+            <span class="col">
+              <span class="plabel">${s.name}</span>
+              <span class="psub">${s.goal}</span>
+            </span>
+          </div>`;
+        if (s.expanded) html += agentSummaryRow(s.id, s.agents, 3);
+      });
+      if (adding) html += inlineRow(p.id);
+      if (p.directAgents && p.agents) html += agentSummaryRow(p.id, p.agents, 1);
+      if (!adding && (p.subprojects || []).length === 0 && !(p.directAgents)) {
+        html += `<div class="ghost-add" onclick="beginAdd('${p.id}')"><span style="font-size:14px;line-height:1">＋</span> New sub project</div>`;
+      }
+      return html;
+    }
+
+    /* ---------------- current tree (comparison) ---------------- */
+    function currentProject(p) {
+      const open = p.expanded;
+      const all = (p.subprojects || []).flatMap(s => s.agents || []).concat(p.agents || []);
+      let html = `<div class="row project" onclick="toggleProject('${p.id}')">
+          <span class="caret${open ? '' : ' collapsed'}">${svg.chev}</span>
+          <span class="picon${p.live ? ' active' : ''}">${svg.folder}</span>
+          <span class="col"><span class="plabel">${p.name}</span><span class="psub">${p.source}</span></span>
+          ${all.length ? `<span class="count">${all.length}</span>` : ''}
+        </div>`;
+      if (open) html += all.map(a => `
+          <div class="row agent" style="padding-left:30px">
+            <span class="picon" style="margin-top:0">${svg.bot}</span>
+            <span class="col"><span class="plabel" style="font-size:12.5px">${a.name}</span></span>
+            ${pill(a.state)}
+          </div>`).join('');
+      return html;
+    }
+
+    function renderTree() {
+      const renderProject = state.mode === 'proposed' ? proposedProject : currentProject;
+      document.getElementById('tree').innerHTML = workers.map(w => {
+        const head = `<div class="group-head">
+            <div class="line1"><span class="chev">${svg.chev}</span><span class="dot ${w.dot}"></span><span class="name">${w.name}</span></div>
+            <div class="sub">${w.res}</div>
+          </div>`;
+        return `<div class="group">${head}<div class="group-body">${w.projects.map(renderProject).join('')}</div></div>`;
+      }).join('');
+      if (state.inlineParent) {
+        const el = document.getElementById('inlineInput');
+        if (el && el.focus) el.focus();
+      }
+    }
+
+    function toggleProject(id) {
+      workers.forEach(w => w.projects.forEach(p => {
+        if (p.id === id) p.expanded = !p.expanded;
+        (p.subprojects || []).forEach(s => { if (s.id === id) s.expanded = !s.expanded; });
+      }));
+      renderTree();
+    }
+    function toggleAgents(id) {
+      if (expandedAgents.has(id)) expandedAgents.delete(id); else expandedAgents.add(id);
+      renderTree();
+    }
+
+    /* ---------------- inline create ---------------- */
+    function beginAdd(projectId) {
+      const p = findProject(projectId);
+      if (p) p.expanded = true;
+      state.inlineParent = projectId;
+      state.parentId = projectId;
+      state.headerMenu = false;
+      state.scene = 'add';
+      sync();
+    }
+    function cancelInline() { state.inlineParent = null; state.scene = 'sidebar'; sync(); }
+    function createInline(projectId) {
+      const el = document.getElementById('inlineInput');
+      const raw = el && el.value ? el.value.trim() : '';
+      const name = raw || 'untitled';
+      const p = findProject(projectId);
+      if (p) {
+        p.subprojects = p.subprojects || [];
+        p.subprojects.push({
+          id: name, name, goal: 'Add a goal…', branch: `subproject/${p.name}/${name}`,
+          dot: 'off', expanded: false, selected: true, agents: []
+        });
+        p.subprojects.forEach(s => { if (s.name !== name) s.selected = false; });
+      }
+      state.inlineParent = null;
+      state.scene = 'sidebar';
+      sync();
+    }
+
+    /* ---------------- canvas ---------------- */
+    function renderSidebarCanvas() {
+      document.getElementById('canvasHead').innerHTML = `
+        <div class="proj">${svg.folder.replace('<svg', '<svg style="width:16px;height:16px"')} web-client
+          <span class="crumb">loom · github.com/bearmuckle/loom</span></div>
+        <div class="meta"><span class="branch-chip">subproject/loom/web-client</span><span>2 agents</span><span style="color:var(--ok)">● Working</span></div>`;
+      document.getElementById('canvasBody').innerHTML = `
+        <div class="bubble"><div class="who">You → sub project</div>Rebuild the workspace navigator so sub projects and agents read cleanly at a glance.</div>
+        <div class="bubble agent"><div class="who">web-client · manager</div>
+          <div class="steps">Delegating <code>navigator-tree</code> (code) and <code>navigator-tests</code> (read-only). Branch base <code>subproject/loom/web-client</code> off the loom project branch.</div></div>
+        <div class="bubble agent" style="border-color:#1f6b4d;background:#101d17"><div class="who" style="color:var(--ok)">web-client · navigator-tests</div>
+          <div class="steps">Completed and integrated — <b>archived automatically</b>. Still reachable from the agent summary row for inspection.</div></div>
+        <div class="composer"><span>Message web-client…</span><span class="send">Send</span></div>`;
+    }
+
+    function renderAddCanvas() {
+      document.getElementById('canvasHead').innerHTML = `
+        <div class="proj">loom <span class="crumb">project · github.com/bearmuckle/loom</span></div>
+        <div class="meta"><span>3 sub projects</span></div>`;
+      document.getElementById('canvasBody').innerHTML = `
+        <div class="scroll" style="display:flex;flex-direction:column;gap:12px">
+          <div class="card">
+            <h3>Create a sub project</h3>
+            <div class="agent-line"><span class="aname">1. Name it in the sidebar</span><span class="note-badge good">required</span></div>
+            <div class="agent-line"><span class="aname">2. Repository — inherited from loom</span><span class="pill idle">github.com/bearmuckle/loom</span></div>
+            <div class="agent-line"><span class="aname">3. Branch — off the project branch</span><span class="pill idle">subproject/loom/&lt;name&gt;</span></div>
+            <div class="agent-line"><span class="aname">4. Model — project default</span><span class="pill idle">deepseek-flash</span></div>
+            <div class="agent-line"><span class="aname">5. Goal — editable after creation</span><span class="pill idle">optional now</span></div>
+          </div>
+          <div class="card">
+            <h3>Why so little to fill in</h3>
+            <div class="setting-row"><div class="txt">A sub project shares the parent project's repository, worker, model, and approval policy, so nothing needs to be chosen. It only needs a name; the goal and branch defaults can be changed from the sub project's own settings.</div></div>
+          </div>
+        </div>`;
+    }
+
+    function renderDetailCanvas() {
+      document.getElementById('canvasHead').innerHTML = `
+        <div class="proj">${svg.folder.replace('<svg', '<svg style="width:16px;height:16px"')} loom
+          <span class="crumb">project · github.com/bearmuckle/loom</span></div>
+        <div class="meta"><span>3 sub projects</span><span>Model · deepseek-flash</span><span style="color:var(--ok)">● Working</span></div>`;
+      document.getElementById('canvasBody').innerHTML = `
+        <div class="scroll" style="display:flex;flex-direction:column;gap:12px">
+          <div class="card">
+            <h3>Repository</h3>
+            <div class="kv"><span class="k">Source</span><span class="v">github.com/bearmuckle/loom</span></div>
+            <div class="kv"><span class="k">Project branch</span><span class="v">project/loom</span></div>
+            <div class="kv"><span class="k">Worktrees</span><span class="v">3 sub projects · isolated</span></div>
+          </div>
+          <div class="card">
+            <h3>Sub projects</h3>
+            <div class="subproj-line"><span class="picon active">${svg.folder}</span><span class="n"><div>web-client</div><div class="goal">Rebuild the workspace navigator</div></span>${pill('running')}</div>
+            <div class="subproj-line"><span class="picon active">${svg.folder}</span><span class="n"><div>protocol-v2</div><div class="goal">Negotiate the project protocol major</div></span>${pill('running')}</div>
+            <div class="subproj-line"><span class="picon">${svg.folder}</span><span class="n"><div>release-hardening</div><div class="goal">Harden the archive retention sweep</div></span>${pill('done')}</div>
+          </div>
+          <div class="card">
+            <h3>Sub agent lifecycle</h3>
+            <div class="setting-row">
+              <div class="txt"><b>Auto-archive completed sub agents.</b> Archive a delegated agent once its task is complete and any code result is integrated. Failures and un-integrated code stay visible.</div>
+              <div class="inline-choices"><button>Off</button><button class="active">Immediately</button><button>After 5 min</button></div>
+            </div>
+            <div class="setting-row" style="border-top:1px solid var(--border)">
+              <div class="txt"><b>Sub agents in the sidebar.</b> Show one collapsed summary row per project or sub project.</div>
+              <div class="inline-choices"><button class="active">Summary row</button><button>Hidden</button></div>
+            </div>
+          </div>
+          <div class="card">
+            <h3>Agents</h3>
+            <div class="agent-line"><span class="picon" style="margin-top:0">${svg.bot}</span><span class="aname">navigator-tree <span class="sub">· web-client</span></span>${pill('running')}</div>
+            <div class="agent-line"><span class="picon" style="margin-top:0">${svg.bot}</span><span class="aname">navigator-tests <span class="sub">· web-client</span></span><span class="note-badge good">auto-archived</span></div>
+            <div class="agent-line"><span class="picon" style="margin-top:0">${svg.bot}</span><span class="aname">protocol-negotiate <span class="sub">· protocol-v2</span></span>${pill('running')}</div>
+          </div>
+        </div>`;
+    }
+
+    /* ---------------- menus ---------------- */
+    function toggleHeaderMenu(e) { if (e) e.stopPropagation(); state.headerMenu = !state.headerMenu; sync(); }
+    function closeMenus() { state.headerMenu = false; sync(); }
+
+    function sync() {
+      document.querySelectorAll('#modeSeg button').forEach(b => b.classList.toggle('active', b.dataset.mode === state.mode));
+      document.querySelectorAll('#sceneSeg button').forEach(b => b.classList.toggle('active', b.dataset.scene === state.scene));
+      document.getElementById('popupHeader').classList.toggle('show', state.headerMenu);
+      document.getElementById('popupProject').classList.toggle('show', state.scene === 'menu');
+      document.getElementById('popupAgent').classList.toggle('show', state.scene === 'menu');
+
+      if (state.scene === 'detail') renderDetailCanvas();
+      else if (state.scene === 'add') renderAddCanvas();
+      else renderSidebarCanvas();
+
+      renderTree();
+
+      const cap = document.getElementById('caption');
+      if (state.mode === 'current') {
+        cap.innerHTML = `<span class="bad">Current:</span> every delegated sub agent is a first-class row with the same menu as a project, and related work on one repository becomes several sibling top-level projects.`;
+      } else if (state.scene === 'menu') {
+        cap.innerHTML = `Proposed: the <b>project</b> menu offers <b>New sub project</b> in one field; the <b>sub agent</b> menu drops <b>Archive</b> (greyed, automatic) and keeps Open transcript and Stop.`;
+      } else if (state.scene === 'add') {
+        cap.innerHTML = `Initiating: click <b>+</b> on a project row (or the header menu, the ghost row, or the context menu) and type a name — <b>Enter</b> creates it. Everything else is inherited, so there is no dialog.`;
+      } else if (state.scene === 'detail') {
+        cap.innerHTML = `Project detail: sub projects under the repo, plus the <b>auto-archive</b> policy for completed sub agents.`;
+      } else {
+        cap.innerHTML = `Proposed sidebar: projects own sub projects; each shows a single muted <b>agent summary row</b> that expands only for inspection.`;
+      }
+    }
+
+    document.getElementById('modeSeg').addEventListener('click', e => {
+      const b = e.target.closest('button'); if (!b) return;
+      state.mode = b.dataset.mode; state.inlineParent = null; sync();
+    });
+    document.getElementById('sceneSeg').addEventListener('click', e => {
+      const b = e.target.closest('button'); if (!b) return;
+      state.scene = b.dataset.scene;
+      if (b.dataset.scene === 'add') { state.inlineParent = 'loom'; findProject('loom').expanded = true; }
+      else state.inlineParent = null;
+      sync();
+    });
+
+    sync();
+    if (state.scene === 'add') { /* no-op */ }
+  </script>
+</body>
+</html>

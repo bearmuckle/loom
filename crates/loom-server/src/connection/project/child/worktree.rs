@@ -370,6 +370,7 @@ impl InProcessConnection {
             worktree.error = None;
             worktree.updated_at = Timestamp::now();
             self.save_project_worktree_state(&worktree)?;
+            self.auto_archive_integrated_child(worktree.child_session_id);
             return Ok(ServerResponse::Project(
                 ProjectResponse::ProjectChildWorktreeUpdated(Box::new(worktree)),
             ));
@@ -467,9 +468,21 @@ impl InProcessConnection {
         worktree.error = None;
         worktree.updated_at = Timestamp::now();
         self.save_project_worktree_state(worktree)?;
+        self.auto_archive_integrated_child(worktree.child_session_id);
         Ok(ServerResponse::Project(
             ProjectResponse::ProjectChildWorktreeUpdated(Box::new(worktree.clone())),
         ))
+    }
+
+    /// Best-effort auto-archive of a code child once its result is integrated.
+    /// A disabled policy or a refusal is logged and never fails integration.
+    fn auto_archive_integrated_child(&self, child_session_id: AgentSessionId) {
+        if let Err(error) = self.backend.auto_archive_completed_child(child_session_id) {
+            log::warn!(
+                "[loom-server] could not auto-archive integrated sub agent {child_session_id}: {}",
+                error.message
+            );
+        }
     }
 
     pub(crate) fn cleanup_project_child_worktree(
@@ -679,6 +692,7 @@ impl InProcessConnection {
                 worktree.error = None;
                 worktree.updated_at = Timestamp::now();
                 self.save_project_worktree_state(&worktree)?;
+                self.auto_archive_integrated_child(worktree.child_session_id);
             }
         }
         Ok(())
