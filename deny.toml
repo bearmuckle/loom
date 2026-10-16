@@ -33,16 +33,6 @@ ignore = [
     # `PemObject` trait, but it is still a direct dependency of `loom-server`
     # and of `gpui-pre-reqwest`. Migrating is a source change.
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is used by loom-server; migrating to rustls-pki-types is a source change" },
-    # The four rustls advisories below are all fixed in rustls 0.23.46, which
-    # the workspace's `rustls = "0.23.45"` requirement already allows, so they
-    # are cleared by `cargo update -p rustls` rather than by any code change.
-    # They are ignored here only because this change is configuration-only and
-    # must not alter the locked dependency graph: remove each entry when the
-    # rustls bump lands.
-    { id = "RUSTSEC-2026-0346", reason = "fixed in rustls 0.23.46; needs `cargo update -p rustls`" },
-    { id = "RUSTSEC-2026-0347", reason = "fixed in rustls 0.23.46; needs `cargo update -p rustls`" },
-    { id = "RUSTSEC-2026-0348", reason = "fixed in rustls 0.23.46; needs `cargo update -p rustls`" },
-    { id = "RUSTSEC-2026-0349", reason = "fixed in rustls 0.23.46; needs `cargo update -p rustls`" },
 ]
 
 [licenses]
