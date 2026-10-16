@@ -155,6 +155,26 @@ impl InProcessConnection {
             )));
         }
         if let Some(persistence) = &self.backend.persistence {
+            // A live run can hold transcript that SQLite does not have yet.
+            // Streamed assistant text is batched into message fragments behind a
+            // flusher thread, so a buffered tail has no `run_messages` row at
+            // all until a fragment is written. Reading only SQLite would then
+            // serve a page older than what the run has already produced, and a
+            // reopen that has to page again would lose the newest messages even
+            // though the run kept them. Flush the live run's pending fragments
+            // first, so the page includes its newest durable messages.
+            //
+            // The flush writes one bounded batch (at most the pending fragment
+            // buffer) and holds only the short fragment lock; the page read runs
+            // after that lock is released, so no run lock is held across the
+            // SQLite read. A run without a registered handle, or an idle run with
+            // nothing buffered, takes exactly the persisted path it took before.
+            // A failed flush fails the read with its retryable persistence error
+            // rather than serving a page that is knowingly older than the run.
+            let live_handle = self.backend.runs()?.get(&run_id).cloned();
+            if let Some(handle) = live_handle {
+                handle.flush_message_fragments(persistence.as_ref())?;
+            }
             return persistence
                 .load_run_message_page(run_id, before_ordinal, limit as usize)
                 .map(|messages| {

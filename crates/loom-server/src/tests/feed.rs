@@ -672,6 +672,229 @@ fn streamed_message_fragments_batch_until_the_time_threshold() {
 }
 
 #[test]
+fn run_message_page_flushes_a_live_run_s_buffered_tail() {
+    let (endpoint, first_delta, release_second, second_delta, finish) =
+        gated_model_endpoint("first");
+    let persistence =
+        std::env::temp_dir().join(format!("loom-server-live-page-{}.db", WorkspaceId::new()));
+    let backend = InProcessBackend::with_openai_compatible_persistent(
+        endpoint,
+        "key",
+        ModelId::new("slow/model"),
+        &persistence,
+    )
+    .unwrap();
+    let session_root_base = backend.session_root_base.clone();
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+    let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Live page workspace".to_owned(),
+        },
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+        workspace.result.unwrap()
+    else {
+        panic!("unexpected workspace response");
+    };
+    let session = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
+            workspace_id: workspace.id,
+            name: "live page".to_owned(),
+        },
+    )));
+    let session_id = match session.result.unwrap() {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => snapshot.id,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id,
+            task: "stream a response".to_owned(),
+            model: ModelId::new("slow/model"),
+            system_instructions: None,
+            repository_instructions: None,
+        },
+    )));
+    let run_id = match started.result.unwrap() {
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    first_delta
+        .recv_timeout(Duration::from_secs(10))
+        .expect("first model delta");
+
+    // The stream stays open, so the run is still producing its answer while the
+    // first delta sits in the fragment buffer: the assistant message has no
+    // durable row at all yet. A page read that only looked at SQLite would
+    // answer without the run's newest message.
+    let handle = backend.runs().unwrap().get(&run_id).cloned().unwrap();
+    for _ in 0..200 {
+        if handle.message_fragments.lock().unwrap().pending_bytes == "first".len() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        handle.message_fragments.lock().unwrap().pending_bytes,
+        "first".len()
+    );
+
+    let page = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunMessagePage {
+            run_id,
+            before_ordinal: None,
+            limit: MAX_AGENT_RUN_MESSAGE_PAGE_SIZE,
+        },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunMessagePage { messages, .. }) =
+        page.result.unwrap()
+    else {
+        panic!("unexpected run message page response");
+    };
+    let newest = messages.first().expect("the newest page is not empty");
+    assert_eq!(newest.role, loom_model::MessageRole::Assistant);
+    assert_eq!(newest.content_bytes, "first".len() as u64);
+    // The read flushed the buffered tail instead of leaving it for the flusher.
+    assert_eq!(handle.message_fragments.lock().unwrap().pending_bytes, 0);
+
+    let transcript = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunTranscriptPage {
+            run_id,
+            before_ordinal: None,
+            limit: MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE,
+        },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunTranscriptPage {
+        messages,
+        has_older,
+        ..
+    }) = transcript.result.unwrap()
+    else {
+        panic!("unexpected run transcript page response");
+    };
+    let streamed = messages.last().expect("the transcript page is not empty");
+    assert_eq!(streamed.ordinal, newest.ordinal);
+    assert_eq!(streamed.message.content, "first");
+    assert!(!streamed.content_truncated);
+    assert!(!has_older);
+
+    release_second.send(()).unwrap();
+    second_delta
+        .recv_timeout(Duration::from_secs(10))
+        .expect("second model delta");
+    finish.send(()).unwrap();
+    await_settled_run(&connection, run_id);
+    drop(connection);
+    drop(backend);
+    fs::remove_dir_all(session_root_base).unwrap();
+    let _ = fs::remove_file(&persistence);
+    let _ = fs::remove_file(persistence.with_extension("db-shm"));
+    let _ = fs::remove_file(persistence.with_extension("db-wal"));
+}
+
+#[test]
+fn a_completed_run_serves_the_same_message_page_without_a_live_handle() {
+    let (endpoint, first_delta, release_second, second_delta, finish) =
+        gated_model_endpoint("first");
+    let persistence = std::env::temp_dir().join(format!(
+        "loom-server-completed-page-{}.db",
+        WorkspaceId::new()
+    ));
+    let backend = InProcessBackend::with_openai_compatible_persistent(
+        endpoint,
+        "key",
+        ModelId::new("slow/model"),
+        &persistence,
+    )
+    .unwrap();
+    let session_root_base = backend.session_root_base.clone();
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+    let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Completed page workspace".to_owned(),
+        },
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+        workspace.result.unwrap()
+    else {
+        panic!("unexpected workspace response");
+    };
+    let session = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
+            workspace_id: workspace.id,
+            name: "completed page".to_owned(),
+        },
+    )));
+    let session_id = match session.result.unwrap() {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => snapshot.id,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id,
+            task: "stream a response".to_owned(),
+            model: ModelId::new("slow/model"),
+            system_instructions: None,
+            repository_instructions: None,
+        },
+    )));
+    let run_id = match started.result.unwrap() {
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    first_delta
+        .recv_timeout(Duration::from_secs(10))
+        .expect("first model delta");
+    release_second.send(()).unwrap();
+    second_delta
+        .recv_timeout(Duration::from_secs(10))
+        .expect("second model delta");
+    finish.send(()).unwrap();
+    assert_eq!(
+        await_settled_run(&connection, run_id).state,
+        AgentRunState::Completed
+    );
+
+    let page_headers = |connection: &InProcessConnection| {
+        let page = connection.request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::GetAgentRunMessagePage {
+                run_id,
+                before_ordinal: None,
+                limit: MAX_AGENT_RUN_MESSAGE_PAGE_SIZE,
+            },
+        )));
+        let ServerResponse::Run(RunResponse::AgentRunMessagePage { messages, .. }) =
+            page.result.unwrap()
+        else {
+            panic!("unexpected run message page response");
+        };
+        messages
+    };
+    let with_live_handle = page_headers(&connection);
+    assert!(
+        with_live_handle
+            .iter()
+            .any(|message| message.role == loom_model::MessageRole::Assistant
+                && message.content_bytes == "firstsecond".len() as u64),
+        "a completed run must serve its full durable transcript: {with_live_handle:?}"
+    );
+
+    // A run whose handle is not registered (a fresh process only registers
+    // active runs) takes the persisted path, and it must serve the same page.
+    backend.runs().unwrap().remove(&run_id);
+    assert_eq!(page_headers(&connection), with_live_handle);
+
+    drop(connection);
+    drop(backend);
+    fs::remove_dir_all(session_root_base).unwrap();
+    let _ = fs::remove_file(&persistence);
+    let _ = fs::remove_file(persistence.with_extension("db-shm"));
+    let _ = fs::remove_file(persistence.with_extension("db-wal"));
+}
+
+#[test]
 fn streamed_message_fragments_flush_at_the_byte_threshold_without_splitting_utf8() {
     let content = format!(
         "{}é",
