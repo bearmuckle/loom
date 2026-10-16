@@ -208,10 +208,33 @@ pub enum EventsResponse {
         events: Vec<WorkspaceFeedEvent>,
         #[serde(default)]
         stream_epoch: Option<String>,
+        /// The cursor a bounded batch stopped at, so the caller continues from
+        /// it.
+        ///
+        /// The workspace feed is bounded to one response frame for the same
+        /// reason a session batch is: it grows with activity, so a feed larger
+        /// than the bound arrives as a sequence of pages. `Some(sequence)` means
+        /// this page ended at that event because the response reached its bound
+        /// and more events follow: the caller asks again with
+        /// `after_sequence: Some(sequence)` until `None` says the page reached
+        /// the latest event of the feed. The field is additive (`serde`
+        /// default), so a body that omits it decodes as `None` and a caller that
+        /// ignores it still advances from the events it received.
+        #[serde(default)]
+        next_after_sequence: Option<EventSequence>,
     },
 
     SessionEventsSnapshot {
         session: AgentSessionSnapshot,
+        /// The retained window, or its newest part when that window is larger
+        /// than one response frame.
+        ///
+        /// A snapshot is bounded to a frame as well: an oversized window is
+        /// delivered from its newest event backwards, and `oldest_sequence`
+        /// names the first sequence actually carried rather than the oldest one
+        /// the journal retains. Everything older is recovered by the durable
+        /// rebuild the snapshot triggers, which is why dropping the oldest side
+        /// is safe while dropping the newest would not be.
         events: Vec<ServerEventEnvelope>,
         oldest_sequence: EventSequence,
         latest_sequence: EventSequence,
@@ -221,10 +244,15 @@ pub enum EventsResponse {
 
     /// Returned when a workspace cursor is stale or the backend epoch changed. `sessions`
     /// is the current workspace catalog snapshot; `events` contains the retained workspace
-    /// feed. `latest_sequence` is the latest event for this workspace, not the global head.
+    /// feed, or its newest part when the feed is larger than one response frame.
+    /// `latest_sequence` is the latest event for this workspace, not the global head.
     WorkspaceEventsSnapshot {
         workspace_id: WorkspaceId,
         sessions: Vec<AgentSessionSnapshot>,
+        /// The retained feed, or its newest part when it is larger than one
+        /// response frame; `oldest_sequence` then names the first sequence
+        /// actually carried. Older events come from the durable workspace
+        /// catalog the snapshot carries instead.
         events: Vec<WorkspaceFeedEvent>,
         oldest_sequence: EventSequence,
         latest_sequence: EventSequence,

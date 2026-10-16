@@ -106,6 +106,13 @@ impl InProcessConnection {
                                     .map(|cursor| cursor.pruned_through.next())
                             })
                             .unwrap_or_else(|| latest_sequence.next());
+                        // A snapshot cannot page, so the feed window it carries
+                        // is bounded to its newest events and `oldest_sequence`
+                        // says how far back this response reaches; the caller
+                        // rebuilds the older part from the workspace catalog the
+                        // same snapshot carries.
+                        let window = self.bound_workspace_snapshot(events)?;
+                        let oldest_sequence = window.oldest_sequence.unwrap_or(oldest_sequence);
                         return Ok(ServerResponse::Events(
                             EventsResponse::WorkspaceEventsSnapshot {
                                 workspace_id,
@@ -113,17 +120,22 @@ impl InProcessConnection {
                                     .backend
                                     .sessions()?
                                     .list_in_workspace(Some(workspace_id), true),
-                                events,
+                                events: window.events,
                                 oldest_sequence,
                                 latest_sequence,
                                 stream_epoch: current_stream_epoch,
                             },
                         ));
                     }
+                    // The feed grows with activity, so it is bounded like a
+                    // session batch: the oldest events of the backlog are kept
+                    // and the caller continues from the cursor this page names.
+                    let page = self.bound_workspace_events(events)?;
                     return Ok(ServerResponse::Events(EventsResponse::WorkspaceEvents {
                         workspace_id,
-                        events,
+                        events: page.events,
                         stream_epoch: current_stream_epoch,
+                        next_after_sequence: page.next_after_sequence,
                     }));
                 }
                 let (events, session_latest_sequence) = match session_id {
@@ -170,10 +182,17 @@ impl InProcessConnection {
                                     .unwrap_or(journal.next_sequence)
                                     .next()
                             });
+                        // A snapshot cannot page, so the window it carries is
+                        // bounded to its newest events: the caller resumes into
+                        // that state, and the durable rebuild the same snapshot
+                        // triggers recovers everything older than
+                        // `oldest_sequence`.
+                        let window = self.bound_event_snapshot(events)?;
+                        let oldest_sequence = window.oldest_sequence.unwrap_or(oldest_sequence);
                         return Ok(ServerResponse::Events(
                             EventsResponse::SessionEventsSnapshot {
                                 session: self.backend.sessions()?.get(session_id)?,
-                                events,
+                                events: window.events,
                                 oldest_sequence,
                                 latest_sequence: session_latest_sequence
                                     .unwrap_or(journal.next_sequence),

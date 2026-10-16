@@ -814,6 +814,112 @@ fn event_pages_are_followed_and_merged_into_one_batch() {
     );
 }
 
+/// The project feed is bounded the same way a session batch is, so the rule the
+/// project poll follows is the same one: a page names a cursor that moves
+/// forward, and a response that is not a feed page never continues.
+#[test]
+fn workspace_feed_pages_are_followed_by_the_cursor_they_name() {
+    let workspace_id = WorkspaceId::new();
+    let feed_event = |sequence: u64| {
+        loom_protocol::WorkspaceFeedEvent::Workspace(loom_protocol::WorkspaceEventEnvelope {
+            protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
+            sequence: EventSequence::new(sequence),
+            workspace_id,
+            event: loom_protocol::WorkspaceEvent::Renamed {
+                name: format!("name {sequence}"),
+            },
+        })
+    };
+    let page = |events, next_after_sequence| {
+        loom_protocol::ResponseEnvelope::success(
+            loom_core::RequestId::new(),
+            ServerResponse::Events(EventsResponse::WorkspaceEvents {
+                workspace_id,
+                events,
+                stream_epoch: Some("node".to_owned()),
+                next_after_sequence,
+            }),
+        )
+    };
+
+    let first = page(vec![feed_event(1)], Some(EventSequence::new(1)));
+    assert_eq!(
+        workspace_feed_page_continuation(&first, None),
+        Some((EventSequence::new(1), Some("node".to_owned())))
+    );
+    // A cursor that does not move forward cannot be followed, so it stops the
+    // loop instead of asking for the same page forever.
+    assert_eq!(
+        workspace_feed_page_continuation(&first, Some(EventSequence::new(1))),
+        None
+    );
+    // A page that reached the latest feed event names none.
+    let last = page(vec![feed_event(2)], None);
+    assert_eq!(
+        workspace_feed_page_continuation(&last, Some(EventSequence::new(1))),
+        None
+    );
+    // A failure never continues.
+    assert_eq!(
+        workspace_feed_page_continuation(
+            &loom_protocol::ResponseEnvelope::failure(
+                loom_core::RequestId::new(),
+                loom_core::LoomError::not_found("workspace", workspace_id),
+            ),
+            None
+        ),
+        None
+    );
+}
+
+/// The project poll answers a feed page and leaves the feed cursor where the
+/// answer reached, so a later poll continues from it instead of replaying the
+/// page. The fixture has no live child on purpose: a project with one re-arms the
+/// poll on a timer, which a synchronous test cannot wait out.
+#[cfg(not(target_family = "wasm"))]
+#[gpui_kit::test]
+fn a_project_poll_answers_a_feed_page_without_rewinding_the_cursor(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        let root = view.active_session.id;
+        let project_id = loom_core::ProjectId::from_uuid(*root.as_uuid());
+        view.project_snapshot = Some(loom_core::ProjectSnapshot {
+            project_id,
+            root_session_id: root,
+            agents: vec![loom_core::ProjectAgentRecord {
+                session_id: root,
+                project_id,
+                parent_session_id: None,
+                depth: 1,
+                state: AgentSessionState::Idle,
+                task_summary: None,
+                output_cursor: EventSequence::default(),
+                updated_at: Timestamp::from_unix_millis(1),
+            }],
+            tasks: Vec::new(),
+            worktrees: Vec::new(),
+        });
+        view.project_feed_after_sequence = Some(EventSequence::new(3));
+        view.poll_project_once(cx);
+        view
+    });
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        let view = window
+            .root::<LoomView>()
+            .flatten()
+            .expect("the view is mounted");
+        assert!(
+            view.read(cx)
+                .project_feed_after_sequence
+                .is_some_and(|cursor| cursor >= EventSequence::new(3)),
+            "the poll must leave the feed cursor at or past where it asked from"
+        );
+    })
+    .unwrap();
+}
+
 /// A poll that finds more events than one bounded response carries keeps asking
 /// for the pages that follow instead of waiting for the next poll cadence.
 #[cfg(not(target_family = "wasm"))]

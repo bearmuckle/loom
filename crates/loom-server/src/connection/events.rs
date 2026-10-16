@@ -8,111 +8,220 @@ use super::*;
 /// the events it leaves room for always fit the configured frame limit.
 const EVENT_BATCH_ENVELOPE_BYTES: usize = 512;
 
-/// One bounded page of journaled session events.
+/// One item of a journaled batch: where it sits in the journal, and what it
+/// costs in a response.
+///
+/// Two response families are bounded the same way — the session events batch and
+/// the workspace feed — so the bound itself is written once against this trait.
+trait FeedItem {
+    /// What one item is called in a size diagnostic.
+    const NOUN: &'static str;
+
+    fn sequence(&self) -> EventSequence;
+
+    fn encoded_bytes(&self) -> Result<usize>;
+}
+
+impl FeedItem for ServerEventEnvelope {
+    const NOUN: &'static str = "session event";
+
+    fn sequence(&self) -> EventSequence {
+        self.sequence
+    }
+
+    fn encoded_bytes(&self) -> Result<usize> {
+        loom_protocol::encode_event(self)
+            .map(|bytes| bytes.len())
+            .map_err(|error| {
+                LoomError::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "could not measure session event {} for the events batch bound: {error}",
+                        self.sequence
+                    ),
+                    false,
+                )
+            })
+    }
+}
+
+impl FeedItem for loom_protocol::WorkspaceFeedEvent {
+    const NOUN: &'static str = "workspace feed event";
+
+    fn sequence(&self) -> EventSequence {
+        match self {
+            Self::Session(event) => event.sequence,
+            Self::Workspace(event) => event.sequence,
+        }
+    }
+
+    fn encoded_bytes(&self) -> Result<usize> {
+        serde_json::to_vec(self)
+            .map(|bytes| bytes.len())
+            .map_err(|error| {
+                LoomError::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "could not measure workspace feed event {} for the events batch bound: {error}",
+                        self.sequence()
+                    ),
+                    false,
+                )
+            })
+    }
+}
+
+/// Which side of an oversized batch a response keeps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchEdge {
+    /// Keep the oldest items and name the cursor to continue from, so a caller
+    /// follows the pages forward. This is the paged batch, which can afford
+    /// nothing else.
+    Oldest,
+    /// Keep the newest items. A response that cannot page (a snapshot) has to
+    /// carry the state the caller is resuming into, and the older part is
+    /// recovered from durable state by the rebuild the snapshot triggers.
+    Newest,
+}
+
+/// One bounded page of journaled events.
 #[derive(Debug)]
-pub(crate) struct BoundedEventBatch {
+pub(crate) struct BoundedBatch<T> {
     /// The events this page carries, in sequence order.
-    pub(crate) events: Vec<ServerEventEnvelope>,
+    pub(crate) events: Vec<T>,
     /// The sequence to continue from when [`Self::events`] does not reach the
-    /// latest journaled event; `None` when the page did.
+    /// latest journaled event; `None` when the page did — and always `None` for
+    /// [`BatchEdge::Newest`], which cannot drop the newest side.
     pub(crate) next_after_sequence: Option<EventSequence>,
+    /// The first sequence the page carries, which for [`BatchEdge::Newest`] is
+    /// the oldest sequence this response reached; `None` for an empty page.
+    pub(crate) oldest_sequence: Option<EventSequence>,
 }
 
 /// Bounds one batch of journaled events to a single response frame.
 ///
-/// The events response is the one response that grows with the journal, so it is
-/// delivered as a sequence of pages a caller follows: each page stops before the
-/// event count (`MAX_EVENT_BATCH_EVENTS`) or the configured response byte budget
-/// would be crossed and names the sequence to continue from.
+/// Both response families that grow with the journal are bounded here: the events
+/// batch, which is delivered as a sequence of pages a caller follows, and a
+/// snapshot, which cannot page and therefore keeps its newest side instead. Each
+/// page stops before the event count (`MAX_EVENT_BATCH_EVENTS`) or the configured
+/// response byte budget would be crossed.
 ///
 /// An event that alone exceeds the byte budget cannot be delivered in any frame
-/// under the configured limit. When such an event is the first of the batch it is
-/// reported as [`ErrorCode::PayloadTooLarge`] naming its sequence and size,
-/// instead of the batch being sent and the caller's own frame rule dropping the
-/// event without telling anyone which one was lost. Later in a batch it ends the
-/// page before it, so the caller reaches it as the first event of the next page
-/// and is told about it there.
+/// under the configured limit. When such an event is the one the response has to
+/// carry — the first event of an oldest-first page, or the newest event of a
+/// snapshot — it is reported as [`ErrorCode::PayloadTooLarge`] naming its
+/// sequence and size, instead of the response being sent and the reader's own
+/// frame rule dropping the event without telling anyone which one was lost.
+/// Elsewhere it simply ends the page, and the caller reaches it on the next one
+/// or recovers it durably.
 ///
 /// `max_response_bytes` is the frame limit this connection's responses must fit
 /// (`None` for an in-process caller, which has no frame): the batch is then
 /// bounded by event count alone.
-pub(crate) fn bound_event_batch(
-    events: Vec<ServerEventEnvelope>,
+fn bound_batch<T: FeedItem>(
+    items: Vec<T>,
     max_response_bytes: Option<usize>,
-) -> Result<BoundedEventBatch> {
+    edge: BatchEdge,
+) -> Result<BoundedBatch<T>> {
     // The events themselves must fit what the response envelope leaves over.
     let content_budget =
         max_response_bytes.map(|limit| limit.saturating_sub(EVENT_BATCH_ENVELOPE_BYTES));
-    let mut page = Vec::new();
+    // A budget only exists with a limit, so a diagnostic always has one to name.
+    let configured_limit = max_response_bytes.unwrap_or_default();
+    let fits = |size: usize, total: usize| {
+        content_budget.is_none_or(|budget| total.saturating_add(size) <= budget)
+    };
+    let mut page: Vec<T> = Vec::new();
     let mut total = 0usize;
     let mut next_after_sequence = None;
-    for event in events {
-        let size = encoded_event_bytes(&event)?;
-        if let Some(budget) = content_budget
-            && size > budget
-        {
-            // The event cannot fit any frame under the configured limit, so the
-            // page never includes it. As the first event it is reported by name
-            // instead of being sent and dropped; later it ends this page and is
-            // reported as the first event of the next one.
-            if page.is_empty() {
-                return Err(event_too_large_error(
-                    event.sequence,
-                    size,
-                    // A budget only exists with a limit, so the diagnostic always
-                    // has one to name.
-                    max_response_bytes.unwrap_or_default(),
-                ));
+    match edge {
+        BatchEdge::Oldest => {
+            for item in items {
+                let size = item.encoded_bytes()?;
+                let oversized = content_budget.is_some_and(|budget| size > budget);
+                if oversized && page.is_empty() {
+                    return Err(event_too_large_error(
+                        T::NOUN,
+                        item.sequence(),
+                        size,
+                        configured_limit,
+                    ));
+                }
+                if oversized || page.len() >= MAX_EVENT_BATCH_EVENTS || !fits(size, total) {
+                    // This event opens the next page, and the caller is told
+                    // where to continue.
+                    next_after_sequence = page.last().map(FeedItem::sequence);
+                    break;
+                }
+                total += size;
+                page.push(item);
             }
-        } else if page.len() < MAX_EVENT_BATCH_EVENTS
-            && content_budget.is_none_or(|budget| total + size <= budget)
-        {
-            total += size;
-            page.push(event);
-            continue;
         }
-        next_after_sequence = last_sequence(&page);
-        break;
+        BatchEdge::Newest => {
+            // Walked from the newest event backwards, because a snapshot has to
+            // carry the state the caller resumes into: dropping the newest side
+            // would hand it a window that cannot be completed, while the oldest
+            // side is recovered from durable state by the rebuild the snapshot
+            // triggers.
+            let mut newest_first: Vec<T> = Vec::new();
+            for item in items.into_iter().rev() {
+                let size = item.encoded_bytes()?;
+                let oversized = content_budget.is_some_and(|budget| size > budget);
+                if oversized && newest_first.is_empty() {
+                    // The newest event cannot fit any frame this connection may
+                    // send, so no snapshot can carry it: name it instead of
+                    // sending a response the reader discards.
+                    return Err(event_too_large_error(
+                        T::NOUN,
+                        item.sequence(),
+                        size,
+                        configured_limit,
+                    ));
+                }
+                if oversized || newest_first.len() >= MAX_EVENT_BATCH_EVENTS || !fits(size, total) {
+                    // Older than the window this response can carry; the
+                    // caller's durable rebuild covers it.
+                    break;
+                }
+                total += size;
+                newest_first.push(item);
+            }
+            newest_first.reverse();
+            page = newest_first;
+        }
     }
-    Ok(BoundedEventBatch {
+    let oldest_sequence = page.first().map(FeedItem::sequence);
+    Ok(BoundedBatch {
         events: page,
         next_after_sequence,
+        oldest_sequence,
     })
 }
 
-/// The sequence a follow-up page continues from: the last event of the page.
-///
-/// Every page either carries an event or reports the unfit one it could not fit,
-/// so the caller's cursor moves forward on every answer and cannot loop on the
-/// same batch.
-fn last_sequence(events: &[ServerEventEnvelope]) -> Option<EventSequence> {
-    events.last().map(|event| event.sequence)
-}
-
-/// The encoded size of one event envelope, in bytes.
-fn encoded_event_bytes(event: &ServerEventEnvelope) -> Result<usize> {
-    loom_protocol::encode_event(event)
-        .map(|bytes| bytes.len())
-        .map_err(|error| {
-            LoomError::new(
-                ErrorCode::Internal,
-                format!(
-                    "could not measure session event {} for the events batch bound: {error}",
-                    event.sequence
-                ),
-                false,
-            )
-        })
+/// Bounds a batch that a caller follows page by page: the oldest events are
+/// kept and the continuation cursor names the next page.
+pub(crate) fn bound_event_batch(
+    events: Vec<ServerEventEnvelope>,
+    max_response_bytes: Option<usize>,
+) -> Result<BoundedBatch<ServerEventEnvelope>> {
+    bound_batch(events, max_response_bytes, BatchEdge::Oldest)
 }
 
 /// The diagnostic for an event that cannot fit an events response at all.
 ///
 /// It names the event's sequence and size, because the caller otherwise only
 /// sees a sequence gap: the frame would have been sent and dropped by the
-/// caller's own frame rule, with nothing saying which event went missing.
-fn event_too_large_error(sequence: EventSequence, size: usize, limit: usize) -> LoomError {
+/// caller's own frame rule, with nothing saying which event went missing. `noun`
+/// says which response family the event belongs to, so a workspace feed event is
+/// not reported as a session event.
+fn event_too_large_error(
+    noun: &str,
+    sequence: EventSequence,
+    size: usize,
+    limit: usize,
+) -> LoomError {
     LoomError::payload_too_large(format!(
-        "session event {sequence} of {size} bytes cannot be delivered: it is above the configured \
+        "{noun} {sequence} of {size} bytes cannot be delivered: it is above the configured \
          {limit}-byte response frame limit, so the events batch stops before it; raise the frame \
          size limit to fetch it"
     ))
@@ -120,12 +229,40 @@ fn event_too_large_error(sequence: EventSequence, size: usize, limit: usize) -> 
 
 impl InProcessConnection {
     /// Bounds one batch of journaled events to a response this connection may
-    /// send; see [`bound_event_batch`].
+    /// send; see [`bound_batch`].
     pub(crate) fn bound_event_batch(
         &self,
         events: Vec<ServerEventEnvelope>,
-    ) -> Result<BoundedEventBatch> {
+    ) -> Result<BoundedBatch<ServerEventEnvelope>> {
         bound_event_batch(events, self.max_response_bytes)
+    }
+
+    /// Bounds a session snapshot's window, keeping its newest events.
+    ///
+    /// A snapshot cannot page, so the state the caller resumes into is the part
+    /// that has to fit; the caller recovers everything older from the durable
+    /// projection the snapshot is paired with.
+    pub(crate) fn bound_event_snapshot(
+        &self,
+        events: Vec<ServerEventEnvelope>,
+    ) -> Result<BoundedBatch<ServerEventEnvelope>> {
+        bound_batch(events, self.max_response_bytes, BatchEdge::Newest)
+    }
+
+    /// Bounds one page of the workspace feed, which a caller follows forward.
+    pub(crate) fn bound_workspace_events(
+        &self,
+        events: Vec<loom_protocol::WorkspaceFeedEvent>,
+    ) -> Result<BoundedBatch<loom_protocol::WorkspaceFeedEvent>> {
+        bound_batch(events, self.max_response_bytes, BatchEdge::Oldest)
+    }
+
+    /// Bounds a workspace snapshot's feed window, keeping its newest events.
+    pub(crate) fn bound_workspace_snapshot(
+        &self,
+        events: Vec<loom_protocol::WorkspaceFeedEvent>,
+    ) -> Result<BoundedBatch<loom_protocol::WorkspaceFeedEvent>> {
+        bound_batch(events, self.max_response_bytes, BatchEdge::Newest)
     }
 
     pub(crate) fn session_events_since(

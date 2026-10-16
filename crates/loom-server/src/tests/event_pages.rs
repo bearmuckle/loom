@@ -341,3 +341,241 @@ fn an_event_above_the_response_bound_is_reported_instead_of_dropped() {
         vec![after]
     );
 }
+
+/// A session events request whose stream epoch the backend never had.
+///
+/// One way a cursor is treated as stale is an epoch the connection no longer
+/// belongs to, which is what makes the backend answer with the snapshot fallback
+/// — the response a client takes when the incremental path cannot be served.
+fn stale_epoch_request(
+    session_id: AgentSessionId,
+    after_sequence: Option<EventSequence>,
+) -> RequestEnvelope {
+    RequestEnvelope::new(ClientRequest::Events(EventsRequest::GetSessionEvents {
+        session_id: Some(session_id),
+        workspace_id: None,
+        after_sequence,
+        stream_epoch: Some("an-epoch-this-backend-never-had".to_owned()),
+    }))
+}
+
+#[test]
+fn a_snapshot_above_the_response_bound_keeps_its_newest_events() {
+    const LIMIT: usize = 2048;
+    let (backend, session_id) = workspace_and_session("snapshot-bound");
+    for index in 0..40 {
+        append_delta(
+            &backend,
+            session_id,
+            "d".repeat(160) + &format!("{index:03}"),
+        );
+    }
+    let connection = backend.connect().with_max_response_bytes(LIMIT);
+    negotiate(&connection);
+
+    let response = connection.request(stale_epoch_request(session_id, None));
+    let frame_bytes = encode_response(&response)
+        .expect("the snapshot response should encode")
+        .len();
+    let ServerResponse::Events(EventsResponse::SessionEventsSnapshot {
+        events,
+        oldest_sequence,
+        latest_sequence,
+        ..
+    }) = response.result.unwrap()
+    else {
+        panic!("the stale epoch should be answered with the snapshot fallback");
+    };
+
+    let journaled = journaled_sequences(&backend, session_id);
+    assert_eq!(latest_sequence, *journaled.last().unwrap());
+    assert!(
+        !events.is_empty(),
+        "a bounded snapshot still carries its newest events"
+    );
+    // The window keeps the newest events, so what it carries is the tail of the
+    // journal and `oldest_sequence` names the first one carried rather than the
+    // oldest one the journal retains: the caller rebuilds the older part from
+    // durable state, which is why dropping that side is safe.
+    let carried = events
+        .iter()
+        .map(|event| event.sequence)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        carried,
+        journaled[journaled.len() - carried.len()..].to_vec()
+    );
+    assert_eq!(oldest_sequence, carried[0]);
+    assert!(
+        oldest_sequence > journaled[0],
+        "the whole retained window must not be what was sent: {oldest_sequence} vs {}",
+        journaled[0]
+    );
+    assert!(
+        frame_bytes <= LIMIT,
+        "a snapshot of {frame_bytes} bytes is above the configured {LIMIT}-byte frame limit"
+    );
+}
+
+#[test]
+fn an_event_that_cannot_fit_a_snapshot_is_reported_by_name() {
+    const LIMIT: usize = 2048;
+    let (backend, session_id) = workspace_and_session("snapshot-unfit");
+    append_delta(&backend, session_id, "small".to_owned());
+    let unfit = append_delta(&backend, session_id, "h".repeat(4096));
+    let connection = backend.connect().with_max_response_bytes(LIMIT);
+    negotiate(&connection);
+
+    // The newest event is the one a snapshot cannot leave out, so this is the
+    // one case where the diagnostic is the only honest answer: sending the
+    // response would let the reader drop the event without saying which one.
+    let error = connection
+        .request(stale_epoch_request(session_id, None))
+        .result
+        .expect_err("a snapshot whose newest event cannot fit must be reported");
+    let encoded_size = encode_event(
+        &backend
+            .journal()
+            .unwrap()
+            .events_since(Some(session_id), None)
+            .into_iter()
+            .find(|event| event.sequence == unfit)
+            .expect("the unfit event should be journaled"),
+    )
+    .expect("the unfit event should encode")
+    .len();
+    assert_eq!(error.code, ErrorCode::PayloadTooLarge);
+    assert!(
+        !error.retryable,
+        "raising the limit is the only fix: {error}"
+    );
+    assert!(
+        error.message.contains(&unfit.to_string()),
+        "the diagnostic must name the event: {error}"
+    );
+    assert!(
+        error.message.contains(&encoded_size.to_string()),
+        "the diagnostic must name the event size {encoded_size}: {error}"
+    );
+    assert!(
+        error.message.contains(&LIMIT.to_string()),
+        "the diagnostic must name the configured limit: {error}"
+    );
+}
+
+#[test]
+fn a_workspace_feed_above_the_response_bound_is_delivered_in_followable_pages() {
+    const LIMIT: usize = 2048;
+    let backend = InProcessBackend::new();
+    let setup = backend.connect();
+    negotiate(&setup);
+    let workspace_id = match setup
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "feed bound workspace".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace.id,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let session_id = match setup
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id,
+                name: "feed bound session".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    // The feed belongs to a workspace with a session in it, which is what makes
+    // the session events part of it.
+    assert!(
+        backend
+            .sessions()
+            .unwrap()
+            .list_in_workspace(Some(workspace_id), true)
+            .iter()
+            .any(|session| session.id == session_id)
+    );
+
+    // Long names, so the feed crosses the bound with a handful of events.
+    let mut appended = Vec::new();
+    for index in 0..40 {
+        appended.push(backend.journal().unwrap().append_workspace(
+            workspace_id,
+            loom_protocol::WorkspaceEvent::Renamed {
+                name: format!("{}{index:03}", "n".repeat(200)),
+            },
+        ));
+    }
+
+    let connection = backend.connect().with_max_response_bytes(LIMIT);
+    negotiate(&connection);
+    let mut cursor = Some(EventSequence::default());
+    let mut collected: Vec<EventSequence> = Vec::new();
+    let mut pages = 0;
+    loop {
+        let response = connection.request(RequestEnvelope::new(ClientRequest::Events(
+            EventsRequest::GetSessionEvents {
+                session_id: None,
+                workspace_id: Some(workspace_id),
+                after_sequence: cursor,
+                stream_epoch: None,
+            },
+        )));
+        let frame_bytes = encode_response(&response)
+            .expect("a feed page should encode")
+            .len();
+        let ServerResponse::Events(EventsResponse::WorkspaceEvents {
+            events,
+            next_after_sequence,
+            ..
+        }) = response.result.unwrap()
+        else {
+            panic!("the feed should be answered with bounded pages");
+        };
+        assert!(
+            !events.is_empty(),
+            "every page must make progress towards the latest feed event"
+        );
+        assert!(
+            frame_bytes <= LIMIT,
+            "a feed page of {frame_bytes} bytes is above the configured {LIMIT}-byte frame limit"
+        );
+        for event in &events {
+            let sequence = match event {
+                loom_protocol::WorkspaceFeedEvent::Session(event) => event.sequence,
+                loom_protocol::WorkspaceFeedEvent::Workspace(event) => event.sequence,
+            };
+            assert!(
+                cursor.is_none_or(|cursor| sequence > cursor),
+                "page repeats sequence {sequence}"
+            );
+            collected.push(sequence);
+        }
+        pages += 1;
+        match next_after_sequence {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    assert!(pages > 1, "the feed should not fit one page");
+    assert!(
+        collected.windows(2).all(|pair| pair[1] > pair[0]),
+        "the pages must carry the feed in sequence order without repeating"
+    );
+    for sequence in &appended {
+        assert!(
+            collected.contains(sequence),
+            "the followed pages must carry every event, missing {sequence}"
+        );
+    }
+}

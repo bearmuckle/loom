@@ -991,6 +991,51 @@ mod run_message_protocol_tests {
             serde_json::from_slice::<ServerResponse>(&encoded).unwrap(),
             response
         );
+
+        // The incremental feed carries the same additive continuation cursor as
+        // a session batch, so a peer that predates it omits the field and has to
+        // read it as an unbounded page rather than as a failure.
+        let page = ServerResponse::Events(EventsResponse::WorkspaceEvents {
+            workspace_id,
+            events: vec![WorkspaceFeedEvent::Workspace(WorkspaceEventEnvelope {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                sequence: EventSequence::new(5),
+                workspace_id,
+                event: WorkspaceEvent::Renamed {
+                    name: "new name".to_owned(),
+                },
+            })],
+            stream_epoch: Some("epoch".to_owned()),
+            next_after_sequence: Some(EventSequence::new(5)),
+        });
+        let encoded = serde_json::to_vec(&page).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ServerResponse>(&encoded).unwrap(),
+            page
+        );
+        let mut without_cursor = serde_json::to_value(&page).unwrap();
+        // Two tagged layers: the `ServerResponse` and the `EventsResponse`
+        // inside it, so the feed fields sit at the second `data`.
+        let data = without_cursor["data"]["data"].as_object_mut().unwrap();
+        data.remove("stream_epoch");
+        data.remove("next_after_sequence");
+        let decoded: ServerResponse = serde_json::from_value(without_cursor).unwrap();
+        assert_eq!(
+            decoded,
+            ServerResponse::Events(EventsResponse::WorkspaceEvents {
+                workspace_id,
+                events: vec![WorkspaceFeedEvent::Workspace(WorkspaceEventEnvelope {
+                    protocol_version: CURRENT_PROTOCOL_VERSION,
+                    sequence: EventSequence::new(5),
+                    workspace_id,
+                    event: WorkspaceEvent::Renamed {
+                        name: "new name".to_owned(),
+                    },
+                })],
+                stream_epoch: None,
+                next_after_sequence: None,
+            })
+        );
     }
 
     #[test]

@@ -67,17 +67,20 @@ impl LoomView {
             .iter()
             .map(|agent| agent.session_id)
             .collect::<BTreeSet<_>>();
-        let after_sequence = self.project_feed_after_sequence;
+        let request_cursor = self.project_feed_after_sequence;
         let stream_epoch = self.project_feed_epoch.clone();
         self.dispatch(
             cx,
             ClientRequest::Events(EventsRequest::GetSessionEvents {
                 session_id: None,
                 workspace_id: Some(workspace_id),
-                after_sequence,
+                after_sequence: request_cursor,
                 stream_epoch,
             }),
             move |view, response, cx| {
+                // Read before the response is consumed, so a page the backend
+                // bounded is followed from the cursor this poll asked on.
+                let continuation = workspace_feed_page_continuation(&response, request_cursor);
                 if view.active_session.id != root_session_id
                     || view.active_session.workspace_id != workspace_id
                 {
@@ -90,6 +93,7 @@ impl LoomView {
                         workspace_id: response_workspace,
                         events,
                         stream_epoch,
+                        ..
                     })) if response_workspace == workspace_id => {
                         view.project_feed_epoch = stream_epoch;
                         if let Some(latest) = events.iter().map(workspace_feed_event_sequence).max()
@@ -145,7 +149,20 @@ impl LoomView {
                     // event batch.
                     view.start_run_poll_if_idle(cx);
                 }
-                view.schedule_project_poll(cx);
+                match continuation {
+                    // Keep draining the feed pages the backend named without
+                    // waiting out the poll cadence; every answer advances the
+                    // cursor, so the loop ends at the latest feed event.
+                    Some((next, _)) => {
+                        view.project_feed_after_sequence = Some(
+                            view.project_feed_after_sequence
+                                .map_or(next, |current| current.max(next)),
+                        );
+                        view.project_poll_scheduled = false;
+                        view.poll_project_once(cx);
+                    }
+                    None => view.schedule_project_poll(cx),
+                }
             },
         );
     }
