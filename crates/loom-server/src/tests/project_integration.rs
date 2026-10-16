@@ -855,6 +855,69 @@ fn child_creation_proceeds_with_a_warning_when_the_refresh_fails() {
 }
 
 #[test]
+fn delegated_child_instructions_carry_the_recorded_base_freshness() {
+    let mut fixture = pending_project_code_child_fixture();
+    // Upstream moves after the parent checkout was cloned, so the child's
+    // recorded base is one commit behind the fetched default-branch tip.
+    commit_file(
+        &fixture.source,
+        "upstream.txt",
+        "upstream change\n",
+        "upstream change",
+    );
+    create_project_code_child_checkout(&mut fixture);
+    let recorded = fixture
+        .worktree
+        .base_refresh
+        .clone()
+        .expect("child creation should record its base refresh");
+
+    let mut task = fixture
+        .backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .load_delegated_task(fixture.task_id)
+        .unwrap()
+        .expect("the child task should be durable");
+    fixture
+        .connection
+        .schedule_project_task_if_ready_under_admission(&mut task)
+        .unwrap();
+
+    let run_id = fixture
+        .backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .load_latest_run_summary_for_session(fixture.worktree.child_session_id)
+        .unwrap()
+        .expect("the scheduled child should have started a run")
+        .snapshot
+        .id;
+    let instructions = fixture
+        .backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .load_run_runtime_config(run_id)
+        .unwrap()
+        .expect("the child run should be persisted with its runtime config")
+        .system_instructions
+        .expect("the child run should carry system instructions");
+
+    assert!(
+        instructions.contains("is 1 commit ahead at"),
+        "the child should know how stale its base is: {instructions}"
+    );
+    assert!(
+        instructions.contains(&recorded.summary()),
+        "the child should carry the recorded base summary: {instructions}"
+    );
+    fixture.shutdown();
+}
+
+#[test]
 fn interrupted_project_child_integration_recovers_without_replay() {
     let fixture = project_code_child_fixture();
     commit_file(

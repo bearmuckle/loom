@@ -250,6 +250,20 @@ impl InProcessConnection {
                 task.project_id, task.requester_session_id, task.task_id
             ),
         };
+        // A child checkout is pinned to the parent revision it was created
+        // from, so the freshness recorded then tells the child how stale its
+        // base may already be (#282). This appends the recorded value only; the
+        // child's own run start measures the base again.
+        let system_instructions = match checkout
+            .as_ref()
+            .and_then(|worktree| worktree.base_refresh.as_ref())
+        {
+            Some(base_refresh) => format!(
+                "{system_instructions} Base freshness of your checkout: {}.",
+                base_refresh.summary()
+            ),
+            None => system_instructions,
+        };
         if !persistence.update_delegated_task_status_if_queued(
             task.task_id,
             loom_core::DelegatedTaskStatus::Running,

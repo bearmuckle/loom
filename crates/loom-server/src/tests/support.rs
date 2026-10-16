@@ -176,6 +176,12 @@ impl ProjectCodeChildFixture {
 }
 
 pub(super) fn git_in(dir: &Path, arguments: &[&str]) {
+    git_output(dir, arguments);
+}
+
+/// Runs `git` in `dir` and returns its trimmed stdout, so a test can read back
+/// a branch name or a revision from a repository it just changed.
+pub(super) fn git_output(dir: &Path, arguments: &[&str]) -> String {
     let output = Command::new("git")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
@@ -191,6 +197,7 @@ pub(super) fn git_in(dir: &Path, arguments: &[&str]) {
         arguments,
         String::from_utf8_lossy(&output.stderr)
     );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
 pub(super) fn commit_file(dir: &Path, file: &str, content: &str, message: &str) {

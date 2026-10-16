@@ -383,6 +383,34 @@ impl InProcessConnection {
         Ok(state)
     }
 
+    /// Base-freshness record for the checkout of a session that has exactly one
+    /// attached repository with an `origin`, measured by a refresh performed
+    /// now, or `None` when the session has no such single checkout.
+    ///
+    /// The refresh is bounded by the checkout refresh deadline (see
+    /// `CHILD_WORKTREE_REFRESH_DEADLINE`) and never fails: an unreachable
+    /// remote is recorded as unknown drift so the caller can report the pinned
+    /// base without blocking the run.
+    fn session_checkout_base_refresh(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Option<ProjectWorktreeBaseRefresh> {
+        let repository_id = {
+            let repositories = self.backend.session_repositories().ok()?;
+            let repositories = repositories.get(&session_id)?;
+            if repositories.len() != 1 {
+                return None;
+            }
+            repositories.keys().next().copied()?
+        };
+        let git = self.session_git(session_id, repository_id).ok()?;
+        if !matches!(git.remote_url("origin"), Ok(Some(_))) {
+            return None;
+        }
+        let head = git.status().ok()?.head?;
+        Some(self.refresh_checkout_base_revision(&git, &head))
+    }
+
     pub(crate) fn start_run_with_options(
         &self,
         mut input: StartRunInput,
@@ -436,6 +464,24 @@ impl InProcessConnection {
             input.repository_instructions.take(),
             &workspace.instruction_text()?,
         );
+        // A checkout stays pinned to the revision it was cloned at, so the run
+        // is told how far that revision has drifted from its remote's default
+        // branch now (#282): a stale base is what a push or a pull request
+        // opens against. The refresh is bounded and advisory, because it must
+        // never fail or delay the run, and a session without exactly one
+        // attached repository has no single base to describe.
+        match self.session_checkout_base_refresh(session.id) {
+            Some(base_refresh) => {
+                input.repository_instructions = merge_repository_instructions(
+                    input.repository_instructions.take(),
+                    &base_refresh.summary(),
+                );
+            }
+            None => log::debug!(
+                "session {} has no single attached checkout to report a base freshness for",
+                session.id
+            ),
+        }
         input.options.project_delegation_enabled = false;
         input.options.project_messaging_enabled = false;
         input.options.project_branch_messaging_enabled = false;

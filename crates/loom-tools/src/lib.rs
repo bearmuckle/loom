@@ -10,7 +10,10 @@ use std::{
 };
 
 use globset::Glob;
-use loom_core::{ActionKind, AgentSessionId, ApprovalPolicy, PolicyEvaluation, Result};
+use loom_core::{
+    ActionKind, AgentSessionId, ApprovalPolicy, PolicyEvaluation, ProjectWorktreeBaseRefresh,
+    Result, Timestamp,
+};
 use loom_model::{CancellationToken, ToolCall, ToolDefinition};
 pub use loom_protocol::ToolResult;
 use loom_vcs::GitService;
@@ -293,6 +296,11 @@ const GITHUB_CONVERT_TO_DRAFT_MUTATION: &str = concat!(
     "convertPullRequestToDraft(input: {pullRequestId: $pullRequestId}) { ",
     "pullRequest { id isDraft url } } }"
 );
+/// Deadline for the advisory `origin` refresh that a push or a pull request
+/// reports the checkout's base drift from. The refresh only produces a note, so
+/// it is bounded: a remote that does not answer within this window is reported
+/// as unknown drift instead of holding the tool call (#282).
+const GITHUB_BASE_FRESHNESS_DEADLINE: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WebSearchRequest {
@@ -1299,7 +1307,30 @@ impl ToolExecutor {
             "draft": arguments.draft.unwrap_or(false),
         });
         match self.github_api("POST", &arguments.repository, "pulls", Some(body)) {
-            Ok(value) => ToolResult::success(call, self.limit_output(value.to_string())),
+            Ok(value) => {
+                // A pull request opened from a checkout that is many commits
+                // behind its base is stale before review starts, so the result
+                // states the base drift the same way a push does. The refresh is
+                // advisory: it can only change this note.
+                let freshness = match GitService::open(&self.root) {
+                    Ok(service) => Some(checkout_base_freshness_note(
+                        &service,
+                        self.github_token.as_deref(),
+                    )),
+                    Err(error) => {
+                        log::debug!(
+                            "could not open the checkout at the workspace root for a base freshness note: {}",
+                            error.message
+                        );
+                        None
+                    }
+                };
+                let mut output = self.limit_output(value.to_string());
+                if let Some(freshness) = freshness {
+                    output = format!("{output}\nBase freshness: {freshness}");
+                }
+                ToolResult::success(call, output)
+            }
             Err(error) => ToolResult::failure(call, error),
         }
     }
@@ -1773,7 +1804,18 @@ impl ToolExecutor {
             },
         };
         match service.push_branch_authenticated(&branch, token) {
-            Ok(()) => ToolResult::success(call, format!("Pushed branch '{branch}' to {target}.")),
+            Ok(()) => {
+                // The push already succeeded, so the base drift is reported
+                // next to the result: a branch pushed from a checkout that is
+                // many commits behind its base opens a stale pull request.
+                let freshness = checkout_base_freshness_note(&service, Some(token));
+                ToolResult::success(
+                    call,
+                    self.limit_output(format!(
+                        "Pushed branch '{branch}' to {target}.\nBase freshness: {freshness}"
+                    )),
+                )
+            }
             Err(error) => ToolResult::failure(call, error.message),
         }
     }
@@ -2612,6 +2654,40 @@ fn encode_github_path_segment(segment: &str) -> String {
         }
     }
     encoded
+}
+
+/// Describes how far the checkout at `service` has drifted from the default
+/// branch of its `origin`, as resolved by a bounded fetch performed now.
+///
+/// The note is advisory: a failed or expired fetch reports the drift as unknown
+/// instead of failing the caller, and a cached `origin/*` ref is never used as a
+/// stand-in for the fetch that failed. The wording comes from
+/// [`ProjectWorktreeBaseRefresh::summary`], so a pinned base reads the same
+/// wherever it is reported.
+fn checkout_base_freshness_note(service: &GitService, token: Option<&str>) -> String {
+    let head = service.status().ok().and_then(|status| status.head);
+    let refresh = match service.refresh_origin_default_branch(
+        head.as_deref(),
+        token,
+        GITHUB_BASE_FRESHNESS_DEADLINE,
+    ) {
+        Ok(report) => ProjectWorktreeBaseRefresh::Fetched {
+            remote: report.remote,
+            base_revision: report.local_revision,
+            default_branch: report.default_branch,
+            default_branch_revision: report.default_branch_revision,
+            ahead: u32::try_from(report.ahead).unwrap_or(u32::MAX),
+            behind: u32::try_from(report.behind).unwrap_or(u32::MAX),
+            fetched_at: report.fetched_at,
+        },
+        Err(error) => ProjectWorktreeBaseRefresh::Unavailable {
+            remote: "origin".to_owned(),
+            base_revision: head.unwrap_or_else(|| "HEAD".to_owned()),
+            attempted_at: Timestamp::now(),
+            warning: error.message,
+        },
+    };
+    refresh.summary()
 }
 
 enum PushRemote {
@@ -4177,6 +4253,234 @@ mod tests {
         ));
         assert!(!not_connected.success);
         assert!(not_connected.output.contains("not connected"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Points the checkout's `origin` at a fresh bare repository that already
+    /// holds the checkout's branch, and records that branch as the remote's
+    /// default branch the way a clone would.
+    fn origin_remote(root: &Path, branch: &str) -> PathBuf {
+        let bare = workspace().join("origin.git");
+        run_git(root, &["init", "--bare", "-q", bare.to_str().unwrap()]);
+        run_git(root, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        run_git(root, &["push", "-q", "origin", branch]);
+        run_git(
+            &bare,
+            &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
+        );
+        bare
+    }
+
+    /// Adds one commit to `branch` on the bare origin through a second clone,
+    /// so a checkout that does not fetch falls behind by exactly one commit.
+    fn advance_origin(bare: &Path, branch: &str) {
+        let parent = bare.parent().unwrap();
+        let work = parent.join("upstream");
+        run_git(
+            parent,
+            &[
+                "clone",
+                "-q",
+                bare.to_str().unwrap(),
+                work.to_str().unwrap(),
+            ],
+        );
+        run_git(&work, &["config", "user.email", "loom@example.test"]);
+        run_git(&work, &["config", "user.name", "Loom Test"]);
+        fs::write(work.join("upstream.txt"), "upstream change\n").unwrap();
+        run_git(&work, &["add", "--", "upstream.txt"]);
+        run_git(&work, &["commit", "-qm", "upstream change"]);
+        run_git(&work, &["push", "-q", "origin", branch]);
+        fs::remove_dir_all(work).unwrap();
+    }
+
+    #[test]
+    fn github_push_branch_reports_the_base_drift_in_its_result() {
+        let root = std::env::temp_dir().join(format!("loom-push-{}", AgentSessionId::new()));
+        let branch = init_git_repository(&root);
+        let bare = origin_remote(&root, &branch);
+        // The remote moves on after the checkout was cloned, while the pushed
+        // branch is new to the remote, so the push still fast-forwards.
+        advance_origin(&bare, &branch);
+        run_git(&root, &["checkout", "-q", "-b", "loom/pushed"]);
+
+        let workspace = Workspace::open(AgentSessionId::new(), &root).unwrap();
+        let executor = ToolExecutor::new_with_workspace(workspace)
+            .with_github_token(Some("test-token".to_owned()))
+            .with_github_write_access(true);
+        let pushed = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name"}),
+        ));
+
+        assert!(pushed.success, "{}", pushed.output);
+        assert!(
+            pushed.output.contains("Base freshness:"),
+            "{}",
+            pushed.output
+        );
+        assert!(
+            pushed
+                .output
+                .contains(&format!("origin/{branch} is 1 commit ahead at")),
+            "{}",
+            pushed.output
+        );
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(bare).unwrap();
+    }
+
+    #[test]
+    fn github_push_branch_reports_an_unknown_base_when_the_refresh_fails() {
+        let root = std::env::temp_dir().join(format!("loom-push-{}", AgentSessionId::new()));
+        init_git_repository(&root);
+        // The pushed branch is new to the remote, so the push succeeds, while
+        // the remote's recorded default branch is left absent by the fetch, so
+        // only the advisory refresh fails.
+        run_git(&root, &["checkout", "-q", "-b", "loom/topic"]);
+        let bare = workspace().join("origin.git");
+        run_git(&root, &["init", "--bare", "-q", bare.to_str().unwrap()]);
+        run_git(
+            &bare,
+            &["symbolic-ref", "HEAD", "refs/heads/absent-default"],
+        );
+        run_git(&root, &["remote", "add", "origin", bare.to_str().unwrap()]);
+
+        let workspace = Workspace::open(AgentSessionId::new(), &root).unwrap();
+        let executor = ToolExecutor::new_with_workspace(workspace)
+            .with_github_token(Some("test-token".to_owned()))
+            .with_github_write_access(true);
+        let pushed = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name"}),
+        ));
+
+        assert!(pushed.success, "{}", pushed.output);
+        assert!(
+            pushed.output.contains("Pushed branch 'loom/topic'"),
+            "{}",
+            pushed.output
+        );
+        assert!(
+            pushed.output.contains(
+                "could not be refreshed, so the base's drift from its default branch is unknown"
+            ),
+            "{}",
+            pushed.output
+        );
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(bare).unwrap();
+    }
+
+    #[test]
+    fn github_create_pull_request_reports_the_checkout_base_drift() {
+        let root = std::env::temp_dir().join(format!("loom-pull-{}", AgentSessionId::new()));
+        let branch = init_git_repository(&root);
+        let bare = origin_remote(&root, &branch);
+        advance_origin(&bare, &branch);
+
+        let mock = MockGitHub::start(vec![MockResponse::json(serde_json::json!({
+            "number": 12,
+            "html_url": "https://github.com/owner/name/pull/12"
+        }))]);
+        let executor = github_executor(&root, &mock);
+        let created = executor.execute(&call(
+            "github_create_pull_request",
+            serde_json::json!({
+                "repository": "owner/name",
+                "title": "Stale base",
+                "head": "loom/stale",
+                "base": "main"
+            }),
+        ));
+
+        assert!(created.success, "{}", created.output);
+        assert!(
+            created.output.contains("\"number\":12"),
+            "{}",
+            created.output
+        );
+        assert!(
+            created
+                .output
+                .contains(&format!("origin/{branch} is 1 commit ahead at")),
+            "{}",
+            created.output
+        );
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(bare).unwrap();
+    }
+
+    #[test]
+    fn github_create_pull_request_succeeds_when_the_base_refresh_cannot_reach_the_remote() {
+        let root = std::env::temp_dir().join(format!("loom-pull-{}", AgentSessionId::new()));
+        init_git_repository(&root);
+        run_git(
+            &root,
+            &["remote", "add", "origin", "/nonexistent/loom-origin"],
+        );
+
+        let mock = MockGitHub::start(vec![MockResponse::json(serde_json::json!({
+            "number": 13,
+            "html_url": "https://github.com/owner/name/pull/13"
+        }))]);
+        let executor = github_executor(&root, &mock);
+        let created = executor.execute(&call(
+            "github_create_pull_request",
+            serde_json::json!({
+                "repository": "owner/name",
+                "title": "Unknown base",
+                "head": "loom/unknown",
+                "base": "main"
+            }),
+        ));
+
+        assert!(created.success, "{}", created.output);
+        assert!(
+            created.output.contains("\"number\":13"),
+            "{}",
+            created.output
+        );
+        assert!(
+            created.output.contains(
+                "could not be refreshed, so the base's drift from its default branch is unknown"
+            ),
+            "{}",
+            created.output
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_create_pull_request_omits_the_base_note_outside_a_checkout() {
+        // A workspace root that is not a Git checkout has no base to report, so
+        // the pull request still succeeds without a freshness note.
+        let root = workspace();
+        let mock = MockGitHub::start(vec![MockResponse::json(serde_json::json!({
+            "number": 14,
+            "html_url": "https://github.com/owner/name/pull/14"
+        }))]);
+        let executor = github_executor(&root, &mock);
+        let created = executor.execute(&call(
+            "github_create_pull_request",
+            serde_json::json!({
+                "repository": "owner/name",
+                "title": "No checkout",
+                "head": "loom/missing",
+                "base": "main"
+            }),
+        ));
+
+        assert!(created.success, "{}", created.output);
+        assert!(
+            !created.output.contains("Base freshness:"),
+            "{}",
+            created.output
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
