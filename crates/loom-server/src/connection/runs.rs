@@ -556,7 +556,7 @@ impl InProcessConnection {
                     instructions.push_str(" Use `integrate_project_child` only after reviewing the completed child, supplying the base revision from review. Integration fast-forwards when possible and otherwise merges the reviewed revision into your clean checkout; you may keep committing while children run, and a conflict is refused with paths preserved.");
                 }
                 if input.options.project_messaging_enabled {
-                    instructions.push_str(" Use `send_project_agent_message` with `target_session_id` to direct a child or reply to questions and blockers; `task_id` is optional context only. Message delivery is durable and may wait until the child reaches a safe model-turn boundary.");
+                    instructions.push_str(" Use `send_project_agent_message` with `target_session_id` to direct a child or reply to questions and blockers; `task_id` is optional context only. Message delivery is durable: a running child reads the message at its next safe model-turn boundary, and a `direction`, `question`, or `answer` also wakes an idle or finished child so it can act instead of leaving the message unread. The result reports whether the message reached a live turn, woke the child, or is still queued, and `list_project_children` reports each child's undelivered inbox messages.");
                 }
                 if input.options.project_branch_messaging_enabled {
                     instructions.push_str(" Non-adjacent messages require explicit branch-messaging grants on both agents. Use `list_project_message_recipients` to find eligible session IDs and never infer permission from direct messaging.");
@@ -592,7 +592,7 @@ impl InProcessConnection {
                         .unwrap_or_else(|| "unavailable".to_owned()),
                 );
                 if input.options.project_messaging_enabled {
-                    instructions.push_str(" Report progress, questions, blockers, and the final result using `send_project_agent_message` with your parent's `target_session_id`; `task_id` is optional context only. Message delivery is durable and does not interrupt an in-flight provider request or pending approval.");
+                    instructions.push_str(" Report progress, questions, blockers, and the final result using `send_project_agent_message` with your parent's `target_session_id`; `task_id` is optional context only. Message delivery is durable and does not interrupt an in-flight provider request or pending approval, and a question wakes a parent that has already finished its turn so it can answer.");
                 } else {
                     instructions.push_str(" Include progress and your final result in the run response because project messaging is not enabled for this run.");
                 }
@@ -881,40 +881,42 @@ impl InProcessConnection {
     /// reporting), it is appended as a project message turn so the member has
     /// something to react to. No-op when the member is already running or parked
     /// on a durable wait, because its worker or the wait scheduler delivers.
+    /// The returned route states how the member's pending inbox will be read, so
+    /// a caller that just accepted a durable message can report its delivery
+    /// honestly instead of assuming a wake happened.
     pub(crate) fn wake_project_recipient(
         &self,
         session_id: AgentSessionId,
         notification: Option<String>,
-    ) -> Result<()> {
+    ) -> Result<ProjectMessageRoute> {
         let Some(persistence) = self.backend.persistence.as_ref().cloned() else {
-            return Ok(());
+            return Ok(ProjectMessageRoute::Queued);
         };
         let Some(summary) = persistence.load_latest_run_summary_for_session(session_id)? else {
-            return Ok(());
+            return Ok(ProjectMessageRoute::Queued);
         };
         let run_id = summary.snapshot.id;
         // Restore the run on demand so a wake still works after a restart, when
         // only active runs are registered eagerly.
         let Ok(handle) = self.run_handle(run_id) else {
-            return Ok(());
+            return Ok(ProjectMessageRoute::Queued);
         };
-        if handle.is_running() || handle.state().pending_project_join.is_some() {
-            return Ok(());
+        if handle.state().pending_project_join.is_some() {
+            return Ok(ProjectMessageRoute::ParkedWait);
+        }
+        if handle.is_running() {
+            return Ok(ProjectMessageRoute::LiveTurn);
         }
         if notification.is_none() {
-            let cursor = persistence
-                .load_run_execution_state(run_id)?
-                .map(|state| state.last_project_message_sequence)
-                .unwrap_or(0);
-            let project_id = persistence
-                .load_delegated_task_for_target(session_id)?
-                .map(|task| task.project_id)
-                .unwrap_or_else(|| ProjectId::from_uuid(*session_id.as_uuid()));
+            let (project_id, cursor) = project_member_inbox_position(&persistence, session_id)?;
             if persistence
                 .list_agent_messages(project_id, session_id, cursor, 1)?
                 .is_empty()
             {
-                return Ok(());
+                // Nothing is waiting for an idle member, so an active turn must
+                // have consumed the message before this wake and no resume is
+                // needed. The message reached a live turn.
+                return Ok(ProjectMessageRoute::LiveTurn);
             }
         }
         self.continue_run(run_id, move |run| {
@@ -930,7 +932,34 @@ impl InProcessConnection {
                 continues: false,
             })
         })?;
-        Ok(())
+        Ok(ProjectMessageRoute::Woken)
+    }
+
+    /// Reports how a member's pending durable inbox messages will be read,
+    /// without waking or otherwise disturbing its run. A running member reads
+    /// them at its next safe model-turn boundary, so a message accepted for one
+    /// has reached a live turn; an idle member keeps them until its next turn.
+    pub(crate) fn project_message_route(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<ProjectMessageRoute> {
+        let Some(persistence) = self.backend.persistence.as_ref() else {
+            return Ok(ProjectMessageRoute::Queued);
+        };
+        let Some(summary) = persistence.load_latest_run_summary_for_session(session_id)? else {
+            return Ok(ProjectMessageRoute::Queued);
+        };
+        let Ok(handle) = self.run_handle(summary.snapshot.id) else {
+            return Ok(ProjectMessageRoute::Queued);
+        };
+        if handle.state().pending_project_join.is_some() {
+            return Ok(ProjectMessageRoute::ParkedWait);
+        }
+        Ok(if handle.is_running() {
+            ProjectMessageRoute::LiveTurn
+        } else {
+            ProjectMessageRoute::Queued
+        })
     }
 
     /// Marks a resumed manager's delegated task as running so capacity

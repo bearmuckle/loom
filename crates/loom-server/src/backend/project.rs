@@ -280,13 +280,13 @@ impl InProcessBackend {
     }
 
     pub(crate) fn accept_project_agent_message(
-        &self,
+        self: &Arc<Self>,
         request_id: RequestId,
         trusted_sender_session_id: AgentSessionId,
         sender_can_message: bool,
         sender_can_branch_message: bool,
         mut draft: loom_core::AgentMessageDraft,
-    ) -> Result<ServerResponse> {
+    ) -> Result<AcceptedProjectMessage> {
         if draft.body.trim().is_empty() || draft.body.len() > 16 * 1024 {
             return Err(LoomError::invalid_request(
                 "agent message body must contain 1 to 16384 bytes",
@@ -348,61 +348,114 @@ impl InProcessBackend {
                 false,
             ));
         }
-        if persistence
+        // Only the kinds that ask for action may wake a finished member. A
+        // `progress`, `result`, or `blocker` message is a report the recipient
+        // reads when it runs next, so delivering one must not hand a finished
+        // child new work it was not asked for.
+        let wakes_recipient = matches!(
+            draft.kind,
+            loom_core::AgentMessageKind::Direction
+                | loom_core::AgentMessageKind::Question
+                | loom_core::AgentMessageKind::Answer
+        );
+        // A retried send keeps the identifier its first attempt was given, so
+        // the delivery checks below only apply to a message that is not durable
+        // yet. The wake is attempted for both: a retry repairs a delivery that
+        // never happened.
+        let already_accepted = persistence
             .load_agent_message_by_request(request_id)?
-            .is_some()
-        {
-            let message = persistence.accept_agent_message(request_id, &draft)?;
-            return Ok(ServerResponse::Project(
-                ProjectResponse::ProjectAgentMessageAccepted(message),
-            ));
-        }
-        // A completed agent has only ended its current turn: its run can be
-        // woken and resumed through the durable project inbox, so a durable
-        // report from a child is still accepted and delivered. Failed,
-        // cancelled, and archived recipients have no resume path, so a message
-        // to them would be stranded.
-        if matches!(
-            target.state,
-            AgentSessionState::Failed | AgentSessionState::Cancelled | AgentSessionState::Archived
-        ) {
-            return Err(LoomError::new(
-                ErrorCode::InvalidState,
-                "cannot message a terminal project agent that has no resume path",
-                false,
-            ));
-        }
-        if target_task.as_ref().is_some_and(|task| {
-            matches!(
-                task.status,
-                loom_core::DelegatedTaskStatus::Failed | loom_core::DelegatedTaskStatus::Cancelled
-            )
-        }) {
-            return Err(LoomError::new(
-                ErrorCode::InvalidState,
-                "cannot message a terminal delegated task that has no resume path",
-                false,
-            ));
+            .is_some();
+        if !already_accepted {
+            // A completed agent has only ended its current turn: its run can be
+            // woken and resumed through the durable project inbox, so a durable
+            // report from a child is still accepted and delivered. Failed,
+            // cancelled, and archived recipients have no resume path, so a
+            // message to them would be stranded.
+            if matches!(
+                target.state,
+                AgentSessionState::Failed
+                    | AgentSessionState::Cancelled
+                    | AgentSessionState::Archived
+            ) {
+                return Err(LoomError::new(
+                    ErrorCode::InvalidState,
+                    "cannot message a terminal project agent that has no resume path; create a new task instead",
+                    false,
+                ));
+            }
+            if target_task.as_ref().is_some_and(|task| {
+                matches!(
+                    task.status,
+                    loom_core::DelegatedTaskStatus::Failed
+                        | loom_core::DelegatedTaskStatus::Cancelled
+                )
+            }) {
+                return Err(LoomError::new(
+                    ErrorCode::InvalidState,
+                    "cannot message a terminal delegated task that has no resume path; create a new task instead",
+                    false,
+                ));
+            }
+            // A completed code task is finished work: its revision is what the
+            // manager reviews and integrates, so resuming its run for a new
+            // request would add commits behind a revision that may already be
+            // landed. An action request to it therefore has no delivery path,
+            // and is refused the way `control_project_child` `continue` refuses
+            // a finished run, instead of being stranded in its inbox. A report
+            // stays accepted: the member reads it if a later turn wakes it for
+            // another reason, such as one of its own children finishing.
+            if wakes_recipient
+                && target_task.as_ref().is_some_and(|task| {
+                    task.code_change && task.status == loom_core::DelegatedTaskStatus::Completed
+                })
+            {
+                return Err(LoomError::new(
+                    ErrorCode::InvalidState,
+                    "the code child's delegated task is already complete, so its run cannot be resumed behind a revision that may be reviewed or integrated; create a new task instead",
+                    false,
+                ));
+            }
         }
         let message = persistence.accept_agent_message(request_id, &draft)?;
-        self.journal()?.append_server_event(
-            CURRENT_PROTOCOL_VERSION,
-            draft.target_session_id,
-            ServerEvent::ProjectAgentMessageAccepted {
-                message: message.clone(),
-            },
-        );
-        if !branch_route && draft.target_session_id != project.root_session_id {
+        if !already_accepted {
             self.journal()?.append_server_event(
                 CURRENT_PROTOCOL_VERSION,
-                project.root_session_id,
+                draft.target_session_id,
                 ServerEvent::ProjectAgentMessageAccepted {
                     message: message.clone(),
                 },
             );
+            if !branch_route && draft.target_session_id != project.root_session_id {
+                self.journal()?.append_server_event(
+                    CURRENT_PROTOCOL_VERSION,
+                    project.root_session_id,
+                    ServerEvent::ProjectAgentMessageAccepted {
+                        message: message.clone(),
+                    },
+                );
+            }
         }
-        Ok(ServerResponse::Project(
-            ProjectResponse::ProjectAgentMessageAccepted(message),
-        ))
+        // The message is committed before the recipient is woken, so a failed
+        // wake never loses it: the inbox stays pending and the sender is told
+        // the message is waiting instead of that the send failed.
+        let connection = self.connect();
+        let routing = if wakes_recipient {
+            connection.wake_project_recipient(draft.target_session_id, None)
+        } else {
+            connection.project_message_route(draft.target_session_id)
+        };
+        let route = match routing {
+            Ok(route) => route,
+            Err(error) => {
+                log::warn!(
+                    "project message {} for {} stays in its durable inbox because delivery routing failed: {}",
+                    message.message_id,
+                    draft.target_session_id,
+                    error.message
+                );
+                ProjectMessageRoute::Queued
+            }
+        };
+        Ok(AcceptedProjectMessage { message, route })
     }
 }

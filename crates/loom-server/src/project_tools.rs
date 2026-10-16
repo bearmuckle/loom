@@ -119,7 +119,7 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_message || self.can_branch_message {
             definitions.push(ToolDefinition {
                 name: "send_project_agent_message".to_owned(),
-                description: "Send a durable message to an explicitly named project member. Direct parent-child routes use the direct messaging grant; non-adjacent routes require the sender and recipient to have independent branch-messaging grants. task_id supplies optional context and never selects the recipient. The sender is bound to this agent run.".to_owned(),
+                description: "Send a durable message to an explicitly named project member. Direct parent-child routes use the direct messaging grant; non-adjacent routes require the sender and recipient to have independent branch-messaging grants. task_id supplies optional context and never selects the recipient. A direction, question, or answer wakes an idle or finished member so it can act on the message; progress, result, and blocker wait for the recipient's next turn. The result reports whether the message reached a live turn, woke the recipient, waits for a parked wait, or is queued, and list_project_children reports each child's undelivered inbox messages. The sender is bound to this agent run.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -147,7 +147,7 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_inspect_children {
             definitions.push(ToolDefinition {
                 name: "list_project_children".to_owned(),
-                description: "Inspect the current status of your direct child agents and their delegated tasks in this project. Each child reports its stored result and whether that result reached this session, so a completed child whose result never arrived stays retrievable: pass its task_id to return the whole stored result instead of a bounded excerpt.".to_owned(),
+                description: "Inspect the current status of your direct child agents and their delegated tasks in this project. Each child reports its stored result and whether that result reached this session, so a completed child whose result never arrived stays retrievable: pass its task_id to return the whole stored result instead of a bounded excerpt. Each child also reports how many durable inbox messages it has not read yet, so a message you sent can be told apart from one that is still undelivered.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -763,24 +763,23 @@ impl ProjectAgentTools {
             self.can_branch_message,
             draft,
         ) {
-            Ok(ServerResponse::Project(ProjectResponse::ProjectAgentMessageAccepted(message))) => {
-                ToolResult {
-                    tool_call_id: call.id,
-                    name: call.name.clone(),
-                    success: true,
-                    output: serde_json::to_string(&serde_json::json!({
-                        "message_id": message.message_id,
-                        "project_sequence": message.project_sequence,
-                        "accepted_at": message.accepted_at,
-                        "target_session_id": message.target_session_id,
-                        "kind": message.kind,
-                    }))
-                    .unwrap_or_else(|error| {
-                        format!("could not encode project message result: {error}")
-                    }),
-                }
-            }
-            Ok(_) => ToolResult::failure(call, "project messaging returned an unexpected result"),
+            Ok(accepted) => ToolResult {
+                tool_call_id: call.id,
+                name: call.name.clone(),
+                success: true,
+                output: serde_json::to_string(&serde_json::json!({
+                    "message_id": accepted.message.message_id,
+                    "project_sequence": accepted.message.project_sequence,
+                    "accepted_at": accepted.message.accepted_at,
+                    "target_session_id": accepted.message.target_session_id,
+                    "kind": accepted.message.kind,
+                    "delivery": accepted.route.as_str(),
+                    "delivery_note": accepted.route.note(),
+                }))
+                .unwrap_or_else(|error| {
+                    format!("could not encode project message result: {error}")
+                }),
+            },
             Err(error) => ToolResult::failure(call, error.message),
         }
     }
@@ -910,6 +909,14 @@ impl ProjectAgentTools {
                 Ok(run) => run,
                 Err(error) => return ToolResult::failure(call, error.message),
             };
+            // A message this manager sent is only known to be read when the
+            // child's durable inbox cursor has passed it, so the count of
+            // unread inbox messages is what makes a stranded message visible.
+            let undelivered_messages =
+                match project_member_undelivered_message_count(persistence, agent.session_id) {
+                    Ok(count) => count,
+                    Err(error) => return ToolResult::failure(call, error.message),
+                };
             let worktree = match task {
                 Some(task) => match persistence.load_project_worktree_by_task(task.task_id) {
                     Ok(worktree) => worktree,
@@ -967,6 +974,7 @@ impl ProjectAgentTools {
                 "result_delivered": delivery.as_ref().is_some_and(|(_, delivery)| delivery.delivered()),
                 "result_body": result_body,
                 "result_body_truncated": result_body_truncated,
+                "undelivered_messages": undelivered_messages,
                 "updated_at": agent.updated_at,
             }));
         }
@@ -992,7 +1000,7 @@ impl ProjectAgentTools {
             output: serde_json::to_string(&serde_json::json!({
                 "children": children,
                 "truncated": truncated,
-                "note": "result_state reports whether each child's stored result reached this session: delivered, undelivered (accepted for delivery but not yet in your transcript), missing (a finished child never reported a result), or pending. Pass a child's task_id to return its whole stored result."
+                "note": "result_state reports whether each child's stored result reached this session: delivered, undelivered (accepted for delivery but not yet in your transcript), missing (a finished child never reported a result), or pending. undelivered_messages counts the durable inbox messages the child has not read yet, so a message you sent that still waits is distinguishable from one the child consumed. Pass a child's task_id to return its whole stored result."
             }))
             .unwrap_or_else(|error| format!("could not encode project child status: {error}")),
         }

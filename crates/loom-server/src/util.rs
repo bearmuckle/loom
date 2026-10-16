@@ -874,6 +874,112 @@ pub(crate) fn sync_cached_run_attempt(state: &mut AgentRuntimeState) {
     };
 }
 
+/// Pages of durable inbox messages read when counting what a member has not
+/// consumed, so an unread backlog cannot make one count unbounded.
+const PROJECT_INBOX_PAGE_SIZE: usize = 512;
+
+/// How a durable project message reaches its recipient.
+///
+/// The variants are the delivery states a sender is told about: a message
+/// either reaches a live turn, resumes the recipient, waits for a parked wait
+/// to resolve, or stays in the durable inbox until the recipient's next turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectMessageRoute {
+    /// The recipient run is active, so its own worker reads the durable inbox at
+    /// the next safe model-turn boundary.
+    LiveTurn,
+    /// The recipient is parked on a durable project child wait; the wait
+    /// scheduler resumes it with its pending inbox.
+    ParkedWait,
+    /// The recipient run was idle, and accepting the message resumed it.
+    Woken,
+    /// The recipient is not running and was not woken, so the message waits in
+    /// its durable inbox for the recipient's next turn.
+    Queued,
+}
+
+impl ProjectMessageRoute {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::LiveTurn => "live_turn",
+            Self::ParkedWait => "parked_wait",
+            Self::Woken => "woken",
+            Self::Queued => "queued",
+        }
+    }
+
+    pub(crate) fn note(self) -> &'static str {
+        match self {
+            Self::LiveTurn => {
+                "the recipient run is active and reads the message at its next safe model-turn boundary"
+            }
+            Self::ParkedWait => {
+                "the recipient is parked on a durable child wait and reads the message when that wait resolves"
+            }
+            Self::Woken => {
+                "the recipient run was idle and this message resumed it, so the recipient reads the message now"
+            }
+            Self::Queued => {
+                "the recipient is not running and was not woken, so the message waits in its durable inbox until the recipient's next turn"
+            }
+        }
+    }
+}
+
+/// A durably accepted project message together with how it will be read, so the
+/// sender can tell a delivered message from one that is still waiting.
+pub(crate) struct AcceptedProjectMessage {
+    pub(crate) message: loom_core::AgentMessageRecord,
+    pub(crate) route: ProjectMessageRoute,
+}
+
+/// The project a member belongs to and the message sequence its durable inbox is
+/// read from: everything after the delivered cursor of its newest run.
+pub(crate) fn project_member_inbox_position(
+    persistence: &dyn Persistence,
+    session_id: AgentSessionId,
+) -> Result<(ProjectId, u64)> {
+    let project_id = persistence
+        .load_delegated_task_for_target(session_id)?
+        .map(|task| task.project_id)
+        .unwrap_or_else(|| ProjectId::from_uuid(*session_id.as_uuid()));
+    let cursor = match persistence.load_latest_run_summary_for_session(session_id)? {
+        Some(summary) => persistence
+            .load_run_execution_state(summary.snapshot.id)?
+            .map(|state| state.last_project_message_sequence)
+            .unwrap_or(0),
+        None => 0,
+    };
+    Ok((project_id, cursor))
+}
+
+/// Counts the durable inbox messages a member's run has not consumed yet, so a
+/// sender can tell a delivered message from one that is still pending.
+pub(crate) fn project_member_undelivered_message_count(
+    persistence: &dyn Persistence,
+    session_id: AgentSessionId,
+) -> Result<u64> {
+    let (project_id, mut cursor) = project_member_inbox_position(persistence, session_id)?;
+    let mut undelivered = 0;
+    loop {
+        let messages = persistence.list_agent_messages(
+            project_id,
+            session_id,
+            cursor,
+            PROJECT_INBOX_PAGE_SIZE,
+        )?;
+        undelivered += messages.len() as u64;
+        let Some(last) = messages.last() else {
+            break;
+        };
+        if messages.len() < PROJECT_INBOX_PAGE_SIZE {
+            break;
+        }
+        cursor = last.project_sequence;
+    }
+    Ok(undelivered)
+}
+
 pub(crate) fn deliver_project_agent_messages(
     persistence: &dyn Persistence,
     runtime: &mut AgentRuntime,

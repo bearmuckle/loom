@@ -893,10 +893,7 @@ fn a_finished_child_result_stays_readable_with_its_delivery_state() {
             },
         )
         .expect("a finished child must be able to report its result");
-    let ServerResponse::Project(ProjectResponse::ProjectAgentMessageAccepted(accepted)) = accepted
-    else {
-        panic!("unexpected project message response");
-    };
+    let accepted = accepted.message;
 
     let extension = backend
         .project_agent_tools(
@@ -1127,10 +1124,7 @@ fn a_child_report_reaches_a_completed_project_manager() {
             },
         )
         .expect("a completed manager must accept a durable child report");
-    assert!(matches!(
-        accepted,
-        ServerResponse::Project(ProjectResponse::ProjectAgentMessageAccepted(_))
-    ));
+    assert_eq!(accepted.message.target_session_id, root);
     let root_inbox = persistence
         .list_agent_messages(project_id, root, 0, 10)
         .unwrap();
@@ -1162,6 +1156,666 @@ fn a_child_report_reaches_a_completed_project_manager() {
         rejected,
         Err(error) if error.code == ErrorCode::InvalidState
     ));
+
+    drop(connection);
+    backend.shutdown().unwrap();
+    fs::remove_dir_all(temp).unwrap();
+}
+
+/// A persistent backend, a root manager session, and one delegated non-code child
+/// whose turns a scripted model drives, so a test can target a finished child.
+struct ScriptedProjectMessageSetup {
+    temp: PathBuf,
+    backend: Arc<InProcessBackend>,
+    connection: InProcessConnection,
+    model: ScriptedOpenAiEndpoint,
+    model_id: ModelId,
+    root: AgentSessionId,
+    child: ProjectAgentRecord,
+    task: loom_core::DelegatedTaskRecord,
+    child_run_id: loom_core::RunId,
+}
+
+impl ScriptedProjectMessageSetup {
+    /// Stops the backend before removing its state directory, matching the other
+    /// persistent tests.
+    fn teardown(self) {
+        drop(self.connection);
+        self.backend.shutdown().unwrap();
+        drop(self.backend);
+        drop(self.model);
+        fs::remove_dir_all(self.temp).unwrap();
+    }
+}
+
+/// Creates the delivery test fixture. The child's first turn is left unanswered
+/// so the caller decides whether it finishes, keeps running, or reports.
+fn scripted_project_message_setup(prefix: &str) -> ScriptedProjectMessageSetup {
+    let temp = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&temp).unwrap();
+    let model = ScriptedOpenAiEndpoint::start();
+    let model_endpoint = model.endpoint.clone();
+    let model_id = ModelId::new(format!("fixture/{prefix}"));
+    let backend = InProcessBackend::with_provider_registry_persistent(
+        scripted_project_provider_registry(&model_endpoint, model_id.clone()),
+        temp.join("state.sqlite"),
+    )
+    .unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: format!("{prefix} workspace"),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let root = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Manager".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    let (task, child) = match connection
+        .create_project_child(
+            RequestId::new(),
+            root,
+            "worker".to_owned(),
+            loom_core::DelegatedTaskSpec {
+                intent: "Do one bounded piece of work and stop.".to_owned(),
+                model_id: model_id.as_str().to_owned(),
+                context_references: Vec::new(),
+                dependencies: Vec::new(),
+                code_change: false,
+                permissions: loom_core::ProjectAgentPermissions::default(),
+            },
+        )
+        .unwrap()
+    {
+        ServerResponse::Project(ProjectResponse::ProjectChildCreated { task, child }) => {
+            (*task, child)
+        }
+        response => panic!("unexpected child response: {response:?}"),
+    };
+    let child_run_id = backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .load_latest_run_summary_for_session(child.session_id)
+        .unwrap()
+        .expect("the delegated child should have a durable run")
+        .snapshot
+        .id;
+    ScriptedProjectMessageSetup {
+        temp,
+        backend,
+        connection,
+        model,
+        model_id,
+        root,
+        child,
+        task,
+        child_run_id,
+    }
+}
+
+/// Root-session project tools, so a test can message as the manager without
+/// running a manager model turn.
+fn project_message_tools(
+    backend: &Arc<InProcessBackend>,
+    connection: &InProcessConnection,
+    root: AgentSessionId,
+    model_id: &ModelId,
+) -> ToolExecutor {
+    let extension = backend
+        .project_agent_tools(
+            root,
+            model_id.clone(),
+            ProjectAgentToolGrants {
+                messaging: true,
+                inspection: true,
+                ..ProjectAgentToolGrants::default()
+            },
+        )
+        .unwrap()
+        .expect("manager project tools");
+    ToolExecutor::new_with_workspace(connection.session_filesystem(root).unwrap())
+        .with_extension(extension)
+}
+
+fn send_project_message(
+    tools: &ToolExecutor,
+    target_session_id: AgentSessionId,
+    task_id: loom_core::TaskId,
+    kind: &str,
+    body: &str,
+) -> ToolResult {
+    tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "send_project_agent_message".to_owned(),
+        arguments: serde_json::json!({
+            "target_session_id": target_session_id,
+            "task_id": task_id,
+            "kind": kind,
+            "body": body,
+        }),
+    })
+}
+
+fn list_project_children_json(tools: &ToolExecutor) -> serde_json::Value {
+    let listing = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "list_project_children".to_owned(),
+        arguments: serde_json::json!({}),
+    });
+    assert!(listing.success, "{}", listing.output);
+    serde_json::from_str(&listing.output).unwrap()
+}
+
+fn listed_child(listing: &serde_json::Value, task_id: loom_core::TaskId) -> serde_json::Value {
+    listing["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["task_id"] == task_id.to_string())
+        .cloned()
+        .unwrap_or_else(|| panic!("missing child entry for {task_id}"))
+}
+
+#[test]
+fn a_direction_wakes_a_finished_child_for_its_next_turn() {
+    let mut setup = scripted_project_message_setup("loom-finished-child-wake");
+    // Let the child end its first turn, so the follow-up targets a run whose
+    // state is already terminal.
+    let child_first_turn = setup.model.next_for_child();
+    setup
+        .model
+        .respond_with_text(child_first_turn, "worker: the first half is done.");
+    assert_eq!(
+        await_settled_run(&setup.connection, setup.child_run_id).state,
+        AgentRunState::Completed
+    );
+    assert_eq!(
+        setup
+            .backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_delegated_task(setup.task.task_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        loom_core::DelegatedTaskStatus::Completed
+    );
+    let tools = project_message_tools(
+        &setup.backend,
+        &setup.connection,
+        setup.root,
+        &setup.model_id,
+    );
+
+    let direction = send_project_message(
+        &tools,
+        setup.child.session_id,
+        setup.task.task_id,
+        "direction",
+        "The first half is done; do the second half now.",
+    );
+    assert!(direction.success, "{}", direction.output);
+    let ack: serde_json::Value = serde_json::from_str(&direction.output).unwrap();
+    assert_eq!(ack["delivery"], "woken", "{}", direction.output);
+    assert_eq!(ack["target_session_id"], setup.child.session_id.to_string());
+    assert_eq!(ack["kind"], "direction");
+    assert_eq!(ack["project_sequence"], 1);
+
+    // The wake resumes the finished run, which reads the message on its next turn.
+    let woken_turn = setup.model.next_for_child();
+    assert!(request_has_project_message(
+        &woken_turn.request,
+        "direction"
+    ));
+    assert!(
+        woken_turn.request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("do the second half"))
+            })
+    );
+    setup
+        .model
+        .respond_with_text(woken_turn, "worker: the second half is done.");
+    assert_eq!(
+        await_settled_run(&setup.connection, setup.child_run_id).state,
+        AgentRunState::Completed
+    );
+
+    // The woken child consumed the message, so nothing is left undelivered for
+    // the sender to worry about.
+    let listing = list_project_children_json(&tools);
+    assert_eq!(
+        listed_child(&listing, setup.task.task_id)["undelivered_messages"],
+        0
+    );
+    setup.teardown();
+}
+
+#[test]
+fn a_report_does_not_wake_a_finished_project_child() {
+    let mut setup = scripted_project_message_setup("loom-finished-child-report");
+    let child_first_turn = setup.model.next_for_child();
+    setup
+        .model
+        .respond_with_text(child_first_turn, "worker: the first half is done.");
+    assert_eq!(
+        await_settled_run(&setup.connection, setup.child_run_id).state,
+        AgentRunState::Completed
+    );
+    let tools = project_message_tools(
+        &setup.backend,
+        &setup.connection,
+        setup.root,
+        &setup.model_id,
+    );
+
+    // A report is not a request for new work, so it must not resume the child;
+    // it waits in the durable inbox for the child's next turn instead.
+    for (kind, body) in [
+        ("progress", "worker progress: the first half is committed."),
+        ("result", "worker result: the first half is complete."),
+    ] {
+        let report = send_project_message(
+            &tools,
+            setup.child.session_id,
+            setup.task.task_id,
+            kind,
+            body,
+        );
+        assert!(report.success, "{}", report.output);
+        let ack: serde_json::Value = serde_json::from_str(&report.output).unwrap();
+        assert_eq!(ack["delivery"], "queued", "{}", report.output);
+        assert_eq!(ack["kind"], kind);
+    }
+    assert_eq!(
+        setup
+            .backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_latest_run_summary_for_session(setup.child.session_id)
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .state,
+        AgentRunState::Completed,
+        "a report must not resume a finished child"
+    );
+    // Both reports are still unread, so the sender can tell that they were not
+    // delivered rather than assume they were.
+    let listing = list_project_children_json(&tools);
+    let worker = listed_child(&listing, setup.task.task_id);
+    assert_eq!(worker["undelivered_messages"], 2);
+    assert_eq!(worker["run_state"], "completed");
+
+    // Nothing is lost: the direction below wakes the child, whose next turn reads
+    // the queued reports along with it.
+    let direction = send_project_message(
+        &tools,
+        setup.child.session_id,
+        setup.task.task_id,
+        "direction",
+        "Now do the second half as well.",
+    );
+    assert!(direction.success, "{}", direction.output);
+    let ack: serde_json::Value = serde_json::from_str(&direction.output).unwrap();
+    assert_eq!(ack["delivery"], "woken", "{}", direction.output);
+    let woken_turn = setup.model.next_for_child();
+    for kind in ["progress", "result", "direction"] {
+        assert!(
+            request_has_project_message(&woken_turn.request, kind),
+            "the woken child should read the queued {kind} message"
+        );
+    }
+    setup
+        .model
+        .respond_with_text(woken_turn, "worker: the second half is done.");
+    assert_eq!(
+        await_settled_run(&setup.connection, setup.child_run_id).state,
+        AgentRunState::Completed
+    );
+    let listing = list_project_children_json(&tools);
+    assert_eq!(
+        listed_child(&listing, setup.task.task_id)["undelivered_messages"],
+        0
+    );
+    setup.teardown();
+}
+
+#[test]
+fn a_message_to_a_running_child_waits_for_its_next_turn() {
+    let mut setup = scripted_project_message_setup("loom-running-child-message");
+    // Hold the child's first turn open, so it is mid-run when the message
+    // arrives. Nothing here answers it until after the message is accepted.
+    let child_open_turn = setup.model.next_for_child();
+    let tools = project_message_tools(
+        &setup.backend,
+        &setup.connection,
+        setup.root,
+        &setup.model_id,
+    );
+
+    let direction = send_project_message(
+        &tools,
+        setup.child.session_id,
+        setup.task.task_id,
+        "direction",
+        "Keep the same approach; add the second half.",
+    );
+    assert!(direction.success, "{}", direction.output);
+    let ack: serde_json::Value = serde_json::from_str(&direction.output).unwrap();
+    assert_eq!(ack["delivery"], "live_turn", "{}", direction.output);
+    // The running turn is untouched: the run is still the one already in flight,
+    // and the message is still unread.
+    assert_eq!(
+        setup
+            .backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_latest_run_summary_for_session(setup.child.session_id)
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .state,
+        AgentRunState::Executing
+    );
+    let listing = list_project_children_json(&tools);
+    assert_eq!(
+        listed_child(&listing, setup.task.task_id)["undelivered_messages"],
+        1
+    );
+
+    // The in-flight request cannot see the message, and the next turn boundary
+    // after it delivers it without a wake.
+    assert!(!request_has_project_message(
+        &child_open_turn.request,
+        "direction"
+    ));
+    setup.model.respond_with_tool(
+        child_open_turn,
+        "list_files",
+        serde_json::json!({ "path": "." }),
+    );
+    let child_next_turn = setup.model.next_for_child();
+    assert!(request_has_project_message(
+        &child_next_turn.request,
+        "direction"
+    ));
+    setup
+        .model
+        .respond_with_text(child_next_turn, "worker: the second half is done.");
+    assert_eq!(
+        await_settled_run(&setup.connection, setup.child_run_id).state,
+        AgentRunState::Completed
+    );
+    let listing = list_project_children_json(&tools);
+    assert_eq!(
+        listed_child(&listing, setup.task.task_id)["undelivered_messages"],
+        0
+    );
+    setup.teardown();
+}
+
+#[test]
+fn an_action_request_to_a_completed_code_child_is_refused() {
+    let temp = std::env::temp_dir().join(format!(
+        "loom-completed-code-child-message-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&temp).unwrap();
+    let backend = InProcessBackend::new_persistent(temp.join("state.sqlite")).unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Completed code child message".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let root = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Manager".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    let project_id = ProjectId::from_uuid(*root.as_uuid());
+    let persistence = backend.persistence.as_ref().unwrap();
+    let created_at = Timestamp::now();
+
+    // One finished code child, one finished non-code child, and one child whose
+    // delegated task already failed. None of them has a run, so each outcome is
+    // decided by the delivery rules rather than by a live run.
+    let create_child = |name: &str, code_change: bool, status: loom_core::DelegatedTaskStatus| {
+        let child_id = AgentSessionId::new();
+        let child = AgentSessionSnapshot {
+            id: child_id,
+            workspace_id: workspace.id,
+            name: name.to_owned(),
+            state: AgentSessionState::Idle,
+            created_at,
+            updated_at: created_at,
+        };
+        let task = loom_core::DelegatedTaskRecord {
+            task_id: loom_core::TaskId::new(),
+            project_id,
+            requester_session_id: root,
+            target_session_id: child_id,
+            child_name: name.to_owned(),
+            intent: "A finished bounded task".to_owned(),
+            model_id: "deterministic/demo".to_owned(),
+            context_references: Vec::new(),
+            dependencies: Vec::new(),
+            code_change,
+            permissions: loom_core::ProjectAgentPermissions::default(),
+            status: loom_core::DelegatedTaskStatus::Queued,
+            created_at,
+            updated_at: created_at,
+        };
+        let (_, created_event) = backend
+            .sessions()
+            .unwrap()
+            .create_in_workspace_with_id(workspace.id, child_id, child.name.clone())
+            .unwrap();
+        backend.journal().unwrap().append_session(created_event);
+        // A code task has to carry its worktree intent, so it is stored with the
+        // record its checkout would be created from. Nothing here needs the
+        // checkout itself.
+        let stored = if code_change {
+            let worktree = ProjectWorktreeRecord {
+                project_id,
+                task_id: task.task_id,
+                parent_session_id: root,
+                child_session_id: child_id,
+                parent_repository_id: RepositoryId::new(),
+                child_repository_id: RepositoryId::new(),
+                relative_path: format!("project-worktrees/{}", task.task_id),
+                worktree_name: format!("loom-child-{}", task.task_id),
+                branch_name: format!("loom/project-child-{}", task.task_id),
+                base_revision: "0000000000000000000000000000000000000000".to_owned(),
+                base_refresh: None,
+                result_revision: None,
+                integrated_revision: None,
+                status: ProjectWorktreeStatus::Creating,
+                conflict_paths: Vec::new(),
+                error: None,
+                cleanup_disposition: None,
+                created_at,
+                updated_at: created_at,
+            };
+            persistence.create_project_child_with_worktree(
+                RequestId::new(),
+                &child,
+                backend.sessions().unwrap().next_sequence().next(),
+                &task,
+                &worktree,
+            )
+        } else {
+            persistence.create_project_child(
+                RequestId::new(),
+                &child,
+                backend.sessions().unwrap().next_sequence().next(),
+                &task,
+            )
+        };
+        stored.unwrap();
+        assert!(
+            persistence
+                .update_delegated_task_status(task.task_id, status, Timestamp::now())
+                .unwrap()
+        );
+        persistence
+            .load_delegated_task(task.task_id)
+            .unwrap()
+            .unwrap()
+    };
+    let code_task = create_child(
+        "code-worker",
+        true,
+        loom_core::DelegatedTaskStatus::Completed,
+    );
+    let report_task = create_child(
+        "report-worker",
+        false,
+        loom_core::DelegatedTaskStatus::Completed,
+    );
+    let failed_task = create_child(
+        "failed-worker",
+        false,
+        loom_core::DelegatedTaskStatus::Failed,
+    );
+    let draft = |task: &loom_core::DelegatedTaskRecord,
+                 kind: loom_core::AgentMessageKind,
+                 body: &str| loom_core::AgentMessageDraft {
+        project_id,
+        task_id: Some(task.task_id),
+        sender_session_id: root,
+        target_session_id: task.target_session_id,
+        kind,
+        body: body.to_owned(),
+    };
+
+    // A direction asks a finished code child for new work, but its revision is
+    // what the manager reviews and integrates, so the send is refused with the
+    // remedy `control_project_child` gives for the same finished child.
+    let refused = backend.accept_project_agent_message(
+        RequestId::new(),
+        root,
+        true,
+        false,
+        draft(
+            &code_task,
+            loom_core::AgentMessageKind::Direction,
+            "Add one more change.",
+        ),
+    );
+    assert!(
+        matches!(refused, Err(ref error) if error.code == ErrorCode::InvalidState
+            && error.message.contains("create a new task")),
+        "an action request to a completed code child must name the remedy"
+    );
+
+    // A report to the same child is accepted: the child reads it if a later turn
+    // wakes it for another reason, and with no run here it simply waits.
+    let accepted = backend
+        .accept_project_agent_message(
+            RequestId::new(),
+            root,
+            true,
+            false,
+            draft(
+                &code_task,
+                loom_core::AgentMessageKind::Progress,
+                "Context for a future turn.",
+            ),
+        )
+        .expect("a report to a completed code child is still accepted");
+    assert_eq!(accepted.route, ProjectMessageRoute::Queued);
+
+    // The code-task rule is about finished code work, not about every completed
+    // task: a non-code child is not refused.
+    let accepted = backend
+        .accept_project_agent_message(
+            RequestId::new(),
+            root,
+            true,
+            false,
+            draft(
+                &report_task,
+                loom_core::AgentMessageKind::Direction,
+                "Do one more bounded piece of work.",
+            ),
+        )
+        .expect("a completed non-code child still accepts a direction");
+    assert_eq!(accepted.route, ProjectMessageRoute::Queued);
+
+    // A terminal delegated task has no resume path at all, whatever the kind.
+    let refused = backend.accept_project_agent_message(
+        RequestId::new(),
+        root,
+        true,
+        false,
+        draft(
+            &failed_task,
+            loom_core::AgentMessageKind::Progress,
+            "A report no one can read.",
+        ),
+    );
+    assert!(
+        matches!(refused, Err(ref error) if error.code == ErrorCode::InvalidState
+            && error.message.contains("create a new task")),
+        "a terminal delegated task must refuse the send"
+    );
+
+    // The refused sends left no message behind, so nothing reads as stranded.
+    let code_inbox = persistence
+        .list_agent_messages(project_id, code_task.target_session_id, 0, 10)
+        .unwrap();
+    assert_eq!(code_inbox.len(), 1);
+    assert_eq!(code_inbox[0].kind, loom_core::AgentMessageKind::Progress);
+    assert!(
+        persistence
+            .list_agent_messages(project_id, failed_task.target_session_id, 0, 10)
+            .unwrap()
+            .is_empty()
+    );
 
     drop(connection);
     backend.shutdown().unwrap();
