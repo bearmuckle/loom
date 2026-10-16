@@ -330,6 +330,7 @@ open:
   platform security models differ.
 - Building a hosted service before the standalone backend and protocol are
   reliable.
-- Hiding destructive or privileged actions behind automatic behavior.
+- Running a destructive or privileged action without recording it in the
+  session event stream.
 - Extensibility, collaboration, and language-server integration are deferred
   until the M0-M6 product loop has proven stable.
