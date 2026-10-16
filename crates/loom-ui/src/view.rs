@@ -472,17 +472,16 @@ pub(crate) struct LoomView {
     project_feed_after_sequence: Option<EventSequence>,
     project_feed_epoch: Option<String>,
     project_poll_scheduled: bool,
-    /// One session tree per worker node so the sidebar can group projects by
-    /// the worker that owns them. Keyed by the backend's stable node identity.
-    session_trees: BTreeMap<String, Entity<TreeState>>,
-    /// Last rendered tree nodes per worker node, used to skip redundant updates.
-    session_tree_entries: BTreeMap<String, Vec<SessionTreeNode>>,
-    /// Active session each worker's tree was last synchronized to. Navigation
-    /// reveals the active session, but a chevron toggle must not force the
-    /// active session's ancestors back open.
-    session_tree_active: BTreeMap<String, AgentSessionId>,
-    /// Worker node groups the user has collapsed in the sidebar.
-    collapsed_worker_nodes: BTreeSet<String>,
+    /// The single session tree shared by every worker section. One tree for
+    /// the whole pane means the sidebar scrolls as one region instead of
+    /// giving each worker its own full-height, independently scrolling tree.
+    session_tree: Option<Entity<TreeState>>,
+    /// Last rendered rows of the shared tree, used to skip redundant updates.
+    session_tree_entries: Option<Vec<SessionTreeRow>>,
+    /// Active session the shared tree was last synchronized to. Navigation
+    /// reveals the active session, but a project chevron toggle must not force
+    /// the active session's ancestors back open.
+    session_tree_active: Option<AgentSessionId>,
     /// The main source of each known project, shown as the second line of a
     /// project row: `owner/repository` for a clone, a short path for a folder.
     session_sources: BTreeMap<AgentSessionId, String>,
@@ -670,6 +669,14 @@ struct SessionTreeNode {
     session_id: AgentSessionId,
     label: String,
     children: Vec<SessionTreeNode>,
+}
+
+/// One row of the sidebar's single session tree: a worker section header, or a
+/// project subtree owned by that worker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SessionTreeRow {
+    WorkerHeader { node_id: String },
+    Project(SessionTreeNode),
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1587,10 +1594,9 @@ impl LoomView {
             project_feed_after_sequence: None,
             project_feed_epoch: None,
             project_poll_scheduled: false,
-            session_trees: BTreeMap::new(),
-            session_tree_entries: BTreeMap::new(),
-            session_tree_active: BTreeMap::new(),
-            collapsed_worker_nodes: BTreeSet::new(),
+            session_tree: None,
+            session_tree_entries: None,
+            session_tree_active: None,
             session_sources: BTreeMap::new(),
             session_source_lookups: BTreeMap::new(),
             node_session_load_errors: BTreeMap::new(),
