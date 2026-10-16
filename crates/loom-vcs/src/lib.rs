@@ -42,6 +42,18 @@ pub enum MergeIntegrationOutcome {
 /// remote refresh.
 pub const DEFAULT_REMOTE_REFRESH_DEADLINE: Duration = Duration::from_secs(30);
 
+/// Outcome of [`GitService::create_mirror`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MirrorCreation {
+    /// This call cloned the mirror from the source it was given, so the
+    /// mirror's heads are the source's heads as of that clone.
+    Created,
+    /// A mirror already existed at the requested path and was left untouched:
+    /// this call performed no clone and therefore knows nothing new about the
+    /// mirror's contents.
+    Existing,
+}
+
 /// How far one local revision is ahead of and behind the default branch a
 /// remote fetch resolved.
 ///
@@ -138,14 +150,19 @@ impl GitService {
     /// Creates a bare mirror of a local checkout at `mirror`, used as the node
     /// cache that later sessions can clone from. The mirror's `origin` points
     /// at `origin_url` so its identity matches the remote repository.
+    ///
+    /// A mirror that already exists is left exactly as it is, and the returned
+    /// [`MirrorCreation::Existing`] says so: this call then knows nothing about
+    /// how old the mirror's heads are, and a caller that records freshness must
+    /// not treat the result as a fresh clone.
     pub fn create_mirror(
         source: impl AsRef<Path>,
         mirror: impl AsRef<Path>,
         origin_url: &str,
-    ) -> Result<()> {
+    ) -> Result<MirrorCreation> {
         let mirror = mirror.as_ref();
         if mirror.exists() {
-            return Ok(());
+            return Ok(MirrorCreation::Existing);
         }
         if let Some(parent) = mirror.parent() {
             fs::create_dir_all(parent).map_err(|error| {
@@ -164,7 +181,90 @@ impl GitService {
         let repository = builder
             .clone(source, mirror)
             .map_err(|error| git_error("could not create repository mirror", error))?;
-        set_origin_url(&repository, origin_url)
+        set_origin_url(&repository, origin_url)?;
+        Ok(MirrorCreation::Created)
+    }
+
+    /// Fetches `origin` into a bare mirror and moves the mirror's own heads to
+    /// the tips that fetch resolved.
+    ///
+    /// A checkout cloned from a mirror takes its `refs/remotes/origin/*` from
+    /// the mirror's `refs/heads/*`, so a mirror that is only fetched leaves
+    /// those frozen at the clone it was created from and every later checkout
+    /// starts from that tip. This call therefore runs the bounded fetch of
+    /// [`Self::refresh_origin_default_branch`] (the same worker thread, deadline,
+    /// credentials and report) and then advances the mirror's heads locally to
+    /// the fetched remote-tracking tips, which costs no network access.
+    ///
+    /// The mirror must be bare: its heads are moved with a forced reference
+    /// update, which is only safe when nothing is checked out.
+    pub fn refresh_mirror_heads(
+        &self,
+        token: Option<&str>,
+        deadline: Duration,
+    ) -> Result<RemoteRefreshReport> {
+        if !self.repository()?.is_bare() {
+            return Err(LoomError::invalid_request(
+                "refreshing mirror heads requires a bare repository",
+            ));
+        }
+        let report = self.refresh_origin_default_branch(None, token, deadline)?;
+        self.advance_mirror_heads()?;
+        Ok(report)
+    }
+
+    /// Points every head a mirror holds a fetched `origin` tip for at that tip.
+    ///
+    /// Returns how many heads were advanced. Symbolic remote refs, such as
+    /// `refs/remotes/origin/HEAD`, are skipped because they hold no tip of their
+    /// own.
+    fn advance_mirror_heads(&self) -> Result<usize> {
+        let repository = self.repository()?;
+        let mut fetched = Vec::new();
+        let references = repository
+            .references_glob("refs/remotes/origin/*")
+            .map_err(|error| git_error("could not list the fetched remote refs", error))?;
+        for reference in references {
+            let reference = reference
+                .map_err(|error| git_error("could not read a fetched remote ref", error))?;
+            let name = reference.name().ok().and_then(strip_origin_prefix);
+            if let (Some(name), Some(target)) = (name, reference.target()) {
+                fetched.push((name.to_owned(), target));
+            }
+        }
+        let advanced = fetched.len();
+        for (name, target) in fetched {
+            repository
+                .reference(
+                    &format!("refs/heads/{name}"),
+                    target,
+                    true,
+                    "loom mirror refresh",
+                )
+                .map_err(|error| {
+                    git_error(
+                        &format!("could not advance the mirror branch '{name}'"),
+                        error,
+                    )
+                })?;
+        }
+        Ok(advanced)
+    }
+
+    /// Whether `revision` resolves in this repository, either directly or as
+    /// `refs/remotes/origin/<revision>`.
+    ///
+    /// This is the resolution [`Self::checkout_cloned_revision`] performs, so a
+    /// caller can tell before cloning whether the source it is about to clone
+    /// from can satisfy a requested revision.
+    pub fn resolves_revision(&self, revision: &str) -> bool {
+        let Ok(repository) = self.repository() else {
+            return false;
+        };
+        repository.revparse_single(revision).is_ok()
+            || repository
+                .revparse_single(&format!("refs/remotes/origin/{revision}"))
+                .is_ok()
     }
 
     fn checkout_cloned_revision(repository: &Repository, revision: Option<&str>) -> Result<()> {
@@ -2229,6 +2329,147 @@ mod tests {
                 .code,
             ErrorCode::NotFound
         );
+
+        fs::remove_dir_all(bare).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Revision the repository's `HEAD` resolves to.
+    fn head_revision(git: &GitService) -> String {
+        git.repository()
+            .unwrap()
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string()
+    }
+
+    fn mirror_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "loom-git-mirror-{}",
+            loom_core::RepositoryId::new()
+        ))
+    }
+
+    #[test]
+    fn create_mirror_reports_whether_it_cloned_the_mirror() {
+        let (_git, root) = repository();
+        let bare = std::env::temp_dir().join(format!(
+            "loom-git-mirror-origin-{}",
+            loom_core::RepositoryId::new()
+        ));
+        Repository::init_bare(&bare).unwrap();
+        let mirror = mirror_root();
+
+        assert_eq!(
+            GitService::create_mirror(&root, &mirror, bare.to_str().unwrap()).unwrap(),
+            MirrorCreation::Created
+        );
+        // A mirror that already exists is not cloned again, so the caller learns
+        // that this call knows nothing new about the mirror's contents.
+        assert_eq!(
+            GitService::create_mirror(&root, &mirror, bare.to_str().unwrap()).unwrap(),
+            MirrorCreation::Existing
+        );
+
+        fs::remove_dir_all(&mirror).unwrap();
+        fs::remove_dir_all(&bare).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refreshing_a_mirror_moves_its_heads_to_the_fetched_tips() {
+        let (git, root) = repository();
+        let branch = git.current_branch().unwrap().unwrap();
+        let bare = origin_remote(&git, &root, &branch);
+        let mirror = mirror_root();
+        assert_eq!(
+            GitService::create_mirror(&root, &mirror, bare.to_str().unwrap()).unwrap(),
+            MirrorCreation::Created
+        );
+        let frozen = head_revision(&GitService::open(&mirror).unwrap());
+
+        advance_origin(&bare, &branch, 2);
+        let mirror_git = GitService::open(&mirror).unwrap();
+        // A clone reads the mirror's heads, so before the refresh the mirror still
+        // hands out the tip it was created from.
+        assert_eq!(head_revision(&mirror_git), frozen);
+        mirror_git
+            .repository()
+            .unwrap()
+            .reference_symbolic(
+                "refs/remotes/origin/HEAD",
+                &format!("refs/remotes/origin/{branch}"),
+                true,
+                "loom test: record the remote default branch",
+            )
+            .unwrap();
+
+        let report = mirror_git
+            .refresh_mirror_heads(None, DEFAULT_REMOTE_REFRESH_DEADLINE)
+            .unwrap();
+        assert_eq!(report.default_branch, branch);
+        assert_ne!(report.default_branch_revision, frozen);
+        // The fetched tip is now both the mirror's own head and what a checkout
+        // cloned from the mirror starts at.
+        assert_eq!(head_revision(&mirror_git), report.default_branch_revision);
+        assert!(
+            mirror_git
+                .repository()
+                .unwrap()
+                .find_reference("refs/heads/HEAD")
+                .is_err(),
+            "a symbolic remote ref holds no tip to advance"
+        );
+
+        let destination = std::env::temp_dir().join(format!(
+            "loom-git-mirror-clone-{}",
+            loom_core::RepositoryId::new()
+        ));
+        let cloned = GitService::clone_from_local(
+            &mirror,
+            &destination,
+            None,
+            "https://example.test/owner/name.git",
+        )
+        .unwrap();
+        assert_eq!(head_revision(&cloned), report.default_branch_revision);
+
+        fs::remove_dir_all(destination).unwrap();
+        fs::remove_dir_all(&mirror).unwrap();
+        fs::remove_dir_all(&bare).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refreshing_mirror_heads_rejects_a_working_checkout() {
+        let (git, root) = repository();
+        assert_eq!(
+            git.refresh_mirror_heads(None, DEFAULT_REMOTE_REFRESH_DEADLINE)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolving_a_revision_accepts_a_local_tip_or_a_remote_tip() {
+        let (git, root) = repository();
+        let branch = git.current_branch().unwrap().unwrap();
+        let bare = origin_remote(&git, &root, &branch);
+        let revision = head_revision(&git);
+        assert!(git.resolves_revision(&branch));
+        assert!(git.resolves_revision(&revision));
+        assert!(!git.resolves_revision("loom-unknown-revision"));
+
+        // A remote tip resolves once a fetch has written it, which is the ref a
+        // requested revision falls back to.
+        let remote_tip = format!("refs/remotes/origin/{branch}");
+        git.refresh_origin_default_branch(None, None, DEFAULT_REMOTE_REFRESH_DEADLINE)
+            .unwrap();
+        assert!(git.resolves_revision(&remote_tip));
 
         fs::remove_dir_all(bare).unwrap();
         fs::remove_dir_all(root).unwrap();

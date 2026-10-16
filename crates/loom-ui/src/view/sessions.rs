@@ -797,7 +797,10 @@ impl LoomView {
         let creation_status = match source.as_ref() {
             Some(SessionCreationSource::GitHub(source)) => {
                 if source.reuse_local {
-                    format!("Creating project from cached {}…", source.full_name)
+                    format!(
+                        "Creating project from cached {} (refreshing it on the worker before use)…",
+                        source.full_name
+                    )
                 } else {
                     format!("Creating project and cloning {}…", source.full_name)
                 }

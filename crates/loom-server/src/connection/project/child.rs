@@ -81,7 +81,7 @@ impl InProcessConnection {
     /// Access token used to refresh a checkout's `origin`: the authenticated
     /// GitHub account token for GitHub HTTPS remotes, matching how clones are
     /// authenticated, and nothing for remotes that need no credentials.
-    fn origin_fetch_token(&self, parent_git: &GitService) -> Option<String> {
+    pub(crate) fn origin_fetch_token(&self, parent_git: &GitService) -> Option<String> {
         let origin = parent_git.remote_url("origin").ok().flatten()?;
         let url = url::Url::parse(&origin).ok()?;
         if url.scheme() != "https" || url.host_str() != Some("github.com") {

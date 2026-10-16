@@ -66,7 +66,7 @@ use loom_providers::{
 };
 use loom_session::{SessionManager, WorkspaceManager};
 use loom_tools::{ToolExecutor, ToolExtension, ToolResult};
-use loom_vcs::GitService;
+use loom_vcs::{GitService, MirrorCreation};
 use loom_workspace::Workspace;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -76,8 +76,8 @@ mod auth;
 mod backend;
 
 use backend::{
-    ProcessService, RepositoryService, RunService, SessionFilesystemService, SessionService,
-    WorkspaceService,
+    CachedMirrorRefresh, MirrorFreshness, ProcessService, RepositoryService, RunService,
+    SessionFilesystemService, SessionService, WorkspaceService,
 };
 mod connection;
 mod deployment;

@@ -1,5 +1,37 @@
 use super::*;
 
+/// Deadline for the bounded refresh that runs before a session clones from a
+/// node mirror (#303). The refresh is bounded because a stalled remote must not
+/// hold the attach; a remote that does not answer within this window degrades to
+/// "reused, freshness unknown" instead of blocking or failing the attach.
+const MIRROR_REFRESH_DEADLINE: Duration = Duration::from_secs(10);
+
+/// A mirror whose last successful refresh is older than this is not reused at
+/// all: the session clones from the network instead, so a node that has not seen
+/// a repository in that long does not start a session from a nearly frozen
+/// mirror. An unknown age is not stale, because the bounded refresh below
+/// establishes it.
+const MIRROR_REUSE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A node mirror resolved for reuse, together with how current its contents were
+/// when it was resolved.
+#[derive(Debug)]
+pub(crate) struct ReusableMirror {
+    pub(crate) path: PathBuf,
+    pub(crate) freshness: MirrorFreshness,
+}
+
+/// Whether a mirror with this refresh record may still be reused for a session.
+fn mirror_may_be_reused(recorded: &CachedMirrorRefresh, now: Timestamp) -> bool {
+    recorded.age_millis(now) <= MIRROR_REUSE_MAX_AGE.as_millis() as u64
+}
+
+/// Whether a mirror resolves `revision` from its own refs, which decides whether
+/// a refresh that did not run may still satisfy the request.
+fn mirror_contains_revision(mirror: &Path, revision: &str) -> bool {
+    GitService::open(mirror).is_ok_and(|git| git.resolves_revision(revision))
+}
+
 impl InProcessConnection {
     pub(crate) fn search_github_repositories(&self, query: &str) -> Result<ServerResponse> {
         let token = self.backend.providers.github_account_token()?;
@@ -93,14 +125,15 @@ impl InProcessConnection {
             .filter(|url| url.scheme() == "https" && url.host_str() == Some("github.com"))
             .and_then(|_| self.backend.providers.github_account_token().ok());
         let cached_mirror = if reuse_local {
-            self.backend.cached_repository_mirror(&source)?
+            self.resolve_reusable_mirror(&source, &source_name, revision.as_deref())?
         } else {
             None
         };
         if let Some(mirror) = &cached_mirror {
             log::info!(
-                "[loom-server] reusing cached clone of {source_name} for session {session_id} from {}",
-                mirror.display()
+                "[loom-server] reusing cached clone of {source_name} for session {session_id} from {} ({})",
+                mirror.path.display(),
+                mirror.freshness.summary(Timestamp::now())
             );
         } else {
             log::info!(
@@ -109,7 +142,7 @@ impl InProcessConnection {
             );
         }
         let cloned = if let Some(mirror) = &cached_mirror {
-            GitService::clone_from_local(mirror, &temporary, revision.as_deref(), &source)
+            GitService::clone_from_local(&mirror.path, &temporary, revision.as_deref(), &source)
         } else {
             GitService::clone_from_authenticated(
                 &source,
@@ -168,7 +201,12 @@ impl InProcessConnection {
             );
         }
         let status = service.status()?;
-        self.cache_clone_for_reuse(&source, &destination, status.branch.as_deref());
+        self.cache_clone_for_reuse(
+            &source,
+            &destination,
+            status.branch.as_deref(),
+            status.head.as_deref(),
+        );
         let repository = SessionRepository {
             id: repository_id,
             source: source_name.clone(),
@@ -189,6 +227,109 @@ impl InProcessConnection {
         filesystem.mark_state_dirty()?;
         log::info!("repository {source_name} attached to session {session_id}");
         Ok(repository)
+    }
+
+    /// Resolves the node mirror to clone a session checkout from, refreshing it
+    /// first, or reports `None` so the caller clones from the network.
+    ///
+    /// A checkout cloned from a mirror takes its `refs/remotes/origin/*` from the
+    /// mirror's `refs/heads/*`, so a mirror that is not fetched hands every later
+    /// session the tip it was created from (#303). The mirror is therefore
+    /// fetched with a bounded deadline before it is used, and that refresh never
+    /// fails the attach: a stalled or unreachable remote degrades to a mirror
+    /// reported as `reused, freshness unknown` instead.
+    ///
+    /// A mirror whose recorded refresh is older than [`MIRROR_REUSE_MAX_AGE`] is
+    /// not reused at all: the checkout comes from the network instead. That mirror
+    /// is still refreshed, so a mirror that went unused past the limit becomes
+    /// reusable again for the session after this one. A mirror whose bounded
+    /// refresh failed is not reused for a request it cannot resolve.
+    pub(crate) fn resolve_reusable_mirror(
+        &self,
+        source: &str,
+        source_name: &str,
+        revision: Option<&str>,
+    ) -> Result<Option<ReusableMirror>> {
+        let Some(mirror) = self.backend.cached_repository_mirror(source)? else {
+            return Ok(None);
+        };
+        let now = Timestamp::now();
+        let recorded = self.backend.mirror_refresh(source)?;
+        if let Some(recorded) = recorded
+            .as_ref()
+            .filter(|recorded| !mirror_may_be_reused(recorded, now))
+        {
+            log::info!(
+                "[loom-server] not reusing the cached clone of {source_name} at {}: last refreshed {} ms ago, past the {} ms reuse limit; cloning from the network instead",
+                mirror.display(),
+                recorded.age_millis(now),
+                MIRROR_REUSE_MAX_AGE.as_millis()
+            );
+            self.refresh_cached_mirror(source, &mirror, Some(recorded.clone()));
+            return Ok(None);
+        }
+        let freshness = self.refresh_cached_mirror(source, &mirror, recorded);
+        let unsatisfied = revision.filter(|revision| {
+            freshness.is_unknown() && !mirror_contains_revision(&mirror, revision)
+        });
+        if let Some(revision) = unsatisfied {
+            log::warn!(
+                "[loom-server] not reusing the cached clone of {source_name} at {}: {} and its cached tip does not contain the requested revision '{revision}'; cloning from the network instead",
+                mirror.display(),
+                freshness.summary(now)
+            );
+            return Ok(None);
+        }
+        Ok(Some(ReusableMirror {
+            path: mirror,
+            freshness,
+        }))
+    }
+
+    /// Refreshes a node mirror with the deadline-bounded remote machinery
+    /// ([`GitService::refresh_mirror_heads`]) and records when it finished.
+    ///
+    /// A failure is logged and reported as unknown freshness, never returned: the
+    /// mirror is still a usable starting point, and an attach must not depend on
+    /// the remote answering.
+    fn refresh_cached_mirror(
+        &self,
+        source: &str,
+        mirror: &Path,
+        recorded: Option<CachedMirrorRefresh>,
+    ) -> MirrorFreshness {
+        let refreshed = GitService::open(mirror).and_then(|git| {
+            let token = self.origin_fetch_token(&git);
+            git.refresh_mirror_heads(token.as_deref(), MIRROR_REFRESH_DEADLINE)
+        });
+        let report = match refreshed {
+            Ok(report) => report,
+            Err(error) => {
+                log::warn!(
+                    "[loom-server] could not refresh the cached clone mirror {}: {}",
+                    mirror.display(),
+                    error.message
+                );
+                return MirrorFreshness::Unknown {
+                    last_refresh: recorded,
+                    warning: error.message,
+                };
+            }
+        };
+        let refresh = CachedMirrorRefresh {
+            clone_url: source.to_owned(),
+            refreshed_at: report.fetched_at,
+            default_branch: Some(report.default_branch),
+            revision: Some(report.default_branch_revision),
+        };
+        if let Err(error) = self.backend.record_mirror_refresh(&refresh) {
+            log::warn!(
+                "[loom-server] could not record the mirror refresh for {}: {}",
+                mirror.display(),
+                error.message
+            );
+        }
+        MirrorFreshness::Refreshed(refresh)
     }
 
     /// Attributes commits created in a newly attached checkout to the user.
@@ -234,19 +375,49 @@ impl InProcessConnection {
 
     /// Caches a freshly cloned GitHub checkout as a node mirror so later
     /// sessions can start from an existing clone instead of the network.
-    fn cache_clone_for_reuse(&self, source: &str, checkout: &Path, branch: Option<&str>) {
+    ///
+    /// A mirror this call created is recorded as refreshed now, because it is a
+    /// clone of the checkout that the remote was just cloned into. A mirror that
+    /// already existed is left alone, record included: this call did not fetch it
+    /// and cannot claim its heads are current (#303).
+    fn cache_clone_for_reuse(
+        &self,
+        source: &str,
+        checkout: &Path,
+        branch: Option<&str>,
+        revision: Option<&str>,
+    ) {
         let Some(full_name) = github_repository_full_name(source) else {
             return;
         };
         let Ok(mirror_path) = self.backend.repository_mirror_path(source) else {
             return;
         };
-        if let Err(error) = GitService::create_mirror(checkout, &mirror_path, source) {
-            log::warn!(
-                "[loom-server] could not cache a clone mirror for {full_name}: {}",
-                error.message
-            );
-            return;
+        match GitService::create_mirror(checkout, &mirror_path, source) {
+            Ok(MirrorCreation::Created) => {
+                let refresh = CachedMirrorRefresh {
+                    clone_url: source.to_owned(),
+                    refreshed_at: Timestamp::now(),
+                    default_branch: branch.map(str::to_owned),
+                    revision: revision.map(str::to_owned),
+                };
+                if let Err(error) = self.backend.record_mirror_refresh(&refresh) {
+                    log::warn!(
+                        "[loom-server] could not record the mirror refresh for {full_name}: {}",
+                        error.message
+                    );
+                }
+            }
+            Ok(MirrorCreation::Existing) => log::debug!(
+                "[loom-server] the cached clone mirror for {full_name} already exists; its recorded freshness is unchanged"
+            ),
+            Err(error) => {
+                log::warn!(
+                    "[loom-server] could not cache a clone mirror for {full_name}: {}",
+                    error.message
+                );
+                return;
+            }
         }
         let repository = ClonedRepository {
             full_name,
@@ -325,5 +496,50 @@ impl InProcessConnection {
         repository_id: RepositoryId,
     ) -> Result<GitService> {
         self.backend.session_git(session_id, repository_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refresh(refreshed_at: Timestamp) -> CachedMirrorRefresh {
+        CachedMirrorRefresh {
+            clone_url: "https://github.com/owner/name.git".to_owned(),
+            refreshed_at,
+            default_branch: Some("main".to_owned()),
+            revision: Some("a1b2c3".to_owned()),
+        }
+    }
+
+    #[test]
+    fn a_mirror_is_reused_until_its_recorded_refresh_is_a_day_old() {
+        let now = Timestamp::from_unix_millis(100_000_000);
+        assert!(mirror_may_be_reused(&refresh(now), now));
+        assert!(mirror_may_be_reused(
+            &refresh(Timestamp::from_unix_millis(100_000_000 - 1_000)),
+            now
+        ));
+        // At the limit the mirror is still reused, past it the network wins.
+        let limit = MIRROR_REUSE_MAX_AGE.as_millis() as u64;
+        assert!(mirror_may_be_reused(
+            &refresh(Timestamp::from_unix_millis(100_000_000 - limit)),
+            now
+        ));
+        assert!(!mirror_may_be_reused(
+            &refresh(Timestamp::from_unix_millis(100_000_000 - limit - 1)),
+            now
+        ));
+        // A record written by a clock that ran ahead is not stale.
+        assert!(mirror_may_be_reused(
+            &refresh(Timestamp::from_unix_millis(100_000_001)),
+            now
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_mirror_contains_no_revision() {
+        let missing = std::env::temp_dir().join(format!("loom-missing-{}", AgentSessionId::new()));
+        assert!(!mirror_contains_revision(&missing, "main"));
     }
 }
