@@ -310,7 +310,12 @@ HTTP upgrade + bearer credential
 
 `RemoteServerConfig` makes the bind address, path, heartbeat, request
 deadline, frame size, and outbound capacity explicit. It defaults to loopback
-and `/ws`; a `RunningRemoteServer` owns graceful shutdown. The
+and `/ws`; a `RunningRemoteServer` owns graceful shutdown. An inbound frame
+above the configured size limit (4 MiB by default, raised with
+`--max-frame-bytes` or `LOOM_MAX_FRAME_BYTES`) is rejected as
+`payload_too_large`, answered under the request id the frame names, or closed
+with a WebSocket reason when it names none; a client that reaches the listener
+resolves the same limit for the frames it sends and receives. The
 `WebSocketTransport` client uses the same JSON codecs as protocol tests, so a
 native client and a browser client do not need different domain operations.
 Transport tasks may time out or be cancelled, but backend work that already

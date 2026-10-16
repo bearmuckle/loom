@@ -731,6 +731,70 @@ mod tests {
     }
 
     #[test]
+    fn remote_connection_applies_the_configured_frame_limit() {
+        use loom_protocol::{ClientRequest, ControlRequest, RequestEnvelope};
+
+        // An unusable limit is rejected before anything is connected.
+        let options = RemoteConnectionOptions::default();
+        let error = RemoteConnection::connect_with_max_frame_bytes(
+            "ws://127.0.0.1:1/ws",
+            "token",
+            false,
+            &options,
+            0,
+        )
+        .err()
+        .expect("a zero frame limit must be rejected");
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains("greater than zero"), "{error}");
+
+        // The option bounds the request this client sends and the response it
+        // receives, with the reported failure naming the size and the limit.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (url, token, server) = runtime.block_on(async {
+            let backend = loom_server::InProcessBackend::new();
+            let auth = Arc::new(loom_server::AuthTokenStore::new());
+            let token = auth
+                .insert("frame-limit-token", loom_server::AuthorizationScope::all())
+                .unwrap();
+            let server = loom_server::RemoteServer::new(
+                backend,
+                auth,
+                loom_server::RemoteServerConfig::local_ephemeral(),
+            )
+            .bind()
+            .await
+            .unwrap();
+            (server.websocket_url().to_owned(), token.token, server)
+        });
+        let request =
+            || RequestEnvelope::new(ClientRequest::Control(ControlRequest::DiscoverCapabilities));
+
+        let connection =
+            RemoteConnection::connect_with_max_frame_bytes(&url, &token, false, &options, 64)
+                .unwrap();
+        let error = connection.request(request()).result.unwrap_err();
+        assert_eq!(error.code, ErrorCode::PayloadTooLarge);
+        assert!(error.message.starts_with("remote request of "), "{error}");
+        assert!(error.message.contains("limit of 64 bytes"), "{error}");
+        connection.close().unwrap();
+
+        let connection =
+            RemoteConnection::connect_with_max_frame_bytes(&url, &token, false, &options, 256)
+                .unwrap();
+        let error = connection.request(request()).result.unwrap_err();
+        assert_eq!(error.code, ErrorCode::PayloadTooLarge);
+        assert!(error.message.starts_with("remote response of "), "{error}");
+        assert!(error.message.contains("limit of 256 bytes"), "{error}");
+        connection.close().unwrap();
+
+        runtime.block_on(server.stop()).unwrap();
+    }
+
+    #[test]
     fn peer_credentials_are_scoped_by_workspace_and_url_and_deleted_with_peer() {
         let backend = Arc::new(MemoryPeerCredentialBackend::default());
         let store = PeerCredentialStore::with_backend(backend);

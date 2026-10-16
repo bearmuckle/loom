@@ -3,22 +3,25 @@ use std::{sync::Arc, time::Duration};
 use futures_util::{SinkExt, StreamExt};
 use loom_agent::AgentEvent;
 use loom_core::{
-    AgentSessionId, ApprovalPolicy, Capability, CapabilitySet, ErrorCode, EventSequence, RequestId,
-    WorkspaceId,
+    AgentSessionId, ApprovalPolicy, Capability, CapabilitySet, ErrorCode, EventSequence, LoomError,
+    RequestId, WorkspaceId,
 };
 use loom_model::ModelId;
 use loom_protocol::{
     ClientRequest, ControlRequest, ControlResponse, EventsRequest, EventsResponse, ProviderRequest,
-    ProviderResponse, RequestEnvelope, RunRequest, RunResponse, ServerEvent, ServerResponse,
-    SessionRequest, SessionResponse, TerminalRequest, TerminalResponse, WorkerNodeStatus,
-    WorkspaceRequest, WorkspaceResponse, decode_response,
+    ProviderResponse, RequestEnvelope, ResponseEnvelope, RunRequest, RunResponse, ServerEvent,
+    ServerResponse, SessionRequest, SessionResponse, TerminalRequest, TerminalResponse,
+    WorkerNodeStatus, WorkspaceRequest, WorkspaceResponse, decode_request, decode_response,
+    encode_request, encode_response,
 };
 use loom_server::{
-    AuthTokenStore, AuthorizationScope, InProcessBackend, RemoteServer, RemoteServerConfig,
-    ServerTlsConfig, WEBSOCKET_TLS_SUPPORTED, WebSocketConnection, WebSocketTransport,
+    AuthTokenStore, AuthorizationScope, DEFAULT_MAX_FRAME_BYTES, InProcessBackend, RemoteServer,
+    RemoteServerConfig, ServerTlsConfig, WEBSOCKET_TLS_SUPPORTED, WebSocketConnection,
+    WebSocketTransport,
 };
+use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{
-    connect_async,
+    MaybeTlsStream, WebSocketStream, accept_async, connect_async,
     tungstenite::{Message, client::IntoClientRequest},
 };
 
@@ -48,6 +51,30 @@ async fn server_with_backend(
     loom_server::IssuedToken,
     loom_server::RunningRemoteServer,
 ) {
+    server_with_backend_and_frame_limit(backend, DEFAULT_MAX_FRAME_BYTES).await
+}
+
+/// The standard test server with `max_frame_bytes` as its inbound limit.
+async fn server_with_frame_limit(
+    max_frame_bytes: usize,
+) -> (
+    Arc<InProcessBackend>,
+    Arc<AuthTokenStore>,
+    loom_server::IssuedToken,
+    loom_server::RunningRemoteServer,
+) {
+    server_with_backend_and_frame_limit(InProcessBackend::new(), max_frame_bytes).await
+}
+
+async fn server_with_backend_and_frame_limit(
+    backend: Arc<InProcessBackend>,
+    max_frame_bytes: usize,
+) -> (
+    Arc<InProcessBackend>,
+    Arc<AuthTokenStore>,
+    loom_server::IssuedToken,
+    loom_server::RunningRemoteServer,
+) {
     let auth = Arc::new(AuthTokenStore::new());
     let token = auth
         .insert("remote-test-token", AuthorizationScope::all())
@@ -58,6 +85,7 @@ async fn server_with_backend(
         RemoteServerConfig {
             heartbeat_interval: Duration::from_millis(25),
             request_timeout: Duration::from_secs(5),
+            max_frame_bytes,
             ..RemoteServerConfig::local_ephemeral()
         },
     )
@@ -65,6 +93,46 @@ async fn server_with_backend(
     .await
     .unwrap();
     (backend, auth, token, server)
+}
+
+/// A request padded to about `bytes` so a frame-size bound can be exercised
+/// without creating the session it names. An unknown session is answered with
+/// `not_found`, which shows the frame reached the request handler.
+fn padding_request(bytes: usize) -> RequestEnvelope {
+    RequestEnvelope::new(ClientRequest::Session(SessionRequest::RenameAgentSession {
+        session_id: AgentSessionId::new(),
+        name: "p".repeat(bytes),
+    }))
+}
+
+/// Opens a raw WebSocket to the test server, authenticated like a client but
+/// without a client-side frame limit of its own.
+async fn raw_socket(
+    server: &loom_server::RunningRemoteServer,
+    token: &str,
+) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
+    let mut request = server.websocket_url().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    let (socket, _) = connect_async(request).await.unwrap();
+    socket
+}
+
+/// The next text frame from `socket`, answering heartbeats in between.
+async fn next_text_frame(socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) -> Vec<u8> {
+    loop {
+        match socket.next().await {
+            Some(Ok(Message::Text(text))) => return text.as_bytes().to_vec(),
+            Some(Ok(Message::Ping(payload))) => {
+                socket.send(Message::Pong(payload)).await.unwrap();
+            }
+            Some(Ok(Message::Pong(_)))
+            | Some(Ok(Message::Binary(_)))
+            | Some(Ok(Message::Frame(_))) => {}
+            other => panic!("expected a text frame, got {other:?}"),
+        }
+    }
 }
 
 #[tokio::test]
@@ -1076,6 +1144,243 @@ async fn malformed_payloads_receive_structured_errors() {
         ErrorCode::MalformedPayload
     );
     server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_oversized_response_fails_only_its_own_request() {
+    let limit = 256;
+    let (_backend, _auth, token, server) = server().await;
+    let mut connection = WebSocketTransport::new(server.websocket_url(), token.token)
+        .with_max_frame_bytes(limit)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+
+    let request =
+        RequestEnvelope::new(ClientRequest::Control(ControlRequest::DiscoverCapabilities));
+    let request_id = request.request_id;
+    let error = connection
+        .request(request)
+        .await
+        .expect_err("a response above the frame limit must fail");
+    assert_eq!(error.code, ErrorCode::PayloadTooLarge);
+    assert!(!error.retryable);
+    // The failure names the awaited request, the received size, and the limit,
+    // and it comes from the response path rather than from send time.
+    assert!(error.message.starts_with("remote response of "), "{error}");
+    assert!(
+        error.message.contains(&format!("for request {request_id}")),
+        "{error}"
+    );
+    assert!(
+        error
+            .message
+            .contains(&format!("frame size limit of {limit} bytes")),
+        "{error}"
+    );
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_oversized_request_is_rejected_before_it_is_sent() {
+    let limit = 64;
+    let (_backend, _auth, token, server) = server().await;
+    let mut connection = WebSocketTransport::new(server.websocket_url(), token.token)
+        .with_max_frame_bytes(limit)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+
+    let request =
+        RequestEnvelope::new(ClientRequest::Control(ControlRequest::DiscoverCapabilities));
+    let request_id = request.request_id;
+    let encoded = encode_request(&request).unwrap();
+    assert!(encoded.len() > limit);
+    let error = connection
+        .request(request)
+        .await
+        .expect_err("a request above the frame limit must fail");
+    assert_eq!(error.code, ErrorCode::PayloadTooLarge);
+    assert_eq!(
+        error.message,
+        format!(
+            "remote request of {} bytes for request {request_id} is above the configured frame \
+             size limit of {limit} bytes",
+            encoded.len()
+        )
+    );
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn oversized_inbound_frames_are_correlated_or_closed_with_the_limit() {
+    let limit = 2048;
+    let (_backend, _auth, token, server) = server_with_frame_limit(limit).await;
+
+    // A frame that still decodes is answered under the request id it names.
+    let mut socket = raw_socket(&server, &token.token).await;
+    let request = padding_request(limit * 2);
+    let encoded = encode_request(&request).unwrap();
+    assert!(encoded.len() > limit);
+    socket
+        .send(Message::Text(
+            String::from_utf8(encoded.clone()).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+    let response = decode_response(&next_text_frame(&mut socket).await).unwrap();
+    assert_eq!(response.request_id, request.request_id);
+    let error = response.result.unwrap_err();
+    assert_eq!(error.code, ErrorCode::PayloadTooLarge);
+    assert!(
+        error
+            .message
+            .contains(&format!("of {} bytes", encoded.len())),
+        "{error}"
+    );
+    assert!(
+        error.message.contains(&format!("limit of {limit} bytes")),
+        "{error}"
+    );
+    assert!(
+        error
+            .message
+            .contains(&format!("for request {}", request.request_id)),
+        "{error}"
+    );
+
+    // A frame that names no request cannot be answered, so the connection
+    // closes with a reason carrying the same explanation. The oversized bytes
+    // must be valid UTF-8, so they are text that is not a request.
+    let mut socket = raw_socket(&server, &token.token).await;
+    let oversized = "x".repeat(limit * 2);
+    socket
+        .send(Message::Text(oversized.clone().into()))
+        .await
+        .unwrap();
+    let close = loop {
+        match socket.next().await {
+            Some(Ok(Message::Close(Some(frame)))) => break frame,
+            Some(Ok(Message::Ping(payload))) => {
+                socket.send(Message::Pong(payload)).await.unwrap();
+            }
+            Some(Ok(Message::Pong(_)))
+            | Some(Ok(Message::Binary(_)))
+            | Some(Ok(Message::Frame(_))) => {}
+            other => panic!("expected a close frame, got {other:?}"),
+        }
+    };
+    assert_eq!(u16::from(close.code), 1009);
+    let reason = close.reason.as_str();
+    assert!(reason.contains(&oversized.len().to_string()), "{reason}");
+    assert!(reason.contains(&limit.to_string()), "{reason}");
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_configured_frame_limit_is_honoured_end_to_end() {
+    let limit = 2048;
+    let (_backend, _auth, token, server) = server_with_frame_limit(limit).await;
+    let mut connection = WebSocketTransport::new(server.websocket_url(), token.token)
+        .with_max_frame_bytes(limit)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+
+    // Frames under the configured limit still negotiate and reach the request
+    // handler on both sides.
+    negotiate(&mut connection).await;
+    let under_limit = padding_request(limit / 4);
+    assert!(encode_request(&under_limit).unwrap().len() < limit);
+    let response = connection.request(under_limit).await.unwrap();
+    assert_eq!(
+        response.result.unwrap_err().code,
+        ErrorCode::NotFound,
+        "a frame under the limit must be dispatched"
+    );
+
+    // A frame above the limit is rejected rather than dispatched, and the
+    // rejection names the request, the size, and the limit.
+    let over_limit = padding_request(limit * 2);
+    let request_id = over_limit.request_id;
+    let encoded = encode_request(&over_limit).unwrap();
+    assert!(encoded.len() > limit);
+    let error = connection
+        .request(over_limit)
+        .await
+        .expect_err("a frame above the configured limit must be rejected");
+    assert_eq!(error.code, ErrorCode::PayloadTooLarge);
+    assert_eq!(
+        error.message,
+        format!(
+            "remote request of {} bytes for request {request_id} is above the configured frame \
+             size limit of {limit} bytes",
+            encoded.len()
+        )
+    );
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_oversized_frame_that_is_not_the_awaited_response_does_not_fail_the_request() {
+    let limit = 512;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    // The scripted peer sends an over-limit frame that belongs to another
+    // request before answering the awaited request.
+    let scripted = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        let request = loop {
+            match socket.next().await {
+                Some(Ok(Message::Text(text))) => break decode_request(text.as_bytes()).unwrap(),
+                Some(Ok(Message::Ping(payload))) => {
+                    socket.send(Message::Pong(payload)).await.unwrap();
+                }
+                Some(Ok(Message::Pong(_)))
+                | Some(Ok(Message::Binary(_)))
+                | Some(Ok(Message::Frame(_))) => {}
+                other => panic!("expected a request frame, got {other:?}"),
+            }
+        };
+        let foreign = encode_response(&ResponseEnvelope::failure(
+            RequestId::new(),
+            LoomError::invalid_request("x".repeat(limit * 2)),
+        ))
+        .unwrap();
+        socket
+            .send(Message::Text(String::from_utf8(foreign).unwrap().into()))
+            .await
+            .unwrap();
+        let awaited = encode_response(&ResponseEnvelope::failure(
+            request.request_id,
+            LoomError::not_found("agent session", request.request_id),
+        ))
+        .unwrap();
+        socket
+            .send(Message::Text(String::from_utf8(awaited).unwrap().into()))
+            .await
+            .unwrap();
+    });
+
+    let mut connection = WebSocketTransport::new(format!("ws://{address}/ws"), "token")
+        .with_max_frame_bytes(limit)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let request =
+        RequestEnvelope::new(ClientRequest::Control(ControlRequest::DiscoverCapabilities));
+    let request_id = request.request_id;
+    let response = connection.request(request).await.unwrap_or_else(|error| {
+        panic!("an over-limit frame for another request must not fail this one: {error}")
+    });
+    assert_eq!(response.request_id, request_id);
+    assert_eq!(response.result.unwrap_err().code, ErrorCode::NotFound);
+    scripted.await.unwrap();
 }
 
 #[tokio::test]

@@ -27,9 +27,9 @@ use loom_providers::{
 use loom_server::{
     ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FORCE_DISCARD_ENV, ARCHIVE_RETENTION_SWEEP_INTERVAL,
     AuthTokenStore, AuthorizationScope, InProcessBackend, InProcessConnection, Instance,
-    InstanceOptions, RemoteServer, RemoteServerConfig, WebSocketConnection, WebSocketTransport,
-    apply_startup_archive_retention, resolve_archive_retention, run_archive_retention_sweeps,
-    sweep_archive_retention_at_startup,
+    InstanceOptions, MAX_FRAME_BYTES_ENV, RemoteServer, RemoteServerConfig, WebSocketConnection,
+    WebSocketTransport, apply_startup_archive_retention, resolve_archive_retention,
+    resolve_max_frame_bytes, run_archive_retention_sweeps, sweep_archive_retention_at_startup,
 };
 
 /// How long the shell waits between event polls while a run is executing.
@@ -153,6 +153,8 @@ struct CliOptions {
     archive_retention: Option<String>,
     /// Raw `--archive-retention-force-discard` value.
     archive_retention_force_discard: Option<String>,
+    /// Raw `--max-frame-bytes` value, before it is resolved into a byte count.
+    max_frame_bytes: Option<String>,
 }
 
 impl CliOptions {
@@ -167,6 +169,18 @@ impl CliOptions {
             env::var(ARCHIVE_RETENTION_FORCE_DISCARD_ENV)
                 .ok()
                 .as_deref(),
+        )
+    }
+
+    /// The most bytes either side of this shell's remote transport accepts in
+    /// one WebSocket frame: `--max-frame-bytes`, `LOOM_MAX_FRAME_BYTES`, or the
+    /// documented `loom_server::DEFAULT_MAX_FRAME_BYTES` (4 MiB). It bounds the
+    /// listener a `--serve` start exposes and the client the `--m4-demo`
+    /// connects with.
+    fn max_frame_bytes(&self) -> Result<usize, LoomError> {
+        resolve_max_frame_bytes(
+            self.max_frame_bytes.as_deref(),
+            env::var(MAX_FRAME_BYTES_ENV).ok().as_deref(),
         )
     }
 
@@ -194,7 +208,7 @@ fn help_text() -> String {
          [--serve --bind <addr> --instance-name <name> \
          [--token <token> | --token-file <path>] [--archive-retention <duration>] \
          [--archive-retention-force-discard <bool>]] [--m4-demo] [--login github-copilot] \
-         [--allow-insecure-remote]",
+         [--allow-insecure-remote] [--max-frame-bytes <bytes>]",
         "Add --m2-demo to exercise workspace, terminal, and task APIs.",
         "Add --m3-demo to persist the run, list deterministic/Ollama providers, and reopen the \
          backend.",
@@ -206,6 +220,10 @@ fn help_text() -> String {
         "A --serve --bind address that is not loopback needs --allow-insecure-remote to accept \
          sending the bearer token in plaintext, because this shell serves plain ws:// only.",
         "Use --m4-demo to exercise a second reconnecting remote client.",
+        "--max-frame-bytes <bytes> (or LOOM_MAX_FRAME_BYTES) raises or lowers the frame \
+         size limit of this shell's remote transport, for both the --serve listener and \
+         the --m4-demo client; it defaults to 4194304 (4 MiB) and rejects any frame above \
+         it as payload_too_large naming the request, the received size, and the limit.",
         "Use --login github-copilot to authenticate GitHub Copilot.",
         "Use --reset-state to wipe an incompatible state database instead of being prompted.",
         "Use --archive-retention <duration> (or LOOM_ARCHIVE_RETENTION) to delete archived \
@@ -241,6 +259,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
         allow_insecure_remote: false,
         archive_retention: None,
         archive_retention_force_discard: None,
+        max_frame_bytes: None,
     };
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -255,6 +274,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
             "--m4-demo" => options.m4_demo = true,
             "--reset-state" => options.reset_state = true,
             "--allow-insecure-remote" => options.allow_insecure_remote = true,
+            "--max-frame-bytes" => {
+                options.max_frame_bytes = Some(required_value(&mut args, "--max-frame-bytes")?);
+            }
             "--archive-retention" => {
                 options.archive_retention = Some(required_value(&mut args, "--archive-retention")?);
             }
@@ -329,6 +351,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
                 options.archive_retention_force_discard =
                     Some(value["--archive-retention-force-discard=".len()..].to_owned());
             }
+            value if value.starts_with("--max-frame-bytes=") => {
+                options.max_frame_bytes = Some(value["--max-frame-bytes=".len()..].to_owned());
+            }
             value if value.starts_with("--login=") => {
                 options.login_provider = Some(value["--login=".len()..].to_owned());
             }
@@ -397,6 +422,7 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
     sweep_archive_retention_at_startup(&backend);
     let config = RemoteServerConfig {
         bind_addr: options.bind,
+        max_frame_bytes: options.max_frame_bytes()?,
         allow_insecure_remote: options.allow_insecure_remote,
         ..RemoteServerConfig::default()
     };
@@ -437,6 +463,9 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
 }
 
 fn run_m4_demo(options: CliOptions) -> Result<(), LoomError> {
+    // The limit is resolved before the fields below are moved into the
+    // demonstration client.
+    let max_frame_bytes = options.max_frame_bytes()?;
     let workspace_root = prepare_workspace(options.root)?;
     let backend = InProcessBackend::new();
     let auth = Arc::new(AuthTokenStore::new());
@@ -462,6 +491,7 @@ fn run_m4_demo(options: CliOptions) -> Result<(), LoomError> {
             token.to_owned(),
             workspace_root,
             options.task,
+            max_frame_bytes,
         )
         .await;
         let stop_result = server.stop().await;
@@ -474,8 +504,9 @@ async fn m4_demo_remote(
     token: String,
     workspace_root: PathBuf,
     task: String,
+    max_frame_bytes: usize,
 ) -> Result<(), LoomError> {
-    let transport = WebSocketTransport::new(url, token);
+    let transport = WebSocketTransport::new(url, token).with_max_frame_bytes(max_frame_bytes)?;
     let mut first = transport.connect().await?;
     negotiate_remote(&mut first).await?;
     let workspace = match first
@@ -1503,10 +1534,13 @@ mod tests {
         CliOptions, create_session, create_workspace, demonstrate_m2_services,
         demonstrate_m3_recovery, negotiate, parse_args, run_m4_demo, start_run, stream_run,
     };
-    use loom_core::{AgentSessionState, RunId};
+    use loom_core::{AgentSessionState, ErrorCode, RunId};
     use loom_model::ModelId;
     use loom_protocol::ArchiveRetentionPolicy;
-    use loom_server::{InProcessBackend, ensure_state_database_with, resolve_archive_retention};
+    use loom_server::{
+        DEFAULT_MAX_FRAME_BYTES, InProcessBackend, ensure_state_database_with,
+        resolve_archive_retention,
+    };
     use std::net::SocketAddr;
 
     fn arguments<'a>(values: &'a [&str]) -> impl Iterator<Item = String> + 'a {
@@ -1702,7 +1736,41 @@ mod tests {
         assert!(help.contains("--archive-retention-force-discard <bool>"));
         assert!(help.contains("LOOM_ARCHIVE_RETENTION"));
         assert!(help.contains("LOOM_ARCHIVE_RETENTION_FORCE_DISCARD"));
+        assert!(help.contains("--max-frame-bytes <bytes>"));
+        assert!(help.contains("LOOM_MAX_FRAME_BYTES"));
         assert!(help.contains("--serve"));
+    }
+
+    #[test]
+    fn max_frame_bytes_resolves_from_the_flag_then_the_environment() {
+        let defaults = parse_args(arguments(&[])).unwrap().unwrap();
+        assert_eq!(defaults.max_frame_bytes, None);
+        assert_eq!(defaults.max_frame_bytes().unwrap(), DEFAULT_MAX_FRAME_BYTES);
+
+        let spaced = parse_args(arguments(&["--max-frame-bytes", "8192"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(spaced.max_frame_bytes.as_deref(), Some("8192"));
+        assert_eq!(spaced.max_frame_bytes().unwrap(), 8192);
+
+        let equals = parse_args(arguments(&["--max-frame-bytes=16384"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(equals.max_frame_bytes().unwrap(), 16384);
+
+        // A rejected value names the flag it came from.
+        let error = parse_args(arguments(&["--max-frame-bytes=0"]))
+            .unwrap()
+            .unwrap()
+            .max_frame_bytes()
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains("--max-frame-bytes"), "{error}");
+        assert!(
+            parse_error(&["--max-frame-bytes"])
+                .message
+                .contains("requires a value")
+        );
     }
 
     #[test]
@@ -1734,6 +1802,7 @@ mod tests {
             allow_insecure_remote: false,
             archive_retention: None,
             archive_retention_force_discard: None,
+            max_frame_bytes: None,
         };
         let run_id = start_run(&connection, session.id, &options).unwrap();
         stream_run(&connection, session.id, run_id, false).unwrap();
@@ -1766,6 +1835,7 @@ mod tests {
             allow_insecure_remote: false,
             archive_retention: None,
             archive_retention_force_discard: None,
+            max_frame_bytes: None,
         };
 
         let result = run_m4_demo(options);
@@ -1801,6 +1871,7 @@ mod tests {
             allow_insecure_remote: false,
             archive_retention: None,
             archive_retention_force_discard: None,
+            max_frame_bytes: None,
         };
         let run_id = start_run(&connection, session.id, &options).unwrap();
         stream_run(&connection, session.id, run_id, false).unwrap();
