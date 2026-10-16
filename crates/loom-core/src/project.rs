@@ -124,14 +124,13 @@ pub enum ProjectWorktreeCleanupDisposition {
     DiscardChanges,
 }
 
-/// The revision a delegated child checkout was created from, together with how
-/// far that revision is from the default branch of the remote that was fetched
-/// for it.
+/// The revision a checkout was created from, together with how far that
+/// revision is from the default branch of the remote that was fetched for it.
 ///
-/// A record exists only for a refresh that ran while the checkout was created,
-/// so a stale `refs/remotes/origin/*` ref is never presented as the current
-/// upstream tip. When that fetch fails the record states the failure and leaves
-/// the drift unknown instead of reporting a cached answer.
+/// A record exists only for a refresh that ran for the revision it names, so a
+/// stale `refs/remotes/origin/*` ref is never presented as the current upstream
+/// tip. When that fetch fails the record states the failure and leaves the
+/// drift unknown instead of reporting a cached answer.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "state")]
 pub enum ProjectWorktreeBaseRefresh {
@@ -139,7 +138,7 @@ pub enum ProjectWorktreeBaseRefresh {
     Fetched {
         /// Remote that was fetched.
         remote: String,
-        /// Revision the child checkout was created from.
+        /// Revision the refresh measured against.
         base_revision: String,
         /// Default branch that the fetch resolved for that remote.
         default_branch: String,
@@ -156,7 +155,7 @@ pub enum ProjectWorktreeBaseRefresh {
     Unavailable {
         /// Remote whose refresh failed.
         remote: String,
-        /// Revision the child checkout was created from.
+        /// Revision the refresh measured against.
         base_revision: String,
         /// When the failed refresh was attempted.
         attempted_at: Timestamp,

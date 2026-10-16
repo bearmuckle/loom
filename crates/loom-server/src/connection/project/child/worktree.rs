@@ -718,7 +718,7 @@ impl InProcessConnection {
             // this same creation is reused instead of fetching twice.
             if !base_refresh_is_recent(worktree.base_refresh.as_ref(), Timestamp::now()) {
                 worktree.base_refresh =
-                    Some(self.refresh_child_base_revision(&parent_git, &worktree.base_revision));
+                    Some(self.refresh_checkout_base_revision(&parent_git, &worktree.base_revision));
                 worktree.updated_at = Timestamp::now();
             }
             parent_git.create_linked_worktree_at_revision(

@@ -1730,3 +1730,254 @@ fn workspace_event_requests_require_workspace_event_capability() {
             if matches!(events.as_slice(), [WorkspaceFeedEvent::Workspace(_)])));
     fs::remove_file(path).unwrap();
 }
+
+/// A session whose single attached repository is a clone of a bare `origin`, so
+/// a test can advance the remote after the clone and read what the next run
+/// reports about the base it is pinned to.
+struct SessionCheckoutFixture {
+    temp: PathBuf,
+    source: PathBuf,
+    origin: PathBuf,
+    branch: String,
+    checkout: PathBuf,
+    backend: Arc<InProcessBackend>,
+    connection: InProcessConnection,
+    session_id: AgentSessionId,
+}
+
+impl SessionCheckoutFixture {
+    fn shutdown(self) {
+        let session_root_base = self.backend.session_root_base.clone();
+        self.backend.shutdown().unwrap();
+        fs::remove_dir_all(&session_root_base).unwrap();
+        fs::remove_dir_all(&self.temp).unwrap();
+        fs::remove_dir_all(&self.source).unwrap();
+    }
+
+    /// Adds one commit to the default branch of the bare origin through a
+    /// second clone, so the checkout falls behind by exactly one commit without
+    /// any network access.
+    fn advance_origin(&self) {
+        let work = self.temp.join("upstream");
+        git_in(
+            &self.temp,
+            &[
+                "clone",
+                "-q",
+                self.origin.to_str().unwrap(),
+                work.to_str().unwrap(),
+            ],
+        );
+        commit_file(
+            &work,
+            "upstream.txt",
+            "upstream change\n",
+            "upstream change",
+        );
+        git_in(&work, &["push", "-q", "origin", &self.branch]);
+    }
+
+    /// Attaches the same bare origin a second time, so the session no longer
+    /// exposes exactly one repository.
+    fn attach_second_repository(&self) {
+        let attached = self
+            .connection
+            .request(RequestEnvelope::new(ClientRequest::Repository(
+                RepositoryRequest::AttachSessionRepository {
+                    session_id: self.session_id,
+                    source: self.origin.display().to_string(),
+                    path: "repo-again".to_owned(),
+                    revision: None,
+                    reuse_local: false,
+                },
+            )));
+        assert!(
+            matches!(
+                attached.result,
+                Ok(ServerResponse::Repository(
+                    RepositoryResponse::SessionRepositoryAttached(_)
+                ))
+            ),
+            "{:?}",
+            attached.result
+        );
+    }
+
+    /// Starts one agent run and returns the repository instructions it was
+    /// persisted with.
+    fn run_repository_instructions(&self) -> String {
+        let started = self
+            .connection
+            .request(RequestEnvelope::new(ClientRequest::Run(
+                RunRequest::StartSessionAgentRun {
+                    session_id: self.session_id,
+                    task: "report the base".to_owned(),
+                    model: ModelId::new("deterministic/demo"),
+                    system_instructions: None,
+                    repository_instructions: Some("Keep changes focused.".to_owned()),
+                },
+            )));
+        let run_id = match started.result.unwrap() {
+            ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
+            response => panic!("unexpected run response: {response:?}"),
+        };
+        self.backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_run_runtime_config(run_id)
+            .unwrap()
+            .expect("the started run should be persisted with its runtime config")
+            .repository_instructions
+            .expect("the run should carry repository instructions")
+    }
+}
+
+fn session_checkout_fixture() -> SessionCheckoutFixture {
+    let temp = workspace();
+    let source = git_repository();
+    let branch = git_output(&source, &["branch", "--show-current"]);
+    let origin = temp.join("origin.git");
+    git_in(&temp, &["init", "--bare", "-q", origin.to_str().unwrap()]);
+    git_in(
+        &source,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git_in(&source, &["push", "-q", "origin", &branch]);
+    // Record the remote default branch the way a clone would, so the refresh
+    // resolves it from the first fetch onwards.
+    git_in(
+        &origin,
+        &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
+    );
+
+    let backend = InProcessBackend::new_persistent(temp.join("state.sqlite")).unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Pinned base".to_owned(),
+        },
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+        created.result.unwrap()
+    else {
+        panic!("unexpected workspace response");
+    };
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
+            workspace_id: workspace.id,
+            name: "Pinned base".to_owned(),
+        },
+    )));
+    let ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) =
+        created.result.unwrap()
+    else {
+        panic!("unexpected session response");
+    };
+    let session_id = session.id;
+    let attached = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+        RepositoryRequest::AttachSessionRepository {
+            session_id,
+            source: origin.display().to_string(),
+            path: "repo".to_owned(),
+            revision: None,
+            reuse_local: false,
+        },
+    )));
+    assert!(
+        matches!(
+            attached.result,
+            Ok(ServerResponse::Repository(
+                RepositoryResponse::SessionRepositoryAttached(_)
+            ))
+        ),
+        "{:?}",
+        attached.result
+    );
+    let checkout = connection
+        .session_filesystem(session_id)
+        .unwrap()
+        .root()
+        .join("repo");
+
+    SessionCheckoutFixture {
+        temp,
+        source,
+        origin,
+        branch,
+        checkout,
+        backend,
+        connection,
+        session_id,
+    }
+}
+
+#[test]
+fn run_repository_instructions_report_how_far_the_checkout_fell_behind() {
+    let fixture = session_checkout_fixture();
+    fixture.advance_origin();
+
+    let instructions = fixture.run_repository_instructions();
+
+    assert!(
+        instructions.contains("Keep changes focused."),
+        "the client instructions should be preserved: {instructions}"
+    );
+    assert!(
+        instructions.contains(&format!("origin/{} is 1 commit ahead at", fixture.branch)),
+        "the run should be told how stale its pinned base is: {instructions}"
+    );
+    fixture.shutdown();
+}
+
+#[test]
+fn run_repository_instructions_report_an_unknown_base_when_the_refresh_fails() {
+    let fixture = session_checkout_fixture();
+    // The remote the session checkout was cloned from is no longer reachable,
+    // so the bounded refresh cannot resolve the default-branch tip.
+    git_in(
+        &fixture.checkout,
+        &["remote", "set-url", "origin", "/nonexistent/loom-origin"],
+    );
+
+    let instructions = fixture.run_repository_instructions();
+
+    assert!(
+        instructions.contains("Keep changes focused."),
+        "the run must still start with its instructions: {instructions}"
+    );
+    assert!(
+        instructions.contains(
+            "could not be refreshed, so the base's drift from its default branch is unknown"
+        ),
+        "an unreachable remote should be reported as unknown drift: {instructions}"
+    );
+    fixture.shutdown();
+}
+
+#[test]
+fn run_repository_instructions_omit_the_base_note_for_several_repositories() {
+    let fixture = session_checkout_fixture();
+    fixture.advance_origin();
+    fixture.attach_second_repository();
+
+    let instructions = fixture.run_repository_instructions();
+
+    assert_eq!(instructions, "Keep changes focused.");
+    fixture.shutdown();
+}
+
+#[test]
+fn run_repository_instructions_omit_the_base_note_without_an_origin() {
+    let fixture = session_checkout_fixture();
+    fixture.advance_origin();
+    // Without an `origin` there is no default branch to be pinned against, so
+    // the run starts without a freshness note.
+    git_in(&fixture.checkout, &["remote", "remove", "origin"]);
+
+    let instructions = fixture.run_repository_instructions();
+
+    assert_eq!(instructions, "Keep changes focused.");
+    fixture.shutdown();
+}

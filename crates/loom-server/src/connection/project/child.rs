@@ -7,8 +7,8 @@ mod result;
 mod schedule;
 mod worktree;
 
-/// Deadline for the remote refresh that runs before a child checkout is
-/// created. The refresh is bounded because a stalled remote must not hold the
+/// Deadline for the remote refresh that runs before a checkout is created or
+/// measured. The refresh is bounded because a stalled remote must not hold the
 /// project scheduling locks indefinitely (#274); a remote that does not answer
 /// within this window is reported as an unavailable base instead of blocking
 /// creation.
@@ -35,20 +35,21 @@ pub(crate) fn base_refresh_is_recent(
 }
 
 impl InProcessConnection {
-    /// Fetches `origin` with a bounded deadline and records how far
-    /// `base_revision` is from the default-branch tip that fetch resolved.
+    /// Fetches `origin` with a bounded deadline and records how far a
+    /// checkout's `base_revision` is from the default-branch tip that fetch
+    /// resolved.
     ///
     /// A failed or expired refresh becomes an `Unavailable` record and a log
-    /// warning rather than an error: an unreachable remote must not block
-    /// creating a child checkout, and the cached `origin/*` refs are
-    /// deliberately not used as a stand-in for the fetch that failed.
-    pub(crate) fn refresh_child_base_revision(
+    /// warning rather than an error: an unreachable remote must not block the
+    /// caller, and the cached `origin/*` refs are deliberately not used as a
+    /// stand-in for the fetch that failed.
+    pub(crate) fn refresh_checkout_base_revision(
         &self,
-        parent_git: &GitService,
+        git: &GitService,
         base_revision: &str,
     ) -> ProjectWorktreeBaseRefresh {
-        let token = self.origin_fetch_token(parent_git);
-        match parent_git.refresh_origin_default_branch(
+        let token = self.origin_fetch_token(git);
+        match git.refresh_origin_default_branch(
             Some(base_revision),
             token.as_deref(),
             CHILD_WORKTREE_REFRESH_DEADLINE,
@@ -64,7 +65,7 @@ impl InProcessConnection {
             },
             Err(error) => {
                 log::warn!(
-                    "could not refresh 'origin' before creating a project child checkout from {base_revision}: {}",
+                    "could not refresh 'origin' for the checkout at {base_revision}: {}",
                     error.message
                 );
                 ProjectWorktreeBaseRefresh::Unavailable {

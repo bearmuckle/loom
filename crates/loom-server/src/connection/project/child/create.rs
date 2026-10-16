@@ -402,7 +402,7 @@ impl InProcessConnection {
                         // default-branch tip are recorded and reported to the
                         // manager. A failed refresh is recorded as unknown.
                         let base_refresh =
-                            self.refresh_child_base_revision(&parent_git, base_revision);
+                            self.refresh_checkout_base_revision(&parent_git, base_revision);
                         checkout =
                             Some((parent_repository_id, base_revision.to_owned(), base_refresh));
                     }
