@@ -121,6 +121,93 @@ fn completed_run_projection(
     }
 }
 
+/// The same durable projection with the run's transcript, which is what a live
+/// run handle answers `GetAgentSessionSnapshot` with.
+#[cfg(not(target_family = "wasm"))]
+fn run_projection_with_transcript(
+    session_id: AgentSessionId,
+    task: &str,
+) -> loom_protocol::AgentRunSnapshotProjection {
+    let mut projection = completed_run_projection(session_id, task);
+    projection.messages = vec![
+        loom_model::ModelMessage::new(loom_model::MessageRole::User, task.to_owned()),
+        loom_model::ModelMessage::new(
+            loom_model::MessageRole::Assistant,
+            "The recovered answer is complete.",
+        ),
+    ];
+    projection.message_timeline_ordinals = vec![0, 1];
+    projection.run.summary = None;
+    projection
+}
+
+/// The boot ladder's snapshot step must rebuild the conversation from the
+/// durable projection even though the event batch left the timeline non-empty.
+///
+/// `load_session` reaches this step through `collect_events_since` when the
+/// backend answers with a snapshot instead of an incremental batch, and the
+/// snapshot's window is not the conversation: its events are a tail of the
+/// journal, so the durable run projection is the only source of the messages.
+/// Applying the projection over that window used to merge only its activities,
+/// which left the timeline at exactly the delivered window (GitHub issue #261).
+#[cfg(not(target_family = "wasm"))]
+#[gpui_kit::test]
+fn apply_event_snapshot_over_a_tail_event_keeps_the_durable_conversation(cx: &mut TestAppContext) {
+    let view = cx.new(|cx| LoomView::new_for_test(cx.focus_handle()));
+    view.update(cx, |view, _| {
+        let session_id = view.active_session.id;
+        let task = "rebuild the boot ladder over a tail event";
+        let projection = run_projection_with_transcript(session_id, task);
+        let run_id = projection.run.id;
+        let batch = vec![agent_envelope(
+            1,
+            session_id,
+            AgentEvent::AssistantMessageDelta {
+                run_id,
+                message_id: 1,
+                text: "a delta carried by the snapshot window".to_owned(),
+            },
+        )];
+
+        view.apply_event_snapshot(batch.clone(), EventSequence::new(1), Some(projection.clone()));
+
+        assert_eq!(view.active_run_id, Some(run_id));
+        assert!(
+            view.timeline
+                .iter()
+                .any(|item| matches!(item, TimelineItem::User(text) if text == task)),
+            "the boot rebuild dropped the durable conversation: {:?}",
+            view.timeline
+        );
+        assert!(
+            view.timeline.iter().any(|item| matches!(
+                item,
+                TimelineItem::Assistant(turn)
+                    if turn.parts.iter().any(|part| matches!(
+                        part,
+                        AssistantPart::Text(text) if text.contains("The recovered answer is complete")
+                    ))
+            )),
+            "the boot rebuild dropped the durable answer: {:?}",
+            view.timeline
+        );
+
+        // The ladder can apply the same durable projection twice (a resync
+        // repeating a rebuild), so the rebuild must not duplicate it.
+        view.apply_event_snapshot(batch, EventSequence::new(1), Some(projection));
+        let task_rows = view
+            .timeline
+            .iter()
+            .filter(|item| matches!(item, TimelineItem::User(text) if text == task))
+            .count();
+        assert_eq!(
+            task_rows, 1,
+            "the durable rebuild duplicated the conversation: {:?}",
+            view.timeline
+        );
+    });
+}
+
 /// The session state must follow the run state, because the inspector's session
 /// row and the run row read them separately.
 #[cfg(not(target_family = "wasm"))]
