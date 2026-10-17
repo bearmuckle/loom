@@ -65,16 +65,7 @@ pub(crate) fn search_github_repositories_at(
     }
     let needle = github_search_needle(query);
     run_github_async(async {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|error| {
-                LoomError::new(
-                    ErrorCode::Internal,
-                    format!("could not start the GitHub client: {error}"),
-                    true,
-                )
-            })?;
+        let client = loom_providers::shared_http_client()?;
         let mut matches = Vec::new();
         for page in 1..=GITHUB_REPOSITORY_MAX_PAGES {
             let mut url = url::Url::parse(endpoint).map_err(|error| {
@@ -92,6 +83,7 @@ pub(crate) fn search_github_repositories_at(
                 .append_pair("page", &page.to_string());
             let response = client
                 .get(url)
+                .timeout(Duration::from_secs(30))
                 .header("Accept", "application/vnd.github+json")
                 .header("Authorization", format!("Bearer {token}"))
                 .header("X-GitHub-Api-Version", "2022-11-28")
@@ -200,18 +192,10 @@ pub(crate) fn github_account_identity_at(
     endpoint: &str,
 ) -> Result<GitHubAccountIdentity> {
     run_github_async(async {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|error| {
-                LoomError::new(
-                    ErrorCode::Internal,
-                    format!("could not start the GitHub client: {error}"),
-                    true,
-                )
-            })?;
+        let client = loom_providers::shared_http_client()?;
         let response = client
             .get(endpoint)
+            .timeout(Duration::from_secs(30))
             .header("Accept", "application/vnd.github+json")
             .header("Authorization", format!("Bearer {token}"))
             .header("X-GitHub-Api-Version", "2022-11-28")
@@ -311,17 +295,7 @@ pub(crate) fn github_repository_rank(repository: &GitHubApiRepository, needle: &
 }
 
 fn run_github_async<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| {
-            LoomError::new(
-                ErrorCode::Internal,
-                format!("could not start the GitHub runtime: {error}"),
-                true,
-            )
-        })?
-        .block_on(future)
+    loom_providers::run_async(future)
 }
 
 pub(crate) fn copy_directory_contents(source: &Path, destination: &Path) -> Result<()> {

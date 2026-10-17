@@ -26,11 +26,42 @@ use serde::Serialize;
 fn run_async<T>(
     future: impl std::future::Future<Output = std::result::Result<T, String>>,
 ) -> std::result::Result<T, String> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("could not start the HTTP runtime: {error}"))?
-        .block_on(future)
+    let runtime = shared_http_runtime()?;
+    match tokio::runtime::Handle::try_current() {
+        Err(_) => runtime.block_on(future),
+        Ok(current) if current.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| runtime.block_on(future))
+        }
+        Ok(_) => Err("blocking HTTP request called from a current-thread async runtime".to_owned()),
+    }
+}
+
+fn shared_http_runtime() -> std::result::Result<&'static tokio::runtime::Runtime, String> {
+    static RUNTIME: std::sync::OnceLock<std::result::Result<tokio::runtime::Runtime, String>> =
+        std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("loom-tools-http")
+                .enable_all()
+                .build()
+                .map_err(|error| format!("could not start the HTTP runtime: {error}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+fn shared_http_client() -> std::result::Result<reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<std::result::Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .build()
+                .map_err(|error| format!("could not build the HTTP client: {error}"))
+        })
+        .clone()
 }
 use url::Url;
 
@@ -381,12 +412,10 @@ impl WebSearchProvider for HtmlSearchProvider {
             query.append_pair("q", &request.query);
         }
         let (status, body) = run_async(async {
-            let client = reqwest::Client::builder()
-                .timeout(WEB_SEARCH_TIMEOUT)
-                .build()
-                .map_err(|error| format!("web search request failed: {error}"))?;
+            let client = shared_http_client()?;
             let response = client
                 .get(url.as_str())
+                .timeout(WEB_SEARCH_TIMEOUT)
                 .header("User-Agent", "Loom/0.1 (web search)")
                 .send()
                 .await
@@ -2605,17 +2634,15 @@ fn github_request(
         ));
     }
     run_async(async {
-        let client = reqwest::Client::builder()
-            .timeout(GITHUB_REQUEST_TIMEOUT)
-            .build()
-            .map_err(|error| format!("GitHub request failed for {request}: {error}"))?;
+        let client = shared_http_client()?;
         let payload = body.unwrap_or_else(|| serde_json::json!({}));
         let outgoing = match method {
             "GET" => client.get(url),
             "POST" => client.post(url).json(&payload),
             "PATCH" => client.patch(url).json(&payload),
             _ => client.delete(url),
-        };
+        }
+        .timeout(GITHUB_REQUEST_TIMEOUT);
         let response = outgoing
             .header("Accept", "application/vnd.github+json")
             .header("Authorization", format!("Bearer {token}"))

@@ -10,19 +10,56 @@ pub fn trim_endpoint(endpoint: &str) -> String {
     endpoint.trim_end_matches('/').to_owned()
 }
 
-/// Drives an async provider request to completion from a synchronous caller.
+fn internal(message: String) -> LoomError {
+    LoomError::new(ErrorCode::Internal, message, true)
+}
+
+fn shared_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    static RUNTIME: std::sync::OnceLock<std::result::Result<tokio::runtime::Runtime, String>> =
+        std::sync::OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("loom-http")
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| internal(format!("could not start the HTTP runtime: {error}")))
+}
+
+/// Returns the process-wide HTTP client so connections are reused. Apply
+/// timeouts per request.
+pub fn shared_http_client() -> Result<reqwest::Client> {
+    static CLIENT: std::sync::OnceLock<std::result::Result<reqwest::Client, String>> =
+        std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .clone()
+        .map_err(|error| normalize_transport_error("provider", &error))
+}
+
+/// Drives an async request to completion on the shared HTTP runtime from a
+/// synchronous caller. Called from inside a multi-thread Tokio runtime it
+/// yields the worker instead of panicking; inside a current-thread runtime it
+/// returns an error because blocking there would stall the runtime.
 pub fn run_async<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| {
-            LoomError::new(
-                ErrorCode::Internal,
-                format!("could not start the provider runtime: {error}"),
-                true,
-            )
-        })?
-        .block_on(future)
+    let runtime = shared_runtime()?;
+    match tokio::runtime::Handle::try_current() {
+        Err(_) => runtime.block_on(future),
+        Ok(current) if current.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| runtime.block_on(future))
+        }
+        Ok(_) => Err(internal(
+            "blocking provider request called from a current-thread async runtime".to_owned(),
+        )),
+    }
 }
 
 /// Sends a JSON request and returns the status code and decoded body (or
@@ -33,12 +70,10 @@ pub async fn request_json(
     headers: &[(&str, String)],
     body: Option<serde_json::Value>,
 ) -> Result<(u16, serde_json::Value)> {
-    let client = reqwest::Client::builder()
-        .timeout(PROVIDER_REQUEST_TIMEOUT)
-        .build()
-        .map_err(|error| normalize_transport_error("provider", &error.to_string()))?;
+    let client = shared_http_client()?;
     let mut request = client
         .request(method, endpoint)
+        .timeout(PROVIDER_REQUEST_TIMEOUT)
         .header("Accept", "application/json");
     if let Some(body) = body {
         request = request.json(&body);

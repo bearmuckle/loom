@@ -334,17 +334,7 @@ pub fn send_openai_request(
     if !responses_api {
         payload["stream_options"] = serde_json::json!({"include_usage": true});
     }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| {
-            LoomError::new(
-                ErrorCode::Internal,
-                format!("could not start the provider runtime: {error}"),
-                true,
-            )
-        })?;
-    runtime.block_on(send_openai_request_async(
+    run_async(send_openai_request_async(
         endpoint,
         authorization,
         headers,
@@ -369,12 +359,10 @@ async fn send_openai_request_async(
     cancel: &CancellationToken,
     sink: &mut dyn ModelStreamSink,
 ) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(PROVIDER_REQUEST_TIMEOUT)
-        .build()
-        .map_err(|error| normalize_transport_error(provider, &error.to_string()))?;
+    let client = shared_http_client()?;
     let mut request = client
         .post(endpoint)
+        .timeout(PROVIDER_REQUEST_TIMEOUT)
         .header("Content-Type", "application/json")
         .header("Accept", "text/event-stream")
         .json(&payload);
