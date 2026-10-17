@@ -27,6 +27,9 @@ pub use loom_core::{
     GitBranch, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,
     GitFileStatusKind, GitRepositoryStatus,
 };
+pub use loom_core::{
+    ParticipantId, ParticipantIdentity, PresenceStatus, RosterEntry, SessionGrant, SessionRole,
+};
 pub use loom_model::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, AgentEvent,
     AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
@@ -526,6 +529,230 @@ impl ClientRequest {
                 Some(Capability::InspectContext)
             }
             Self::Run(RunRequest::AttachRunEvidence { .. }) => Some(Capability::ControlAgentRun),
+            Self::Access(AccessRequest::GetCurrentParticipant) => None,
+            Self::Access(AccessRequest::ListParticipants)
+            | Self::Access(AccessRequest::GrantSessionAccess { .. })
+            | Self::Access(AccessRequest::SetSessionRole { .. })
+            | Self::Access(AccessRequest::RevokeSessionAccess { .. }) => {
+                Some(Capability::ManageSessionAccess)
+            }
+            Self::Access(AccessRequest::GetSessionRoster { .. }) => {
+                Some(Capability::ReadSessionRoster)
+            }
+        }
+    }
+
+    /// The least session role a person needs for this request, when the
+    /// request reads or acts on one session (or a run, project, or child of
+    /// it).
+    ///
+    /// `None` means the request is not scoped to a session: it is governed by
+    /// the connection's token scope alone, and listings it returns are
+    /// filtered to the sessions the person may read. An operator connection
+    /// that is not bound to a person is not subject to roles.
+    pub const fn required_session_role(&self) -> Option<SessionRole> {
+        use SessionRole::{Observer, Owner, Participant};
+        match self {
+            Self::Control(_)
+            | Self::Provider(_)
+            | Self::Workspace(_)
+            | Self::Repository(RepositoryRequest::SearchGitHubRepositories { .. })
+            | Self::Repository(RepositoryRequest::ListClonedRepositories)
+            | Self::Access(AccessRequest::GetCurrentParticipant)
+            | Self::Access(AccessRequest::ListParticipants) => None,
+            Self::Events(EventsRequest::GetSessionEvents { session_id, .. }) => {
+                if session_id.is_some() {
+                    Some(Observer)
+                } else {
+                    None
+                }
+            }
+            Self::Events(EventsRequest::GetRecentSessionEvents { .. })
+            | Self::Session(SessionRequest::GetAgentSession { .. })
+            | Self::Session(SessionRequest::GetAgentSessionSnapshot { .. })
+            | Self::Session(SessionRequest::GetAgentSessionSnapshotMetadata { .. })
+            | Self::Session(SessionRequest::GetAgentSessionInitialState { .. })
+            | Self::Run(RunRequest::GetAgentRun { .. })
+            | Self::Run(RunRequest::GetAgentRunMessagePage { .. })
+            | Self::Run(RunRequest::GetAgentRunTranscriptPage { .. })
+            | Self::Run(RunRequest::GetAgentRunMessageContentRange { .. })
+            | Self::Run(RunRequest::GetAgentRunSnapshot { .. })
+            | Self::Run(RunRequest::GetRunCheckpoint { .. })
+            | Self::Usage(_)
+            | Self::Context(_)
+            | Self::Repository(RepositoryRequest::ListSessionRepositories { .. })
+            | Self::Repository(RepositoryRequest::GetSessionVcsStatus { .. })
+            | Self::Repository(RepositoryRequest::GetSessionVcsDiff { .. })
+            | Self::Repository(RepositoryRequest::GetSessionVcsBranches { .. })
+            | Self::Repository(RepositoryRequest::GetSessionVcsConflicts { .. })
+            | Self::Filesystem(FilesystemRequest::ListSessionDirectories { .. })
+            | Self::Filesystem(FilesystemRequest::GetSessionFilesystemSnapshot { .. })
+            | Self::Filesystem(FilesystemRequest::GetSessionFilesystemChanges { .. })
+            | Self::Filesystem(FilesystemRequest::ReadSessionFile { .. })
+            | Self::Filesystem(FilesystemRequest::GetSessionContextFiles { .. })
+            | Self::Terminal(TerminalRequest::GetSessionTerminalEvents { .. })
+            | Self::Task(TaskRequest::ListSessionTasks { .. })
+            | Self::Task(TaskRequest::GetSessionTask { .. })
+            | Self::Task(TaskRequest::GetSessionTaskEvents { .. })
+            | Self::Task(TaskRequest::GetSessionTaskEvidence { .. })
+            | Self::Project(ProjectRequest::GetProjectSnapshot { .. })
+            | Self::Project(ProjectRequest::GetProjectSnapshotForSession { .. })
+            | Self::Project(ProjectRequest::ListProjectAgentMessages { .. })
+            | Self::Project(ProjectRequest::GetProjectChildReview { .. })
+            | Self::Access(AccessRequest::GetSessionRoster { .. }) => Some(Observer),
+            Self::Run(RunRequest::StartSessionAgentRun { .. })
+            | Self::Run(RunRequest::StartSessionAgentRunWithOptions { .. })
+            | Self::Run(RunRequest::ApproveAgentAction { .. })
+            | Self::Run(RunRequest::RejectAgentAction { .. })
+            | Self::Run(RunRequest::SendAgentMessage { .. })
+            | Self::Run(RunRequest::InterruptAgentRun { .. })
+            | Self::Run(RunRequest::RetryAgentStep { .. })
+            | Self::Run(RunRequest::PauseAgentRun { .. })
+            | Self::Run(RunRequest::ResumeAgentRun { .. })
+            | Self::Run(RunRequest::RetryAgentFromCheckpoint { .. })
+            | Self::Run(RunRequest::AttachRunEvidence { .. })
+            | Self::Session(SessionRequest::ForkAgentSession { .. })
+            | Self::Filesystem(FilesystemRequest::ApplySessionFilesystemEdit { .. })
+            | Self::Filesystem(FilesystemRequest::TakeSessionFilesystemControl { .. })
+            | Self::Filesystem(FilesystemRequest::CreateSessionCheckpoint { .. })
+            | Self::Filesystem(FilesystemRequest::RevertSessionCheckpoint { .. })
+            | Self::Filesystem(FilesystemRequest::UndoSessionEdit { .. })
+            | Self::Terminal(TerminalRequest::OpenSessionTerminal { .. })
+            | Self::Terminal(TerminalRequest::WriteSessionTerminalInput { .. })
+            | Self::Terminal(TerminalRequest::ResizeSessionTerminal { .. })
+            | Self::Terminal(TerminalRequest::CancelSessionTerminal { .. })
+            | Self::Task(TaskRequest::StartSessionTask { .. })
+            | Self::Task(TaskRequest::CancelSessionTask { .. })
+            | Self::Project(ProjectRequest::SendProjectAgentMessage { .. })
+            | Self::Project(ProjectRequest::ControlProjectChild { .. })
+            | Self::Project(ProjectRequest::IntegrateProjectChild { .. })
+            | Self::Project(ProjectRequest::CleanupProjectChildWorktree { .. }) => {
+                Some(Participant)
+            }
+            Self::Session(SessionRequest::RenameAgentSession { .. })
+            | Self::Session(SessionRequest::ArchiveAgentSession { .. })
+            | Self::Session(SessionRequest::DeleteAgentSession { .. })
+            | Self::Session(SessionRequest::SetSessionApprovalPolicy { .. })
+            | Self::Repository(RepositoryRequest::AttachSessionRepository { .. })
+            | Self::Repository(RepositoryRequest::DetachSessionRepository { .. })
+            | Self::Filesystem(FilesystemRequest::ImportSessionDirectory { .. })
+            | Self::Filesystem(FilesystemRequest::AttachSessionDirectory { .. })
+            | Self::Filesystem(FilesystemRequest::DetachSessionDirectory { .. })
+            | Self::Access(AccessRequest::GrantSessionAccess { .. })
+            | Self::Access(AccessRequest::SetSessionRole { .. })
+            | Self::Access(AccessRequest::RevokeSessionAccess { .. }) => Some(Owner),
+        }
+    }
+
+    /// What a session-scoped request reads or acts on, so a backend can find
+    /// the session whose role governs it. `None` when
+    /// [`Self::required_session_role`] is `None`.
+    pub const fn access_target(&self) -> Option<AccessTarget> {
+        use AccessTarget::{Project, Run, Session};
+        match self {
+            Self::Events(EventsRequest::GetSessionEvents {
+                session_id: Some(session_id),
+                ..
+            })
+            | Self::Events(EventsRequest::GetRecentSessionEvents { session_id, .. })
+            | Self::Session(SessionRequest::GetAgentSession { session_id })
+            | Self::Session(SessionRequest::GetAgentSessionSnapshot { session_id })
+            | Self::Session(SessionRequest::GetAgentSessionSnapshotMetadata { session_id })
+            | Self::Session(SessionRequest::GetAgentSessionInitialState { session_id })
+            | Self::Session(SessionRequest::RenameAgentSession { session_id, .. })
+            | Self::Session(SessionRequest::ArchiveAgentSession { session_id })
+            | Self::Session(SessionRequest::DeleteAgentSession { session_id, .. })
+            | Self::Session(SessionRequest::ForkAgentSession { session_id, .. })
+            | Self::Session(SessionRequest::SetSessionApprovalPolicy { session_id, .. })
+            | Self::Usage(UsageRequest::GetSessionUsage { session_id })
+            | Self::Repository(RepositoryRequest::AttachSessionRepository { session_id, .. })
+            | Self::Repository(RepositoryRequest::ListSessionRepositories { session_id })
+            | Self::Repository(RepositoryRequest::DetachSessionRepository { session_id, .. })
+            | Self::Repository(RepositoryRequest::GetSessionVcsStatus { session_id, .. })
+            | Self::Repository(RepositoryRequest::GetSessionVcsDiff { session_id, .. })
+            | Self::Repository(RepositoryRequest::GetSessionVcsBranches { session_id, .. })
+            | Self::Repository(RepositoryRequest::GetSessionVcsConflicts { session_id, .. })
+            | Self::Filesystem(FilesystemRequest::ImportSessionDirectory { session_id, .. })
+            | Self::Filesystem(FilesystemRequest::AttachSessionDirectory { session_id, .. })
+            | Self::Filesystem(FilesystemRequest::ListSessionDirectories { session_id })
+            | Self::Filesystem(FilesystemRequest::DetachSessionDirectory { session_id, .. })
+            | Self::Filesystem(FilesystemRequest::GetSessionFilesystemSnapshot { session_id })
+            | Self::Filesystem(FilesystemRequest::GetSessionFilesystemChanges {
+                session_id, ..
+            })
+            | Self::Filesystem(FilesystemRequest::ReadSessionFile { session_id, .. })
+            | Self::Filesystem(FilesystemRequest::ApplySessionFilesystemEdit {
+                session_id, ..
+            })
+            | Self::Filesystem(FilesystemRequest::TakeSessionFilesystemControl {
+                session_id,
+                ..
+            })
+            | Self::Filesystem(FilesystemRequest::CreateSessionCheckpoint { session_id, .. })
+            | Self::Filesystem(FilesystemRequest::RevertSessionCheckpoint { session_id, .. })
+            | Self::Filesystem(FilesystemRequest::UndoSessionEdit { session_id })
+            | Self::Filesystem(FilesystemRequest::GetSessionContextFiles { session_id })
+            | Self::Terminal(TerminalRequest::OpenSessionTerminal { session_id, .. })
+            | Self::Terminal(TerminalRequest::WriteSessionTerminalInput { session_id, .. })
+            | Self::Terminal(TerminalRequest::ResizeSessionTerminal { session_id, .. })
+            | Self::Terminal(TerminalRequest::GetSessionTerminalEvents { session_id, .. })
+            | Self::Terminal(TerminalRequest::CancelSessionTerminal { session_id, .. })
+            | Self::Task(TaskRequest::StartSessionTask { session_id, .. })
+            | Self::Task(TaskRequest::ListSessionTasks { session_id })
+            | Self::Task(TaskRequest::GetSessionTask { session_id, .. })
+            | Self::Task(TaskRequest::GetSessionTaskEvents { session_id, .. })
+            | Self::Task(TaskRequest::CancelSessionTask { session_id, .. })
+            | Self::Task(TaskRequest::GetSessionTaskEvidence { session_id, .. })
+            | Self::Run(RunRequest::StartSessionAgentRun { session_id, .. })
+            | Self::Run(RunRequest::StartSessionAgentRunWithOptions { session_id, .. })
+            | Self::Project(ProjectRequest::GetProjectSnapshotForSession { session_id })
+            | Self::Project(ProjectRequest::ListProjectAgentMessages { session_id, .. })
+            | Self::Project(ProjectRequest::ControlProjectChild {
+                manager_session_id: session_id,
+                ..
+            })
+            | Self::Project(ProjectRequest::GetProjectChildReview {
+                manager_session_id: session_id,
+                ..
+            })
+            | Self::Project(ProjectRequest::IntegrateProjectChild {
+                manager_session_id: session_id,
+                ..
+            })
+            | Self::Project(ProjectRequest::CleanupProjectChildWorktree {
+                manager_session_id: session_id,
+                ..
+            })
+            | Self::Access(AccessRequest::GetSessionRoster { session_id })
+            | Self::Access(AccessRequest::GrantSessionAccess { session_id, .. })
+            | Self::Access(AccessRequest::SetSessionRole { session_id, .. })
+            | Self::Access(AccessRequest::RevokeSessionAccess { session_id, .. }) => {
+                Some(Session(*session_id))
+            }
+            Self::Run(RunRequest::GetAgentRun { run_id })
+            | Self::Run(RunRequest::GetAgentRunMessagePage { run_id, .. })
+            | Self::Run(RunRequest::GetAgentRunTranscriptPage { run_id, .. })
+            | Self::Run(RunRequest::GetAgentRunMessageContentRange { run_id, .. })
+            | Self::Run(RunRequest::GetAgentRunSnapshot { run_id })
+            | Self::Run(RunRequest::GetRunCheckpoint { run_id })
+            | Self::Run(RunRequest::ApproveAgentAction { run_id, .. })
+            | Self::Run(RunRequest::RejectAgentAction { run_id, .. })
+            | Self::Run(RunRequest::SendAgentMessage { run_id, .. })
+            | Self::Run(RunRequest::InterruptAgentRun { run_id })
+            | Self::Run(RunRequest::RetryAgentStep { run_id })
+            | Self::Run(RunRequest::PauseAgentRun { run_id })
+            | Self::Run(RunRequest::ResumeAgentRun { run_id })
+            | Self::Run(RunRequest::RetryAgentFromCheckpoint { run_id, .. })
+            | Self::Run(RunRequest::AttachRunEvidence { run_id, .. })
+            | Self::Usage(UsageRequest::GetRunUsage { run_id })
+            | Self::Context(ContextRequest::InspectAgentContext { run_id }) => Some(Run(*run_id)),
+            Self::Project(ProjectRequest::GetProjectSnapshot { project_id }) => {
+                Some(Project(*project_id))
+            }
+            Self::Project(ProjectRequest::SendProjectAgentMessage { message }) => {
+                Some(Project(message.project_id))
+            }
+            _ => None,
         }
     }
 
@@ -574,6 +801,9 @@ impl ClientRequest {
                 | Self::Session(SessionRequest::ForkAgentSession { .. })
                 | Self::Provider(ProviderRequest::ConfigureGitHubWriteAccess { .. })
                 | Self::Run(RunRequest::AttachRunEvidence { .. })
+                | Self::Access(AccessRequest::GrantSessionAccess { .. })
+                | Self::Access(AccessRequest::SetSessionRole { .. })
+                | Self::Access(AccessRequest::RevokeSessionAccess { .. })
         )
     }
 }
@@ -602,6 +832,16 @@ pub enum GitHubCopilotLoginStatus {
     Pending,
     Configured,
     Failed { message: String },
+}
+
+/// The entity a session-scoped request names; see
+/// [`ClientRequest::access_target`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccessTarget {
+    Session(AgentSessionId),
+    Run(RunId),
+    /// A project is named by its root session.
+    Project(ProjectId),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -686,8 +926,92 @@ mod run_message_protocol_tests {
     use super::*;
 
     #[test]
+    fn access_requests_carry_roles_targets_and_round_trip() {
+        let session_id = AgentSessionId::new();
+        let participant_id = ParticipantId::new();
+        let manage = ClientRequest::Access(AccessRequest::SetSessionRole {
+            session_id,
+            participant_id,
+            role: SessionRole::Participant,
+        });
+        assert_eq!(
+            manage.required_capability(),
+            Some(Capability::ManageSessionAccess)
+        );
+        assert_eq!(manage.required_session_role(), Some(SessionRole::Owner));
+        assert_eq!(
+            manage.access_target(),
+            Some(AccessTarget::Session(session_id))
+        );
+        assert!(manage.is_retryable_mutation());
+        let encoded = serde_json::to_value(&manage).unwrap();
+        assert_eq!(encoded["type"], "access");
+        assert_eq!(encoded["data"]["type"], "set_session_role");
+        assert_eq!(encoded["data"]["data"]["role"], "participant");
+        assert_eq!(
+            serde_json::from_value::<ClientRequest>(encoded).unwrap(),
+            manage
+        );
+
+        let roster = ClientRequest::Access(AccessRequest::GetSessionRoster { session_id });
+        assert_eq!(
+            roster.required_capability(),
+            Some(Capability::ReadSessionRoster)
+        );
+        assert_eq!(roster.required_session_role(), Some(SessionRole::Observer));
+        let whoami = ClientRequest::Access(AccessRequest::GetCurrentParticipant);
+        assert_eq!(whoami.required_capability(), None);
+        assert_eq!(whoami.required_session_role(), None);
+        assert_eq!(whoami.access_target(), None);
+
+        let run_id = RunId::new();
+        for (request, role) in [
+            (
+                ClientRequest::Run(RunRequest::GetAgentRun { run_id }),
+                SessionRole::Observer,
+            ),
+            (
+                ClientRequest::Run(RunRequest::PauseAgentRun { run_id }),
+                SessionRole::Participant,
+            ),
+            (
+                ClientRequest::Run(RunRequest::InterruptAgentRun { run_id }),
+                SessionRole::Participant,
+            ),
+        ] {
+            assert_eq!(request.required_session_role(), Some(role));
+            assert_eq!(request.access_target(), Some(AccessTarget::Run(run_id)));
+        }
+        let attach = ClientRequest::Repository(RepositoryRequest::DetachSessionRepository {
+            session_id,
+            repository_id: RepositoryId::new(),
+        });
+        assert_eq!(attach.required_session_role(), Some(SessionRole::Owner));
+
+        let response = ServerResponse::Access(AccessResponse::SessionRoster {
+            session_id,
+            entries: vec![RosterEntry {
+                participant: ParticipantIdentity {
+                    id: participant_id,
+                    display_name: "Sam".to_owned(),
+                },
+                role: SessionRole::Observer,
+                presence: PresenceStatus::Away,
+                connections: 1,
+                last_active_at: None,
+            }],
+        });
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded["data"]["data"]["entries"][0]["presence"], "away");
+        assert_eq!(
+            serde_json::from_value::<ServerResponse>(encoded).unwrap(),
+            response
+        );
+    }
+
+    #[test]
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 2));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 3));
         let project_id = ProjectId::new();
         let request = ClientRequest::Project(ProjectRequest::GetProjectSnapshot { project_id });
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));

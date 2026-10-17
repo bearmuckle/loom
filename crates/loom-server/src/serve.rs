@@ -132,11 +132,35 @@ pub async fn start_remote_server(
     token: &str,
     config: RemoteServerConfig,
 ) -> Result<ServingBackend, LoomError> {
+    start_remote_server_with_participants(backend, token, &[], config).await
+}
+
+/// [`start_remote_server`] that also accepts one bearer token per person.
+///
+/// `token` stays the operator token: it is not bound to a person and is not
+/// subject to session roles. Each entry of `participants` authenticates as
+/// that person, whose identity is derived on the server from the token; the
+/// people are added to the participant directory so owners can grant them
+/// access before their first connection.
+pub async fn start_remote_server_with_participants(
+    backend: Arc<InProcessBackend>,
+    token: &str,
+    participants: &[crate::ParticipantTokenEntry],
+    config: RemoteServerConfig,
+) -> Result<ServingBackend, LoomError> {
     let tls_configured = config.tls.is_some();
     let allow_insecure_remote = config.allow_insecure_remote;
     let bind_addr = config.bind_addr;
     let auth = Arc::new(AuthTokenStore::new());
     let _issued = auth.insert(token, AuthorizationScope::all())?;
+    let identities = auth.insert_participant_tokens(participants)?;
+    if !identities.is_empty() {
+        backend.register_participants(&identities)?;
+        log::info!(
+            "accepting {} participant token(s) for multi-user sessions",
+            identities.len()
+        );
+    }
     if let Some(warning) = bind_exposure_warning(bind_addr, tls_configured, allow_insecure_remote) {
         log::warn!("{warning}");
     }

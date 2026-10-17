@@ -6,6 +6,7 @@
 
 use super::*;
 
+mod access;
 mod control;
 mod filesystem;
 mod project;
@@ -320,6 +321,7 @@ impl InProcessConnection {
             ClientRequest::Run(RunRequest::AttachRunEvidence { .. }) => {
                 self.run_control_dispatch(request, request_id)
             }
+            ClientRequest::Access(_) => self.access_dispatch(request, request_id),
         }
     }
 }

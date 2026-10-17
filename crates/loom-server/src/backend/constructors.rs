@@ -268,6 +268,8 @@ impl InProcessBackend {
             Capability::ReadProject,
             Capability::ReadSessionFilesystem,
             Capability::WriteSessionFilesystem,
+            Capability::ReadSessionRoster,
+            Capability::ManageSessionAccess,
         ];
         if persistence.is_some() {
             supported_capabilities.extend([
@@ -310,6 +312,7 @@ impl InProcessBackend {
             archive_retention_stored: AtomicBool::new(false),
             idempotency_store: IdempotencyStore::new(),
             admissions: AdmissionService::new(),
+            access: Arc::new(AccessService::new()),
             self_reference: Mutex::new(Weak::new()),
             request_lifecycle: RwLock::new(0),
             persistence_failed: AtomicBool::new(false),
@@ -324,6 +327,12 @@ impl InProcessBackend {
             .self_reference
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&backend);
+        // Access is restored first: restoring sessions can save state, and a
+        // save rewrites the stored grants from memory.
+        if let Some(persistence) = &backend.persistence {
+            let (participants, grants) = persistence.load_session_access()?;
+            backend.access.restore(participants, grants);
+        }
         backend.restore_persisted()?;
         // The stored retention policy is loaded here rather than in the restore
         // path, so a start that was given an explicit flag can tell that it

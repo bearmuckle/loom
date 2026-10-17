@@ -5,6 +5,7 @@ mod error;
 mod filesystem;
 mod id;
 mod limits;
+mod participant;
 #[cfg(not(target_family = "wasm"))]
 mod paths;
 mod policy;
@@ -35,10 +36,14 @@ pub use filesystem::{
 };
 pub use id::{
     ActivityId, AgentMessageId, AgentSessionId, CheckpointId, EventSequence, InteractionId,
-    ProjectId, ProjectManagerWaitId, RepositoryId, RequestId, RunAttemptId, RunId, StepId, TaskId,
-    TerminalId, ToolCallId, WorkspaceId,
+    ParticipantId, ProjectId, ProjectManagerWaitId, RepositoryId, RequestId, RunAttemptId, RunId,
+    StepId, TaskId, TerminalId, ToolCallId, WorkspaceId,
 };
 pub use limits::{LimitKind, LimitStatus, SessionLimits, UsageSnapshot};
+pub use participant::{
+    MAX_PARTICIPANT_DISPLAY_NAME_BYTES, ParticipantIdentity, PresenceStatus, RosterEntry,
+    SessionGrant, SessionRole,
+};
 #[cfg(not(target_family = "wasm"))]
 pub use paths::{
     bind_key, config_dir, create_private_dir, instance_dir, state_dir, state_root, token_path,

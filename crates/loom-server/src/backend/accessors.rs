@@ -7,16 +7,34 @@ impl InProcessBackend {
             negotiated_capabilities: Arc::new(Mutex::new(None)),
             auth: None,
             max_response_bytes: None,
+            presence: None,
         }
     }
 
     pub fn connect_authenticated(self: &Arc<Self>, auth: AuthSession) -> InProcessConnection {
+        let presence = auth
+            .participant()
+            .map(|participant| Arc::new(self.access.connect(participant)));
         InProcessConnection {
             backend: Arc::clone(self),
             negotiated_capabilities: Arc::new(Mutex::new(None)),
             auth: Some(auth),
             max_response_bytes: None,
+            presence,
         }
+    }
+
+    /// Adds people to the participant directory, so an owner can grant them
+    /// access before their first connection. The directory is saved with the
+    /// durable state.
+    pub fn register_participants(
+        &self,
+        participants: &[loom_core::ParticipantIdentity],
+    ) -> Result<()> {
+        for participant in participants {
+            self.access.register_participant(participant);
+        }
+        self.persist_state()
     }
 
     pub fn provider_registry(&self) -> ProviderRegistry {

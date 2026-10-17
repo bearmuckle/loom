@@ -437,4 +437,32 @@ pub enum ServerResponse {
     Terminal(TerminalResponse),
     Task(TaskResponse),
     Project(ProjectResponse),
+    Access(AccessResponse),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum AccessResponse {
+    /// The connection's identity. `None` for an unrestricted operator
+    /// connection that is not bound to a person.
+    CurrentParticipant {
+        participant: Option<ParticipantIdentity>,
+    },
+
+    Participants {
+        participants: Vec<ParticipantIdentity>,
+    },
+
+    SessionRoster {
+        session_id: AgentSessionId,
+        entries: Vec<RosterEntry>,
+    },
+
+    /// The grant after a grant, promotion, or demotion.
+    SessionGrant(SessionGrant),
+
+    SessionAccessRevoked {
+        session_id: AgentSessionId,
+        participant_id: ParticipantId,
+    },
 }

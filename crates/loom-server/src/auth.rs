@@ -6,8 +6,10 @@ use std::{
 };
 
 use loom_core::{
-    AgentSessionId, Capability, CapabilitySet, ErrorCode, LoomError, Result, WorkspaceId,
+    AgentSessionId, Capability, CapabilitySet, ErrorCode, LoomError,
+    MAX_PARTICIPANT_DISPLAY_NAME_BYTES, ParticipantId, ParticipantIdentity, Result, WorkspaceId,
 };
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
@@ -97,6 +99,7 @@ pub struct AuthSession {
     token_id: String,
     digest: [u8; 32],
     scope: AuthorizationScope,
+    participant: Option<ParticipantIdentity>,
 }
 
 impl fmt::Debug for AuthSession {
@@ -105,6 +108,7 @@ impl fmt::Debug for AuthSession {
             .debug_struct("AuthSession")
             .field("token_id", &self.token_id)
             .field("scope", &self.scope)
+            .field("participant", &self.participant)
             .finish_non_exhaustive()
     }
 }
@@ -118,6 +122,15 @@ impl AuthSession {
         &self.scope
     }
 
+    /// The person this credential belongs to.
+    ///
+    /// The identity is bound to the token by the server operator and is never
+    /// taken from a client. `None` marks an operator token: it is not bound to
+    /// a person and is not subject to session roles, only to its scope.
+    pub fn participant(&self) -> Option<&ParticipantIdentity> {
+        self.participant.as_ref()
+    }
+
     pub fn verify(&self) -> Result<()> {
         let active = self
             .store
@@ -129,6 +142,7 @@ impl AuthSession {
                 !record.revoked
                     && bool::from(record.digest.ct_eq(&self.digest))
                     && record.scope == self.scope
+                    && record.participant == self.participant
             });
         if active {
             Ok(())
@@ -147,6 +161,7 @@ pub struct IssuedToken {
     pub token_id: String,
     pub token: String,
     pub scope: AuthorizationScope,
+    pub participant: Option<ParticipantIdentity>,
 }
 
 impl fmt::Debug for IssuedToken {
@@ -156,6 +171,7 @@ impl fmt::Debug for IssuedToken {
             .field("token_id", &self.token_id)
             .field("token", &"<redacted>")
             .field("scope", &self.scope)
+            .field("participant", &self.participant)
             .finish()
     }
 }
@@ -176,7 +192,83 @@ impl IssuedToken {
 struct TokenRecord {
     digest: [u8; 32],
     scope: AuthorizationScope,
+    participant: Option<ParticipantIdentity>,
     revoked: bool,
+}
+
+/// One entry of a participant token file.
+///
+/// The file is a JSON array of these objects. `participant_id` is optional:
+/// without it the id is derived from the token, so it stays stable for as long
+/// as the token does. Session grants are keyed by this id, so changing it (or
+/// the token, when it is derived) gives the person a new identity.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParticipantTokenEntry {
+    pub token: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub participant_id: Option<ParticipantId>,
+}
+
+impl fmt::Debug for ParticipantTokenEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ParticipantTokenEntry")
+            .field("token", &"<redacted>")
+            .field("display_name", &self.display_name)
+            .field("participant_id", &self.participant_id)
+            .finish()
+    }
+}
+
+/// The stable participant id derived from a token when none is configured.
+pub fn participant_id_for_token(token: &str) -> ParticipantId {
+    let digest = Sha256::digest(format!("loom-participant:{token}").as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    ParticipantId::from_uuid(uuid::Builder::from_random_bytes(bytes).into_uuid())
+}
+
+/// Validates and trims a participant display name.
+pub fn validate_display_name(name: &str) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty()
+        || name.len() > MAX_PARTICIPANT_DISPLAY_NAME_BYTES
+        || name.chars().any(char::is_control)
+    {
+        return Err(LoomError::invalid_request(format!(
+            "participant display names must be 1 to {MAX_PARTICIPANT_DISPLAY_NAME_BYTES} bytes \
+             without control characters"
+        )));
+    }
+    Ok(name.to_owned())
+}
+
+/// Parses a participant token file; see [`ParticipantTokenEntry`].
+pub fn parse_participant_tokens(json: &str) -> Result<Vec<ParticipantTokenEntry>> {
+    let entries: Vec<ParticipantTokenEntry> = serde_json::from_str(json).map_err(|error| {
+        LoomError::invalid_request(format!("participant token file is not valid: {error}"))
+    })?;
+    let mut tokens = BTreeSet::new();
+    let mut ids = BTreeSet::new();
+    for entry in &entries {
+        if entry.token.trim().is_empty() || !tokens.insert(entry.token.clone()) {
+            return Err(LoomError::invalid_request(
+                "participant tokens must be non-empty and unique",
+            ));
+        }
+        validate_display_name(&entry.display_name)?;
+        let id = entry
+            .participant_id
+            .unwrap_or_else(|| participant_id_for_token(&entry.token));
+        if !ids.insert(id) {
+            return Err(LoomError::invalid_request(
+                "participant ids in the token file must be unique",
+            ));
+        }
+    }
+    Ok(entries)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -204,7 +296,69 @@ impl AuthTokenStore {
         token: impl Into<String>,
         scope: AuthorizationScope,
     ) -> Result<IssuedToken> {
-        let token = token.into();
+        self.insert_record(token.into(), scope, None)
+    }
+
+    /// Registers a token that authenticates as `participant`.
+    ///
+    /// Connections using it are bound to that identity and are subject to
+    /// session roles in addition to `scope`.
+    pub fn insert_for_participant(
+        &self,
+        token: impl Into<String>,
+        scope: AuthorizationScope,
+        participant: ParticipantIdentity,
+    ) -> Result<IssuedToken> {
+        let participant = ParticipantIdentity {
+            id: participant.id,
+            display_name: validate_display_name(&participant.display_name)?,
+        };
+        self.insert_record(token.into(), scope, Some(participant))
+    }
+
+    /// Mints a new token for `participant`; see [`Self::insert_for_participant`].
+    pub fn issue_for_participant(
+        &self,
+        scope: AuthorizationScope,
+        participant: ParticipantIdentity,
+    ) -> Result<IssuedToken> {
+        self.insert_for_participant(Self::generate_token(), scope, participant)
+    }
+
+    /// Registers every entry of a participant token file with full scope and
+    /// returns the identities it bound.
+    pub fn insert_participant_tokens(
+        &self,
+        entries: &[ParticipantTokenEntry],
+    ) -> Result<Vec<ParticipantIdentity>> {
+        entries
+            .iter()
+            .map(|entry| {
+                let identity = ParticipantIdentity {
+                    id: entry
+                        .participant_id
+                        .unwrap_or_else(|| participant_id_for_token(&entry.token)),
+                    display_name: entry.display_name.clone(),
+                };
+                self.insert_for_participant(
+                    entry.token.clone(),
+                    AuthorizationScope::all(),
+                    identity.clone(),
+                )
+                .map(|_| ParticipantIdentity {
+                    id: identity.id,
+                    display_name: identity.display_name.trim().to_owned(),
+                })
+            })
+            .collect()
+    }
+
+    fn insert_record(
+        &self,
+        token: String,
+        scope: AuthorizationScope,
+        participant: Option<ParticipantIdentity>,
+    ) -> Result<IssuedToken> {
         let token_id = Uuid::new_v4().to_string();
         let digest = digest(&token);
         self.tokens
@@ -215,6 +369,7 @@ impl AuthTokenStore {
                 TokenRecord {
                     digest,
                     scope: scope.clone(),
+                    participant: participant.clone(),
                     revoked: false,
                 },
             );
@@ -222,6 +377,7 @@ impl AuthTokenStore {
             token_id,
             token,
             scope,
+            participant,
         })
     }
 
@@ -267,6 +423,7 @@ impl AuthTokenStore {
             token_id: token_id.clone(),
             digest,
             scope: record.scope.clone(),
+            participant: record.participant.clone(),
         })
     }
 }
@@ -362,6 +519,67 @@ mod tests {
         store.revoke_all().unwrap();
         assert!(store.authenticate(&first.token).is_err());
         assert!(store.authenticate(&second.token).is_err());
+    }
+
+    #[test]
+    fn participant_tokens_bind_a_server_derived_identity() {
+        let entries = parse_participant_tokens(
+            r#"[
+                {"token": "sam-token", "display_name": "  Sam  "},
+                {"token": "nadia-token", "display_name": "Nadia",
+                 "participant_id": "00000000-0000-4000-8000-000000000001"}
+            ]"#,
+        )
+        .unwrap();
+        assert!(!format!("{entries:?}").contains("sam-token"));
+        let store = AuthTokenStore::new();
+        let identities = store.insert_participant_tokens(&entries).unwrap();
+        assert_eq!(identities[0].display_name, "Sam");
+        assert_eq!(identities[0].id, participant_id_for_token("sam-token"));
+        assert_eq!(
+            identities[1].id.to_string(),
+            "00000000-0000-4000-8000-000000000001"
+        );
+        let session = store.authenticate("sam-token").unwrap();
+        assert_eq!(session.participant(), Some(&identities[0]));
+        session.verify().unwrap();
+        // Derived ids are stable for a token and distinct across tokens.
+        assert_eq!(
+            participant_id_for_token("sam-token"),
+            participant_id_for_token("sam-token")
+        );
+        assert_ne!(
+            participant_id_for_token("sam-token"),
+            participant_id_for_token("nadia-token")
+        );
+        let operator = store.issue(AuthorizationScope::all()).unwrap();
+        assert!(
+            store
+                .authenticate(&operator.token)
+                .unwrap()
+                .participant()
+                .is_none()
+        );
+
+        for invalid in [
+            "not json",
+            r#"[{"token": "a", "display_name": " "}]"#,
+            r#"[{"token": "a", "display_name": "A"}, {"token": "a", "display_name": "B"}]"#,
+            r#"[{"token": "", "display_name": "A"}]"#,
+            r#"[{"token": "a", "display_name": "A", "role": "owner"}]"#,
+            r#"[{"token": "a", "display_name": "A",
+                 "participant_id": "00000000-0000-4000-8000-000000000001"},
+                {"token": "b", "display_name": "B",
+                 "participant_id": "00000000-0000-4000-8000-000000000001"}]"#,
+        ] {
+            assert_eq!(
+                parse_participant_tokens(invalid).unwrap_err().code,
+                ErrorCode::InvalidRequest,
+                "{invalid}"
+            );
+        }
+        assert!(validate_display_name("bad\nname").is_err());
+        assert!(validate_display_name(&"x".repeat(129)).is_err());
     }
 
     #[test]

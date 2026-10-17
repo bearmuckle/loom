@@ -58,6 +58,16 @@ impl InProcessConnection {
             .session_repositories()?
             .insert(session_id, BTreeMap::new());
         self.backend.journal()?.append_session(record);
+        self.grant_creator_ownership(session_id);
         Ok(snapshot)
+    }
+
+    /// Makes the person who created (or forked) a session its owner. Operator
+    /// connections create sessions without an owner; an operator then grants
+    /// access explicitly.
+    pub(crate) fn grant_creator_ownership(&self, session_id: AgentSessionId) {
+        if let Some(participant) = self.participant() {
+            self.backend.access.add_owner(session_id, participant.id);
+        }
     }
 }

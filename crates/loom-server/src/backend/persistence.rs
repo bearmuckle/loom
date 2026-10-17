@@ -599,6 +599,7 @@ impl InProcessBackend {
             workspace_events: journal.pending_workspace_events.clone(),
         };
         let archive_retention = self.archive_retention();
+        let (participants, session_grants) = self.access.export();
         let session_settings = DurableSessionSettings {
             approval_policies: self.session_policies()?.clone(),
             auto_approve_actions: self.auto_approve_actions()?.clone(),
@@ -612,6 +613,8 @@ impl InProcessBackend {
                     .sub_agent_retention_ms
                     .filter(|value| *value > 0),
             },
+            participants,
+            session_grants,
         };
         let workspace_configs = self.workspace_configs()?.clone();
         let provider_state = DurableProviderState {

@@ -36,6 +36,7 @@ use super::*;
 #[allow(unused_imports)]
 use support::*;
 
+mod access;
 mod event_pages;
 mod feed;
 mod filesystem;

@@ -52,6 +52,9 @@ impl InProcessConnection {
         {
             return ResponseEnvelope::failure(request_id, error);
         }
+        if let Some(presence) = &self.presence {
+            presence.touch_request();
+        }
         if !request
             .protocol_version
             .is_compatible_with(CURRENT_PROTOCOL_VERSION)
@@ -878,6 +881,23 @@ impl InProcessConnection {
             ClientRequest::Provider(ProviderRequest::ConfigureGitHubCopilot { .. })
             | ClientRequest::Provider(ProviderRequest::ConfigureApiKeyProvider { .. })
             | ClientRequest::Provider(ProviderRequest::ConfigureGitHubRepository { .. }) => {}
+            ClientRequest::Access(loom_protocol::AccessRequest::GetCurrentParticipant)
+            | ClientRequest::Access(loom_protocol::AccessRequest::ListParticipants) => {}
+            ClientRequest::Access(loom_protocol::AccessRequest::GetSessionRoster {
+                session_id: requested_session,
+            })
+            | ClientRequest::Access(loom_protocol::AccessRequest::GrantSessionAccess {
+                session_id: requested_session,
+                ..
+            })
+            | ClientRequest::Access(loom_protocol::AccessRequest::SetSessionRole {
+                session_id: requested_session,
+                ..
+            })
+            | ClientRequest::Access(loom_protocol::AccessRequest::RevokeSessionAccess {
+                session_id: requested_session,
+                ..
+            }) => session_id = Some(*requested_session),
         }
 
         if let ClientRequest::Repository(RepositoryRequest::AttachSessionRepository {
@@ -964,7 +984,97 @@ impl InProcessConnection {
                 false,
             ));
         }
-        Ok(())
+        self.authorize_session_role(request)
+    }
+
+    /// Holds a connection bound to a person to their role in the session the
+    /// request reads or acts on.
+    ///
+    /// Operator connections (unauthenticated in-process callers and tokens not
+    /// bound to a person) are governed by their token scope alone. A person
+    /// without any grant in the session is told the session is not authorized,
+    /// exactly as if it did not belong to their scope, so neither content nor
+    /// presence leaks.
+    pub(crate) fn authorize_session_role(&self, request: &ClientRequest) -> Result<()> {
+        let Some(participant) = self.participant() else {
+            return Ok(());
+        };
+        let Some(required) = request.required_session_role() else {
+            return Ok(());
+        };
+        let session_id = match request.access_target() {
+            Some(loom_protocol::AccessTarget::Session(session_id)) => session_id,
+            Some(loom_protocol::AccessTarget::Run(run_id)) => {
+                self.run_summary(run_id)?.snapshot.session_id
+            }
+            Some(loom_protocol::AccessTarget::Project(project_id)) => {
+                AgentSessionId::from_uuid(*project_id.as_uuid())
+            }
+            None => {
+                return Err(LoomError::new(
+                    ErrorCode::AuthorizationDenied,
+                    "request names no session to authorize",
+                    false,
+                ));
+            }
+        };
+        let role = self.session_role(participant.id, session_id)?;
+        match role {
+            None => Err(unauthorized_session(session_id)),
+            Some(role) if role < required => Err(LoomError::new(
+                ErrorCode::AuthorizationDenied,
+                format!(
+                    "this request needs the {} role in session {session_id}; you are {}",
+                    required.as_str(),
+                    role.as_str()
+                ),
+                false,
+            )),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// A person's effective role in a session.
+    ///
+    /// A sub-agent session of a project has no grants of its own; it inherits
+    /// the grants of the project's root session, so access to a project covers
+    /// the agents it delegates to.
+    pub(crate) fn session_role(
+        &self,
+        participant: loom_core::ParticipantId,
+        session_id: AgentSessionId,
+    ) -> Result<Option<loom_core::SessionRole>> {
+        if let Some(role) = self.backend.access.role(session_id, participant) {
+            return Ok(Some(role));
+        }
+        let Some(persistence) = &self.backend.persistence else {
+            return Ok(None);
+        };
+        let Some(task) = persistence.load_delegated_task_for_target(session_id)? else {
+            return Ok(None);
+        };
+        let root = AgentSessionId::from_uuid(*task.project_id.as_uuid());
+        Ok(self.backend.access.role(root, participant))
+    }
+
+    /// Sessions this connection may read, or `None` when it is not limited by
+    /// session grants (an operator connection).
+    pub(crate) fn readable_sessions(&self) -> Result<Option<BTreeSet<AgentSessionId>>> {
+        let Some(participant) = self.participant() else {
+            return Ok(None);
+        };
+        let granted = self.backend.access.sessions_of(participant.id);
+        let mut readable = granted.clone();
+        if let Some(persistence) = &self.backend.persistence {
+            for root in &granted {
+                if let Ok(Some(project)) = persistence
+                    .load_project_snapshot(loom_core::ProjectId::from_uuid(*root.as_uuid()))
+                {
+                    readable.extend(project.agents.iter().map(|agent| agent.session_id));
+                }
+            }
+        }
+        Ok(Some(readable))
     }
 
     pub(crate) fn negotiated_capabilities(&self) -> Result<MutexGuard<'_, Option<CapabilitySet>>> {

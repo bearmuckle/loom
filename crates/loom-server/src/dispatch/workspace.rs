@@ -45,19 +45,25 @@ impl InProcessConnection {
             ClientRequest::Workspace(WorkspaceRequest::ListWorkspaceSessions {
                 workspace_id,
                 include_archived,
-            }) => Ok(ServerResponse::Session(SessionResponse::AgentSessions {
-                sessions: self
-                    .backend
-                    .sessions()?
-                    .list_in_workspace(Some(workspace_id), include_archived)
-                    .into_iter()
-                    .filter(|session| {
-                        self.auth
-                            .as_ref()
-                            .is_none_or(|auth| auth.scope().allows_session(session.id))
-                    })
-                    .collect(),
-            })),
+            }) => {
+                let readable = self.readable_sessions()?;
+                Ok(ServerResponse::Session(SessionResponse::AgentSessions {
+                    sessions: self
+                        .backend
+                        .sessions()?
+                        .list_in_workspace(Some(workspace_id), include_archived)
+                        .into_iter()
+                        .filter(|session| {
+                            self.auth
+                                .as_ref()
+                                .is_none_or(|auth| auth.scope().allows_session(session.id))
+                                && readable
+                                    .as_ref()
+                                    .is_none_or(|readable| readable.contains(&session.id))
+                        })
+                        .collect(),
+                }))
+            }
             ClientRequest::Workspace(WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id,
                 name,
