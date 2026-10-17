@@ -1,10 +1,12 @@
 //! The People tab: roster and presence, owner access controls, the run
 //! credential, and repository access.
 
-use loom_protocol::SessionRole;
+use loom_protocol::{MAX_ACCESS_REQUEST_NOTE_BYTES, SessionRole};
 
 use super::*;
-use crate::collaboration::{credential_label, pin_label, presence_label, role_label};
+use crate::collaboration::{
+    access_outcome_text, credential_label, pin_label, presence_label, role_label,
+};
 
 impl LoomView {
     pub(crate) fn render_inspector_people(
@@ -14,8 +16,228 @@ impl LoomView {
     ) -> impl IntoElement {
         inspector_scroll()
             .child(self.render_roster_card(cx))
+            .when_some(self.render_access_request_card(cx), |scroll, card| {
+                scroll.child(card)
+            })
+            .when_some(self.render_pending_requests_card(cx), |scroll, card| {
+                scroll.child(card)
+            })
             .child(self.render_credential_card(cx))
             .child(self.render_repository_access_card())
+    }
+
+    /// The requester's "Request access" control, pending state, and outcome.
+    fn render_access_request_card(&self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+        let state = &self.collaboration;
+        let access = &state.access;
+        if !state.can_request_access() && access.outcome.is_none() {
+            return None;
+        }
+        let mut body = div().flex().flex_col().gap_2();
+        if let Some(outcome) = &access.outcome {
+            body = body.child(
+                div()
+                    .id("access-request-outcome")
+                    .test_support()
+                    .text_size(card_value_font())
+                    .text_color(rgb(0xe5e7eb))
+                    .child(access_outcome_text(outcome)),
+            );
+        }
+        if let Some(own) = &access.own {
+            let view = cx.entity();
+            body = body
+                .child(
+                    div()
+                        .id("access-request-pending")
+                        .test_support()
+                        .text_size(card_value_font())
+                        .text_color(rgb(0xe5e7eb))
+                        .child(format!(
+                            "Requested {} access · waiting for an owner",
+                            role_label(own.requested_role).to_lowercase()
+                        )),
+                )
+                .when_some(own.note.clone(), |body, note| {
+                    body.child(div().text_xs().text_color(rgb(0x8f98a6)).child(note))
+                })
+                .child(
+                    Button::new("withdraw-access-request")
+                        .label("Withdraw")
+                        .outline()
+                        .xsmall()
+                        .disabled(access.in_flight)
+                        .on_click(move |_, _, cx| {
+                            view.update(cx, |this, cx| this.withdraw_session_access_request(cx));
+                        }),
+                );
+        } else if state.can_request_access() {
+            let role = access.draft_role();
+            let role_view = cx.entity();
+            let send_view = cx.entity();
+            let note_input = self.access_note_input.clone();
+            let mut controls = div().flex().items_center().gap_2().child(
+                Button::new("access-request-role")
+                    .label(role_label(role))
+                    .ghost()
+                    .xsmall()
+                    .accessibility_label("Requested role")
+                    .dropdown_menu(move |mut menu, _, _| {
+                        for candidate in [SessionRole::Participant, SessionRole::Owner] {
+                            let view = role_view.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(role_label(candidate))
+                                    .checked(candidate == role)
+                                    .on_click(move |_, _, cx| {
+                                        view.update(cx, |this, cx| {
+                                            this.set_access_request_role(candidate, cx);
+                                        });
+                                    }),
+                            );
+                        }
+                        menu
+                    }),
+            );
+            controls = controls.child(
+                Button::new("send-access-request")
+                    .label("Request access")
+                    .primary()
+                    .xsmall()
+                    .disabled(access.in_flight)
+                    .on_click(move |_, _, cx| {
+                        let note = note_input
+                            .as_ref()
+                            .map(|input| input.read(cx).value().to_string())
+                            .unwrap_or_default();
+                        send_view.update(cx, |this, cx| this.request_session_access(&note, cx));
+                    }),
+            );
+            if let Some(input) = self.access_note_input.as_ref() {
+                body = body.child(KitInput::new(input).id("access-request-note").small());
+            }
+            body = body
+                .child(controls)
+                .child(div().text_xs().text_color(rgb(0x64748b)).child(format!(
+                    "Owners see your request and note (at most {MAX_ACCESS_REQUEST_NOTE_BYTES} \
+                     bytes)."
+                )));
+        }
+        Some(card("Request access", body).into_any_element())
+    }
+
+    /// The owner's list of pending access requests.
+    fn render_pending_requests_card(&self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+        let state = &self.collaboration;
+        if !state.manages_access_requests() {
+            return None;
+        }
+        let access = &state.access;
+        let mut body = div().flex().flex_col().gap_2();
+        if access.pending.is_empty() {
+            body = body.child(empty_note("No pending requests."));
+        }
+        for (index, request) in access.pending.iter().enumerate() {
+            let request_id = request.id;
+            let approve_role = access.approve_role(request);
+            let role_view = cx.entity();
+            let approve_view = cx.entity();
+            let deny_view = cx.entity();
+            let deny_input = self.access_deny_input.clone();
+            body = body.child(
+                div()
+                    .id(("access-request", index))
+                    .test_support()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(card_value_font())
+                            .text_color(rgb(0xe5e7eb))
+                            .child(format!(
+                                "{} asks to be {}",
+                                request.participant.display_name,
+                                role_label(request.requested_role).to_lowercase()
+                            )),
+                    )
+                    .when_some(request.note.clone(), |row, note| {
+                        row.child(div().text_xs().text_color(rgb(0x8f98a6)).child(note))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new(("access-request-approve-role", index))
+                                    .label(role_label(approve_role))
+                                    .ghost()
+                                    .xsmall()
+                                    .accessibility_label("Role to grant")
+                                    .dropdown_menu(move |mut menu, _, _| {
+                                        for candidate in [
+                                            SessionRole::Observer,
+                                            SessionRole::Participant,
+                                            SessionRole::Owner,
+                                        ] {
+                                            let view = role_view.clone();
+                                            menu = menu.item(
+                                                PopupMenuItem::new(role_label(candidate))
+                                                    .checked(candidate == approve_role)
+                                                    .on_click(move |_, _, cx| {
+                                                        view.update(cx, |this, cx| {
+                                                            this.collaboration
+                                                                .access
+                                                                .set_approve_role(
+                                                                    request_id, candidate,
+                                                                );
+                                                            cx.notify();
+                                                        });
+                                                    }),
+                                            );
+                                        }
+                                        menu
+                                    }),
+                            )
+                            .child(
+                                Button::new(("access-request-approve", index))
+                                    .label("Approve")
+                                    .primary()
+                                    .xsmall()
+                                    .disabled(access.in_flight)
+                                    .on_click(move |_, _, cx| {
+                                        approve_view.update(cx, |this, cx| {
+                                            this.approve_session_access_request(request_id, cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new(("access-request-deny", index))
+                                    .label("Deny")
+                                    .outline()
+                                    .xsmall()
+                                    .disabled(access.in_flight)
+                                    .on_click(move |_, _, cx| {
+                                        let reason = deny_input
+                                            .as_ref()
+                                            .map(|input| input.read(cx).value().to_string())
+                                            .unwrap_or_default();
+                                        deny_view.update(cx, |this, cx| {
+                                            this.deny_session_access_request(
+                                                request_id, &reason, cx,
+                                            );
+                                        });
+                                    }),
+                            ),
+                    ),
+            );
+        }
+        if !access.pending.is_empty()
+            && let Some(input) = self.access_deny_input.as_ref()
+        {
+            body = body.child(KitInput::new(input).id("access-deny-reason").small());
+        }
+        Some(card("Access requests", body).into_any_element())
     }
 
     fn render_roster_card(&self, cx: &mut Context<Self>) -> impl IntoElement {

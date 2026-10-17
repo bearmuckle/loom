@@ -249,10 +249,13 @@ impl LoomView {
                     self.review.mark_changes_unread_from_event();
                 }
             }
-            ServerEvent::Terminal { .. }
-            | ServerEvent::Task { .. }
-            | ServerEvent::SessionAccessRequested { .. }
-            | ServerEvent::SessionAccessRequestResolved { .. } => {}
+            ServerEvent::Terminal { .. } | ServerEvent::Task { .. } => {}
+            ServerEvent::SessionAccessRequested { request } => self
+                .collaboration
+                .apply_access_requested(self.active_session.id, request),
+            ServerEvent::SessionAccessRequestResolved { request, decision } => self
+                .collaboration
+                .apply_access_resolved(self.active_session.id, request, decision),
             ServerEvent::Collaboration { entry } => self.consume_collaboration_entry(entry),
             ServerEvent::SessionRosterChanged { entries } => {
                 self.collaboration

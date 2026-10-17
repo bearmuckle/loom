@@ -6,9 +6,11 @@
 //! enforces roles; the client only hides controls a role cannot use.
 
 use loom_core::{
-    AgentSessionId, Author, CollaborationEntry, CollaborationEntryKind, CredentialId, ErrorCode,
-    LoomError, ParticipantId, ParticipantIdentity, PresenceStatus, ProviderCredentialMetadata,
-    Recipient, RosterEntry, RunControlAction, RunCredentialPin, RunId, RunRevision, SessionRole,
+    AccessRequestDecision, AccessRequestId, AgentSessionId, Author, CollaborationEntry,
+    CollaborationEntryKind, CredentialId, ErrorCode, LoomError, MAX_ACCESS_REQUEST_NOTE_BYTES,
+    ParticipantId, ParticipantIdentity, PresenceStatus, ProviderCredentialMetadata, Recipient,
+    RosterEntry, RunControlAction, RunCredentialPin, RunId, RunRevision, SessionAccessRequest,
+    SessionRole,
 };
 use loom_protocol::{AgentRunSnapshot, AgentRunState, CollaborationRequest, RunRequest};
 
@@ -306,6 +308,120 @@ pub(crate) struct CollaborationState {
     /// against the history read on load.
     pub(crate) seen_entries: std::collections::VecDeque<CollaborationEntry>,
     pub(crate) request_in_flight: bool,
+    /// Session access requests: the caller's own and, for owners, the
+    /// pending ones.
+    pub(crate) access: AccessRequestsState,
+}
+
+/// Access request state for the active session.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AccessRequestsState {
+    /// The worker does not know access requests (older protocol); the
+    /// controls are hidden.
+    pub(crate) unsupported: bool,
+    /// The role the requester picked; `None` means participant.
+    pub(crate) draft_role: Option<SessionRole>,
+    /// The caller's pending request.
+    pub(crate) own: Option<SessionAccessRequest>,
+    /// How the caller's last request ended (approved or denied).
+    pub(crate) outcome: Option<AccessRequestDecision>,
+    /// Pending requests an owner decides on, oldest first.
+    pub(crate) pending: Vec<SessionAccessRequest>,
+    /// The role an owner picked to approve each request with.
+    pub(crate) approve_roles: Vec<(AccessRequestId, SessionRole)>,
+    /// Whether the owner list was read for this session.
+    pub(crate) pending_loaded: bool,
+    pub(crate) in_flight: bool,
+}
+
+impl AccessRequestsState {
+    pub(crate) fn draft_role(&self) -> SessionRole {
+        self.draft_role.unwrap_or(SessionRole::Participant)
+    }
+
+    /// The role an approval grants: the owner's pick, else the requested one.
+    pub(crate) fn approve_role(&self, request: &SessionAccessRequest) -> SessionRole {
+        self.approve_roles
+            .iter()
+            .find(|(id, _)| *id == request.id)
+            .map_or(request.requested_role, |(_, role)| *role)
+    }
+
+    pub(crate) fn set_approve_role(&mut self, request_id: AccessRequestId, role: SessionRole) {
+        self.approve_roles.retain(|(id, _)| *id != request_id);
+        self.approve_roles.push((request_id, role));
+    }
+
+    /// Replaces the owner list with a fresh read.
+    pub(crate) fn replace_pending(&mut self, requests: Vec<SessionAccessRequest>) {
+        self.approve_roles
+            .retain(|(id, _)| requests.iter().any(|request| request.id == *id));
+        self.pending = requests;
+    }
+
+    /// Adds a filed request, or replaces it in place when it was re-filed.
+    pub(crate) fn upsert_pending(&mut self, request: SessionAccessRequest) {
+        match self.pending.iter_mut().find(|known| known.id == request.id) {
+            Some(known) => *known = request,
+            None => self.pending.push(request),
+        }
+    }
+
+    /// Records the caller's filed (or replaced) request.
+    pub(crate) fn record_own(&mut self, request: SessionAccessRequest) {
+        self.outcome = None;
+        self.own = Some(request);
+    }
+
+    /// Applies a resolution. `mine` is whether the caller filed the request.
+    pub(crate) fn resolve(
+        &mut self,
+        request: &SessionAccessRequest,
+        decision: &AccessRequestDecision,
+        mine: bool,
+    ) {
+        self.pending.retain(|known| known.id != request.id);
+        self.approve_roles.retain(|(id, _)| *id != request.id);
+        if mine && self.own.as_ref().is_none_or(|own| own.id == request.id) {
+            self.own = None;
+            self.outcome = match decision {
+                AccessRequestDecision::Withdrawn => None,
+                other => Some(other.clone()),
+            };
+        }
+    }
+}
+
+/// The note to send with an access request: trimmed, `None` when empty.
+/// Errors when it is longer than [`MAX_ACCESS_REQUEST_NOTE_BYTES`].
+pub(crate) fn access_request_note(text: &str) -> Result<Option<String>, String> {
+    let text = text.trim();
+    if text.len() > MAX_ACCESS_REQUEST_NOTE_BYTES {
+        return Err(format!(
+            "The note is {} bytes; at most {MAX_ACCESS_REQUEST_NOTE_BYTES} are allowed.",
+            text.len()
+        ));
+    }
+    Ok((!text.is_empty()).then(|| text.to_owned()))
+}
+
+/// The requester-facing text for how a request ended.
+pub(crate) fn access_outcome_text(decision: &AccessRequestDecision) -> String {
+    match decision {
+        AccessRequestDecision::Approved { role } => {
+            format!(
+                "Approved: you are now {}.",
+                role_label(*role).to_lowercase()
+            )
+        }
+        AccessRequestDecision::Denied {
+            reason: Some(reason),
+        } => {
+            format!("Denied: {reason}")
+        }
+        AccessRequestDecision::Denied { reason: None } => "Denied.".to_owned(),
+        AccessRequestDecision::Withdrawn => "Withdrawn.".to_owned(),
+    }
 }
 
 impl CollaborationState {
@@ -324,6 +440,59 @@ impl CollaborationState {
         self.seen_entries.clear();
         self.recipient = ComposerRecipient::Agent;
         self.request_in_flight = false;
+        self.access = AccessRequestsState::default();
+    }
+
+    /// Whether the connection may ask for access: a bound person who is an
+    /// observer (or has no grant) on a worker that knows access requests.
+    pub(crate) fn can_request_access(&self) -> bool {
+        self.support == CollaborationSupport::Supported
+            && !self.access.unsupported
+            && self.role() == Some(SessionRole::Observer)
+    }
+
+    /// Whether the owner's pending request list applies.
+    pub(crate) fn manages_access_requests(&self) -> bool {
+        self.support == CollaborationSupport::Supported
+            && !self.access.unsupported
+            && self.role() == Some(SessionRole::Owner)
+    }
+
+    /// Applies a filed or replaced request from an event.
+    pub(crate) fn apply_access_requested(
+        &mut self,
+        active: AgentSessionId,
+        request: &SessionAccessRequest,
+    ) {
+        if request.session_id != active {
+            return;
+        }
+        if self.is_requester(request) {
+            self.access.record_own(request.clone());
+        }
+        if self.role() == Some(SessionRole::Owner) {
+            self.access.upsert_pending(request.clone());
+        }
+    }
+
+    /// Applies an approved, denied, or withdrawn request.
+    pub(crate) fn apply_access_resolved(
+        &mut self,
+        active: AgentSessionId,
+        request: &SessionAccessRequest,
+        decision: &AccessRequestDecision,
+    ) {
+        if request.session_id != active {
+            return;
+        }
+        let mine = self.is_requester(request);
+        self.access.resolve(request, decision, mine);
+    }
+
+    fn is_requester(&self, request: &SessionAccessRequest) -> bool {
+        self.identity
+            .as_ref()
+            .is_some_and(|identity| identity.id == request.participant.id)
     }
 
     /// The connection's role in the active session. `None` for an operator
@@ -588,11 +757,18 @@ pub(crate) fn entry_text(entry: &CollaborationEntry) -> String {
                 participant.display_name,
                 role_label(*role).to_lowercase()
             ),
-            loom_core::AccessRequestDecision::Denied { .. } => format!(
-                "Denied {}'s request to be {}",
-                participant.display_name,
-                role_label(*requested_role).to_lowercase()
-            ),
+            loom_core::AccessRequestDecision::Denied { reason } => {
+                let mut text = format!(
+                    "Denied {}'s request to be {}",
+                    participant.display_name,
+                    role_label(*requested_role).to_lowercase()
+                );
+                if let Some(reason) = reason.as_deref().filter(|reason| !reason.is_empty()) {
+                    text.push_str(": ");
+                    text.push_str(reason);
+                }
+                text
+            }
             loom_core::AccessRequestDecision::Withdrawn => {
                 format!("{} withdrew their request", participant.display_name)
             }
@@ -1059,5 +1235,170 @@ mod tests {
             owner_label: "Worker default".to_owned(),
         };
         assert_eq!(pin_label(&pin), "openai · Worker default · v2");
+    }
+
+    fn access_request(
+        session_id: AgentSessionId,
+        who: &ParticipantIdentity,
+        role: SessionRole,
+    ) -> SessionAccessRequest {
+        SessionAccessRequest {
+            id: AccessRequestId::new(),
+            session_id,
+            participant: who.clone(),
+            requested_role: role,
+            note: None,
+            created_at: Timestamp::now(),
+        }
+    }
+
+    #[test]
+    fn requester_state_moves_from_pending_to_outcome() {
+        let session = AgentSessionId::new();
+        let me = person("Nadia");
+        let mut state = CollaborationState {
+            identity: Some(me.clone()),
+            support: CollaborationSupport::Supported,
+            ..CollaborationState::default()
+        };
+        assert!(state.can_request_access(), "no grant counts as observer");
+        assert_eq!(state.access.draft_role(), SessionRole::Participant);
+        let request = access_request(session, &me, SessionRole::Participant);
+        state.apply_access_requested(session, &request);
+        assert_eq!(state.access.own.as_ref(), Some(&request));
+        assert!(state.access.pending.is_empty(), "observers see no list");
+        // A request for another session is ignored.
+        state.apply_access_resolved(
+            AgentSessionId::new(),
+            &request,
+            &AccessRequestDecision::Withdrawn,
+        );
+        assert!(state.access.own.is_some());
+        let approved = AccessRequestDecision::Approved {
+            role: SessionRole::Participant,
+        };
+        state.apply_access_resolved(session, &request, &approved);
+        assert!(state.access.own.is_none());
+        assert_eq!(state.access.outcome.as_ref(), Some(&approved));
+        assert_eq!(
+            access_outcome_text(&approved),
+            "Approved: you are now participant."
+        );
+        // The role then comes from the roster.
+        state.replace_roster(session, vec![entry(&me, SessionRole::Participant)]);
+        assert!(!state.can_request_access());
+
+        // A withdrawal clears the pending request without an outcome.
+        state.access.record_own(request.clone());
+        state.apply_access_resolved(session, &request, &AccessRequestDecision::Withdrawn);
+        assert!(state.access.own.is_none() && state.access.outcome.is_none());
+        let denied = AccessRequestDecision::Denied {
+            reason: Some("not now".to_owned()),
+        };
+        assert_eq!(access_outcome_text(&denied), "Denied: not now");
+    }
+
+    #[test]
+    fn legacy_workers_hide_access_request_controls() {
+        let me = person("Nadia");
+        let mut state = CollaborationState {
+            identity: Some(me),
+            support: CollaborationSupport::Legacy,
+            ..CollaborationState::default()
+        };
+        assert!(!state.can_request_access());
+        state.support = CollaborationSupport::Supported;
+        state.access.unsupported = true;
+        assert!(!state.can_request_access());
+        assert!(!state.manages_access_requests());
+        state.identity = None;
+        state.access.unsupported = false;
+        assert!(!state.can_request_access(), "operators do not request");
+    }
+
+    #[test]
+    fn owner_list_follows_events_without_duplicates() {
+        let session = AgentSessionId::new();
+        let owner = person("Björn");
+        let nadia = person("Nadia");
+        let mut state = CollaborationState {
+            identity: Some(owner.clone()),
+            support: CollaborationSupport::Supported,
+            ..CollaborationState::default()
+        };
+        state.replace_roster(session, vec![entry(&owner, SessionRole::Owner)]);
+        assert!(state.manages_access_requests());
+        let request = access_request(session, &nadia, SessionRole::Participant);
+        state.access.replace_pending(vec![request.clone()]);
+        state.apply_access_requested(session, &request);
+        assert_eq!(state.access.pending.len(), 1, "deduplicated by id");
+        assert_eq!(
+            state.access.approve_role(&request),
+            SessionRole::Participant
+        );
+        let replaced = SessionAccessRequest {
+            requested_role: SessionRole::Owner,
+            ..request.clone()
+        };
+        state.apply_access_requested(session, &replaced);
+        assert_eq!(state.access.pending, vec![replaced.clone()]);
+        assert_eq!(state.access.approve_role(&replaced), SessionRole::Owner);
+        state
+            .access
+            .set_approve_role(replaced.id, SessionRole::Observer);
+        assert_eq!(state.access.approve_role(&replaced), SessionRole::Observer);
+        state.apply_access_resolved(
+            session,
+            &replaced,
+            &AccessRequestDecision::Denied { reason: None },
+        );
+        assert!(state.access.pending.is_empty());
+        assert!(state.access.approve_roles.is_empty());
+        assert!(state.access.outcome.is_none(), "not the owner's request");
+    }
+
+    #[test]
+    fn access_request_notes_are_trimmed_and_bounded() {
+        assert_eq!(access_request_note("  "), Ok(None));
+        assert_eq!(access_request_note(" hi "), Ok(Some("hi".to_owned())));
+        let long = "x".repeat(MAX_ACCESS_REQUEST_NOTE_BYTES + 1);
+        assert!(access_request_note(&long).is_err());
+        let max = "x".repeat(MAX_ACCESS_REQUEST_NOTE_BYTES);
+        assert!(access_request_note(&max).is_ok());
+    }
+
+    #[test]
+    fn access_request_decisions_have_entry_text() {
+        let nadia = person("Nadia");
+        let decided = |decision| CollaborationEntry {
+            session_id: AgentSessionId::new(),
+            run_id: None,
+            author: Author::Operator,
+            recipient: Recipient::People,
+            kind: CollaborationEntryKind::AccessRequestDecided {
+                request_id: AccessRequestId::new(),
+                participant: nadia.clone(),
+                requested_role: SessionRole::Owner,
+                decision,
+            },
+            revision: None,
+            created_at: Timestamp::now(),
+        };
+        assert_eq!(
+            entry_text(&decided(AccessRequestDecision::Approved {
+                role: SessionRole::Participant
+            })),
+            "Approved Nadia as participant"
+        );
+        assert_eq!(
+            entry_text(&decided(AccessRequestDecision::Denied {
+                reason: Some("later".to_owned())
+            })),
+            "Denied Nadia's request to be owner: later"
+        );
+        assert_eq!(
+            entry_text(&decided(AccessRequestDecision::Withdrawn)),
+            "Nadia withdrew their request"
+        );
     }
 }

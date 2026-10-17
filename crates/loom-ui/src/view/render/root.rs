@@ -163,6 +163,26 @@ impl Render for LoomView {
             }
             self.clear_node_on_render = false;
         }
+        if self.access_note_input.is_none() {
+            let input = cx
+                .new(|cx| InputState::new(window, cx).placeholder("Optional note for the owners"));
+            self.access_note_input = Some(input);
+        }
+        if self.access_deny_input.is_none() {
+            let input =
+                cx.new(|cx| InputState::new(window, cx).placeholder("Optional reason to deny"));
+            self.access_deny_input = Some(input);
+        }
+        if std::mem::take(&mut self.clear_access_note)
+            && let Some(input) = self.access_note_input.as_ref()
+        {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        if std::mem::take(&mut self.clear_access_deny_reason)
+            && let Some(input) = self.access_deny_input.as_ref()
+        {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
         #[cfg(target_family = "wasm")]
         if !self.connected || self.browser_starting {
             return self.render_startup_screen(window, cx);

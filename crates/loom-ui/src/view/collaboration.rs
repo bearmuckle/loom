@@ -2,8 +2,8 @@
 //! directions, and the session's provider credential.
 
 use loom_protocol::{
-    AccessRequest, AccessResponse, CollaborationRequest, CollaborationResponse, CredentialId,
-    ParticipantId, RunActionOutcome, SessionRole,
+    AccessRequest, AccessRequestId, AccessResponse, CollaborationRequest, CollaborationResponse,
+    CredentialId, ParticipantId, RunActionOutcome, SessionRole,
 };
 
 use super::*;
@@ -61,6 +61,10 @@ impl LoomView {
                 {
                     view.collaboration.replace_roster(session_id, entries);
                     view.schedule_run_poll(cx);
+                    // Owners see pending requests on session load.
+                    if !view.collaboration.access.pending_loaded {
+                        view.refresh_access_requests(cx);
+                    }
                 }
                 cx.notify();
             },
@@ -775,6 +779,235 @@ impl LoomView {
         self.refresh_roster(session_id, cx);
         self.refresh_participant_directory(cx);
         self.refresh_session_credential(cx);
+        self.refresh_access_requests(cx);
+    }
+
+    /// Reads the pending access requests an owner decides on.
+    pub(crate) fn refresh_access_requests(&mut self, cx: &mut Context<Self>) {
+        if !self.collaboration.manages_access_requests() {
+            return;
+        }
+        let session_id = self.active_session.id;
+        self.dispatch(
+            cx,
+            ClientRequest::Access(AccessRequest::ListSessionAccessRequests { session_id }),
+            move |view, response, cx| {
+                if view.active_session.id != session_id {
+                    return;
+                }
+                match response.result {
+                    Ok(ServerResponse::Access(AccessResponse::SessionAccessRequests {
+                        requests,
+                        ..
+                    })) => {
+                        view.collaboration.access.pending_loaded = true;
+                        view.collaboration.access.replace_pending(requests);
+                    }
+                    // An older worker: hide the access request controls.
+                    Err(error) if is_unsupported_error(&error) => {
+                        view.collaboration.access.unsupported = true;
+                    }
+                    Err(error) => view.record_backend_error("list access requests", error),
+                    Ok(response) => view.record_backend_error(
+                        "list access requests",
+                        unexpected_response("list access requests", response),
+                    ),
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    pub(crate) fn set_access_request_role(&mut self, role: SessionRole, cx: &mut Context<Self>) {
+        self.collaboration.access.draft_role = Some(role);
+        cx.notify();
+    }
+
+    /// Asks the session's owners for the chosen role, with an optional note.
+    pub(crate) fn request_session_access(&mut self, note: &str, cx: &mut Context<Self>) {
+        if !self.collaboration.can_request_access() || self.collaboration.access.in_flight {
+            return;
+        }
+        let note = match crate::collaboration::access_request_note(note) {
+            Ok(note) => note,
+            Err(message) => {
+                self.record_backend_error(
+                    "request access",
+                    loom_core::LoomError::invalid_request(message),
+                );
+                cx.notify();
+                return;
+            }
+        };
+        let session_id = self.active_session.id;
+        self.collaboration.access.in_flight = true;
+        self.dispatch(
+            cx,
+            ClientRequest::Access(AccessRequest::RequestSessionAccess {
+                session_id,
+                requested_role: self.collaboration.access.draft_role(),
+                note,
+            }),
+            move |view, response, cx| {
+                view.collaboration.access.in_flight = false;
+                match response.result {
+                    Ok(ServerResponse::Access(AccessResponse::SessionAccessRequestPending(
+                        request,
+                    ))) => {
+                        if view.active_session.id == session_id {
+                            view.collaboration.access.record_own(request);
+                            view.clear_access_note = true;
+                        }
+                    }
+                    Err(error) if is_unsupported_error(&error) => {
+                        view.collaboration.access.unsupported = true;
+                    }
+                    Err(error) => view.record_backend_error("request access", error),
+                    Ok(response) => view.record_backend_error(
+                        "request access",
+                        unexpected_response("request access", response),
+                    ),
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Withdraws the caller's pending request.
+    pub(crate) fn withdraw_session_access_request(&mut self, cx: &mut Context<Self>) {
+        let Some(request) = self.collaboration.access.own.clone() else {
+            return;
+        };
+        self.send_access_decision(
+            "withdraw request",
+            AccessRequest::WithdrawSessionAccessRequest {
+                session_id: request.session_id,
+                request_id: request.id,
+            },
+            cx,
+        );
+    }
+
+    /// Approves a pending request with the role the owner picked.
+    pub(crate) fn approve_session_access_request(
+        &mut self,
+        request_id: AccessRequestId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(request) = self.pending_access_request(request_id) else {
+            return;
+        };
+        let role = self.collaboration.access.approve_role(&request);
+        self.send_access_decision(
+            "approve request",
+            AccessRequest::ApproveSessionAccessRequest {
+                session_id: request.session_id,
+                request_id,
+                role: Some(role),
+            },
+            cx,
+        );
+    }
+
+    /// Denies a pending request with an optional reason.
+    pub(crate) fn deny_session_access_request(
+        &mut self,
+        request_id: AccessRequestId,
+        reason: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(request) = self.pending_access_request(request_id) else {
+            return;
+        };
+        let reason = reason.trim();
+        self.send_access_decision(
+            "deny request",
+            AccessRequest::DenySessionAccessRequest {
+                session_id: request.session_id,
+                request_id,
+                reason: (!reason.is_empty()).then(|| reason.to_owned()),
+            },
+            cx,
+        );
+    }
+
+    fn pending_access_request(
+        &self,
+        request_id: AccessRequestId,
+    ) -> Option<loom_protocol::SessionAccessRequest> {
+        if !self.collaboration.manages_access_requests() {
+            return None;
+        }
+        self.collaboration
+            .access
+            .pending
+            .iter()
+            .find(|request| request.id == request_id)
+            .cloned()
+    }
+
+    fn send_access_decision(
+        &mut self,
+        operation: &'static str,
+        request: AccessRequest,
+        cx: &mut Context<Self>,
+    ) {
+        if self.collaboration.access.in_flight {
+            return;
+        }
+        self.collaboration.access.in_flight = true;
+        let session_id = self.active_session.id;
+        self.dispatch(
+            cx,
+            ClientRequest::Access(request),
+            move |view, response, cx| {
+                view.collaboration.access.in_flight = false;
+                view.finish_access_decision(operation, session_id, response, cx);
+            },
+        );
+    }
+
+    /// Applies the answer to an approve, deny, or withdraw request.
+    pub(crate) fn finish_access_decision(
+        &mut self,
+        operation: &'static str,
+        session_id: AgentSessionId,
+        response: ResponseEnvelope,
+        cx: &mut Context<Self>,
+    ) {
+        match response.result {
+            Ok(ServerResponse::Access(AccessResponse::SessionAccessRequestResolved {
+                request,
+                decision,
+                ..
+            })) => {
+                self.collaboration.apply_access_resolved(
+                    self.active_session.id,
+                    &request,
+                    &decision,
+                );
+                self.clear_access_deny_reason = true;
+                if self.active_session.id == session_id
+                    && matches!(
+                        decision,
+                        loom_protocol::AccessRequestDecision::Approved { .. }
+                    )
+                {
+                    self.refresh_roster(session_id, cx);
+                }
+            }
+            Err(error) => {
+                // The request may have been decided elsewhere; re-read the list.
+                if self.active_session.id == session_id {
+                    self.refresh_access_requests(cx);
+                }
+                self.record_backend_error(operation, error);
+            }
+            Ok(response) => {
+                self.record_backend_error(operation, unexpected_response(operation, response))
+            }
+        }
+        cx.notify();
     }
 
     /// Whether a repository may be searched or attached from this connection.

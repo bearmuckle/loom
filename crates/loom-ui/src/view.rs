@@ -680,6 +680,12 @@ pub(crate) struct LoomView {
     input_subscriptions: Vec<Subscription>,
     clear_composer_on_render: bool,
     clear_node_on_render: bool,
+    /// The requester's note for an access request.
+    access_note_input: Option<Entity<InputState>>,
+    /// An owner's reason for denying an access request.
+    access_deny_input: Option<Entity<InputState>>,
+    clear_access_note: bool,
+    clear_access_deny_reason: bool,
     rename_input_state: Option<Entity<InputState>>,
     source_path_input: Option<Entity<InputState>>,
     repository_filter_input: Option<Entity<InputState>>,
@@ -1890,6 +1896,10 @@ impl LoomView {
             input_subscriptions: Vec::new(),
             clear_composer_on_render: false,
             clear_node_on_render: false,
+            access_note_input: None,
+            access_deny_input: None,
+            clear_access_note: false,
+            clear_access_deny_reason: false,
             rename_input_state: None,
             source_path_input: None,
             repository_filter_input: None,

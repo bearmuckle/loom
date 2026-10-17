@@ -423,3 +423,132 @@ fn history_rebuild_restores_peer_chat_once_after_a_reset(cx: &mut TestAppContext
         view
     });
 }
+
+fn access_request(
+    view: &LoomView,
+    who: &ParticipantIdentity,
+    role: SessionRole,
+) -> loom_protocol::SessionAccessRequest {
+    loom_protocol::SessionAccessRequest {
+        id: loom_protocol::AccessRequestId::new(),
+        session_id: view.active_session.id,
+        participant: who.clone(),
+        requested_role: role,
+        note: Some("please".to_owned()),
+        created_at: Timestamp::now(),
+    }
+}
+
+#[gpui_kit::test]
+fn observer_request_shows_pending_then_the_outcome(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        let me = person("Nadia");
+        view.collaboration.identity = Some(me.clone());
+        view.collaboration.support = crate::collaboration::CollaborationSupport::Supported;
+        view.collaboration.replace_roster(
+            view.active_session.id,
+            vec![roster(&me, SessionRole::Observer)],
+        );
+        let request = access_request(&view, &me, SessionRole::Participant);
+        view.consume_event(&ServerEvent::SessionAccessRequested {
+            request: request.clone(),
+        });
+        assert_eq!(view.collaboration.access.own.as_ref(), Some(&request));
+        view.review.open = true;
+        view.review.tab = InspectorTab::People;
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("access-request-pending").visible());
+    })
+    .unwrap();
+    handle
+        .update(cx, |view, _window, cx| {
+            let request = view.collaboration.access.own.clone().unwrap();
+            view.finish_access_decision(
+                "deny request",
+                view.active_session.id,
+                ResponseEnvelope::success(
+                    loom_core::RequestId::new(),
+                    ServerResponse::Access(
+                        loom_protocol::AccessResponse::SessionAccessRequestResolved {
+                            request,
+                            decision: loom_protocol::AccessRequestDecision::Denied {
+                                reason: Some("not now".to_owned()),
+                            },
+                            grant: None,
+                        },
+                    ),
+                ),
+                cx,
+            );
+            assert!(view.collaboration.access.own.is_none());
+        })
+        .unwrap();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("access-request-outcome").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn owner_sees_pending_requests_until_resolved(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        let owner = person("Björn");
+        let nadia = person("Nadia");
+        view.collaboration.identity = Some(owner.clone());
+        view.collaboration.support = crate::collaboration::CollaborationSupport::Supported;
+        view.collaboration.replace_roster(
+            view.active_session.id,
+            vec![roster(&owner, SessionRole::Owner)],
+        );
+        let request = access_request(&view, &nadia, SessionRole::Owner);
+        view.consume_event(&ServerEvent::SessionAccessRequested {
+            request: request.clone(),
+        });
+        view.consume_event(&ServerEvent::SessionAccessRequested {
+            request: request.clone(),
+        });
+        assert_eq!(view.collaboration.access.pending.len(), 1);
+        // A failed decision is reported through the status banner.
+        view.finish_access_decision(
+            "approve request",
+            view.active_session.id,
+            ResponseEnvelope::failure(
+                loom_core::RequestId::new(),
+                loom_core::LoomError::invalid_state("already decided"),
+            ),
+            cx,
+        );
+        assert!(view.status_banner.is_some());
+        view.review.open = true;
+        view.review.tab = InspectorTab::People;
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("access-deny-reason").visible());
+    })
+    .unwrap();
+    handle
+        .update(cx, |view, _window, _cx| {
+            let request = view.collaboration.access.pending[0].clone();
+            view.consume_event(&ServerEvent::SessionAccessRequestResolved {
+                request,
+                decision: loom_protocol::AccessRequestDecision::Approved {
+                    role: SessionRole::Participant,
+                },
+            });
+            assert!(view.collaboration.access.pending.is_empty());
+            assert!(view.collaboration.access.outcome.is_none());
+        })
+        .unwrap();
+}
