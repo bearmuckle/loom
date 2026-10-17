@@ -110,9 +110,9 @@ const FULL_SIDEBAR_WIDTH: Pixels = px(260.);
 const COMPACT_REVIEW_WIDTH: Pixels = px(400.);
 const FULL_REVIEW_WIDTH: Pixels = px(540.);
 const TIMELINE_CONTENT_MAX_WIDTH: Pixels = px(680.);
-const DEFAULT_FONT_SCALE_PERCENT: u16 = 100;
-const MIN_FONT_SCALE_PERCENT: u16 = 75;
-const MAX_FONT_SCALE_PERCENT: u16 = 150;
+pub(crate) const DEFAULT_FONT_SCALE_PERCENT: u16 = 100;
+pub(crate) const MIN_FONT_SCALE_PERCENT: u16 = 75;
+pub(crate) const MAX_FONT_SCALE_PERCENT: u16 = 150;
 const FONT_SCALE_STEP_PERCENT: i16 = 5;
 /// Consecutive tool calls of the same kind collapse into one summary row once
 /// they reach this count.

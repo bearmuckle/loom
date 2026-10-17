@@ -282,6 +282,7 @@ impl LoomView {
         window.set_rem_size(px(
             BASE_FONT_SIZE * font_scale_percent as f32 / DEFAULT_FONT_SCALE_PERCENT as f32
         ));
+        self.persist_ui_preferences();
         cx.notify();
     }
 

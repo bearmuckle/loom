@@ -1090,6 +1090,7 @@ impl LoomView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let changed = self.theme_choice != theme;
         self.theme_choice = theme;
         let appearance = match theme {
             ThemeChoice::System => {
@@ -1106,6 +1107,9 @@ impl LoomView {
             }
         };
         self.apply_appearance(appearance, window, cx);
+        if changed {
+            self.persist_ui_preferences();
+        }
     }
 
     /// Toggles whether provider reasoning is shown in the transcript. The
@@ -1120,17 +1124,22 @@ impl LoomView {
     /// presentation-only, so it never affects the provider request; `Medium`
     /// keeps the transcript that existed before the setting.
     pub(crate) fn set_output_detail(&mut self, detail: OutputDetail, cx: &mut Context<Self>) {
+        let changed = self.output_detail != detail;
         self.output_detail = detail;
-        self.persist_ui_preferences();
+        if changed {
+            self.persist_ui_preferences();
+        }
         cx.notify();
     }
 
     /// Writes the client-local presentation settings after a change. The
     /// backend never sees them, and a failed write must not interrupt the UI.
-    fn persist_ui_preferences(&self) {
+    pub(crate) fn persist_ui_preferences(&self) {
         UiPreferences {
             show_reasoning: self.show_reasoning,
             output_detail: self.output_detail,
+            theme_choice: self.theme_choice,
+            font_scale_percent: self.font_scale_percent,
         }
         .save();
     }

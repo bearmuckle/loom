@@ -16,7 +16,8 @@ impl Render for LoomView {
             self.observe_system_appearance(window, cx);
             self.observe_browser_visibility(window, cx);
             self.composer_focus_handle.focus(window, cx);
-            self.select_theme(ThemeChoice::System, window, cx);
+            let theme = self.theme_choice;
+            self.select_theme(theme, window, cx);
         }
         if self.shortcut_interceptor.is_none() {
             // Keystrokes are dispatched along the focus path, so a view-level

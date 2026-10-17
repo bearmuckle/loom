@@ -97,8 +97,10 @@ pub(crate) struct FilesState {
     pub(crate) file_error: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum ThemeChoice {
+    #[default]
     System,
     Light,
     Dark,

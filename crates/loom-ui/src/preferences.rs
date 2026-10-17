@@ -8,17 +8,42 @@
 use loom_core::{ErrorCode, LoomError};
 use serde::{Deserialize, Serialize};
 
-use crate::state::OutputDetail;
+use crate::{
+    state::{OutputDetail, ThemeChoice},
+    view::{DEFAULT_FONT_SCALE_PERCENT, MAX_FONT_SCALE_PERCENT, MIN_FONT_SCALE_PERCENT},
+};
 
 /// The presentation settings that survive a client restart.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub(crate) struct UiPreferences {
     pub(crate) show_reasoning: bool,
     pub(crate) output_detail: OutputDetail,
+    pub(crate) theme_choice: ThemeChoice,
+    pub(crate) font_scale_percent: u16,
+}
+
+impl Default for UiPreferences {
+    fn default() -> Self {
+        Self {
+            show_reasoning: false,
+            output_detail: OutputDetail::default(),
+            theme_choice: ThemeChoice::default(),
+            font_scale_percent: DEFAULT_FONT_SCALE_PERCENT,
+        }
+    }
 }
 
 impl UiPreferences {
+    /// Keeps a hand-edited or older file inside the range the Appearance
+    /// controls can represent.
+    fn normalized(mut self) -> Self {
+        self.font_scale_percent = self
+            .font_scale_percent
+            .clamp(MIN_FONT_SCALE_PERCENT, MAX_FONT_SCALE_PERCENT);
+        self
+    }
+
     #[cfg(all(not(target_family = "wasm"), not(test)))]
     pub(crate) fn load() -> Self {
         let path = native_path();
@@ -100,7 +125,7 @@ impl UiPreferences {
                 false,
             )
         })?;
-        serde_json::from_slice(&bytes).map_err(|error| {
+        let preferences: Self = serde_json::from_slice(&bytes).map_err(|error| {
             LoomError::new(
                 ErrorCode::MalformedPayload,
                 format!(
@@ -109,10 +134,12 @@ impl UiPreferences {
                 ),
                 false,
             )
-        })
+        })?;
+        Ok(preferences.normalized())
     }
 
     fn save_to(path: &Path, preferences: Self) -> loom_core::Result<()> {
+        let preferences = preferences.normalized();
         let parent = path.parent().ok_or_else(|| {
             LoomError::invalid_request("UI preferences path must have a parent directory")
         })?;
@@ -179,17 +206,18 @@ mod wasm {
         else {
             return Ok(UiPreferences::default());
         };
-        serde_json::from_str(&serialized).map_err(|error| {
+        let preferences: UiPreferences = serde_json::from_str(&serialized).map_err(|error| {
             LoomError::new(
                 ErrorCode::MalformedPayload,
                 format!("saved UI preferences are malformed: {error}"),
                 false,
             )
-        })
+        })?;
+        Ok(preferences.normalized())
     }
 
     pub(super) fn save(preferences: UiPreferences) -> loom_core::Result<()> {
-        let serialized = serde_json::to_string(&preferences).map_err(|error| {
+        let serialized = serde_json::to_string(&preferences.normalized()).map_err(|error| {
             LoomError::new(
                 ErrorCode::Internal,
                 format!("could not encode UI preferences: {error}"),
@@ -243,12 +271,15 @@ mod tests {
         let preferences = UiPreferences {
             show_reasoning: true,
             output_detail: OutputDetail::High,
+            theme_choice: ThemeChoice::Dark,
+            font_scale_percent: 120,
         };
 
         UiPreferences::save_to(&path, preferences).unwrap();
 
         let serialized = fs::read_to_string(&path).unwrap();
         assert!(serialized.contains("\"output_detail\": \"high\""));
+        assert!(serialized.contains("\"theme_choice\": \"dark\""));
         assert_eq!(UiPreferences::load_from(&path).unwrap(), preferences);
         assert!(!path.with_extension("json.tmp").exists());
         remove_parent(&path);
@@ -269,6 +300,32 @@ mod tests {
             UiPreferences {
                 show_reasoning: true,
                 output_detail: OutputDetail::Low,
+                ..UiPreferences::default()
+            }
+        );
+        remove_parent(&path);
+    }
+
+    #[test]
+    fn font_scale_is_clamped_to_the_appearance_range() {
+        let path = temporary_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        fs::write(&path, r#"{"font_scale_percent":999}"#).unwrap();
+        assert_eq!(
+            UiPreferences::load_from(&path).unwrap(),
+            UiPreferences {
+                font_scale_percent: MAX_FONT_SCALE_PERCENT,
+                ..UiPreferences::default()
+            }
+        );
+
+        fs::write(&path, r#"{"font_scale_percent":1}"#).unwrap();
+        assert_eq!(
+            UiPreferences::load_from(&path).unwrap(),
+            UiPreferences {
+                font_scale_percent: MIN_FONT_SCALE_PERCENT,
+                ..UiPreferences::default()
             }
         );
         remove_parent(&path);

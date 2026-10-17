@@ -159,7 +159,8 @@ fn main() {
                 view.update(cx, |view, cx| {
                     view.reconnect_configured_worker_nodes(cx);
                     view.observe_system_appearance(window, cx);
-                    view.select_theme(crate::state::ThemeChoice::System, window, cx);
+                    let theme = view.theme_choice;
+                    view.select_theme(theme, window, cx);
                     view.composer_focus_handle.focus(window, cx);
                 });
                 cx.activate(true);
@@ -224,7 +225,8 @@ fn start_browser_client(cx: &mut App) {
                 // visibility observer for it.
                 view.observe_browser_visibility(window, cx);
                 view.composer_focus_handle.focus(window, cx);
-                view.select_theme(crate::state::ThemeChoice::System, window, cx);
+                let theme = view.theme_choice;
+                view.select_theme(theme, window, cx);
                 if auto_connect {
                     view.connect_worker_node(cx);
                 }
