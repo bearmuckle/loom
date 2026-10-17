@@ -1356,6 +1356,19 @@ mod tests {
     }
 
     #[test]
+    fn every_supported_openai_model_declares_a_context_window() {
+        // Adding a model to the accepted OpenAI catalog without a declared window
+        // would silently budget it with the unknown-model fallback.
+        for model in OPENAI_SUPPORTED_MODELS {
+            assert!(openai_model_supported(model), "{model}");
+            assert!(
+                declared_context_window(model).is_some(),
+                "{model} is accepted by the OpenAI catalog but declares no context window"
+            );
+        }
+    }
+
+    #[test]
     fn configured_deepseek_provider_serves_a_model_request_with_its_api_key() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();

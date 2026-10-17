@@ -340,24 +340,29 @@ pub struct CopilotAccessToken {
 // Copilot exposes per-model limits under capabilities.limits. Some compatible
 // catalogs expose context_length directly. A prompt cap is also a safe upper
 // bound on our usable window, since the runtime separately reserves output.
+//
+// This list is also the catalog whose families must declare a context window in
+// `loom_model::declared_context_window`; a test enforces the pairing, because a
+// model without a window silently budgets with the unknown-model fallback.
+pub const OPENAI_SUPPORTED_MODELS: &[&str] = &[
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5-nano",
+    "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
+    "o3",
+    "o3-mini",
+    "o4-mini",
+];
+
 pub fn openai_model_supported(model: &str) -> bool {
-    matches!(
-        model,
-        "gpt-4.1"
-            | "gpt-4.1-mini"
-            | "gpt-4.1-nano"
-            | "gpt-4o"
-            | "gpt-4o-mini"
-            | "gpt-5"
-            | "gpt-5-mini"
-            | "gpt-5-nano"
-            | "gpt-6-astra"
-            | "gpt-6-sol"
-            | "gpt-6-luna"
-            | "o3"
-            | "o3-mini"
-            | "o4-mini"
-    )
+    OPENAI_SUPPORTED_MODELS.contains(&model)
 }
 
 pub fn discovered_context_window(model: &serde_json::Value) -> Option<u32> {

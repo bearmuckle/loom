@@ -216,20 +216,35 @@ impl ProviderConfig {
 /// hosted OpenAI run budgets with the unknown-model fallback instead of the
 /// real window, which forces compaction on every large tool result.
 ///
-/// Names match exactly or with a versioned suffix (`gpt-4.1-2025-04-14`). A
-/// discovered window or a client-supplied `context_options.context_window`
-/// takes precedence over this table. The `gpt-6` value is a conservative floor
-/// consistent with the Copilot descriptor for the same families.
+/// Names match exactly or with a versioned suffix (`gpt-4.1-2025-04-14`). An
+/// exact name wins over a family prefix, and a versioned suffix inherits the
+/// longest matching name, so `gpt-4.1-mini-2025-04-14` resolves to the mini
+/// window rather than the family window. A discovered window or a
+/// client-supplied `context_options.context_window` takes precedence over this
+/// table. The `gpt-6` value is a conservative floor consistent with the Copilot
+/// descriptor for the same families.
 pub fn declared_context_window(model: &str) -> Option<u32> {
+    declared_context_window_entry(model).map(|(_, window)| window)
+}
+
+/// The declared entry `model` resolves to, so the exact-name and longest-prefix
+/// rules can be asserted directly instead of through coincident window values.
+fn declared_context_window_entry(model: &str) -> Option<(&'static str, u32)> {
+    if let Some(entry) = DECLARED_CONTEXT_WINDOWS
+        .iter()
+        .find(|(name, _)| model == *name)
+    {
+        return Some(*entry);
+    }
     DECLARED_CONTEXT_WINDOWS
         .iter()
-        .find_map(|(family, window)| {
-            let matches = model == *family
-                || model
-                    .strip_prefix(family)
-                    .is_some_and(|suffix| suffix.starts_with('-'));
-            matches.then_some(*window)
+        .filter(|(name, _)| {
+            model
+                .strip_prefix(*name)
+                .is_some_and(|suffix| suffix.starts_with('-'))
         })
+        .max_by_key(|(name, _)| name.len())
+        .copied()
 }
 
 const DECLARED_CONTEXT_WINDOWS: &[(&str, u32)] = &[
@@ -380,5 +395,46 @@ pub fn deterministic_descriptor() -> ModelDescriptor {
             vision: false,
             json_mode: true,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DECLARED_CONTEXT_WINDOWS, declared_context_window_entry};
+
+    #[test]
+    fn a_variant_entry_is_not_shadowed_by_its_family_prefix() {
+        // Every current variant shares its family window, so the resolution rule
+        // is asserted against the matched name rather than the window value.
+        assert_eq!(
+            declared_context_window_entry("gpt-4.1-mini").map(|(name, _)| name),
+            Some("gpt-4.1-mini")
+        );
+        assert_eq!(
+            declared_context_window_entry("gpt-4.1-mini-2025-04-14").map(|(name, _)| name),
+            Some("gpt-4.1-mini")
+        );
+        assert_eq!(
+            declared_context_window_entry("gpt-4.1-2025-04-14").map(|(name, _)| name),
+            Some("gpt-4.1")
+        );
+        assert_eq!(
+            declared_context_window_entry("o3-mini-2025-01-31").map(|(name, _)| name),
+            Some("o3-mini")
+        );
+        assert!(declared_context_window_entry("gpt-7-preview").is_none());
+    }
+
+    #[test]
+    fn declared_names_are_unique() {
+        // A duplicate name would make the table's order decide the window.
+        let mut names = DECLARED_CONTEXT_WINDOWS
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total);
     }
 }
