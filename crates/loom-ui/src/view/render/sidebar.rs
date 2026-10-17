@@ -16,11 +16,13 @@ const WORKER_SECTION_ID_PREFIX: &str = "worker-section:";
 /// The height of one project row.
 ///
 /// Every row shares it because the list measures a single row and lays the rest
-/// out at the same size.
+/// out at the same size. The rows carry their own vertical breathing room:
+/// consecutive projects otherwise read as one block of text, and the section
+/// heading already supplies the separation between workers.
 fn project_row_height(layout: ResponsiveLayout) -> Pixels {
-    // Two text lines plus the padding the layout gives a navigation row, so a
-    // phone row stays a finger-sized target.
-    layout.nav_row_padding() + px(28.)
+    // Two text lines, then the row padding above and below them. A phone row
+    // stays well past the finger-sized target.
+    layout.nav_row_padding() + layout.nav_row_padding() + px(31.)
 }
 
 /// The presentation of one worker section heading: the connection dot, name,
