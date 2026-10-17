@@ -468,17 +468,21 @@ impl ProjectAgentTools {
 
     /// Inspects one code child's checkout for the manager listing.
     ///
-    /// Only a terminal task's checkout is inspected: a live child's checkout is
-    /// still moving, so a count taken now would change on its next turn and say
-    /// nothing the manager can act on. A checkout that is already removed or
-    /// being removed holds nothing to report. An inspection failure is returned
-    /// so the caller can report it rather than claim the checkout is clean.
+    /// A child whose run is still progressing keeps writing its checkout, so a
+    /// count taken now would change on its next turn and say nothing the manager
+    /// can act on; `checkout_is_settled` is false for that child and for one that
+    /// has not started a run. Every stopped child — paused, waiting for input or
+    /// approval, or finished — is settled, and its uncommitted work is reported,
+    /// so a blocked child's work is visible without opening its path. A checkout
+    /// that is already removed or being removed holds nothing to report. An
+    /// inspection failure is returned so the caller can report it rather than
+    /// claim the checkout is clean.
     fn inspect_project_child_checkout(
         &self,
         worktree: &ProjectWorktreeRecord,
-        task_terminal: bool,
+        checkout_is_settled: bool,
     ) -> Result<Option<ProjectChildCheckoutState>> {
-        if !task_terminal
+        if !checkout_is_settled
             || matches!(
                 worktree.status,
                 ProjectWorktreeStatus::Removed | ProjectWorktreeStatus::CleanupPending
@@ -1016,13 +1020,28 @@ impl ProjectAgentTools {
             // A finished code child's checkout is where its work still exists
             // when its run failed mid-flight, so the listing states that the work
             // is there instead of making the manager open a worktree path. A
-            // checkout that cannot be inspected is reported as such rather than
-            // claiming that the child left nothing behind.
+            // child whose run stopped before it finished — paused, or blocked
+            // waiting for input or approval — is in the same position: its
+            // checkout is no longer moving, and what it wrote is the only place
+            // that work exists, so it is reported too. A run that is still
+            // progressing is skipped because its checkout is in motion, and so is
+            // a child that has not started a run at all. A checkout that cannot
+            // be inspected is reported as such rather than claiming that the
+            // child left nothing behind.
             let (checkout_state, worktree_note) = match worktree.as_ref() {
                 Some(worktree) => {
                     let task_terminal =
                         task.is_some_and(|task| delegated_task_is_terminal(task.status));
-                    match self.inspect_project_child_checkout(worktree, task_terminal) {
+                    let checkout_is_settled = task_terminal
+                        || run.as_ref().is_some_and(|summary| {
+                            !matches!(
+                                summary.snapshot.state,
+                                AgentRunState::Planning
+                                    | AgentRunState::Executing
+                                    | AgentRunState::Evaluating
+                            )
+                        });
+                    match self.inspect_project_child_checkout(worktree, checkout_is_settled) {
                         Ok(state) => (state, None),
                         Err(error) => (
                             None,
@@ -1119,7 +1138,7 @@ impl ProjectAgentTools {
             output: serde_json::to_string(&serde_json::json!({
                 "children": children,
                 "truncated": truncated,
-                "note": "result_state reports whether each child's stored result reached this session: delivered, undelivered (accepted for delivery but not yet in your transcript), missing (a finished child never reported a result), or pending. undelivered_messages counts the durable inbox messages the child has not read yet, so a message you sent that still waits is distinguishable from one the child consumed. For a finished code child, worktree_uncommitted_path_count and worktree_uncommitted_line_delta report what its checkout still holds uncommitted, worktree_head_is_base says whether that checkout has no commit of its own yet, and result_revision_is_base says whether no reviewed result revision other than its base has been recorded. Work that is never reviewed and integrated, or abandoned, is not landed. Pass a child's task_id to return its whole stored result."
+                "note": "result_state reports whether each child's stored result reached this session: delivered, undelivered (accepted for delivery but not yet in your transcript), missing (a finished child never reported a result), or pending. undelivered_messages counts the durable inbox messages the child has not read yet, so a message you sent that still waits is distinguishable from one the child consumed. For a code child whose run is not progressing — finished, paused, or blocked waiting for input or approval — worktree_uncommitted_path_count and worktree_uncommitted_line_delta report what its checkout still holds uncommitted, worktree_head_is_base says whether that checkout has no commit of its own yet, and result_revision_is_base says whether no reviewed result revision other than its base has been recorded. A child whose run is still running reports none of them, because its checkout is in motion. Work that is never reviewed and integrated, or abandoned, is not landed. Pass a child's task_id to return its whole stored result."
             }))
             .unwrap_or_else(|error| format!("could not encode project child status: {error}")),
         }

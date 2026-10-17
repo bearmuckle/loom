@@ -1547,6 +1547,14 @@ impl FilePersistence {
 
     /// Appends an immutable byte fragment to an assistant message. Repeating an
     /// identical fragment is safe; gaps, overlaps, and conflicting retries fail.
+    ///
+    /// A streamed assistant turn reaches storage before the run assigns its
+    /// finished message a timeline ordinal, so the row this creates claims one
+    /// above every item the run already persisted, messages and activities
+    /// alike. Without the reservation the row would default to ordinal zero and
+    /// collide with the transcript's first message, which made a run restored
+    /// from that state hold two timeline items on one ordinal. The run's own
+    /// checkpoint replaces the reserved value with the ordained one.
     pub fn append_run_message_fragment(
         &self,
         run_id: RunId,
@@ -1602,9 +1610,17 @@ impl FilePersistence {
         transaction
             .execute(
                 "INSERT INTO run_messages(
-                    run_id, session_id, ordinal, role, content_hash, name, tool_call_id,
-                    tool_calls, fragments
-                 ) VALUES (?1, ?2, ?3, 'assistant', NULL, NULL, NULL, '[]', '[]')
+                    run_id, session_id, ordinal, timeline_ordinal, role, content_hash, name,
+                    tool_call_id, tool_calls, fragments
+                 ) VALUES (
+                    ?1, ?2, ?3,
+                    (SELECT COALESCE(MAX(timeline_ordinal), -1) + 1 FROM (
+                        SELECT timeline_ordinal FROM run_messages WHERE run_id = ?1
+                        UNION ALL
+                        SELECT timeline_ordinal FROM run_activities WHERE run_id = ?1
+                    )),
+                    'assistant', NULL, NULL, NULL, '[]', '[]'
+                 )
                  ON CONFLICT(run_id, ordinal) DO NOTHING",
                 params![
                     run_id_bytes.as_slice(),

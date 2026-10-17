@@ -478,6 +478,139 @@ fn streamed_messages_are_append_only_and_paged_by_keyset() {
 }
 
 #[test]
+fn a_streamed_message_reserves_an_ordinal_above_every_persisted_item() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+    let persistence = FilePersistence::open(&path).unwrap();
+    let mut manager = SessionManager::default();
+    let (session, _) = manager
+        .create_in_workspace(WorkspaceId::new(), "Streamed ordinal")
+        .unwrap();
+    let run_id = RunId::new();
+    let summary = DurableRunSummary {
+        snapshot: AgentRunSnapshot {
+            id: run_id,
+            attempt_id: loom_core::RunAttemptId::new(),
+            control_revision: 0,
+            session_id: session.id,
+            task: "stream an ordinal".to_owned(),
+            model: ModelId::new("deterministic-model"),
+            state: AgentRunState::Executing,
+            started_at: Timestamp::from_unix_millis(1000),
+            updated_at: Timestamp::from_unix_millis(1000),
+            completed_at: None,
+            summary: None,
+            evidence: Vec::new(),
+            approval_policy: None,
+        },
+        usage: UsageSnapshot::default(),
+        attempts: None,
+        execution_state: None,
+        interactions: None,
+    };
+    let run_summaries = BTreeMap::from([(run_id, summary)]);
+    let run_messages = BTreeMap::from([(
+        run_id,
+        (0..3)
+            .map(|ordinal| DurableRunMessage {
+                timeline_ordinal: ordinal,
+                role: if ordinal == 0 {
+                    loom_model::MessageRole::User
+                } else {
+                    loom_model::MessageRole::Assistant
+                },
+                content: format!("message {ordinal}"),
+                name: None,
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            })
+            .collect::<Vec<_>>(),
+    )]);
+    let activity = AgentActivityRecord {
+        id: ActivityId::new(),
+        run_id,
+        timeline_ordinal: 3,
+        parent_id: None,
+        step_id: Some(StepId::new()),
+        kind: AgentActivityKind::ToolCall,
+        status: AgentActivityStatus::Completed,
+        started_at: Timestamp::from_unix_millis(1500),
+        completed_at: None,
+        elapsed_ms: None,
+        data: AgentActivityData::ToolCall {
+            call: loom_model::ToolCall {
+                id: loom_core::ToolCallId::new(),
+                name: "search_text".to_owned(),
+                arguments: serde_json::json!({"query": "ordinal"}),
+            },
+            result: None,
+        },
+    };
+    let run_activities = BTreeMap::from([(run_id, vec![activity])]);
+    persistence
+        .save_state(DurableStateWrite {
+            sessions: &manager.export_state(),
+            workspaces: None,
+            settings: None,
+            workspace_configs: None,
+            providers: None,
+            usage: None,
+            idempotency: None,
+            run_summaries: Some(&run_summaries),
+            run_runtime_configs: None,
+            run_context_checkpoints: None,
+            run_plans: None,
+            run_messages: Some(&run_messages),
+            run_activities: Some(&run_activities),
+            filesystem_records: None,
+            feed: None,
+        })
+        .unwrap();
+
+    // A streamed assistant turn reaches storage before the run assigns the
+    // finished message its timeline ordinal. The row it creates must claim one of
+    // its own instead of defaulting to zero, which is the ordinal of the
+    // transcript's first message.
+    persistence
+        .append_run_message_fragment(run_id, session.id, 3, 0, 0, b"partial reply")
+        .unwrap();
+
+    let messages = persistence.load_run_messages(run_id).unwrap();
+    assert_eq!(messages.len(), 4);
+    assert_eq!(
+        messages[3].timeline_ordinal, 4,
+        "the streamed row reserves an ordinal above the persisted messages and the activity"
+    );
+    let mut ordinals = messages
+        .iter()
+        .map(|message| message.timeline_ordinal)
+        .chain(
+            persistence
+                .load_run_activities(run_id)
+                .unwrap()
+                .iter()
+                .map(|activity| activity.timeline_ordinal),
+        )
+        .collect::<Vec<_>>();
+    ordinals.sort_unstable();
+    assert!(
+        ordinals.windows(2).all(|pair| pair[0] < pair[1]),
+        "every timeline item keeps its own ordinal: {ordinals:?}"
+    );
+    assert_eq!(
+        persistence
+            .load_run_messages(run_id)
+            .unwrap()
+            .iter()
+            .filter(|message| message.timeline_ordinal == 0)
+            .count(),
+        1,
+        "only the first message may claim ordinal zero"
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn streamed_transcript_reuses_decoded_content_across_messages() {
     let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
     let persistence = FilePersistence::open(&path).unwrap();

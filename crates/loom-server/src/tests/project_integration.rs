@@ -2045,7 +2045,7 @@ fn abandoning_a_clean_or_unreadable_checkout_reports_that_nothing_will_be_landed
 }
 
 #[test]
-fn listing_a_code_child_reports_its_checkout_state_only_for_a_finished_task() {
+fn listing_a_code_child_reports_its_checkout_state_unless_its_run_is_progressing() {
     let fixture = project_code_child_fixture();
     let tools = code_child_manager_tools(&fixture);
     let listed_child = |tools: &ToolExecutor| {
@@ -2075,6 +2075,29 @@ fn listing_a_code_child_reports_its_checkout_state_only_for_a_finished_task() {
         serde_json::Value::Null
     );
     assert_eq!(live["result_revision_is_base"], serde_json::json!(true));
+
+    // A child whose run stopped before it finished — here paused — is no longer
+    // writing its checkout, so the work it left there is reported even though the
+    // task is not terminal.
+    let child_run_id = loom_core::RunId::new();
+    fixture.persist_child_run_state(child_run_id, AgentRunState::Paused);
+    let paused = listed_child(&tools);
+    assert_eq!(paused["run_state"], serde_json::json!("paused"));
+    assert_eq!(
+        paused["worktree_uncommitted_path_count"],
+        serde_json::json!(1)
+    );
+    assert_eq!(paused["worktree_head_is_base"], serde_json::json!(true));
+
+    // A run that is still progressing keeps its checkout out of the listing,
+    // because a count taken now would change on its next turn.
+    fixture.persist_child_run_state(child_run_id, AgentRunState::Executing);
+    let running = listed_child(&tools);
+    assert_eq!(running["run_state"], serde_json::json!("executing"));
+    assert_eq!(
+        running["worktree_uncommitted_path_count"],
+        serde_json::Value::Null
+    );
 
     // Once the task is terminal, the same listing reports the uncommitted path
     // count, so the manager learns the work exists without opening the path.

@@ -155,6 +155,9 @@ impl<T: SessionRepository + ?Sized> SessionRepository for Arc<T> {
 }
 
 pub trait RunRepository: Send + Sync {
+    /// Creates the streamed assistant row when needed and appends one fragment,
+    /// reserving a timeline ordinal above every item the run already persisted
+    /// so the row never claims the ordinal of another item.
     fn append_run_message_fragment(
         &self,
         run_id: RunId,

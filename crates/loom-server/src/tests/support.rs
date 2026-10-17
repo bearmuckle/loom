@@ -173,6 +173,55 @@ impl ProjectCodeChildFixture {
         fs::remove_dir_all(&self.temp).unwrap();
         fs::remove_dir_all(&self.source).unwrap();
     }
+
+    /// Persists a run of this child's session in `state`, so a test can list a
+    /// child that has started and then stopped at that state without driving a
+    /// model through it.
+    pub(super) fn persist_child_run_state(&self, run_id: loom_core::RunId, state: AgentRunState) {
+        let persistence = self.backend.persistence.as_ref().unwrap();
+        let sessions = persistence.load_sessions().unwrap().unwrap();
+        let summary = DurableRunSummary {
+            snapshot: AgentRunSnapshot {
+                id: run_id,
+                attempt_id: loom_core::RunAttemptId::new(),
+                control_revision: 0,
+                session_id: self.worktree.child_session_id,
+                task: "Make a committed code change".to_owned(),
+                model: ModelId::new("deterministic/demo"),
+                state,
+                started_at: Timestamp::from_unix_millis(1000),
+                updated_at: Timestamp::from_unix_millis(1000),
+                completed_at: None,
+                summary: None,
+                evidence: Vec::new(),
+                approval_policy: None,
+            },
+            usage: UsageSnapshot::default(),
+            attempts: None,
+            execution_state: None,
+            interactions: None,
+        };
+        let summaries = BTreeMap::from([(run_id, summary)]);
+        persistence
+            .save_state(DurableStateWrite {
+                sessions: &sessions,
+                workspaces: None,
+                settings: None,
+                workspace_configs: None,
+                providers: None,
+                usage: None,
+                idempotency: None,
+                run_summaries: Some(&summaries),
+                run_runtime_configs: None,
+                run_context_checkpoints: None,
+                run_plans: None,
+                run_messages: None,
+                run_activities: None,
+                filesystem_records: None,
+                feed: None,
+            })
+            .unwrap();
+    }
 }
 
 pub(super) fn git_in(dir: &Path, arguments: &[&str]) {

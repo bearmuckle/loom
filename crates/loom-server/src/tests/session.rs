@@ -278,9 +278,99 @@ fn archiving_a_session_with_a_deferred_run_stops_it() {
 }
 
 #[test]
-fn archiving_a_session_repairs_a_streamed_messages_stale_ordinal() {
+fn archiving_a_session_repairs_a_colliding_timeline_ordinal() {
+    let (persistence, session_id, run_id) = persisted_run_with_a_colliding_ordinal("archive");
+    let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+    assert!(
+        backend.runs().unwrap().is_empty(),
+        "a non-terminal run is deferred on restore, so no handle is registered"
+    );
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+    let archived = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::ArchiveAgentSession { session_id },
+    )));
+    assert!(
+        matches!(
+            &archived.result,
+            Ok(ServerResponse::Session(
+                SessionResponse::AgentSessionArchived(_)
+            ))
+        ),
+        "a transcript with a colliding timeline ordinal must still archive, not be stranded: {:?}",
+        archived.result
+    );
+    assert_eq!(
+        backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_run_summary(run_id)
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .state,
+        AgentRunState::Cancelled,
+        "the deferred run must be stopped before the session is archived"
+    );
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    let _ = fs::remove_file(&persistence);
+}
+
+#[test]
+fn resuming_a_run_repairs_a_colliding_timeline_ordinal() {
+    let (persistence, _session_id, run_id) = persisted_run_with_a_colliding_ordinal("resume");
+    let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+
+    // A paused run is restored from its durable state when it is resumed, so a
+    // transcript holding two items on one ordinal must be repaired instead of
+    // making the run impossible to resume.
+    let resumed = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::ResumeAgentRun { run_id },
+    )));
+    match resumed.result {
+        Ok(ServerResponse::Run(RunResponse::AgentRun(snapshot))) => {
+            assert_eq!(snapshot.id, run_id);
+        }
+        other => panic!("a colliding timeline ordinal must not block a resume: {other:?}"),
+    }
+
+    // The repair is durable, so the next restore of this run sees the ordinals
+    // the resume assigned rather than the collision again.
+    let mut ordinals = backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .load_run_messages(run_id)
+        .unwrap()
+        .iter()
+        .map(|message| message.timeline_ordinal)
+        .collect::<Vec<_>>();
+    ordinals.sort_unstable();
+    assert!(
+        ordinals.windows(2).all(|pair| pair[0] < pair[1]),
+        "the repaired ordinals must be persisted: {ordinals:?}"
+    );
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    let _ = fs::remove_file(&persistence);
+}
+
+/// Starts a persisted session whose run settles non-terminal, then rewrites its
+/// transcript so two messages claim one timeline ordinal, which is the state a
+/// run persisted before the ordinal reservation could hold.
+///
+/// Returns the database path with the session and run to drive.
+fn persisted_run_with_a_colliding_ordinal(
+    label: &str,
+) -> (PathBuf, AgentSessionId, loom_core::RunId) {
     let persistence = std::env::temp_dir().join(format!(
-        "loom-stale-ordinal-archive-{}.db",
+        "loom-colliding-ordinal-{label}-{}.db",
         uuid::Uuid::new_v4()
     ));
     let (session_id, run_id) = {
@@ -290,7 +380,7 @@ fn archiving_a_session_repairs_a_streamed_messages_stale_ordinal() {
         let workspace = match connection
             .request(RequestEnvelope::new(ClientRequest::Workspace(
                 WorkspaceRequest::CreateWorkspace {
-                    name: "Stale ordinal archive".to_owned(),
+                    name: format!("Colliding ordinal {label}"),
                 },
             )))
             .result
@@ -303,7 +393,7 @@ fn archiving_a_session_repairs_a_streamed_messages_stale_ordinal() {
             .request(RequestEnvelope::new(ClientRequest::Workspace(
                 WorkspaceRequest::CreateAgentSessionInWorkspace {
                     workspace_id: workspace.id,
-                    name: "stale ordinal".to_owned(),
+                    name: "colliding ordinal".to_owned(),
                 },
             )))
             .result
@@ -345,53 +435,52 @@ fn archiving_a_session_repairs_a_streamed_messages_stale_ordinal() {
         backend.shutdown().unwrap();
         (session_id, run_id)
     };
-    let backend = InProcessBackend::new_persistent(&persistence).unwrap();
-    assert!(
-        backend.runs().unwrap().is_empty(),
-        "a non-terminal run is deferred on restore, so no handle is registered"
-    );
-    // Simulate a streamed assistant row flushed to disk before the run assigned
-    // the finished message a timeline ordinal: the column defaults to zero, so
-    // it collides with the transcript's first message.
-    {
-        let persistence = backend.persistence.as_ref().unwrap();
-        let next_ordinal = persistence.load_run_messages(run_id).unwrap().len() as u64;
-        persistence
-            .append_run_message_fragment(run_id, session_id, next_ordinal, 0, 0, b"partial reply")
-            .unwrap();
+
+    let store = FilePersistence::open(&persistence).unwrap();
+    let sessions = store.load_sessions().unwrap().unwrap();
+    let mut summary = store.load_run_summary(run_id).unwrap().unwrap();
+    // A run that was paused when the process stopped is the state a caller
+    // resumes from, so the fixture settles there instead of wherever the
+    // deterministic turn left it. The execution state and attempt row are
+    // written with it, because a restore requires them to agree.
+    summary.snapshot.state = AgentRunState::Paused;
+    let mut execution = store.load_run_execution_state(run_id).unwrap().unwrap();
+    execution.state = AgentRunState::Paused;
+    summary.execution_state = Some(execution);
+    let mut attempts = store.load_run_attempts(run_id).unwrap();
+    if let Some(attempt) = attempts.last_mut() {
+        attempt.state = AgentRunState::Paused;
     }
-    let connection = backend.connect();
-    negotiate_m3(&connection);
-    let archived = connection.request(RequestEnvelope::new(ClientRequest::Session(
-        SessionRequest::ArchiveAgentSession { session_id },
-    )));
+    summary.attempts = Some(attempts);
+    let summaries = BTreeMap::from([(run_id, summary)]);
+    let mut messages = store.load_run_messages(run_id).unwrap();
     assert!(
-        matches!(
-            &archived.result,
-            Ok(ServerResponse::Session(
-                SessionResponse::AgentSessionArchived(_)
-            ))
-        ),
-        "a transcript with a stale streamed ordinal must still archive, not be stranded: {:?}",
-        archived.result
+        messages.len() >= 2,
+        "the settled run must hold a transcript to collide"
     );
-    assert_eq!(
-        backend
-            .persistence
-            .as_ref()
-            .unwrap()
-            .load_run_summary(run_id)
-            .unwrap()
-            .unwrap()
-            .snapshot
-            .state,
-        AgentRunState::Cancelled,
-        "the deferred run must be stopped before the session is archived"
-    );
-    drop(connection);
-    backend.shutdown().unwrap();
-    drop(backend);
-    let _ = fs::remove_file(&persistence);
+    messages[1].timeline_ordinal = messages[0].timeline_ordinal;
+    let run_messages = BTreeMap::from([(run_id, messages)]);
+    store
+        .save_state(DurableStateWrite {
+            sessions: &sessions,
+            workspaces: None,
+            settings: None,
+            workspace_configs: None,
+            providers: None,
+            usage: None,
+            idempotency: None,
+            run_summaries: Some(&summaries),
+            run_runtime_configs: None,
+            run_context_checkpoints: None,
+            run_plans: None,
+            run_messages: Some(&run_messages),
+            run_activities: None,
+            filesystem_records: None,
+            feed: None,
+        })
+        .unwrap();
+    drop(store);
+    (persistence, session_id, run_id)
 }
 
 #[test]
