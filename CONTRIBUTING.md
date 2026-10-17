@@ -39,8 +39,18 @@ workflow:
 cargo test -p loom-ui --features visual-tests --locked --bins visual_render_tests
 ```
 
-CI does not run full coverage or visual render tests. Coverage should be
-focused on changed code when needed; there is no workspace-wide coverage gate.
+The benchmark targets are optional local checks too. They run a real restore and
+checkpoint workload and print measurements instead of asserting thresholds, so
+CI only compiles them (through the Clippy `--all-targets` check) and never runs
+them:
+
+```sh
+cargo bench -p loom-persistence -p loom-server --locked
+```
+
+CI does not run full coverage, visual render tests, or benchmarks. Coverage
+should be focused on changed code when needed; there is no workspace-wide
+coverage gate.
 `./scripts/ci-check.sh` runs routine formatting, Clippy, and build checks. CI
 runs formatting, Clippy, and workspace tests for pull requests and pushes to
 `main`; tests provide the workspace compilation check, so CI does not run a

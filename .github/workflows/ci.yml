@@ -93,12 +93,12 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run tests
         run: cargo test --workspace --locked --lib --bins --tests
-      - name: Run benchmarks
-        if: github.event_name == 'push'
-        # Both bench targets are `harness = false`: they print measurements
-        # rather than assert thresholds, so this only keeps them compiling and
-        # running instead of rotting.
-        run: cargo bench -p loom-persistence -p loom-server --locked
+      # The benchmark targets (`crates/*/benches`, all `harness = false`) are
+      # compiled by the Clippy step above, which is what keeps them from rotting.
+      # They are deliberately not run here: they execute a real restore and
+      # checkpoint workload, and the measured numbers are a local diagnostic
+      # rather than a gate, so running them only made this job slow. Run them
+      # locally with `cargo bench -p loom-persistence -p loom-server --locked`.
       # Printed even when an earlier step failed: a cold cache is one plausible
       # reason for a slow or failed build, and the hit rate is what says whether
       # the shared cache is paying for itself.
