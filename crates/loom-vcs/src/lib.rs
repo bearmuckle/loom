@@ -629,7 +629,9 @@ impl GitService {
     /// `deadline` for, so a stalled remote delays the caller by at most that
     /// deadline and then reports [`ErrorCode::DeadlineExceeded`]. The worker is
     /// detached when the deadline expires; it holds no lock and its eventual
-    /// result is discarded.
+    /// result is discarded. A zero deadline never starts a worker, because its
+    /// result could not be awaited and the fetch would only mutate the
+    /// checkout after the caller had already been told the answer is unknown.
     ///
     /// `token` authenticates HTTPS remotes the same way as
     /// [`Self::push_branch_authenticated`] and is never written to the
@@ -640,6 +642,9 @@ impl GitService {
         token: Option<&str>,
         deadline: Duration,
     ) -> Result<RemoteRefreshReport> {
+        if deadline.is_zero() {
+            return Err(remote_refresh_deadline_error(deadline));
+        }
         let root = self.root.clone();
         let local_revision = local_revision.map(str::to_owned);
         let token = token.map(str::to_owned);
@@ -2360,6 +2365,18 @@ fn git_error(operation: &str, error: git2::Error) -> LoomError {
     LoomError::new(ErrorCode::Vcs, format!("{operation}: {error}"), false)
 }
 
+/// The failure a bounded remote refresh reports once `deadline` has expired.
+fn remote_refresh_deadline_error(deadline: Duration) -> LoomError {
+    LoomError::new(
+        ErrorCode::DeadlineExceeded,
+        format!(
+            "refreshing the 'origin' remote did not finish within {} ms; the drift from its default branch is unknown and no cached remote ref was used instead",
+            deadline.as_millis()
+        ),
+        false,
+    )
+}
+
 /// Waits up to `deadline` for a bounded remote refresh worker to report.
 fn await_remote_refresh(
     receiver: &mpsc::Receiver<Result<RemoteRefreshReport>>,
@@ -2367,14 +2384,7 @@ fn await_remote_refresh(
 ) -> Result<RemoteRefreshReport> {
     match receiver.recv_timeout(deadline) {
         Ok(report) => report,
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(LoomError::new(
-            ErrorCode::DeadlineExceeded,
-            format!(
-                "refreshing the 'origin' remote did not finish within {} ms; the drift from its default branch is unknown and no cached remote ref was used instead",
-                deadline.as_millis()
-            ),
-            false,
-        )),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(remote_refresh_deadline_error(deadline)),
         Err(mpsc::RecvTimeoutError::Disconnected) => Err(LoomError::new(
             ErrorCode::Internal,
             "the bounded remote refresh stopped without reporting a result",
