@@ -190,10 +190,16 @@ impl FilePersistence {
         let connection = self.connection()?;
         let row = connection
             .query_row(
-                "SELECT retention_ms, force_discard_worktrees
+                "SELECT retention_ms, force_discard_worktrees, sub_agent_retention_ms
                  FROM archive_retention_policy WHERE singleton = 1",
                 [],
-                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|error| {
@@ -202,9 +208,21 @@ impl FilePersistence {
                     true,
                 )
             })?;
-        let Some((retention_ms, force_discard_worktrees)) = row else {
+        let Some((retention_ms, force_discard_worktrees, sub_agent_retention_ms)) = row else {
             return Ok(None);
         };
+        let sub_agent_retention_ms = sub_agent_retention_ms
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "persisted sub-agent retention window is negative",
+                        false,
+                    )
+                })
+            })
+            .transpose()?
+            .filter(|value| *value > 0);
         let retention_ms = retention_ms
             .map(|retention_ms| {
                 u64::try_from(retention_ms).map_err(|_| {
@@ -231,6 +249,7 @@ impl FilePersistence {
         Ok(Some(DurableArchiveRetentionPolicy {
             retention_ms,
             force_discard_worktrees,
+            sub_agent_retention_ms,
         }))
     }
 
@@ -1178,20 +1197,37 @@ pub(crate) fn save_session_settings_rows(
                 false,
             )
         })?;
+    let sub_agent_retention_ms = settings
+        .archive_retention
+        .sub_agent_retention_ms
+        .filter(|value| *value > 0)
+        .map(i64::try_from)
+        .transpose()
+        .map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "sub-agent retention window exceeds SQLite's integer range",
+                false,
+            )
+        })?;
     transaction
         .execute(
             "INSERT INTO archive_retention_policy(
-                singleton, retention_ms, force_discard_worktrees
-             ) VALUES (1, ?1, ?2)
+                singleton, retention_ms, force_discard_worktrees, sub_agent_retention_ms
+             ) VALUES (1, ?1, ?2, ?3)
              ON CONFLICT(singleton) DO UPDATE SET
                 retention_ms=excluded.retention_ms,
-                force_discard_worktrees=excluded.force_discard_worktrees
+                force_discard_worktrees=excluded.force_discard_worktrees,
+                sub_agent_retention_ms=excluded.sub_agent_retention_ms
              WHERE archive_retention_policy.retention_ms IS NOT excluded.retention_ms
                 OR archive_retention_policy.force_discard_worktrees
-                    IS NOT excluded.force_discard_worktrees",
+                    IS NOT excluded.force_discard_worktrees
+                OR archive_retention_policy.sub_agent_retention_ms
+                    IS NOT excluded.sub_agent_retention_ms",
             params![
                 retention_ms,
-                settings.archive_retention.force_discard_worktrees
+                settings.archive_retention.force_discard_worktrees,
+                sub_agent_retention_ms
             ],
         )
         .map_err(|error| {

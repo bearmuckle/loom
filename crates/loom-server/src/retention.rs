@@ -14,9 +14,14 @@
 use std::{sync::Arc, time::Duration};
 
 use loom_core::{AgentSessionId, ErrorCode, LoomError, Result};
-use loom_protocol::ArchiveRetentionPolicy;
+use loom_protocol::{ArchiveRetentionPolicy, DEFAULT_SUB_AGENT_RETENTION_MS};
 
 use crate::InProcessBackend;
+
+/// Environment variable holding the archived sub-agent retention window.
+pub const ARCHIVE_RETENTION_SUB_AGENT_ENV: &str = "LOOM_ARCHIVE_RETENTION_SUB_AGENT";
+/// The flag that carries the archived sub-agent retention window.
+pub const ARCHIVE_RETENTION_SUB_AGENT_FLAG: &str = "--archive-retention-sub-agent";
 
 /// Environment variable holding the retention window.
 pub const ARCHIVE_RETENTION_ENV: &str = "LOOM_ARCHIVE_RETENTION";
@@ -118,9 +123,35 @@ pub fn resolve_archive_retention(
     env: Option<&str>,
     force_env: Option<&str>,
 ) -> Result<Option<ArchiveRetentionPolicy>> {
-    if flag.is_none() && force_flag.is_none() && env.is_none() && force_env.is_none() {
+    resolve_archive_retention_with_sub_agent(flag, force_flag, None, env, force_env, None)
+}
+
+/// [`resolve_archive_retention`] with the archived sub-agent window input. An
+/// unset window keeps the 10 minute default; `off`, `never`, or zero disables it.
+pub fn resolve_archive_retention_with_sub_agent(
+    flag: Option<&str>,
+    force_flag: Option<&str>,
+    sub_agent_flag: Option<&str>,
+    env: Option<&str>,
+    force_env: Option<&str>,
+    sub_agent_env: Option<&str>,
+) -> Result<Option<ArchiveRetentionPolicy>> {
+    if flag.is_none()
+        && force_flag.is_none()
+        && sub_agent_flag.is_none()
+        && env.is_none()
+        && force_env.is_none()
+        && sub_agent_env.is_none()
+    {
         return Ok(None);
     }
+    let sub_agent_retention_ms = match sub_agent_flag {
+        Some(value) => parse_retention_window(value, ARCHIVE_RETENTION_SUB_AGENT_FLAG)?,
+        None => match sub_agent_env {
+            Some(value) => parse_retention_window(value, ARCHIVE_RETENTION_SUB_AGENT_ENV)?,
+            None => Some(DEFAULT_SUB_AGENT_RETENTION_MS),
+        },
+    };
     let retention_ms = match flag {
         Some(value) => parse_retention_window(value, ARCHIVE_RETENTION_FLAG)?,
         None => match env {
@@ -138,6 +169,7 @@ pub fn resolve_archive_retention(
     Ok(Some(ArchiveRetentionPolicy {
         retention_ms: retention_ms.filter(|retention_ms| *retention_ms > 0),
         force_discard_worktrees,
+        sub_agent_retention_ms: sub_agent_retention_ms.filter(|value| *value > 0),
     }))
 }
 
@@ -166,14 +198,18 @@ impl ArchiveRetentionSource {
 
 /// One-line description of a policy for the logs.
 pub(crate) fn describe_archive_retention(policy: ArchiveRetentionPolicy) -> String {
+    let sub_agent = match policy.sub_agent_retention() {
+        Some(window) => format!("{} ms", window.as_millis()),
+        None => "disabled".to_owned(),
+    };
     match policy.retention() {
         Some(window) => format!(
-            "{} ms window (force discard worktrees: {})",
+            "{} ms window (force discard worktrees: {}; sub-agent window: {sub_agent})",
             window.as_millis(),
             policy.force_discard_worktrees
         ),
         None => format!(
-            "disabled (force discard worktrees: {})",
+            "disabled (force discard worktrees: {}; sub-agent window: {sub_agent})",
             policy.force_discard_worktrees
         ),
     }

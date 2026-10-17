@@ -528,6 +528,7 @@ fn archived_session_deletion_and_retention_policy_contracts_round_trip() {
             policy: ArchiveRetentionPolicy {
                 retention_ms: Some(86_400_000),
                 force_discard_worktrees: true,
+                sub_agent_retention_ms: Some(600_000),
             },
         },
     ));
@@ -561,6 +562,7 @@ fn archived_session_deletion_and_retention_policy_contracts_round_trip() {
             ArchiveRetentionPolicy {
                 retention_ms: Some(86_400_000),
                 force_discard_worktrees: true,
+                sub_agent_retention_ms: Some(600_000),
             },
         )),
     );

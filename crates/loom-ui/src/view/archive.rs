@@ -208,6 +208,54 @@ pub(crate) fn retention_window_choices(policy: ArchiveRetentionPolicy) -> (Vec<S
     }
 }
 
+/// The windows the editor offers for archived sub-agent sessions, "Off" first.
+pub(crate) const SUB_AGENT_RETENTION_WINDOW_PRESETS: [Option<Duration>; 7] = [
+    None,
+    Some(Duration::from_secs(60)),
+    Some(Duration::from_secs(5 * 60)),
+    Some(Duration::from_secs(10 * 60)),
+    Some(Duration::from_secs(30 * 60)),
+    Some(Duration::from_secs(3_600)),
+    Some(Duration::from_secs(86_400)),
+];
+
+/// The sub-agent window choices and the one a policy selects; a stored window
+/// no preset covers is offered as a `Custom (…)` entry.
+pub(crate) fn sub_agent_retention_window_choices(
+    policy: ArchiveRetentionPolicy,
+) -> (Vec<String>, String) {
+    let mut choices = SUB_AGENT_RETENTION_WINDOW_PRESETS
+        .iter()
+        .map(|window| retention_window_choice_label(*window))
+        .collect::<Vec<_>>();
+    let stored = policy.sub_agent_retention();
+    match stored {
+        Some(window) if !SUB_AGENT_RETENTION_WINDOW_PRESETS.contains(&Some(window)) => {
+            let label = format!("Custom ({})", retention_window_label(window));
+            choices.push(label.clone());
+            (choices, label)
+        }
+        _ => {
+            let label = retention_window_choice_label(stored);
+            (choices, label)
+        }
+    }
+}
+
+/// Reads a sub-agent choice label back to what it means for the draft.
+pub(crate) fn sub_agent_retention_window_choice(label: &str) -> RetentionWindowChoice {
+    if label == RETENTION_OFF_LABEL {
+        return RetentionWindowChoice::Off;
+    }
+    SUB_AGENT_RETENTION_WINDOW_PRESETS
+        .iter()
+        .flatten()
+        .find(|window| retention_window_label(**window) == label)
+        .map_or(RetentionWindowChoice::Custom, |window| {
+            RetentionWindowChoice::Window(*window)
+        })
+}
+
 /// A human-readable retention window, largest unit first.
 pub(crate) fn retention_window_label(window: Duration) -> String {
     let minutes = window.as_millis() as u64 / 60_000;
@@ -353,12 +401,26 @@ pub(crate) fn archived_session_groups(
         .iter()
         .map(|entry| (entry.session.id, entry))
         .collect::<BTreeMap<_, _>>();
+    // Sub-agent sessions (project members below the root) are never listed:
+    // they are removed with their project or by the sub-agent retention sweep.
+    let sub_agents = projects
+        .iter()
+        .flat_map(|project| {
+            project
+                .agents
+                .iter()
+                .filter(|agent| agent.session_id != project.root_session_id || agent.depth > 1)
+                .map(|agent| agent.session_id)
+        })
+        .collect::<BTreeSet<_>>();
     let mut grouped = BTreeSet::new();
     let mut groups = Vec::new();
     for project in projects.iter().filter(|project| is_project_tree(project)) {
+        // Only an archived project root yields a row.
         let mut members = project
             .agents
             .iter()
+            .filter(|agent| agent.session_id == project.root_session_id)
             .filter(|agent| !grouped.contains(&agent.session_id))
             .filter_map(|agent| by_id.get(&agent.session_id).copied())
             .collect::<Vec<_>>();
@@ -403,6 +465,7 @@ pub(crate) fn archived_session_groups(
     let mut loose = entries
         .iter()
         .filter(|entry| !grouped.contains(&entry.session.id))
+        .filter(|entry| !sub_agents.contains(&entry.session.id))
         .collect::<Vec<_>>();
     // Newest archive first, with the name breaking ties so the order is stable.
     loose.sort_by_key(|entry| {
@@ -547,6 +610,28 @@ impl LoomView {
             return;
         }
         draft.retention_ms = window;
+        self.archived_sessions.retention_saved = false;
+        cx.notify();
+    }
+
+    /// Applies a sub-agent window choice of the card's editor to the draft.
+    pub(crate) fn choose_archive_sub_agent_retention_window(
+        &mut self,
+        choice: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let window = match sub_agent_retention_window_choice(choice) {
+            RetentionWindowChoice::Off => None,
+            RetentionWindowChoice::Window(window) => Some(window.as_millis() as u64),
+            RetentionWindowChoice::Custom => return,
+        };
+        let Some(draft) = self.archived_sessions.retention_draft.as_mut() else {
+            return;
+        };
+        if draft.sub_agent_retention_ms == window {
+            return;
+        }
+        draft.sub_agent_retention_ms = window;
         self.archived_sessions.retention_saved = false;
         cx.notify();
     }

@@ -71,7 +71,7 @@ pub use schema::*;
 /// column where the payload column already exists. The upgrade path
 /// additionally re-applies the idempotent baseline batches, so a bump is what
 /// hands new baseline objects (such as indexes) to existing databases.
-const DATABASE_SCHEMA_VERSION: u32 = 8;
+const DATABASE_SCHEMA_VERSION: u32 = 9;
 /// Oldest schema version that the migration ladder can upgrade in place.
 const DATABASE_MIN_MIGRATABLE_VERSION: u32 = 2;
 /// Maximum UTF-8 bytes stored for a raw or provider-qualified model selector.
@@ -170,12 +170,25 @@ pub struct DurableSessionSettings {
 ///
 /// A zero `retention_ms` is stored as `None`, so a stored policy is either
 /// disabled or a positive window.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DurableArchiveRetentionPolicy {
     /// Retention window in milliseconds; `None` leaves retention disabled.
     pub retention_ms: Option<u64>,
     /// Whether an automatic sweep may discard dirty or locked worktrees.
     pub force_discard_worktrees: bool,
+    /// Window in milliseconds for archived sub-agent sessions; `None` disables
+    /// it. Defaults to 10 minutes.
+    pub sub_agent_retention_ms: Option<u64>,
+}
+
+impl Default for DurableArchiveRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            retention_ms: None,
+            force_discard_worktrees: false,
+            sub_agent_retention_ms: Some(600_000),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]

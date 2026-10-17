@@ -207,6 +207,7 @@ impl InProcessBackend {
         self.store_archive_retention(loom_protocol::ArchiveRetentionPolicy {
             retention_ms: stored.retention_ms.filter(|retention_ms| *retention_ms > 0),
             force_discard_worktrees: stored.force_discard_worktrees,
+            sub_agent_retention_ms: stored.sub_agent_retention_ms.filter(|value| *value > 0),
         });
         // Recorded so a start without explicit input can log that the stored
         // policy won rather than the built-in default.
@@ -227,6 +228,7 @@ impl InProcessBackend {
         let normalized = loom_protocol::ArchiveRetentionPolicy {
             retention_ms: policy.retention_ms.filter(|retention_ms| *retention_ms > 0),
             force_discard_worktrees: policy.force_discard_worktrees,
+            sub_agent_retention_ms: policy.sub_agent_retention_ms.filter(|value| *value > 0),
         };
         let mut current = self
             .archive_retention

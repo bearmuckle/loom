@@ -608,6 +608,9 @@ impl InProcessBackend {
                     .retention_ms
                     .filter(|retention_ms| *retention_ms > 0),
                 force_discard_worktrees: archive_retention.force_discard_worktrees,
+                sub_agent_retention_ms: archive_retention
+                    .sub_agent_retention_ms
+                    .filter(|value| *value > 0),
             },
         };
         let workspace_configs = self.workspace_configs()?.clone();

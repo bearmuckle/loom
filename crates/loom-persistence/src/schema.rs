@@ -454,7 +454,9 @@ CREATE INDEX IF NOT EXISTS workspace_configs_by_revision
 CREATE TABLE IF NOT EXISTS archive_retention_policy (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     retention_ms INTEGER CHECK(retention_ms IS NULL OR retention_ms > 0),
-    force_discard_worktrees INTEGER NOT NULL CHECK(force_discard_worktrees IN (0, 1))
+    force_discard_worktrees INTEGER NOT NULL CHECK(force_discard_worktrees IN (0, 1)),
+    sub_agent_retention_ms INTEGER DEFAULT 600000
+        CHECK(sub_agent_retention_ms IS NULL OR sub_agent_retention_ms > 0)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS provider_configs (
     provider_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(provider_id)) > 0),
@@ -1130,6 +1132,28 @@ fn migrate_schema_transaction(connection: &Connection, from_version: u32) -> Res
                         })?;
                 }
                 version = 8;
+            }
+            8 => {
+                if migration_table_exists(&transaction, "archive_retention_policy")?
+                    && !migration_column_exists(
+                        &transaction,
+                        "archive_retention_policy",
+                        "sub_agent_retention_ms",
+                    )?
+                {
+                    transaction
+                        .execute_batch(
+                            "ALTER TABLE archive_retention_policy ADD COLUMN sub_agent_retention_ms INTEGER DEFAULT 600000
+                                 CHECK(sub_agent_retention_ms IS NULL OR sub_agent_retention_ms > 0);",
+                        )
+                        .map_err(|error| {
+                            persistence_error(
+                                format!("could not migrate persistence schema to v9: {error}"),
+                                true,
+                            )
+                        })?;
+                }
+                version = 9;
             }
             other => return Err(unsupported_database_error(other)),
         }

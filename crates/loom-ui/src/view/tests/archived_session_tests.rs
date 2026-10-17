@@ -14,7 +14,7 @@ use crate::view::archive::{
     archived_age_label, archived_session_groups, delete_archived_session_request, is_project_tree,
     project_deletion_consequence, project_row_consequence, retention_editable_state,
     retention_policy_state, retention_window_choice, retention_window_choices,
-    retention_window_label,
+    retention_window_label, sub_agent_retention_window_choice, sub_agent_retention_window_choices,
 };
 
 /// An archived session whose archive timestamp is `archived_at`.
@@ -118,8 +118,8 @@ fn archived_sessions_list_one_row_per_project_with_the_tree_size() {
     assert_eq!(row.session_id, root);
     assert_eq!(row.label, "Checkout flow");
     assert!(row.is_project);
-    // The newest archived member dates the row; the root was archived first.
-    assert_eq!(row.age, "Archived 30m ago");
+    // Only the archived root dates and lists the row; sub-agents never do.
+    assert_eq!(row.age, "Archived 2d ago");
     // The deletion removes the whole tree, the running member included.
     assert_eq!(row.session_count - 1, 3, "three sub-agent sessions");
     assert_eq!(project_group.heading_detail(), "4 sessions in the tree");
@@ -149,44 +149,18 @@ fn archived_sessions_list_one_row_per_project_with_the_tree_size() {
 }
 
 #[test]
-fn a_project_whose_archived_member_is_a_descendant_is_still_one_row() {
+fn an_archived_sub_agent_of_an_unarchived_project_is_not_listed_at_all() {
     let now = 1_700_000_000_000u64;
     let root = AgentSessionId::new();
     let child = AgentSessionId::new();
-    // Only the descendant is archived; the root is not, so the row takes its
-    // name from the sessions the client lists.
+    // Only the sub-agent is archived; its project is not, so it must not
+    // appear as a project row or a loose row.
     let entries = vec![entry(archived_session(child, "Researcher", now))];
     let names = BTreeMap::from([(root, "Checkout flow".to_owned())]);
 
     let groups =
         archived_session_groups(&entries, &[project_snapshot(root, &[child])], &names, now);
-
-    assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].project_root, Some(root));
-    assert_eq!(groups[0].label, "Checkout flow");
-    assert_eq!(groups[0].rows.len(), 1);
-    let row = &groups[0].rows[0];
-    assert_eq!(
-        row.session_id, root,
-        "the row deletes the tree's root, not the archived descendant"
-    );
-    assert!(row.is_project);
-    assert_eq!(row.session_count, 2);
-    assert_eq!(row.age, "Archived just now");
-
-    // With no name for the root anywhere, the row still names the tree by its
-    // root session id rather than by the descendant.
-    let groups = archived_session_groups(
-        &entries,
-        &[project_snapshot(root, &[child])],
-        &BTreeMap::new(),
-        now,
-    );
-    assert_eq!(
-        groups[0].label,
-        format!("Project {}", &root.to_string()[..8])
-    );
-    assert_eq!(groups[0].rows[0].session_id, root);
+    assert!(groups.is_empty(), "{groups:?}");
 }
 
 #[test]
@@ -310,6 +284,7 @@ fn retention_policy_text_covers_enabled_disabled_and_unsupported() {
         RetentionPolicyText::of(&RetentionPolicyState::Available(ArchiveRetentionPolicy {
             retention_ms: Some(7 * 86_400_000),
             force_discard_worktrees: true,
+            sub_agent_retention_ms: Some(600_000),
         }));
     assert_eq!(enabled.headline, "Automatic deletion after 7 days");
     assert!(
@@ -322,6 +297,7 @@ fn retention_policy_text_covers_enabled_disabled_and_unsupported() {
         RetentionPolicyText::of(&RetentionPolicyState::Available(ArchiveRetentionPolicy {
             retention_ms: Some(86_400_000),
             force_discard_worktrees: false,
+            sub_agent_retention_ms: Some(600_000),
         }));
     assert_eq!(gentle.headline, "Automatic deletion after 1 day");
     assert!(
@@ -348,6 +324,7 @@ fn a_worker_without_a_retention_policy_reads_as_unavailable() {
     let policy = ArchiveRetentionPolicy {
         retention_ms: Some(3_600_000),
         force_discard_worktrees: false,
+        sub_agent_retention_ms: Some(600_000),
     };
     assert_eq!(
         retention_policy_state(Ok(ServerResponse::Control(
@@ -376,6 +353,7 @@ fn retention_window_choices_offer_presets_and_a_custom_entry() {
     let preset = ArchiveRetentionPolicy {
         retention_ms: Some(7 * 86_400_000),
         force_discard_worktrees: false,
+        sub_agent_retention_ms: Some(600_000),
     };
     let (choices, selected) = retention_window_choices(preset);
     assert_eq!(choices.len(), RETENTION_WINDOW_PRESETS.len());
@@ -397,6 +375,7 @@ fn retention_window_choices_offer_presets_and_a_custom_entry() {
     let custom = ArchiveRetentionPolicy {
         retention_ms: Some(37 * 60_000),
         force_discard_worktrees: true,
+        sub_agent_retention_ms: Some(600_000),
     };
     let (choices, selected) = retention_window_choices(custom);
     assert_eq!(choices.len(), RETENTION_WINDOW_PRESETS.len() + 1);
@@ -414,6 +393,32 @@ fn retention_window_choices_offer_presets_and_a_custom_entry() {
     // A disabled policy selects the off entry rather than a window.
     let (_, selected) = retention_window_choices(ArchiveRetentionPolicy::disabled());
     assert_eq!(selected, "Off");
+}
+
+#[test]
+fn sub_agent_window_choices_offer_minutes_and_edit_the_draft() {
+    let policy = ArchiveRetentionPolicy::disabled();
+    let (choices, selected) = sub_agent_retention_window_choices(policy);
+    assert_eq!(selected, "10 minutes");
+    assert!(choices.contains(&"1 minute".to_owned()));
+    assert_eq!(choices.first().map(String::as_str), Some("Off"));
+    assert_eq!(
+        sub_agent_retention_window_choice("5 minutes"),
+        RetentionWindowChoice::Window(Duration::from_secs(300))
+    );
+    let custom = ArchiveRetentionPolicy {
+        sub_agent_retention_ms: Some(7 * 60_000),
+        ..policy
+    };
+    assert_eq!(
+        sub_agent_retention_window_choices(custom).1,
+        "Custom (7 minutes)"
+    );
+    let off = ArchiveRetentionPolicy {
+        sub_agent_retention_ms: None,
+        ..policy
+    };
+    assert_eq!(sub_agent_retention_window_choices(off).1, "Off");
 }
 
 #[test]
@@ -599,19 +604,10 @@ fn loading_archived_sessions_reuses_a_project_snapshot_the_client_already_has(
             &view.known_session_names(),
             Timestamp::now().as_unix_millis(),
         );
-        assert_eq!(groups.len(), 1);
-        assert!(groups[0].label.starts_with("Project "), "cached root label");
-        assert_eq!(
-            groups[0].rows.len(),
-            1,
-            "the cached project still lists one row"
+        assert!(
+            groups.is_empty(),
+            "an archived sub-agent of a cached project is not listed: {groups:?}"
         );
-        assert_eq!(
-            groups[0].rows[0].session_id, root,
-            "the archived session groups under the cached project's root"
-        );
-        assert!(groups[0].rows[0].is_project);
-        assert_eq!(groups[0].rows[0].session_count, 2);
     });
 }
 
@@ -846,6 +842,7 @@ fn archived_sessions_surface_renders_the_policy_and_the_rows(cx: &mut TestAppCon
                 retention: RetentionPolicyState::Available(ArchiveRetentionPolicy {
                     retention_ms: Some(7 * 86_400_000),
                     force_discard_worktrees: true,
+                    sub_agent_retention_ms: Some(600_000),
                 }),
                 ..ArchivedSessionsState::default()
             };
@@ -939,6 +936,7 @@ fn applying_a_window_stores_it_and_the_card_shows_the_stored_policy(cx: &mut Tes
     let expected = ArchiveRetentionPolicy {
         retention_ms: Some(7 * 86_400_000),
         force_discard_worktrees: true,
+        sub_agent_retention_ms: Some(600_000),
     };
     cx.update(|cx| {
         let view = view.read(cx);
@@ -1003,6 +1001,7 @@ fn a_refused_window_change_shows_the_reason_and_keeps_the_stored_policy(cx: &mut
     let requested = ArchiveRetentionPolicy {
         retention_ms: Some(30 * 86_400_000),
         force_discard_worktrees: true,
+        sub_agent_retention_ms: Some(600_000),
     };
     view.update(cx, |view, cx| {
         view.archived_sessions.retention_editable = true;
@@ -1053,6 +1052,7 @@ fn an_unexpected_answer_to_a_policy_change_is_reported(cx: &mut TestAppContext) 
         view.archived_sessions.retention_draft = Some(ArchiveRetentionPolicy {
             retention_ms: Some(86_400_000),
             force_discard_worktrees: false,
+            sub_agent_retention_ms: Some(600_000),
         });
         view
     });
@@ -1061,6 +1061,7 @@ fn an_unexpected_answer_to_a_policy_change_is_reported(cx: &mut TestAppContext) 
             policy: ArchiveRetentionPolicy {
                 retention_ms: Some(86_400_000),
                 force_discard_worktrees: false,
+                sub_agent_retention_ms: Some(600_000),
             },
         },
     ));
@@ -1097,6 +1098,7 @@ fn choosing_a_window_edits_the_draft_without_touching_a_custom_window(cx: &mut T
     let stored = ArchiveRetentionPolicy {
         retention_ms: Some(37 * 60_000),
         force_discard_worktrees: false,
+        sub_agent_retention_ms: Some(600_000),
     };
     let view = cx.new(|cx| {
         let mut view = LoomView::new_for_test(cx.focus_handle());
@@ -1164,6 +1166,7 @@ fn choosing_a_window_edits_the_draft_without_touching_a_custom_window(cx: &mut T
             Some(ArchiveRetentionPolicy {
                 retention_ms: None,
                 force_discard_worktrees: true,
+                sub_agent_retention_ms: Some(600_000),
             })
         );
         assert!(view.archive_retention_draft_is_dirty());
@@ -1317,6 +1320,7 @@ fn a_worker_that_cannot_change_the_policy_renders_the_card_read_only(cx: &mut Te
     let reported = ArchiveRetentionPolicy {
         retention_ms: Some(7 * 86_400_000),
         force_discard_worktrees: false,
+        sub_agent_retention_ms: Some(600_000),
     };
     // A worker that reports a policy but cannot store a change explains itself
     // instead of offering controls.
@@ -1355,6 +1359,7 @@ fn confirming_a_window_in_the_card_edits_the_draft_and_apply_submits_it(cx: &mut
     let stored = ArchiveRetentionPolicy {
         retention_ms: Some(7 * 86_400_000),
         force_discard_worktrees: false,
+        sub_agent_retention_ms: Some(600_000),
     };
     let (handle, view) = open_retention_card(
         cx,
@@ -1428,6 +1433,7 @@ fn the_retention_card_renders_the_editor_for_a_worker_that_stores_a_policy(
     let stored = ArchiveRetentionPolicy {
         retention_ms: Some(37 * 60_000),
         force_discard_worktrees: false,
+        sub_agent_retention_ms: Some(600_000),
     };
     let (handle, view) = open_retention_card(
         cx,
@@ -1466,6 +1472,7 @@ fn the_retention_card_renders_the_editor_for_a_worker_that_stores_a_policy(
         view.archived_sessions.retention_draft = Some(ArchiveRetentionPolicy {
             retention_ms: Some(7 * 86_400_000),
             force_discard_worktrees: true,
+            sub_agent_retention_ms: Some(600_000),
         });
         cx.notify();
     });
@@ -1489,6 +1496,7 @@ fn the_retention_card_renders_the_editor_for_a_worker_that_stores_a_policy(
     let saved = ArchiveRetentionPolicy {
         retention_ms: Some(7 * 86_400_000),
         force_discard_worktrees: true,
+        sub_agent_retention_ms: Some(600_000),
     };
     view.update(cx, |view, cx| {
         view.finish_archive_retention_save(
@@ -1534,6 +1542,7 @@ fn toggling_the_force_switch_in_the_card_edits_the_draft(cx: &mut TestAppContext
     let stored = ArchiveRetentionPolicy {
         retention_ms: Some(7 * 86_400_000),
         force_discard_worktrees: false,
+        sub_agent_retention_ms: Some(600_000),
     };
     let (handle, view) = open_retention_card(
         cx,
@@ -1565,6 +1574,7 @@ fn toggling_the_force_switch_in_the_card_edits_the_draft(cx: &mut TestAppContext
             view.archived_sessions.retention_draft,
             Some(ArchiveRetentionPolicy {
                 force_discard_worktrees: true,
+                sub_agent_retention_ms: Some(600_000),
                 ..stored
             }),
             "the switch reports its change to the card's draft"

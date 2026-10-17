@@ -621,6 +621,15 @@ fn migrates_a_v4_database_by_adding_the_archive_retention_policy_table() {
         .query_row("SELECT value FROM sentinel", [], |row| row.get(0))
         .unwrap();
     assert_eq!(sentinel, "keep", "a migration keeps unrelated tables");
+    let has_column: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('archive_retention_policy')
+             WHERE name='sub_agent_retention_ms')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(has_column, "the v9 migration adds the sub-agent window");
     drop(connection);
     fs::remove_file(path).unwrap();
 }

@@ -144,10 +144,12 @@ pub use remote::{
 };
 pub use retention::{
     ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FLAG, ARCHIVE_RETENTION_FORCE_DISCARD_ENV,
-    ARCHIVE_RETENTION_FORCE_DISCARD_FLAG, ARCHIVE_RETENTION_SWEEP_INTERVAL, ArchiveRetentionSource,
+    ARCHIVE_RETENTION_FORCE_DISCARD_FLAG, ARCHIVE_RETENTION_SUB_AGENT_ENV,
+    ARCHIVE_RETENTION_SUB_AGENT_FLAG, ARCHIVE_RETENTION_SWEEP_INTERVAL, ArchiveRetentionSource,
     ArchiveRetentionSweepDriver, ArchiveSweepReport, ArchiveSweepSkip,
     apply_startup_archive_retention, parse_force_discard, parse_retention_window,
-    resolve_archive_retention, run_archive_retention_sweeps, sweep_archive_retention_at_startup,
+    resolve_archive_retention, resolve_archive_retention_with_sub_agent,
+    run_archive_retention_sweeps, sweep_archive_retention_at_startup,
 };
 pub use serve::{
     ServingBackend, bind_exposure_warning, ensure_state_database, ensure_state_database_with,

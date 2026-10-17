@@ -69,7 +69,10 @@ policy stored in the worker's durable state and is stored in turn: a worker
 started without the flag resumes the policy it stored, and a client can change
 the window and the force-discard switch at runtime through
 `SetArchiveRetentionPolicy`. Retention is disabled when no flag, variable, or
-stored policy enables it. [deployment](docs/deployment.md) documents the
+stored policy enables it. Archived sub-agent sessions have their own window,
+`--archive-retention-sub-agent <duration>` (or `LOOM_ARCHIVE_RETENTION_SUB_AGENT`),
+defaulting to 10 minutes, applied even when general retention is off.
+[deployment](docs/deployment.md) documents the
 duration syntax and the sweep.
 
 ## Providers

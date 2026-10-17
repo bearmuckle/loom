@@ -87,6 +87,7 @@ fn enabled_retention(window_ms: u64, force_discard_worktrees: bool) -> ArchiveRe
     ArchiveRetentionPolicy {
         retention_ms: Some(window_ms),
         force_discard_worktrees,
+        sub_agent_retention_ms: None,
     }
 }
 
@@ -297,6 +298,28 @@ fn retention_durations_parse_every_unit_and_reject_junk() {
 }
 
 #[test]
+fn sub_agent_window_resolves_from_flag_env_and_defaults_to_ten_minutes() {
+    use crate::retention::resolve_archive_retention_with_sub_agent as resolve;
+    let policy = resolve(None, None, Some("2m"), None, None, Some("9m"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(policy.sub_agent_retention_ms, Some(120_000));
+    let policy = resolve(None, None, None, None, None, Some("90s"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(policy.sub_agent_retention_ms, Some(90_000));
+    let policy = resolve(Some("1h"), None, None, None, None, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(policy.sub_agent_retention_ms, Some(600_000));
+    let policy = resolve(None, None, Some("off"), None, None, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(policy.sub_agent_retention_ms, None);
+    assert!(resolve(None, None, Some("soon"), None, None, None).is_err());
+}
+
+#[test]
 fn flags_win_over_the_environment_and_off_disables_retention() {
     use crate::retention::{
         ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FLAG, ARCHIVE_RETENTION_FORCE_DISCARD_ENV,
@@ -306,16 +329,25 @@ fn flags_win_over_the_environment_and_off_disables_retention() {
     // Both flags win over both variables.
     assert_eq!(
         resolve_archive_retention(Some("14d"), Some("1"), Some("1ms"), Some("no")).unwrap(),
-        Some(enabled_retention(1_209_600_000, true))
+        Some(ArchiveRetentionPolicy {
+            sub_agent_retention_ms: Some(600_000),
+            ..enabled_retention(1_209_600_000, true)
+        })
     );
     assert_eq!(
         resolve_archive_retention(Some("30m"), Some("no"), None, Some("yes")).unwrap(),
-        Some(enabled_retention(1_800_000, false))
+        Some(ArchiveRetentionPolicy {
+            sub_agent_retention_ms: Some(600_000),
+            ..enabled_retention(1_800_000, false)
+        })
     );
     // Without a flag the variable is the fallback.
     assert_eq!(
         resolve_archive_retention(None, None, Some("30m"), Some("YES")).unwrap(),
-        Some(enabled_retention(1_800_000, true))
+        Some(ArchiveRetentionPolicy {
+            sub_agent_retention_ms: Some(600_000),
+            ..enabled_retention(1_800_000, true)
+        })
     );
     // No input at all leaves the policy to the durable state, so a start never
     // disables retention an earlier start or a client turned on.
@@ -710,6 +742,60 @@ fn a_sweep_skips_a_dirty_worktree_until_force_discard_is_enabled() {
 }
 
 #[test]
+fn a_sweep_deletes_an_archived_sub_agent_alone_even_when_general_retention_is_off() {
+    let fixture = project_code_child_fixture();
+    complete_project_code_child(&fixture);
+    let child_id = fixture.worktree.child_session_id;
+    archive_session(&fixture.connection, child_id);
+    assert_eq!(
+        session_state(&fixture.backend, child_id),
+        Some(AgentSessionState::Archived)
+    );
+    fs::write(fixture.child_checkout.join("dirty.txt"), b"dirty").unwrap();
+    let policy = |force| ArchiveRetentionPolicy {
+        retention_ms: None,
+        force_discard_worktrees: force,
+        sub_agent_retention_ms: Some(1),
+    };
+
+    // The dirty checkout is respected without force.
+    fixture
+        .backend
+        .set_archive_retention(policy(false))
+        .unwrap();
+    wait_past_a_one_millisecond_window();
+    let report = fixture.backend.sweep_archive_retention().unwrap();
+    assert!(report.deleted_sessions.is_empty());
+    assert_eq!(report.skipped.len(), 1);
+    assert_eq!(report.skipped[0].session_id, child_id);
+    assert!(fixture.child_checkout.join("dirty.txt").exists());
+
+    // With force only the sub-agent goes; the project root and snapshot stay.
+    fixture.backend.set_archive_retention(policy(true)).unwrap();
+    let report = fixture.backend.sweep_archive_retention().unwrap();
+    assert_eq!(report.deleted_sessions, vec![child_id]);
+    assert!(!session_is_present(&fixture.backend, child_id));
+    assert!(session_is_present(&fixture.backend, fixture.root_id));
+    assert!(!fixture.child_checkout.exists());
+    let snapshot = fixture
+        .backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .load_project_snapshot_for_session(fixture.root_id)
+        .unwrap()
+        .expect("the project survives");
+    assert!(
+        snapshot
+            .agents
+            .iter()
+            .all(|agent| agent.session_id != child_id)
+    );
+    assert!(snapshot.worktrees.is_empty());
+    fixture.shutdown();
+}
+
+#[test]
 fn a_persistent_backend_with_a_policy_sweeps_at_startup_before_serving() {
     let (temp, database, backend) = persistent_backend("startup");
     let connection = backend.connect();
@@ -779,6 +865,7 @@ fn the_protocol_stores_the_policy_it_reports() {
         ArchiveRetentionPolicy {
             retention_ms: Some(0),
             force_discard_worktrees: true,
+            sub_agent_retention_ms: Some(600_000),
         },
     );
     assert_eq!(
@@ -786,6 +873,7 @@ fn the_protocol_stores_the_policy_it_reports() {
         ArchiveRetentionPolicy {
             retention_ms: None,
             force_discard_worktrees: true,
+            sub_agent_retention_ms: Some(600_000),
         }
     );
     assert_eq!(backend.archive_retention(), normalized);

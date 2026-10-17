@@ -147,6 +147,7 @@ fn archive_retention_policy_round_trips_through_state_saves() {
     let enabled = DurableArchiveRetentionPolicy {
         retention_ms: Some(1_209_600_000),
         force_discard_worktrees: true,
+        sub_agent_retention_ms: Some(120_000),
     };
     save_archive_retention(&persistence, &sessions, enabled);
     assert_eq!(
@@ -180,14 +181,14 @@ fn archive_retention_policy_round_trips_through_state_saves() {
         Some(DurableArchiveRetentionPolicy::default())
     );
     let connection = Connection::open(&path).unwrap();
-    let stored: (Option<i64>, i64) = connection
+    let stored: (Option<i64>, i64, Option<i64>) = connection
         .query_row(
-            "SELECT retention_ms, force_discard_worktrees FROM archive_retention_policy",
+            "SELECT retention_ms, force_discard_worktrees, sub_agent_retention_ms FROM archive_retention_policy",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(stored, (None, 0));
+    assert_eq!(stored, (None, 0, Some(600_000)));
     drop(connection);
     fs::remove_file(path).unwrap();
 }

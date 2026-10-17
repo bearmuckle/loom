@@ -281,13 +281,15 @@ impl InProcessBackend {
     /// error is reserved for a failure that stops the sweep itself.
     pub fn sweep_archive_retention(&self) -> Result<ArchiveSweepReport> {
         let policy = self.archive_retention();
-        let Some(window) = policy.retention() else {
+        let window = policy.retention();
+        let sub_agent_window = policy.sub_agent_retention();
+        if window.is_none() && sub_agent_window.is_none() {
             log::debug!("[loom-server] archive retention sweep is idle: retention is disabled");
             return Ok(ArchiveSweepReport::default());
-        };
+        }
         let _gate = self.archive_gate()?;
         let now = Timestamp::now().as_unix_millis();
-        let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
+        let window_ms = window.map(|window| u64::try_from(window.as_millis()).unwrap_or(u64::MAX));
         let force = policy.force_discard_worktrees;
         // The catalog is read once: `Archived` is terminal, so a candidate can
         // only leave it by being deleted, and the deletion path re-validates
@@ -303,13 +305,32 @@ impl InProcessBackend {
             .collect::<Vec<_>>();
         candidates.sort_unstable();
         log::debug!(
-            "[loom-server] archive retention sweep considering {} archived session(s) with a {} ms window (force discard: {force})",
+            "[loom-server] archive retention sweep considering {} archived session(s) with a {window_ms:?} ms window and a {sub_agent_window:?} sub-agent window (force discard: {force})",
             candidates.len(),
-            window_ms
         );
 
         let mut report = ArchiveSweepReport::default();
         let mut deleted = BTreeSet::new();
+        if let Some(sub_agent_window) = sub_agent_window {
+            let sub_agent_ms = u64::try_from(sub_agent_window.as_millis()).unwrap_or(u64::MAX);
+            self.sweep_archived_sub_agents(
+                &candidates,
+                &catalog,
+                now,
+                sub_agent_ms,
+                force,
+                &mut deleted,
+                &mut report,
+            )?;
+        }
+        let Some(window_ms) = window_ms else {
+            log::info!(
+                "[loom-server] archive retention sweep deleted {} session(s) and skipped {} candidate(s)",
+                report.deleted_sessions.len(),
+                report.skipped.len()
+            );
+            return Ok(report);
+        };
         for session_id in candidates {
             // A session deleted by an earlier candidate in this round is gone.
             if deleted.contains(&session_id) {
@@ -380,6 +401,92 @@ impl InProcessBackend {
             report.skipped.len()
         );
         Ok(report)
+    }
+
+    /// Deletes archived sub-agent sessions that are past the sub-agent window,
+    /// one at a time and deepest first, so a session is only removed once its own
+    /// children are gone. A sub-agent with an unfinished task or a child that is
+    /// still around is left for a later round.
+    #[allow(clippy::too_many_arguments)]
+    fn sweep_archived_sub_agents(
+        &self,
+        candidates: &[AgentSessionId],
+        catalog: &BTreeMap<AgentSessionId, AgentSessionSnapshot>,
+        now: u64,
+        sub_agent_ms: u64,
+        force: bool,
+        deleted: &mut BTreeSet<AgentSessionId>,
+        report: &mut ArchiveSweepReport,
+    ) -> Result<()> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+        let mut sub_agents = Vec::new();
+        for session_id in candidates {
+            let Some(project) = persistence.load_project_snapshot_for_session(*session_id)? else {
+                continue;
+            };
+            let Some(agent) = project
+                .agents
+                .iter()
+                .find(|agent| agent.session_id == *session_id)
+            else {
+                continue;
+            };
+            if project.root_session_id == *session_id {
+                continue;
+            }
+            sub_agents.push((std::cmp::Reverse(agent.depth), *session_id));
+        }
+        sub_agents.sort();
+        for (_, session_id) in sub_agents {
+            if deleted.contains(&session_id) {
+                continue;
+            }
+            // Re-read: an earlier deletion in this round changed the project.
+            let Some(project) = persistence.load_project_snapshot_for_session(session_id)? else {
+                continue;
+            };
+            let blocker = catalog
+                .get(&session_id)
+                .and_then(|session| retention_blocker_for_session(session, now, sub_agent_ms))
+                .or_else(|| sub_agent_structure_blocker(&project, session_id));
+            if let Some(blocker) = blocker {
+                if blocker.warning {
+                    log::warn!(
+                        "[loom-server] archive retention skipped sub-agent {session_id}: {}",
+                        blocker.reason
+                    );
+                } else {
+                    log::info!(
+                        "[loom-server] archive retention skipped sub-agent {session_id}: {}",
+                        blocker.reason
+                    );
+                }
+                report.skipped.push(ArchiveSweepSkip {
+                    session_id,
+                    reason: blocker.reason,
+                });
+                continue;
+            }
+            match self.delete_agent_session_locked(session_id, force) {
+                Ok((removed, _)) => {
+                    deleted.extend(removed.iter().copied());
+                    report.deleted_sessions.extend(removed);
+                }
+                Err(error) => {
+                    log::warn!(
+                        "[loom-server] archive retention skipped sub-agent {session_id}: {}",
+                        error.message
+                    );
+                    report.skipped.push(ArchiveSweepSkip {
+                        session_id,
+                        reason: error.message,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The first reason `project` cannot be discarded yet, or `None` when every
@@ -496,6 +603,36 @@ impl RetentionBlocker {
             warning: false,
         }
     }
+}
+
+/// Why a project member cannot be deleted on its own yet: it still has child
+/// sessions in the project or a delegated task that has not finished.
+fn sub_agent_structure_blocker(
+    project: &ProjectSnapshot,
+    session_id: AgentSessionId,
+) -> Option<RetentionBlocker> {
+    if project
+        .agents
+        .iter()
+        .any(|agent| agent.parent_session_id == Some(session_id))
+    {
+        return Some(RetentionBlocker::ineligible(format!(
+            "sub-agent {session_id} still has child sessions"
+        )));
+    }
+    project
+        .tasks
+        .iter()
+        .find(|task| {
+            (task.target_session_id == session_id || task.requester_session_id == session_id)
+                && !delegated_task_is_terminal(task.status)
+        })
+        .map(|task| {
+            RetentionBlocker::ineligible(format!(
+                "project task '{}' is not terminal ({:?})",
+                task.child_name, task.status
+            ))
+        })
 }
 
 /// Whether one session is archived and past the retention window, or the reason

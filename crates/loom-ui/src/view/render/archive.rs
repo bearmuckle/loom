@@ -1,7 +1,7 @@
 use super::*;
 use crate::view::archive::{
     ArchivedSessionRow, RetentionPolicyState, RetentionPolicyText, archived_session_groups,
-    project_row_consequence, retention_window_choices,
+    project_row_consequence, retention_window_choices, sub_agent_retention_window_choices,
 };
 use gpui_kit::WeakEntity;
 use gpui_kit::component::checkbox::Checkbox;
@@ -253,6 +253,7 @@ impl LoomView {
         };
 
         let (choices, selected) = retention_window_choices(draft);
+        let (sub_agent_choices, sub_agent_selected) = sub_agent_retention_window_choices(draft);
         let saving = state.retention_saving;
         let worker = self
             .node_names
@@ -307,6 +308,21 @@ impl LoomView {
                 choices,
                 selected,
                 saving,
+                false,
+            ))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0xf3f4f6))
+                    .child("Delete archived sub-agent sessions after"),
+            )
+            .child(RetentionWindowSelect::new(
+                ("archive-retention-window", 1usize),
+                cx.entity().downgrade(),
+                sub_agent_choices,
+                sub_agent_selected,
+                saving,
+                true,
             ))
             .child(
                 Checkbox::new("archive-retention-force")
@@ -545,6 +561,7 @@ struct RetentionWindowSelect {
     choices: Vec<String>,
     selected: String,
     disabled: bool,
+    sub_agent: bool,
 }
 
 /// The window-owned state of one retention-window Select: the control plus what
@@ -565,6 +582,7 @@ impl RetentionWindowSelect {
         choices: Vec<String>,
         selected: String,
         disabled: bool,
+        sub_agent: bool,
     ) -> Self {
         Self {
             id,
@@ -572,6 +590,7 @@ impl RetentionWindowSelect {
             choices,
             selected,
             disabled,
+            sub_agent,
         }
     }
 
@@ -589,6 +608,7 @@ impl RenderOnce for RetentionWindowSelect {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let state = window.use_keyed_state(self.id, cx, |window, cx| {
             let view = self.view.clone();
+            let sub_agent = self.sub_agent;
             let select = cx.new(|cx| {
                 SelectState::new(
                     SearchableVec::new(self.choices.clone()),
@@ -606,7 +626,11 @@ impl RenderOnce for RetentionWindowSelect {
                     let choice = choice.clone();
                     if let Some(view) = view.upgrade() {
                         view.update(cx, |view, cx| {
-                            view.choose_archive_retention_window(&choice, cx);
+                            if sub_agent {
+                                view.choose_archive_sub_agent_retention_window(&choice, cx);
+                            } else {
+                                view.choose_archive_retention_window(&choice, cx);
+                            }
                         });
                     }
                 },
@@ -641,7 +665,11 @@ impl RenderOnce for RetentionWindowSelect {
             .id(self.id)
             .small()
             .disabled(self.disabled)
-            .accessibility_label("Delete archived sessions after")
+            .accessibility_label(if self.sub_agent {
+                "Delete archived sub-agent sessions after"
+            } else {
+                "Delete archived sessions after"
+            })
             .into_any_element()
     }
 }

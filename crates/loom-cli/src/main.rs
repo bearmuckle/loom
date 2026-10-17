@@ -25,11 +25,12 @@ use loom_providers::{
     CredentialRef, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF, GitHubCopilotAuthenticator,
 };
 use loom_server::{
-    ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FORCE_DISCARD_ENV, ARCHIVE_RETENTION_SWEEP_INTERVAL,
-    AuthTokenStore, AuthorizationScope, InProcessBackend, InProcessConnection, Instance,
-    InstanceOptions, MAX_FRAME_BYTES_ENV, RemoteServer, RemoteServerConfig, WebSocketConnection,
-    WebSocketTransport, apply_startup_archive_retention, resolve_archive_retention,
-    resolve_max_frame_bytes, run_archive_retention_sweeps, sweep_archive_retention_at_startup,
+    ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FORCE_DISCARD_ENV, ARCHIVE_RETENTION_SUB_AGENT_ENV,
+    ARCHIVE_RETENTION_SWEEP_INTERVAL, AuthTokenStore, AuthorizationScope, InProcessBackend,
+    InProcessConnection, Instance, InstanceOptions, MAX_FRAME_BYTES_ENV, RemoteServer,
+    RemoteServerConfig, WebSocketConnection, WebSocketTransport, apply_startup_archive_retention,
+    resolve_archive_retention_with_sub_agent, resolve_max_frame_bytes,
+    run_archive_retention_sweeps, sweep_archive_retention_at_startup,
 };
 
 /// How long the shell waits between event polls while a run is executing.
@@ -153,6 +154,7 @@ struct CliOptions {
     archive_retention: Option<String>,
     /// Raw `--archive-retention-force-discard` value.
     archive_retention_force_discard: Option<String>,
+    archive_retention_sub_agent: Option<String>,
     /// Raw `--max-frame-bytes` value, before it is resolved into a byte count.
     max_frame_bytes: Option<String>,
 }
@@ -162,13 +164,15 @@ impl CliOptions {
     /// environment fallback exactly like `loom-server` does. `None` means no
     /// retention input was given, so the persisted policy applies.
     fn retention_policy(&self) -> Result<Option<loom_protocol::ArchiveRetentionPolicy>, LoomError> {
-        resolve_archive_retention(
+        resolve_archive_retention_with_sub_agent(
             self.archive_retention.as_deref(),
             self.archive_retention_force_discard.as_deref(),
+            self.archive_retention_sub_agent.as_deref(),
             env::var(ARCHIVE_RETENTION_ENV).ok().as_deref(),
             env::var(ARCHIVE_RETENTION_FORCE_DISCARD_ENV)
                 .ok()
                 .as_deref(),
+            env::var(ARCHIVE_RETENTION_SUB_AGENT_ENV).ok().as_deref(),
         )
     }
 
@@ -231,7 +235,9 @@ fn help_text() -> String {
          a bare number of seconds, or off. It is a startup default that overrides and replaces \
          the policy stored in durable state, and a client can change that policy at runtime. \
          --archive-retention-force-discard <bool> (or LOOM_ARCHIVE_RETENTION_FORCE_DISCARD) \
-         lets the sweep discard dirty or locked worktrees.",
+         lets the sweep discard dirty or locked worktrees. \
+         --archive-retention-sub-agent <duration> (or LOOM_ARCHIVE_RETENTION_SUB_AGENT) sets how \
+         long an archived sub-agent session is kept (default 10m; minutes accepted, off disables).",
     ]
     .join("\n")
 }
@@ -259,6 +265,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
         allow_insecure_remote: false,
         archive_retention: None,
         archive_retention_force_discard: None,
+        archive_retention_sub_agent: None,
         max_frame_bytes: None,
     };
     while let Some(argument) = args.next() {
@@ -285,6 +292,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
                     &mut args,
                     "--archive-retention-force-discard",
                 )?);
+            }
+            "--archive-retention-sub-agent" => {
+                options.archive_retention_sub_agent =
+                    Some(required_value(&mut args, "--archive-retention-sub-agent")?);
             }
             "--bind" => {
                 options.bind = required_value(&mut args, "--bind")?
@@ -350,6 +361,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
             value if value.starts_with("--archive-retention-force-discard=") => {
                 options.archive_retention_force_discard =
                     Some(value["--archive-retention-force-discard=".len()..].to_owned());
+            }
+            value if value.starts_with("--archive-retention-sub-agent=") => {
+                options.archive_retention_sub_agent =
+                    Some(value["--archive-retention-sub-agent=".len()..].to_owned());
             }
             value if value.starts_with("--max-frame-bytes=") => {
                 options.max_frame_bytes = Some(value["--max-frame-bytes=".len()..].to_owned());
@@ -1678,6 +1693,7 @@ mod tests {
             Some(ArchiveRetentionPolicy {
                 retention_ms: Some(1_209_600_000),
                 force_discard_worktrees: true,
+                sub_agent_retention_ms: Some(600_000),
             })
         );
 
@@ -1694,6 +1710,7 @@ mod tests {
             Some(ArchiveRetentionPolicy {
                 retention_ms: Some(1_800_000),
                 force_discard_worktrees: false,
+                sub_agent_retention_ms: Some(600_000),
             })
         );
 
@@ -1707,6 +1724,7 @@ mod tests {
             Some(ArchiveRetentionPolicy {
                 retention_ms: Some(3_600_000),
                 force_discard_worktrees: true,
+                sub_agent_retention_ms: Some(600_000),
             })
         );
         if std::env::var("LOOM_ARCHIVE_RETENTION").is_err()
@@ -1823,6 +1841,7 @@ mod tests {
             allow_insecure_remote: false,
             archive_retention: None,
             archive_retention_force_discard: None,
+            archive_retention_sub_agent: None,
             max_frame_bytes: None,
         };
         let run_id = start_run(&connection, session.id, &options).unwrap();
@@ -1856,6 +1875,7 @@ mod tests {
             allow_insecure_remote: false,
             archive_retention: None,
             archive_retention_force_discard: None,
+            archive_retention_sub_agent: None,
             max_frame_bytes: None,
         };
 
@@ -1892,6 +1912,7 @@ mod tests {
             allow_insecure_remote: false,
             archive_retention: None,
             archive_retention_force_discard: None,
+            archive_retention_sub_agent: None,
             max_frame_bytes: None,
         };
         let run_id = start_run(&connection, session.id, &options).unwrap();
