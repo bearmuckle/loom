@@ -567,6 +567,9 @@ impl ClientRequest {
             Self::Collaboration(CollaborationRequest::GetRunRevision { .. }) => {
                 Some(Capability::ReadAgentRun)
             }
+            Self::Collaboration(CollaborationRequest::ListSessionCollaboration { .. }) => {
+                Some(Capability::ReadAgentSession)
+            }
             Self::Access(AccessRequest::ListProviderCredentials)
             | Self::Access(AccessRequest::GetSessionCredential { .. })
             | Self::Access(AccessRequest::GetRunCredential { .. })
@@ -642,6 +645,7 @@ impl ClientRequest {
             | Self::Project(ProjectRequest::ListProjectAgentMessages { .. })
             | Self::Project(ProjectRequest::GetProjectChildReview { .. })
             | Self::Collaboration(CollaborationRequest::GetRunRevision { .. })
+            | Self::Collaboration(CollaborationRequest::ListSessionCollaboration { .. })
             | Self::Access(AccessRequest::GetSessionCredential { .. })
             | Self::Access(AccessRequest::GetRunCredential { .. })
             | Self::Access(AccessRequest::GetSessionRoster { .. }) => Some(Observer),
@@ -785,9 +789,11 @@ impl ClientRequest {
                 ..
             })
             | Self::Access(AccessRequest::RevokeSessionAccess { session_id, .. })
-            | Self::Collaboration(CollaborationRequest::SendPeerMessage { session_id, .. }) => {
-                Some(Session(*session_id))
-            }
+            | Self::Collaboration(CollaborationRequest::SendPeerMessage { session_id, .. })
+            | Self::Collaboration(CollaborationRequest::ListSessionCollaboration {
+                session_id,
+                ..
+            }) => Some(Session(*session_id)),
             Self::Access(AccessRequest::GetRunCredential { run_id })
             | Self::Run(RunRequest::GetAgentRun { run_id })
             | Self::Run(RunRequest::GetAgentRunMessagePage { run_id, .. })

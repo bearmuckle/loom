@@ -491,6 +491,12 @@ connections may omit it.
   `AnswerAgentQuestion { run_id, expected, text }`, and
   `ControlRun { run_id, expected, action }` → `RunAction(RunActionOutcome)`.
 - `GetRunRevision { run_id }` → `RunRevision { revision }`. Observer role.
+- `ListSessionCollaboration { session_id, after_sequence, limit }` →
+  `SessionCollaboration { entries, next_after_sequence }`. Observer role. The
+  retained `CollaborationEntry` records of the session, oldest first, each
+  with its feed sequence; at most 500 per page. Clients read it on session
+  load and reconnect to rebuild peer chat and attribution, and de-duplicate
+  it against live `Collaboration` events.
 
 Sends need the participant role. Text is limited to 16 KiB.
 

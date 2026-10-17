@@ -608,7 +608,20 @@ pub enum CollaborationRequest {
 
     /// The run's current revision, to decide an action against.
     GetRunRevision { run_id: RunId },
+
+    /// The session's retained attributed history entries, oldest first, so a
+    /// client can rebuild peer chat and attribution after a reload. Pages
+    /// follow `next_after_sequence`. Any reader may send it.
+    ListSessionCollaboration {
+        session_id: AgentSessionId,
+        after_sequence: Option<EventSequence>,
+        limit: u32,
+    },
 }
+
+/// The most entries one [`CollaborationRequest::ListSessionCollaboration`]
+/// page returns.
+pub const MAX_SESSION_COLLABORATION_PAGE_SIZE: u32 = 500;
 
 /// Multi-user identity, session access, and presence.
 ///

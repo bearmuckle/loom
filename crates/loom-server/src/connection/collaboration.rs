@@ -128,6 +128,38 @@ impl InProcessConnection {
         })
     }
 
+    /// One page of the attributed entries retained in `session_id`'s feed.
+    pub(crate) fn session_collaboration_page(
+        &self,
+        session_id: AgentSessionId,
+        after_sequence: Option<EventSequence>,
+        limit: u32,
+    ) -> Result<loom_protocol::CollaborationResponse> {
+        // A deleted session is reported as missing, not as an empty history.
+        self.backend.sessions()?.get(session_id)?;
+        let limit = limit.clamp(1, loom_protocol::MAX_SESSION_COLLABORATION_PAGE_SIZE) as usize;
+        let mut entries = self
+            .session_events_since(Some(session_id), after_sequence)?
+            .into_iter()
+            .filter_map(|event| match event.event {
+                ServerEvent::Collaboration { entry } => Some((event.sequence, entry)),
+                _ => None,
+            })
+            .take(limit + 1)
+            .collect::<Vec<_>>();
+        let next_after_sequence = if entries.len() > limit {
+            entries.truncate(limit);
+            entries.last().map(|(sequence, _)| *sequence)
+        } else {
+            None
+        };
+        Ok(loom_protocol::CollaborationResponse::SessionCollaboration {
+            session_id,
+            entries,
+            next_after_sequence,
+        })
+    }
+
     pub(crate) fn collaboration_request(
         &self,
         request: loom_protocol::CollaborationRequest,
@@ -160,6 +192,11 @@ impl InProcessConnection {
                     revision: self.current_run_revision(run_id)?,
                 });
             }
+            CollaborationRequest::ListSessionCollaboration {
+                session_id,
+                after_sequence,
+                limit,
+            } => return self.session_collaboration_page(session_id, after_sequence, limit),
             CollaborationRequest::DirectAgent {
                 run_id,
                 expected,

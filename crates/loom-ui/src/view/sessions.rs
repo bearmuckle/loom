@@ -721,6 +721,9 @@ impl LoomView {
             // for it can reveal the workspace.
             self.finish_browser_startup();
         }
+        // Peer chat and attribution are not part of the run transcript, and the
+        // event window above can be a partial tail, so read them from history.
+        self.load_collaboration_history(cx);
         self.refresh_review(cx);
         self.refresh_active_project_snapshot(cx);
         cx.notify();

@@ -7,7 +7,11 @@ use loom_protocol::{
 };
 
 use super::*;
-use crate::collaboration::{ComposerRecipient, ComposerRoute, route_composer};
+use crate::collaboration::{
+    CollaborationSupport, ComposerRecipient, ComposerRoute, ControlRoute, is_unsupported_error,
+    route_composer, route_control,
+};
+use loom_core::RunControlAction;
 
 impl LoomView {
     /// Loads who this connection is, then the active session's roster and
@@ -25,10 +29,15 @@ impl LoomView {
                         })) => {
                             view.collaboration.identity_loaded = true;
                             view.collaboration.identity = participant;
+                            view.collaboration.support = CollaborationSupport::Supported;
                         }
                         // An older worker without multi-user support: an
-                        // operator connection with every control.
-                        Ok(_) | Err(_) => view.collaboration.identity_loaded = true,
+                        // operator connection with every control, using the
+                        // legacy run requests.
+                        Ok(_) | Err(_) => {
+                            view.collaboration.identity_loaded = true;
+                            view.collaboration.support = CollaborationSupport::Legacy;
+                        }
                     }
                     cx.notify();
                 },
@@ -274,9 +283,10 @@ impl LoomView {
             self.pending_input.is_some(),
             revision,
         );
-        // Only a person sharing the session needs the ordered path; an
-        // operator alone keeps the existing run requests.
-        let ordered = self.collaboration.is_participant_bound();
+        // Every connection that can act takes the ordered path when the worker
+        // supports it, so operators are ordered against people too. Older
+        // workers keep the existing run requests.
+        let ordered = self.collaboration.uses_ordered_path();
         match route {
             ComposerRoute::ReadOnly => {
                 self.record_status("Observers can read this session but not send messages.");
@@ -433,7 +443,7 @@ impl LoomView {
                         run,
                     } => {
                         self.collaboration.observe_revision(run.id, revision);
-                        self.collaboration.observe_entry(&entry);
+                        self.consume_collaboration_entry(&entry);
                         self.adopt_run(run);
                         self.pending_input = None;
                         self.start_run_polling(cx);
@@ -502,7 +512,9 @@ impl LoomView {
         if entry.session_id != self.active_session.id {
             return;
         }
-        self.collaboration.observe_entry(entry);
+        if !self.collaboration.observe_entry(entry) {
+            return;
+        }
         match &entry.kind {
             loom_core::CollaborationEntryKind::AgentDirection { .. }
             | loom_core::CollaborationEntryKind::AgentAnswer { .. } => {}
@@ -518,6 +530,245 @@ impl LoomView {
         }
     }
 
+    /// Approves, rejects, pauses, resumes, interrupts, or retries the active
+    /// run. Uses the ordered `ControlRun` request against the last revision
+    /// seen (read first when unknown); older workers get the legacy request.
+    pub(crate) fn control_run(&mut self, action: RunControlAction, cx: &mut Context<Self>) {
+        if !self.collaboration.permissions().can_act {
+            self.clear_control_in_flight(&action);
+            return;
+        }
+        let Some(run) = self
+            .active_run
+            .as_ref()
+            .filter(|run| Some(run.id) == self.active_run_id)
+            .cloned()
+        else {
+            self.clear_control_in_flight(&action);
+            return;
+        };
+        let revision = self.collaboration.revision_for(&run);
+        match route_control(
+            self.collaboration.uses_ordered_path(),
+            &run,
+            revision,
+            action.clone(),
+        ) {
+            ControlRoute::Legacy(request) => self.send_legacy_control(request, action, cx),
+            ControlRoute::NeedRevision { run_id } => {
+                self.fetch_revision_then_control(run_id, action, cx)
+            }
+            ControlRoute::Ordered(request) => {
+                self.collaboration.conflict = None;
+                let run = run.clone();
+                self.dispatch(
+                    cx,
+                    ClientRequest::Collaboration(request),
+                    move |view, response, cx| {
+                        view.finish_ordered_control(response, &run, action, cx)
+                    },
+                );
+            }
+        }
+    }
+
+    fn send_legacy_control(
+        &mut self,
+        request: RunRequest,
+        action: RunControlAction,
+        cx: &mut Context<Self>,
+    ) {
+        let approval = is_approval(&action);
+        self.dispatch(
+            cx,
+            ClientRequest::Run(request),
+            move |view, response, cx| {
+                if approval {
+                    view.finish_approval_response(response, cx);
+                } else {
+                    view.finish_legacy_control_response(
+                        crate::collaboration::control_label(&action),
+                        response,
+                        cx,
+                    );
+                }
+            },
+        );
+    }
+
+    fn fetch_revision_then_control(
+        &mut self,
+        run_id: RunId,
+        action: RunControlAction,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch(
+            cx,
+            ClientRequest::Collaboration(CollaborationRequest::GetRunRevision { run_id }),
+            move |view, response, cx| {
+                match response.result {
+                    Ok(ServerResponse::Collaboration(CollaborationResponse::RunRevision {
+                        run_id,
+                        revision,
+                    })) => {
+                        view.collaboration.observe_revision(run_id, revision);
+                        let known = view
+                            .active_run
+                            .as_ref()
+                            .filter(|run| run.id == run_id)
+                            .and_then(|run| view.collaboration.revision_for(run))
+                            .is_some();
+                        if known {
+                            view.control_run(action, cx);
+                        } else {
+                            // The run moved to another attempt meanwhile; let
+                            // the person decide again.
+                            view.clear_control_in_flight(&action);
+                        }
+                    }
+                    Err(error) if is_unsupported_error(&error) => {
+                        view.collaboration.support = CollaborationSupport::Legacy;
+                        view.control_run(action, cx);
+                    }
+                    Err(error) => {
+                        view.clear_control_in_flight(&action);
+                        view.record_backend_error("read run revision", error);
+                    }
+                    Ok(response) => {
+                        view.clear_control_in_flight(&action);
+                        view.record_backend_error(
+                            "read run revision",
+                            unexpected_response("read run revision", response),
+                        );
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Applies the outcome of an ordered run control. A conflict adopts the
+    /// current revision and run and shows the notice; the action is not
+    /// applied or retried.
+    pub(crate) fn finish_ordered_control(
+        &mut self,
+        response: ResponseEnvelope,
+        run: &AgentRunSnapshot,
+        action: RunControlAction,
+        cx: &mut Context<Self>,
+    ) {
+        let operation = crate::collaboration::control_label(&action);
+        match response.result {
+            Ok(ServerResponse::Collaboration(CollaborationResponse::RunAction(outcome))) => {
+                match *outcome {
+                    RunActionOutcome::Accepted {
+                        entry,
+                        revision,
+                        run,
+                    } => {
+                        self.collaboration.observe_revision(run.id, revision);
+                        self.consume_collaboration_entry(&entry);
+                        self.adopt_run(run);
+                        self.start_run_polling(cx);
+                    }
+                    RunActionOutcome::Conflict {
+                        expected,
+                        current,
+                        run,
+                    } => {
+                        self.clear_control_in_flight(&action);
+                        self.collaboration
+                            .record_control_conflict(run.id, expected, current, action);
+                        self.adopt_run(run);
+                    }
+                }
+            }
+            Err(error) if is_unsupported_error(&error) => {
+                // The worker does not know the ordered request after all.
+                self.collaboration.support = CollaborationSupport::Legacy;
+                let request = crate::collaboration::legacy_control_request(run, action.clone());
+                self.send_legacy_control(request, action, cx);
+            }
+            Err(error) => {
+                self.clear_control_in_flight(&action);
+                self.record_backend_error(operation, error);
+            }
+            Ok(response) => {
+                self.clear_control_in_flight(&action);
+                self.record_backend_error(operation, unexpected_response(operation, response));
+            }
+        }
+        cx.notify();
+    }
+
+    fn clear_control_in_flight(&mut self, action: &RunControlAction) {
+        if is_approval(action) {
+            self.approval_request_in_flight = false;
+        }
+    }
+
+    /// Reads the session's retained attributed history and applies it, so
+    /// peer chat and attribution survive a reload or reconnect. Entries
+    /// already applied from live events are skipped.
+    pub(crate) fn load_collaboration_history(&mut self, cx: &mut Context<Self>) {
+        if self.collaboration.support == CollaborationSupport::Legacy {
+            return;
+        }
+        let session_id = self.active_session.id;
+        let generation = self.transcript_generation;
+        self.load_collaboration_page(session_id, generation, None, cx);
+    }
+
+    fn load_collaboration_page(
+        &mut self,
+        session_id: AgentSessionId,
+        generation: u64,
+        after_sequence: Option<loom_core::EventSequence>,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch(
+            cx,
+            ClientRequest::Collaboration(CollaborationRequest::ListSessionCollaboration {
+                session_id,
+                after_sequence,
+                limit: loom_protocol::MAX_SESSION_COLLABORATION_PAGE_SIZE,
+            }),
+            move |view, response, cx| {
+                if view.active_session.id != session_id || view.transcript_generation != generation
+                {
+                    return;
+                }
+                // An older worker has no history read; live events still apply.
+                if let Ok(ServerResponse::Collaboration(
+                    CollaborationResponse::SessionCollaboration {
+                        entries,
+                        next_after_sequence,
+                        ..
+                    },
+                )) = response.result
+                {
+                    view.apply_collaboration_history(entries.into_iter().map(|(_, entry)| entry));
+                    if let Some(next) = next_after_sequence
+                        && Some(next) != after_sequence
+                    {
+                        view.load_collaboration_page(session_id, generation, Some(next), cx);
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Applies attributed entries read from history, oldest first.
+    pub(crate) fn apply_collaboration_history(
+        &mut self,
+        entries: impl IntoIterator<Item = loom_core::CollaborationEntry>,
+    ) {
+        for entry in entries {
+            self.consume_collaboration_entry(&entry);
+        }
+    }
+
     /// Refreshes everything the People tab shows.
     pub(crate) fn refresh_people(&mut self, cx: &mut Context<Self>) {
         let session_id = self.active_session.id;
@@ -530,4 +781,13 @@ impl LoomView {
     pub(crate) fn can_manage_sources(&self) -> bool {
         self.collaboration.permissions().can_manage
     }
+}
+
+/// Whether a control answers a pending approval, which has its own in-flight
+/// flag.
+fn is_approval(action: &RunControlAction) -> bool {
+    matches!(
+        action,
+        RunControlAction::Approve { .. } | RunControlAction::Reject { .. }
+    )
 }

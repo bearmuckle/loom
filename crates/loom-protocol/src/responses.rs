@@ -454,6 +454,15 @@ pub enum CollaborationResponse {
         run_id: RunId,
         revision: RunRevision,
     },
+
+    /// One page of a session's attributed history. Each entry carries the
+    /// feed sequence it was stored at. `next_after_sequence` is set when more
+    /// entries follow.
+    SessionCollaboration {
+        session_id: AgentSessionId,
+        entries: Vec<(EventSequence, CollaborationEntry)>,
+        next_after_sequence: Option<EventSequence>,
+    },
 }
 
 /// Whether a run-scoped collaboration request was applied.

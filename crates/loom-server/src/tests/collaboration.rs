@@ -552,3 +552,82 @@ fn roster_and_role_changes_are_pushed_and_revoked_people_stop_reading() {
         }
     );
 }
+
+#[test]
+fn session_collaboration_history_is_readable_in_pages() {
+    let backend = InProcessBackend::new();
+    let tokens = AuthTokenStore::new();
+    let owner = person("Owner");
+    let owner_connection = connect(&backend, &tokens, &owner);
+    let session_id = create_session(&owner_connection);
+    for text in ["one", "two", "three"] {
+        collaborate(
+            &owner_connection,
+            CollaborationRequest::SendPeerMessage {
+                session_id,
+                text: text.to_owned(),
+            },
+        )
+        .unwrap();
+    }
+    let page = |after_sequence| match collaborate(
+        &owner_connection,
+        CollaborationRequest::ListSessionCollaboration {
+            session_id,
+            after_sequence,
+            limit: 2,
+        },
+    )
+    .unwrap()
+    {
+        CollaborationResponse::SessionCollaboration {
+            entries,
+            next_after_sequence,
+            ..
+        } => (entries, next_after_sequence),
+        response => panic!("unexpected history response: {response:?}"),
+    };
+    let text = |entry: &CollaborationEntry| match &entry.kind {
+        CollaborationEntryKind::PeerMessage { text } => text.clone(),
+        kind => panic!("unexpected entry kind: {kind:?}"),
+    };
+    let (first, next) = page(None);
+    assert_eq!(
+        first
+            .iter()
+            .map(|(_, entry)| text(entry))
+            .collect::<Vec<_>>(),
+        ["one", "two"]
+    );
+    assert_eq!(next, Some(first[1].0));
+    let (second, next) = page(next);
+    assert_eq!(
+        second
+            .iter()
+            .map(|(_, entry)| text(entry))
+            .collect::<Vec<_>>(),
+        ["three"]
+    );
+    assert_eq!(next, None);
+
+    // An observer may read the history too.
+    let reader = person("Reader");
+    let reader_connection = connect(&backend, &tokens, &reader);
+    promote(
+        &owner_connection,
+        session_id,
+        &reader,
+        SessionRole::Observer,
+    );
+    assert!(
+        collaborate(
+            &reader_connection,
+            CollaborationRequest::ListSessionCollaboration {
+                session_id,
+                after_sequence: None,
+                limit: 10,
+            },
+        )
+        .is_ok()
+    );
+}

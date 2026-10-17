@@ -167,23 +167,24 @@ impl LoomView {
         let (Some(run_id), Some(call)) = (self.active_run_id, self.pending_approval.clone()) else {
             return;
         };
-        let Some(run) = self.active_run.as_ref().filter(|run| run.id == run_id) else {
+        if self
+            .active_run
+            .as_ref()
+            .filter(|run| run.id == run_id)
+            .is_none()
+        {
             self.record_backend_error(
                 "approve action",
                 LoomError::invalid_state("active run control state is unavailable"),
             );
             return;
-        };
+        }
         self.approval_request_in_flight = true;
-        self.dispatch(
-            cx,
-            ClientRequest::Run(RunRequest::ApproveAgentAction {
-                run_id,
-                attempt_id: run.attempt_id,
-                expected_control_revision: run.control_revision,
+        self.control_run(
+            loom_core::RunControlAction::Approve {
                 tool_call_id: call.id,
-            }),
-            |view, response, cx| view.finish_approval_response(response, cx),
+            },
+            cx,
         );
     }
 
@@ -197,24 +198,25 @@ impl LoomView {
         let (Some(run_id), Some(call)) = (self.active_run_id, self.pending_approval.clone()) else {
             return;
         };
-        let Some(run) = self.active_run.as_ref().filter(|run| run.id == run_id) else {
+        if self
+            .active_run
+            .as_ref()
+            .filter(|run| run.id == run_id)
+            .is_none()
+        {
             self.record_backend_error(
                 "reject action",
                 LoomError::invalid_state("active run control state is unavailable"),
             );
             return;
-        };
+        }
         self.approval_request_in_flight = true;
-        self.dispatch(
-            cx,
-            ClientRequest::Run(RunRequest::RejectAgentAction {
-                run_id,
-                attempt_id: run.attempt_id,
-                expected_control_revision: run.control_revision,
+        self.control_run(
+            loom_core::RunControlAction::Reject {
                 tool_call_id: call.id,
                 reason: None,
-            }),
-            |view, response, cx| view.finish_approval_response(response, cx),
+            },
+            cx,
         );
     }
 
@@ -258,31 +260,34 @@ impl LoomView {
         if !self.collaboration.permissions().can_act {
             return;
         }
-        let Some(run_id) = self.active_run_id else {
+        if self.active_run_id.is_none() {
             return;
-        };
-        self.dispatch(
-            cx,
-            ClientRequest::Run(RunRequest::InterruptAgentRun { run_id }),
-            |view, response, cx| {
-                match response.result {
-                    Ok(ServerResponse::Run(RunResponse::AgentRun(run)))
-                    | Ok(ServerResponse::Run(RunResponse::AgentRunStarted(run))) => {
-                        view.active_run_id = Some(run.id);
-                        view.active_run = Some(run.clone());
-                        view.run_state = Some(run.state);
-                        view.session_state = session_state_for_run(run.state);
-                        view.active_session.state = view.session_state;
-                    }
-                    Err(error) => view.record_backend_error("interrupt run", error),
-                    Ok(response) => view.record_backend_error(
-                        "interrupt run",
-                        unexpected_response("interrupt run", response),
-                    ),
-                }
-                cx.notify();
-            },
-        );
+        }
+        self.control_run(loom_core::RunControlAction::Interrupt, cx);
+    }
+
+    /// Applies the response to a legacy interrupt, pause, resume, or retry.
+    pub(crate) fn finish_legacy_control_response(
+        &mut self,
+        operation: &'static str,
+        response: ResponseEnvelope,
+        cx: &mut Context<Self>,
+    ) {
+        match response.result {
+            Ok(ServerResponse::Run(RunResponse::AgentRun(run)))
+            | Ok(ServerResponse::Run(RunResponse::AgentRunStarted(run))) => {
+                self.active_run_id = Some(run.id);
+                self.active_run = Some(run.clone());
+                self.run_state = Some(run.state);
+                self.session_state = session_state_for_run(run.state);
+                self.active_session.state = self.session_state;
+            }
+            Err(error) => self.record_backend_error(operation, error),
+            Ok(response) => {
+                self.record_backend_error(operation, unexpected_response(operation, response))
+            }
+        }
+        cx.notify();
     }
 
     pub(crate) fn begin_transcript_page(

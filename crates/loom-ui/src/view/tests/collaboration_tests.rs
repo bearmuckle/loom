@@ -211,3 +211,215 @@ fn collaboration_events_reach_the_timeline_and_roster(cx: &mut TestAppContext) {
     cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
         .unwrap();
 }
+
+#[gpui_kit::test]
+fn control_conflict_adopts_the_run_and_does_not_apply_the_action(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        let run = run_snapshot(&view, AgentRunState::Paused);
+        view.active_run_id = Some(run.id);
+        view.active_run = Some(run.clone());
+        view.approval_request_in_flight = true;
+        let expected = RunRevision {
+            attempt_id: run.attempt_id,
+            control_revision: 1,
+            action_sequence: 1,
+        };
+        let current = RunRevision {
+            control_revision: 2,
+            action_sequence: 2,
+            ..expected
+        };
+        let moved = AgentRunSnapshot {
+            control_revision: 2,
+            state: AgentRunState::Cancelled,
+            ..run.clone()
+        };
+        let action = loom_core::RunControlAction::Approve {
+            tool_call_id: loom_core::ToolCallId::new(),
+        };
+        view.finish_ordered_control(
+            ResponseEnvelope::success(
+                loom_core::RequestId::new(),
+                ServerResponse::Collaboration(CollaborationResponse::RunAction(Box::new(
+                    RunActionOutcome::Conflict {
+                        expected,
+                        current,
+                        run: moved.clone(),
+                    },
+                ))),
+            ),
+            &run,
+            action,
+            cx,
+        );
+        assert!(!view.approval_request_in_flight);
+        assert_eq!(view.active_run.as_ref(), Some(&moved));
+        assert_eq!(view.run_state, Some(AgentRunState::Cancelled));
+        assert_eq!(view.collaboration.revision_for(&moved), Some(current));
+        assert!(view.collaboration.restore_draft.is_none());
+        assert!(
+            view.collaboration
+                .conflict
+                .as_ref()
+                .is_some_and(|notice| notice.control.is_some())
+        );
+        assert!(
+            !view
+                .timeline
+                .iter()
+                .any(|item| matches!(item, TimelineItem::Collaboration(_))),
+            "a refused control leaves no history row"
+        );
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("run-conflict-notice").visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn accepted_control_records_the_attributed_entry(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        let run = run_snapshot(&view, AgentRunState::Executing);
+        view.active_run_id = Some(run.id);
+        view.active_run = Some(run.clone());
+        let revision = RunRevision {
+            attempt_id: run.attempt_id,
+            control_revision: 2,
+            action_sequence: 3,
+        };
+        let paused = AgentRunSnapshot {
+            state: AgentRunState::Completed,
+            control_revision: 2,
+            ..run.clone()
+        };
+        let entry = CollaborationEntry {
+            session_id: view.active_session.id,
+            run_id: Some(run.id),
+            author: Author::Operator,
+            recipient: Recipient::Agent,
+            kind: CollaborationEntryKind::RunControl {
+                action: loom_core::RunControlAction::Pause,
+            },
+            revision: Some(revision),
+            created_at: Timestamp::now(),
+        };
+        view.finish_ordered_control(
+            ResponseEnvelope::success(
+                loom_core::RequestId::new(),
+                ServerResponse::Collaboration(CollaborationResponse::RunAction(Box::new(
+                    RunActionOutcome::Accepted {
+                        entry: entry.clone(),
+                        revision,
+                        run: paused.clone(),
+                    },
+                ))),
+            ),
+            &run,
+            loom_core::RunControlAction::Pause,
+            cx,
+        );
+        assert_eq!(view.run_state, Some(AgentRunState::Completed));
+        assert!(view.collaboration.conflict.is_none());
+        // The live event for the same entry does not add a second row.
+        view.consume_event(&ServerEvent::Collaboration { entry });
+        assert_eq!(
+            view.timeline
+                .iter()
+                .filter(|item| matches!(item, TimelineItem::Collaboration(_)))
+                .count(),
+            1
+        );
+        view
+    });
+}
+
+#[gpui_kit::test]
+fn unsupported_ordered_control_falls_back_to_the_legacy_request(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        let run = run_snapshot(&view, AgentRunState::Executing);
+        view.active_run_id = Some(run.id);
+        view.active_run = Some(run.clone());
+        view.collaboration.support = crate::collaboration::CollaborationSupport::Supported;
+        view.finish_ordered_control(
+            ResponseEnvelope::failure(
+                loom_core::RequestId::new(),
+                loom_core::LoomError::new(ErrorCode::UnsupportedCapability, "old worker", false),
+            ),
+            &run,
+            loom_core::RunControlAction::Interrupt,
+            cx,
+        );
+        assert!(!view.collaboration.uses_ordered_path());
+        assert!(view.collaboration.conflict.is_none());
+        view
+    });
+}
+
+#[gpui_kit::test]
+fn history_rebuild_restores_peer_chat_once_after_a_reset(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        let sam = person("Sam Rivera");
+        let author = Author::Participant {
+            participant: sam,
+            role: SessionRole::Participant,
+        };
+        let peer = CollaborationEntry {
+            session_id: view.active_session.id,
+            run_id: None,
+            author: author.clone(),
+            recipient: Recipient::People,
+            kind: CollaborationEntryKind::PeerMessage {
+                text: "earlier chat".to_owned(),
+            },
+            revision: None,
+            created_at: Timestamp::now(),
+        };
+        let direction = CollaborationEntry {
+            recipient: Recipient::Agent,
+            kind: CollaborationEntryKind::AgentDirection {
+                text: "cover reconnects".to_owned(),
+            },
+            ..peer.clone()
+        };
+        let peer_rows = |view: &LoomView| {
+            view.timeline
+                .iter()
+                .filter(|item| matches!(item, TimelineItem::Collaboration(_)))
+                .count()
+        };
+        // A live event arrives before the history read lands.
+        view.consume_event(&ServerEvent::Collaboration {
+            entry: peer.clone(),
+        });
+        view.apply_collaboration_history([peer.clone(), direction.clone()]);
+        assert_eq!(peer_rows(&view), 1);
+        assert_eq!(
+            view.collaboration.author_of("cover reconnects"),
+            Some(&author)
+        );
+
+        // A reload clears the timeline; history puts the rows back once.
+        view.reset_projection();
+        assert_eq!(peer_rows(&view), 0);
+        view.apply_collaboration_history([peer.clone(), direction]);
+        view.consume_event(&ServerEvent::Collaboration { entry: peer });
+        assert_eq!(peer_rows(&view), 1);
+        assert_eq!(
+            view.collaboration.author_of("cover reconnects"),
+            Some(&author)
+        );
+        view
+    });
+}

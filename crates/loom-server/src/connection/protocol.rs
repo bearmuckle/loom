@@ -948,6 +948,12 @@ impl InProcessConnection {
                     session_id: requested_session,
                     ..
                 },
+            )
+            | ClientRequest::Collaboration(
+                loom_protocol::CollaborationRequest::ListSessionCollaboration {
+                    session_id: requested_session,
+                    ..
+                },
             ) => session_id = Some(*requested_session),
             ClientRequest::Collaboration(loom_protocol::CollaborationRequest::DirectAgent {
                 run_id: requested_run,

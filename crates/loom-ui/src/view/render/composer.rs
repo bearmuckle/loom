@@ -92,10 +92,12 @@ impl LoomView {
                             div()
                                 .flex_1()
                                 .min_w(px(0.))
-                                .child(div().text_xs().text_color(rgb(0xfbbf24)).child(format!(
-                                    "Direction conflict · run rev {}",
-                                    crate::collaboration::revision_label(&conflict.current)
-                                )))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0xfbbf24))
+                                        .child(conflict.heading()),
+                                )
                                 .child(div().text_sm().child(conflict.message())),
                         )
                         .child(

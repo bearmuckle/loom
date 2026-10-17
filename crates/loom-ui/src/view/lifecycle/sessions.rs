@@ -130,6 +130,9 @@ impl LoomView {
 
     pub(crate) fn reset_projection(&mut self) {
         self.timeline.clear();
+        // The attributed rows went with the timeline, so the history read on
+        // load must be able to put them back.
+        self.collaboration.forget_entries();
         // The optimistic entries stood for timeline items that this reset just
         // removed, so keeping one would silently suppress the next matching
         // `UserMessage` event instead of showing that message.

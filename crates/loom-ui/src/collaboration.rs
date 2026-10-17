@@ -10,7 +10,7 @@ use loom_core::{
     LoomError, ParticipantId, ParticipantIdentity, PresenceStatus, ProviderCredentialMetadata,
     Recipient, RosterEntry, RunControlAction, RunCredentialPin, RunId, RunRevision, SessionRole,
 };
-use loom_protocol::{AgentRunSnapshot, AgentRunState};
+use loom_protocol::{AgentRunSnapshot, AgentRunState, CollaborationRequest, RunRequest};
 
 /// Whom the composer sends to. The choice is explicit so peer chat never
 /// reaches the agent by accident.
@@ -129,17 +129,144 @@ pub(crate) struct ConflictNotice {
     pub(crate) run_id: RunId,
     pub(crate) expected: RunRevision,
     pub(crate) current: RunRevision,
+    /// The refused run control, or `None` for a refused message.
+    pub(crate) control: Option<RunControlAction>,
 }
 
 impl ConflictNotice {
-    pub(crate) fn message(&self) -> String {
-        format!(
-            "The run changed before your message arrived (revision {} -> {}); someone else \
-             acted first. Nothing was sent and your draft is kept. Review the run and send again.",
-            revision_label(&self.expected),
-            revision_label(&self.current)
-        )
+    pub(crate) fn heading(&self) -> String {
+        let kind = if self.control.is_some() {
+            "Control conflict"
+        } else {
+            "Direction conflict"
+        };
+        format!("{kind} · run rev {}", revision_label(&self.current))
     }
+
+    pub(crate) fn message(&self) -> String {
+        match &self.control {
+            Some(action) => format!(
+                "The run changed before your action arrived (revision {} -> {}); someone else \
+                 acted first. {} was not applied. Review the run and decide again.",
+                revision_label(&self.expected),
+                revision_label(&self.current),
+                control_label(action)
+            ),
+            None => format!(
+                "The run changed before your message arrived (revision {} -> {}); someone else \
+                 acted first. Nothing was sent and your draft is kept. Review the run and send \
+                 again.",
+                revision_label(&self.expected),
+                revision_label(&self.current)
+            ),
+        }
+    }
+}
+
+/// A short name for a run control, as in "Approve".
+pub(crate) const fn control_label(action: &RunControlAction) -> &'static str {
+    match action {
+        RunControlAction::Approve { .. } => "Approve",
+        RunControlAction::Reject { .. } => "Reject",
+        RunControlAction::Pause => "Pause",
+        RunControlAction::Resume => "Resume",
+        RunControlAction::Interrupt => "Interrupt",
+        RunControlAction::Retry => "Retry",
+        RunControlAction::RetryFromCheckpoint { .. } => "Retry from checkpoint",
+    }
+}
+
+/// Where a run control goes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ControlRoute {
+    /// The worker has no ordered collaboration path: use the run request.
+    Legacy(RunRequest),
+    /// The run's revision is unknown; read it, then send.
+    NeedRevision { run_id: RunId },
+    /// Send through the ordered gate against `expected`.
+    Ordered(CollaborationRequest),
+}
+
+/// Picks the request for a run control. `ordered` is whether the worker
+/// supports collaboration requests.
+pub(crate) fn route_control(
+    ordered: bool,
+    run: &AgentRunSnapshot,
+    revision: Option<RunRevision>,
+    action: RunControlAction,
+) -> ControlRoute {
+    if !ordered {
+        return ControlRoute::Legacy(legacy_control_request(run, action));
+    }
+    match revision.filter(|revision| revision.attempt_id == run.attempt_id) {
+        Some(expected) => ControlRoute::Ordered(CollaborationRequest::ControlRun {
+            run_id: run.id,
+            expected,
+            action,
+        }),
+        None => ControlRoute::NeedRevision { run_id: run.id },
+    }
+}
+
+/// The pre-collaboration request for a run control, for older workers.
+pub(crate) fn legacy_control_request(
+    run: &AgentRunSnapshot,
+    action: RunControlAction,
+) -> RunRequest {
+    let run_id = run.id;
+    match action {
+        RunControlAction::Approve { tool_call_id } => RunRequest::ApproveAgentAction {
+            run_id,
+            attempt_id: run.attempt_id,
+            expected_control_revision: run.control_revision,
+            tool_call_id,
+        },
+        RunControlAction::Reject {
+            tool_call_id,
+            reason,
+        } => RunRequest::RejectAgentAction {
+            run_id,
+            attempt_id: run.attempt_id,
+            expected_control_revision: run.control_revision,
+            tool_call_id,
+            reason,
+        },
+        RunControlAction::Pause => RunRequest::PauseAgentRun { run_id },
+        RunControlAction::Resume => RunRequest::ResumeAgentRun { run_id },
+        RunControlAction::Interrupt => RunRequest::InterruptAgentRun { run_id },
+        RunControlAction::Retry => RunRequest::RetryAgentStep { run_id },
+        RunControlAction::RetryFromCheckpoint { checkpoint_id } => {
+            RunRequest::RetryAgentFromCheckpoint {
+                run_id,
+                checkpoint_id,
+            }
+        }
+    }
+}
+
+/// Whether an error means the worker does not know collaboration requests,
+/// so the client should use the legacy run requests instead.
+pub(crate) fn is_unsupported_error(error: &LoomError) -> bool {
+    matches!(
+        error.code,
+        ErrorCode::UnsupportedProtocol
+            | ErrorCode::UnsupportedCapability
+            | ErrorCode::MalformedPayload
+    )
+}
+
+/// How many applied entries are remembered for de-duplication.
+const MAX_SEEN_ENTRIES: usize = 2_048;
+
+/// Whether the worker answers collaboration requests.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum CollaborationSupport {
+    /// Not known yet: the identity request has not been answered.
+    #[default]
+    Unknown,
+    Supported,
+    /// An older worker: use the legacy run requests.
+    Legacy,
 }
 
 pub(crate) fn revision_label(revision: &RunRevision) -> String {
@@ -153,6 +280,8 @@ pub(crate) struct CollaborationState {
     pub(crate) identity_loaded: bool,
     /// The person this connection is bound to; `None` for an operator.
     pub(crate) identity: Option<ParticipantIdentity>,
+    /// Whether the worker answers collaboration requests.
+    pub(crate) support: CollaborationSupport,
     pub(crate) roster_session: Option<AgentSessionId>,
     pub(crate) roster: Vec<RosterEntry>,
     /// People an owner can grant access to.
@@ -173,6 +302,9 @@ pub(crate) struct CollaborationState {
     /// Who sent each agent-directed text, newest last, so the transcript can
     /// attribute the user messages it rebuilds from the run.
     pub(crate) message_authors: Vec<(String, Author)>,
+    /// Entries already applied, newest last, to de-duplicate live events
+    /// against the history read on load.
+    pub(crate) seen_entries: std::collections::VecDeque<CollaborationEntry>,
     pub(crate) request_in_flight: bool,
 }
 
@@ -180,6 +312,7 @@ impl CollaborationState {
     /// Clears everything scoped to the previous session.
     pub(crate) fn reset_session(&mut self) {
         self.identity_loaded = false;
+        self.support = CollaborationSupport::Unknown;
         self.roster_session = None;
         self.roster.clear();
         self.revision = None;
@@ -188,6 +321,7 @@ impl CollaborationState {
         self.credential_loaded = false;
         self.run_pin = None;
         self.message_authors.clear();
+        self.seen_entries.clear();
         self.recipient = ComposerRecipient::Agent;
         self.request_in_flight = false;
     }
@@ -213,6 +347,13 @@ impl CollaborationState {
     /// the roster relevant.
     pub(crate) fn is_participant_bound(&self) -> bool {
         self.identity.is_some()
+    }
+
+    /// Whether directions, answers, and controls take the ordered
+    /// collaboration path. True for participant-bound and operator
+    /// connections alike once the worker has answered the identity request.
+    pub(crate) fn uses_ordered_path(&self) -> bool {
+        self.support == CollaborationSupport::Supported
     }
 
     pub(crate) fn replace_roster(&mut self, session_id: AgentSessionId, entries: Vec<RosterEntry>) {
@@ -257,12 +398,40 @@ impl CollaborationState {
             run_id,
             expected,
             current,
+            control: None,
         });
         self.restore_draft = Some(draft);
     }
 
-    /// Records an attributed entry from the session history.
-    pub(crate) fn observe_entry(&mut self, entry: &CollaborationEntry) {
+    /// Applies a refused run control: records the current revision and shows
+    /// the notice. The control is not applied or retried.
+    pub(crate) fn record_control_conflict(
+        &mut self,
+        run_id: RunId,
+        expected: RunRevision,
+        current: RunRevision,
+        action: RunControlAction,
+    ) {
+        self.revision = Some((run_id, current));
+        self.conflict = Some(ConflictNotice {
+            run_id,
+            expected,
+            current,
+            control: Some(action),
+        });
+    }
+
+    /// Records an attributed entry from the session history. Returns `false`
+    /// for an entry already seen, so a live event and the same entry read back
+    /// from history apply once.
+    pub(crate) fn observe_entry(&mut self, entry: &CollaborationEntry) -> bool {
+        if self.seen_entries.contains(entry) {
+            return false;
+        }
+        self.seen_entries.push_back(entry.clone());
+        if self.seen_entries.len() > MAX_SEEN_ENTRIES {
+            self.seen_entries.pop_front();
+        }
         if let (Some(run_id), Some(revision)) = (entry.run_id, entry.revision) {
             self.observe_revision(run_id, revision);
         }
@@ -276,6 +445,14 @@ impl CollaborationState {
                 self.message_authors.remove(0);
             }
         }
+        true
+    }
+
+    /// Forgets which entries were applied, after the timeline was cleared for
+    /// a rebuild, so the history read can put them back.
+    pub(crate) fn forget_entries(&mut self) {
+        self.seen_entries.clear();
+        self.message_authors.clear();
     }
 
     /// The author of an agent-directed message text, when known.
@@ -693,6 +870,137 @@ mod tests {
         };
         assert_eq!(entry_text(&revoke), "Revoked access for Sam Rivera");
         assert_eq!(author_label(&Author::Operator), "Operator");
+    }
+
+    #[test]
+    fn controls_route_through_the_ordered_gate_or_the_legacy_request() {
+        let active = run(AgentRunState::Paused);
+        let current = revision(&active, 4);
+        let tool_call_id = loom_core::ToolCallId::new();
+        let approve = RunControlAction::Approve { tool_call_id };
+        assert_eq!(
+            route_control(true, &active, Some(current), approve.clone()),
+            ControlRoute::Ordered(CollaborationRequest::ControlRun {
+                run_id: active.id,
+                expected: current,
+                action: approve.clone(),
+            })
+        );
+        assert_eq!(
+            route_control(true, &active, None, RunControlAction::Resume),
+            ControlRoute::NeedRevision { run_id: active.id }
+        );
+        let stale = RunRevision {
+            attempt_id: RunAttemptId::new(),
+            ..current
+        };
+        assert_eq!(
+            route_control(true, &active, Some(stale), RunControlAction::Pause),
+            ControlRoute::NeedRevision { run_id: active.id }
+        );
+        // An older worker keeps the run requests.
+        assert_eq!(
+            route_control(false, &active, Some(current), approve),
+            ControlRoute::Legacy(RunRequest::ApproveAgentAction {
+                run_id: active.id,
+                attempt_id: active.attempt_id,
+                expected_control_revision: active.control_revision,
+                tool_call_id,
+            })
+        );
+        let checkpoint_id = loom_core::CheckpointId::new();
+        for (action, expected) in [
+            (
+                RunControlAction::Reject {
+                    tool_call_id,
+                    reason: None,
+                },
+                RunRequest::RejectAgentAction {
+                    run_id: active.id,
+                    attempt_id: active.attempt_id,
+                    expected_control_revision: active.control_revision,
+                    tool_call_id,
+                    reason: None,
+                },
+            ),
+            (
+                RunControlAction::Pause,
+                RunRequest::PauseAgentRun { run_id: active.id },
+            ),
+            (
+                RunControlAction::Resume,
+                RunRequest::ResumeAgentRun { run_id: active.id },
+            ),
+            (
+                RunControlAction::Interrupt,
+                RunRequest::InterruptAgentRun { run_id: active.id },
+            ),
+            (
+                RunControlAction::Retry,
+                RunRequest::RetryAgentStep { run_id: active.id },
+            ),
+            (
+                RunControlAction::RetryFromCheckpoint { checkpoint_id },
+                RunRequest::RetryAgentFromCheckpoint {
+                    run_id: active.id,
+                    checkpoint_id,
+                },
+            ),
+        ] {
+            assert_eq!(legacy_control_request(&active, action), expected);
+        }
+    }
+
+    #[test]
+    fn ordered_path_needs_worker_support_not_a_bound_person() {
+        let mut state = CollaborationState::default();
+        assert!(!state.uses_ordered_path());
+        state.support = CollaborationSupport::Supported;
+        assert!(!state.is_participant_bound());
+        assert!(state.uses_ordered_path(), "operators take the ordered path");
+        state.support = CollaborationSupport::Legacy;
+        assert!(!state.uses_ordered_path());
+        assert!(is_unsupported_error(&LoomError::new(
+            ErrorCode::UnsupportedCapability,
+            "x",
+            false
+        )));
+        assert!(!is_unsupported_error(&LoomError::invalid_state("x")));
+    }
+
+    #[test]
+    fn control_conflict_keeps_no_draft_and_names_the_action() {
+        let mut state = CollaborationState::default();
+        let active = run(AgentRunState::Executing);
+        let expected = revision(&active, 1);
+        let current = revision(&active, 2);
+        state.record_control_conflict(active.id, expected, current, RunControlAction::Pause);
+        assert_eq!(state.restore_draft, None);
+        assert_eq!(state.revision_for(&active), Some(current));
+        let notice = state.conflict.as_ref().unwrap();
+        assert!(notice.message().contains("Pause was not applied"));
+        assert!(notice.heading().starts_with("Control conflict"));
+    }
+
+    #[test]
+    fn entries_are_observed_once_until_forgotten() {
+        let mut state = CollaborationState::default();
+        let entry = CollaborationEntry {
+            session_id: AgentSessionId::new(),
+            run_id: None,
+            author: Author::Operator,
+            recipient: Recipient::Agent,
+            kind: CollaborationEntryKind::AgentDirection {
+                text: "go".to_owned(),
+            },
+            revision: None,
+            created_at: Timestamp::now(),
+        };
+        assert!(state.observe_entry(&entry));
+        assert!(!state.observe_entry(&entry));
+        assert_eq!(state.message_authors.len(), 1);
+        state.forget_entries();
+        assert!(state.observe_entry(&entry));
     }
 
     #[test]
