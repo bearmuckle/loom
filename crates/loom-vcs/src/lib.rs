@@ -95,27 +95,97 @@ pub struct RemoteRefreshReport {
     pub fetched_at: Timestamp,
 }
 
-/// What one push to the `origin` remote changed about a branch.
+/// One push request against the `origin` remote.
 ///
-/// Every field describes the update that push performed, never what a cached
-/// `refs/remotes/origin/*` ref says afterwards: `previous_revision` comes from
-/// the refs the remote itself advertised to the push, so a checkout that has
-/// been idle for hours cannot report a stale revision as the one it replaced.
+/// `remote_branch` names the remote ref to update when it differs from the
+/// local branch name. `lease` turns the update into a force-with-lease rewrite
+/// of the target ref. `dry_run` performs every read a push performs and reports
+/// what it would change without sending a ref update.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BranchPush<'a> {
+    /// Local branch whose tip is pushed.
+    pub branch: &'a str,
+    /// Remote branch to update; the local branch name when omitted.
+    pub remote_branch: Option<&'a str>,
+    /// Revision the caller believes the remote ref is at. Supplying it asks for
+    /// a force-with-lease rewrite instead of a fast-forward-only push.
+    pub lease: Option<&'a str>,
+    /// Report the update without performing it.
+    pub dry_run: bool,
+}
+
+/// What one push or one remote ref deletion did to the `origin` remote.
+///
+/// Every field describes the update this call performed or would perform,
+/// never what a cached `refs/remotes/origin/*` ref says afterwards:
+/// `previous_revision` comes from the refs the remote itself advertised, so a
+/// checkout that has been idle for hours cannot report a stale revision as the
+/// one it replaced.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BranchPushReport {
-    /// Full ref name the push updated, such as `refs/heads/loom/topic`.
+pub struct PushReport {
+    /// Full ref name the call updated, deleted, or would update, such as
+    /// `refs/heads/loom/topic` or `refs/tags/v1`.
     pub refname: String,
-    /// Revision the remote ref held before this push, or `None` when the remote
+    /// Revision the remote ref held before this call, or `None` when the remote
     /// advertised no such ref, so the push created it.
     pub previous_revision: Option<String>,
-    /// Revision the pushed branch pointed at, which is the revision the remote
-    /// ref holds once the push succeeded.
-    pub revision: String,
+    /// Revision the pushed ref points at once the push succeeded, or `None` for
+    /// a delete, which leaves no revision behind.
+    pub revision: Option<String>,
     /// Commits `revision` carries that `previous_revision` did not, counted over
-    /// the range `previous_revision..revision`. `None` exactly when
-    /// `previous_revision` is `None`: a ref that did not exist has no previous
-    /// side of the range to count from.
+    /// the range `previous_revision..revision`. `None` exactly when there is no
+    /// previous revision (a ref that did not exist has no previous side of the
+    /// range to count from), when the previous side cannot be counted, or for a
+    /// delete.
     pub commits: Option<usize>,
+    /// Whether the pushed tip equals or descends from the previous remote
+    /// revision. `Some` only for a branch push that has a previous remote
+    /// revision: a new ref, a tag push, and a delete have no fast-forward
+    /// question to answer.
+    pub fast_forward: Option<bool>,
+    /// Whether this call deleted the ref.
+    pub deleted: bool,
+    /// Whether this call reported the change without performing it.
+    pub dry_run: bool,
+}
+
+/// One ref the `origin` remote advertises.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteRef {
+    /// Full ref name, such as `refs/heads/main` or `refs/tags/v1`.
+    pub refname: String,
+    /// Revision the remote advertises for that ref.
+    pub revision: String,
+}
+
+/// How far one local branch is ahead of and behind the head of the same name on
+/// the `origin` remote, as resolved by a fetch performed for the report.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteBranchTracking {
+    /// Branch name, which is both the local branch and the remote head name.
+    pub branch: String,
+    /// Tip of the local branch.
+    pub local_revision: String,
+    /// Tip of the remote head, as resolved by that fetch.
+    pub remote_revision: String,
+    /// Commits the local branch has that the remote head does not.
+    pub ahead: usize,
+    /// Commits the remote head has that the local branch does not.
+    pub behind: usize,
+}
+
+/// The refs the `origin` remote advertises, plus tracking for one local branch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteRefsReport {
+    /// Remote that was read; currently always `origin`.
+    pub remote: String,
+    /// Heads the remote advertises, sorted by ref name.
+    pub heads: Vec<RemoteRef>,
+    /// Tags the remote advertises, sorted by ref name, without peeled entries.
+    pub tags: Vec<RemoteRef>,
+    /// Ahead/behind of the requested local branch against the remote head of the
+    /// same name, when both exist.
+    pub tracking: Option<RemoteBranchTracking>,
 }
 
 impl GitService {
@@ -669,77 +739,41 @@ impl GitService {
     /// Pushes a local branch to the `origin` remote using the supplied access
     /// token and reports what the push changed.
     ///
-    /// The branch must already exist and point at a commit. The update is
-    /// fast-forward-only: the remote rejects a non-fast-forward push. Before
-    /// pushing, the refs the remote advertises are read on a bounded worker (the
-    /// deadline, credentials, and proxy options of
+    /// The branch must already exist and point at a commit. `push.remote_branch`
+    /// names the remote ref to update when it differs from the local branch name.
+    /// The update is fast-forward-only unless `push.lease` is supplied: the
+    /// remote rejects a non-fast-forward push, and a lease turns the push into a
+    /// force-with-lease rewrite of the target ref.
+    ///
+    /// Before pushing, the refs the remote advertises are read on a bounded
+    /// worker (the deadline, credentials, and proxy options of
     /// [`Self::refresh_origin_default_branch`]), and the revision that read
-    /// resolves for the branch is what the report's previous revision states, so
-    /// the report never describes a cached `refs/remotes/origin/*` ref. A read
-    /// that does not finish within `deadline` fails the push instead of
-    /// reporting an unknown update. The token is used only for this push and the
-    /// reads it performs and is never written to the repository configuration.
+    /// resolves for the target ref is what the report's previous revision
+    /// states, so the report never describes a cached `refs/remotes/origin/*`
+    /// ref. A read that does not finish within `deadline` fails the push instead
+    /// of reporting an unknown update. With `push.dry_run` the same reads are
+    /// performed and the same report is returned, and no ref update is sent. The
+    /// token is used only for this push and the reads it performs and is never
+    /// written to the repository configuration.
     pub fn push_branch_authenticated(
         &self,
-        branch: &str,
+        push: BranchPush<'_>,
         token: &str,
         deadline: Duration,
-    ) -> Result<BranchPushReport> {
-        self.push_branch(branch, None, token, deadline)
-    }
-
-    /// Pushes a local branch to the `origin` remote as a force-with-lease rewrite
-    /// using the supplied access token.
-    ///
-    /// `lease` is the revision the caller believes the remote branch is at. The
-    /// push reads the refs the remote advertises (bounded by `deadline`, with the
-    /// same credentials as [`Self::push_branch_authenticated`]) and rewrites the
-    /// ref only while the advertised revision equals `lease`. A lease that does
-    /// not match, and a lease for a branch the remote does not advertise, are
-    /// refused with [`ErrorCode::Conflict`] naming the lease and the advertised
-    /// revision, and no ref update reaches the remote.
-    ///
-    /// The rewrite is a forced refspec whose old value is the revision the remote
-    /// advertised, so the remote still rejects the update if the ref moves
-    /// between the read and the rewrite. This is the two-step shape of
-    /// `git push --force-with-lease`: the lease is what makes the rewrite safe,
-    /// and a caller that leases a revision it did not read from the remote gives
-    /// up that safety.
-    pub fn push_branch_force_with_lease_authenticated(
-        &self,
-        branch: &str,
-        lease: &str,
-        token: &str,
-        deadline: Duration,
-    ) -> Result<BranchPushReport> {
-        self.push_branch(branch, Some(lease), token, deadline)
-    }
-
-    /// Shared implementation of the two authenticated pushes.
-    ///
-    /// `lease` turns the push into a force-with-lease rewrite: the revision the
-    /// remote advertises for the branch is read first, compared with `lease`, and
-    /// the ref is rewritten with a forced refspec only once they match. A refused
-    /// push has sent no ref update to the remote.
-    fn push_branch(
-        &self,
-        branch: &str,
-        lease: Option<&str>,
-        token: &str,
-        deadline: Duration,
-    ) -> Result<BranchPushReport> {
-        let refname = format!("refs/heads/{branch}");
+    ) -> Result<PushReport> {
+        let remote_branch = push.remote_branch.unwrap_or(push.branch);
+        let refname = format!("refs/heads/{remote_branch}");
         if !git2::Reference::is_valid_name(&refname) {
             return Err(LoomError::invalid_request(format!(
-                "'{branch}' is not a valid Git branch name"
+                "'{remote_branch}' is not a valid Git branch name"
             )));
         }
         let repository = self.repository()?;
         let revision = repository
-            .find_branch(branch, BranchType::Local)
+            .find_branch(push.branch, BranchType::Local)
             .map_err(|error| {
                 if error.code() == git2::ErrorCode::NotFound {
-                    LoomError::not_found("local Git branch", branch)
+                    LoomError::not_found("local Git branch", push.branch)
                 } else {
                     git_error("could not look up local Git branch", error)
                 }
@@ -748,14 +782,15 @@ impl GitService {
             .target()
             .ok_or_else(|| {
                 LoomError::invalid_state(format!(
-                    "local Git branch '{branch}' does not point to a commit"
+                    "local Git branch '{}' does not point to a commit",
+                    push.branch
                 ))
             })?;
-        // The remote's own advertisement of the ref decides both the lease and
-        // the previous revision the report names, so nothing here trusts a cached
-        // remote-tracking ref.
-        let previous = self.remote_branch_revision(branch, token, deadline)?;
-        if let Some(lease) = lease
+        // The remote's own advertisement of the target ref decides both the lease
+        // and the previous revision the report names, so nothing here trusts a
+        // cached remote-tracking ref.
+        let previous = self.remote_ref_revision(&refname, token, deadline)?;
+        if let Some(lease) = push.lease
             && previous
                 .as_deref()
                 .is_none_or(|previous| !previous.eq_ignore_ascii_case(lease))
@@ -769,18 +804,184 @@ impl GitService {
                 ),
             }));
         }
-        let commits = match previous.as_deref() {
-            Some(previous) => Some(self.landed_commits(
+        let (commits, fast_forward) = match previous.as_deref() {
+            Some(previous) => {
+                let commits = self.landed_commits(
+                    &repository,
+                    previous,
+                    revision,
+                    &refname,
+                    token,
+                    deadline,
+                )?;
+                let previous_oid = remote_revision_oid(previous, &refname)?;
+                // The range above is materialised, so the previous revision is
+                // readable here. A rewritten history is a legitimate lease push,
+                // which is exactly the report that says the update is not a
+                // fast-forward.
+                let fast_forward = revision == previous_oid
+                    || repository
+                        .graph_descendant_of(revision, previous_oid)
+                        .map_err(|error| {
+                            git_error(
+                                &format!(
+                                    "could not verify that the pushed revision {revision} descends from the previous remote revision {previous} of '{refname}'"
+                                ),
+                                error,
+                            )
+                        })?;
+                (Some(commits), Some(fast_forward))
+            }
+            None => (None, None),
+        };
+        if !push.dry_run {
+            // Only a verified lease rewrites the ref, so only then is the refspec
+            // forced; without one the remote rejects an update that is not a
+            // fast-forward. The refspec source is the revision resolved above, so
+            // the ref that is updated is the revision the report names.
+            let forced = if push.lease.is_some() { "+" } else { "" };
+            self.push_refspec(
                 &repository,
-                previous,
-                revision,
-                branch,
+                &format!("{forced}{revision}:{refname}"),
+                "could not push Git branch",
                 token,
-                deadline,
-            )?),
+            )?;
+        }
+        Ok(PushReport {
+            refname,
+            previous_revision: previous,
+            revision: Some(revision.to_string()),
+            commits,
+            fast_forward,
+            deleted: false,
+            dry_run: push.dry_run,
+        })
+    }
+
+    /// Pushes the local tag `tag` to `refs/tags/<tag>` on the `origin` remote.
+    ///
+    /// The tag must already exist locally. The pushed value is the tag's own
+    /// target object, so an annotated tag is pushed as the tag object and not as
+    /// the commit it peels to. The previous remote revision is read on the same
+    /// bounded worker as a branch push, and the commit range is counted from the
+    /// peeled previous tag to the peeled local tag when both peel. No lease
+    /// applies to a tag, so `fast_forward` is `None`. With `dry_run` the same
+    /// reads are performed and no ref update is sent.
+    pub fn push_tag_authenticated(
+        &self,
+        tag: &str,
+        dry_run: bool,
+        token: &str,
+        deadline: Duration,
+    ) -> Result<PushReport> {
+        let refname = format!("refs/tags/{tag}");
+        if !git2::Reference::is_valid_name(&refname) {
+            return Err(LoomError::invalid_request(format!(
+                "'{tag}' is not a valid Git tag name"
+            )));
+        }
+        let repository = self.repository()?;
+        let revision = repository
+            .find_reference(&refname)
+            .map_err(|error| {
+                if error.code() == git2::ErrorCode::NotFound {
+                    LoomError::not_found("local Git tag", tag)
+                } else {
+                    git_error("could not look up local Git tag", error)
+                }
+            })?
+            .target()
+            .ok_or_else(|| {
+                LoomError::invalid_state(format!(
+                    "local Git tag '{tag}' does not point to an object"
+                ))
+            })?;
+        let previous = self.remote_ref_revision(&refname, token, deadline)?;
+        let commits = match previous.as_deref() {
+            Some(previous) => {
+                self.materialize_remote_revision(&repository, previous, &refname, token, deadline)?;
+                peeled_commit_commits(&repository, previous, revision)?
+            }
             None => None,
         };
-        let mut remote = find_origin_remote(&repository)?;
+        if !dry_run {
+            self.push_refspec(
+                &repository,
+                &format!("{revision}:{refname}"),
+                "could not push Git tag",
+                token,
+            )?;
+        }
+        Ok(PushReport {
+            refname,
+            previous_revision: previous,
+            revision: Some(revision.to_string()),
+            commits,
+            fast_forward: None,
+            deleted: false,
+            dry_run,
+        })
+    }
+
+    /// Deletes the full ref name `refname` from the `origin` remote.
+    ///
+    /// `refname` must be a valid full ref name. The ref the remote advertises is
+    /// read first; a ref the remote does not advertise is reported as
+    /// [`ErrorCode::NotFound`] naming the ref, because there is nothing to
+    /// delete. The report names the previous revision and holds no new revision.
+    /// With `dry_run` the read is performed and the deletion is not.
+    pub fn delete_remote_ref_authenticated(
+        &self,
+        refname: &str,
+        dry_run: bool,
+        token: &str,
+        deadline: Duration,
+    ) -> Result<PushReport> {
+        if !git2::Reference::is_valid_name(refname) {
+            return Err(LoomError::invalid_request(format!(
+                "'{refname}' is not a valid full Git ref name to delete"
+            )));
+        }
+        let previous = self
+            .remote_ref_revision(refname, token, deadline)?
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::NotFound,
+                    format!(
+                        "the 'origin' remote advertises no ref '{refname}', so there is nothing to delete"
+                    ),
+                    false,
+                )
+            })?;
+        if !dry_run {
+            let repository = self.repository()?;
+            self.push_refspec(
+                &repository,
+                &format!(":{refname}"),
+                "could not delete the remote Git ref",
+                token,
+            )?;
+        }
+        Ok(PushReport {
+            refname: refname.to_owned(),
+            previous_revision: Some(previous),
+            revision: None,
+            commits: None,
+            fast_forward: None,
+            deleted: true,
+            dry_run,
+        })
+    }
+
+    /// Sends one refspec to the `origin` remote with the push credentials.
+    fn push_refspec(
+        &self,
+        repository: &Repository,
+        refspec: &str,
+        operation: &str,
+        token: &str,
+    ) -> Result<()> {
+        let mut remote = find_origin_remote(repository)?;
         let token = token.to_owned();
         let mut callbacks = RemoteCallbacks::new();
         callbacks.credentials(move |url, username_from_url, allowed_types| {
@@ -795,120 +996,126 @@ impl GitService {
         let mut push_options = PushOptions::new();
         push_options.remote_callbacks(callbacks);
         push_options.proxy_options(remote_proxy_options());
-        // Only a verified lease rewrites the ref, so only then is the refspec
-        // forced; without one the remote rejects an update that is not a
-        // fast-forward. The refspec source is the revision resolved above, so the
-        // ref that is updated is the revision the report names.
-        let forced = if lease.is_some() { "+" } else { "" };
-        let refspec = format!("{forced}{revision}:{refname}");
         remote
-            .push(&[refspec.as_str()], Some(&mut push_options))
-            .map_err(|error| git_error("could not push Git branch", error))?;
-        Ok(BranchPushReport {
-            refname,
-            previous_revision: previous,
-            revision: revision.to_string(),
-            commits,
-        })
+            .push(&[refspec], Some(&mut push_options))
+            .map_err(|error| git_error(operation, error))?;
+        Ok(())
     }
 
-    /// Revision the `origin` remote advertises for `branch`, or `None` when the
+    /// Revision the `origin` remote advertises for `refname`, or `None` when the
     /// remote advertises no such ref.
     ///
     /// The read runs on a bounded worker with the credentials of a push and looks
     /// at the refs the remote itself advertised, so a cached
     /// `refs/remotes/origin/*` ref is never used as a stand-in for it.
-    fn remote_branch_revision(
+    fn remote_ref_revision(
         &self,
-        branch: &str,
+        refname: &str,
         token: &str,
         deadline: Duration,
     ) -> Result<Option<String>> {
         let root = self.root.clone();
-        let branch = branch.to_owned();
+        let refname = refname.to_owned();
         let token = token.to_owned();
-        let operation = format!(
-            "reading the revision the 'origin' remote advertises for 'refs/heads/{branch}'"
-        );
+        let operation =
+            format!("reading the revision the 'origin' remote advertises for '{refname}'");
         bounded_remote_operation(
-            "loom-vcs-remote-branch-read",
+            "loom-vcs-remote-ref-read",
             &operation,
             deadline,
-            move || read_remote_branch(&root, &branch, &token),
+            move || read_remote_ref(&root, &refname, &token),
         )
     }
 
-    /// Commits the pushed revision carries that the previous remote revision did
-    /// not, which is the range `previous..revision` a push landed.
+    /// Makes a revision the remote advertises readable in this checkout.
     ///
     /// A previous revision the remote advertises but the checkout cannot read is
     /// the case a report matters most in: the remote moved on since this checkout
     /// was cloned, so the range is measured against what the remote really held,
-    /// materialised with one bounded fetch.
+    /// materialised with one bounded fetch into
+    /// `refs/remotes/origin/<short name>`.
+    fn materialize_remote_revision(
+        &self,
+        repository: &Repository,
+        previous: &str,
+        refname: &str,
+        token: &str,
+        deadline: Duration,
+    ) -> Result<()> {
+        let previous_oid = remote_revision_oid(previous, refname)?;
+        let present = repository
+            .odb()
+            .map_err(|error| git_error("could not read the repository object database", error))?
+            .exists(previous_oid);
+        if present {
+            return Ok(());
+        }
+        let root = self.root.clone();
+        let refname = refname.to_owned();
+        let fetched = previous.to_owned();
+        let token = token.to_owned();
+        let operation = format!(
+            "fetching the revision '{previous}' the 'origin' remote advertises for '{refname}'"
+        );
+        bounded_remote_operation(
+            "loom-vcs-remote-ref-fetch",
+            &operation,
+            deadline,
+            move || fetch_remote_ref(&root, &refname, &fetched, &token),
+        )
+    }
+
+    /// Commits the pushed branch revision carries that the previous remote
+    /// revision did not, which is the range `previous..revision` a push landed.
     fn landed_commits(
         &self,
         repository: &Repository,
         previous: &str,
         revision: Oid,
-        branch: &str,
+        refname: &str,
         token: &str,
         deadline: Duration,
     ) -> Result<usize> {
-        let previous_oid = Oid::from_str(previous).map_err(|error| {
-            LoomError::new(
-                ErrorCode::Vcs,
-                format!(
-                    "the 'origin' remote advertised an unreadable revision '{previous}' for '{branch}': {error}"
-                ),
-                false,
-            )
-        })?;
-        let present = repository
-            .odb()
-            .map_err(|error| git_error("could not read the repository object database", error))?
-            .exists(previous_oid);
-        if !present {
-            let root = self.root.clone();
-            let branch = branch.to_owned();
-            let fetched = previous.to_owned();
-            let token = token.to_owned();
-            let operation = format!(
-                "fetching the revision '{previous}' the 'origin' remote advertises for 'refs/heads/{branch}'"
-            );
-            bounded_remote_operation(
-                "loom-vcs-remote-branch-fetch",
-                &operation,
-                deadline,
-                move || fetch_remote_branch(&root, &branch, &fetched, &token),
-            )?;
-        }
+        self.materialize_remote_revision(repository, previous, refname, token, deadline)?;
+        let previous_oid = remote_revision_oid(previous, refname)?;
         let previous_commit = repository.find_commit(previous_oid).map_err(|error| {
             git_error(
                 &format!(
-                    "could not read the previous remote revision {previous} of '{branch}' after fetching it"
+                    "could not read the previous remote revision {previous} of '{refname}' after fetching it"
                 ),
                 error,
             )
         })?;
-        // Counted with a revision walk rather than a merge-base comparison:
-        // replacing history with an unrelated one is a legitimate force push, and
-        // the range is then every commit the pushed revision carries.
-        let mut walk = repository
-            .revwalk()
-            .map_err(|error| git_error("could not walk the Git history", error))?;
-        walk.push(revision).map_err(|error| {
-            git_error(
-                &format!("could not walk the pushed revision {revision}"),
-                error,
-            )
-        })?;
-        walk.hide(previous_commit.id()).map_err(|error| {
-            git_error(
-                &format!("could not walk up to the previous remote revision {previous}"),
-                error,
-            )
-        })?;
-        Ok(walk.count())
+        count_landed_commits(repository, previous_commit.id(), revision)
+    }
+
+    /// Lists the refs the `origin` remote itself advertises and, when a local
+    /// branch is named, how far it is ahead of and behind the remote head of the
+    /// same name.
+    ///
+    /// The whole read runs on one bounded worker with the credentials of a push,
+    /// so a stalled remote delays the caller by at most `deadline`. The heads and
+    /// tags come from the remote's advertisement, never from cached
+    /// `refs/remotes/origin/*` refs. When `branch` is given and both a local
+    /// branch and a remote head of that name exist, that one head is fetched into
+    /// `refs/remotes/origin/<branch>` and the tracking report is measured against
+    /// it; `ahead` counts the commits the local branch has that the remote head
+    /// does not.
+    pub fn remote_refs_authenticated(
+        &self,
+        branch: Option<&str>,
+        token: &str,
+        deadline: Duration,
+    ) -> Result<RemoteRefsReport> {
+        let root = self.root.clone();
+        let branch = branch.map(str::to_owned);
+        let token = token.to_owned();
+        bounded_remote_operation(
+            "loom-vcs-remote-refs-read",
+            "listing the refs the 'origin' remote advertises",
+            deadline,
+            move || read_remote_refs(&root, branch.as_deref(), &token),
+        )
     }
 
     /// Fast-forwards the currently checked-out local branch to `target_commit`.
@@ -2454,13 +2661,88 @@ where
     }
 }
 
-/// Revision `origin` advertises for `branch`, read from the refs the remote
-/// sends when it is contacted for a fetch. `None` means the remote advertises no
-/// such ref, so a push would create it.
+/// Parses a revision the remote advertised, naming the ref in every failure.
+fn remote_revision_oid(previous: &str, refname: &str) -> Result<Oid> {
+    Oid::from_str(previous).map_err(|error| {
+        LoomError::new(
+            ErrorCode::Vcs,
+            format!(
+                "the 'origin' remote advertised an unreadable revision '{previous}' for '{refname}': {error}"
+            ),
+            false,
+        )
+    })
+}
+
+/// Counts the commits in the range `previous..revision` a push landed.
+///
+/// Counted with a revision walk rather than a merge-base comparison: replacing
+/// history with an unrelated one is a legitimate force push, and the range is
+/// then every commit the pushed revision carries.
+fn count_landed_commits(repository: &Repository, previous: Oid, revision: Oid) -> Result<usize> {
+    let mut walk = repository
+        .revwalk()
+        .map_err(|error| git_error("could not walk the Git history", error))?;
+    walk.push(revision).map_err(|error| {
+        git_error(
+            &format!("could not walk the pushed revision {revision}"),
+            error,
+        )
+    })?;
+    walk.hide(previous).map_err(|error| {
+        git_error(
+            &format!("could not walk up to the previous remote revision {previous}"),
+            error,
+        )
+    })?;
+    Ok(walk.count())
+}
+
+/// Commits a tag push lands, counted from the peeled previous remote revision to
+/// the peeled local one. `None` when either side does not peel to a commit, such
+/// as a tag of a blob: there is then no commit range to count.
+fn peeled_commit_commits(
+    repository: &Repository,
+    previous: &str,
+    revision: Oid,
+) -> Result<Option<usize>> {
+    let peeled = |revision: &str| {
+        repository
+            .revparse_single(revision)
+            .and_then(|object| object.peel_to_commit())
+            .ok()
+            .map(|commit| commit.id())
+    };
+    let (Some(previous_commit), Some(revision_commit)) =
+        (peeled(previous), peeled(&revision.to_string()))
+    else {
+        return Ok(None);
+    };
+    count_landed_commits(repository, previous_commit, revision_commit).map(Some)
+}
+
+/// The `refs/remotes/origin/*` ref a fetched ref name is materialised as. A tag
+/// keeps its `tags/` segment so it cannot shadow a branch of the same name.
+fn remote_tracking_refname(refname: &str) -> String {
+    let short = refname
+        .strip_prefix("refs/heads/")
+        .map(str::to_owned)
+        .or_else(|| {
+            refname
+                .strip_prefix("refs/tags/")
+                .map(|tag| format!("tags/{tag}"))
+        })
+        .unwrap_or_else(|| refname.to_owned());
+    format!("refs/remotes/origin/{short}")
+}
+
+/// Revision `origin` advertises for the full ref name `refname`, read from the
+/// refs the remote sends when it is contacted for a fetch. `None` means the
+/// remote advertises no such ref, so a push would create it.
 ///
 /// Runs on a bounded worker thread, so it never opens a second repository handle
 /// on the caller's behalf.
-fn read_remote_branch(root: &Path, branch: &str, token: &str) -> Result<Option<String>> {
+fn read_remote_ref(root: &Path, refname: &str, token: &str) -> Result<Option<String>> {
     let repository = Repository::open(root)
         .map_err(|error| git_error("could not open Git repository", error))?;
     let mut remote = find_origin_remote(&repository)?;
@@ -2480,7 +2762,6 @@ fn read_remote_branch(root: &Path, branch: &str, token: &str) -> Result<Option<S
         )
         .map_err(|error| git_error("could not contact the 'origin' remote", error))?;
     drop(connection);
-    let refname = format!("refs/heads/{branch}");
     let heads = remote.list().map_err(|error| {
         git_error(
             "could not read the refs the 'origin' remote advertises",
@@ -2493,12 +2774,13 @@ fn read_remote_branch(root: &Path, branch: &str, token: &str) -> Result<Option<S
         .map(|head| head.oid().to_string()))
 }
 
-/// Fetches `branch` from `origin`, so a revision the remote advertises but this
-/// checkout does not hold yet becomes readable.
+/// Fetches the full ref name `refname` from `origin` into
+/// `refs/remotes/origin/<short name>`, so a revision the remote advertises but
+/// this checkout does not hold yet becomes readable.
 ///
 /// Runs on a bounded worker thread, so it never opens a second repository handle
 /// on the caller's behalf.
-fn fetch_remote_branch(root: &Path, branch: &str, revision: &str, token: &str) -> Result<()> {
+fn fetch_remote_ref(root: &Path, refname: &str, revision: &str, token: &str) -> Result<()> {
     let repository = Repository::open(root)
         .map_err(|error| git_error("could not open Git repository", error))?;
     let mut remote = find_origin_remote(&repository)?;
@@ -2510,15 +2792,156 @@ fn fetch_remote_branch(root: &Path, branch: &str, revision: &str, token: &str) -
     let mut fetch_options = FetchOptions::new();
     fetch_options.remote_callbacks(callbacks);
     fetch_options.proxy_options(remote_proxy_options());
-    let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+    let refspec = format!("+{refname}:{}", remote_tracking_refname(refname));
     remote
         .fetch(&[refspec.as_str()], Some(&mut fetch_options), None)
         .map_err(|error| {
             git_error(
-                &format!("could not fetch the remote revision {revision} of 'refs/heads/{branch}'"),
+                &format!("could not fetch the remote revision {revision} of '{refname}'"),
                 error,
             )
         })
+}
+
+/// Reads the refs the `origin` remote advertises and, when `branch` is given and
+/// both sides exist, the ahead/behind of that local branch against the remote
+/// head of the same name.
+///
+/// Runs on a bounded worker thread, so it never opens a second repository handle
+/// on the caller's behalf.
+fn read_remote_refs(root: &Path, branch: Option<&str>, token: &str) -> Result<RemoteRefsReport> {
+    let repository = Repository::open(root)
+        .map_err(|error| git_error("could not open Git repository", error))?;
+    let mut remote = find_origin_remote(&repository)?;
+    let connection_token = token.to_owned();
+    let mut callbacks = RemoteCallbacks::new();
+    callbacks.credentials(move |url, username_from_url, allowed_types| {
+        credential_for(url, username_from_url, allowed_types, &connection_token)
+    });
+    // The connection guard holds the mutable borrow of the remote, so it is
+    // dropped before the refs are read; libgit2 keeps the refs the remote
+    // advertised available after the connection closes.
+    let connection = remote
+        .connect_auth(
+            Direction::Fetch,
+            Some(callbacks),
+            Some(remote_proxy_options()),
+        )
+        .map_err(|error| git_error("could not contact the 'origin' remote", error))?;
+    drop(connection);
+    let advertised = remote.list().map_err(|error| {
+        git_error(
+            "could not read the refs the 'origin' remote advertises",
+            error,
+        )
+    })?;
+    let mut heads = Vec::new();
+    let mut tags = Vec::new();
+    for reference in advertised {
+        let refname = reference.name();
+        // A peeled tag entry names the commit the tag points at; it is not a ref
+        // the remote holds, so it is not reported as one.
+        if refname.ends_with("^{}") {
+            continue;
+        }
+        let advertised_ref = RemoteRef {
+            refname: refname.to_owned(),
+            revision: reference.oid().to_string(),
+        };
+        if refname.starts_with("refs/heads/") {
+            heads.push(advertised_ref);
+        } else if refname.starts_with("refs/tags/") {
+            tags.push(advertised_ref);
+        }
+    }
+    heads.sort_by(|left, right| left.refname.cmp(&right.refname));
+    tags.sort_by(|left, right| left.refname.cmp(&right.refname));
+    let tracking = match branch {
+        Some(branch) => remote_branch_tracking(&repository, &mut remote, branch, &heads, token)?,
+        None => None,
+    };
+    Ok(RemoteRefsReport {
+        remote: "origin".to_owned(),
+        heads,
+        tags,
+        tracking,
+    })
+}
+
+/// Ahead/behind of the local branch `branch` against the remote head of the same
+/// name, materialised with one fetch into `refs/remotes/origin/<branch>`.
+///
+/// `None` when the remote advertises no such head or the checkout has no local
+/// branch of that name: there is then nothing to compare.
+fn remote_branch_tracking(
+    repository: &Repository,
+    remote: &mut git2::Remote<'_>,
+    branch: &str,
+    heads: &[RemoteRef],
+    token: &str,
+) -> Result<Option<RemoteBranchTracking>> {
+    let refname = format!("refs/heads/{branch}");
+    if !heads.iter().any(|head| head.refname == refname) {
+        return Ok(None);
+    }
+    let local_branch = match repository.find_branch(branch, BranchType::Local) {
+        Ok(local_branch) => local_branch,
+        Err(error) if error.code() == git2::ErrorCode::NotFound => return Ok(None),
+        Err(error) => return Err(git_error("could not look up local Git branch", error)),
+    };
+    let local_commit = local_branch
+        .into_reference()
+        .peel_to_commit()
+        .map_err(|error| {
+            git_error(
+                &format!("could not read the local Git branch '{branch}' as a commit"),
+                error,
+            )
+        })?;
+    let token_owned = token.to_owned();
+    let mut callbacks = RemoteCallbacks::new();
+    callbacks.credentials(move |url, username_from_url, allowed_types| {
+        credential_for(url, username_from_url, allowed_types, &token_owned)
+    });
+    let mut fetch_options = FetchOptions::new();
+    fetch_options.remote_callbacks(callbacks);
+    fetch_options.proxy_options(remote_proxy_options());
+    let refspec = format!("+{refname}:{}", remote_tracking_refname(&refname));
+    remote
+        .fetch(&[refspec.as_str()], Some(&mut fetch_options), None)
+        .map_err(|error| {
+            git_error(
+                &format!("could not fetch the remote head '{refname}' for branch tracking"),
+                error,
+            )
+        })?;
+    let tracking_refname = remote_tracking_refname(&refname);
+    let remote_commit = repository
+        .find_reference(&tracking_refname)
+        .and_then(|reference| reference.peel_to_commit())
+        .map_err(|error| {
+            git_error(
+                &format!(
+                    "the fetch left no remote head at '{tracking_refname}' to compare '{branch}' against"
+                ),
+                error,
+            )
+        })?;
+    let (ahead, behind) = repository
+        .graph_ahead_behind(local_commit.id(), remote_commit.id())
+        .map_err(|error| {
+            git_error(
+                &format!("could not compare local branch '{branch}' with its remote head"),
+                error,
+            )
+        })?;
+    Ok(Some(RemoteBranchTracking {
+        branch: branch.to_owned(),
+        local_revision: local_commit.id().to_string(),
+        remote_revision: remote_commit.id().to_string(),
+        ahead,
+        behind,
+    }))
 }
 
 /// Fetches every head of `origin` into `refs/remotes/origin/*` and resolves the
@@ -2765,6 +3188,16 @@ mod tests {
         fs::remove_dir_all(source_root).unwrap();
     }
 
+    /// A plain fast-forward push of `branch` to `refs/heads/<branch>`.
+    fn branch_push(branch: &str) -> BranchPush<'_> {
+        BranchPush {
+            branch,
+            remote_branch: None,
+            lease: None,
+            dry_run: false,
+        }
+    }
+
     #[test]
     fn pushing_a_branch_updates_the_origin_remote() {
         let (git, root) = repository();
@@ -2782,7 +3215,11 @@ mod tests {
             .unwrap()
             .to_string();
         let report = git
-            .push_branch_authenticated(&branch, "test-token", DEFAULT_REMOTE_REFRESH_DEADLINE)
+            .push_branch_authenticated(
+                branch_push(&branch),
+                "test-token",
+                DEFAULT_REMOTE_REFRESH_DEADLINE,
+            )
             .unwrap();
         let pushed = Repository::open_bare(&bare).unwrap();
         let remote_tip = pushed
@@ -2795,9 +3232,12 @@ mod tests {
         // The report states the update that reached the remote, and the ref it
         // replaced did not exist before it.
         assert_eq!(report.refname, format!("refs/heads/{branch}"));
-        assert_eq!(report.revision, tip);
+        assert_eq!(report.revision.as_deref(), Some(tip.as_str()));
         assert_eq!(report.previous_revision, None);
         assert_eq!(report.commits, None);
+        assert_eq!(report.fast_forward, None);
+        assert!(!report.deleted);
+        assert!(!report.dry_run);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(bare).unwrap();
     }
@@ -2811,7 +3251,7 @@ mod tests {
         run(&root, &["remote", "add", "origin", bare.to_str().unwrap()]);
         assert!(
             git.push_branch_authenticated(
-                "bad name",
+                branch_push("bad name"),
                 "test-token",
                 DEFAULT_REMOTE_REFRESH_DEADLINE
             )
@@ -2819,7 +3259,7 @@ mod tests {
         );
         assert!(
             git.push_branch_authenticated(
-                "does-not-exist",
+                branch_push("does-not-exist"),
                 "test-token",
                 DEFAULT_REMOTE_REFRESH_DEADLINE
             )
@@ -2858,7 +3298,11 @@ mod tests {
 
         // Without a lease the update stays fast-forward-only.
         let refused = git
-            .push_branch_authenticated(&branch, "test-token", DEFAULT_REMOTE_REFRESH_DEADLINE)
+            .push_branch_authenticated(
+                branch_push(&branch),
+                "test-token",
+                DEFAULT_REMOTE_REFRESH_DEADLINE,
+            )
             .unwrap_err();
         assert!(
             refused.message.contains("cannot push non-fastforwardable"),
@@ -2868,17 +3312,23 @@ mod tests {
         assert_eq!(remote_tip(&bare, &branch).to_string(), previous);
 
         let report = git
-            .push_branch_force_with_lease_authenticated(
-                &branch,
-                &previous,
+            .push_branch_authenticated(
+                BranchPush {
+                    lease: Some(&previous),
+                    ..branch_push(&branch)
+                },
                 "test-token",
                 DEFAULT_REMOTE_REFRESH_DEADLINE,
             )
             .unwrap();
         assert_eq!(report.refname, format!("refs/heads/{branch}"));
         assert_eq!(report.previous_revision.as_deref(), Some(previous.as_str()));
-        assert_eq!(report.revision, rewritten.to_string());
+        assert_eq!(
+            report.revision.as_deref(),
+            Some(rewritten.to_string().as_str())
+        );
         assert_eq!(report.commits, Some(1));
+        assert_eq!(report.fast_forward, Some(false));
         assert_eq!(remote_tip(&bare, &branch), rewritten);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(bare).unwrap();
@@ -2895,9 +3345,11 @@ mod tests {
         // The lease names the rewritten tip, while the remote still holds the
         // revision it replaced.
         let refused = git
-            .push_branch_force_with_lease_authenticated(
-                &branch,
-                &rewritten,
+            .push_branch_authenticated(
+                BranchPush {
+                    lease: Some(&rewritten),
+                    ..branch_push(&branch)
+                },
                 "test-token",
                 DEFAULT_REMOTE_REFRESH_DEADLINE,
             )
@@ -2931,9 +3383,11 @@ mod tests {
         run(&root, &["checkout", "-qb", "loom/new"]);
 
         let refused = git
-            .push_branch_force_with_lease_authenticated(
-                "loom/new",
-                &tip,
+            .push_branch_authenticated(
+                BranchPush {
+                    lease: Some(&tip),
+                    ..branch_push("loom/new")
+                },
                 "test-token",
                 DEFAULT_REMOTE_REFRESH_DEADLINE,
             )
@@ -2970,9 +3424,11 @@ mod tests {
         );
 
         let report = git
-            .push_branch_force_with_lease_authenticated(
-                &branch,
-                &moved.to_string(),
+            .push_branch_authenticated(
+                BranchPush {
+                    lease: Some(&moved.to_string()),
+                    ..branch_push(&branch)
+                },
                 "test-token",
                 DEFAULT_REMOTE_REFRESH_DEADLINE,
             )
@@ -2981,9 +3437,326 @@ mod tests {
             report.previous_revision.as_deref(),
             Some(moved.to_string().as_str())
         );
-        assert_eq!(report.revision, rewritten.to_string());
+        assert_eq!(
+            report.revision.as_deref(),
+            Some(rewritten.to_string().as_str())
+        );
         assert_eq!(report.commits, Some(1));
         assert_eq!(remote_tip(&bare, &branch), rewritten);
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(bare).unwrap();
+    }
+
+    /// The revision a repository (bare or not) holds for the full ref name
+    /// `refname`.
+    fn remote_ref(repository: &Path, refname: &str) -> String {
+        Repository::open(repository)
+            .unwrap()
+            .find_reference(refname)
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn pushing_to_a_remote_branch_name_updates_that_ref() {
+        let (git, root) = repository();
+        let branch = git.current_branch().unwrap().unwrap();
+        let bare = origin_remote(&git, &root, &branch);
+        let previous = remote_tip(&bare, &branch);
+        write_commit(&root, "remote-name.txt", "remote name\n", "remote name");
+        let first = head_revision(&git);
+
+        let report = git
+            .push_branch_authenticated(
+                BranchPush {
+                    branch: &branch,
+                    remote_branch: Some("loom/remote"),
+                    lease: None,
+                    dry_run: false,
+                },
+                "test-token",
+                DEFAULT_REMOTE_REFRESH_DEADLINE,
+            )
+            .unwrap();
+        // The report names the target ref, and the local branch's own remote ref
+        // was not touched by this push.
+        assert_eq!(report.refname, "refs/heads/loom/remote");
+        assert_eq!(report.previous_revision, None);
+        assert_eq!(report.revision.as_deref(), Some(first.as_str()));
+        assert_eq!(report.commits, None);
+        assert_eq!(report.fast_forward, None);
+        assert_eq!(remote_tip(&bare, "loom/remote").to_string(), first);
+        assert_eq!(remote_tip(&bare, &branch), previous);
+
+        // A second push to the same target ref is a fast-forward.
+        write_commit(&root, "remote-name.txt", "second\n", "second remote name");
+        let second = head_revision(&git);
+        let report = git
+            .push_branch_authenticated(
+                BranchPush {
+                    branch: &branch,
+                    remote_branch: Some("loom/remote"),
+                    lease: None,
+                    dry_run: false,
+                },
+                "test-token",
+                DEFAULT_REMOTE_REFRESH_DEADLINE,
+            )
+            .unwrap();
+        assert_eq!(report.previous_revision.as_deref(), Some(first.as_str()));
+        assert_eq!(report.revision.as_deref(), Some(second.as_str()));
+        assert_eq!(report.commits, Some(1));
+        assert_eq!(report.fast_forward, Some(true));
+        assert_eq!(remote_tip(&bare, "loom/remote").to_string(), second);
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(bare).unwrap();
+    }
+
+    #[test]
+    fn a_dry_run_push_reports_the_update_without_touching_the_remote() {
+        let (git, root) = repository();
+        let branch = git.current_branch().unwrap().unwrap();
+        let bare = origin_remote(&git, &root, &branch);
+        let previous = remote_tip(&bare, &branch).to_string();
+        write_commit(&root, "dry-run.txt", "dry run\n", "dry run change");
+        let revision = head_revision(&git);
+
+        let report = git
+            .push_branch_authenticated(
+                BranchPush {
+                    branch: &branch,
+                    remote_branch: None,
+                    lease: None,
+                    dry_run: true,
+                },
+                "test-token",
+                DEFAULT_REMOTE_REFRESH_DEADLINE,
+            )
+            .unwrap();
+        assert!(report.dry_run);
+        assert!(!report.deleted);
+        assert_eq!(report.previous_revision.as_deref(), Some(previous.as_str()));
+        assert_eq!(report.revision.as_deref(), Some(revision.as_str()));
+        assert_eq!(report.commits, Some(1));
+        assert_eq!(report.fast_forward, Some(true));
+        // The same report a push would produce, with the remote left as it was.
+        assert_eq!(remote_tip(&bare, &branch).to_string(), previous);
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(bare).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_remote_ref_removes_it_and_reports_the_previous_revision() {
+        let (git, root) = repository();
+        let branch = git.current_branch().unwrap().unwrap();
+        let bare = origin_remote(&git, &root, &branch);
+        let previous = remote_tip(&bare, &branch).to_string();
+        let refname = format!("refs/heads/{branch}");
+
+        let dry_run = git
+            .delete_remote_ref_authenticated(
+                &refname,
+                true,
+                "test-token",
+                DEFAULT_REMOTE_REFRESH_DEADLINE,
+            )
+            .unwrap();
+        assert!(dry_run.deleted);
+        assert!(dry_run.dry_run);
+        assert_eq!(dry_run.revision, None);
+        assert_eq!(remote_tip(&bare, &branch).to_string(), previous);
+
+        let report = git
+            .delete_remote_ref_authenticated(
+                &refname,
+                false,
+                "test-token",
+                DEFAULT_REMOTE_REFRESH_DEADLINE,
+            )
+            .unwrap();
+        assert_eq!(report.refname, refname);
+        assert!(report.deleted);
+        assert!(!report.dry_run);
+        assert_eq!(report.previous_revision.as_deref(), Some(previous.as_str()));
+        assert_eq!(report.revision, None);
+        assert_eq!(report.commits, None);
+        assert_eq!(report.fast_forward, None);
+        assert!(
+            Repository::open_bare(&bare)
+                .unwrap()
+                .find_reference(&refname)
+                .is_err()
+        );
+
+        // The ref is gone, so there is nothing left to delete.
+        let absent = git
+            .delete_remote_ref_authenticated(
+                &refname,
+                false,
+                "test-token",
+                DEFAULT_REMOTE_REFRESH_DEADLINE,
+            )
+            .unwrap_err();
+        assert_eq!(absent.code, ErrorCode::NotFound);
+        assert!(absent.message.contains(&refname), "{}", absent.message);
+
+        let invalid = git
+            .delete_remote_ref_authenticated(
+                "not a ref name",
+                false,
+                "test-token",
+                DEFAULT_REMOTE_REFRESH_DEADLINE,
+            )
+            .unwrap_err();
+        assert_eq!(invalid.code, ErrorCode::InvalidRequest);
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(bare).unwrap();
+    }
+
+    #[test]
+    fn pushing_a_tag_creates_the_remote_tag() {
+        let (git, root) = repository();
+        let branch = git.current_branch().unwrap().unwrap();
+        let bare = origin_remote(&git, &root, &branch);
+        run(&root, &["tag", "-a", "v1", "-m", "release v1"]);
+        let tag_object = remote_ref(&root, "refs/tags/v1");
+
+        let report = git
+            .push_tag_authenticated("v1", false, "test-token", DEFAULT_REMOTE_REFRESH_DEADLINE)
+            .unwrap();
+        assert_eq!(report.refname, "refs/tags/v1");
+        assert_eq!(report.previous_revision, None);
+        // The tag object itself is pushed, not the commit it peels to.
+        assert_eq!(report.revision.as_deref(), Some(tag_object.as_str()));
+        assert_eq!(report.commits, None);
+        assert_eq!(report.fast_forward, None);
+        assert!(!report.deleted);
+        assert_eq!(remote_ref(&bare, "refs/tags/v1"), tag_object);
+
+        // Recreating the tag locally and asking for a dry run measures the peeled
+        // commit range and leaves the remote tag where it was.
+        write_commit(&root, "tagged.txt", "tagged\n", "tagged change");
+        run(&root, &["tag", "-f", "-a", "v1", "-m", "release v1 moved"]);
+        let moved = remote_ref(&root, "refs/tags/v1");
+        let dry_run = git
+            .push_tag_authenticated("v1", true, "test-token", DEFAULT_REMOTE_REFRESH_DEADLINE)
+            .unwrap();
+        assert!(dry_run.dry_run);
+        assert_eq!(
+            dry_run.previous_revision.as_deref(),
+            Some(tag_object.as_str())
+        );
+        assert_eq!(dry_run.revision.as_deref(), Some(moved.as_str()));
+        assert_eq!(dry_run.commits, Some(1));
+        assert_eq!(remote_ref(&bare, "refs/tags/v1"), tag_object);
+
+        assert!(
+            git.push_tag_authenticated(
+                "absent",
+                false,
+                "test-token",
+                DEFAULT_REMOTE_REFRESH_DEADLINE
+            )
+            .is_err()
+        );
+        assert!(
+            git.push_tag_authenticated(
+                "bad tag",
+                false,
+                "test-token",
+                DEFAULT_REMOTE_REFRESH_DEADLINE
+            )
+            .is_err()
+        );
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(bare).unwrap();
+    }
+
+    #[test]
+    fn remote_refs_lists_heads_and_tags_with_branch_tracking() {
+        let (git, root) = repository();
+        let branch = git.current_branch().unwrap().unwrap();
+        let bare = origin_remote(&git, &root, &branch);
+        run(&root, &["tag", "-a", "v1", "-m", "release v1"]);
+        git.push_tag_authenticated("v1", false, "test-token", DEFAULT_REMOTE_REFRESH_DEADLINE)
+            .unwrap();
+        advance_origin(&bare, &branch, 2);
+
+        let report = git
+            .remote_refs_authenticated(Some(&branch), "test-token", DEFAULT_REMOTE_REFRESH_DEADLINE)
+            .unwrap();
+        assert_eq!(report.remote, "origin");
+        assert_eq!(
+            report.heads,
+            vec![RemoteRef {
+                refname: format!("refs/heads/{branch}"),
+                revision: remote_tip(&bare, &branch).to_string(),
+            }]
+        );
+        // Only the tag itself is listed; its peeled `^{}` entry is not a ref.
+        assert_eq!(report.tags.len(), 1);
+        assert_eq!(report.tags[0].refname, "refs/tags/v1");
+        let tracking = report.tracking.expect("tracking for the local branch");
+        assert_eq!(tracking.branch, branch);
+        assert_eq!(tracking.local_revision, head_revision(&git));
+        assert_eq!(
+            tracking.remote_revision,
+            remote_tip(&bare, &branch).to_string()
+        );
+        assert_eq!((tracking.ahead, tracking.behind), (0, 2));
+
+        // Without a branch name nothing is tracked, and a branch name the remote
+        // does not advertise has no remote head to track against.
+        assert!(
+            git.remote_refs_authenticated(None, "test-token", DEFAULT_REMOTE_REFRESH_DEADLINE)
+                .unwrap()
+                .tracking
+                .is_none()
+        );
+        assert!(
+            git.remote_refs_authenticated(
+                Some("loom/absent"),
+                "test-token",
+                DEFAULT_REMOTE_REFRESH_DEADLINE
+            )
+            .unwrap()
+            .tracking
+            .is_none()
+        );
+
+        // A remote head with no local branch of that name has nothing to compare.
+        git.push_branch_authenticated(
+            BranchPush {
+                branch: &branch,
+                remote_branch: Some("loom/only-remote"),
+                lease: None,
+                dry_run: false,
+            },
+            "test-token",
+            DEFAULT_REMOTE_REFRESH_DEADLINE,
+        )
+        .unwrap();
+        let report = git
+            .remote_refs_authenticated(
+                Some("loom/only-remote"),
+                "test-token",
+                DEFAULT_REMOTE_REFRESH_DEADLINE,
+            )
+            .unwrap();
+        assert!(report.tracking.is_none());
+        assert!(
+            report
+                .heads
+                .iter()
+                .any(|head| head.refname == "refs/heads/loom/only-remote")
+        );
+
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(bare).unwrap();
     }
@@ -3701,8 +4474,17 @@ mod tests {
             .unwrap();
         drop(repository);
         run(root, &["remote", "add", "origin", bare.to_str().unwrap()]);
-        git.push_branch_authenticated(branch, "test-token", DEFAULT_REMOTE_REFRESH_DEADLINE)
-            .unwrap();
+        git.push_branch_authenticated(
+            BranchPush {
+                branch,
+                remote_branch: None,
+                lease: None,
+                dry_run: false,
+            },
+            "test-token",
+            DEFAULT_REMOTE_REFRESH_DEADLINE,
+        )
+        .unwrap();
         git.repository()
             .unwrap()
             .reference_symbolic(

@@ -126,7 +126,9 @@ policy and Auto approve mode both allow them:
 
 - `github_push_branch` publishes local commits to the origin remote. Published
   commits can be fetched or mirrored by others before any force-push, so the
-  action is not locally reversible.
+  action is not locally reversible. The same tool can also delete a remote ref
+  (or, with `tag`, push or delete a remote tag), which removes something other
+  clones may already depend on.
 - `github_remove_labels` is a remote DELETE that can drive remote automation,
   even though labels themselves can be re-added.
 
