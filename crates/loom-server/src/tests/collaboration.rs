@@ -458,27 +458,7 @@ fn roster_and_role_changes_are_pushed_and_revoked_people_stop_reading() {
     );
     let guest_connection = connect(&backend, &tokens, &guest);
 
-    let rosters = history(&owner_connection, session_id)
-        .into_iter()
-        .filter_map(|event| match event {
-            ServerEvent::SessionRosterChanged { entries } => Some(entries),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    // Grant, promotion, and the guest's connection each pushed a roster.
-    assert!(rosters.len() >= 3, "{rosters:?}");
-    let latest = rosters.last().unwrap();
-    let guest_entry = latest
-        .iter()
-        .find(|entry| entry.participant.id == guest.id)
-        .unwrap();
-    assert_eq!(guest_entry.role, SessionRole::Participant);
-    assert_eq!(guest_entry.connections, 1);
-
-    // A second connection and its disconnect each push a roster too.
-    let second = connect(&backend, &tokens, &guest);
-    drop(second);
-    let latest_roster = || {
+    let rosters = || {
         history(&owner_connection, session_id)
             .into_iter()
             .filter_map(|event| match event {
@@ -487,16 +467,33 @@ fn roster_and_role_changes_are_pushed_and_revoked_people_stop_reading() {
             })
             .collect::<Vec<_>>()
     };
-    let after_disconnect = latest_roster();
-    assert_eq!(after_disconnect.len(), rosters.len() + 2);
-    let guest_entry = after_disconnect
-        .last()
-        .unwrap()
+    // Presence churn is coalesced: the feed carries only the latest roster,
+    // which reflects the promotion and the guest's connection.
+    let latest = rosters();
+    assert_eq!(latest.len(), 1, "{latest:?}");
+    let guest_entry = latest[0]
         .iter()
         .find(|entry| entry.participant.id == guest.id)
-        .cloned()
         .unwrap();
+    assert_eq!(guest_entry.role, SessionRole::Participant);
     assert_eq!(guest_entry.connections, 1);
+
+    // A second connection pushes a newer roster; its disconnect another.
+    let second = connect(&backend, &tokens, &guest);
+    let with_second = rosters();
+    assert_eq!(with_second.len(), 1);
+    let guest_count = |roster: &[loom_core::RosterEntry]| {
+        roster
+            .iter()
+            .find(|entry| entry.participant.id == guest.id)
+            .unwrap()
+            .connections
+    };
+    assert_eq!(guest_count(&with_second[0]), 2);
+    drop(second);
+    let after_disconnect = rosters();
+    assert_eq!(after_disconnect.len(), 1);
+    assert_eq!(guest_count(&after_disconnect[0]), 1);
 
     let changes = entries(&owner_connection, session_id)
         .into_iter()
@@ -630,4 +627,131 @@ fn session_collaboration_history_is_readable_in_pages() {
         )
         .is_ok()
     );
+}
+
+#[test]
+fn presence_churn_does_not_consume_history_retention() {
+    let backend = InProcessBackend::new();
+    let tokens = AuthTokenStore::new();
+    let owner = person("Owner");
+    let guest = person("Guest");
+    let owner_connection = connect(&backend, &tokens, &owner);
+    let session_id = create_session(&owner_connection);
+    backend
+        .register_participants(std::slice::from_ref(&guest))
+        .unwrap();
+    promote(
+        &owner_connection,
+        session_id,
+        &guest,
+        SessionRole::Participant,
+    );
+    collaborate(
+        &owner_connection,
+        CollaborationRequest::SendPeerMessage {
+            session_id,
+            text: "keep me".to_owned(),
+        },
+    )
+    .unwrap();
+    backend.set_event_retention(8).unwrap();
+    // Far more connects and disconnects than the retention window holds.
+    for _ in 0..20 {
+        drop(connect(&backend, &tokens, &guest));
+    }
+    let events = history(&owner_connection, session_id);
+    let rosters = events
+        .iter()
+        .filter(|event| matches!(event, ServerEvent::SessionRosterChanged { .. }))
+        .count();
+    assert_eq!(rosters, 1, "only the latest roster is kept");
+    let kept = entries(&owner_connection, session_id);
+    assert!(
+        kept.iter().any(|entry| entry.kind
+            == CollaborationEntryKind::PeerMessage {
+                text: "keep me".to_owned(),
+            }),
+        "presence churn evicted history: {events:?}"
+    );
+    // Access changes are still attributed history entries.
+    assert!(
+        kept.iter()
+            .any(|entry| matches!(entry.kind, CollaborationEntryKind::AccessChanged { .. }))
+    );
+}
+
+#[test]
+fn run_revisions_survive_a_backend_restart() {
+    let directory = std::env::temp_dir().join(format!("loom-revision-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("state.db");
+    let owner = person("Owner");
+    let (session_id, run_id, before_restart) = {
+        let backend = InProcessBackend::new_persistent(&path).unwrap();
+        let tokens = AuthTokenStore::new();
+        let connection = connect(&backend, &tokens, &owner);
+        let session_id = create_session(&connection);
+        let run_id = start_settled_run(&connection, session_id);
+        for text in ["first", "second"] {
+            let expected = revision(&connection, run_id);
+            let CollaborationResponse::RunAction(outcome) = collaborate(
+                &connection,
+                CollaborationRequest::DirectAgent {
+                    run_id,
+                    expected,
+                    text: text.to_owned(),
+                },
+            )
+            .unwrap() else {
+                panic!("expected a run action");
+            };
+            assert!(
+                matches!(*outcome, RunActionOutcome::Accepted { .. }),
+                "{outcome:?}"
+            );
+            await_settled_run(&connection, run_id);
+        }
+        let current = revision(&connection, run_id);
+        assert_eq!(current.action_sequence, 2);
+        backend.shutdown().unwrap();
+        (session_id, run_id, current)
+    };
+
+    let backend = InProcessBackend::new_persistent(&path).unwrap();
+    let tokens = AuthTokenStore::new();
+    let connection = connect(&backend, &tokens, &owner);
+    let after_restart = revision(&connection, run_id);
+    assert_eq!(
+        after_restart, before_restart,
+        "the action sequence is durable"
+    );
+    // A revision that a counter reset to zero would produce (for example one
+    // issued right after the run started) must not match after the restart.
+    let stale = RunRevision {
+        action_sequence: 0,
+        ..after_restart
+    };
+    let CollaborationResponse::RunAction(outcome) = collaborate(
+        &connection,
+        CollaborationRequest::DirectAgent {
+            run_id,
+            expected: stale,
+            text: "late".to_owned(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected a run action");
+    };
+    assert!(
+        matches!(*outcome, RunActionOutcome::Conflict { .. }),
+        "{outcome:?}"
+    );
+    assert!(!entries(&connection, session_id).iter().any(|entry| {
+        entry.kind
+            == CollaborationEntryKind::AgentDirection {
+                text: "late".to_owned(),
+            }
+    }));
+    backend.shutdown().unwrap();
+    let _ = fs::remove_dir_all(directory);
 }

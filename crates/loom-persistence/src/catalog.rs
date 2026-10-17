@@ -253,6 +253,96 @@ impl FilePersistence {
         Ok((participants, grants))
     }
 
+    /// Loads every pending session access request.
+    pub fn load_access_requests(&self) -> Result<Vec<SessionAccessRequest>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let read_error = |error: rusqlite::Error| {
+            persistence_error(format!("could not read access requests: {error}"), true)
+        };
+        let mut statement = connection
+            .prepare(
+                "SELECT request.request_id, request.session_id, request.participant_id,
+                        participant.display_name, request.requested_role, request.note,
+                        request.created_at
+                 FROM session_access_requests request
+                 JOIN participants participant
+                   ON participant.participant_id = request.participant_id
+                 ORDER BY request.created_at, request.request_id",
+            )
+            .map_err(read_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .map_err(read_error)?;
+        let mut requests = Vec::new();
+        for row in rows {
+            let (id, session_id, participant_id, display_name, role, note, created_at) =
+                row.map_err(read_error)?;
+            let requested_role = SessionRole::parse(&role).ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted requested role '{role}' is invalid"),
+                    false,
+                )
+            })?;
+            requests.push(SessionAccessRequest {
+                id: loom_core::AccessRequestId::from_uuid(decode_uuid(&id, "access request id")?),
+                session_id: AgentSessionId::from_uuid(decode_uuid(&session_id, "session id")?),
+                participant: loom_core::ParticipantIdentity {
+                    id: ParticipantId::from_uuid(decode_uuid(&participant_id, "participant id")?),
+                    display_name,
+                },
+                requested_role,
+                note,
+                created_at: decode_timestamp(created_at)?,
+            });
+        }
+        Ok(requests)
+    }
+
+    /// Loads the accepted-action count of every run that has one.
+    pub fn load_run_action_sequences(&self) -> Result<BTreeMap<RunId, u64>> {
+        if !self.path.exists() {
+            return Ok(BTreeMap::new());
+        }
+        let connection = self.connection()?;
+        let read_error = |error: rusqlite::Error| {
+            persistence_error(
+                format!("could not read run action sequences: {error}"),
+                true,
+            )
+        };
+        let mut statement = connection
+            .prepare("SELECT run_id, action_sequence FROM run_action_sequences")
+            .map_err(read_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(read_error)?;
+        let mut sequences = BTreeMap::new();
+        for row in rows {
+            let (run_id, sequence) = row.map_err(read_error)?;
+            sequences.insert(
+                RunId::from_uuid(decode_uuid(&run_id, "run id")?),
+                u64::try_from(sequence).unwrap_or_default(),
+            );
+        }
+        Ok(sequences)
+    }
+
     /// Loads the singleton archive-retention policy this worker applies, or
     /// `None` when the database never stored one.
     ///
@@ -1359,6 +1449,57 @@ fn save_session_access_rows(
                 ],
             )
             .map_err(write_error)?;
+    }
+    transaction
+        .execute("DELETE FROM session_access_requests", [])
+        .map_err(write_error)?;
+    for request in &settings.access_requests {
+        transaction
+            .execute(
+                "INSERT INTO session_access_requests(
+                    request_id, session_id, participant_id, requested_role, note, created_at
+                 )
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6
+                 WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?2)
+                   AND EXISTS (SELECT 1 FROM participants WHERE participant_id = ?3)",
+                params![
+                    request.id.as_uuid().as_bytes().as_slice(),
+                    request.session_id.as_uuid().as_bytes().as_slice(),
+                    request.participant.id.as_uuid().as_bytes().as_slice(),
+                    request.requested_role.as_str(),
+                    request.note,
+                    encode_timestamp(request.created_at)?,
+                ],
+            )
+            .map_err(write_error)?;
+    }
+    Ok(())
+}
+
+/// Upserts run action sequences. Runs it after the run summaries of the same
+/// transaction; a sequence for a run that is not stored is skipped.
+pub(crate) fn save_run_action_sequence_rows(
+    transaction: &Transaction<'_>,
+    sequences: &BTreeMap<RunId, u64>,
+) -> Result<()> {
+    for (run_id, sequence) in sequences {
+        transaction
+            .execute(
+                "INSERT INTO run_action_sequences(run_id, action_sequence)
+                 SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM run_summaries WHERE run_id = ?1)
+                 ON CONFLICT(run_id) DO UPDATE SET action_sequence = excluded.action_sequence
+                 WHERE run_action_sequences.action_sequence IS NOT excluded.action_sequence",
+                params![
+                    run_id.as_uuid().as_bytes().as_slice(),
+                    i64::try_from(*sequence).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not save run action sequences: {error}"),
+                    true,
+                )
+            })?;
     }
     Ok(())
 }

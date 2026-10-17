@@ -67,13 +67,36 @@ impl EventJournal {
         event: loom_protocol::ServerEvent,
     ) -> EventSequence {
         let sequence = self.next();
-        self.append_event(ServerEventEnvelope {
+        let envelope = ServerEventEnvelope {
             protocol_version,
             sequence,
             session_id,
             event,
-        });
+        };
+        if matches!(
+            envelope.event,
+            loom_protocol::ServerEvent::SessionRosterChanged { .. }
+        ) {
+            // Presence churn is live state, not history: only the latest
+            // roster of a session is kept, outside the retained window, and it
+            // is never written to the durable feed. It therefore never evicts
+            // a history event; `GetSessionRoster` reads the same state.
+            self.rosters.insert(session_id, envelope);
+            return sequence;
+        }
+        self.append_event(envelope);
         sequence
+    }
+
+    /// The latest roster event of a session, if it is newer than `after`.
+    fn roster_since(
+        &self,
+        session_id: AgentSessionId,
+        after_sequence: Option<EventSequence>,
+    ) -> Option<&ServerEventEnvelope> {
+        self.rosters
+            .get(&session_id)
+            .filter(|event| Self::is_after(event.sequence, after_sequence))
     }
 
     fn append_event(&mut self, event: ServerEventEnvelope) {
@@ -289,16 +312,24 @@ impl EventJournal {
         after_sequence: Option<EventSequence>,
     ) -> Vec<ServerEventEnvelope> {
         match session_id {
-            Some(session_id) => self
-                .session_events(session_id)
-                .filter(|event| Self::is_after(event.sequence, after_sequence))
-                .cloned()
-                .collect(),
+            Some(session_id) => {
+                let mut events = self
+                    .session_events(session_id)
+                    .filter(|event| Self::is_after(event.sequence, after_sequence))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if let Some(roster) = self.roster_since(session_id, after_sequence) {
+                    events.push(roster.clone());
+                    events.sort_by_key(|event| event.sequence);
+                }
+                events
+            }
             None => {
                 let mut events = self
                     .events
                     .values()
                     .flatten()
+                    .chain(self.rosters.values())
                     .filter(|event| Self::is_after(event.sequence, after_sequence))
                     .cloned()
                     .collect::<Vec<_>>();
@@ -316,7 +347,10 @@ impl EventJournal {
     ) -> Vec<WorkspaceFeedEvent> {
         let mut events = session_ids
             .iter()
-            .flat_map(|session_id| self.session_events(*session_id))
+            .flat_map(|session_id| {
+                self.session_events(*session_id)
+                    .chain(self.rosters.get(session_id))
+            })
             .filter(|event| Self::is_after(event.sequence, after_sequence))
             .cloned()
             .map(WorkspaceFeedEvent::Session)

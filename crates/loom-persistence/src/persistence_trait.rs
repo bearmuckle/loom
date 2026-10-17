@@ -99,6 +99,10 @@ pub trait SessionRepository: Send + Sync {
     fn load_session_settings(&self) -> Result<DurableSessionSettings>;
     /// Loads known participants and every stored session grant.
     fn load_session_access(&self) -> Result<(BTreeMap<ParticipantId, String>, Vec<SessionGrant>)>;
+    /// Loads every pending session access request.
+    fn load_access_requests(&self) -> Result<Vec<SessionAccessRequest>>;
+    /// Loads the accepted-action count of every run that has one.
+    fn load_run_action_sequences(&self) -> Result<BTreeMap<RunId, u64>>;
     fn load_session_usage(
         &self,
         session_id: AgentSessionId,
@@ -124,6 +128,12 @@ impl SessionRepository for FilePersistence {
     }
     fn load_session_access(&self) -> Result<(BTreeMap<ParticipantId, String>, Vec<SessionGrant>)> {
         FilePersistence::load_session_access(self)
+    }
+    fn load_access_requests(&self) -> Result<Vec<SessionAccessRequest>> {
+        FilePersistence::load_access_requests(self)
+    }
+    fn load_run_action_sequences(&self) -> Result<BTreeMap<RunId, u64>> {
+        FilePersistence::load_run_action_sequences(self)
     }
     fn load_session_usage(
         &self,
@@ -152,6 +162,12 @@ impl<T: SessionRepository + ?Sized> SessionRepository for Arc<T> {
     }
     fn load_session_access(&self) -> Result<(BTreeMap<ParticipantId, String>, Vec<SessionGrant>)> {
         (**self).load_session_access()
+    }
+    fn load_access_requests(&self) -> Result<Vec<SessionAccessRequest>> {
+        (**self).load_access_requests()
+    }
+    fn load_run_action_sequences(&self) -> Result<BTreeMap<RunId, u64>> {
+        (**self).load_run_action_sequences()
     }
     fn load_session_usage(
         &self,

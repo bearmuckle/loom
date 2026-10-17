@@ -71,6 +71,7 @@ impl InProcessConnection {
         }
         let response = apply(self)?;
         *sequence += 1;
+        self.backend.collaboration.advanced(run_id, *sequence);
         let revision = run_revision(&handle.snapshot(), *sequence);
         drop(sequence);
         let entry = CollaborationEntry {

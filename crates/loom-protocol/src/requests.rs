@@ -689,4 +689,41 @@ pub enum AccessRequest {
     /// pinned to it fail their next provider call with an authentication
     /// error instead of switching to another account.
     RevokeProviderCredential { credential_id: CredentialId },
+
+    /// Asks the session's owners for access, or for a higher role. Needs only
+    /// a connection bound to a person; no grant is required. A person has at
+    /// most one pending request per session: asking again replaces the role
+    /// and note of the pending one and keeps its id. Protocol 11.5.
+    RequestSessionAccess {
+        session_id: AgentSessionId,
+        requested_role: SessionRole,
+        /// Optional note for the owners, at most
+        /// [`loom_core::MAX_ACCESS_REQUEST_NOTE_BYTES`] bytes.
+        note: Option<String>,
+    },
+
+    /// Pending access requests of a session, oldest first. Owner only.
+    ListSessionAccessRequests { session_id: AgentSessionId },
+
+    /// Approves a pending request. Owner only. The requester is granted
+    /// `role`, or the requested role when `role` is `None`.
+    ApproveSessionAccessRequest {
+        session_id: AgentSessionId,
+        request_id: AccessRequestId,
+        role: Option<SessionRole>,
+    },
+
+    /// Denies a pending request. Owner only. The requester's access is
+    /// unchanged.
+    DenySessionAccessRequest {
+        session_id: AgentSessionId,
+        request_id: AccessRequestId,
+        reason: Option<String>,
+    },
+
+    /// Withdraws the caller's own pending request.
+    WithdrawSessionAccessRequest {
+        session_id: AgentSessionId,
+        request_id: AccessRequestId,
+    },
 }

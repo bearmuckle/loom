@@ -128,7 +128,9 @@ impl InProcessConnection {
                                             .is_none_or(|readable| readable.contains(&session.id))
                                     })
                                     .collect(),
-                                events: filter_workspace_feed(window.events, readable.as_ref()),
+                                events: self.filter_private_workspace_events(
+                                    filter_workspace_feed(window.events, readable.as_ref()),
+                                )?,
                                 oldest_sequence,
                                 latest_sequence,
                                 stream_epoch: current_stream_epoch,
@@ -141,10 +143,10 @@ impl InProcessConnection {
                     let page = self.bound_workspace_events(events)?;
                     return Ok(ServerResponse::Events(EventsResponse::WorkspaceEvents {
                         workspace_id,
-                        events: filter_workspace_feed(
+                        events: self.filter_private_workspace_events(filter_workspace_feed(
                             page.events,
                             self.readable_sessions()?.as_ref(),
-                        ),
+                        ))?,
                         stream_epoch: current_stream_epoch,
                         next_after_sequence: page.next_after_sequence,
                     }));
@@ -203,7 +205,7 @@ impl InProcessConnection {
                         return Ok(ServerResponse::Events(
                             EventsResponse::SessionEventsSnapshot {
                                 session: self.backend.sessions()?.get(session_id)?,
-                                events: window.events,
+                                events: self.filter_private_events(window.events)?,
                                 oldest_sequence,
                                 latest_sequence: session_latest_sequence
                                     .unwrap_or(journal.next_sequence),
@@ -220,16 +222,22 @@ impl InProcessConnection {
                 } else {
                     None
                 };
+                let own_request = |event: &ServerEventEnvelope| {
+                    self.participant()
+                        .is_some_and(|participant| requested_by(event, participant.id))
+                };
+                let events = batch
+                    .events
+                    .into_iter()
+                    .filter(|event| {
+                        readable
+                            .as_ref()
+                            .is_none_or(|readable| readable.contains(&event.session_id))
+                            || own_request(event)
+                    })
+                    .collect();
                 Ok(ServerResponse::Events(EventsResponse::SessionEvents {
-                    events: batch
-                        .events
-                        .into_iter()
-                        .filter(|event| {
-                            readable
-                                .as_ref()
-                                .is_none_or(|readable| readable.contains(&event.session_id))
-                        })
-                        .collect(),
+                    events: self.filter_private_events(events)?,
                     stream_epoch: session_id.map(|_| self.backend.node_id.clone()),
                     next_after_sequence: batch.next_after_sequence,
                 }))
@@ -239,7 +247,9 @@ impl InProcessConnection {
                 // that grows with the journal, so its own bound is the count the
                 // caller asked for; the resync path is the one that pages.
                 Ok(ServerResponse::Events(EventsResponse::SessionEvents {
-                    events: self.recent_session_events(session_id, limit as usize)?,
+                    events: self.filter_private_events(
+                        self.recent_session_events(session_id, limit as usize)?,
+                    )?,
                     stream_epoch: Some(self.backend.node_id.clone()),
                     next_after_sequence: None,
                 }))
@@ -264,4 +274,75 @@ fn filter_workspace_feed(
             WorkspaceFeedEvent::Workspace(_) => true,
         })
         .collect()
+}
+
+/// Whether `event` is an access-request event filed by `participant`.
+fn requested_by(event: &ServerEventEnvelope, participant: loom_core::ParticipantId) -> bool {
+    match &event.event {
+        loom_protocol::ServerEvent::SessionAccessRequested { request }
+        | loom_protocol::ServerEvent::SessionAccessRequestResolved { request, .. } => {
+            request.participant.id == participant
+        }
+        _ => false,
+    }
+}
+
+impl InProcessConnection {
+    /// Drops access-request events a person may not see: they go to the
+    /// session's owners and to the requester only. Operator connections see
+    /// every event.
+    fn filter_private_events(
+        &self,
+        events: Vec<ServerEventEnvelope>,
+    ) -> Result<Vec<ServerEventEnvelope>> {
+        let Some(participant) = self.participant() else {
+            return Ok(events);
+        };
+        let mut kept = Vec::with_capacity(events.len());
+        for event in events {
+            if self.private_event_visible(&event, participant.id)? {
+                kept.push(event);
+            }
+        }
+        Ok(kept)
+    }
+
+    fn filter_private_workspace_events(
+        &self,
+        events: Vec<WorkspaceFeedEvent>,
+    ) -> Result<Vec<WorkspaceFeedEvent>> {
+        let Some(participant) = self.participant() else {
+            return Ok(events);
+        };
+        let mut kept = Vec::with_capacity(events.len());
+        for event in events {
+            let visible = match &event {
+                WorkspaceFeedEvent::Session(event) => {
+                    self.private_event_visible(event, participant.id)?
+                }
+                WorkspaceFeedEvent::Workspace(_) => true,
+            };
+            if visible {
+                kept.push(event);
+            }
+        }
+        Ok(kept)
+    }
+
+    fn private_event_visible(
+        &self,
+        event: &ServerEventEnvelope,
+        participant: loom_core::ParticipantId,
+    ) -> Result<bool> {
+        if !matches!(
+            event.event,
+            loom_protocol::ServerEvent::SessionAccessRequested { .. }
+                | loom_protocol::ServerEvent::SessionAccessRequestResolved { .. }
+        ) {
+            return Ok(true);
+        }
+        Ok(requested_by(event, participant)
+            || self.session_role(participant, event.session_id)?
+                == Some(loom_core::SessionRole::Owner))
+    }
 }

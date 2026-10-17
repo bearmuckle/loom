@@ -943,6 +943,25 @@ impl InProcessConnection {
                 session_id: requested_session,
                 ..
             })
+            | ClientRequest::Access(loom_protocol::AccessRequest::RequestSessionAccess {
+                session_id: requested_session,
+                ..
+            })
+            | ClientRequest::Access(loom_protocol::AccessRequest::ListSessionAccessRequests {
+                session_id: requested_session,
+            })
+            | ClientRequest::Access(loom_protocol::AccessRequest::ApproveSessionAccessRequest {
+                session_id: requested_session,
+                ..
+            })
+            | ClientRequest::Access(loom_protocol::AccessRequest::DenySessionAccessRequest {
+                session_id: requested_session,
+                ..
+            })
+            | ClientRequest::Access(loom_protocol::AccessRequest::WithdrawSessionAccessRequest {
+                session_id: requested_session,
+                ..
+            })
             | ClientRequest::Collaboration(
                 loom_protocol::CollaborationRequest::SendPeerMessage {
                     session_id: requested_session,

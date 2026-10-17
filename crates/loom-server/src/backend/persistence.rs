@@ -615,6 +615,8 @@ impl InProcessBackend {
             },
             participants,
             session_grants,
+            access_requests: self.access.export_requests(),
+            run_action_sequences: self.collaboration.export(),
         };
         let workspace_configs = self.workspace_configs()?.clone();
         let provider_state = DurableProviderState {

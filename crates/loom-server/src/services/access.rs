@@ -25,8 +25,9 @@ use std::{
 };
 
 use loom_core::{
-    AgentSessionId, ErrorCode, LoomError, ParticipantId, ParticipantIdentity, PresenceStatus,
-    Result, RosterEntry, SessionGrant, SessionRole, Timestamp,
+    AccessRequestId, AgentSessionId, ErrorCode, LoomError, MAX_ACCESS_REQUEST_NOTE_BYTES,
+    ParticipantId, ParticipantIdentity, PresenceStatus, Result, RosterEntry, SessionAccessRequest,
+    SessionGrant, SessionRole, Timestamp,
 };
 use tokio::sync::Notify;
 
@@ -44,6 +45,8 @@ pub(crate) type RosterListener = Arc<dyn Fn(Vec<AgentSessionId>) + Send + Sync>;
 struct AccessState {
     participants: BTreeMap<ParticipantId, String>,
     grants: BTreeMap<AgentSessionId, BTreeMap<ParticipantId, SessionGrant>>,
+    /// Pending access requests; at most one per person and session.
+    requests: BTreeMap<AccessRequestId, SessionAccessRequest>,
     connections: BTreeMap<u64, ConnectionState>,
     last_active: BTreeMap<ParticipantId, Timestamp>,
     next_connection: u64,
@@ -408,6 +411,128 @@ impl AccessService {
                 .then_with(|| left.participant.id.cmp(&right.participant.id))
         });
         entries
+    }
+
+    /// Files or replaces `requester`'s pending request for `role` in a
+    /// session. A person who already holds `role` or a higher one gets an
+    /// error; a second request replaces the role and note of the first and
+    /// keeps its id.
+    pub(crate) fn request_access(
+        &self,
+        session_id: AgentSessionId,
+        requester: &ParticipantIdentity,
+        requested_role: SessionRole,
+        note: Option<String>,
+    ) -> Result<SessionAccessRequest> {
+        let note = note
+            .map(|note| note.trim().to_owned())
+            .filter(|note| !note.is_empty());
+        if note
+            .as_ref()
+            .is_some_and(|note| note.len() > MAX_ACCESS_REQUEST_NOTE_BYTES)
+        {
+            return Err(LoomError::invalid_request(format!(
+                "access request note exceeds {MAX_ACCESS_REQUEST_NOTE_BYTES} bytes"
+            )));
+        }
+        let mut state = self.state();
+        if let Some(current) = state
+            .grants
+            .get(&session_id)
+            .and_then(|grants| grants.get(&requester.id))
+            .map(|grant| grant.role)
+            && current >= requested_role
+        {
+            return Err(LoomError::invalid_request(format!(
+                "you already hold the {} role in session {session_id}",
+                current.as_str()
+            )));
+        }
+        state
+            .participants
+            .entry(requester.id)
+            .or_insert_with(|| requester.display_name.clone());
+        let existing = state
+            .requests
+            .values()
+            .find(|request| {
+                request.session_id == session_id && request.participant.id == requester.id
+            })
+            .map(|request| (request.id, request.created_at));
+        let (id, created_at) =
+            existing.unwrap_or_else(|| (AccessRequestId::new(), Timestamp::now()));
+        let request = SessionAccessRequest {
+            id,
+            session_id,
+            participant: requester.clone(),
+            requested_role,
+            note,
+            created_at,
+        };
+        state.requests.insert(id, request.clone());
+        Ok(request)
+    }
+
+    /// Pending requests of a session, oldest first.
+    pub(crate) fn access_requests(&self, session_id: AgentSessionId) -> Vec<SessionAccessRequest> {
+        let mut requests = self
+            .state()
+            .requests
+            .values()
+            .filter(|request| request.session_id == session_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        requests.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then(left.id.cmp(&right.id))
+        });
+        requests
+    }
+
+    /// One pending request of a session.
+    pub(crate) fn access_request(
+        &self,
+        session_id: AgentSessionId,
+        request_id: AccessRequestId,
+    ) -> Result<SessionAccessRequest> {
+        self.state()
+            .requests
+            .get(&request_id)
+            .filter(|request| request.session_id == session_id)
+            .cloned()
+            .ok_or_else(|| LoomError::not_found("access request", request_id))
+    }
+
+    /// Removes a pending request once it is decided or withdrawn.
+    pub(crate) fn remove_access_request(&self, request_id: AccessRequestId) {
+        self.state().requests.remove(&request_id);
+    }
+
+    /// Grants `participant` exactly `role`, creating the grant when needed.
+    pub(crate) fn grant_role(
+        &self,
+        session_id: AgentSessionId,
+        participant: ParticipantId,
+        role: SessionRole,
+        granted_by: Option<ParticipantId>,
+    ) -> Result<SessionGrant> {
+        self.grant(session_id, participant, granted_by)?;
+        self.set_role(session_id, participant, role, granted_by)
+    }
+
+    /// Durable form of the pending requests.
+    pub(crate) fn export_requests(&self) -> Vec<SessionAccessRequest> {
+        self.state().requests.values().cloned().collect()
+    }
+
+    /// Replaces the pending requests with the durable state.
+    pub(crate) fn restore_requests(&self, requests: Vec<SessionAccessRequest>) {
+        let mut state = self.state();
+        state.requests = requests
+            .into_iter()
+            .map(|request| (request.id, request))
+            .collect();
     }
 
     /// Durable form: the directory and every grant.

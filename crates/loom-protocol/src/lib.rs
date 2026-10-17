@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use loom_core::{
+    AccessRequestDecision, AccessRequestId, CredentialId, MAX_ACCESS_REQUEST_NOTE_BYTES,
+    ParticipantId, ParticipantIdentity, PresenceStatus, ProviderCredentialMetadata, RosterEntry,
+    RunCredentialPin, SessionAccessRequest, SessionCredentialSelection, SessionGrant, SessionRole,
+};
+pub use loom_core::{
     Author, CollaborationEntry, CollaborationEntryKind, MAX_COLLABORATION_TEXT_BYTES, Recipient,
     RunControlAction, RunRevision,
 };
@@ -26,10 +31,6 @@ pub use loom_core::{
     TerminalStream, UndoResult, WorkerNodeConfig, WorkspaceChangeKind, WorkspaceConfig,
     WorkspaceControl, WorkspaceEdit, WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind,
     WorkspaceRecord,
-};
-pub use loom_core::{
-    CredentialId, ParticipantId, ParticipantIdentity, PresenceStatus, ProviderCredentialMetadata,
-    RosterEntry, RunCredentialPin, SessionCredentialSelection, SessionGrant, SessionRole,
 };
 pub use loom_core::{
     GitBranch, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,
@@ -579,6 +580,15 @@ impl ClientRequest {
             Self::Access(AccessRequest::SelectSessionCredential { .. }) => {
                 Some(Capability::ControlAgentSession)
             }
+            Self::Access(AccessRequest::RequestSessionAccess { .. })
+            | Self::Access(AccessRequest::WithdrawSessionAccessRequest { .. }) => {
+                Some(Capability::RequestSessionAccess)
+            }
+            Self::Access(AccessRequest::ListSessionAccessRequests { .. })
+            | Self::Access(AccessRequest::ApproveSessionAccessRequest { .. })
+            | Self::Access(AccessRequest::DenySessionAccessRequest { .. }) => {
+                Some(Capability::ManageSessionAccess)
+            }
         }
     }
 
@@ -604,7 +614,11 @@ impl ClientRequest {
             | Self::Access(AccessRequest::GetCurrentParticipant)
             | Self::Access(AccessRequest::ListParticipants)
             | Self::Access(AccessRequest::ListProviderCredentials)
-            | Self::Access(AccessRequest::RevokeProviderCredential { .. }) => None,
+            | Self::Access(AccessRequest::RevokeProviderCredential { .. })
+            // Asking for access needs only a bound identity; withdrawing is
+            // limited to the requester by the backend.
+            | Self::Access(AccessRequest::RequestSessionAccess { .. })
+            | Self::Access(AccessRequest::WithdrawSessionAccessRequest { .. }) => None,
             Self::Events(EventsRequest::GetSessionEvents { session_id, .. }) => {
                 if session_id.is_some() {
                     Some(Observer)
@@ -696,6 +710,9 @@ impl ClientRequest {
                 session_id: Some(_),
                 ..
             })
+            | Self::Access(AccessRequest::ListSessionAccessRequests { .. })
+            | Self::Access(AccessRequest::ApproveSessionAccessRequest { .. })
+            | Self::Access(AccessRequest::DenySessionAccessRequest { .. })
             | Self::Access(AccessRequest::RevokeSessionAccess { .. }) => Some(Owner),
         }
     }
@@ -789,6 +806,9 @@ impl ClientRequest {
                 ..
             })
             | Self::Access(AccessRequest::RevokeSessionAccess { session_id, .. })
+            | Self::Access(AccessRequest::ListSessionAccessRequests { session_id })
+            | Self::Access(AccessRequest::ApproveSessionAccessRequest { session_id, .. })
+            | Self::Access(AccessRequest::DenySessionAccessRequest { session_id, .. })
             | Self::Collaboration(CollaborationRequest::SendPeerMessage { session_id, .. })
             | Self::Collaboration(CollaborationRequest::ListSessionCollaboration {
                 session_id,
@@ -880,6 +900,10 @@ impl ClientRequest {
                 | Self::Collaboration(CollaborationRequest::ControlRun { .. })
                 | Self::Access(AccessRequest::SelectSessionCredential { .. })
                 | Self::Access(AccessRequest::RevokeProviderCredential { .. })
+                | Self::Access(AccessRequest::RequestSessionAccess { .. })
+                | Self::Access(AccessRequest::ApproveSessionAccessRequest { .. })
+                | Self::Access(AccessRequest::DenySessionAccessRequest { .. })
+                | Self::Access(AccessRequest::WithdrawSessionAccessRequest { .. })
         )
     }
 }
@@ -1168,7 +1192,7 @@ mod run_message_protocol_tests {
 
     #[test]
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 4));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 5));
         let project_id = ProjectId::new();
         let request = ClientRequest::Project(ProjectRequest::GetProjectSnapshot { project_id });
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));

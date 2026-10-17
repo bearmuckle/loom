@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::{AgentSessionId, ParticipantId, Timestamp};
+use crate::{AccessRequestId, AgentSessionId, ParticipantId, Timestamp};
 use serde::{Deserialize, Serialize};
 
 /// Most UTF-8 bytes a participant display name may carry.
@@ -81,6 +81,35 @@ pub struct SessionGrant {
     pub granted_by: Option<ParticipantId>,
     pub granted_at: Timestamp,
     pub updated_at: Timestamp,
+}
+
+/// Most UTF-8 bytes the note of an access request may carry.
+pub const MAX_ACCESS_REQUEST_NOTE_BYTES: usize = 1024;
+
+/// A person's pending request for access to a session, or for a higher role
+/// in it. Only pending requests are stored; a decision or a withdrawal
+/// removes the request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionAccessRequest {
+    pub id: AccessRequestId,
+    pub session_id: AgentSessionId,
+    /// The requester, derived by the server from the connection.
+    pub participant: ParticipantIdentity,
+    pub requested_role: SessionRole,
+    pub note: Option<String>,
+    pub created_at: Timestamp,
+}
+
+/// How a pending access request ended.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum AccessRequestDecision {
+    /// An owner approved it; `role` is the role the requester now holds.
+    Approved { role: SessionRole },
+    /// An owner denied it.
+    Denied { reason: Option<String> },
+    /// The requester withdrew it.
+    Withdrawn,
 }
 
 /// Aggregated presence of one person across all of their connections.

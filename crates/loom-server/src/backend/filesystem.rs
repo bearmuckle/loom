@@ -258,6 +258,7 @@ impl InProcessBackend {
                     pending_events: Vec::new(),
                     workspace_events: Vec::new(),
                     pending_workspace_events: Vec::new(),
+                    rosters: BTreeMap::new(),
                     retention_limit: feed.retention_limit,
                 })
                 .unwrap_or_default(),

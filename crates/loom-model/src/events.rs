@@ -118,6 +118,17 @@ pub enum ServerEvent {
     SessionRosterChanged {
         entries: Vec<loom_core::RosterEntry>,
     },
+    /// A person asked for access to the session, or replaced their pending
+    /// request. Delivered only to the session's owners. Protocol 11.5.
+    SessionAccessRequested {
+        request: loom_core::SessionAccessRequest,
+    },
+    /// A pending access request was approved, denied, or withdrawn.
+    /// Delivered to the session's owners and to the requester. Protocol 11.5.
+    SessionAccessRequestResolved {
+        request: loom_core::SessionAccessRequest,
+        decision: loom_core::AccessRequestDecision,
+    },
 }
 
 impl From<SessionEventRecord> for ServerEventEnvelope {

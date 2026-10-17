@@ -480,6 +480,27 @@ CREATE TABLE IF NOT EXISTS session_grants (
 ) WITHOUT ROWID, STRICT;
 CREATE INDEX IF NOT EXISTS session_grants_by_participant
     ON session_grants(participant_id, session_id);
+-- A person's pending request for access to a session, or for a higher role.
+-- Decided and withdrawn requests are removed.
+CREATE TABLE IF NOT EXISTS session_access_requests (
+    request_id BLOB PRIMARY KEY NOT NULL CHECK(length(request_id) = 16),
+    session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+        CHECK(length(session_id) = 16),
+    participant_id BLOB NOT NULL REFERENCES participants(participant_id) ON DELETE CASCADE
+        CHECK(length(participant_id) = 16),
+    requested_role TEXT NOT NULL CHECK(requested_role IN ('observer', 'participant', 'owner')),
+    note TEXT CHECK(note IS NULL OR length(CAST(note AS BLOB)) <= 1024),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    UNIQUE(session_id, participant_id)
+) WITHOUT ROWID, STRICT;
+-- Count of people's actions accepted on a run, the last part of its
+-- RunRevision. Stored so a revision issued before a restart never matches a
+-- different run state after it.
+CREATE TABLE IF NOT EXISTS run_action_sequences (
+    run_id BLOB PRIMARY KEY NOT NULL REFERENCES run_summaries(run_id) ON DELETE CASCADE
+        CHECK(length(run_id) = 16),
+    action_sequence INTEGER NOT NULL CHECK(action_sequence >= 0)
+) WITHOUT ROWID, STRICT;
 CREATE TABLE IF NOT EXISTS provider_configs (
     provider_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(provider_id)) > 0),
     config TEXT NOT NULL CHECK(length(config) <= 65536)
@@ -1181,6 +1202,11 @@ fn migrate_schema_transaction(connection: &Connection, from_version: u32) -> Res
             // tables, which the re-applied baseline below creates.
             9 => {
                 version = 10;
+            }
+            // v11 adds pending access requests and run action sequences, both
+            // new baseline tables.
+            10 => {
+                version = 11;
             }
             other => return Err(unsupported_database_error(other)),
         }

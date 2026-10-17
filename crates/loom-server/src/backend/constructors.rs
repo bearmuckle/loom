@@ -271,6 +271,7 @@ impl InProcessBackend {
             Capability::ReadSessionRoster,
             Capability::ManageSessionAccess,
             Capability::SendPeerMessage,
+            Capability::RequestSessionAccess,
         ];
         if persistence.is_some() {
             supported_capabilities.extend([
@@ -346,6 +347,12 @@ impl InProcessBackend {
         if let Some(persistence) = &backend.persistence {
             let (participants, grants) = persistence.load_session_access()?;
             backend.access.restore(participants, grants);
+            backend
+                .access
+                .restore_requests(persistence.load_access_requests()?);
+            backend
+                .collaboration
+                .restore(persistence.load_run_action_sequences()?);
         }
         backend
             .provider_credentials

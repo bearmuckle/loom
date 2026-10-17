@@ -533,4 +533,20 @@ pub enum AccessResponse {
     ProviderCredentialRevoked {
         credential_id: CredentialId,
     },
+
+    /// The caller's pending request after it was created or replaced.
+    SessionAccessRequestPending(SessionAccessRequest),
+
+    SessionAccessRequests {
+        session_id: AgentSessionId,
+        requests: Vec<SessionAccessRequest>,
+    },
+
+    /// A request was approved, denied, or withdrawn. `grant` is the
+    /// requester's grant after an approval and `None` otherwise.
+    SessionAccessRequestResolved {
+        request: SessionAccessRequest,
+        decision: AccessRequestDecision,
+        grant: Option<SessionGrant>,
+    },
 }

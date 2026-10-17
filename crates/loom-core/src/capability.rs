@@ -69,6 +69,9 @@ pub enum Capability {
     /// Allows sending peer chat to the people in a session. The backend
     /// additionally requires the participant role.
     SendPeerMessage,
+    /// Allows a person to request access to a session, or a higher role in
+    /// it, and to withdraw that request. Needs only a bound identity.
+    RequestSessionAccess,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

@@ -42,14 +42,15 @@ pub use filesystem::{
     WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind,
 };
 pub use id::{
-    ActivityId, AgentMessageId, AgentSessionId, CheckpointId, CredentialId, EventSequence,
-    InteractionId, ParticipantId, ProjectId, ProjectManagerWaitId, RepositoryId, RequestId,
-    RunAttemptId, RunId, StepId, TaskId, TerminalId, ToolCallId, WorkspaceId,
+    AccessRequestId, ActivityId, AgentMessageId, AgentSessionId, CheckpointId, CredentialId,
+    EventSequence, InteractionId, ParticipantId, ProjectId, ProjectManagerWaitId, RepositoryId,
+    RequestId, RunAttemptId, RunId, StepId, TaskId, TerminalId, ToolCallId, WorkspaceId,
 };
 pub use limits::{LimitKind, LimitStatus, SessionLimits, UsageSnapshot};
 pub use participant::{
-    MAX_PARTICIPANT_DISPLAY_NAME_BYTES, ParticipantIdentity, PresenceStatus, RosterEntry,
-    SessionGrant, SessionRole,
+    AccessRequestDecision, MAX_ACCESS_REQUEST_NOTE_BYTES, MAX_PARTICIPANT_DISPLAY_NAME_BYTES,
+    ParticipantIdentity, PresenceStatus, RosterEntry, SessionAccessRequest, SessionGrant,
+    SessionRole,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use paths::{

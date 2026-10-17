@@ -424,7 +424,9 @@ transcript may lag the event stream by one in-flight model call.
 
 Protocol 11.3 adds identity, roles, and presence; 11.4 adds attributed chat
 and ordered run actions. Provider credential selection uses the same 11.4
-version.
+version. 11.5 adds access requests. Every addition is a new enum variant or
+capability, so clients of an older 11.x minor keep working; they simply never
+send the new requests or negotiate the new capability.
 
 ### Identity and roles
 
@@ -472,6 +474,26 @@ requests and closes their WebSocket connections with close code 1008.
 - `RevokeProviderCredential { credential_id }` →
   `ProviderCredentialRevoked`. Runs pinned to it fail their next provider call.
 
+- `RequestSessionAccess { session_id, requested_role, note }` →
+  `SessionAccessRequestPending(SessionAccessRequest)`. Needs only a
+  participant-bound connection (capability `RequestSessionAccess`); no grant
+  is required. One pending request per person and session: asking again
+  replaces role and note and keeps the id. A note is at most 1 KiB. Asking for
+  a role you already hold (or lower) fails with `invalid_request`.
+- `ListSessionAccessRequests { session_id }` → `SessionAccessRequests`.
+  Owner only. Oldest first.
+- `ApproveSessionAccessRequest { session_id, request_id, role }` →
+  `SessionAccessRequestResolved { request, decision, grant }`. Owner only.
+  Grants `role`, or the requested role when `role` is `None`.
+- `DenySessionAccessRequest { session_id, request_id, reason }` →
+  `SessionAccessRequestResolved`. Owner only. Access is unchanged.
+- `WithdrawSessionAccessRequest { session_id, request_id }` →
+  `SessionAccessRequestResolved` with `decision: withdrawn`. Only the
+  requester; anyone else gets `not_found`.
+
+Pending requests persist (table `session_access_requests`, schema v11) and are
+removed when decided or withdrawn.
+
 A missing, revoked, or mismatched credential fails with
 `provider_authentication` and a recovery hint (the owner signs in again or
 selects another credential). There is no fallback to another account.
@@ -507,7 +529,10 @@ server serializes every direction, answer, and control action on a run. An
 action is applied only if its `expected` revision equals the current one; it
 then advances `action_sequence` and answers `Accepted { entry, revision, run }`.
 Otherwise it answers `Conflict { expected, current, run }` and changes
-nothing. Two people acting on the same revision get one acceptance and one
+nothing. `action_sequence` is persisted per run (table
+`run_action_sequences`, schema v11) with every state save, so it survives a
+backend restart and a revision issued before the restart never matches a
+different state after it. Two people acting on the same revision get one acceptance and one
 conflict, in the order the server received them.
 
 Clients send the revision they decided against (from `GetRunRevision`, the
@@ -521,11 +546,22 @@ without a revision check, so they are ordered and attributed too.
 - `ServerEvent::Collaboration { entry }`: a `CollaborationEntry` with
   `author` (`participant` with identity and role, or `operator`), `recipient`
   (`agent` or `people`), `kind` (`peer_message`, `agent_direction`,
-  `agent_answer`, `run_control`, `access_changed`), optional `run_id` and
-  `revision`, and `created_at`. Persisted in the session history.
+  `agent_answer`, `run_control`, `access_changed`, `access_request_decided`),
+  optional `run_id` and `revision`, and `created_at`. Persisted in the session
+  history. Grants, role changes, revokes, and approve/deny decisions are all
+  recorded here with their author.
 - `ServerEvent::SessionRosterChanged { entries }`: the full roster after a
   connect, disconnect, grant, role change, or revoke. Clients replace their
-  copy.
+  copy. Presence is live state, not history: only the latest roster per
+  session is kept, outside the retained window, and it is never written to
+  the durable feed, so presence churn never evicts history events. After a
+  restart or for the current state, read `GetSessionRoster`.
+- `ServerEvent::SessionAccessRequested { request }`: a request was filed or
+  replaced. Delivered to the session's owners and the requester only.
+- `ServerEvent::SessionAccessRequestResolved { request, decision }`: a
+  request was approved, denied, or withdrawn. Delivered to the owners and the
+  requester (the requester sees it on the cross-session stream even before
+  holding a grant).
 
 ## Reconnect and consistency
 

@@ -226,6 +226,7 @@ impl InProcessBackend {
             // events are indexed per session, so deleting a session drops its
             // whole window.
             journal.events.retain(|id, _| !deleted_ids.contains(id));
+            journal.rosters.retain(|id, _| !deleted_ids.contains(id));
             journal
                 .pending_events
                 .retain(|event| !deleted_ids.contains(&event.session_id));

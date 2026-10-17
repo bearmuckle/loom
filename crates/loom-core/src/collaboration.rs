@@ -4,8 +4,8 @@
 //! a client never names the author.
 
 use crate::{
-    AgentSessionId, CheckpointId, InteractionId, ParticipantIdentity, RunAttemptId, RunId,
-    SessionRole, Timestamp, ToolCallId,
+    AccessRequestDecision, AccessRequestId, AgentSessionId, CheckpointId, InteractionId,
+    ParticipantIdentity, RunAttemptId, RunId, SessionRole, Timestamp, ToolCallId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -99,6 +99,14 @@ pub enum CollaborationEntryKind {
     AccessChanged {
         participant: ParticipantIdentity,
         role: Option<SessionRole>,
+    },
+    /// An owner approved or denied a person's access request. An approval
+    /// also changes the person's role, which the roster reflects.
+    AccessRequestDecided {
+        request_id: AccessRequestId,
+        participant: ParticipantIdentity,
+        requested_role: SessionRole,
+        decision: AccessRequestDecision,
     },
 }
 

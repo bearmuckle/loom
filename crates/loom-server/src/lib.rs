@@ -198,6 +198,10 @@ struct EventJournal {
     workspace_events: Vec<WorkspaceEventEnvelope>,
     #[serde(skip)]
     pending_workspace_events: Vec<WorkspaceEventEnvelope>,
+    /// Latest `SessionRosterChanged` per session. Presence is live state, so
+    /// it is kept out of the retained window and the durable feed.
+    #[serde(skip)]
+    rosters: BTreeMap<AgentSessionId, ServerEventEnvelope>,
     #[serde(default = "default_event_retention")]
     retention_limit: usize,
 }

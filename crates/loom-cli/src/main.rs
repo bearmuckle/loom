@@ -1548,6 +1548,16 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
                         None => format!("revoked {}", participant.display_name),
                     }
                 }
+                loom_core::CollaborationEntryKind::AccessRequestDecided {
+                    participant,
+                    requested_role,
+                    decision,
+                    ..
+                } => format!(
+                    "{}'s request for {} was {decision:?}",
+                    participant.display_name,
+                    requested_role.as_str()
+                ),
             };
             println!("{author} -> {recipient}: {detail}");
         }
@@ -1565,6 +1575,19 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
                 .collect::<Vec<_>>()
                 .join(", ");
             println!("Roster: {people}");
+        }
+        ServerEvent::SessionAccessRequested { request } => {
+            println!(
+                "Access requested: {} asks for {}",
+                request.participant.display_name,
+                request.requested_role.as_str()
+            );
+        }
+        ServerEvent::SessionAccessRequestResolved { request, decision } => {
+            println!(
+                "Access request of {} resolved: {decision:?}",
+                request.participant.display_name
+            );
         }
     }
 }

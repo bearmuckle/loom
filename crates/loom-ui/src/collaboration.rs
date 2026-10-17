@@ -577,6 +577,26 @@ pub(crate) fn entry_text(entry: &CollaborationEntry) -> String {
             ),
             None => format!("Revoked access for {}", participant.display_name),
         },
+        CollaborationEntryKind::AccessRequestDecided {
+            participant,
+            requested_role,
+            decision,
+            ..
+        } => match decision {
+            loom_core::AccessRequestDecision::Approved { role } => format!(
+                "Approved {} as {}",
+                participant.display_name,
+                role_label(*role).to_lowercase()
+            ),
+            loom_core::AccessRequestDecision::Denied { .. } => format!(
+                "Denied {}'s request to be {}",
+                participant.display_name,
+                role_label(*requested_role).to_lowercase()
+            ),
+            loom_core::AccessRequestDecision::Withdrawn => {
+                format!("{} withdrew their request", participant.display_name)
+            }
+        },
     }
 }
 

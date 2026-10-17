@@ -769,3 +769,326 @@ fn only_owners_browse_repositories_and_only_operators_configure_providers() {
     negotiate(&operator);
     assert!(status(&operator).is_ok());
 }
+
+fn request_access(
+    connection: &InProcessConnection,
+    session_id: AgentSessionId,
+    role: SessionRole,
+    note: Option<&str>,
+) -> Result<loom_core::SessionAccessRequest> {
+    match access(
+        connection,
+        AccessRequest::RequestSessionAccess {
+            session_id,
+            requested_role: role,
+            note: note.map(str::to_owned),
+        },
+    )? {
+        AccessResponse::SessionAccessRequestPending(request) => Ok(request),
+        response => panic!("unexpected request response: {response:?}"),
+    }
+}
+
+fn pending(
+    connection: &InProcessConnection,
+    session_id: AgentSessionId,
+) -> Result<Vec<loom_core::SessionAccessRequest>> {
+    match access(
+        connection,
+        AccessRequest::ListSessionAccessRequests { session_id },
+    )? {
+        AccessResponse::SessionAccessRequests { requests, .. } => Ok(requests),
+        response => panic!("unexpected list response: {response:?}"),
+    }
+}
+
+/// Access-request events a connection sees on the cross-session stream. A
+/// requester without a grant cannot read the session feed, so the request
+/// events filed by them are delivered there.
+fn request_events(connection: &InProcessConnection) -> Vec<ServerEvent> {
+    match send(
+        connection,
+        ClientRequest::Events(EventsRequest::GetSessionEvents {
+            session_id: None,
+            workspace_id: None,
+            after_sequence: None,
+            stream_epoch: None,
+        }),
+    )
+    .unwrap()
+    {
+        ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) => events
+            .into_iter()
+            .map(|event| event.event)
+            .filter(|event| {
+                matches!(
+                    event,
+                    ServerEvent::SessionAccessRequested { .. }
+                        | ServerEvent::SessionAccessRequestResolved { .. }
+                )
+            })
+            .collect(),
+        response => panic!("unexpected events response: {response:?}"),
+    }
+}
+
+#[test]
+fn access_requests_are_filed_listed_and_decided_by_owners() {
+    use loom_core::{AccessRequestDecision, Author, CollaborationEntryKind};
+
+    let backend = InProcessBackend::new();
+    let people = People::new(backend.clone());
+    let owner = person("Owner");
+    let guest = person("Guest");
+    let other = person("Other");
+    let owner_connection = people.connect(&owner);
+    let guest_connection = people.connect(&guest);
+    let other_connection = people.connect(&other);
+    let session_id = create_session(&owner_connection);
+
+    // An operator connection has no identity to request with.
+    let operator = backend.connect();
+    negotiate(&operator);
+    assert_eq!(
+        request_access(&operator, session_id, SessionRole::Observer, None)
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    );
+    // An owner already holds every role.
+    assert!(request_access(&owner_connection, session_id, SessionRole::Owner, None).is_err());
+
+    // A person without a grant may ask; asking again replaces the request.
+    let first = request_access(
+        &guest_connection,
+        session_id,
+        SessionRole::Observer,
+        Some("hi"),
+    )
+    .unwrap();
+    let request = request_access(
+        &guest_connection,
+        session_id,
+        SessionRole::Participant,
+        Some("  pairing on #25  "),
+    )
+    .unwrap();
+    assert_eq!(request.id, first.id);
+    assert_eq!(request.participant, guest);
+    assert_eq!(request.note.as_deref(), Some("pairing on #25"));
+    assert_eq!(
+        request_access(
+            &guest_connection,
+            session_id,
+            SessionRole::Observer,
+            Some(&"x".repeat(loom_core::MAX_ACCESS_REQUEST_NOTE_BYTES + 1)),
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::InvalidRequest
+    );
+
+    // Only owners list and decide.
+    denied(pending(&guest_connection, session_id));
+    assert_eq!(
+        pending(&owner_connection, session_id).unwrap(),
+        vec![request.clone()]
+    );
+    denied(access(
+        &guest_connection,
+        AccessRequest::ApproveSessionAccessRequest {
+            session_id,
+            request_id: request.id,
+            role: None,
+        },
+    ));
+    // Someone else cannot withdraw it.
+    assert_eq!(
+        access(
+            &other_connection,
+            AccessRequest::WithdrawSessionAccessRequest {
+                session_id,
+                request_id: request.id,
+            },
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::NotFound
+    );
+
+    // Owners and the requester see the request event; others do not.
+    assert!(matches!(
+        request_events(&owner_connection).last(),
+        Some(ServerEvent::SessionAccessRequested { request: seen }) if *seen == request
+    ));
+    assert!(!request_events(&guest_connection).is_empty());
+    assert!(request_events(&other_connection).is_empty());
+
+    // Approval applies the requested role and is attributed history.
+    let AccessResponse::SessionAccessRequestResolved {
+        decision, grant, ..
+    } = access(
+        &owner_connection,
+        AccessRequest::ApproveSessionAccessRequest {
+            session_id,
+            request_id: request.id,
+            role: None,
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a resolution");
+    };
+    assert_eq!(
+        decision,
+        AccessRequestDecision::Approved {
+            role: SessionRole::Participant
+        }
+    );
+    assert_eq!(grant.unwrap().role, SessionRole::Participant);
+    assert!(pending(&owner_connection, session_id).unwrap().is_empty());
+    assert!(matches!(
+        request_events(&guest_connection).last(),
+        Some(ServerEvent::SessionAccessRequestResolved { decision, .. })
+            if *decision == AccessRequestDecision::Approved { role: SessionRole::Participant }
+    ));
+    let history = match send(
+        &owner_connection,
+        ClientRequest::Events(EventsRequest::GetSessionEvents {
+            session_id: Some(session_id),
+            workspace_id: None,
+            after_sequence: None,
+            stream_epoch: None,
+        }),
+    )
+    .unwrap()
+    {
+        ServerResponse::Events(EventsResponse::SessionEvents { events, .. })
+        | ServerResponse::Events(EventsResponse::SessionEventsSnapshot { events, .. }) => events,
+        response => panic!("unexpected events response: {response:?}"),
+    };
+    let decided = history
+        .iter()
+        .find_map(|event| match &event.event {
+            ServerEvent::Collaboration { entry } => match &entry.kind {
+                CollaborationEntryKind::AccessRequestDecided { participant, .. } => {
+                    Some((entry.author.clone(), participant.clone()))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("the approval is recorded");
+    assert_eq!(
+        decided,
+        (
+            Author::Participant {
+                participant: owner.clone(),
+                role: SessionRole::Owner
+            },
+            guest.clone()
+        )
+    );
+
+    // A denial leaves access unchanged; a withdrawal removes the request.
+    let promotion =
+        request_access(&guest_connection, session_id, SessionRole::Owner, None).unwrap();
+    let AccessResponse::SessionAccessRequestResolved {
+        decision, grant, ..
+    } = access(
+        &owner_connection,
+        AccessRequest::DenySessionAccessRequest {
+            session_id,
+            request_id: promotion.id,
+            reason: Some("not yet".to_owned()),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected a resolution");
+    };
+    assert_eq!(
+        decision,
+        AccessRequestDecision::Denied {
+            reason: Some("not yet".to_owned())
+        }
+    );
+    assert!(grant.is_none());
+    denied(rename(&guest_connection, session_id));
+    let again = request_access(&other_connection, session_id, SessionRole::Observer, None).unwrap();
+    assert!(matches!(
+        access(
+            &other_connection,
+            AccessRequest::WithdrawSessionAccessRequest {
+                session_id,
+                request_id: again.id,
+            },
+        )
+        .unwrap(),
+        AccessResponse::SessionAccessRequestResolved {
+            decision: AccessRequestDecision::Withdrawn,
+            ..
+        }
+    ));
+    assert!(pending(&owner_connection, session_id).unwrap().is_empty());
+    assert_eq!(
+        access(
+            &owner_connection,
+            AccessRequest::DenySessionAccessRequest {
+                session_id,
+                request_id: again.id,
+                reason: None,
+            },
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::NotFound
+    );
+}
+
+#[test]
+fn pending_access_requests_survive_a_backend_restart() {
+    let directory =
+        std::env::temp_dir().join(format!("loom-access-request-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("state.db");
+    let owner = person("Owner");
+    let guest = person("Guest");
+    let (session_id, request) = {
+        let backend = InProcessBackend::new_persistent(&path).unwrap();
+        let people = People::new(backend.clone());
+        let owner_connection = people.connect(&owner);
+        let guest_connection = people.connect(&guest);
+        let session_id = create_session(&owner_connection);
+        let request = request_access(
+            &guest_connection,
+            session_id,
+            SessionRole::Participant,
+            Some("note"),
+        )
+        .unwrap();
+        backend.shutdown().unwrap();
+        (session_id, request)
+    };
+    let backend = InProcessBackend::new_persistent(&path).unwrap();
+    let people = People::new(backend.clone());
+    let owner_connection = people.connect(&owner);
+    assert_eq!(
+        pending(&owner_connection, session_id).unwrap(),
+        vec![request.clone()]
+    );
+    access(
+        &owner_connection,
+        AccessRequest::ApproveSessionAccessRequest {
+            session_id,
+            request_id: request.id,
+            role: Some(SessionRole::Observer),
+        },
+    )
+    .unwrap();
+    let guest_connection = people.connect(&guest);
+    assert!(read(&guest_connection, session_id).is_ok());
+    denied(start_run(&guest_connection, session_id));
+    backend.shutdown().unwrap();
+    let _ = fs::remove_dir_all(directory);
+}

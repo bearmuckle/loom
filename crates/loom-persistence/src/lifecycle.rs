@@ -330,6 +330,9 @@ impl FilePersistence {
             save_run_attempt_rows(&transaction, run_summaries)?;
             save_run_execution_state_rows(&transaction, run_summaries)?;
         }
+        if let Some(settings) = write.settings {
+            save_run_action_sequence_rows(&transaction, &settings.run_action_sequences)?;
+        }
         if let Some(runtime_configs) = write.run_runtime_configs {
             save_run_runtime_config_rows(&transaction, runtime_configs)?;
         }
