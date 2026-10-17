@@ -155,8 +155,8 @@ impl Render for LoomView {
             self.clear_node_on_render = false;
         }
         #[cfg(target_family = "wasm")]
-        if !self.connected {
-            return self.render_disconnected(window, cx);
+        if !self.connected || self.browser_starting {
+            return self.render_startup_screen(window, cx);
         }
         if self.rename_dialog.is_some() && self.rename_input_state.is_none() {
             let initial_value = self

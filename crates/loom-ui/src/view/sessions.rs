@@ -415,8 +415,32 @@ impl LoomView {
         self.session_drawer_open = false;
     }
 
+    /// Opens the session a fresh browser bootstrap already made active.
+    ///
+    /// The bootstrap resolved the landing session's sources, project snapshot,
+    /// and node with the rest of the first frame, so this only starts the
+    /// conversation load. Routing through [`Self::select_session`] instead
+    /// would clear the source state that the frame is about to draw and leave
+    /// the header blank until the review load refilled it.
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn open_browser_landing_session(
+        &mut self,
+        session: AgentSessionSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_session.id != session.id {
+            self.select_session(session, cx);
+            return;
+        }
+        self.begin_session_data_load(session.id, cx);
+        cx.notify();
+    }
+
     pub(crate) fn select_session(&mut self, session: AgentSessionSnapshot, cx: &mut Context<Self>) {
         if let Err(error) = self.backend_for_session(session.id) {
+            // Nothing will load for this session, so the browser startup screen
+            // must not wait on it; the error banner explains the empty workspace.
+            self.finish_browser_startup();
             self.record_backend_error("select session", error);
             cx.notify();
             return;
@@ -458,6 +482,7 @@ impl LoomView {
         let backend = match self.backend_for_session(session_id) {
             Ok(backend) => backend,
             Err(error) => {
+                self.finish_browser_startup();
                 self.record_backend_error("load session", error);
                 cx.notify();
                 return;
@@ -689,6 +714,10 @@ impl LoomView {
         self.ensure_session_task_message(session_id);
         if needs_transcript_page {
             self.begin_transcript_page(None, cx);
+        } else {
+            // The conversation is on screen, so a browser startup that waited
+            // for it can reveal the workspace.
+            self.finish_browser_startup();
         }
         self.refresh_review(cx);
         self.refresh_active_project_snapshot(cx);

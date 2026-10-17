@@ -48,15 +48,26 @@ impl LoomView {
         picker
     }
 
+    /// The screen the browser client shows while it has no workspace to show:
+    /// the startup skeleton while it connects and opens its landing project, or
+    /// the disconnected screen once it has no worker to reach.
     #[cfg(target_family = "wasm")]
-    pub(crate) fn render_disconnected(
+    pub(crate) fn render_startup_screen(
         &self,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
         let layout = responsive_layout(window.bounds().size.width);
-        let screen = disconnected_screen(self.browser_connection_lost.as_deref())
-            .with_progress(self.reconnect_progress());
+        let screen = if self.browser_starting {
+            startup_screen(self.connected)
+        } else {
+            disconnected_screen(self.browser_connection_lost.as_deref())
+        }
+        .with_progress(self.reconnect_progress());
+        // A bootstrap in flight is progress, not a failure: it offers neither a
+        // settings prompt nor a reconnect, which would only look like something
+        // to fix while the client is already working on it.
+        let offer_worker_settings = !self.browser_starting;
         let details = screen.details.clone();
         div()
             .size_full()
@@ -112,15 +123,17 @@ impl LoomView {
                                         .border_t_1()
                                         .border_color(rgb(0x30343f))
                                         .pt_2()
-                                        .child(
-                                            Button::new("disconnected-settings")
-                                                .icon(Icon::new(IconName::Settings))
-                                                .ghost()
-                                                .xsmall()
-                                                .on_click(cx.listener(|view, _, _, cx| {
-                                                    view.open_settings_from_menu(cx);
-                                                })),
-                                        ),
+                                        .when(offer_worker_settings, |footer| {
+                                            footer.child(
+                                                Button::new("disconnected-settings")
+                                                    .icon(Icon::new(IconName::Settings))
+                                                    .ghost()
+                                                    .xsmall()
+                                                    .on_click(cx.listener(|view, _, _, cx| {
+                                                        view.open_settings_from_menu(cx);
+                                                    })),
+                                            )
+                                        }),
                                 ),
                         )
                     })
@@ -192,34 +205,43 @@ impl LoomView {
                                     )
                                     .child(
                                         disconnected_header_actions()
-                                            .when(screen.reconnect, |row| {
+                                            .when(
+                                                screen.reconnect && offer_worker_settings,
+                                                |row| {
+                                                    row.child(
+                                                        Button::new("disconnected-reconnect")
+                                                            .label("Reconnect")
+                                                            .small()
+                                                            .when(layout.phone, |button| {
+                                                                button.h(layout.control_size())
+                                                            })
+                                                            .on_click(cx.listener(
+                                                                |view, _, _, cx| {
+                                                                    view.reconnect_browser(cx);
+                                                                },
+                                                            )),
+                                                    )
+                                                },
+                                            )
+                                            .when(offer_worker_settings, |row| {
                                                 row.child(
-                                                    Button::new("disconnected-reconnect")
-                                                        .label("Reconnect")
-                                                        .small()
+                                                    Button::new("disconnected-open-settings")
+                                                        .icon(Icon::new(IconName::Settings))
+                                                        .ghost()
                                                         .when(layout.phone, |button| {
-                                                            button.h(layout.control_size())
+                                                            button
+                                                                .large()
+                                                                .h(layout.control_size())
+                                                                .w(layout.control_size())
+                                                        })
+                                                        .when(!layout.phone, |button| {
+                                                            button.xsmall()
                                                         })
                                                         .on_click(cx.listener(|view, _, _, cx| {
-                                                            view.reconnect_browser(cx);
+                                                            view.open_settings_from_menu(cx);
                                                         })),
                                                 )
-                                            })
-                                            .child(
-                                                Button::new("disconnected-open-settings")
-                                                    .icon(Icon::new(IconName::Settings))
-                                                    .ghost()
-                                                    .when(layout.phone, |button| {
-                                                        button
-                                                            .large()
-                                                            .h(layout.control_size())
-                                                            .w(layout.control_size())
-                                                    })
-                                                    .when(!layout.phone, |button| button.xsmall())
-                                                    .on_click(cx.listener(|view, _, _, cx| {
-                                                        view.open_settings_from_menu(cx);
-                                                    })),
-                                            ),
+                                            }),
                                     ),
                             )
                             .child(div().flex_1().flex().items_center().justify_center())
@@ -252,6 +274,7 @@ impl LoomView {
             .when(
                 !self.settings_open()
                     && !self.welcome_dialog_dismissed
+                    && !self.browser_starting
                     && self.browser_connection_lost.is_none(),
                 |element| {
                     element.child(

@@ -1,7 +1,7 @@
 //! Render tests for the browser disconnected (worker reconnect) screen.
 //!
 //! The screen itself is compiled only for wasm, where these tests cannot render
-//! it, so they compose the layout helpers that `render_disconnected` uses and
+//! it, so they compose the layout helpers that `render_startup_screen` uses and
 //! assert the reconnect controls stay inside the viewport. The narrow-phone
 //! case is the regression: the copy, the connection reason and the controls
 //! shared one unconstrained row and pushed the controls past the right edge.
@@ -20,7 +20,7 @@ use gpui_kit::{Context, TestAppContext, TestSupportExt as _, Window, div, prelud
 const LONG_CLOSE_REASON: &str = "the transport reported an unexpected end of stream while the worker was draining its queue and no close frame arrived 0123456789abcdefghijklmnopqrstuvwxyz";
 
 /// The header and the status bar of the disconnected screen, composed the way
-/// `render_disconnected` composes them.
+/// `render_startup_screen` composes them.
 struct DisconnectedChrome {
     screen: DisconnectedScreen,
 }

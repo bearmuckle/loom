@@ -733,6 +733,14 @@ pub(crate) struct LoomView {
     #[cfg(target_family = "wasm")]
     browser_resume_in_flight: bool,
     browser_startup_error: Option<String>,
+    /// Whether the browser client is still preparing its first workspace:
+    /// connecting, or loading the project it opens. While set, the client shows
+    /// one neutral startup screen instead of the settings prompt, the reconnect
+    /// screen, or a workspace whose project list and conversation are still
+    /// filling in. Always false on native builds, which finish the same work
+    /// before the window opens. A plain field (not `cfg(wasm)`) so the shared
+    /// load paths can end it without a cfg on every call.
+    browser_starting: bool,
     /// Set when the browser transport is known to be closed so the disconnected
     /// screen can offer a reconnect instead of a settings prompt. A plain field
     /// (not `cfg(wasm)`) so its copy can be unit-tested on native builds.
@@ -1175,6 +1183,42 @@ pub(crate) fn disconnected_screen(connection_lost: Option<&str>) -> Disconnected
     }
 }
 
+/// Copy for the browser's startup screen, shown from the first connect until
+/// the landing project is on screen.
+///
+/// A bootstrap in flight is progress, not a failure, so this screen has no
+/// settings prompt, no reconnect action, and no details: those stay for a
+/// client that never connected or lost its worker.
+#[cfg(any(target_family = "wasm", test))]
+pub(crate) fn startup_screen(connected: bool) -> DisconnectedScreen {
+    DisconnectedScreen {
+        heading: if connected {
+            "Opening your most recent project"
+        } else {
+            "Connecting to your worker"
+        },
+        detail: if connected {
+            "Loading the conversation and its project.".to_owned()
+        } else {
+            "Loading your projects and the most recent project to open.".to_owned()
+        },
+        details: None,
+        progress: None,
+        sidebar: "Loading projects…",
+        empty: if connected {
+            "Opening the most recent project…"
+        } else {
+            "Connecting to the worker…"
+        },
+        footer: if connected {
+            "Connected  ·  opening your most recent project"
+        } else {
+            "Connecting to the worker"
+        },
+        reconnect: false,
+    }
+}
+
 /// What the browser client should do once the page becomes visible again.
 ///
 /// Kept as a pure decision so the table below can be tested on native builds,
@@ -1476,6 +1520,39 @@ fn uncovered_session_ids(
         .filter(|session| !covered.contains(&session.id))
         .map(|session| session.id)
         .collect()
+}
+
+/// The session the client opens on startup: the project that was worked on
+/// most recently.
+///
+/// `sessions` is ordered newest activity first, as the worker lists them, and
+/// `projects` holds the snapshots that cover them. A delegated sub-agent never
+/// becomes the landing session: its update is its project's activity, so the
+/// project's root session opens instead. A session no snapshot covers (a
+/// standalone session, or one whose snapshot could not be read) lands as
+/// itself.
+#[cfg(any(target_family = "wasm", test))]
+pub(crate) fn landing_session(
+    sessions: &[AgentSessionSnapshot],
+    projects: &[loom_core::ProjectSnapshot],
+) -> Option<AgentSessionSnapshot> {
+    let most_recent = sessions.first()?;
+    let root_session_id = projects
+        .iter()
+        .find(|project| {
+            project
+                .agents
+                .iter()
+                .any(|agent| agent.session_id == most_recent.id)
+        })
+        .map_or(most_recent.id, |project| project.root_session_id);
+    Some(
+        sessions
+            .iter()
+            .find(|session| session.id == root_session_id)
+            .unwrap_or(most_recent)
+            .clone(),
+    )
 }
 
 fn workspace_feed_event_sequence(event: &WorkspaceFeedEvent) -> EventSequence {
@@ -1845,6 +1922,7 @@ impl LoomView {
             node_input_state: None,
             run_poll_scheduled: false,
             browser_startup_error: None,
+            browser_starting: false,
             browser_connection_lost: None,
         }
     }

@@ -373,6 +373,7 @@ impl LoomView {
             node_input_state: None,
             run_poll_scheduled: false,
             browser_startup_error: None,
+            browser_starting: false,
             browser_connection_lost: None,
         };
         if discover_models {
@@ -614,6 +615,7 @@ impl LoomView {
             visibility_subscription: None,
             browser_resume_in_flight: false,
             browser_startup_error: startup_error,
+            browser_starting: options.is_configured() && !options.demo(),
             browser_connection_lost: None,
         }
     }
@@ -622,10 +624,14 @@ impl LoomView {
     /// over the in-page WebSocket transport and resolves the same project /
     /// session / model state that native's remote-mode bootstrap resolves,
     /// using the `_async` request helpers since nothing may block the page's
-    /// single JS thread. Unlike [`Self::try_new`], this does not load the
-    /// active session's snapshot/events itself (that requires a `Context`,
-    /// which does not exist yet); the caller finishes bootstrapping once the
-    /// view is mounted, via [`Self::select_session`] and [`Self::reload_sessions`].
+    /// single JS thread.
+    ///
+    /// Everything the first workspace frame shows is resolved here, including
+    /// every workspace's sessions, the project snapshots that group them, and
+    /// the sources of the project the client lands on. The caller still opens
+    /// that session once the view is mounted, because the conversation load
+    /// needs a `Context`, but the view it mounts already describes the
+    /// workspace it is about to show.
     #[cfg(target_family = "wasm")]
     pub(crate) async fn try_new_browser(
         options: &BrowserOptions,
@@ -642,7 +648,7 @@ impl LoomView {
         let node_status = worker_node_status_async(&connection).await?;
         let default_backend_node_id = node_status.node_id.clone();
         let mut workspaces = list_workspaces_async(&connection).await?;
-        let workspace = match workspaces.first() {
+        let workspace = match active_workspace(&workspaces) {
             Some(workspace) => workspace.clone(),
             None => {
                 let workspace = create_workspace_async(&connection, "Default").await?;
@@ -651,8 +657,6 @@ impl LoomView {
             }
         };
         let workspace_id = workspace.id;
-        let sessions = list_workspace_sessions_async(&connection, workspace_id).await?;
-        let had_sessions = !sessions.is_empty();
         let workspace_config = workspace_config_async(&connection, workspace_id).await?;
         let mut worker_nodes = initial_worker_nodes(
             node_status,
@@ -667,37 +671,61 @@ impl LoomView {
                 Some(options.token()),
             ));
         }
-        let (session, new_session) = match sessions.into_iter().next() {
-            Some(session) => (session, false),
-            None => {
-                if options.workspace().is_some() {
-                    (
-                        create_session_in_workspace_async(
-                            &connection,
-                            workspace_id,
-                            session_name_for_path(Path::new(options.workspace().unwrap()))
-                                .as_deref()
-                                .unwrap_or("New session"),
-                        )
-                        .await?,
-                        true,
-                    )
-                } else {
-                    (empty_session_snapshot(workspace_id), false)
-                }
-            }
-        };
-        let has_session = had_sessions || new_session;
+        // A worker keeps its projects under its own workspaces, so the list is
+        // read from all of them: reading only the home workspace made the rest
+        // of the sidebar appear a moment after the workspace did.
+        let mut sessions = Vec::new();
+        for workspace in &workspaces {
+            sessions.extend(list_workspace_sessions_async(&connection, workspace.id).await?);
+        }
+        // Newest activity first, which is the order the landing project is
+        // chosen from; the sidebar orders its own rows.
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
         let workspace_root = options.workspace().map(PathBuf::from).unwrap_or_default();
-        if new_session && !workspace_root.as_os_str().is_empty() {
-            attach_session_repository_async(
+        // A project is created only for a page that named a source, and only
+        // when the worker has none at all; otherwise the client opens what is
+        // already there.
+        if sessions.is_empty() && options.workspace().is_some() {
+            let created = create_session_in_workspace_async(
                 &connection,
-                session.id,
-                &workspace_root.display().to_string(),
-                "repo",
+                workspace_id,
+                session_name_for_path(&workspace_root)
+                    .as_deref()
+                    .unwrap_or("New session"),
             )
             .await?;
+            if !workspace_root.as_os_str().is_empty() {
+                attach_session_repository_async(
+                    &connection,
+                    created.id,
+                    &workspace_root.display().to_string(),
+                    "repo",
+                )
+                .await?;
+            }
+            sessions.push(created);
         }
+        // One request per project covers its root and every delegated agent, so
+        // loading these before the first frame keeps a sub-agent session from
+        // painting as a project of its own and then moving under its project.
+        let projects = load_project_snapshots(&connection, &sessions).await;
+        // The most recently active session is often a delegated sub-agent, so
+        // the client opens the project that owns it rather than its transcript.
+        let session = landing_session(&sessions, &projects)
+            .unwrap_or_else(|| empty_session_snapshot(workspace_id));
+        let project_snapshot = projects
+            .iter()
+            .find(|project| project.root_session_id == session.id)
+            .cloned();
+        // The header and the landing project's row show the session's sources,
+        // so they are read with the rest of the startup state instead of
+        // appearing after the first frame.
+        let (session_repositories, session_directories) =
+            load_session_sources(&connection, session.id).await;
+        let selected_repository_id = session_repositories.first().map(|repository| repository.id);
+        let session_sources = session_source_label(&session_repositories, &session_directories)
+            .map(|label| BTreeMap::from([(session.id, label)]))
+            .unwrap_or_default();
         let model_catalog = list_models_async(&connection).await?;
         let models = model_catalog.models;
         let model_provider_names = model_catalog.provider_names;
@@ -710,11 +738,10 @@ impl LoomView {
             BTreeMap::from([(default_backend_node_id.clone(), models.clone())]);
         let backend = BackendWorker::spawn(connection.clone());
         let node_backends = BTreeMap::from([(default_backend_node_id.clone(), backend.clone())]);
-        let session_node_ids = if has_session {
-            BTreeMap::from([(session.id, default_backend_node_id.clone())])
-        } else {
-            BTreeMap::new()
-        };
+        let session_node_ids = sessions
+            .iter()
+            .map(|session| (session.id, default_backend_node_id.clone()))
+            .collect();
         let node_names = worker_nodes
             .iter()
             .map(|node| (node.status.node_id.clone(), worker_node_display_name(node)))
@@ -738,13 +765,9 @@ impl LoomView {
             node_workspaces: BTreeMap::new(),
             local_directory_sources_available: false,
             local_current_directory: None,
-            sessions: if has_session {
-                vec![session.clone()]
-            } else {
-                Vec::new()
-            },
-            project_snapshot: None,
-            project_tree_snapshots: Vec::new(),
+            sessions,
+            project_snapshot,
+            project_tree_snapshots: projects,
             project_child_review: None,
             project_snapshot_stale: false,
             project_snapshot_refreshing: None,
@@ -756,7 +779,7 @@ impl LoomView {
             project_list_subscription: None,
             project_list_view: None,
             project_list_active: None,
-            session_sources: BTreeMap::new(),
+            session_sources,
             session_source_lookups: BTreeMap::new(),
             session_source_request_in_flight: false,
             node_session_load_errors: BTreeMap::new(),
@@ -785,7 +808,7 @@ impl LoomView {
                 default_backend_node_id.clone(),
                 model_provider_names,
             )]),
-            model_catalog_node_id: None,
+            model_catalog_node_id: Some(default_backend_node_id.clone()),
             model_refreshes_in_flight: BTreeSet::new(),
             model_catalog_refreshed_at: BTreeMap::new(),
             model_select: None,
@@ -857,9 +880,9 @@ impl LoomView {
             session_state: session.state,
             run_state: None,
             review: ReviewState::default(),
-            session_repositories: Vec::new(),
-            session_directories: Vec::new(),
-            selected_repository_id: None,
+            session_repositories,
+            session_directories,
+            selected_repository_id,
             session_drawer_open: false,
             rename_dialog: None,
             project_delete_dialog: None,
@@ -887,6 +910,7 @@ impl LoomView {
             visibility_subscription: None,
             browser_resume_in_flight: false,
             browser_startup_error: None,
+            browser_starting: false,
             browser_connection_lost: None,
         };
         cleanup_guard.disarm();
@@ -1162,6 +1186,10 @@ impl LoomView {
             .unwrap_or_default()
             .trim()
             .to_owned();
+        // Only a bootstrap this call actually starts may hold the startup
+        // screen; a validation refusal below must leave the client on the
+        // settings screen instead of a connecting screen that never connects.
+        self.browser_starting = false;
         let mut parts = value.split_whitespace();
         let Some(url) = parts.next() else {
             self.record_status("Enter a node URL followed by its access token");
@@ -1292,6 +1320,9 @@ impl LoomView {
         submitted_value: String,
         cx: &mut Context<Self>,
     ) {
+        // The startup screen covers the bootstrap until the landing project is
+        // on screen, whether it was started automatically or from Settings.
+        self.browser_starting = true;
         let options = BrowserOptions::from_connection(
             url.clone(),
             token.clone(),
@@ -1314,10 +1345,13 @@ impl LoomView {
                         let active_session = initialized.active_session.clone();
                         initialized.covering_surface = None;
                         initialized.browser_window_initialized = false;
+                        // Keep the startup screen until the landing project's
+                        // conversation is applied, so the workspace is revealed
+                        // in one paint instead of growing row by row.
+                        initialized.browser_starting = !initialized.sessions.is_empty();
                         *view = initialized;
-                        view.reload_sessions(cx);
                         if !view.sessions.is_empty() {
-                            view.select_session(active_session, cx);
+                            view.open_browser_landing_session(active_session, cx);
                         }
                         if view
                             .node_input_state
@@ -1333,6 +1367,9 @@ impl LoomView {
                         }
                     }
                     Err(error) if is_pending => {
+                        // The bootstrap is over, so the startup screen gives way
+                        // to the disconnected screen and its worker settings.
+                        view.browser_starting = false;
                         view.fail_worker_node_connection(
                             id,
                             &url,
@@ -1497,15 +1534,18 @@ impl LoomView {
                     let active_session = initialized.active_session.clone();
                     initialized.covering_surface = None;
                     initialized.browser_window_initialized = false;
+                    // The reconnect holds the startup screen until the landing
+                    // project is on screen, exactly like the first connect.
+                    initialized.browser_starting = !initialized.sessions.is_empty();
                     *view = initialized;
-                    view.reload_sessions(cx);
                     if !view.sessions.is_empty() {
-                        view.select_session(active_session, cx);
+                        view.open_browser_landing_session(active_session, cx);
                     }
                 }
                 Err(error) => {
                     view.browser_resume_in_flight = false;
                     view.connected = false;
+                    view.browser_starting = false;
                     // The raw reason stays as the reconnect screen's details;
                     // the notice itself is plain language and keeps the
                     // automatic attempts running.
@@ -1524,5 +1564,151 @@ impl LoomView {
             });
         })
         .detach();
+    }
+
+    /// Ends the browser startup screen once the landing project is on screen.
+    ///
+    /// The screen stays up from the first connect until the landing session's
+    /// conversation is applied, so the workspace is never revealed with a
+    /// half-loaded project list or an empty transcript. Native builds never set
+    /// the state; the hook is shared so the load paths that end it need no cfg.
+    pub(crate) fn finish_browser_startup(&mut self) {
+        self.browser_starting = false;
+    }
+}
+
+/// Loads the project snapshot of every session no loaded snapshot covers.
+///
+/// A returned snapshot covers its root and every delegated agent, so a project
+/// costs one request and the sessions it covers are skipped. This mirrors the
+/// native bootstrap's `refresh_project_snapshots`, but awaits each answer since
+/// nothing may block the page.
+#[cfg(target_family = "wasm")]
+async fn load_project_snapshots(
+    connection: &ClientConnection,
+    sessions: &[AgentSessionSnapshot],
+) -> Vec<loom_core::ProjectSnapshot> {
+    let mut projects = Vec::new();
+    let mut attempted = BTreeSet::new();
+    // A failed request covers nothing, so each session is attempted once. The
+    // loop re-reads the uncovered set after every answer.
+    while let Some(session_id) = uncovered_session_ids(sessions, &projects)
+        .into_iter()
+        .find(|session_id| !attempted.contains(session_id))
+    {
+        attempted.insert(session_id);
+        let response = connection
+            .request(RequestEnvelope::new(ClientRequest::Project(
+                ProjectRequest::GetProjectSnapshotForSession { session_id },
+            )))
+            .await;
+        let Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(snapshot))) =
+            response.result
+        else {
+            continue;
+        };
+        projects.retain(|known| known.project_id != snapshot.project_id);
+        projects.push(snapshot);
+    }
+    projects
+}
+
+/// The landing session's repositories and directories, read with the rest of
+/// the startup state so the header and the project row are complete on the
+/// first frame.
+#[cfg(target_family = "wasm")]
+async fn load_session_sources(
+    connection: &ClientConnection,
+    session_id: AgentSessionId,
+) -> (Vec<SessionRepository>, Vec<SessionDirectory>) {
+    let repositories = connection
+        .request(RequestEnvelope::new(ClientRequest::Repository(
+            RepositoryRequest::ListSessionRepositories { session_id },
+        )))
+        .await;
+    let repositories = match repositories.result {
+        Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositories {
+            repositories,
+        })) => repositories,
+        Err(error) => {
+            log::warn!("[loom-ui] could not load the landing session repositories: {error}");
+            Vec::new()
+        }
+        Ok(response) => {
+            log::warn!("[loom-ui] unexpected landing session repository response: {response:?}");
+            Vec::new()
+        }
+    };
+    let directories = connection
+        .request(RequestEnvelope::new(ClientRequest::Filesystem(
+            FilesystemRequest::ListSessionDirectories { session_id },
+        )))
+        .await;
+    let directories = match directories.result {
+        Ok(ServerResponse::Filesystem(FilesystemResponse::SessionDirectories { directories })) => {
+            directories
+        }
+        Err(error) => {
+            log::warn!("[loom-ui] could not load the landing session directories: {error}");
+            Vec::new()
+        }
+        Ok(response) => {
+            log::warn!("[loom-ui] unexpected landing session directory response: {response:?}");
+            Vec::new()
+        }
+    };
+    (repositories, directories)
+}
+
+/// The project row's source label from a session's repositories or, when it has
+/// none, its folders. A repository outranks a folder, matching the interactive
+/// source discovery.
+#[cfg(any(target_family = "wasm", test))]
+fn session_source_label(
+    repositories: &[SessionRepository],
+    directories: &[SessionDirectory],
+) -> Option<String> {
+    repositories
+        .first()
+        .map(|repository| source_context_label(&repository.source))
+        .or_else(|| {
+            directories
+                .first()
+                .map(|directory| source_context_label(&directory.source))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The landing project's row reads a repository when it has one, because a
+    /// checkout outranks the folder that holds it.
+    #[test]
+    fn the_session_source_label_prefers_a_repository_over_a_folder() {
+        let repository = SessionRepository {
+            id: RepositoryId::new(),
+            source: "https://github.com/bearmuckle/loom.git".to_owned(),
+            path: "sources/repo".to_owned(),
+            revision: None,
+            attached_at: Timestamp::from_unix_millis(1),
+        };
+        let directory = SessionDirectory {
+            source: "/home/user/project".to_owned(),
+            path: "sources/project".to_owned(),
+        };
+
+        assert_eq!(
+            session_source_label(
+                std::slice::from_ref(&repository),
+                std::slice::from_ref(&directory),
+            ),
+            Some("bearmuckle/loom".to_owned())
+        );
+        assert_eq!(
+            session_source_label(&[], std::slice::from_ref(&directory)),
+            Some("user/project".to_owned())
+        );
+        assert_eq!(session_source_label(&[], &[]), None);
     }
 }

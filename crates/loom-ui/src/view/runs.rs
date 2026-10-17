@@ -290,6 +290,7 @@ impl LoomView {
         let backend = match self.backend_for_session(self.active_session.id) {
             Ok(backend) => backend,
             Err(error) => {
+                self.finish_browser_startup();
                 self.record_backend_error("load conversation history", error);
                 cx.notify();
                 return;
@@ -335,6 +336,10 @@ impl LoomView {
                                 next_before,
                                 has_older,
                             );
+                            // The first page puts the conversation on screen, so
+                            // a browser startup that waited for it can reveal
+                            // the workspace.
+                            view.finish_browser_startup();
                             if next.is_none() {
                                 if backfill.is_some() {
                                     let cursor_after = view.after_sequence;
@@ -360,6 +365,7 @@ impl LoomView {
                             next
                         }
                         Err(error) => {
+                            view.finish_browser_startup();
                             view.record_backend_error("load conversation history", error);
                             view.transcript_loading = false;
                             cx.notify();
