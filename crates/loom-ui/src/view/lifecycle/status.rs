@@ -27,7 +27,10 @@ impl LoomView {
         self.status_banner = Some(SystemNote {
             tone: SystemTone::Error,
             heading: Some(format!("{operation} · {}", error.code)),
-            text: error.message.clone(),
+            text: match crate::collaboration::provider_auth_recovery(&error) {
+                Some(hint) => format!("{} {hint}", error.message),
+                None => error.message.clone(),
+            },
             details: Some(error_details(&error)),
             progress: None,
             // Nothing here can re-run the failed call, and a retry sentence

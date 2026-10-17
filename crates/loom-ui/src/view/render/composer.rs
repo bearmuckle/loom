@@ -7,7 +7,14 @@ impl LoomView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let placeholder = if self.pending_input.is_some() {
+        let permissions = self.collaboration.permissions();
+        let to_people =
+            self.collaboration.recipient == crate::collaboration::ComposerRecipient::People;
+        let placeholder = if !permissions.can_act {
+            "Observers can read this session but not send messages"
+        } else if to_people {
+            "Message the people in this session (not sent to the agent)..."
+        } else if self.pending_input.is_some() {
             "Answer the agent question..."
         } else if self.sending_message {
             "Sending direction..."
@@ -65,6 +72,43 @@ impl LoomView {
             .border_color(rgb(0x30343f))
             .when_some(self.status_banner.clone(), |element, banner| {
                 element.child(self.render_status_banner(&banner, cx))
+            })
+            .when_some(self.collaboration.conflict.clone(), |element, conflict| {
+                element.child(
+                    div()
+                        .id("run-conflict-notice")
+                        .test_support()
+                        .w_full()
+                        .mb_2()
+                        .px_3()
+                        .py_2()
+                        .rounded_sm()
+                        .bg(rgb(0x241f3b))
+                        .text_color(rgb(0xe9d5ff))
+                        .flex()
+                        .items_start()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(div().text_xs().text_color(rgb(0xfbbf24)).child(format!(
+                                    "Direction conflict · run rev {}",
+                                    crate::collaboration::revision_label(&conflict.current)
+                                )))
+                                .child(div().text_sm().child(conflict.message())),
+                        )
+                        .child(
+                            Button::new("dismiss-run-conflict")
+                                .label("Dismiss")
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.collaboration.conflict = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
             })
             .child(self.render_run_status())
             .when_some(self.composer_completion.clone(), |element, completion| {
@@ -153,6 +197,7 @@ impl LoomView {
                             .child(
                                 Textarea::new(composer)
                                     .aria_label(placeholder)
+                                    .disabled(!permissions.can_act)
                                     .h(px(height))
                                     .appearance(false)
                                     .bordered(false),
@@ -179,6 +224,9 @@ impl LoomView {
                                     // row instead of dropping onto a mostly empty
                                     // second row.
                                     .when(layout.phone, |element| element.flex_1())
+                                    .when(permissions.can_act, |element| {
+                                        element.child(self.render_recipient_toggle(cx))
+                                    })
                                     .child(self.render_model_picker(layout.phone, cx))
                                     .child(
                                         Button::new("open-command-palette")
@@ -206,20 +254,23 @@ impl LoomView {
                                     .flex_none()
                                     .items_center()
                                     .gap_2()
-                                    .when(self.run_can_interrupt(), |element| {
-                                        element.child(
-                                            Button::new("interrupt-run")
-                                                .label("Stop")
-                                                .danger()
-                                                .when(layout.phone, |button| {
-                                                    button.small().h(layout.control_size())
-                                                })
-                                                .when(!layout.phone, |button| button.small())
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.interrupt_active_run(cx);
-                                                })),
-                                        )
-                                    })
+                                    .when(
+                                        self.run_can_interrupt() && permissions.can_act,
+                                        |element| {
+                                            element.child(
+                                                Button::new("interrupt-run")
+                                                    .label("Stop")
+                                                    .danger()
+                                                    .when(layout.phone, |button| {
+                                                        button.small().h(layout.control_size())
+                                                    })
+                                                    .when(!layout.phone, |button| button.small())
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.interrupt_active_run(cx);
+                                                    })),
+                                            )
+                                        },
+                                    )
                                     .child(
                                         Button::new("send-message")
                                             .icon(Icon::new(AssetIconName::ArrowUp))
@@ -231,7 +282,12 @@ impl LoomView {
                                                     .w(layout.control_size())
                                             })
                                             .when(!layout.phone, |button| button.small())
-                                            .tooltip("Send (Enter)")
+                                            .tooltip(if to_people {
+                                                "Send to people (Enter)"
+                                            } else {
+                                                "Send to agent (Enter)"
+                                            })
+                                            .disabled(!permissions.can_act)
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.submit_composer(cx);
                                             })),
@@ -239,6 +295,35 @@ impl LoomView {
                             ),
                     ),
             )
+    }
+
+    /// The explicit Agent / People recipient switch. People sends peer chat,
+    /// which is never added to model context.
+    fn render_recipient_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::collaboration::ComposerRecipient;
+        use gpui_kit::component::button::ButtonGroup;
+        let recipient = self.collaboration.recipient;
+        ButtonGroup::new("composer-recipient")
+            .outline()
+            .xsmall()
+            .child(
+                Button::new("recipient-agent")
+                    .label(ComposerRecipient::Agent.label())
+                    .selected(recipient == ComposerRecipient::Agent),
+            )
+            .child(
+                Button::new("recipient-people")
+                    .label(ComposerRecipient::People.label())
+                    .selected(recipient == ComposerRecipient::People),
+            )
+            .on_click(cx.listener(|this, clicked: &Vec<usize>, _, cx| {
+                let recipient = if clicked.contains(&1) {
+                    ComposerRecipient::People
+                } else {
+                    ComposerRecipient::Agent
+                };
+                this.set_composer_recipient(recipient, cx);
+            }))
     }
 
     /// A dismissible banner for the latest operational status or backend error.

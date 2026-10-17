@@ -30,15 +30,18 @@ pub(crate) enum InspectorTab {
     Agent,
     Context,
     Files,
+    /// The session roster, access, run credential, and repository access.
+    People,
 }
 
 impl InspectorTab {
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::Changes,
         Self::Plan,
         Self::Agent,
         Self::Context,
         Self::Files,
+        Self::People,
     ];
 
     pub(crate) const fn label(self) -> &'static str {
@@ -48,6 +51,7 @@ impl InspectorTab {
             Self::Agent => "Agent",
             Self::Context => "Context",
             Self::Files => "Files",
+            Self::People => "People",
         }
     }
 
@@ -374,7 +378,10 @@ impl ReviewState {
                 self.changes_seen_key = Some(self.changes_content_key());
             }
             InspectorTab::Plan => self.unread.plan = false,
-            InspectorTab::Agent | InspectorTab::Context | InspectorTab::Files => {}
+            InspectorTab::Agent
+            | InspectorTab::Context
+            | InspectorTab::Files
+            | InspectorTab::People => {}
         }
     }
 
@@ -485,6 +492,10 @@ pub(crate) enum TimelineItem {
     User(String),
     Assistant(AssistantTurn),
     System(SystemNote),
+    /// An attributed entry that is not a message to the agent: peer chat, a
+    /// run control action, or an access change. Agent-directed messages stay
+    /// `User` rows and are attributed through the collaboration state.
+    Collaboration(Box<loom_core::CollaborationEntry>),
 }
 
 /// Live progress for the active run's plan.
@@ -933,7 +944,7 @@ mod tests {
     fn inspector_tabs_report_stable_labels_and_indexes() {
         assert_eq!(
             InspectorTab::ALL.map(InspectorTab::label),
-            ["Changes", "Plan", "Agent", "Context", "Files"]
+            ["Changes", "Plan", "Agent", "Context", "Files", "People"]
         );
         for (index, tab) in InspectorTab::ALL.into_iter().enumerate() {
             assert_eq!(tab.index(), index);

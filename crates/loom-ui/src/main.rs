@@ -11,6 +11,7 @@ mod assets;
 mod backend_host;
 #[cfg(target_family = "wasm")]
 mod browser;
+mod collaboration;
 mod connection;
 #[cfg(not(target_family = "wasm"))]
 mod local_backend;

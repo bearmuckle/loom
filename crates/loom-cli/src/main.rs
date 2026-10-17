@@ -1523,10 +1523,48 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
             );
         }
         ServerEvent::Collaboration { entry } => {
-            println!("Collaboration: {:?} -> {:?}", entry.author, entry.recipient);
+            let author = match &entry.author {
+                loom_core::Author::Participant { participant, role } => {
+                    format!("{} · {}", participant.display_name, role.as_str())
+                }
+                loom_core::Author::Operator => "operator".to_owned(),
+            };
+            let recipient = match entry.recipient {
+                loom_core::Recipient::Agent => "agent",
+                loom_core::Recipient::People => "people",
+            };
+            let detail = match &entry.kind {
+                loom_core::CollaborationEntryKind::PeerMessage { text }
+                | loom_core::CollaborationEntryKind::AgentDirection { text }
+                | loom_core::CollaborationEntryKind::AgentAnswer { text, .. } => text.clone(),
+                loom_core::CollaborationEntryKind::RunControl { action } => {
+                    format!("{action:?}")
+                }
+                loom_core::CollaborationEntryKind::AccessChanged { participant, role } => {
+                    match role {
+                        Some(role) => {
+                            format!("{} is now {}", participant.display_name, role.as_str())
+                        }
+                        None => format!("revoked {}", participant.display_name),
+                    }
+                }
+            };
+            println!("{author} -> {recipient}: {detail}");
         }
         ServerEvent::SessionRosterChanged { entries } => {
-            println!("Roster changed: {} people", entries.len());
+            let people = entries
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "{} ({}, {:?})",
+                        entry.participant.display_name,
+                        entry.role.as_str(),
+                        entry.presence
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("Roster: {people}");
         }
     }
 }

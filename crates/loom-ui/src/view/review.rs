@@ -184,6 +184,7 @@ impl LoomView {
                     }
                 }
                 InspectorTab::Plan => {}
+                InspectorTab::People => self.refresh_people(cx),
             }
             if tab == InspectorTab::Context {
                 self.refresh_context(cx);
@@ -196,6 +197,7 @@ impl LoomView {
         self.review.clear_unread(tab);
         match tab {
             InspectorTab::Changes | InspectorTab::Plan => {}
+            InspectorTab::People => self.refresh_people(cx),
             InspectorTab::Agent | InspectorTab::Context => self.refresh_usage(cx),
             InspectorTab::Files => {
                 if !self.review.files.loaded {

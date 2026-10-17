@@ -22,7 +22,10 @@ impl LoomView {
             self.run_slash_command(&text, cx);
             return;
         }
-        self.send_message(text, cx);
+        if !self.send_composer_text(text.clone(), cx) {
+            // Nothing was sent, so the draft stays in the composer.
+            self.clear_composer_on_render = false;
+        }
     }
 
     /// Starts editing the composer from a tap anywhere in the field.

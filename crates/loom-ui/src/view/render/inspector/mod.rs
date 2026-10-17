@@ -23,6 +23,7 @@ mod agent;
 mod changes;
 mod context;
 mod files;
+mod people;
 mod plan;
 
 impl LoomView {
@@ -105,6 +106,7 @@ impl LoomView {
             InspectorTab::Agent => self.render_inspector_agent(window, cx).into_any_element(),
             InspectorTab::Context => self.render_inspector_context(window, cx).into_any_element(),
             InspectorTab::Files => self.render_inspector_files(window, cx).into_any_element(),
+            InspectorTab::People => self.render_inspector_people(window, cx).into_any_element(),
         };
         div()
             .id("inspector-layer")
@@ -156,6 +158,9 @@ impl LoomView {
                             Some(changed_files.to_string())
                         }
                         InspectorTab::Agent if pending_attention > 0 => Some("•".to_owned()),
+                        InspectorTab::People if !self.collaboration.roster.is_empty() => {
+                            Some(self.collaboration.roster.len().to_string())
+                        }
                         InspectorTab::Plan => self
                             .plan
                             .as_ref()
@@ -166,7 +171,10 @@ impl LoomView {
                     let unread = match tab {
                         InspectorTab::Changes => self.review.unread.changes,
                         InspectorTab::Plan => self.review.unread.plan,
-                        InspectorTab::Agent | InspectorTab::Context | InspectorTab::Files => false,
+                        InspectorTab::Agent
+                        | InspectorTab::Context
+                        | InspectorTab::Files
+                        | InspectorTab::People => false,
                     };
                     let mut item = Tab::new().label(tab.label());
                     if count.is_some() || unread {
@@ -282,6 +290,10 @@ impl LoomView {
                     "Not loaded".to_owned()
                 }
             }
+            InspectorTab::People => match self.collaboration.roster.len() {
+                1 => "1 person".to_owned(),
+                count => format!("{count} people"),
+            },
         }
     }
 
