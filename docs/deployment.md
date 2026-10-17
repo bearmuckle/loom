@@ -7,6 +7,37 @@ intended. It records what the backend and the published image do, not what a
 deployment could add on top of them. The trust boundary itself is in the
 [security and trust model](security.md).
 
+## The desktop client's local worker
+
+The native `loom-ui` client does not embed a backend. Without `--remote` it
+starts `loom-server` as a child process (the managed local worker), so the
+sections below apply to it too: agent commands run on the host as the desktop
+user, with the client's environment.
+
+- The worker binds `127.0.0.1` on a free port; nothing listens beyond loopback.
+- Its bearer token is generated per start and written with mode `0600` to
+  `<state-dir>/local-worker/token-<client-pid>`; it is passed with
+  `--token-file`, never on the command line.
+- Its state database is `<state-dir>/state.db` (`--persistence`), the same file
+  the client used before it ran a separate worker, so existing sessions carry
+  over. `loom-ui --reset-state` is forwarded as `--reset-state`; without it an
+  incompatible database stops the worker and the client reports the failure.
+- The binary is, in order: `--server-binary`/`LOOM_SERVER_BINARY`; the
+  `loom-server` installed next to the client (release archives, AppImage,
+  `.deb`) or on `PATH`; a cached download under
+  `<cache>/loom/server/<tag>/` (`LOOM_CACHE_DIR` overrides `<cache>`); a
+  download from the `bearmuckle/loom` release matching the client's version, or
+  the latest release for a development build. A download is installed only
+  after its archive matches the release's `SHA256SUMS`. With no network the
+  newest cached version is used.
+- The client stops the worker with SIGTERM (then a kill after a grace period)
+  when it quits. On Linux the worker also receives SIGTERM if the client dies
+  without cleaning up.
+
+A download reaches `api.github.com` and GitHub's release asset hosts. A client
+installed from an archive, AppImage, or `.deb` already has `loom-server` next
+to it and does not download.
+
 ## Where agent commands execute
 
 Loom has no separate command sandbox. An agent command runs as a child process

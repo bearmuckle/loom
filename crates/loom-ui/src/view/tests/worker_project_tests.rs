@@ -258,8 +258,9 @@ fn reload_sessions_loads_projects_from_each_connected_worker(cx: &mut TestAppCon
         view.worker_nodes = vec![local];
 
         // A second worker with no workspaces yet exercises the fallback path.
-        let empty_connection =
-            ClientConnection::InProcess(Box::new(loom_local::OwnedBackend::new().connect()));
+        let empty_connection = ClientConnection::InProcess(Box::new(
+            crate::local_backend::OwnedBackend::new().connect(),
+        ));
         negotiate(&empty_connection).expect("negotiate");
         view.node_backends.insert(
             "empty-node".to_owned(),
@@ -297,8 +298,9 @@ fn creation_on_a_peer_uses_the_peers_own_workspace(cx: &mut TestAppContext) {
         view.workspaces = vec![home];
 
         // A peer with its own workspace and a reachable in-process backend.
-        let peer_connection =
-            ClientConnection::InProcess(Box::new(loom_local::OwnedBackend::new().connect()));
+        let peer_connection = ClientConnection::InProcess(Box::new(
+            crate::local_backend::OwnedBackend::new().connect(),
+        ));
         negotiate(&peer_connection).unwrap();
         create_workspace(&peer_connection, "Peer").unwrap();
         view.node_backends.insert(
@@ -359,8 +361,9 @@ fn creation_provisions_a_default_workspace_when_the_worker_has_none(cx: &mut Tes
         view.workspaces = vec![home];
 
         // A peer that has never had a workspace.
-        let fresh_connection =
-            ClientConnection::InProcess(Box::new(loom_local::OwnedBackend::new().connect()));
+        let fresh_connection = ClientConnection::InProcess(Box::new(
+            crate::local_backend::OwnedBackend::new().connect(),
+        ));
         negotiate(&fresh_connection).unwrap();
         view.node_backends.insert(
             "fresh-node".to_owned(),

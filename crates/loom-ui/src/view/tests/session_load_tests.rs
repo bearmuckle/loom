@@ -71,7 +71,7 @@ fn reopening_a_session_with_a_concurrent_event_restores_durable_run_state(cx: &m
     const TASK: &str = "reopen the session while the run is in flight";
     cx.update(gpui_kit::init);
 
-    let backend = loom_local::OwnedBackend::new();
+    let backend = crate::local_backend::OwnedBackend::new();
     let connection = ClientConnection::InProcess(Box::new(backend.connect()));
     let negotiation = crate::connection::negotiate(&connection).unwrap();
     let workspace = crate::connection::create_workspace(&connection, "Reopen").unwrap();
@@ -156,13 +156,11 @@ fn reopening_a_session_with_a_concurrent_event_restores_durable_run_state(cx: &m
         let options = UiOptions {
             project: None,
             task: TASK.to_owned(),
-            demo: false,
             model: ModelId::new("deterministic/demo"),
-            endpoint: None,
-            api_key: None,
             remote: None,
             token: None,
             reset_state: false,
+            server_binary: None,
             ca: None,
             allow_insecure_remote: false,
         };
@@ -367,12 +365,12 @@ fn reopening_from_a_snapshot_that_carries_messages_keeps_the_conversation(cx: &m
 fn completed_demo_session(
     task: &str,
 ) -> (
-    loom_local::OwnedBackend,
+    crate::local_backend::OwnedBackend,
     ClientConnection,
     AgentSessionSnapshot,
     ProtocolVersion,
 ) {
-    let backend = loom_local::OwnedBackend::new();
+    let backend = crate::local_backend::OwnedBackend::new();
     let connection = ClientConnection::InProcess(Box::new(backend.connect()));
     let negotiation = crate::connection::negotiate(&connection).unwrap();
     let workspace = crate::connection::create_workspace(&connection, "Rebuild").unwrap();
@@ -409,7 +407,7 @@ fn completed_demo_session(
 #[cfg(not(target_family = "wasm"))]
 fn open_selected_session_view(
     cx: &mut TestAppContext,
-    backend: loom_local::OwnedBackend,
+    backend: crate::local_backend::OwnedBackend,
     connection: ClientConnection,
     session: AgentSessionSnapshot,
     task: &str,
@@ -418,13 +416,11 @@ fn open_selected_session_view(
     let options = UiOptions {
         project: None,
         task: task.to_owned(),
-        demo: false,
         model: ModelId::new("deterministic/demo"),
-        endpoint: None,
-        api_key: None,
         remote: None,
         token: None,
         reset_state: false,
+        server_binary: None,
         ca: None,
         allow_insecure_remote: false,
     };

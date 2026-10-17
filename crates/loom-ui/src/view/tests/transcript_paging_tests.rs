@@ -458,7 +458,7 @@ fn asynchronous_page_loader_uses_the_bounded_transcript_endpoint() {
     use super::{BackendWorker, ClientConnection, load_transcript_page};
     use loom_protocol::{ClientRequest, RequestEnvelope, RunRequest, RunResponse, ServerResponse};
 
-    let backend = loom_local::OwnedBackend::new();
+    let backend = crate::local_backend::OwnedBackend::new();
     let connection = ClientConnection::InProcess(Box::new(backend.connect()));
     crate::connection::negotiate(&connection).unwrap();
     let workspace = crate::connection::create_workspace(&connection, "Transcript pages").unwrap();

@@ -455,7 +455,18 @@ fn github_copilot_login_finishes_by_registering_the_provider(cx: &mut TestAppCon
         let mut view = LoomView::new_for_test(cx.focus_handle());
         crate::connection::negotiate(&view.connection).unwrap();
         view.github_login_kind = crate::state::GitHubLoginKind::Copilot;
-        view.finish_github_login(Ok("ghu_copilot_token".to_owned()), cx);
+        // The worker stores the credential when its device flow completes;
+        // here the test stores one directly, as that flow would.
+        let configured = view
+            .connection
+            .request(RequestEnvelope::new(ClientRequest::Provider(
+                ProviderRequest::ConfigureGitHubCopilot {
+                    access_token: "ghu_copilot_token".to_owned(),
+                },
+            )));
+        assert!(configured.result.is_ok(), "{:?}", configured.result);
+        let node_id = view.default_backend_node_id.clone();
+        view.handle_github_provider_configured(node_id, cx);
         view
     });
     cx.run_until_parked();

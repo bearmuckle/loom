@@ -277,8 +277,9 @@ fn worker_node_fixtures_preserve_local_connection_and_hide_url_credentials() {
     assert_eq!(placeholder.connection_detail.as_deref(), Some("offline"));
 
     let local_status = node(ACTIVE_BACKEND_NODE_ENTRY_ID, true).status;
-    let local_connection =
-        super::ClientConnection::InProcess(Box::new(loom_local::OwnedBackend::new().connect()));
+    let local_connection = super::ClientConnection::InProcess(Box::new(
+        crate::local_backend::OwnedBackend::new().connect(),
+    ));
     let config = loom_protocol::WorkspaceConfig {
         worker_nodes: vec![
             loom_protocol::WorkerNodeConfig {
@@ -312,7 +313,7 @@ fn worker_node_fixtures_preserve_local_connection_and_hide_url_credentials() {
 #[test]
 fn failed_connection_state_clears_transport_and_keeps_node_url() {
     let mut node = node(7, false);
-    let backend = loom_local::OwnedBackend::new();
+    let backend = crate::local_backend::OwnedBackend::new();
     node.connection = Some(super::ClientConnection::InProcess(Box::new(
         backend.connect(),
     )));

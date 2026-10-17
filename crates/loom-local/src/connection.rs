@@ -1,7 +1,7 @@
 //! Opaque native transport handles.
 //!
-//! The UI holds these instead of `loom-server` types directly, so it depends on
-//! the native launcher (`loom-local`) rather than the backend implementation.
+//! The UI holds these instead of backend types, so it depends only on the
+//! native launcher (`loom-local`) and never links the backend implementation.
 
 use std::{
     env,
@@ -11,114 +11,11 @@ use std::{
 };
 
 use loom_core::{ErrorCode, LoomError, Result};
-use loom_model::ModelId;
 use loom_protocol::{RequestEnvelope, ResponseEnvelope};
-use loom_server::{ARCHIVE_RETENTION_SWEEP_INTERVAL, ArchiveRetentionSweepDriver};
 
-/// An owned in-process backend embedded in a native client.
-pub struct OwnedBackend {
-    inner: Arc<loom_server::InProcessBackend>,
-    /// The background archive-retention sweep, present only for a durable
-    /// backend that can store a retention policy. Dropping it stops the sweep
-    /// before the backend releases its database.
-    retention_sweeps: Mutex<Option<ArchiveRetentionSweepDriver>>,
-}
-
-impl OwnedBackend {
-    pub fn new() -> Self {
-        Self {
-            inner: loom_server::InProcessBackend::new(),
-            retention_sweeps: Mutex::new(None),
-        }
-    }
-
-    pub fn demo_with_github_copilot() -> Result<Self> {
-        Ok(Self {
-            inner: loom_server::InProcessBackend::demo_with_github_copilot()?,
-            retention_sweeps: Mutex::new(None),
-        })
-    }
-
-    pub fn new_persistent(path: PathBuf) -> Result<Self> {
-        Ok(Self::with_retention_sweeps(
-            loom_server::InProcessBackend::new_persistent(path)?,
-        ))
-    }
-
-    pub fn with_openai_compatible_persistent_with_github_copilot(
-        endpoint: &str,
-        api_key: &str,
-        model: ModelId,
-        path: PathBuf,
-    ) -> Result<Self> {
-        Ok(Self::with_retention_sweeps(
-            loom_server::InProcessBackend::with_openai_compatible_persistent_with_github_copilot(
-                endpoint, api_key, model, path,
-            )?,
-        ))
-    }
-
-    pub fn new_persistent_with_github_copilot(path: PathBuf) -> Result<Self> {
-        Ok(Self::with_retention_sweeps(
-            loom_server::InProcessBackend::new_persistent_with_github_copilot(path)?,
-        ))
-    }
-
-    /// Wraps a durable backend and starts the archive-retention sweep.
-    ///
-    /// A native client that embeds its backend has no server process to run the
-    /// sweep, so without this an archived session would stay forever however the
-    /// retention policy is set. Starting is best-effort: a driver that cannot
-    /// start its thread logs the reason there instead of failing the client.
-    fn with_retention_sweeps(inner: Arc<loom_server::InProcessBackend>) -> Self {
-        let driver = ArchiveRetentionSweepDriver::start(
-            Arc::clone(&inner),
-            ARCHIVE_RETENTION_SWEEP_INTERVAL,
-        );
-        Self {
-            inner,
-            retention_sweeps: Mutex::new(Some(driver)),
-        }
-    }
-
-    pub fn connect(&self) -> LocalConnection {
-        LocalConnection(self.inner.connect())
-    }
-
-    pub fn shutdown(&self) -> Result<()> {
-        // Stop the sweep before the backend releases its database, so no round
-        // runs against a shutting-down store.
-        if let Ok(mut driver) = self.retention_sweeps.lock() {
-            drop(driver.take());
-        }
-        self.inner.shutdown()
-    }
-
-    /// Whether a background archive-retention sweep is running for this backend.
-    #[cfg(test)]
-    pub(crate) fn runs_archive_retention_sweeps(&self) -> bool {
-        self.retention_sweeps
-            .lock()
-            .map(|driver| driver.is_some())
-            .unwrap_or(false)
-    }
-}
-
-impl Default for OwnedBackend {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// A connected in-process backend transport.
-#[derive(Clone)]
-pub struct LocalConnection(loom_server::InProcessConnection);
-
-impl LocalConnection {
-    pub fn request(&self, request: RequestEnvelope) -> ResponseEnvelope {
-        self.0.request(request)
-    }
-}
+use crate::transport::{
+    MAX_FRAME_BYTES_ENV, WebSocketConnection, WebSocketTransport, resolve_max_frame_bytes,
+};
 
 /// Settings the launcher passes to the native remote transport.
 ///
@@ -130,8 +27,8 @@ impl LocalConnection {
 /// The frame-size limit is not a field here: it is an argument of
 /// [`RemoteConnection::connect_with_max_frame_bytes`], which
 /// [`RemoteConnection::connect`] defaults from
-/// [`loom_server::MAX_FRAME_BYTES_ENV`] and
-/// [`loom_server::DEFAULT_MAX_FRAME_BYTES`].
+/// [`crate::MAX_FRAME_BYTES_ENV`] and
+/// [`crate::DEFAULT_MAX_FRAME_BYTES`].
 #[derive(Clone, Debug, Default)]
 pub struct RemoteConnectionOptions {
     /// PEM file whose certificates are trusted in addition to the OS roots.
@@ -143,15 +40,15 @@ pub struct RemoteConnectionOptions {
 impl RemoteConnectionOptions {
     /// Builds the transport for one endpoint with `max_frame_bytes` applied.
     ///
-    /// [`loom_server::WebSocketTransport::with_max_frame_bytes`] validates the
+    /// [`WebSocketTransport::with_max_frame_bytes`] validates the
     /// limit, so an unusable value fails before a connection is attempted.
     fn transport(
         &self,
         url: &str,
         token: &str,
         max_frame_bytes: usize,
-    ) -> Result<loom_server::WebSocketTransport> {
-        let transport = loom_server::WebSocketTransport::new(url, token)
+    ) -> Result<WebSocketTransport> {
+        let transport = WebSocketTransport::new(url, token)
             .with_max_frame_bytes(max_frame_bytes)?
             .with_insecure_remote_allowed(self.allow_insecure_remote);
         match self.ca_certificate.as_deref() {
@@ -165,7 +62,7 @@ impl RemoteConnectionOptions {
 #[derive(Clone)]
 pub struct RemoteConnection {
     runtime: Arc<tokio::runtime::Runtime>,
-    connection: Arc<Mutex<loom_server::WebSocketConnection>>,
+    connection: Arc<Mutex<WebSocketConnection>>,
     secure_for_secrets: bool,
 }
 
@@ -181,8 +78,8 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl RemoteConnection {
     /// Connects to `url`, limiting every WebSocket frame to the limit this
-    /// process resolves from [`loom_server::MAX_FRAME_BYTES_ENV`], or to the
-    /// documented [`loom_server::DEFAULT_MAX_FRAME_BYTES`] (4 MiB) when the
+    /// process resolves from [`crate::MAX_FRAME_BYTES_ENV`], or to the
+    /// documented [`crate::DEFAULT_MAX_FRAME_BYTES`] (4 MiB) when the
     /// variable is unset.
     ///
     /// The variable is the surface a launcher and a deployment already have for
@@ -194,10 +91,8 @@ impl RemoteConnection {
         secure_for_secrets: bool,
         options: &RemoteConnectionOptions,
     ) -> Result<Self> {
-        let max_frame_bytes = loom_server::resolve_max_frame_bytes(
-            None,
-            env::var(loom_server::MAX_FRAME_BYTES_ENV).ok().as_deref(),
-        )?;
+        let max_frame_bytes =
+            resolve_max_frame_bytes(None, env::var(MAX_FRAME_BYTES_ENV).ok().as_deref())?;
         Self::connect_with_max_frame_bytes(url, token, secure_for_secrets, options, max_frame_bytes)
     }
 
@@ -245,7 +140,7 @@ impl RemoteConnection {
         })
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, loom_server::WebSocketConnection>> {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, WebSocketConnection>> {
         self.connection.lock().map_err(|_| {
             LoomError::new(
                 ErrorCode::Internal,

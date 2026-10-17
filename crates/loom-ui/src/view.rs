@@ -35,9 +35,10 @@ use gpui_kit::component::{
     text::TextView,
 };
 use gpui_kit::{
-    Animation, AnimationExt, App, ClickEvent, ClipboardItem, Context, Element, Entity, FocusHandle,
-    Focusable, FontWeight, HighlightStyle, MouseButton, Pixels, Render, Rgba, StyledText,
-    Subscription, WeakEntity, Window, WindowAppearance, WindowControlArea, div, prelude::*, px,
+    Animation, AnimationExt, App, AsyncApp, ClickEvent, ClipboardItem, Context, Element, Entity,
+    FocusHandle, Focusable, FontWeight, HighlightStyle, MouseButton, Pixels, Render, Rgba,
+    StyledText, Subscription, WeakEntity, Window, WindowAppearance, WindowControlArea, div,
+    prelude::*, px,
 };
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, ErrorCode,
@@ -45,11 +46,8 @@ use loom_core::{
     UsageSnapshot, WorkspaceId, WorkspaceRecord,
 };
 #[cfg(not(target_family = "wasm"))]
-use loom_local::GitHubDeviceCode;
-#[cfg(not(target_family = "wasm"))]
 use loom_model::GITHUB_COPILOT_DEFAULT_MODEL;
 use loom_model::{MessageRole, ModelId, ModelMessage, ProviderKind, ProviderSummary, ToolCall};
-#[cfg(target_family = "wasm")]
 use loom_protocol::GitHubCopilotLoginStatus;
 use loom_protocol::{
     AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent, AgentRunSnapshot,
@@ -486,7 +484,7 @@ pub(crate) struct LoomView {
     /// Used for the synchronous bootstrap before the window exists.
     pub(crate) connection: ClientConnection,
     #[cfg(not(target_family = "wasm"))]
-    owned_backend: Option<loom_local::OwnedBackend>,
+    owned_backend: Option<crate::local_backend::OwnedBackend>,
     /// The negotiated protocol version of the active backend, or `None` when no
     /// negotiation result is retained (for example a disconnected browser view).
     server_protocol_version: Option<ProtocolVersion>,
@@ -1682,8 +1680,9 @@ pub(crate) struct TimelineView {
 impl LoomView {
     #[cfg(test)]
     fn new_for_test(focus_handle: FocusHandle) -> Self {
-        let connection =
-            ClientConnection::InProcess(Box::new(loom_local::OwnedBackend::new().connect()));
+        let connection = ClientConnection::InProcess(Box::new(
+            crate::local_backend::OwnedBackend::new().connect(),
+        ));
         let backend = BackendWorker::spawn(connection.clone());
         let workspace_id = WorkspaceId::new();
         let active_session = empty_session_snapshot(workspace_id);
@@ -1910,6 +1909,13 @@ impl Drop for LoomView {
 
 #[cfg(not(target_family = "wasm"))]
 impl LoomView {
+    /// The managed local worker this view started, if any.
+    pub(crate) fn managed_worker(&self) -> Option<std::sync::Arc<loom_local::ManagedWorker>> {
+        self.owned_backend
+            .as_ref()
+            .and_then(crate::local_backend::OwnedBackend::managed_worker)
+    }
+
     fn shutdown_owned_backend(&self) {
         if let Some(backend) = &self.owned_backend
             && let Err(error) = backend.shutdown()

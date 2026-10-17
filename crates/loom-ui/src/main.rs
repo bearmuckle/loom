@@ -12,6 +12,8 @@ mod backend_host;
 #[cfg(target_family = "wasm")]
 mod browser;
 mod connection;
+#[cfg(not(target_family = "wasm"))]
+mod local_backend;
 mod preferences;
 mod state;
 mod syntax;
@@ -57,17 +59,6 @@ pub(crate) const MAX_REVIEW_DIFF: usize = 48 * 1024;
 #[cfg(not(target_family = "wasm"))]
 fn main() {
     init_logging();
-    // Bound how long a stalled remote may hold the thread that serves a Git
-    // clone, fetch, or push for an embedded local backend. libgit2's socket
-    // timeouts are process globals that are only safe to write before any thread
-    // exists, so this must stay here, before GPUI starts its threads and before
-    // the embedded backend builds an async runtime; later it would be a silent
-    // no-op at best. See `loom_vcs::configure_remote_timeouts`. The browser build
-    // has no libgit2: its Git work runs on whatever backend it connects to.
-    //
-    // SAFETY: this is the first statement after logging setup and no thread has
-    // been spawned yet.
-    unsafe { loom_vcs::configure_remote_timeouts() };
     let options = match UiOptions::parse(std::env::args()) {
         Ok(Some(options)) => options,
         // `--help` and `--version` printed what was asked for; exit 0.
@@ -81,17 +72,11 @@ fn main() {
         "starting with {} backend, model '{}'",
         if options.remote.is_some() {
             "remote"
-        } else if options.demo {
-            "demo"
         } else {
-            "local"
+            "managed local"
         },
         options.model.as_str()
     );
-    if let Err(error) = loom_local::prepare_backend_state(&options) {
-        error!("{error}");
-        std::process::exit(1);
-    }
     gpui_kit::platform::application()
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx: &mut App| {
@@ -113,6 +98,16 @@ fn main() {
                 }
             };
             info!("Loom view initialized");
+            // GPUI may exit the process without dropping the view, so the
+            // managed local worker is also stopped from the quit hook.
+            let worker = view.managed_worker();
+            cx.on_app_quit(move |_| {
+                if let Some(worker) = &worker {
+                    worker.stop();
+                }
+                async {}
+            })
+            .detach();
 
             let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
             let window = match cx.open_window(

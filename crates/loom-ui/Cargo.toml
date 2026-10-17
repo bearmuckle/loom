@@ -39,11 +39,14 @@ depends = "libc6 (>= 2.35), libgcc-s1, libssl3, zlib1g, libxcb1, libxcb-xkb1, li
 recommends = "mesa-vulkan-drivers, fonts-dejavu-core"
 extended-description = """
  Loom is a remote-first coding-agent environment. This package installs the
- native desktop client, which runs agent sessions locally or against a remote
- loom-server backend, and can also host an embedded backend of its own.
+ native desktop client and the loom-server backend it starts as a local
+ worker process, and the client can also connect to a remote loom-server.
 """
 assets = [
   ["target/release/loom-ui", "usr/bin/", "755"],
+  # The managed local worker the client starts; installed next to it so the
+  # package works offline without downloading a server release.
+  ["target/release/loom-server", "usr/bin/", "755"],
   ["../../packaging/loom.desktop", "usr/share/applications/loom-ui.desktop", "644"],
   ["pwa/icon-512.png", "usr/share/icons/hicolor/512x512/apps/loom-ui.png", "644"],
   ["../../LICENSES.md", "usr/share/doc/loom-ui/", "644"],
@@ -80,6 +83,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
+# Tests drive the view against an in-process backend instead of a child process.
 loom-server.workspace = true
 tokio.workspace = true
 ttf-parser.workspace = true
@@ -87,11 +91,9 @@ ttf-parser.workspace = true
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 env_logger.workspace = true
 open.workspace = true
+# The native launcher and WebSocket client. It has no backend dependency: the
+# local backend runs as a managed `loom-server` child process.
 loom-local.workspace = true
-# The native client hosts embedded backends that clone, fetch, and push, so it
-# applies libgit2's process-wide socket timeouts at startup. The browser build
-# has no libgit2 (its Git work runs on a remote backend), hence the target gate.
-loom-vcs.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 console_log.workspace = true

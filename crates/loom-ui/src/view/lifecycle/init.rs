@@ -1,6 +1,25 @@
 use super::*;
 use crate::preferences::UiPreferences;
 
+/// Resolves and starts the managed `loom-server` worker that replaces the
+/// backend the client used to embed. It keeps the same shared state database,
+/// and `--reset-state` is forwarded so an incompatible database can be wiped.
+#[cfg(not(target_family = "wasm"))]
+fn start_local_worker(options: &UiOptions) -> Result<loom_local::ManagedWorker, LoomError> {
+    let binary = loom_local::worker::resolve_server_binary(options.server_binary.clone())?;
+    let persistence = backend_persistence_path();
+    let token_file = loom_core::state_dir()
+        .join("local-worker")
+        .join(format!("token-{}", std::process::id()));
+    loom_local::ManagedWorker::start(&loom_local::ManagedWorkerOptions {
+        binary,
+        persistence,
+        reset_state: options.reset_state,
+        token_file,
+        port: None,
+    })
+}
+
 impl LoomView {
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn try_new(
@@ -8,10 +27,7 @@ impl LoomView {
         focus_handle: FocusHandle,
     ) -> Result<Self, LoomError> {
         info!("bootstrapping backend connection");
-        let mut remote_cleanup_guard = None;
-        let mut server_protocol_version = None;
-        let (connection, workspace_root, demo_workspace, owned_backend) = if let Some(remote_url) =
-            &options.remote
+        let (connection, workspace_root, owned_backend) = if let Some(remote_url) = &options.remote
         {
             info!("connecting to remote backend");
             if worker_url_embeds_credential(remote_url) {
@@ -27,9 +43,6 @@ impl LoomView {
                 token.to_owned(),
                 &remote_connection_options(options),
             )?;
-            remote_cleanup_guard = Some(ConnectionCleanupGuard::new(connection.clone()));
-            info!("remote transport connected; negotiating protocol");
-            server_protocol_version = Some(negotiate(&connection)?.protocol_version);
             let workspace_root = options
                 .project
                 .clone()
@@ -43,54 +56,31 @@ impl LoomView {
                     )
                 })?
                 .unwrap_or_default();
-            (connection, workspace_root, false, None)
+            (connection, workspace_root, None)
         } else {
-            let (workspace_root, demo_workspace) = prepare_workspace(options)?;
-            info!(
-                "using workspace '{}'{}",
-                workspace_root.display(),
-                if demo_workspace { " (demo)" } else { "" }
-            );
-            let backend = if demo_workspace {
-                info!("starting demo backend");
-                loom_local::OwnedBackend::demo_with_github_copilot()?
-            } else if let Some(endpoint) = &options.endpoint {
-                let persistence_path = backend_persistence_path();
-                info!(
-                    "starting local backend with OpenAI-compatible endpoint; state '{}'",
-                    persistence_path.display()
-                );
-                loom_local::OwnedBackend::with_openai_compatible_persistent_with_github_copilot(
-                    endpoint,
-                    options.api_key.as_deref().unwrap_or_default(),
-                    options.model.clone(),
-                    persistence_path,
-                )?
-            } else {
-                let persistence_path = backend_persistence_path();
-                info!(
-                    "starting local backend with GitHub Copilot; state '{}'",
-                    persistence_path.display()
-                );
-                loom_local::OwnedBackend::new_persistent_with_github_copilot(persistence_path)?
-            };
+            let workspace_root = prepare_workspace(options)?;
+            info!("using workspace '{}'", workspace_root.display());
+            let worker = start_local_worker(options)?;
+            let connection = ClientConnection::remote(
+                worker.websocket_url(),
+                worker.token().to_owned(),
+                &loom_local::RemoteConnectionOptions::default(),
+            )?;
             (
-                ClientConnection::InProcess(Box::new(backend.connect())),
+                connection,
                 workspace_root,
-                demo_workspace,
-                Some(backend),
+                Some(crate::local_backend::OwnedBackend::managed(worker)),
             )
         };
-        if options.remote.is_none() {
-            info!("negotiating protocol");
-            server_protocol_version = Some(negotiate(&connection)?.protocol_version);
-        }
+        let remote_cleanup_guard = Some(ConnectionCleanupGuard::new(connection.clone()));
+        info!("worker transport connected; negotiating protocol");
+        let server_protocol_version = Some(negotiate(&connection)?.protocol_version);
         let backend_endpoint = options.remote.clone();
         let mut view = Self::initialize_from_connection(
             options,
             connection,
             workspace_root,
-            demo_workspace,
+            false,
             remote_cleanup_guard,
             focus_handle,
             true,

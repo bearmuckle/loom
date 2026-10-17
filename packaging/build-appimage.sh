@@ -34,16 +34,22 @@ VERSION="${LOOM_BUILD_VERSION:-dev}"
 SUBDIR="${TARGET:+$TARGET/}"
 RELEASE_DIR="$WORKSPACE/target/${SUBDIR}release"
 BINARY="$RELEASE_DIR/loom-ui"
+# The client starts this as its managed local worker; bundling it next to the
+# client means an AppImage works offline without downloading a server.
+SERVER_BINARY="$RELEASE_DIR/loom-server"
 TOOLS_DIR="${LOOM_APPIMAGE_TOOLS_DIR:-"$WORKSPACE/target/appimage-tools"}"
 BUILD_DIR="$WORKSPACE/target/${SUBDIR}appimage"
 APPDIR="$BUILD_DIR/AppDir"
 ICON="$WORKSPACE/crates/loom-ui/pwa/icon-512.png"
 
-if [ ! -x "$BINARY" ]; then
-  echo "missing executable $BINARY; build it first with" \
-    "'cargo build --release --locked --package loom-ui --target ${TARGET:-<host>}'" >&2
-  exit 1
-fi
+for required in "$BINARY" "$SERVER_BINARY"; do
+  if [ ! -x "$required" ]; then
+    echo "missing executable $required; build it first with" \
+      "'cargo build --release --locked --package loom-ui --package loom-server" \
+      "--target ${TARGET:-<host>}'" >&2
+    exit 1
+  fi
+done
 
 # -- Tooling ------------------------------------------------------------------
 
@@ -94,6 +100,7 @@ mkdir -p "$APPDIR/usr/bin" \
   "$APPDIR/usr/share/licenses/loom-ui" \
   "$DIST"
 install -m755 "$BINARY" "$APPDIR/usr/bin/loom-ui"
+install -m755 "$SERVER_BINARY" "$APPDIR/usr/bin/loom-server"
 install -m644 "$WORKSPACE/packaging/loom.desktop" "$APPDIR/usr/share/applications/loom-ui.desktop"
 install -m644 "$WORKSPACE/packaging/loom.desktop" "$APPDIR/loom-ui.desktop"
 install -m644 "$ICON" "$APPDIR/usr/share/icons/hicolor/512x512/apps/loom-ui.png"
@@ -122,11 +129,13 @@ while read -r soname path; do
   # Already bundled by linuxdeploy.
   [ -e "$APPDIR/usr/lib/$soname" ] && continue
   libraries+=(--library "$path")
-done < <(ldd "$APPDIR/usr/bin/loom-ui" | tr -s ' ' | awk '$2 == "=>" && $3 ~ /^\// { print $1, $3 }')
+done < <(ldd "$APPDIR/usr/bin/loom-ui" "$APPDIR/usr/bin/loom-server" | tr -s ' ' \
+  | awk '$2 == "=>" && $3 ~ /^\// { print $1, $3 }' | sort -u)
 
 "$LINUXDEPLOY" \
   --appdir "$APPDIR" \
   --executable "$APPDIR/usr/bin/loom-ui" \
+  --executable "$APPDIR/usr/bin/loom-server" \
   --desktop-file "$APPDIR/usr/share/applications/loom-ui.desktop" \
   --icon-file "$APPDIR/usr/share/icons/hicolor/512x512/apps/loom-ui.png" \
   "${libraries[@]}"

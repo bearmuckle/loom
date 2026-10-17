@@ -223,13 +223,11 @@ fn startup_rejects_credential_bearing_remote_urls_and_missing_tokens(cx: &mut Te
         let options = |remote: &str, token: Option<&str>| super::UiOptions {
             project: None,
             task: "startup validation".to_owned(),
-            demo: false,
             model: ModelId::new("deterministic/demo"),
-            endpoint: None,
-            api_key: None,
             remote: Some(remote.to_owned()),
             token: token.map(str::to_owned),
             reset_state: false,
+            server_binary: None,
             ca: None,
             allow_insecure_remote: false,
         };
@@ -263,13 +261,11 @@ fn startup_rejects_credential_bearing_remote_urls_and_missing_tokens(cx: &mut Te
         let local_options = super::UiOptions {
             project: Some(invalid_workspace),
             task: "startup validation".to_owned(),
-            demo: false,
             model: ModelId::new("deterministic/demo"),
-            endpoint: None,
-            api_key: None,
             remote: None,
             token: None,
             reset_state: false,
+            server_binary: None,
             ca: None,
             allow_insecure_remote: false,
         };
@@ -291,20 +287,18 @@ fn connection_bootstrap_creates_and_attaches_a_local_workspace_session(cx: &mut 
         let options = super::UiOptions {
             project: None,
             task: "bootstrap test".to_owned(),
-            demo: false,
             model: ModelId::new("deterministic/demo"),
-            endpoint: None,
-            api_key: None,
             remote: None,
             token: None,
             reset_state: false,
+            server_binary: None,
             ca: None,
             allow_insecure_remote: false,
         };
         let workspace_root =
             std::env::temp_dir().join(format!("loom-ui-bootstrap-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&workspace_root).unwrap();
-        let local_backend = loom_local::OwnedBackend::new();
+        let local_backend = crate::local_backend::OwnedBackend::new();
         let connection = super::ClientConnection::InProcess(Box::new(local_backend.connect()));
         let connection_after_teardown = connection.clone();
         let negotiation = crate::connection::negotiate(&connection).unwrap();
@@ -2004,26 +1998,9 @@ fn github_login_failures_update_account_state(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
         let mut view = LoomView::new_for_test(cx.focus_handle());
-        view.handle_github_device_code(
-            Err(loom_core::LoomError::new(
-                ErrorCode::ProviderUnavailable,
-                "device failed",
-                true,
-            )),
-            cx,
-        );
-        assert!(matches!(
-            view.github_login,
-            Some(GitHubLoginState::Error(_))
-        ));
-        view.finish_github_login(
-            Err(loom_core::LoomError::new(
-                ErrorCode::ProviderUnavailable,
-                "poll failed",
-                true,
-            )),
-            cx,
-        );
+        view.providers_node_id = Some("missing-node".to_owned());
+        view.github_login_kind = crate::state::GitHubLoginKind::Repository;
+        view.start_github_login_flow(cx);
         assert!(matches!(
             view.github_login,
             Some(GitHubLoginState::Error(_))
@@ -2041,7 +2018,16 @@ fn github_repository_login_finishes_by_configuring_repository_access(cx: &mut Te
         let mut view = LoomView::new_for_test(cx.focus_handle());
         crate::connection::negotiate(&view.connection).unwrap();
         view.github_login_kind = crate::state::GitHubLoginKind::Repository;
-        view.finish_github_login(Ok("gho_repo_token".to_owned()), cx);
+        let configured = view
+            .connection
+            .request(RequestEnvelope::new(ClientRequest::Provider(
+                ProviderRequest::ConfigureGitHubRepository {
+                    access_token: "gho_repo_token".to_owned(),
+                },
+            )));
+        assert!(configured.result.is_ok(), "{:?}", configured.result);
+        let node_id = view.default_backend_node_id.clone();
+        view.handle_github_repository_configured(node_id, cx);
         view
     });
     cx.run_until_parked();

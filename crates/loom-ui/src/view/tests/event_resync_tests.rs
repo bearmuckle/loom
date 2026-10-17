@@ -555,7 +555,7 @@ fn session_event_snapshot_resync_keeps_the_conversation(cx: &mut TestAppContext)
     const TASK: &str = "keep the conversation across a resync";
     cx.update(gpui_kit::init);
 
-    let backend = loom_local::OwnedBackend::new();
+    let backend = crate::local_backend::OwnedBackend::new();
     let connection = ClientConnection::InProcess(Box::new(backend.connect()));
     let negotiation = crate::connection::negotiate(&connection).unwrap();
     let workspace = crate::connection::create_workspace(&connection, "Resync").unwrap();
@@ -589,13 +589,11 @@ fn session_event_snapshot_resync_keeps_the_conversation(cx: &mut TestAppContext)
         let options = UiOptions {
             project: None,
             task: TASK.to_owned(),
-            demo: false,
             model: ModelId::new("deterministic/demo"),
-            endpoint: None,
-            api_key: None,
             remote: None,
             token: None,
             reset_state: false,
+            server_binary: None,
             ca: None,
             allow_insecure_remote: false,
         };
@@ -732,8 +730,9 @@ fn session_event_snapshot_resync_keeps_the_conversation(cx: &mut TestAppContext)
 #[cfg(not(target_family = "wasm"))]
 #[test]
 fn a_resync_follows_every_bounded_event_page() {
-    let connection =
-        ClientConnection::InProcess(Box::new(loom_local::OwnedBackend::new().connect()));
+    let connection = ClientConnection::InProcess(Box::new(
+        crate::local_backend::OwnedBackend::new().connect(),
+    ));
     crate::connection::negotiate(&connection).unwrap();
     let workspace = crate::connection::create_workspace(&connection, "Paged resync").unwrap();
     let session = crate::connection::create_session_in_workspace(
@@ -1023,7 +1022,7 @@ fn a_poll_drains_every_bounded_event_page(cx: &mut TestAppContext) {
     const TASK: &str = "drain every bounded event page";
     cx.update(gpui_kit::init);
 
-    let backend = loom_local::OwnedBackend::new();
+    let backend = crate::local_backend::OwnedBackend::new();
     let connection = ClientConnection::InProcess(Box::new(backend.connect()));
     let negotiation = crate::connection::negotiate(&connection).unwrap();
     let workspace = crate::connection::create_workspace(&connection, "Polled pages").unwrap();
@@ -1053,13 +1052,11 @@ fn a_poll_drains_every_bounded_event_page(cx: &mut TestAppContext) {
         let options = UiOptions {
             project: None,
             task: TASK.to_owned(),
-            demo: false,
             model: ModelId::new("deterministic/demo"),
-            endpoint: None,
-            api_key: None,
             remote: None,
             token: None,
             reset_state: false,
+            server_binary: None,
             ca: None,
             allow_insecure_remote: false,
         };

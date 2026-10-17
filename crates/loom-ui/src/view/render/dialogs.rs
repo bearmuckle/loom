@@ -1019,11 +1019,6 @@ impl LoomView {
                             "Waiting for authorization (expires in {expires_in}s)"
                         )),
                 ),
-            #[cfg(not(target_family = "wasm"))]
-            GitHubLoginState::Completing => div()
-                .text_sm()
-                .text_color(rgb(0x8f98a6))
-                .child("Authorization received. Saving credentials..."),
             GitHubLoginState::Success => div()
                 .text_sm()
                 .text_color(rgb(0x9ad7bd))

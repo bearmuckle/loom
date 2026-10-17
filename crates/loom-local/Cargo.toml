@@ -13,10 +13,26 @@ loom-build.workspace = true
 loom-core.workspace = true
 loom-model.workspace = true
 loom-protocol.workspace = true
-loom-server.workspace = true
-loom-persistence.workspace = true
-loom-providers.workspace = true
-loom-vcs.workspace = true
 sha2.workspace = true
 keyring.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+rustls-pemfile.workspace = true
+reqwest.workspace = true
+flate2.workspace = true
+tar.workspace = true
+zip.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# Only the transport tests stand up a real server to talk to.
+[dev-dependencies]
+loom-server.workspace = true

@@ -42,12 +42,38 @@ browser support. `loom-ui` is organized into:
   `gpui-kit`'s window root, not by Loom.
 
 Native adapters (process arguments, workspace preparation, local credential
-storage, repository bootstrap, backend state files, the in-process/remote
-transport, and the GitHub Copilot device-login flow) live in `loom-local`, not
-in the UI. `loom-ui` therefore depends only on `loom-protocol` (plus
-`loom-core`/`loom-model` for protocol types and `loom-local` on native
-targets), so the native and browser paths share the same protocol client
-surface and neither links the backend implementation.
+storage, the WebSocket client transport, and the managed local worker) live in
+`loom-local`, not in the UI. Neither `loom-ui` nor `loom-local` has a normal
+dependency on a backend crate (`loom-server`, `loom-persistence`,
+`loom-providers`, `loom-vcs`, `loom-agent`, and the rest): the native client
+reaches every backend, including its own local one, through the versioned
+protocol over WebSocket. `loom-server` is only a dev-dependency, so tests can
+drive the view against an in-process backend.
+
+Without `--remote`, the native client runs a **managed local worker**: a
+`loom-server` child process bound to `127.0.0.1` on a free port. `loom-local`
+resolves the executable in this order:
+
+1. `--server-binary` or `LOOM_SERVER_BINARY`.
+2. `loom-server` next to the client executable (release archives, the AppImage
+   and the `.deb` install it there), then on `PATH`.
+3. A cached download under `<cache>/loom/server/<tag>/`, where `<cache>` is
+   `LOOM_CACHE_DIR`, else the platform cache directory.
+4. A download from the `bearmuckle/loom` GitHub release whose tag equals the
+   client's build version, or the latest release for a development build. The
+   asset `loom-server-<tag>-<platform>.{tar.gz,zip}` is checked against the
+   release's `SHA256SUMS` and refused on a mismatch or a missing entry, then
+   extracted into a staging directory and renamed into the cache.
+5. Offline, the newest cached version.
+
+The worker is started with `--bind 127.0.0.1:<port>`, a generated token passed
+through an owner-only `--token-file`, `--persistence <state-dir>/state.db` (the
+same database the client used when it embedded its backend), and
+`--reset-state` when the client was given it. The client waits for `GET
+/health`, connects over the same WebSocket transport it uses for a remote
+worker, and stops the child (SIGTERM, then a kill) when it exits. GitHub device
+login runs on the worker through the `StartGitHub*Login`/`Get*LoginStatus`
+protocol requests, the same path the browser client uses.
 
 Backend requests are submitted to a single connection worker thread and
 awaited on a background task, so no UI handler blocks on backend latency. The
@@ -66,8 +92,8 @@ backend and are exposed through authorized protocol commands.
 
 The backend is a Rust service and library that can run:
 
-- Embedded in a native application for local-only use.
-- As a local child process reached through an operating-system transport.
+- As a local child process the native client starts and stops (the managed
+  local worker described above).
 - As a standalone service reached over a network.
 - In a constrained hosted environment where only permitted capabilities are
   enabled.
@@ -131,10 +157,11 @@ Suggested backend boundaries:
   per-domain connection helpers under `connection/`, and owned services
   (`IdempotencyStore`, `CredentialService`, `AdmissionService`) under
   `services/`.
-- `loom-local`: the native launcher and local backend host. It owns process
-  arguments, persistence-path preparation, schema status/reset, local
-  credential storage, repository bootstrap, and native backend embedding, so
-  `loom-ui` does not link backend implementation crates directly.
+- `loom-local`: the native launcher. It owns process arguments, workspace
+  preparation, local credential storage, the native WebSocket client
+  transport, and the managed local worker (binary resolution, checksum-verified
+  download and cache, process start, health wait, and shutdown). It has no
+  normal dependency on any backend crate.
 - `loom-cli`: local server startup, diagnostics, and administration.
 
 The backend should expose domain services rather than exposing raw model APIs,

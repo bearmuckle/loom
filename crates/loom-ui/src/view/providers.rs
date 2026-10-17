@@ -96,28 +96,10 @@ impl LoomView {
         self.start_github_login_flow(cx);
     }
 
-    #[cfg(not(target_family = "wasm"))]
-    pub(crate) fn start_github_login_flow(&mut self, cx: &mut Context<Self>) {
-        let kind = self.github_login_kind;
-        let task = cx.background_spawn(async move {
-            match kind {
-                GitHubLoginKind::Copilot => loom_local::github_copilot_login_begin(),
-                GitHubLoginKind::Repository => {
-                    loom_local::GitHubCopilotAuthenticator::repository().begin()
-                }
-            }
-        });
-        cx.spawn(async move |view, cx| {
-            let result = task.await;
-            view.update(cx, |view, cx| view.handle_github_device_code(result, cx))
-                .ok();
-        })
-        .detach();
-    }
-
     /// The worker performs the OAuth exchange and stores its credential;
-    /// browser clients receive only the public device code and login status.
-    #[cfg(target_family = "wasm")]
+    /// clients receive only the public device code and login status. Native
+    /// and browser clients share this path, so the client never needs the
+    /// provider implementation.
     pub(crate) fn start_github_login_flow(&mut self, cx: &mut Context<Self>) {
         let node_id = self
             .providers_node_id
@@ -196,7 +178,7 @@ impl LoomView {
 
             let interval = Duration::from_secs(interval.clamp(1, 10));
             loop {
-                if let Err(error) = browser_delay(interval).await {
+                if let Err(error) = github_login_delay(cx, interval).await {
                     view.update(cx, |view, cx| {
                         view.github_login = Some(GitHubLoginState::Error(error.message));
                         cx.notify();
@@ -277,96 +259,6 @@ impl LoomView {
             }
         })
         .detach();
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    pub(crate) fn handle_github_device_code(
-        &mut self,
-        result: Result<GitHubDeviceCode, LoomError>,
-        cx: &mut Context<Self>,
-    ) {
-        let device = match result {
-            Ok(device) => device,
-            Err(error) => {
-                self.github_login = Some(GitHubLoginState::Error(error.message));
-                cx.notify();
-                return;
-            }
-        };
-        self.github_login = Some(GitHubLoginState::Awaiting {
-            verification_uri: device.verification_uri.clone(),
-            user_code: device.user_code.clone(),
-            expires_in: device.expires_in,
-        });
-        cx.notify();
-        let kind = self.github_login_kind;
-        let task = cx.background_spawn(async move {
-            match kind {
-                GitHubLoginKind::Copilot => loom_local::github_copilot_login_poll(&device),
-                GitHubLoginKind::Repository => {
-                    loom_local::GitHubCopilotAuthenticator::repository().poll(&device)
-                }
-            }
-        });
-        cx.spawn(async move |view, cx| {
-            let result = task.await;
-            view.update(cx, |view, cx| view.finish_github_login(result, cx))
-                .ok();
-        })
-        .detach();
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    pub(crate) fn finish_github_login(
-        &mut self,
-        result: Result<String, LoomError>,
-        cx: &mut Context<Self>,
-    ) {
-        self.github_login = Some(GitHubLoginState::Completing);
-        let token = match result {
-            Ok(token) => token,
-            Err(error) => {
-                self.github_login = Some(GitHubLoginState::Error(error.message));
-                cx.notify();
-                return;
-            }
-        };
-        let kind = self.github_login_kind;
-        let request = match kind {
-            GitHubLoginKind::Copilot => ProviderRequest::ConfigureGitHubCopilot {
-                access_token: token,
-            },
-            GitHubLoginKind::Repository => ProviderRequest::ConfigureGitHubRepository {
-                access_token: token,
-            },
-        };
-        let node_id = self
-            .providers_node_id
-            .clone()
-            .unwrap_or_else(|| self.default_backend_node_id.clone());
-        self.dispatch_to_node(
-            cx,
-            node_id.clone(),
-            ClientRequest::Provider(request),
-            move |view, response, cx| match response.result {
-                Ok(ServerResponse::Provider(ProviderResponse::ProviderConfigured)) => match kind {
-                    GitHubLoginKind::Copilot => {
-                        view.handle_github_provider_configured(node_id, cx);
-                    }
-                    GitHubLoginKind::Repository => {
-                        view.handle_github_repository_configured(node_id, cx);
-                    }
-                },
-                Err(error) => {
-                    view.github_login = Some(GitHubLoginState::Error(error.message));
-                }
-                Ok(response) => view.record_backend_error(
-                    "configure GitHub access",
-                    unexpected_response("provider configuration", response),
-                ),
-            },
-        );
-        cx.notify();
     }
 
     /// Marks repository access as configured and reflects it in settings.
@@ -1191,4 +1083,16 @@ async fn resolve_workspace_id_async(
         return Ok(workspace.id);
     }
     Ok(create_workspace_async(connection, "Default").await?.id)
+}
+
+/// Waits between GitHub login status polls without blocking the UI thread.
+#[cfg(target_family = "wasm")]
+async fn github_login_delay(_: &mut AsyncApp, interval: Duration) -> Result<(), LoomError> {
+    browser_delay(interval).await
+}
+
+#[cfg(not(target_family = "wasm"))]
+async fn github_login_delay(cx: &mut AsyncApp, interval: Duration) -> Result<(), LoomError> {
+    cx.background_executor().timer(interval).await;
+    Ok(())
 }

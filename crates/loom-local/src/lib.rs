@@ -1,8 +1,11 @@
 //! Native platform adapters: process arguments, workspace preparation, local
-//! credential storage, and repository bootstrap.
+//! credential storage, the WebSocket client transport, and the managed local
+//! worker.
 //!
-//! These are the pieces a browser target cannot use unchanged, so they are kept
-//! out of the view and connection modules.
+//! This crate deliberately has no normal dependency on any backend crate. A
+//! native client runs its backend as a separate `loom-server` process that
+//! [`worker::ManagedWorker`] resolves (bundled, on `PATH`, cached, or downloaded
+//! from the latest release), starts on loopback, and stops again.
 
 #[cfg(test)]
 use std::{collections::BTreeMap, sync::Mutex};
@@ -13,23 +16,22 @@ use std::{
 };
 
 use loom_core::{ErrorCode, LoomError, WorkspaceId};
-use loom_model::ModelId;
-use loom_providers::{CredentialRef, GITHUB_COPILOT_DEFAULT_MODEL};
-use loom_vcs::GitService;
+use loom_model::{CredentialRef, GITHUB_COPILOT_DEFAULT_MODEL, ModelId};
 use sha2::{Digest, Sha256};
 
 mod connection;
+mod transport;
+pub mod worker;
 
-pub use connection::{
-    DEFAULT_REQUEST_TIMEOUT, LocalConnection, OwnedBackend, RemoteConnection,
-    RemoteConnectionOptions,
-};
-
+pub use connection::{DEFAULT_REQUEST_TIMEOUT, RemoteConnection, RemoteConnectionOptions};
 /// Whether the native WebSocket transport can negotiate TLS (`wss://`).
 ///
 /// Clients re-export this capability so they report what the transport can
 /// really do instead of trusting a URL scheme.
-pub use loom_server::WEBSOCKET_TLS_SUPPORTED;
+pub use transport::{
+    DEFAULT_MAX_FRAME_BYTES, MAX_FRAME_BYTES_ENV, WEBSOCKET_TLS_SUPPORTED, resolve_max_frame_bytes,
+};
+pub use worker::{ManagedWorker, ManagedWorkerOptions};
 
 const PEER_CREDENTIAL_SERVICE: &str = "com.bearmuckle.loom.worker-peer";
 
@@ -160,13 +162,14 @@ impl PeerCredentialBackend for MemoryPeerCredentialBackend {
 pub struct UiOptions {
     pub project: Option<PathBuf>,
     pub task: String,
-    pub demo: bool,
     pub model: ModelId,
-    pub endpoint: Option<String>,
-    pub api_key: Option<String>,
     pub remote: Option<String>,
     pub token: Option<String>,
+    /// Passed to the managed local worker as `--reset-state`.
     pub reset_state: bool,
+    /// `--server-binary` or `LOOM_SERVER_BINARY`: the `loom-server` executable
+    /// the managed local worker runs, skipping discovery and download.
+    pub server_binary: Option<PathBuf>,
     /// PEM file whose certificates are trusted in addition to the OS roots for
     /// `wss://` workers. `--ca` overrides the `LOOM_TLS_CA` environment
     /// variable.
@@ -197,24 +200,26 @@ fn version_label(version: &str, revision: &str) -> String {
 
 /// The usage text printed by `--help`.
 fn usage_text() -> String {
-    "Usage: loom-ui [--project PATH] [--task DESCRIPTION] [--model ID] [--endpoint URL] \
-     [--remote URL] [--ca PATH] [--allow-insecure-remote] [--reset-state] [--demo]\n\
+    "Usage: loom-ui [--project PATH] [--task DESCRIPTION] [--model ID] [--remote URL] \
+     [--ca PATH] [--allow-insecure-remote] [--server-binary PATH] [--reset-state]\n\
      \n\
      Options:\n\
      \x20 --project PATH        open this directory as the workspace\n\
      \x20 --task DESCRIPTION    initial task description\n\
      \x20 --model ID            model id to use\n\
-     \x20 --endpoint URL        OpenAI-compatible endpoint\n\
      \x20 --remote URL          connect to a Loom worker instead of a local backend\n\
      \x20 --ca PATH             PEM file of additional trusted CAs for wss:// workers\n\
      \x20 --allow-insecure-remote\n\
      \x20                       allow plaintext ws:// to a non-loopback worker\n\
+     \x20 --server-binary PATH  loom-server executable for the local worker\n\
      \x20 --reset-state         wipe an incompatible local state database\n\
-     \x20 --demo                use the deterministic demo provider\n\
      \x20 -h, --help            print this help and exit\n\
      \x20 -V, --version         print the version and exit\n\
      \n\
-     LOOM_TLS_CA names the same PEM file as --ca when the flag is not given."
+     LOOM_TLS_CA names the same PEM file as --ca when the flag is not given, and\n\
+     LOOM_SERVER_BINARY names the same executable as --server-binary. Without\n\
+     --remote the client starts a local loom-server worker: a bundled or PATH\n\
+     binary, else a cached or downloaded release."
         .to_owned()
 }
 
@@ -227,17 +232,17 @@ impl UiOptions {
     {
         let mut project = None;
         let mut task = "make a small repository change and validate it".to_owned();
-        let mut demo = false;
         let mut model = env::var("LOOM_MODEL")
             .map(ModelId::new)
             .unwrap_or_else(|_| ModelId::new(GITHUB_COPILOT_DEFAULT_MODEL));
-        let mut endpoint = env::var("LOOM_OPENAI_ENDPOINT").ok();
-        let api_key = env::var("LOOM_API_KEY").ok();
         let mut remote = env::var("LOOM_REMOTE_URL").ok();
         let token = env::var("LOOM_TOKEN").ok();
         let mut reset_state = false;
         let mut ca = env::var_os("LOOM_TLS_CA").map(PathBuf::from);
         let mut allow_insecure_remote = false;
+        let mut server_binary = env::var_os("LOOM_SERVER_BINARY")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
         let mut args = args.into_iter().skip(1);
         while let Some(argument) = args.next() {
             match argument.as_str() {
@@ -246,7 +251,6 @@ impl UiOptions {
                         .next()
                         .ok_or_else(|| LoomError::invalid_request("--project requires a path"))?;
                     project = Some(PathBuf::from(value));
-                    demo = false;
                 }
                 "--task" => {
                     task = args.next().ok_or_else(|| {
@@ -269,15 +273,28 @@ impl UiOptions {
                     }
                 }
                 "--endpoint" => {
-                    let value = args
-                        .next()
-                        .ok_or_else(|| LoomError::invalid_request("--endpoint requires a URL"))?;
+                    return Err(LoomError::invalid_request(
+                        "--endpoint is no longer supported: the client runs its backend as a \
+                         loom-server worker, so configure the OpenAI-compatible provider in \
+                         Settings or with that worker's environment instead",
+                    ));
+                }
+                "--demo" => {
+                    return Err(LoomError::invalid_request(
+                        "--demo is no longer supported: the client runs its backend as a \
+                         loom-server worker, which has no deterministic demo mode",
+                    ));
+                }
+                "--server-binary" => {
+                    let value = args.next().ok_or_else(|| {
+                        LoomError::invalid_request("--server-binary requires a path")
+                    })?;
                     if value.trim().is_empty() {
                         return Err(LoomError::invalid_request(
-                            "--endpoint requires a non-empty URL",
+                            "--server-binary requires a non-empty path",
                         ));
                     }
-                    endpoint = Some(value);
+                    server_binary = Some(PathBuf::from(value));
                 }
                 "--remote" => {
                     let value = args
@@ -289,12 +306,6 @@ impl UiOptions {
                         ));
                     }
                     remote = Some(value);
-                    demo = false;
-                }
-                "--demo" => {
-                    project = None;
-                    demo = true;
-                    model = ModelId::new("deterministic/demo");
                 }
                 "--ca" => {
                     let value = args.next().ok_or_else(|| {
@@ -331,29 +342,15 @@ impl UiOptions {
         Ok(Some(Self {
             project,
             task,
-            demo,
             model,
-            endpoint,
-            api_key,
             remote,
             token,
             reset_state,
+            server_binary,
             ca,
             allow_insecure_remote,
         }))
     }
-}
-
-/// Ensures the local state database can be opened by this build. An
-/// incompatible database is wiped only when the operator passed
-/// `--reset-state` or explicitly confirmed the interactive prompt; otherwise
-/// the error is returned so the GUI reports it instead of failing silently.
-/// The decision itself is the shared [`loom_server::ensure_state_database`].
-pub fn prepare_backend_state(options: &UiOptions) -> Result<(), LoomError> {
-    if options.remote.is_some() || options.demo {
-        return Ok(());
-    }
-    loom_server::ensure_state_database(&backend_persistence_path(), options.reset_state)
 }
 
 /// Resolves the default project root from a process working directory. Returns
@@ -398,7 +395,7 @@ fn canonical_state_directory() -> PathBuf {
     root.join("loom")
 }
 
-pub fn prepare_workspace(options: &UiOptions) -> Result<(PathBuf, bool), LoomError> {
+pub fn prepare_workspace(options: &UiOptions) -> Result<PathBuf, LoomError> {
     if let Some(project) = &options.project {
         let root = fs::canonicalize(project).map_err(|error| {
             LoomError::new(
@@ -414,58 +411,15 @@ pub fn prepare_workspace(options: &UiOptions) -> Result<(PathBuf, bool), LoomErr
                 false,
             ));
         }
-        return Ok((root, false));
+        return Ok(root);
     }
-
-    if !options.demo {
-        let root = default_project_root(env::current_dir(), &canonical_state_directory())?;
-        return Ok((root, false));
-    }
-
-    let root = env::temp_dir().join("loom-m5-ui-demo");
-    fs::create_dir_all(&root).map_err(|error| {
-        LoomError::new(
-            ErrorCode::ToolExecution,
-            format!("could not create UI workspace: {error}"),
-            false,
-        )
-    })?;
-    let readme = root.join("README.md");
-    if !readme.exists() {
-        fs::write(
-            readme,
-            "Workspace used by the Loom M5 agent workspace demo.\n",
-        )
-        .map_err(|error| {
-            LoomError::new(
-                ErrorCode::ToolExecution,
-                format!("could not seed UI workspace: {error}"),
-                false,
-            )
-        })?;
-    }
-    if !root.join(".git").is_dir() {
-        GitService::init(&root)?;
-    }
-    Ok((root, options.demo))
+    default_project_root(env::current_dir(), &canonical_state_directory())
 }
 
+/// The state database the managed local worker keeps, shared across
+/// workspaces and unchanged from when the client embedded its backend.
 pub fn backend_persistence_path() -> PathBuf {
     loom_core::state_dir().join("state.db")
-}
-
-/// Public device-code payload for a GitHub sign-in.
-pub use loom_providers::GitHubCopilotAuthenticator;
-pub use loom_providers::GitHubDeviceCode;
-
-/// Starts a GitHub Copilot device authorization flow.
-pub fn github_copilot_login_begin() -> Result<GitHubDeviceCode, LoomError> {
-    loom_providers::GitHubCopilotAuthenticator::default().begin()
-}
-
-/// Polls a device authorization until it yields an access token.
-pub fn github_copilot_login_poll(device: &GitHubDeviceCode) -> Result<String, LoomError> {
-    loom_providers::GitHubCopilotAuthenticator::default().poll(device)
 }
 
 #[cfg(test)]
@@ -499,8 +453,8 @@ mod tests {
             "fix the agent flow".to_owned(),
             "--model".to_owned(),
             "gpt-4o-mini".to_owned(),
-            "--endpoint".to_owned(),
-            "http://127.0.0.1:8000/v1/chat/completions".to_owned(),
+            "--server-binary".to_owned(),
+            "/opt/loom/loom-server".to_owned(),
             "--remote".to_owned(),
             "ws://127.0.0.1:8080/ws".to_owned(),
             "--ca".to_owned(),
@@ -514,14 +468,13 @@ mod tests {
         assert_eq!(options.task, "fix the agent flow");
         assert_eq!(options.model.as_str(), "gpt-4o-mini");
         assert_eq!(
-            options.endpoint.as_deref(),
-            Some("http://127.0.0.1:8000/v1/chat/completions")
+            options.server_binary.as_deref(),
+            Some(Path::new("/opt/loom/loom-server"))
         );
         assert_eq!(options.remote.as_deref(), Some("ws://127.0.0.1:8080/ws"));
         assert_eq!(options.ca.as_deref(), Some(Path::new("/tmp/loom-ca.pem")));
         assert!(options.allow_insecure_remote);
         assert!(options.reset_state);
-        assert!(!options.demo);
     }
 
     #[test]
@@ -532,8 +485,10 @@ mod tests {
             vec!["--task", "   "],
             vec!["--model"],
             vec!["--model", "  "],
-            vec!["--endpoint"],
-            vec!["--endpoint", "  "],
+            vec!["--endpoint", "http://127.0.0.1:8000/v1"],
+            vec!["--demo"],
+            vec!["--server-binary"],
+            vec!["--server-binary", "  "],
             vec!["--remote"],
             vec!["--remote", "  "],
             vec!["--ca"],
@@ -548,13 +503,6 @@ mod tests {
             assert!(result.is_err(), "accepted arguments: {args:?}");
             assert_eq!(result.unwrap_err().code, ErrorCode::InvalidRequest);
         }
-        let demo = UiOptions::parse(["loom-ui".to_owned(), "--demo".to_owned()])
-            .unwrap()
-            .expect("demo arguments describe a runnable client");
-        assert!(demo.demo);
-        assert_eq!(demo.model.as_str(), "deterministic/demo");
-        assert_eq!(demo.ca, None);
-        assert!(!demo.allow_insecure_remote);
     }
 
     #[test]
@@ -609,9 +557,8 @@ mod tests {
             .unwrap()
             .expect("no arguments describe a runnable client");
         options.project = Some(root.clone());
-        let (resolved, demo) = prepare_workspace(&options).unwrap();
+        let resolved = prepare_workspace(&options).unwrap();
         assert_eq!(resolved, fs::canonicalize(&root).unwrap());
-        assert!(!demo);
 
         options.project = Some(root.join("missing"));
         assert_eq!(
@@ -684,8 +631,7 @@ mod tests {
         let options = UiOptions::parse(["loom-ui".to_owned()])
             .unwrap()
             .expect("no arguments describe a runnable client");
-        let (root, demo) = prepare_workspace(&options).unwrap();
-        assert!(!demo);
+        let root = prepare_workspace(&options).unwrap();
         let current = fs::canonicalize(env::current_dir().unwrap()).unwrap();
         if current.starts_with(canonical_state_directory()) {
             assert!(root.as_os_str().is_empty());
@@ -844,32 +790,5 @@ mod tests {
                 .message
                 .contains("remove worker-node credential")
         );
-    }
-
-    #[test]
-    fn an_in_memory_owned_backend_runs_no_retention_sweep() {
-        let backend = OwnedBackend::new();
-        assert!(
-            !backend.runs_archive_retention_sweeps(),
-            "an in-memory backend cannot store a policy, so it needs no sweep"
-        );
-        backend.shutdown().unwrap();
-    }
-
-    #[test]
-    fn a_durable_owned_backend_runs_the_archive_retention_sweep() {
-        let path = env::temp_dir().join(format!("loom-local-retention-{}.db", WorkspaceId::new()));
-        let backend = OwnedBackend::new_persistent(path.clone()).expect("durable backend");
-        assert!(
-            backend.runs_archive_retention_sweeps(),
-            "a durable embedded backend must sweep expired archived sessions"
-        );
-        // Shutting down stops the sweep before the backend releases its
-        // database, so a second shutdown would not race a round.
-        backend.shutdown().unwrap();
-        drop(backend);
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_dir_all(path.with_extension("session-roots"));
-        let _ = fs::remove_dir_all(path.with_extension("clone-cache"));
     }
 }

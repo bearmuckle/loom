@@ -145,8 +145,11 @@ use wasm_bindgen::{JsCast, closure::Closure};
 
 #[derive(Clone)]
 pub(crate) enum ClientConnection {
-    #[cfg(not(target_family = "wasm"))]
-    InProcess(Box<loom_local::LocalConnection>),
+    /// An in-process backend; only tests use it, through the `loom-server`
+    /// dev-dependency. The native client always reaches its backend over
+    /// WebSocket, including the managed local worker.
+    #[cfg(all(not(target_family = "wasm"), test))]
+    InProcess(Box<loom_server::InProcessConnection>),
     #[cfg(not(target_family = "wasm"))]
     Remote(loom_local::RemoteConnection),
     #[cfg(target_family = "wasm")]
@@ -206,6 +209,7 @@ impl ClientConnection {
         #[cfg(not(target_family = "wasm"))]
         {
             match self {
+                #[cfg(test)]
                 Self::InProcess(_) => Ok(()),
                 Self::Remote(connection) => connection.close(),
             }
@@ -221,7 +225,7 @@ impl ClientConnection {
 
     pub(crate) fn secure_for_secrets(&self) -> bool {
         match self {
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(all(not(target_family = "wasm"), test))]
             Self::InProcess(_) => true,
             #[cfg(not(target_family = "wasm"))]
             Self::Remote(connection) => connection.secure_for_secrets(),
@@ -266,6 +270,7 @@ impl ClientConnection {
         timeout: Duration,
     ) -> ResponseEnvelope {
         match self {
+            #[cfg(test)]
             Self::InProcess(connection) => connection.request(request),
             Self::Remote(connection) => connection.request_with_timeout(request, timeout),
         }
@@ -1144,8 +1149,9 @@ mod tests {
 
     #[test]
     fn in_process_connection_exercises_workspace_and_session_client_operations() {
-        let connection =
-            ClientConnection::InProcess(Box::new(loom_local::OwnedBackend::new().connect()));
+        let connection = ClientConnection::InProcess(Box::new(
+            crate::local_backend::OwnedBackend::new().connect(),
+        ));
         negotiate(&connection).unwrap();
         let created = create_workspace(&connection, "client wrapper test").unwrap();
         assert_eq!(created.name, "client wrapper test");
@@ -1176,8 +1182,9 @@ mod tests {
 
     #[test]
     fn workspace_client_operations_report_backend_errors_and_register_external_records() {
-        let connection =
-            ClientConnection::InProcess(Box::new(loom_local::OwnedBackend::new().connect()));
+        let connection = ClientConnection::InProcess(Box::new(
+            crate::local_backend::OwnedBackend::new().connect(),
+        ));
         negotiate(&connection).unwrap();
         let timestamp = Timestamp::from_unix_millis(1);
         let external = WorkspaceRecord {

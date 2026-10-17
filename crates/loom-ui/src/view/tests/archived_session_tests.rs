@@ -622,8 +622,9 @@ fn forcing_a_delete_removes_the_session_from_a_durable_worker(cx: &mut TestAppCo
         "loom-ui-archived-sessions-{}",
         uuid::Uuid::new_v4()
     ));
-    let backend = loom_local::OwnedBackend::new_persistent_with_github_copilot(state_path)
-        .expect("durable backend");
+    let backend =
+        crate::local_backend::OwnedBackend::new_persistent_with_github_copilot(state_path)
+            .expect("durable backend");
     let connection = ClientConnection::InProcess(Box::new(backend.connect()));
     crate::connection::negotiate(&connection).unwrap();
 
@@ -888,8 +889,9 @@ fn applying_a_window_stores_it_and_the_card_shows_the_stored_policy(cx: &mut Tes
         "loom-ui-archive-retention-{}",
         uuid::Uuid::new_v4()
     ));
-    let backend = loom_local::OwnedBackend::new_persistent_with_github_copilot(state_path)
-        .expect("durable backend");
+    let backend =
+        crate::local_backend::OwnedBackend::new_persistent_with_github_copilot(state_path)
+            .expect("durable backend");
     let connection = ClientConnection::InProcess(Box::new(backend.connect()));
     crate::connection::negotiate(&connection).unwrap();
 
@@ -1757,8 +1759,9 @@ fn a_confirmed_project_deletion_removes_the_tree_and_closes_the_dialog(cx: &mut 
     // A durable worker is required: an in-memory one refuses every delete.
     let state_path =
         std::env::temp_dir().join(format!("loom-ui-project-deletion-{}", uuid::Uuid::new_v4()));
-    let backend = loom_local::OwnedBackend::new_persistent_with_github_copilot(state_path)
-        .expect("durable backend");
+    let backend =
+        crate::local_backend::OwnedBackend::new_persistent_with_github_copilot(state_path)
+            .expect("durable backend");
     let connection = ClientConnection::InProcess(Box::new(backend.connect()));
     crate::connection::negotiate(&connection).unwrap();
 

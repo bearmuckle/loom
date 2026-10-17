@@ -199,13 +199,24 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          # The client archive also carries loom-server: the client starts it as
+          # its managed local worker, and a binary next to the client is found
+          # before any download, so an unpacked archive works offline.
           for bin in loom-ui loom-server; do
+            files=("$bin${{ matrix.exe }}")
+            if [ "$bin" = loom-ui ]; then
+              files+=("loom-server${{ matrix.exe }}")
+            fi
             if [ "${{ matrix.archive }}" = "zip" ]; then
+              paths=()
+              for file in "${files[@]}"; do
+                paths+=("${{ matrix.bin_dir }}/$file")
+              done
               7z a "dist/$bin-$GITHUB_REF_NAME-${{ matrix.name }}.zip" \
-                "${{ matrix.bin_dir }}/$bin${{ matrix.exe }}" LICENSE-AGPL LICENSES.md
+                "${paths[@]}" LICENSE-AGPL LICENSES.md
             else
               tar -czf "dist/$bin-$GITHUB_REF_NAME-${{ matrix.name }}.tar.gz" \
-                -C "${{ matrix.bin_dir }}" "$bin${{ matrix.exe }}" \
+                -C "${{ matrix.bin_dir }}" "${files[@]}" \
                 -C "$GITHUB_WORKSPACE" LICENSE-AGPL LICENSES.md
             fi
           done
@@ -243,6 +254,7 @@ jobs:
           # `pipefail` that reports a present file as missing.
           contents="$(dpkg-deb --contents "$deb")"
           for asset in usr/bin/loom-ui \
+            usr/bin/loom-server \
             usr/share/applications/loom-ui.desktop \
             usr/share/icons/hicolor/512x512/apps/loom-ui.png; do
             grep -Fq "$asset" <<<"$contents" \
@@ -533,7 +545,11 @@ jobs:
           Native Loom releases contain the `loom-ui` desktop client and the
           standalone `loom-server` backend for Linux (x86_64 and aarch64), macOS
           (one universal binary) and Windows (x86_64), plus Linux AppImages and
-          `.deb` packages of the client and a server container image.
+          `.deb` packages of the client and a server container image. The client
+          archives, AppImages and `.deb` packages include `loom-server`, which the
+          client starts as its local worker process; a client without one
+          downloads the matching `loom-server` archive from this release and
+          checks it against `SHA256SUMS` first.
 
           ## Verify what you downloaded
 
@@ -603,7 +619,8 @@ jobs:
 
           ## Standalone server
 
-          `loom-server` is the backend the client embeds, as a separate process.
+          `loom-server` is the backend the client runs as its local worker
+          process, and can also be deployed on its own.
           Its archives unpack the same way as the client's:
 
           ```sh
