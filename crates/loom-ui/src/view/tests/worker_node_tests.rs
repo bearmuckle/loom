@@ -1,18 +1,15 @@
 use super::{
-    ACTIVE_BACKEND_NODE_ENTRY_ID, AGENT_GROUP_ID_PREFIX, SessionSourceChoice,
-    SessionSourceDialogPurpose, SessionTreeNode, WorkerConnectionStage, WorkerConnectionState,
-    WorkerNodeEntry, adjusted_cpu_pulse_threshold, adjusted_project_agent_concurrency,
-    agent_group_summary, assigned_node_id, classify_connectivity_failure, connection_placeholder,
-    filter_session_tree, format_percentage, format_worker_node_resources, initial_worker_nodes,
+    ACTIVE_BACKEND_NODE_ENTRY_ID, SessionSourceChoice, SessionSourceDialogPurpose,
+    WorkerConnectionStage, WorkerConnectionState, WorkerNodeEntry, adjusted_cpu_pulse_threshold,
+    adjusted_project_agent_concurrency, assigned_node_id, classify_connectivity_failure,
+    connection_placeholder, format_percentage, format_worker_node_resources, initial_worker_nodes,
     local_source_available, mark_worker_connection_failed, merge_node_sessions,
     next_severe_load_streak, order_session_nodes, project_child_control_actions,
-    project_session_list_projection, project_session_list_projection_for_projects,
-    project_snapshot_has_unloaded_agent_sessions, project_tree_item, remove_worker_node_entry,
-    safe_worker_url_label, session_id_for_request, session_list_projection, session_status_pill,
-    session_tree_descendant_count, source_choice_is_allowed, source_dialog_initial_state,
-    transition_worker_connection_to_connecting, uncovered_session_ids, update_worker_node_status,
-    validate_model_for_node, worker_connection_failure_detail, worker_node_display_name,
-    worker_url_embeds_credential,
+    project_snapshot_has_unloaded_agent_sessions, remove_worker_node_entry, safe_worker_url_label,
+    session_id_for_request, session_status_pill, source_choice_is_allowed,
+    source_dialog_initial_state, transition_worker_connection_to_connecting, uncovered_session_ids,
+    update_worker_node_status, validate_model_for_node, worker_connection_failure_detail,
+    worker_node_display_name, worker_url_embeds_credential,
 };
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, EventSequence, RunId,
@@ -348,31 +345,7 @@ fn session(id: AgentSessionId, name: &str) -> AgentSessionSnapshot {
 }
 
 #[test]
-fn session_list_projection_preserves_order_and_selects_active_session() {
-    let first = AgentSessionId::new();
-    let active = AgentSessionId::new();
-    let sessions = vec![session(first, "First"), session(active, "Active")];
-
-    let projection = session_list_projection(&sessions, active);
-
-    assert_eq!(
-        projection.entries,
-        vec![(first, "First".to_owned()), (active, "Active".to_owned())]
-    );
-    assert_eq!(projection.selected_index, Some(1));
-}
-
-#[test]
-fn session_list_projection_has_no_selection_when_active_session_is_missing() {
-    let sessions = vec![session(AgentSessionId::new(), "Only session")];
-
-    let projection = session_list_projection(&sessions, AgentSessionId::new());
-
-    assert_eq!(projection.selected_index, None);
-}
-
-#[test]
-fn project_session_list_projects_nested_children_and_selects_them() {
+fn project_snapshot_has_unloaded_agent_sessions_detects_missing_agent_sessions() {
     let root_id = AgentSessionId::new();
     let child_id = AgentSessionId::new();
     let grandchild_id = AgentSessionId::new();
@@ -463,54 +436,6 @@ fn project_session_list_projects_nested_children_and_selects_them() {
     assert!(!project_snapshot_has_unloaded_agent_sessions(
         &project, &sessions
     ));
-    let projection = project_session_list_projection(&sessions, child_id, Some(&project));
-
-    assert_eq!(
-        projection.entries,
-        vec![
-            (root_id, "Project".to_owned()),
-            (child_id, "Researcher".to_owned()),
-            (grandchild_id, "Analyst".to_owned()),
-            (other_id, "Other session".to_owned()),
-        ]
-    );
-    assert_eq!(projection.selected_index, Some(1));
-    assert_eq!(
-        projection.tree[0].children[0].children[0].session_id,
-        grandchild_id
-    );
-    let grandchild_projection =
-        project_session_list_projection(&sessions, grandchild_id, Some(&project));
-    assert_eq!(grandchild_projection.selected_index, Some(2));
-
-    let other_project_id = loom_core::ProjectId::from_uuid(*other_id.as_uuid());
-    let other_project = loom_core::ProjectSnapshot {
-        project_id: other_project_id,
-        root_session_id: other_id,
-        agents: vec![loom_core::ProjectAgentRecord {
-            session_id: other_id,
-            project_id: other_project_id,
-            parent_session_id: None,
-            depth: 1,
-            state: AgentSessionState::Idle,
-            task_summary: None,
-            output_cursor: EventSequence::default(),
-            updated_at: Timestamp::from_unix_millis(1),
-        }],
-        tasks: Vec::new(),
-        worktrees: Vec::new(),
-    };
-    let switched_project_projection = project_session_list_projection_for_projects(
-        &sessions,
-        other_id,
-        vec![&project, &other_project],
-    );
-    assert_eq!(switched_project_projection.selected_index, Some(3));
-    assert_eq!(
-        switched_project_projection.tree[0].children[0].children[0].session_id,
-        grandchild_id
-    );
-    assert_eq!(switched_project_projection.tree[1].session_id, other_id);
 }
 
 #[test]
@@ -554,104 +479,6 @@ fn uncovered_session_ids_skip_sessions_captured_by_a_known_project() {
         uncovered_session_ids(&sessions, &[]),
         vec![root, child, other_root, other_child]
     );
-}
-
-#[test]
-fn project_order_uses_creation_time_not_recent_activity() {
-    let older = AgentSessionId::new();
-    let newer = AgentSessionId::new();
-    let stamp = Timestamp::from_unix_millis;
-    let snapshot = |id, name: &str, created, updated| AgentSessionSnapshot {
-        id,
-        workspace_id: WorkspaceId::new(),
-        name: name.to_owned(),
-        state: AgentSessionState::Idle,
-        created_at: stamp(created),
-        updated_at: stamp(updated),
-    };
-    // The backend returns sessions by most-recent activity, so the older
-    // project arrives first because it was touched last.
-    let sessions = vec![
-        snapshot(older, "Older", 1, 999),
-        snapshot(newer, "Newer", 2, 5),
-    ];
-    let project = |id: AgentSessionId| {
-        let project_id = loom_core::ProjectId::from_uuid(*id.as_uuid());
-        loom_core::ProjectSnapshot {
-            project_id,
-            root_session_id: id,
-            agents: vec![loom_core::ProjectAgentRecord {
-                session_id: id,
-                project_id,
-                parent_session_id: None,
-                depth: 1,
-                state: AgentSessionState::Idle,
-                task_summary: None,
-                output_cursor: EventSequence::default(),
-                updated_at: stamp(1),
-            }],
-            tasks: Vec::new(),
-            worktrees: Vec::new(),
-        }
-    };
-    let (older_project, newer_project) = (project(older), project(newer));
-
-    let projection = project_session_list_projection_for_projects(
-        &sessions,
-        newer,
-        vec![&older_project, &newer_project],
-    );
-
-    // Newest project first, regardless of which was updated most recently.
-    assert_eq!(projection.tree[0].session_id, newer);
-    assert_eq!(projection.tree[1].session_id, older);
-}
-
-#[test]
-fn project_filter_keeps_matching_projects_whole_and_matches_descendants() {
-    let root_id = AgentSessionId::new();
-    let child_id = AgentSessionId::new();
-    let grandchild_id = AgentSessionId::new();
-    let other_id = AgentSessionId::new();
-    let tree = vec![
-        SessionTreeNode {
-            session_id: root_id,
-            label: "My API refactor".to_owned(),
-            children: vec![SessionTreeNode {
-                session_id: child_id,
-                label: "Add auth tests".to_owned(),
-                children: vec![SessionTreeNode {
-                    session_id: grandchild_id,
-                    label: "Fix token refresh".to_owned(),
-                    children: Vec::new(),
-                }],
-            }],
-        },
-        SessionTreeNode {
-            session_id: other_id,
-            label: "Docs cleanup".to_owned(),
-            children: Vec::new(),
-        },
-    ];
-    assert_eq!(session_tree_descendant_count(&tree[0]), 2);
-    assert_eq!(session_tree_descendant_count(&tree[1]), 0);
-
-    let root_match = filter_session_tree(tree.clone(), "api");
-    assert_eq!(root_match.len(), 1);
-    assert_eq!(root_match[0].session_id, root_id);
-
-    // A descendant match keeps the whole project and its path.
-    let child_match = filter_session_tree(tree.clone(), "auth");
-    assert_eq!(child_match.len(), 1);
-    assert_eq!(child_match[0].session_id, root_id);
-    assert_eq!(child_match[0].children.len(), 1);
-    assert_eq!(child_match[0].children[0].session_id, child_id);
-
-    assert!(filter_session_tree(tree.clone(), "missing").is_empty());
-
-    let other_match = filter_session_tree(tree, "docs");
-    assert_eq!(other_match.len(), 1);
-    assert_eq!(other_match[0].session_id, other_id);
 }
 
 #[test]
@@ -1346,91 +1173,4 @@ fn active_backend_and_external_worker_labels_do_not_collide() {
         worker_node_display_name(&external_worker),
         "External worker · local"
     );
-}
-
-#[test]
-fn project_tree_items_group_agents_under_one_summary_node() {
-    let root = AgentSessionId::new();
-    let child = AgentSessionId::new();
-    let grandchild = AgentSessionId::new();
-    let node = SessionTreeNode {
-        session_id: root,
-        label: "Project".to_owned(),
-        children: vec![SessionTreeNode {
-            session_id: child,
-            label: "Researcher".to_owned(),
-            children: vec![SessionTreeNode {
-                session_id: grandchild,
-                label: "Analyst".to_owned(),
-                children: Vec::new(),
-            }],
-        }],
-    };
-
-    let item = project_tree_item(&node);
-    // The project keeps its own row; every agent sits behind one summary node.
-    assert_eq!(item.id.as_ref(), root.to_string());
-    assert_eq!(item.children.len(), 1);
-    let group = &item.children[0];
-    assert_eq!(group.id.as_ref(), format!("{AGENT_GROUP_ID_PREFIX}{root}"));
-    assert_eq!(group.label.as_ref(), "2 agents");
-    assert_eq!(group.children.len(), 1);
-    assert_eq!(group.children[0].id.as_ref(), child.to_string());
-
-    // A project with no agents stays a plain leaf row.
-    let bare = SessionTreeNode {
-        session_id: AgentSessionId::new(),
-        label: "Empty project".to_owned(),
-        children: Vec::new(),
-    };
-    assert!(project_tree_item(&bare).children.is_empty());
-}
-
-#[test]
-fn agent_group_summary_counts_active_and_completed_agents() {
-    let root = AgentSessionId::new();
-    let running = AgentSessionId::new();
-    let done = AgentSessionId::new();
-    let grandchild = AgentSessionId::new();
-    let node = SessionTreeNode {
-        session_id: root,
-        label: "Project".to_owned(),
-        children: vec![
-            SessionTreeNode {
-                session_id: running,
-                label: "Running".to_owned(),
-                children: vec![SessionTreeNode {
-                    session_id: grandchild,
-                    label: "Blocked".to_owned(),
-                    children: Vec::new(),
-                }],
-            },
-            SessionTreeNode {
-                session_id: done,
-                label: "Done".to_owned(),
-                children: Vec::new(),
-            },
-        ],
-    };
-    let snapshot = |id, state| AgentSessionSnapshot {
-        id,
-        workspace_id: WorkspaceId::new(),
-        name: "agent".to_owned(),
-        state,
-        created_at: Timestamp::from_unix_millis(1),
-        updated_at: Timestamp::from_unix_millis(1),
-    };
-    let sessions = vec![
-        snapshot(running, AgentSessionState::Executing),
-        snapshot(grandchild, AgentSessionState::Planning),
-        snapshot(done, AgentSessionState::Completed),
-    ];
-
-    assert_eq!(
-        agent_group_summary(&node, &sessions),
-        "3 agents · 2 running · 1 done"
-    );
-
-    // Unknown sessions are not counted as active or complete, but stay counted.
-    assert_eq!(agent_group_summary(&node, &[]), "3 agents");
 }

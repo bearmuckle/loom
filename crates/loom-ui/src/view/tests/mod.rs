@@ -26,6 +26,7 @@ mod new_project_pane_tests;
 mod policy_decision_tests;
 mod project_action_tests;
 mod project_activity_tests;
+mod project_list_tests;
 mod provider_control_tests;
 mod provider_error_tests;
 mod provider_mode_tests;

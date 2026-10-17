@@ -94,7 +94,13 @@ fn selecting_the_open_project_dismisses_the_new_project_pane(cx: &mut TestAppCon
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
         assert!(window.find("source-dialog-pane").visible());
-        window.click(("session-tree-root", 0usize), cx);
+        window.click(("project-row", 0usize), cx);
+    })
+    .unwrap();
+    // The list delivers its confirm event as a pending effect, so the view acts
+    // on the click on the way out of the frame.
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
         assert!(
             view.read(cx).source_dialog.is_none(),
@@ -116,7 +122,11 @@ fn selecting_the_open_project_dismisses_settings_and_the_archived_surface(cx: &m
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
         assert!(window.find("settings-content").visible());
-        window.click(("session-tree-root", 0usize), cx);
+        window.click(("project-row", 0usize), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
         assert!(
             !view.read(cx).settings_open(),
@@ -137,7 +147,11 @@ fn selecting_the_open_project_dismisses_the_archived_sessions_surface(cx: &mut T
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
         assert!(window.find("archived-sessions-dialog").visible());
-        window.click(("session-tree-root", 0usize), cx);
+        window.click(("project-row", 0usize), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
         assert!(
             !view.read(cx).archived_sessions_open(),
@@ -176,7 +190,7 @@ fn selecting_another_project_still_switches_sessions(cx: &mut TestAppContext) {
     let view = rendered.borrow().as_ref().unwrap().clone();
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click(("session-tree-root", 1usize), cx);
+        window.click(("project-row", 1usize), cx);
     })
     .unwrap();
     cx.run_until_parked();
@@ -275,11 +289,11 @@ fn project_rows_show_the_main_source_under_the_name(cx: &mut TestAppContext) {
     });
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
-        let name = window.find(("session-tree-label", 0usize));
-        let source = window.find(("session-tree-source", 0usize));
+        let name = window.find(("project-name", 0usize));
+        let source = window.find(("project-detail", 0usize));
         assert_eq!(name.label(), Some("loom"));
         assert_eq!(source.label(), Some("bearmuckle/loom"));
-        let row = window.find(("session-tree-root", 0usize)).bounds();
+        let row = window.find(("project-row", 0usize)).bounds();
         // The two lines stack, and both stay inside the row.
         assert!(
             name.bounds().bottom() <= source.bounds().top() + px(1.),
@@ -300,7 +314,7 @@ fn project_rows_without_a_known_source_keep_the_second_line(cx: &mut TestAppCont
     let (handle, _) = open_view_window(cx, |_| {});
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
-        let source = window.find(("session-tree-source", 0usize));
+        let source = window.find(("project-detail", 0usize));
         assert!(source.visible());
         assert!(
             source

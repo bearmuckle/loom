@@ -6,5 +6,5 @@ mod dialogs;
 mod inspector;
 mod pickers;
 mod root;
-mod sidebar;
+pub(super) mod sidebar;
 mod tool;

@@ -18,7 +18,7 @@ use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::input::{
     Input as KitInput, InputEvent, InputState, Textarea, TextareaState,
 };
-use gpui_kit::component::list::ListItem;
+use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::spinner::Spinner;
@@ -33,12 +33,11 @@ use gpui_kit::component::{
     switch::Switch,
     tab::{Tab, TabBar},
     text::TextView,
-    tree::{Tree as KitTree, TreeItem, TreeState},
 };
 use gpui_kit::{
     Animation, AnimationExt, App, ClickEvent, ClipboardItem, Context, Element, Entity, FocusHandle,
     Focusable, FontWeight, HighlightStyle, MouseButton, Pixels, Render, Rgba, StyledText,
-    Subscription, Window, WindowAppearance, WindowControlArea, div, prelude::*, px,
+    Subscription, WeakEntity, Window, WindowAppearance, WindowControlArea, div, prelude::*, px,
 };
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, ErrorCode,
@@ -118,7 +117,7 @@ const FONT_SCALE_STEP_PERCENT: i16 = 5;
 /// they reach this count.
 const TOOL_GROUP_THRESHOLD: usize = 3;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ResponsiveLayout {
     phone: bool,
     sidebar_width: Pixels,
@@ -536,16 +535,15 @@ pub(crate) struct LoomView {
     project_feed_after_sequence: Option<EventSequence>,
     project_feed_epoch: Option<String>,
     project_poll_scheduled: bool,
-    /// The single session tree shared by every worker section. One tree for
-    /// the whole pane means the sidebar scrolls as one region instead of
-    /// giving each worker its own full-height, independently scrolling tree.
-    session_tree: Option<Entity<TreeState>>,
-    /// Last rendered rows of the shared tree, used to skip redundant updates.
-    session_tree_entries: Option<Vec<SessionTreeRow>>,
-    /// Active session the shared tree was last synchronized to. Navigation
-    /// reveals the active session, but a project chevron toggle must not force
-    /// the active session's ancestors back open.
-    session_tree_active: Option<AgentSessionId>,
+    /// The left pane's project list: one row per project, in one scrolling
+    /// region shared by every worker section.
+    project_list: Option<Entity<ListState<render::sidebar::ProjectListDelegate>>>,
+    /// Keeps the list's own selection and confirm events wired to this view.
+    project_list_subscription: Option<Subscription>,
+    /// The rows, headings, and layout the list was last synchronized to.
+    project_list_view: Option<render::sidebar::ProjectListView>,
+    /// The project row the list was last synchronized to highlight.
+    project_list_active: Option<AgentSessionId>,
     /// The main source of each known project, shown as the second line of a
     /// project row: `owner/repository` for a clone, a short path for a folder.
     session_sources: BTreeMap<AgentSessionId, String>,
@@ -745,103 +743,231 @@ pub(crate) enum SessionSourceChoice {
     GitHub,
 }
 
+/// One delegated agent of a project, as listed in that project row's menu.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct SessionTreeNode {
-    session_id: AgentSessionId,
-    label: String,
-    children: Vec<SessionTreeNode>,
+pub(crate) struct ProjectAgentRow {
+    pub(crate) session_id: AgentSessionId,
+    pub(crate) name: String,
+    pub(crate) state: AgentSessionState,
 }
 
-/// One row of the sidebar's single session tree: a worker section header, or a
-/// project subtree owned by that worker.
+/// One row of the left pane: a project, built from its root session.
+///
+/// Delegated agents never get their own row; they are summarised on the row's
+/// second line and listed behind that summary's menu.
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum SessionTreeRow {
-    WorkerHeader { node_id: String },
-    Project(SessionTreeNode),
+pub(crate) struct ProjectListRow {
+    /// The session the row selects: the project's root, or the session itself
+    /// when no known project snapshot covers it.
+    pub(crate) session_id: AgentSessionId,
+    pub(crate) name: String,
+    /// The project's main source when known, otherwise `updated <when>`.
+    pub(crate) detail: String,
+    /// The one-line agent summary, omitted when the project has no agents.
+    pub(crate) summary: Option<String>,
+    pub(crate) agents: Vec<ProjectAgentRow>,
+    /// Whether the project or one of its agents has work in flight.
+    pub(crate) active: bool,
+    /// The project's own session pill. It colours the activity dots.
+    pub(crate) status: SessionStatusPill,
+    /// The pill shown beside the name, for attention states only.
+    pub(crate) attention: Option<SessionStatusPill>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct SessionListProjection {
-    entries: Vec<(AgentSessionId, String)>,
-    selected_index: Option<usize>,
-    tree: Vec<SessionTreeNode>,
+/// The projects owned by one worker, in list order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectListSection {
+    pub(crate) node_id: String,
+    pub(crate) rows: Vec<ProjectListRow>,
 }
 
-fn session_list_projection(
-    sessions: &[AgentSessionSnapshot],
-    active_session_id: AgentSessionId,
-) -> SessionListProjection {
-    session_list_projection_from_tree(
-        sessions
-            .iter()
-            .map(|session| SessionTreeNode {
-                session_id: session.id,
-                label: session.name.clone(),
-                children: Vec::new(),
-            })
-            .collect(),
-        active_session_id,
-    )
+/// The left pane's derived content: one row per project, grouped by worker,
+/// plus the row that owns the active session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectListModel {
+    pub(crate) sections: Vec<ProjectListSection>,
+    /// The project row that owns the active session.
+    pub(crate) selected: Option<AgentSessionId>,
 }
 
-fn session_list_projection_from_tree(
-    tree: Vec<SessionTreeNode>,
-    active_session_id: AgentSessionId,
-) -> SessionListProjection {
-    fn flatten(node: &SessionTreeNode, entries: &mut Vec<(AgentSessionId, String)>) {
-        entries.push((node.session_id, node.label.clone()));
-        for child in &node.children {
-            flatten(child, entries);
+/// Everything the left pane derives its rows from.
+///
+/// Passed in one struct so the ordering and summary rules stay a pure
+/// function that tests can drive without rendering.
+pub(crate) struct ProjectListInput<'a> {
+    pub(crate) sessions: &'a [AgentSessionSnapshot],
+    pub(crate) owners: &'a BTreeMap<AgentSessionId, String>,
+    pub(crate) node_order: &'a [String],
+    pub(crate) default_node_id: &'a str,
+    pub(crate) projects: &'a [&'a loom_core::ProjectSnapshot],
+    pub(crate) active_session_id: AgentSessionId,
+    /// The main source of each project, shown as the row's second line.
+    pub(crate) source_labels: &'a BTreeMap<AgentSessionId, String>,
+    /// The lowercased filter text. It matches project names only.
+    pub(crate) filter: &'a str,
+    pub(crate) now_millis: u64,
+}
+
+/// Derive the left pane's project rows.
+///
+/// A row is built from a project's root session; its delegated agents are
+/// summarised on the row instead of being listed. Sessions no known project
+/// snapshot covers keep a row of their own, so nothing disappears from the
+/// pane. Rows are listed newest-created first, with the incoming list position
+/// breaking ties, in the worker order `group_sessions_by_worker` reports.
+pub(crate) fn project_list_model(input: ProjectListInput<'_>) -> ProjectListModel {
+    let sessions_by_id = input
+        .sessions
+        .iter()
+        .map(|session| (session.id, session))
+        .collect::<BTreeMap<_, _>>();
+    let positions = input
+        .sessions
+        .iter()
+        .enumerate()
+        .map(|(position, session)| (session.id, position))
+        .collect::<BTreeMap<_, _>>();
+    let active_sessions = input
+        .sessions
+        .iter()
+        .filter(|session| session_is_active(session.state))
+        .map(|session| session.id)
+        .collect::<BTreeSet<_>>();
+    // The project each session belongs to. A project covers its root and every
+    // agent record whose session is loaded, so an agent is never listed twice.
+    let mut project_roots = BTreeMap::<AgentSessionId, AgentSessionId>::new();
+    for project in input.projects {
+        if !sessions_by_id.contains_key(&project.root_session_id) {
+            continue;
+        }
+        project_roots.insert(project.root_session_id, project.root_session_id);
+        for agent in &project.agents {
+            if sessions_by_id.contains_key(&agent.session_id) {
+                project_roots.insert(agent.session_id, project.root_session_id);
+            }
         }
     }
 
-    let mut entries = Vec::new();
-    for node in &tree {
-        flatten(node, &mut entries);
+    let mut sections = Vec::new();
+    for (node_id, group) in group_sessions_by_worker(
+        input.sessions,
+        input.owners,
+        input.node_order,
+        input.default_node_id,
+    ) {
+        let mut rows = Vec::new();
+        for session in &group {
+            let root = project_roots.get(&session.id).copied();
+            // An agent is summarised on its project's row, not listed.
+            let (session_id, agents) = match root {
+                Some(root) if root != session.id => continue,
+                Some(root) => {
+                    let agents = input
+                        .projects
+                        .iter()
+                        .find(|project| project.root_session_id == root)
+                        .map(|project| {
+                            project
+                                .agents
+                                .iter()
+                                .filter(|agent| agent.session_id != root)
+                                .filter_map(|agent| {
+                                    let session = sessions_by_id.get(&agent.session_id)?;
+                                    Some(ProjectAgentRow {
+                                        session_id: agent.session_id,
+                                        name: session.name.clone(),
+                                        // The snapshot's per-agent state is
+                                        // authoritative for its agents.
+                                        state: agent.state,
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    (root, agents)
+                }
+                None => (session.id, Vec::new()),
+            };
+            let Some(source) = sessions_by_id.get(&session_id) else {
+                continue;
+            };
+            if !input.filter.is_empty() && !source.name.to_lowercase().contains(input.filter) {
+                continue;
+            }
+            rows.push(project_list_row(
+                source,
+                agents,
+                &active_sessions,
+                input.source_labels,
+                input.now_millis,
+            ));
+        }
+        rows.sort_by_key(|row| {
+            (
+                std::cmp::Reverse(
+                    sessions_by_id
+                        .get(&row.session_id)
+                        .map(|session| session.created_at.as_unix_millis())
+                        .unwrap_or(0),
+                ),
+                positions
+                    .get(&row.session_id)
+                    .copied()
+                    .unwrap_or(usize::MAX),
+            )
+        });
+        sections.push(ProjectListSection { node_id, rows });
     }
-    let selected_index = entries
-        .iter()
-        .position(|(session_id, _)| *session_id == active_session_id);
-    SessionListProjection {
-        entries,
-        selected_index,
-        tree,
-    }
+
+    // Highlight the project that owns the active session, so selecting a sub
+    // agent keeps its project row highlighted.
+    let selected = sessions_by_id
+        .contains_key(&input.active_session_id)
+        .then(|| {
+            project_roots
+                .get(&input.active_session_id)
+                .copied()
+                .unwrap_or(input.active_session_id)
+        })
+        .filter(|selected| {
+            sections
+                .iter()
+                .any(|section| section.rows.iter().any(|row| row.session_id == *selected))
+        });
+    ProjectListModel { sections, selected }
 }
 
-fn session_tree_item(node: &SessionTreeNode) -> TreeItem {
-    let children = node
-        .children
-        .iter()
-        .map(session_tree_item)
-        .collect::<Vec<_>>();
-    // Projects with sub-agents start collapsed; only the active session's
-    // ancestor chain is expanded automatically (see `set_selected_item`).
-    TreeItem::new(node.session_id.to_string(), node.label.clone()).children(children)
-}
-
-/// Prefix that marks the single agent-group node nested under a project root,
-/// so the row renderer can tell it apart from a session row.
-pub(crate) const AGENT_GROUP_ID_PREFIX: &str = "agents:";
-
-/// The tree item for a project root. Its delegated agents are nested under one
-/// summary node so the sidebar lists projects, not every sub agent; a project
-/// with no agents keeps its plain leaf row.
-fn project_tree_item(node: &SessionTreeNode) -> TreeItem {
-    if node.children.is_empty() {
-        return TreeItem::new(node.session_id.to_string(), node.label.clone());
+/// Build one project row from its root session and the agents it holds.
+fn project_list_row(
+    session: &AgentSessionSnapshot,
+    agents: Vec<ProjectAgentRow>,
+    active_sessions: &BTreeSet<AgentSessionId>,
+    source_labels: &BTreeMap<AgentSessionId, String>,
+    now_millis: u64,
+) -> ProjectListRow {
+    // A project shows activity for its delegated agents too, so a sub agent
+    // that is working keeps its project's row alive. Session state is
+    // authoritative; persisted task records can lag behind and would keep a
+    // finished project animating.
+    let active = active_sessions.contains(&session.id)
+        || agents
+            .iter()
+            .any(|agent| active_sessions.contains(&agent.session_id));
+    ProjectListRow {
+        session_id: session.id,
+        name: session.name.clone(),
+        detail: source_labels.get(&session.id).cloned().unwrap_or_else(|| {
+            format!(
+                "updated {}",
+                relative_time(session.updated_at.as_unix_millis(), now_millis)
+            )
+        }),
+        summary: (!agents.is_empty()).then(|| agent_summary_line(&agents)),
+        agents,
+        active,
+        status: session_status_pill(session.state, None),
+        attention: project_attention_pill(session.state),
     }
-    let agents = node
-        .children
-        .iter()
-        .map(session_tree_item)
-        .collect::<Vec<_>>();
-    let group = TreeItem::new(
-        format!("{AGENT_GROUP_ID_PREFIX}{}", node.session_id),
-        agent_group_label(session_tree_descendant_count(node)),
-    )
-    .children(agents);
-    TreeItem::new(node.session_id.to_string(), node.label.clone()).children(vec![group])
 }
 
 fn agent_group_label(count: usize) -> String {
@@ -852,32 +978,18 @@ fn agent_group_label(count: usize) -> String {
     }
 }
 
-/// A one-line summary of a project's delegated agents for the collapsed group
-/// row: the total, then how many are active and how many are complete.
-fn agent_group_summary(node: &SessionTreeNode, sessions: &[AgentSessionSnapshot]) -> String {
-    fn collect(node: &SessionTreeNode, out: &mut Vec<AgentSessionId>) {
-        for child in &node.children {
-            out.push(child.session_id);
-            collect(child, out);
-        }
-    }
-    let mut ids = Vec::new();
-    collect(node, &mut ids);
-    let state_of = |id: AgentSessionId| {
-        sessions
-            .iter()
-            .find(|session| session.id == id)
-            .map(|session| session.state)
-    };
-    let running = ids
+/// A one-line summary of a project's delegated agents: the total, then how many
+/// are active and how many are complete.
+fn agent_summary_line(agents: &[ProjectAgentRow]) -> String {
+    let running = agents
         .iter()
-        .filter(|id| state_of(**id).is_some_and(session_is_active))
+        .filter(|agent| session_is_active(agent.state))
         .count();
-    let done = ids
+    let done = agents
         .iter()
-        .filter(|id| state_of(**id) == Some(AgentSessionState::Completed))
+        .filter(|agent| agent.state == AgentSessionState::Completed)
         .count();
-    let mut parts = vec![agent_group_label(ids.len())];
+    let mut parts = vec![agent_group_label(agents.len())];
     if running > 0 {
         parts.push(format!("{running} running"));
     }
@@ -887,61 +999,10 @@ fn agent_group_summary(node: &SessionTreeNode, sessions: &[AgentSessionSnapshot]
     parts.join(" · ")
 }
 
-fn find_session_tree_item<'a>(items: &'a [TreeItem], session_id: &str) -> Option<&'a TreeItem> {
-    for item in items {
-        if item.id.as_ref() == session_id {
-            return Some(item);
-        }
-        if let Some(child) = find_session_tree_item(&item.children, session_id) {
-            return Some(child);
-        }
-    }
-    None
-}
-
-/// The total number of descendant sessions below a project tree node.
-fn session_tree_descendant_count(node: &SessionTreeNode) -> usize {
-    node.children.len()
-        + node
-            .children
-            .iter()
-            .map(session_tree_descendant_count)
-            .sum::<usize>()
-}
-
-/// Whether a project node or any of its descendant agents has work in flight.
-fn session_subtree_is_active(
-    node: &SessionTreeNode,
-    active_sessions: &BTreeSet<AgentSessionId>,
-) -> bool {
-    active_sessions.contains(&node.session_id)
-        || node
-            .children
-            .iter()
-            .any(|child| session_subtree_is_active(child, active_sessions))
-}
-
-/// Whether a project node or any of its descendants matches the lowercased
-/// filter. Projects are kept whole, so a child match keeps its root.
-fn session_tree_matches(node: &SessionTreeNode, filter: &str) -> bool {
-    node.label.to_lowercase().contains(filter)
-        || node
-            .children
-            .iter()
-            .any(|child| session_tree_matches(child, filter))
-}
-
-/// Keep every project whose root or any descendant matches the filter.
-fn filter_session_tree(tree: Vec<SessionTreeNode>, filter: &str) -> Vec<SessionTreeNode> {
-    tree.into_iter()
-        .filter(|node| session_tree_matches(node, filter))
-        .collect()
-}
-
 /// A compact status label with theme-resolved foreground and background colors
-/// for a project child row.
-#[derive(Clone, Copy)]
-struct SessionStatusPill {
+/// for a project row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SessionStatusPill {
     label: &'static str,
     foreground: u32,
     background: u32,
@@ -957,8 +1018,21 @@ impl SessionStatusPill {
     }
 }
 
-/// Map a delegated task's lifecycle state to a child row pill. Falls back to
-/// the session state for agents that have no durable task record.
+/// The status pill shown beside a project's name: only the states that ask
+/// something of the user or report a problem earn one, so a healthy project
+/// row stays quiet.
+fn project_attention_pill(state: AgentSessionState) -> Option<SessionStatusPill> {
+    match state {
+        AgentSessionState::AwaitingApproval
+        | AgentSessionState::NeedsInput
+        | AgentSessionState::Failed
+        | AgentSessionState::Paused => Some(session_status_pill(state, None)),
+        _ => None,
+    }
+}
+
+/// Map a session state, or a delegated task's lifecycle state when it has one,
+/// to a row pill. The task status wins because it is the more specific record.
 fn session_status_pill(
     state: AgentSessionState,
     task: Option<loom_core::DelegatedTaskStatus>,
@@ -1021,7 +1095,7 @@ fn task_activity_indicator(index: usize, status: SessionStatusPill) -> gpui_kit:
             )
     };
     div()
-        .id(("session-tree-activity", index))
+        .id(("project-activity", index))
         .test_support()
         .h(px(12.))
         .flex_shrink_0()
@@ -1365,189 +1439,6 @@ fn settings_nav(
         )
 }
 
-#[cfg(test)]
-fn project_session_list_projection(
-    sessions: &[AgentSessionSnapshot],
-    active_session_id: AgentSessionId,
-    project: Option<&loom_core::ProjectSnapshot>,
-) -> SessionListProjection {
-    project_session_list_projection_for_projects(
-        sessions,
-        active_session_id,
-        project.into_iter().collect(),
-    )
-}
-
-fn project_session_list_projection_for_projects(
-    sessions: &[AgentSessionSnapshot],
-    active_session_id: AgentSessionId,
-    projects: Vec<&loom_core::ProjectSnapshot>,
-) -> SessionListProjection {
-    if projects.is_empty() {
-        return session_list_projection(sessions, active_session_id);
-    }
-    let mut tree = Vec::new();
-    let mut included = BTreeSet::new();
-    for project in projects {
-        let projection =
-            project_session_list_projection_for_project(sessions, active_session_id, project);
-        if let Some(root) = projection
-            .tree
-            .into_iter()
-            .find(|node| node.session_id == project.root_session_id)
-            && included.insert(root.session_id)
-        {
-            fn include_descendants(
-                node: &SessionTreeNode,
-                included: &mut BTreeSet<AgentSessionId>,
-            ) {
-                included.insert(node.session_id);
-                for child in &node.children {
-                    include_descendants(child, included);
-                }
-            }
-            include_descendants(&root, &mut included);
-            tree.push(root);
-        }
-    }
-    for session in sessions {
-        if included.insert(session.id) {
-            tree.push(SessionTreeNode {
-                session_id: session.id,
-                label: session.name.clone(),
-                children: Vec::new(),
-            });
-        }
-    }
-    // Order projects by creation time (newest first), with the incoming list
-    // position only breaking ties. The backend lists sessions by `updated_at`,
-    // so ordering by position would make a busy project jump to the top; the
-    // creation time keeps the tree stable as sessions are updated.
-    let created_at = sessions
-        .iter()
-        .map(|session| (session.id, session.created_at.as_unix_millis()))
-        .collect::<BTreeMap<_, _>>();
-    tree.sort_by_key(|node| {
-        let created = created_at.get(&node.session_id).copied().unwrap_or(0);
-        let position = sessions
-            .iter()
-            .position(|session| session.id == node.session_id)
-            .unwrap_or(usize::MAX);
-        (std::cmp::Reverse(created), position)
-    });
-    session_list_projection_from_tree(tree, active_session_id)
-}
-
-fn project_session_list_projection_for_project(
-    sessions: &[AgentSessionSnapshot],
-    active_session_id: AgentSessionId,
-    project: &loom_core::ProjectSnapshot,
-) -> SessionListProjection {
-    let sessions_by_id = sessions
-        .iter()
-        .map(|session| (session.id, session))
-        .collect::<BTreeMap<_, _>>();
-    let agents_by_id = project
-        .agents
-        .iter()
-        .filter(|agent| agent.session_id != project.root_session_id)
-        .map(|agent| (agent.session_id, agent))
-        .collect::<BTreeMap<_, _>>();
-    let mut agents_by_parent =
-        BTreeMap::<AgentSessionId, Vec<&loom_core::ProjectAgentRecord>>::new();
-    for agent in project
-        .agents
-        .iter()
-        .filter(|agent| agent.session_id != project.root_session_id)
-    {
-        let parent_id = agent
-            .parent_session_id
-            .filter(|parent_id| {
-                *parent_id == project.root_session_id
-                    || (agents_by_id.contains_key(parent_id)
-                        && sessions_by_id.contains_key(parent_id))
-            })
-            .unwrap_or(project.root_session_id);
-        agents_by_parent.entry(parent_id).or_default().push(agent);
-    }
-
-    fn build_agent_node(
-        session_id: AgentSessionId,
-        sessions_by_id: &BTreeMap<AgentSessionId, &AgentSessionSnapshot>,
-        agents_by_parent: &BTreeMap<AgentSessionId, Vec<&loom_core::ProjectAgentRecord>>,
-        visited: &mut BTreeSet<AgentSessionId>,
-    ) -> Option<SessionTreeNode> {
-        if !visited.insert(session_id) {
-            return None;
-        }
-        let session = sessions_by_id.get(&session_id)?;
-        let children = agents_by_parent
-            .get(&session_id)
-            .into_iter()
-            .flatten()
-            .filter_map(|agent| {
-                build_agent_node(agent.session_id, sessions_by_id, agents_by_parent, visited)
-            })
-            .collect();
-        Some(SessionTreeNode {
-            session_id,
-            label: session.name.clone(),
-            children,
-        })
-    }
-
-    let Some(root_session) = sessions_by_id.get(&project.root_session_id) else {
-        return session_list_projection(sessions, active_session_id);
-    };
-    let mut visited = BTreeSet::new();
-    let mut root_node = SessionTreeNode {
-        session_id: project.root_session_id,
-        label: root_session.name.clone(),
-        children: Vec::new(),
-    };
-    visited.insert(project.root_session_id);
-    root_node.children = agents_by_parent
-        .get(&project.root_session_id)
-        .into_iter()
-        .flatten()
-        .filter_map(|agent| {
-            build_agent_node(
-                agent.session_id,
-                &sessions_by_id,
-                &agents_by_parent,
-                &mut visited,
-            )
-        })
-        .collect();
-
-    // Keep agents with missing parents and parent cycles in the project group too.
-    for agent in agents_by_id.values() {
-        if let Some(node) = build_agent_node(
-            agent.session_id,
-            &sessions_by_id,
-            &agents_by_parent,
-            &mut visited,
-        ) {
-            root_node.children.push(node);
-        }
-    }
-
-    let project_session_ids = agents_by_id.keys().copied().collect::<BTreeSet<_>>();
-    let mut tree = Vec::new();
-    for session in sessions {
-        if session.id == project.root_session_id {
-            tree.push(root_node.clone());
-        } else if !project_session_ids.contains(&session.id) {
-            tree.push(SessionTreeNode {
-                session_id: session.id,
-                label: session.name.clone(),
-                children: Vec::new(),
-            });
-        }
-    }
-    session_list_projection_from_tree(tree, active_session_id)
-}
-
 fn project_snapshot_has_unloaded_agent_sessions(
     project: &loom_core::ProjectSnapshot,
     sessions: &[AgentSessionSnapshot],
@@ -1804,9 +1695,10 @@ impl LoomView {
             project_feed_after_sequence: None,
             project_feed_epoch: None,
             project_poll_scheduled: false,
-            session_tree: None,
-            session_tree_entries: None,
-            session_tree_active: None,
+            project_list: None,
+            project_list_subscription: None,
+            project_list_view: None,
+            project_list_active: None,
             session_sources: BTreeMap::new(),
             session_source_lookups: BTreeMap::new(),
             node_session_load_errors: BTreeMap::new(),

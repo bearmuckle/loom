@@ -255,9 +255,10 @@ fn selecting_a_project_dismisses_the_archived_surface(cx: &mut TestAppContext) {
     assert_on_screen(cx, handle, &view, Some(CoveringSurface::ArchivedSessions));
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click(("session-tree-root", 0usize), cx);
+        window.click(("project-row", 0usize), cx);
     })
     .unwrap();
+    cx.run_until_parked();
     assert_on_screen(cx, handle, &view, None);
 }
 

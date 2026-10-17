@@ -380,115 +380,13 @@ fn session_list_renders_owner_and_resource_summary(cx: &mut TestAppContext) {
     });
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
-        assert!(window.find(("session-tree-root", 0usize)).visible());
+        assert!(window.find(("project-row", 0usize)).visible());
     })
     .unwrap();
 }
 
 #[gpui_kit::test]
-fn nested_project_tree_selects_grandchild_session_by_click(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let rendered_view = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let rendered_view_for_window = rendered_view.clone();
-    let handle = cx.open_window(size(px(1280.), px(800.)), move |window, cx| {
-        let view = cx.new(|cx| nested_project_view(cx.focus_handle()));
-        *rendered_view_for_window.borrow_mut() = Some(view.clone());
-        gpui_kit::component::Root::new(view, window, cx)
-    });
-    let view = rendered_view.borrow().as_ref().unwrap().clone();
-    cx.update_window(handle.into(), |_, window, cx| {
-        window.render_frame(cx);
-        // Projects with sub-agents start collapsed behind one summary row.
-        assert!(window.find(("session-tree-root", 0usize)).visible());
-        assert!(window.try_find(("session-tree-agents", 0usize)).is_none());
-        // Clicking the project name selects it without expanding its agents.
-        window.click(("session-tree-root", 0usize), cx);
-        window.render_frame(cx);
-        assert_eq!(view.read(cx).active_session.name, "Project");
-        assert!(
-            window.try_find(("session-tree-agents", 0usize)).is_none(),
-            "selecting a project name must not expand its sub-agents"
-        );
-        // The chevron expands the project, revealing the single agent summary.
-        window.click(("session-tree-disclosure", 0usize), cx);
-        window.render_frame(cx);
-        assert!(window.find(("session-tree-agents", 0usize)).visible());
-        assert!(
-            window.try_find(("session-tree-root", 1usize)).is_none(),
-            "individual agents stay behind the summary until it is expanded"
-        );
-        // Expanding the summary reveals the agents, then the manager reveals the
-        // grandchild.
-        window.click(("session-tree-agents", 0usize), cx);
-        window.render_frame(cx);
-        assert!(window.find(("session-tree-root", 1usize)).visible());
-        window.click(("session-tree-disclosure", 1usize), cx);
-        window.render_frame(cx);
-        assert!(window.find(("session-tree-root", 2usize)).visible());
-        // A plain click on the deepest agent still selects it.
-        window.click(("session-tree-root", 2usize), cx);
-        assert_eq!(view.read(cx).active_session.name, "Worker");
-        // Collapsing an ancestor of the active agent keeps it collapsed
-        // instead of forcing the selection back into view.
-        window.click(("session-tree-disclosure", 1usize), cx);
-        window.render_frame(cx);
-        assert!(window.try_find(("session-tree-root", 2usize)).is_none());
-        assert_eq!(
-            view.read(cx).active_session.name,
-            "Worker",
-            "a chevron toggle must not change the active session"
-        );
-        // Re-expanding reveals the selected agent again.
-        window.click(("session-tree-disclosure", 1usize), cx);
-        window.render_frame(cx);
-        assert!(window.find(("session-tree-root", 2usize)).visible());
-        assert_eq!(view.read(cx).active_session.name, "Worker");
-    })
-    .unwrap();
-}
-
-#[gpui_kit::test]
-fn phone_drawer_selects_session_and_closes_the_drawer(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let rendered_view = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let rendered_view_for_window = rendered_view.clone();
-    let handle = cx.open_window(size(px(390.), px(844.)), move |window, cx| {
-        let view = cx.new(|cx| {
-            let mut view = nested_project_view(cx.focus_handle());
-            // Select the nested agent so the collapsed tree auto-expands its path.
-            view.active_session = view
-                .sessions
-                .iter()
-                .find(|session| session.name == "Worker")
-                .cloned()
-                .expect("nested project has a Worker session");
-            view.session_drawer_open = true;
-            view
-        });
-        *rendered_view_for_window.borrow_mut() = Some(view.clone());
-        gpui_kit::component::Root::new(view, window, cx)
-    });
-    let view = rendered_view.borrow().as_ref().unwrap().clone();
-    cx.update_window(handle.into(), |_, window, cx| {
-        window.render_frame(cx);
-        assert!(window.find("mobile-session-drawer").visible());
-        window.click(("session-tree-root", 2usize), cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.update_window(handle.into(), |_, window, cx| {
-        window.render_frame(cx);
-        assert_eq!(view.read(cx).active_session.name, "Worker");
-        assert!(
-            window.try_find("mobile-session-drawer").is_none(),
-            "selecting a session should close the phone drawer"
-        );
-    })
-    .unwrap();
-}
-
-#[gpui_kit::test]
-fn archiving_a_project_removes_descendant_sessions_from_the_tree(cx: &mut TestAppContext) {
+fn archiving_a_project_removes_descendant_sessions(cx: &mut TestAppContext) {
     // Build the view without opening a window so the project poll (which
     // would run while a live project is rendered) never starts.
     let view = cx.new(|cx| {
@@ -3293,7 +3191,7 @@ fn phone_drawer_and_review_sidebar_controls_toggle_panels(cx: &mut TestAppContex
         );
         let row = window
             .within("mobile-session-drawer")
-            .find(("session-tree-root", 0usize));
+            .find(("project-row", 0usize));
         assert!(row.visible());
         assert!(
             row.bounds().size.height >= px(44.),

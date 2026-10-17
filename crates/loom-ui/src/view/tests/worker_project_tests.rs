@@ -141,8 +141,8 @@ fn sidebar_shows_worker_sections_in_one_scrolling_list(cx: &mut TestAppContext) 
         assert!(local_section.visible());
         assert!(peer_section.visible());
         // Sessions keep stable ids that do not depend on the section headings.
-        let local_row = window.find(("session-tree-root", 0usize));
-        let peer_row = window.find(("session-tree-root", 1usize));
+        let local_row = window.find(("project-row", 0usize));
+        let peer_row = window.find(("project-row", 1usize));
         assert!(local_row.visible());
         assert!(peer_row.visible());
         // One list, read top to bottom: the peer's section follows the local
@@ -155,8 +155,8 @@ fn sidebar_shows_worker_sections_in_one_scrolling_list(cx: &mut TestAppContext) 
         window.click(local_section_id.clone(), cx);
         window.render_frame(cx);
         assert!(window.find(local_section_id.clone()).visible());
-        assert!(window.find(("session-tree-root", 0usize)).visible());
-        assert!(window.find(("session-tree-root", 1usize)).visible());
+        assert!(window.find(("project-row", 0usize)).visible());
+        assert!(window.find(("project-row", 1usize)).visible());
     })
     .unwrap();
 }
@@ -189,7 +189,7 @@ fn sidebar_shows_the_worker_section_with_a_single_worker(cx: &mut TestAppContext
         window.render_frame(cx);
         let section = window.find(local_section_id.clone());
         assert!(section.visible());
-        let row = window.find(("session-tree-root", 0usize));
+        let row = window.find(("project-row", 0usize));
         assert!(row.visible());
         assert!(
             section.bounds().origin.y < row.bounds().origin.y,

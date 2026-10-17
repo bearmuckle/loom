@@ -269,6 +269,10 @@ impl Render for LoomView {
         self.schedule_project_poll(cx);
         let view = cx.entity();
         let layout = responsive_layout(window.bounds().size.width);
+        // The left pane's rows are derived from the sessions and project
+        // snapshots once per frame; the list itself only rebuilds when they
+        // change.
+        self.sync_project_list(layout, window, cx);
         let review_panel_visible = review_panel_is_visible(
             layout,
             self.review.open,

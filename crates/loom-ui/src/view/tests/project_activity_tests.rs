@@ -193,7 +193,7 @@ fn applying_a_project_snapshot_stops_the_project_row_activity(cx: &mut TestAppCo
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
         assert!(
-            window.try_find(("session-tree-activity", 0usize)).is_some(),
+            window.try_find(("project-activity", 0usize)).is_some(),
             "the project row should show activity while a child is executing"
         );
 
@@ -215,7 +215,7 @@ fn applying_a_project_snapshot_stops_the_project_row_activity(cx: &mut TestAppCo
 
         window.render_frame(cx);
         assert!(
-            window.try_find(("session-tree-activity", 0usize)).is_none(),
+            window.try_find(("project-activity", 0usize)).is_none(),
             "a project whose agents have finished must not keep animating"
         );
         // The child's row pill is fed by this state, so it reads as finished
@@ -286,7 +286,7 @@ fn applying_a_project_snapshot_keeps_activity_while_a_child_runs(cx: &mut TestAp
         assert_eq!(changed, 0, "the session list already matches the snapshot");
         window.render_frame(cx);
         assert!(
-            window.try_find(("session-tree-activity", 0usize)).is_some(),
+            window.try_find(("project-activity", 0usize)).is_some(),
             "a running descendant still shows activity"
         );
     })
