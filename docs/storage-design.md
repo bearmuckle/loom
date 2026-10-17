@@ -95,6 +95,21 @@ Reconnect notifications are disposable indexed feeds with per-session and per-wo
 
 Transcript, checkpoint, and edit/undo history have no automatic retention limit. Archived sessions remain available, and undo history is not silently capped. Any future retention policy must protect active rollback dependencies and make loss of rollback capability explicit.
 
+## Session build cache
+
+Agent commands and session terminals run with
+`CARGO_TARGET_DIR=<state>.build-cache/<session-id>`, so Cargo output lives
+outside the checkout under the instance directory instead of accumulating in
+each repository clone and project worktree. The cache is scoped per session (not
+per repository) so parallel agents build independently; a compiler cache such as
+sccache still deduplicates object compilation across them.
+
+The cache has no size budget. It is reclaimed by lifecycle instead: archiving a
+session removes its cache, deleting a session or project tree removes every
+descendant's cache, and a startup sweep removes caches whose session no longer
+exists or is archived, so a crash between the state change and the removal
+cannot leak build output. Source and uncommitted work never live in the cache.
+
 ## Session deletion
 
 Archived sessions remain in durable state until they are deleted. `Archived` is
@@ -122,7 +137,8 @@ A deletion removes physical state before it removes rows, in a fixed order:
    checkout.
 2. The deleted sessions' filesystem roots under
    `<session-root-base>/<workspace>/<session>/fs`.
-3. The database rows.
+3. The deleted sessions' build caches under `<state>.build-cache/<session>`.
+4. The database rows.
 
 Rows are deleted in an order that respects the `ON DELETE RESTRICT` edges:
 `project_agent_messages` and `delegated_task_dependencies` before

@@ -269,3 +269,87 @@ impl InProcessBackend {
         Ok(())
     }
 }
+
+impl InProcessBackend {
+    /// Root of the per-session build-output cache, absent for an in-memory
+    /// backend.
+    pub(crate) fn build_cache_root(&self) -> Option<PathBuf> {
+        self.build_cache_base.clone()
+    }
+
+    /// The Cargo target directory that belongs to one session.
+    pub(crate) fn build_cache_for_session(&self, session_id: AgentSessionId) -> Option<PathBuf> {
+        self.build_cache_base
+            .as_ref()
+            .map(|base| base.join(session_id.to_string()))
+    }
+
+    /// Removes a session's build cache. Best effort: build output is
+    /// reproducible, so a failure is logged instead of failing the caller.
+    pub(crate) fn remove_build_cache(&self, session_id: AgentSessionId) {
+        let Some(path) = self.build_cache_for_session(session_id) else {
+            return;
+        };
+        match fs::remove_dir_all(&path) {
+            Ok(()) => {
+                log::info!("[loom-server] removed the build cache of session {session_id}");
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => log::warn!(
+                "[loom-server] could not remove the build cache of session {session_id}: {error}"
+            ),
+        }
+    }
+
+    /// Removes caches left behind by sessions that no longer exist, and by
+    /// archived sessions (which no longer run), so a crash between the state
+    /// change and the cache removal cannot leak build output forever.
+    pub(crate) fn sweep_orphan_build_caches(&self) -> Result<()> {
+        let Some(base) = &self.build_cache_base else {
+            return Ok(());
+        };
+        let known = {
+            let sessions = self.sessions()?;
+            sessions
+                .list_in_workspace(None, true)
+                .into_iter()
+                .map(|session| (session.id.to_string(), session.state))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let entries = match fs::read_dir(base) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(LoomError::new(
+                    ErrorCode::Internal,
+                    format!("could not read the session build cache directory: {error}"),
+                    true,
+                ));
+            }
+        };
+        let mut removed = 0_usize;
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let remove = match known.get(&name) {
+                None => true,
+                Some(state) => *state == AgentSessionState::Archived,
+            };
+            if !remove {
+                continue;
+            }
+            match fs::remove_dir_all(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(error) => log::warn!(
+                    "[loom-server] could not remove orphaned session build cache '{}': {error}",
+                    entry.path().display()
+                ),
+            }
+        }
+        if removed > 0 {
+            log::info!("[loom-server] removed {removed} orphaned session build cache(s)");
+        }
+        Ok(())
+    }
+}

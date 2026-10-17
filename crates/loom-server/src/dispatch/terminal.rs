@@ -15,7 +15,20 @@ impl InProcessConnection {
             }) => {
                 let filesystem = self.session_filesystem(session_id)?;
                 let cwd = filesystem.directory_path(cwd.as_deref().unwrap_or("."))?;
-                let snapshot = self.backend.terminals.open(command, args, cwd)?;
+                let build_cache = self
+                    .backend
+                    .build_cache_for_session(session_id)
+                    .map(|path| {
+                        vec![(
+                            "CARGO_TARGET_DIR".to_owned(),
+                            path.to_string_lossy().into_owned(),
+                        )]
+                    })
+                    .unwrap_or_default();
+                let snapshot =
+                    self.backend
+                        .terminals
+                        .open_with_env(command, args, cwd, &build_cache)?;
                 self.backend
                     .session_terminals()?
                     .insert(snapshot.id, session_id);

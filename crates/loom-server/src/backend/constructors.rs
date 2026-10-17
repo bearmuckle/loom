@@ -224,6 +224,11 @@ impl InProcessBackend {
         // Repository mirrors cached on this node live next to the session roots
         // so they survive process restarts and can seed later session clones.
         let clone_cache_base = session_root_base.with_extension("clone-cache");
+        // Agent build output lives beside the instance state rather than inside
+        // the checkout, so archiving or deleting a session can reclaim it.
+        let build_cache_base = persistence
+            .as_ref()
+            .map(|persistence| persistence.path().with_extension("build-cache"));
         let mut supported_capabilities = vec![
             Capability::CreateAgentSession,
             Capability::ReadAgentSession,
@@ -300,6 +305,7 @@ impl InProcessBackend {
             persistence,
             run_executor: RunExecutor::with_defaults(),
             session_root_base,
+            build_cache_base,
             archive_retention: Mutex::new(loom_protocol::ArchiveRetentionPolicy::disabled()),
             archive_retention_stored: AtomicBool::new(false),
             idempotency_store: IdempotencyStore::new(),
@@ -323,6 +329,13 @@ impl InProcessBackend {
         // path, so a start that was given an explicit flag can tell that it
         // overrides a stored policy instead of the built-in default.
         backend.restore_archive_retention()?;
+        if let Some(build_cache) = backend.build_cache_root() {
+            log::info!(
+                "[loom-server] session build cache: {}",
+                build_cache.display()
+            );
+        }
+        backend.sweep_orphan_build_caches()?;
         Ok(backend)
     }
 }

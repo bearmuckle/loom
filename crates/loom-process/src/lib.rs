@@ -79,6 +79,18 @@ impl TerminalManager {
         args: Vec<String>,
         cwd: impl Into<PathBuf>,
     ) -> Result<TerminalSnapshot> {
+        self.open_with_env(command, args, cwd, &[])
+    }
+
+    /// Opens a terminal with extra environment variables, used to point build
+    /// output at the session's Loom-owned cache.
+    pub fn open_with_env(
+        &self,
+        command: impl Into<String>,
+        args: Vec<String>,
+        cwd: impl Into<PathBuf>,
+        env: &[(String, String)],
+    ) -> Result<TerminalSnapshot> {
         let command = command.into();
         if command.trim().is_empty() {
             return Err(LoomError::invalid_request(
@@ -114,6 +126,9 @@ impl TerminalManager {
         // installed program from a missing one.
         if let Some(path) = loom_core::child_path() {
             builder.env("PATH", path);
+        }
+        for (key, value) in env {
+            builder.env(key, value);
         }
         let child = pty.slave.spawn_command(builder).map_err(|error| {
             LoomError::new(

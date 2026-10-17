@@ -345,6 +345,9 @@ pub struct InProcessBackend {
     persistence: Option<Arc<dyn Persistence>>,
     run_executor: RunExecutor,
     session_root_base: PathBuf,
+    /// Per-instance root for session build output. Present for a durable
+    /// backend, absent for the in-memory one.
+    build_cache_base: Option<PathBuf>,
     /// Configured archive-retention policy; read through
     /// [`InProcessBackend::archive_retention`].
     archive_retention: Mutex<loom_protocol::ArchiveRetentionPolicy>,

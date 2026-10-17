@@ -395,6 +395,103 @@ fn archiving_a_session_repairs_a_streamed_messages_stale_ordinal() {
 }
 
 #[test]
+fn archiving_and_deleting_a_session_reclaim_its_build_cache() {
+    let persistence = std::env::temp_dir().join(format!(
+        "loom-build-cache-reclaim-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+    let workspace = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Build cache".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let session_id = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "build cache".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    let cache = backend
+        .build_cache_for_session(session_id)
+        .expect("a durable backend owns a build cache");
+    fs::create_dir_all(cache.join("debug")).unwrap();
+    fs::write(cache.join("debug/artifact"), b"build output").unwrap();
+
+    let archived = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::ArchiveAgentSession { session_id },
+    )));
+    assert!(
+        archived.result.is_ok(),
+        "archive failed: {:?}",
+        archived.result
+    );
+    assert!(
+        !cache.exists(),
+        "archiving must reclaim the session build cache"
+    );
+
+    fs::create_dir_all(cache.join("debug")).unwrap();
+    let deleted = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::DeleteAgentSession {
+            session_id,
+            force: false,
+        },
+    )));
+    assert!(
+        deleted.result.is_ok(),
+        "delete failed: {:?}",
+        deleted.result
+    );
+    assert!(
+        !cache.exists(),
+        "deleting must reclaim the session build cache"
+    );
+
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    let _ = fs::remove_file(&persistence);
+}
+
+#[test]
+fn startup_reclaims_orphaned_build_caches() {
+    let persistence = std::env::temp_dir().join(format!(
+        "loom-build-cache-orphan-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    let cache_root = persistence.with_extension("build-cache");
+    let orphan = cache_root.join(uuid::Uuid::new_v4().to_string());
+    fs::create_dir_all(orphan.join("debug")).unwrap();
+    fs::write(orphan.join("debug/artifact"), b"build output").unwrap();
+
+    let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+    assert!(
+        !orphan.exists(),
+        "startup must reclaim build caches of sessions that no longer exist"
+    );
+    backend.shutdown().unwrap();
+    drop(backend);
+    let _ = fs::remove_file(&persistence);
+}
+
+#[test]
 fn archiving_a_session_with_a_stale_active_state_recovers() {
     let persistence =
         std::env::temp_dir().join(format!("loom-stale-archive-{}.db", uuid::Uuid::new_v4()));

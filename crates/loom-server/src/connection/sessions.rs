@@ -230,6 +230,8 @@ impl InProcessConnection {
                     );
                 })?;
             self.backend.journal()?.append_session(record);
+            // An archived session no longer runs, so its build output can go.
+            self.backend.remove_build_cache(child_id);
         }
 
         let (snapshot, record) =
@@ -243,6 +245,7 @@ impl InProcessConnection {
                     );
                 })?;
         self.backend.journal()?.append_session(record);
+        self.backend.remove_build_cache(session_id);
         log::info!("[loom-server] archived session {session_id}");
         Ok(ServerResponse::Session(
             SessionResponse::AgentSessionArchived(snapshot),

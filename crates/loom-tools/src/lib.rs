@@ -458,6 +458,8 @@ pub struct ToolExecutor {
     github_write_enabled: bool,
     github_api_base: String,
     extension: Option<Arc<dyn ToolExtension>>,
+    /// Per-session Cargo target directory, when the server owns a build cache.
+    build_cache: Option<PathBuf>,
 }
 
 impl ToolExecutor {
@@ -477,7 +479,16 @@ impl ToolExecutor {
             github_write_enabled: false,
             github_api_base: DEFAULT_GITHUB_API_BASE.to_owned(),
             extension: None,
+            build_cache: None,
         }
+    }
+
+    /// Directs this session's Cargo build output to a Loom-owned cache
+    /// directory instead of the checkout, so the artifacts can be reclaimed
+    /// when the session is archived or deleted.
+    pub fn with_build_cache_root(mut self, root: Option<PathBuf>) -> Self {
+        self.build_cache = root.map(|root| root.join(self.workspace.session_id().to_string()));
+        self
     }
 
     pub fn with_web_search_provider(mut self, provider: Arc<dyn WebSearchProvider>) -> Self {
@@ -1067,6 +1078,11 @@ impl ToolExecutor {
         // inherited one already covers it.
         if let Some(path) = loom_core::child_path() {
             command.env("PATH", path);
+        }
+        // Build output belongs to the session cache, not the checkout, so
+        // archiving or deleting the session reclaims it.
+        if let Some(build_cache) = &self.build_cache {
+            command.env("CARGO_TARGET_DIR", build_cache);
         }
         // Run the command in its own process group so a timeout can terminate
         // the whole tree instead of only the direct child.
@@ -4221,6 +4237,35 @@ mod tests {
                 printed.output
             );
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_uses_the_session_build_cache() {
+        let root = workspace();
+        let cache_root = root.join("build-cache");
+        let session_id = AgentSessionId::new();
+        let workspace = Workspace::open(session_id, &root).unwrap();
+        let executor = ToolExecutor::new_with_workspace(workspace)
+            .with_build_cache_root(Some(cache_root.clone()));
+        let printed = executor.execute(&call(
+            "run_command",
+            serde_json::json!({
+                "command": "sh",
+                "args": ["-c", "printf '%s' \"$CARGO_TARGET_DIR\""]
+            }),
+        ));
+        assert!(printed.success, "{}", printed.output);
+        let expected = cache_root.join(session_id.to_string());
+        assert!(
+            printed
+                .output
+                .contains(&expected.to_string_lossy().to_string()),
+            "the command must build into '{}': {}",
+            expected.display(),
+            printed.output
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

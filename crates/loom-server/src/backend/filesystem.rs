@@ -491,6 +491,7 @@ impl InProcessBackend {
                     }
                 };
             let tools = ToolExecutor::new_with_workspace(workspace)
+                .with_build_cache_root(self.build_cache_root())
                 .with_github_token(self.providers.github_account_token().ok())
                 .with_github_write_access(self.providers.github_write_access());
             let tools = self.with_project_agent_tools(

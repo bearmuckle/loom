@@ -188,6 +188,11 @@ impl InProcessBackend {
                 }
             }
         }
+        // Build output is reproducible and belongs to a session that no longer
+        // exists, so reclaim it with the checkouts.
+        for id in &deleted_ids {
+            self.remove_build_cache(*id);
+        }
         // Drop every in-memory trace before the durable rows, so neither the
         // state save that follows this request nor a later request can observe
         // or re-insert a deleted session. The catalog accepts a removal in any
