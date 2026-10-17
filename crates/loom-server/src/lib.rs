@@ -83,6 +83,7 @@ mod connection;
 mod deployment;
 mod dispatch;
 mod event_journal;
+mod fail_stop;
 mod instance;
 mod project_tools;
 mod remote;
@@ -130,6 +131,7 @@ pub use deployment::{
     DEFAULT_DEPLOYMENT_ROLE, DEPLOYMENT_ROLE_ENV, DiagnosticsSettings, EGRESS_POLICY,
     ExecutionContext, ProcessAccount, ProcessContext, TlsState, diagnostics_lines, startup_summary,
 };
+pub use fail_stop::{ReopenBackoff, fail_stop_record_path, reopen_after_fail_stop};
 pub use instance::{
     Instance, InstanceLayout, InstanceOptions, ResolvedToken, STATE_DB_FILE, TOKEN_FILE,
     TokenSource,

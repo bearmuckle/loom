@@ -78,6 +78,9 @@ The instance directory holds:
 - The session filesystem roots under `state.session-roots`.
 - The cached clone mirrors under `state.clone-cache`.
 - The owner lock, `state.db.loom-owner.lock`.
+- The persistence fail-stop record, `state.db.fail-stop`, which only exists once
+  a durable state save failed; see [Persistence fail-stop and
+  reopen](#persistence-fail-stop-and-reopen).
 
 An explicit `--persistence` names the database path instead, and the credential
 file, session roots, clone cache, and owner lock are then derived from that
@@ -175,6 +178,37 @@ dirty or locked worktrees; without it, the sweep skips such a project, logs the
 reason, and retries later. The native desktop client runs the same sweep for the
 durable backend it embeds, so a retention policy set from the client acts even
 without a separate `loom-server` process.
+
+## Persistence fail-stop and reopen
+
+A durable state save can fail for a reason that clears on its own, most often a
+filesystem that filled up. The backend then latches a persistence fail-stop: it
+keeps the last committed state, refuses every durable request with a
+`persistence` error, and stops writing. The latch is deliberate. A
+request-scoped save can fail after the handler already changed in-memory state,
+so the backend must not keep serving from a state the database does not hold,
+and the latch does not clear itself.
+
+`/health` answers `503 persistence fail-stop` while the latch is set, and the
+standalone server also exits non-zero so a service manager reopens it from the
+last committed state: `Restart=on-failure` in the sample unit, or
+`--restart unless-stopped` under Docker. The reopened process resumes what was
+last written, so only the work of the failed save is lost, and runs resume from
+their last checkpoint.
+
+The exit is delayed, and the delay grows with the number of fail-stops recorded
+in `state.db.fail-stop` during the past hour: 30 seconds for the first, doubling
+up to a five minute cap. A failure that is still present therefore keeps
+retrying at a steady rate instead of restarting in a loop that trips the service
+manager's start limit and leaves the unit stopped. Recorded fail-stops expire on
+their own, so an instance that has been healthy for an hour reopens at the
+shortest delay again. A record that cannot be written at all - a full filesystem
+is a likely reason - falls back to that shortest delay, which still spaces the
+restarts out.
+
+The native shell's `--serve` mode is started by a person rather than by a
+supervisor, so it does not exit: it keeps refusing durable requests and reports
+`503` on `/health`.
 
 ## Network policy
 

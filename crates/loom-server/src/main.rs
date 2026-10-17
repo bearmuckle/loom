@@ -12,6 +12,7 @@ use std::{
     future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::Arc,
 };
 
@@ -20,10 +21,11 @@ use loom_protocol::ArchiveRetentionPolicy;
 use loom_server::{
     ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FORCE_DISCARD_ENV, ARCHIVE_RETENTION_SWEEP_INTERVAL,
     DEFAULT_MAX_FRAME_BYTES, DiagnosticsSettings, InProcessBackend, Instance, InstanceLayout,
-    InstanceOptions, MAX_FRAME_BYTES_ENV, ProcessContext, RemoteServerConfig, ServerTlsConfig,
-    ServingBackend, TlsState, apply_startup_archive_retention, diagnostics_lines, open_backend,
-    resolve_archive_retention, resolve_max_frame_bytes, run_archive_retention_sweeps,
-    start_remote_server, startup_summary, sweep_archive_retention_at_startup,
+    InstanceOptions, MAX_FRAME_BYTES_ENV, ProcessContext, RemoteServerConfig, ReopenBackoff,
+    ServerTlsConfig, ServingBackend, TlsState, apply_startup_archive_retention, diagnostics_lines,
+    fail_stop_record_path, open_backend, reopen_after_fail_stop, resolve_archive_retention,
+    resolve_max_frame_bytes, run_archive_retention_sweeps, start_remote_server, startup_summary,
+    sweep_archive_retention_at_startup,
 };
 
 /// The bind address used when `--bind` is not supplied.
@@ -473,15 +475,31 @@ async fn serve(
     options: ServerOptions,
     shutdown: impl Future<Output = Result<(), LoomError>>,
 ) -> Result<(), LoomError> {
-    serve_in(options, &loom_core::state_dir(), shutdown).await
+    serve_in(options, &loom_core::state_dir(), shutdown, fail_stop_reopen).await
+}
+
+/// The reopen of a fail-stopped backend, as [`serve_in`] takes it: it is built
+/// from the backend that is actually served, and it resolves only after the
+/// recorded wait so a still-present failure does not restart in a tight loop.
+type FailStopReopen = Pin<Box<dyn Future<Output = LoomError>>>;
+
+fn fail_stop_reopen(backend: Arc<InProcessBackend>, record: Option<PathBuf>) -> FailStopReopen {
+    Box::pin(reopen_after_fail_stop(
+        backend,
+        record,
+        ReopenBackoff::default(),
+    ))
 }
 
 /// [`serve`] with the state directory injected, so a test can drive the whole
-/// lifecycle without writing into the operator's real state directory.
+/// lifecycle without writing into the operator's real state directory, and with
+/// the fail-stop reopen injected, so a test can drive the exit path without
+/// latching a live backend.
 async fn serve_in(
     options: ServerOptions,
     state_directory: &Path,
     shutdown: impl Future<Output = Result<(), LoomError>>,
+    reopen: impl FnOnce(Arc<InProcessBackend>, Option<PathBuf>) -> FailStopReopen,
 ) -> Result<(), LoomError> {
     let instance = prepare_instance(&options, state_directory)?;
     let instance_options = options.instance_options()?;
@@ -503,11 +521,31 @@ async fn serve_in(
     let server = start(&options, Arc::clone(&backend), &instance).await?;
     let sweeps =
         run_archive_retention_sweeps(Arc::clone(&backend), ARCHIVE_RETENTION_SWEEP_INTERVAL);
+    // A latched persistence fail-stop never clears itself, and the process would
+    // otherwise keep refusing every durable request until an operator noticed.
+    // Exiting lets `Restart=on-failure` reopen the backend from its last
+    // committed state, and the recorded wait keeps a failure that is still
+    // present (a full filesystem) from restarting in a tight loop.
+    let reopen = reopen(
+        Arc::clone(&backend),
+        instance.state_db().map(fail_stop_record_path),
+    );
     tokio::select! {
         result = shutdown => result?,
         // The driver sweeps immediately and then on every interval until it is
         // dropped by the shutdown branch.
         () = sweeps => {}
+        fail_stop = reopen => {
+            // Release the database before exiting, so the reopened process can
+            // take exclusive ownership of it.
+            if let Err(error) = server.stop().await {
+                log::error!(
+                    "loom-server: could not stop cleanly after a persistence fail-stop: {}",
+                    error.message
+                );
+            }
+            return Err(fail_stop);
+        }
     }
     log::info!("Shutting down loom-server");
     server.stop().await
@@ -582,8 +620,9 @@ mod tests {
     };
 
     use super::{
-        ParsedArgs, ServerOptions, build_version, diagnostics_report_in, help_text, parse_args,
-        prepare_instance, resolve_tls, run, serve_in, start, version_label, version_text,
+        FailStopReopen, ParsedArgs, ServerOptions, build_version, diagnostics_report_in,
+        fail_stop_record_path, fail_stop_reopen, help_text, parse_args, prepare_instance,
+        resolve_tls, run, serve_in, start, version_label, version_text,
     };
     use loom_server::resolve_archive_retention;
 
@@ -621,6 +660,15 @@ mod tests {
     /// temp directory writes nothing into the operator's real state directory.
     fn instance(options: &ServerOptions) -> Instance {
         prepare_instance(options, &std::env::temp_dir()).unwrap()
+    }
+
+    /// A fail-stop reopen that never fires, for the tests that drive a server
+    /// that keeps serving.
+    fn never_reopen(
+        _backend: std::sync::Arc<InProcessBackend>,
+        _record: Option<PathBuf>,
+    ) -> FailStopReopen {
+        Box::pin(std::future::pending())
     }
 
     #[test]
@@ -1169,9 +1217,12 @@ mod tests {
     #[tokio::test]
     async fn serve_in_keeps_an_ephemeral_port_in_memory_and_generates_a_token() {
         let state = temporary_directory("ephemeral");
-        serve_in(serve_options(&["--bind", "127.0.0.1:0"]), &state, async {
-            Ok(())
-        })
+        serve_in(
+            serve_options(&["--bind", "127.0.0.1:0"]),
+            &state,
+            async { Ok(()) },
+            never_reopen,
+        )
         .await
         .unwrap();
         let token = std::fs::read_to_string(state.join("token")).unwrap();
@@ -1195,7 +1246,9 @@ mod tests {
             archive_retention: Some("1ms".to_owned()),
             ..ServerOptions::default()
         };
-        serve_in(options, &state, async { Ok(()) }).await.unwrap();
+        serve_in(options, &state, async { Ok(()) }, never_reopen)
+            .await
+            .unwrap();
 
         // The startup sweep ran before the listener accepted clients, so the
         // archived session is already gone from the durable database.
@@ -1442,7 +1495,9 @@ mod tests {
             token: Some("in-memory-token".to_owned()),
             ..ServerOptions::default()
         };
-        serve_in(options, &state, async { Ok(()) }).await.unwrap();
+        serve_in(options, &state, async { Ok(()) }, never_reopen)
+            .await
+            .unwrap();
         std::fs::remove_dir_all(&state).ok();
     }
 
@@ -1456,7 +1511,9 @@ mod tests {
             persistence: Some(path.clone()),
             ..ServerOptions::default()
         };
-        serve_in(options, &state, async { Ok(()) }).await.unwrap();
+        serve_in(options, &state, async { Ok(()) }, never_reopen)
+            .await
+            .unwrap();
         assert!(
             path.exists(),
             "the persistent backend should create {path:?}"
@@ -1464,6 +1521,70 @@ mod tests {
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("credentials.json")).ok();
         std::fs::remove_file(path.with_extension("session-roots")).ok();
+        std::fs::remove_dir_all(&state).ok();
+    }
+
+    #[tokio::test]
+    async fn the_production_reopen_watches_a_serving_backend_without_firing() {
+        let backend = InProcessBackend::new();
+        let record = temporary_path("reopen-watch");
+
+        let reopened = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            fail_stop_reopen(backend, Some(record.clone())),
+        )
+        .await;
+
+        assert!(reopened.is_err(), "a serving backend must not be reopened");
+        assert!(
+            !record.exists(),
+            "a serving backend records no fail-stop beside its database"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_exits_a_fail_stopped_backend_after_releasing_its_database() {
+        let state = temporary_directory("fail-stop-exit");
+        let database = temporary_path("fail-stop-exit.db");
+        let options = ServerOptions {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            token: Some("fail-stop-token".to_owned()),
+            persistence: Some(database.clone()),
+            ..ServerOptions::default()
+        };
+
+        let error = serve_in(
+            options,
+            &state,
+            // A latched fail-stop wins over a process that is asked to keep
+            // running, which is what the supervisor stands in for here.
+            std::future::pending::<Result<(), loom_core::LoomError>>(),
+            |_, record| {
+                assert_eq!(
+                    record,
+                    Some(fail_stop_record_path(&database)),
+                    "the fail-stop is recorded beside the state database it failed to save"
+                );
+                Box::pin(async {
+                    loom_core::LoomError::new(
+                        loom_core::ErrorCode::Persistence,
+                        "test persistence fail-stop",
+                        true,
+                    )
+                })
+            },
+        )
+        .await
+        .expect_err("a fail-stopped server must report the failure as a process exit");
+
+        assert_eq!(error.code, loom_core::ErrorCode::Persistence);
+        // The database was released before the exit, so the reopened process can
+        // take exclusive ownership of it.
+        let reopened = InProcessBackend::new_persistent(&database)
+            .expect("a fail-stopped server must release the database before exiting");
+        reopened.shutdown().unwrap();
+        std::fs::remove_file(&database).ok();
+        std::fs::remove_file(database.with_extension("credentials.json")).ok();
         std::fs::remove_dir_all(&state).ok();
     }
 

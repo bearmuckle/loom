@@ -11,8 +11,7 @@
 #   sudo useradd --system --home-dir /var/lib/loom --create-home \
 #     --shell /usr/sbin/nologin loom
 #
-# `ExecStart` needs no hand-made token file. With `LOOM_STATE_DIR=/var/lib/loom`
-# the server keeps its instance directory at `/var/lib/loom/loom/loom-server`
+# `ExecStart` needs no hand-made token file. With `LOOM_STATE_DIR=/var/lib/loom`# the server keeps its instance directory at `/var/lib/loom/loom/loom-server`
 # and generates a `loom-<uuid>` bearer token at
 # `/var/lib/loom/loom/loom-server/token` on first start, written with mode 0600
 # and reused on every later start. The path is always logged and the value is
@@ -30,6 +29,14 @@
 # `--allow-insecure-remote` opts in to sending the token and all traffic in the
 # clear. The TLS key must be readable by the `loom` user, so give it that
 # ownership rather than leaving it root-only.
+#
+# `Restart=on-failure` is also how the backend recovers from a latched
+# persistence fail-stop: when a durable state save fails, typically because the
+# filesystem filled up, the process exits so this unit reopens it from its last
+# committed state. The backend delays that exit, and the delay grows with the
+# fail-stops recorded in `state.db.fail-stop` during the past hour, so a
+# filesystem that is still full does not restart in a loop that trips systemd's
+# start limit and leaves the unit stopped.
 [Unit]
 Description=Loom standalone backend
 Documentation=https://github.com/bearmuckle/loom
