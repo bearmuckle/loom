@@ -13,7 +13,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use loom_core::{AgentSessionId, LoomError, Result};
+use loom_core::{AgentSessionId, ErrorCode, LoomError, Result};
 use loom_protocol::ArchiveRetentionPolicy;
 
 use crate::InProcessBackend;
@@ -234,6 +234,10 @@ pub fn sweep_archive_retention_at_startup(backend: &InProcessBackend) {
 /// unreachable database cannot stop retention or abort the server. Each round
 /// reads the policy again, so a policy changed through the protocol applies from
 /// the next round: a change does not start a sweep of its own.
+///
+/// The sweep is synchronous SQLite work, so each round runs on a blocking
+/// thread: run inline it would stall the runtime worker that also polls the
+/// shutdown signal and the remote listener.
 pub async fn run_archive_retention_sweeps(backend: Arc<InProcessBackend>, interval: Duration) {
     run_periodic_sweeps(interval, move || backend.sweep_archive_retention()).await;
 }
@@ -283,11 +287,11 @@ impl ArchiveRetentionSweepDriver {
                         return;
                     }
                 };
-                runtime.block_on(run_periodic_sweeps_until(
-                    interval,
-                    stop_rx,
-                    move || sweep_backend.sweep_archive_retention(),
-                ));
+                // This runtime is private to the thread, so the sweep may run
+                // inline on it.
+                runtime.block_on(run_periodic_sweeps_until(interval, stop_rx, move || {
+                    std::future::ready(sweep_backend.sweep_archive_retention())
+                }));
             })
             .map_err(|error| {
                 log::warn!(
@@ -318,22 +322,39 @@ impl Drop for ArchiveRetentionSweepDriver {
 /// the periodic driver without a server.
 pub(crate) async fn run_periodic_sweeps(
     interval: Duration,
-    sweep: impl FnMut() -> Result<ArchiveSweepReport>,
+    sweep: impl Fn() -> Result<ArchiveSweepReport> + Send + Sync + 'static,
 ) {
     // No stop channel: the caller drops the future to stop the driver. The
     // sender is kept alive for the loop's lifetime so the receiver never sees
     // the channel close.
     let (_stop, stop_rx) = tokio::sync::watch::channel(false);
-    run_periodic_sweeps_until(interval, stop_rx, sweep).await;
+    let sweep = Arc::new(sweep);
+    run_periodic_sweeps_until(interval, stop_rx, move || {
+        let sweep = Arc::clone(&sweep);
+        async move {
+            tokio::task::spawn_blocking(move || sweep())
+                .await
+                .unwrap_or_else(|error| {
+                    Err(LoomError::new(
+                        ErrorCode::Internal,
+                        format!("archive retention sweep worker failed: {error}"),
+                        true,
+                    ))
+                })
+        }
+    })
+    .await;
 }
 
 /// [`run_periodic_sweeps`] with a stop channel, so a background driver can end
 /// its loop and join its thread instead of being dropped.
-async fn run_periodic_sweeps_until(
+async fn run_periodic_sweeps_until<F>(
     interval: Duration,
     mut stop: tokio::sync::watch::Receiver<bool>,
-    mut sweep: impl FnMut() -> Result<ArchiveSweepReport>,
-) {
+    mut sweep: impl FnMut() -> F,
+) where
+    F: std::future::Future<Output = Result<ArchiveSweepReport>>,
+{
     // `tokio::time::interval` panics on a zero period, and the sweep must never
     // take the server down, so a caller-supplied zero becomes the smallest
     // useful period instead.
@@ -351,7 +372,7 @@ async fn run_periodic_sweeps_until(
             _ = ticker.tick() => {}
         }
         log::debug!("[loom-server] archive retention sweep round started");
-        match sweep() {
+        match sweep().await {
             Ok(report) if report.is_empty() => log::debug!(
                 "[loom-server] archive retention sweep round had no candidate to act on"
             ),

@@ -1051,6 +1051,49 @@ async fn the_periodic_helper_sweeps_immediately_and_stops_when_dropped() {
     assert_eq!(sweeps.load(Ordering::SeqCst), stopped);
 }
 
+/// A slow, blocking sweep must run off the runtime worker, so a single-threaded
+/// runtime keeps polling other tasks (the shutdown signal, the listener).
+#[tokio::test(flavor = "current_thread")]
+async fn the_periodic_helper_does_not_block_the_runtime_during_a_sweep() {
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let finished = Arc::new(AtomicUsize::new(0));
+    let sweep_finished = Arc::clone(&finished);
+    let task = tokio::spawn(run_periodic_sweeps(Duration::from_secs(60), move || {
+        let _ = started_tx.send(());
+        let _ = release_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2));
+        sweep_finished.fetch_add(1, Ordering::SeqCst);
+        Ok(ArchiveSweepReport::default())
+    }));
+    // Wait for the sweep to start without blocking this runtime thread.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while started_rx.try_recv().is_err() {
+        assert!(Instant::now() < deadline, "the sweep should start");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    // This task runs while the sweep is still blocked; an inline sweep would
+    // hold the only worker until it finished.
+    assert_eq!(
+        finished.load(Ordering::SeqCst),
+        0,
+        "the runtime was blocked by the sweep"
+    );
+    // While the sweep blocks, another task on this runtime still progresses.
+    let other = tokio::spawn(async { 7 });
+    let value = tokio::time::timeout(Duration::from_secs(2), other)
+        .await
+        .expect("the runtime must not be blocked by the sweep")
+        .unwrap();
+    assert_eq!(value, 7);
+    release_tx.send(()).unwrap();
+    task.abort();
+    let _ = task.await;
+}
+
 #[test]
 fn the_background_sweep_driver_deletes_an_expired_session_and_stops_on_drop() {
     let (temp, _database, backend) = persistent_backend("driver");
