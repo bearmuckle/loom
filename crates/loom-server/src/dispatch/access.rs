@@ -79,6 +79,67 @@ impl InProcessConnection {
                     participant_id,
                 }
             }
+            AccessRequest::ListProviderCredentials => AccessResponse::ProviderCredentials {
+                // A person sees only their own credentials; an operator sees
+                // every credential on the worker.
+                credentials: self
+                    .backend
+                    .provider_credentials
+                    .list(self.participant().map(|participant| participant.id)),
+            },
+            AccessRequest::SelectSessionCredential {
+                session_id,
+                credential_id,
+            } => {
+                self.backend.sessions()?.get(session_id)?;
+                let selection = self.backend.provider_credentials.select(
+                    self.backend.providers.instance_credentials()?.as_ref(),
+                    session_id,
+                    credential_id,
+                    self.participant().map(|participant| participant.id),
+                )?;
+                log::info!(
+                    "[loom-server] session {session_id} selected provider credential \
+                     {credential_id} for later runs"
+                );
+                let credential = self.backend.provider_credentials.get(credential_id);
+                AccessResponse::SessionCredential {
+                    session_id,
+                    selection: Some(selection),
+                    credential,
+                }
+            }
+            AccessRequest::GetSessionCredential { session_id } => {
+                self.backend.sessions()?.get(session_id)?;
+                let (selection, credential) = self
+                    .backend
+                    .provider_credentials
+                    .selection(session_id)
+                    .map_or((None, None), |(selection, credential)| {
+                        (Some(selection), credential)
+                    });
+                AccessResponse::SessionCredential {
+                    session_id,
+                    selection,
+                    credential,
+                }
+            }
+            AccessRequest::GetRunCredential { run_id } => {
+                self.run_summary(run_id)?;
+                AccessResponse::RunCredential {
+                    run_id,
+                    pin: self.backend.provider_credentials.run_pin(run_id),
+                }
+            }
+            AccessRequest::RevokeProviderCredential { credential_id } => {
+                self.backend.provider_credentials.revoke(
+                    self.backend.providers.instance_credentials()?.as_ref(),
+                    credential_id,
+                    self.participant().map(|participant| participant.id),
+                )?;
+                log::info!("[loom-server] revoked provider credential {credential_id}");
+                AccessResponse::ProviderCredentialRevoked { credential_id }
+            }
         };
         Ok(ServerResponse::Access(response))
     }

@@ -305,6 +305,7 @@ impl InProcessBackend {
             supported_capabilities: CapabilitySet::new(supported_capabilities),
             providers,
             credentials: CredentialService::new(),
+            provider_credentials: Arc::new(ProviderCredentialService::default()),
             persistence,
             run_executor: RunExecutor::with_defaults(),
             session_root_base,
@@ -346,6 +347,9 @@ impl InProcessBackend {
             let (participants, grants) = persistence.load_session_access()?;
             backend.access.restore(participants, grants);
         }
+        backend
+            .provider_credentials
+            .restore(backend.providers.instance_credentials()?.as_ref())?;
         backend.restore_persisted()?;
         // The stored retention policy is loaded here rather than in the restore
         // path, so a start that was given an explicit flag can tell that it

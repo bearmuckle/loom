@@ -22,9 +22,10 @@ impl InProcessConnection {
                     reuse_local,
                 )?),
             )),
-            ClientRequest::Repository(RepositoryRequest::SearchGitHubRepositories { query }) => {
-                self.search_github_repositories(&query)
-            }
+            ClientRequest::Repository(RepositoryRequest::SearchGitHubRepositories {
+                query,
+                ..
+            }) => self.search_github_repositories(&query),
             ClientRequest::Repository(RepositoryRequest::ListClonedRepositories) => {
                 self.list_cloned_repositories()
             }

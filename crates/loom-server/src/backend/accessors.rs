@@ -53,6 +53,105 @@ impl InProcessBackend {
         self.providers.create_provider_at(model, cursor)
     }
 
+    /// The credential pin a new run of `session_id` with `model` gets, and
+    /// the provider authenticated with it.
+    ///
+    /// A session with a selected credential pins that credential's latest
+    /// version. A selected credential that is missing, revoked, or for a
+    /// different provider is an authentication error; it never falls back to
+    /// another account. A session without a selection uses the worker-wide
+    /// provider configuration.
+    pub(crate) fn provider_for_new_run(
+        &self,
+        session_id: AgentSessionId,
+        model: &ModelId,
+    ) -> Result<(loom_core::RunCredentialPin, Box<dyn ModelProvider>)> {
+        let provider_id = self.providers.provider_id_for_model(model)?;
+        let Some((selection, credential)) = self.provider_credentials.selection(session_id) else {
+            let pin = loom_core::RunCredentialPin {
+                credential_id: None,
+                version: None,
+                provider: provider_id.as_str().to_owned(),
+                model: model.as_str().to_owned(),
+                owner: None,
+                owner_label: "worker".to_owned(),
+            };
+            return Ok((pin, self.provider(model)?));
+        };
+        let credential = credential.ok_or_else(|| {
+            services::provider_credentials::credential_error(format!(
+                "the session's selected credential {} no longer exists",
+                selection.credential_id
+            ))
+        })?;
+        if credential.provider != provider_id.as_str() {
+            return Err(services::provider_credentials::credential_error(format!(
+                "the session's selected credential is for provider '{}', not '{}'",
+                credential.provider,
+                provider_id.as_str()
+            )));
+        }
+        let pin = loom_core::RunCredentialPin {
+            credential_id: Some(credential.id),
+            version: Some(credential.version),
+            provider: credential.provider.clone(),
+            model: model.as_str().to_owned(),
+            owner: credential.owner,
+            owner_label: credential.owner_label.clone(),
+        };
+        let provider = self.pinned_provider(&pin, model, 0)?;
+        Ok((pin, provider))
+    }
+
+    /// The provider for a run, authenticated with the credential version the
+    /// run pinned. Runs without a pinned credential use the worker-wide
+    /// provider configuration.
+    pub(crate) fn provider_for_run(
+        &self,
+        run_id: loom_core::RunId,
+        model: &ModelId,
+        cursor: usize,
+    ) -> Result<Box<dyn ModelProvider>> {
+        match self.provider_credentials.run_pin(run_id) {
+            Some(pin) if pin.credential_id.is_some() => self.pinned_provider(&pin, model, cursor),
+            _ => self.provider_at(model, cursor),
+        }
+    }
+
+    fn pinned_provider(
+        &self,
+        pin: &loom_core::RunCredentialPin,
+        model: &ModelId,
+        cursor: usize,
+    ) -> Result<Box<dyn ModelProvider>> {
+        let (Some(credential_id), Some(version)) = (pin.credential_id, pin.version) else {
+            return self.provider_at(model, cursor);
+        };
+        let secret = self.provider_credentials.resolve_secret(
+            self.providers.instance_credentials()?.as_ref(),
+            credential_id,
+            version,
+        )?;
+        let inner = self
+            .providers
+            .create_provider_with_secret(model, cursor, Some(secret))?;
+        Ok(Box::new(PinnedCredentialProvider {
+            inner,
+            credentials: Arc::clone(&self.provider_credentials),
+            credential_id,
+        }))
+    }
+
+    /// Records the pin of a run that just started.
+    pub(crate) fn pin_run_credential(
+        &self,
+        run_id: loom_core::RunId,
+        pin: loom_core::RunCredentialPin,
+    ) -> Result<()> {
+        self.provider_credentials
+            .pin(self.providers.instance_credentials()?.as_ref(), run_id, pin)
+    }
+
     pub(crate) fn sessions(&self) -> Result<MutexGuard<'_, SessionManager>> {
         self.session_service.sessions()
     }

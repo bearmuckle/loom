@@ -11,3 +11,4 @@ pub(crate) mod admission;
 pub(crate) mod collaboration;
 pub(crate) mod credential;
 pub(crate) mod idempotency;
+pub(crate) mod provider_credentials;

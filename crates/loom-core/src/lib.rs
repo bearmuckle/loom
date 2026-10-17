@@ -2,6 +2,7 @@ mod capability;
 mod collaboration;
 mod command_env;
 mod context;
+mod credential;
 mod error;
 mod filesystem;
 mod id;
@@ -30,6 +31,7 @@ pub use context::{
     ContextAssemblyOptions, ContextBudget, ContextInspection, ContextItem, ContextItemKind,
     ContextSummary,
 };
+pub use credential::{ProviderCredentialMetadata, RunCredentialPin, SessionCredentialSelection};
 pub use error::{ErrorCode, LoomError, Result};
 pub use filesystem::{
     Checkpoint, CheckpointFile, ClonedRepository, ContextFileKind, ContextFileReference,
@@ -40,9 +42,9 @@ pub use filesystem::{
     WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind,
 };
 pub use id::{
-    ActivityId, AgentMessageId, AgentSessionId, CheckpointId, EventSequence, InteractionId,
-    ParticipantId, ProjectId, ProjectManagerWaitId, RepositoryId, RequestId, RunAttemptId, RunId,
-    StepId, TaskId, TerminalId, ToolCallId, WorkspaceId,
+    ActivityId, AgentMessageId, AgentSessionId, CheckpointId, CredentialId, EventSequence,
+    InteractionId, ParticipantId, ProjectId, ProjectManagerWaitId, RepositoryId, RequestId,
+    RunAttemptId, RunId, StepId, TaskId, TerminalId, ToolCallId, WorkspaceId,
 };
 pub use limits::{LimitKind, LimitStatus, SessionLimits, UsageSnapshot};
 pub use participant::{

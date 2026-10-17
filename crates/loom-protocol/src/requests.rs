@@ -89,6 +89,11 @@ pub enum RepositoryRequest {
     /// filters them locally.
     SearchGitHubRepositories {
         query: String,
+        /// Session the search is for. A connection bound to a person must name
+        /// a session it owns: only a session owner may browse with the
+        /// worker's GitHub credential. Operator connections may omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<AgentSessionId>,
     },
 
     /// List repositories already cloned and cached on this worker node.
@@ -647,4 +652,28 @@ pub enum AccessRequest {
         session_id: AgentSessionId,
         participant_id: ParticipantId,
     },
+
+    /// Provider credentials the caller may select: their own, plus the
+    /// worker-wide default. Metadata only; secrets never leave the worker.
+    ListProviderCredentials,
+
+    /// Selects the provider credential later runs of the session use. Owner
+    /// only, and only a credential the owner holds (or the worker default).
+    /// A run that already started keeps the credential it pinned.
+    SelectSessionCredential {
+        session_id: AgentSessionId,
+        credential_id: CredentialId,
+    },
+
+    /// The session's selected credential, so clients can show whose account
+    /// a run will use before it starts.
+    GetSessionCredential { session_id: AgentSessionId },
+
+    /// The credential and model a run pinned when it started.
+    GetRunCredential { run_id: RunId },
+
+    /// Revokes one of the caller's own credentials, in every version. Runs
+    /// pinned to it fail their next provider call with an authentication
+    /// error instead of switching to another account.
+    RevokeProviderCredential { credential_id: CredentialId },
 }

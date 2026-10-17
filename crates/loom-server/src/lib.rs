@@ -108,6 +108,7 @@ use services::idempotency::{
     IDEMPOTENCY_RETENTION, LEGACY_IDEMPOTENCY_RETENTION, trim_idempotency_cache,
 };
 use services::idempotency::{IdempotencyRecord, IdempotencyStore};
+use services::provider_credentials::{PinnedCredentialProvider, ProviderCredentialService};
 
 const FEED_PRUNE_AFTER_NEW_SEQUENCES: u64 = 64;
 const FEED_PRUNE_AFTER_NEW_BYTES: usize = 4 * 1024 * 1024;
@@ -350,6 +351,9 @@ pub struct InProcessBackend {
     supported_capabilities: CapabilitySet,
     providers: ProviderRegistry,
     credentials: CredentialService,
+    /// Participant-owned provider credentials, session selections, and run
+    /// pins. Secrets stay in the backend's private credential store.
+    provider_credentials: Arc<ProviderCredentialService>,
     persistence: Option<Arc<dyn Persistence>>,
     run_executor: RunExecutor,
     session_root_base: PathBuf,

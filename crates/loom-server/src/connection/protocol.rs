@@ -331,12 +331,14 @@ impl InProcessConnection {
 
         let now = Instant::now();
         let login_id = uuid::Uuid::new_v4().to_string();
-        self.backend.credentials.begin_pending(
+        let initiator = self.participant().cloned();
+        self.backend.credentials.begin_pending_for(
             login_id.clone(),
             now,
             COMPLETED_LOGIN_RETENTION,
             MAX_PENDING_LOGINS,
             now + Duration::from_secs(3600),
+            initiator.as_ref().map(|participant| participant.id),
         )?;
         let device = match kind.authenticator().begin() {
             Ok(device) => device,
@@ -360,11 +362,29 @@ impl InProcessConnection {
                     .authenticator()
                     .poll(&device_for_poll)
                     .and_then(|token| {
-                        match kind {
-                            GitHubLoginKind::Copilot => {
+                        match (kind, &initiator) {
+                            // A person's sign-in adds a version of their own
+                            // credential; it never replaces the worker-wide
+                            // credential or one an active run pinned.
+                            (GitHubLoginKind::Copilot, Some(participant)) => {
+                                let credential = backend.provider_credentials.sign_in(
+                                    backend.providers.instance_credentials()?.as_ref(),
+                                    loom_providers::GITHUB_COPILOT_PROVIDER_ID,
+                                    participant,
+                                    token,
+                                )?;
+                                log::info!(
+                                    "[loom-server] participant {} signed in to GitHub Copilot; \
+                                     credential {} is now version {}",
+                                    participant.id,
+                                    credential.id,
+                                    credential.version
+                                );
+                            }
+                            (GitHubLoginKind::Copilot, None) => {
                                 backend.providers.configure_github_copilot(token)?;
                             }
-                            GitHubLoginKind::Repository => {
+                            (GitHubLoginKind::Repository, _) => {
                                 backend.providers.configure_github_repository(token)?;
                             }
                         }
@@ -417,7 +437,11 @@ impl InProcessConnection {
         kind: GitHubLoginKind,
         login_id: &str,
     ) -> Result<ServerResponse> {
-        let status = self.backend.credentials.status(login_id, Instant::now())?;
+        let status = self.backend.credentials.status_for(
+            login_id,
+            Instant::now(),
+            self.participant().map(|participant| participant.id),
+        )?;
         Ok(ServerResponse::Provider(match kind {
             GitHubLoginKind::Copilot => ProviderResponse::GitHubCopilotLoginStatus { status },
             GitHubLoginKind::Repository => ProviderResponse::GitHubRepositoryLoginStatus { status },
@@ -867,7 +891,10 @@ impl InProcessConnection {
             | ClientRequest::Provider(ProviderRequest::ListModels)
             | ClientRequest::Control(ControlRequest::GetWorkerNodeStatus)
             | ClientRequest::Provider(ProviderRequest::ListProviders)
-            | ClientRequest::Repository(RepositoryRequest::SearchGitHubRepositories { .. })
+            | ClientRequest::Repository(RepositoryRequest::SearchGitHubRepositories {
+                session_id: None,
+                ..
+            })
             | ClientRequest::Repository(RepositoryRequest::ListClonedRepositories)
             | ClientRequest::Provider(ProviderRequest::StartGitHubCopilotLogin)
             | ClientRequest::Provider(ProviderRequest::GetGitHubCopilotLoginStatus { .. })
@@ -882,7 +909,25 @@ impl InProcessConnection {
             | ClientRequest::Provider(ProviderRequest::ConfigureApiKeyProvider { .. })
             | ClientRequest::Provider(ProviderRequest::ConfigureGitHubRepository { .. }) => {}
             ClientRequest::Access(loom_protocol::AccessRequest::GetCurrentParticipant)
-            | ClientRequest::Access(loom_protocol::AccessRequest::ListParticipants) => {}
+            | ClientRequest::Access(loom_protocol::AccessRequest::ListParticipants)
+            | ClientRequest::Access(loom_protocol::AccessRequest::ListProviderCredentials)
+            | ClientRequest::Access(loom_protocol::AccessRequest::RevokeProviderCredential {
+                ..
+            }) => {}
+            ClientRequest::Access(loom_protocol::AccessRequest::GetRunCredential {
+                run_id: requested_run,
+            }) => run_id = Some(*requested_run),
+            ClientRequest::Access(loom_protocol::AccessRequest::SelectSessionCredential {
+                session_id: requested_session,
+                ..
+            })
+            | ClientRequest::Repository(RepositoryRequest::SearchGitHubRepositories {
+                session_id: Some(requested_session),
+                ..
+            })
+            | ClientRequest::Access(loom_protocol::AccessRequest::GetSessionCredential {
+                session_id: requested_session,
+            }) => session_id = Some(*requested_session),
             ClientRequest::Access(loom_protocol::AccessRequest::GetSessionRoster {
                 session_id: requested_session,
             })
@@ -1022,6 +1067,27 @@ impl InProcessConnection {
         let Some(participant) = self.participant() else {
             return Ok(());
         };
+        if Self::is_worker_credential_admin(request) {
+            return Err(LoomError::new(
+                ErrorCode::AuthorizationDenied,
+                "worker provider configuration and credentials are managed by the worker \
+                 administrator, not by participant connections",
+                false,
+            ));
+        }
+        if matches!(
+            request,
+            ClientRequest::Repository(RepositoryRequest::SearchGitHubRepositories {
+                session_id: None,
+                ..
+            }) | ClientRequest::Repository(RepositoryRequest::ListClonedRepositories)
+        ) {
+            return Err(LoomError::new(
+                ErrorCode::AuthorizationDenied,
+                "browsing GitHub repositories needs a session you own",
+                false,
+            ));
+        }
         let Some(required) = request.required_session_role() else {
             return Ok(());
         };
@@ -1055,6 +1121,28 @@ impl InProcessConnection {
             )),
             Some(_) => Ok(()),
         }
+    }
+
+    /// Requests that read or change the worker-wide provider configuration or
+    /// its shared credentials. A connection bound to a person may not make
+    /// them; only an operator (administrator) connection may.
+    ///
+    /// `StartGitHubCopilotLogin` is not among them: a person's sign-in creates
+    /// a new version of that person's own credential instead of replacing the
+    /// worker-wide one.
+    fn is_worker_credential_admin(request: &ClientRequest) -> bool {
+        matches!(
+            request,
+            ClientRequest::Provider(
+                ProviderRequest::ConfigureGitHubCopilot { .. }
+                    | ProviderRequest::ConfigureApiKeyProvider { .. }
+                    | ProviderRequest::ConfigureGitHubRepository { .. }
+                    | ProviderRequest::StartGitHubRepositoryLogin
+                    | ProviderRequest::GetGitHubRepositoryLoginStatus { .. }
+                    | ProviderRequest::ConfigureGitHubWriteAccess { .. }
+                    | ProviderRequest::DiscoverProviderModels { .. }
+            )
+        )
     }
 
     /// A person's effective role in a session.

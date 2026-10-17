@@ -502,4 +502,26 @@ pub enum AccessResponse {
         session_id: AgentSessionId,
         participant_id: ParticipantId,
     },
+
+    ProviderCredentials {
+        credentials: Vec<ProviderCredentialMetadata>,
+    },
+
+    /// The session's selected credential; both fields are `None` when the
+    /// session uses the worker default.
+    SessionCredential {
+        session_id: AgentSessionId,
+        selection: Option<SessionCredentialSelection>,
+        credential: Option<ProviderCredentialMetadata>,
+    },
+
+    /// `pin` is `None` for a run started before credential pinning existed.
+    RunCredential {
+        run_id: RunId,
+        pin: Option<RunCredentialPin>,
+    },
+
+    ProviderCredentialRevoked {
+        credential_id: CredentialId,
+    },
 }

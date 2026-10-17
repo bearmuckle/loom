@@ -28,11 +28,12 @@ pub use loom_core::{
     WorkspaceRecord,
 };
 pub use loom_core::{
-    GitBranch, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,
-    GitFileStatusKind, GitRepositoryStatus,
+    CredentialId, ParticipantId, ParticipantIdentity, PresenceStatus, ProviderCredentialMetadata,
+    RosterEntry, RunCredentialPin, SessionCredentialSelection, SessionGrant, SessionRole,
 };
 pub use loom_core::{
-    ParticipantId, ParticipantIdentity, PresenceStatus, RosterEntry, SessionGrant, SessionRole,
+    GitBranch, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,
+    GitFileStatusKind, GitRepositoryStatus,
 };
 pub use loom_model::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, AgentEvent,
@@ -566,6 +567,15 @@ impl ClientRequest {
             Self::Collaboration(CollaborationRequest::GetRunRevision { .. }) => {
                 Some(Capability::ReadAgentRun)
             }
+            Self::Access(AccessRequest::ListProviderCredentials)
+            | Self::Access(AccessRequest::GetSessionCredential { .. })
+            | Self::Access(AccessRequest::GetRunCredential { .. })
+            | Self::Access(AccessRequest::RevokeProviderCredential { .. }) => {
+                Some(Capability::ListProviders)
+            }
+            Self::Access(AccessRequest::SelectSessionCredential { .. }) => {
+                Some(Capability::ControlAgentSession)
+            }
         }
     }
 
@@ -583,10 +593,15 @@ impl ClientRequest {
             Self::Control(_)
             | Self::Provider(_)
             | Self::Workspace(_)
-            | Self::Repository(RepositoryRequest::SearchGitHubRepositories { .. })
+            | Self::Repository(RepositoryRequest::SearchGitHubRepositories {
+                session_id: None,
+                ..
+            })
             | Self::Repository(RepositoryRequest::ListClonedRepositories)
             | Self::Access(AccessRequest::GetCurrentParticipant)
-            | Self::Access(AccessRequest::ListParticipants) => None,
+            | Self::Access(AccessRequest::ListParticipants)
+            | Self::Access(AccessRequest::ListProviderCredentials)
+            | Self::Access(AccessRequest::RevokeProviderCredential { .. }) => None,
             Self::Events(EventsRequest::GetSessionEvents { session_id, .. }) => {
                 if session_id.is_some() {
                     Some(Observer)
@@ -627,6 +642,8 @@ impl ClientRequest {
             | Self::Project(ProjectRequest::ListProjectAgentMessages { .. })
             | Self::Project(ProjectRequest::GetProjectChildReview { .. })
             | Self::Collaboration(CollaborationRequest::GetRunRevision { .. })
+            | Self::Access(AccessRequest::GetSessionCredential { .. })
+            | Self::Access(AccessRequest::GetRunCredential { .. })
             | Self::Access(AccessRequest::GetSessionRoster { .. }) => Some(Observer),
             Self::Run(RunRequest::StartSessionAgentRun { .. })
             | Self::Run(RunRequest::StartSessionAgentRunWithOptions { .. })
@@ -670,6 +687,11 @@ impl ClientRequest {
             | Self::Filesystem(FilesystemRequest::DetachSessionDirectory { .. })
             | Self::Access(AccessRequest::GrantSessionAccess { .. })
             | Self::Access(AccessRequest::SetSessionRole { .. })
+            | Self::Access(AccessRequest::SelectSessionCredential { .. })
+            | Self::Repository(RepositoryRequest::SearchGitHubRepositories {
+                session_id: Some(_),
+                ..
+            })
             | Self::Access(AccessRequest::RevokeSessionAccess { .. }) => Some(Owner),
         }
     }
@@ -756,11 +778,18 @@ impl ClientRequest {
             | Self::Access(AccessRequest::GetSessionRoster { session_id })
             | Self::Access(AccessRequest::GrantSessionAccess { session_id, .. })
             | Self::Access(AccessRequest::SetSessionRole { session_id, .. })
+            | Self::Access(AccessRequest::SelectSessionCredential { session_id, .. })
+            | Self::Access(AccessRequest::GetSessionCredential { session_id })
+            | Self::Repository(RepositoryRequest::SearchGitHubRepositories {
+                session_id: Some(session_id),
+                ..
+            })
             | Self::Access(AccessRequest::RevokeSessionAccess { session_id, .. })
             | Self::Collaboration(CollaborationRequest::SendPeerMessage { session_id, .. }) => {
                 Some(Session(*session_id))
             }
-            Self::Run(RunRequest::GetAgentRun { run_id })
+            Self::Access(AccessRequest::GetRunCredential { run_id })
+            | Self::Run(RunRequest::GetAgentRun { run_id })
             | Self::Run(RunRequest::GetAgentRunMessagePage { run_id, .. })
             | Self::Run(RunRequest::GetAgentRunTranscriptPage { run_id, .. })
             | Self::Run(RunRequest::GetAgentRunMessageContentRange { run_id, .. })
@@ -843,6 +872,8 @@ impl ClientRequest {
                 | Self::Collaboration(CollaborationRequest::DirectAgent { .. })
                 | Self::Collaboration(CollaborationRequest::AnswerAgentQuestion { .. })
                 | Self::Collaboration(CollaborationRequest::ControlRun { .. })
+                | Self::Access(AccessRequest::SelectSessionCredential { .. })
+                | Self::Access(AccessRequest::RevokeProviderCredential { .. })
         )
     }
 }

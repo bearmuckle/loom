@@ -294,7 +294,10 @@ impl LoomView {
         self.dispatch_to_node(
             cx,
             node_id,
-            ClientRequest::Repository(RepositoryRequest::SearchGitHubRepositories { query }),
+            ClientRequest::Repository(RepositoryRequest::SearchGitHubRepositories {
+                query,
+                session_id: None,
+            }),
             move |view, response, _| {
                 if view.repository_search_generation != generation {
                     return;
