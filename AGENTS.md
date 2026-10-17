@@ -1,6 +1,6 @@
 # Agent instructions
 
-- Commit directly to `main` and push to `main`. Do not open pull requests and do not leave work on a feature branch.
+- Do not open pull requests. Commit and push to `main` directly when you work in the repository checkout. In an isolated worktree or other standalone checkout, `main` is not yours to commit to: commit a local branch there and land it into `main` from the main checkout. Do not leave work only on a branch when you have the main checkout.
 - Include a Verification section in the commit message body only when there are meaningful checks to report. List each relevant command once with a brief result; omit trivial hygiene checks and do not include verbose test output.
 - For UI work, prefer existing `gpui-kit` components when they fit the interaction; build custom controls only when the component library does not provide a suitable option.
 - Before committing, run workspace coverage locally if useful and check patch coverage on changed lines; CI does not run coverage. For a targeted run use the relevant package or test selection with `cargo llvm-cov`, then `git fetch origin main` and `diff-cover lcov.info --compare-branch=origin/main --fail-under=75 --exclude 'crates/*/src/tests.rs' --exclude 'crates/*/src/tests/*' --exclude 'crates/*/src/*/tests.rs' --exclude 'crates/*/src/*/tests/*' --exclude 'crates/*/tests/*'`. New or changed non-test lines should meet the 75% patch threshold when a report is generated.
