@@ -1,5 +1,5 @@
 [package]
-name = "loom-workspace"
+name = "loom-sessionfs"
 description = "Workspace snapshots, scoped edits, watches, and checkpoints for Loom."
 version.workspace = true
 edition.workspace = true

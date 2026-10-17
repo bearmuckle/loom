@@ -65,9 +65,9 @@ use loom_providers::{
     UsageLedger, deterministic_descriptor,
 };
 use loom_session::{SessionManager, WorkspaceManager};
+use loom_sessionfs::Workspace;
 use loom_tools::{ToolExecutor, ToolExtension, ToolResult};
 use loom_vcs::{GitService, MirrorCreation};
-use loom_workspace::Workspace;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sysinfo::System;
@@ -215,7 +215,7 @@ struct PersistedRunSummary {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PersistedSessionFilesystem {
-    filesystem: loom_workspace::WorkspaceStateSnapshot,
+    filesystem: loom_sessionfs::WorkspaceStateSnapshot,
     #[serde(skip)]
     repositories: BTreeMap<RepositoryId, SessionRepository>,
     #[serde(skip)]

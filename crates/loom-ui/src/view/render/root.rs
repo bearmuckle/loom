@@ -279,7 +279,7 @@ impl Render for LoomView {
             self.sessions.len(),
             self.covering_surface(),
         );
-        let panel_layout = h_resizable("loom-workspace-panels")
+        let panel_layout = h_resizable("loom-sessionfs-panels")
             .with_handle_appearance(Rc::new(|handle, _, _| {
                 let active = handle.is_active();
                 let line = div()

@@ -1199,7 +1199,7 @@ fn session_and_workspace_settings_are_bounded_indexed_and_atomic() {
 
 #[test]
 fn workspace_only_events_share_the_cursor_and_persist_with_bounded_retention() {
-    let path = std::env::temp_dir().join(format!("loom-workspace-feed-{}.db", Uuid::new_v4()));
+    let path = std::env::temp_dir().join(format!("loom-sessionfs-feed-{}.db", Uuid::new_v4()));
     let store = FilePersistence::open(&path).unwrap();
     let workspace_id = WorkspaceId::new();
     let workspace_event = |sequence, name: &str| WorkspaceEventEnvelope {

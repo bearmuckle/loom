@@ -34,7 +34,7 @@ numbers below (see [Measurements](#measurements)).
 | Workspace tool schemas | 9 tools, advertised whenever the model supports tool calls | 785 tokens, 4,086 bytes JSON | `crates/loom-tools/src/lib.rs` (`tool_definitions`) |
 | Project-manager tool schemas | 9 more tools for a manager run | 1,440 tokens, 7,482 bytes JSON | `crates/loom-server/src/project_tools.rs` |
 | System instructions | general block plus tool-derived guidance | 332 tokens (109 general, 223 guidance) | `crates/loom-agent/src/steps.rs` (`system_instructions_with_builtin_guidance`), `crates/loom-tools/src/lib.rs` (`tool_guidance`) |
-| Repository instructions | every `AGENTS.md`, `CLAUDE.md`, `LOOM.md`, `CONTRIBUTING.md`, `.github/copilot-instructions.md` in the workspace root, each up to 2 MiB, concatenated and always included | 1,177 tokens, 5,070 bytes for this repository | `crates/loom-workspace/src/instructions.rs`, `crates/loom-server/src/util.rs` (`merge_repository_instructions`) |
+| Repository instructions | every `AGENTS.md`, `CLAUDE.md`, `LOOM.md`, `CONTRIBUTING.md`, `.github/copilot-instructions.md` in the workspace root, each up to 2 MiB, concatenated and always included | 1,177 tokens, 5,070 bytes for this repository | `crates/loom-sessionfs/src/instructions.rs`, `crates/loom-server/src/util.rs` (`merge_repository_instructions`) |
 | One tool result | capped at 64 KiB, head and tail kept | 12,568 tokens (Rust, 5.21 bytes/token), 13,070 tokens (markdown) | `crates/loom-tools/src/lib.rs` (`DEFAULT_MAX_OUTPUT_BYTES`, `truncate_middle`) |
 | Conversation | append-only; every step re-sends the retained history | grows until compaction | `crates/loom-context/src/lib.rs` |
 | Reasoning | stored and replayed on assistant turns when tools are present | part of the prompt on every later step | `crates/loom-agent/src/activity.rs` (`echo_reasoning_on_assistant_turns`), `crates/loom-providers/src/response.rs` (`message_json`) |
@@ -235,7 +235,7 @@ let tokens = loom_model::estimate_tokens(&loom_model::ModelRequest {
 
 Project-manager schemas come from `ProjectAgentTools::definitions` with every
 grant enabled, repository instructions from
-`loom_workspace::Workspace::instruction_text` over this checkout, and the
+`loom_sessionfs::Workspace::instruction_text` over this checkout, and the
 64 KiB figure from `loom_model::estimate_message_tokens` over a real source
 file padded to the cap. Tokenizer comparisons used
 `tiktoken_rs::{cl100k_base_singleton, o200k_base_singleton}`.

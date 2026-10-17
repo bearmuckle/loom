@@ -16,8 +16,8 @@ use loom_core::{
 };
 pub use loom_model::ToolResult;
 use loom_model::{CancellationToken, ToolCall, ToolDefinition};
+use loom_sessionfs::{Workspace, WorkspaceEdit};
 use loom_vcs::{BranchPush, GitService, PushReport, RemoteRef, RemoteRefsReport};
-use loom_workspace::{Workspace, WorkspaceEdit};
 use regex::RegexBuilder;
 use scraper::{Html, Selector};
 use serde::Deserialize;
@@ -872,7 +872,7 @@ impl ToolExecutor {
             Err(error) => return ToolResult::failure(call, error.message),
         };
         for entry in entries {
-            if entry.kind != loom_workspace::WorkspaceEntryKind::File {
+            if entry.kind != loom_sessionfs::WorkspaceEntryKind::File {
                 continue;
             }
             match self.entry_in_scope(&entry.path, relative, &path) {
@@ -996,7 +996,7 @@ impl ToolExecutor {
         let current_file = match self.workspace.read_file(path) {
             Ok(file) => file,
             Err(error) if error.code == loom_core::ErrorCode::NotFound => {
-                loom_workspace::SessionFilesystemFile {
+                loom_sessionfs::SessionFilesystemFile {
                     session_id: self.workspace.session_id(),
                     path: path.to_owned(),
                     content: String::new(),
@@ -2224,7 +2224,7 @@ impl ToolExecutor {
             .list(requested_relative, None, MAX_SCOPED_LIST_ENTRIES)
             .map_err(|error| error.message)?
         {
-            if entry.kind != loom_workspace::WorkspaceEntryKind::File {
+            if entry.kind != loom_sessionfs::WorkspaceEntryKind::File {
                 continue;
             }
             if !self.entry_in_scope(&entry.path, requested_relative, requested_path)? {
@@ -2263,7 +2263,7 @@ impl ToolExecutor {
             .list(requested_relative, None, MAX_SCOPED_LIST_ENTRIES)
             .map_err(|error| error.message)?
         {
-            if entry.kind != loom_workspace::WorkspaceEntryKind::File {
+            if entry.kind != loom_sessionfs::WorkspaceEntryKind::File {
                 continue;
             }
             if !self.entry_in_scope(&entry.path, requested_relative, requested_path)? {

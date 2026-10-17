@@ -30,7 +30,7 @@ use loom_protocol::{
     WorkspaceRequest, WorkspaceResponse,
 };
 use loom_providers::CredentialStore;
-use loom_workspace::{WorkspaceControl, WorkspaceEdit};
+use loom_sessionfs::{WorkspaceControl, WorkspaceEdit};
 
 use super::*;
 #[allow(unused_imports)]

@@ -4561,9 +4561,9 @@ dependencies = [
  "loom-protocol",
  "loom-providers",
  "loom-session",
+ "loom-sessionfs",
  "loom-tools",
  "loom-vcs",
- "loom-workspace",
  "reqwest",
  "rustls",
  "rustls-native-certs",
@@ -4589,6 +4589,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-sessionfs"
+version = "0.1.0"
+dependencies = [
+ "ignore",
+ "loom-core",
+ "serde",
+ "sha2 0.11.1",
+ "similar 3.2.0",
+]
+
+[[package]]
 name = "loom-tools"
 version = "0.1.0"
 dependencies = [
@@ -4597,8 +4608,8 @@ dependencies = [
  "log",
  "loom-core",
  "loom-model",
+ "loom-sessionfs",
  "loom-vcs",
- "loom-workspace",
  "regex",
  "reqwest",
  "scraper",
@@ -4642,17 +4653,6 @@ version = "0.1.0"
 dependencies = [
  "git2",
  "loom-core",
-]
-
-[[package]]
-name = "loom-workspace"
-version = "0.1.0"
-dependencies = [
- "ignore",
- "loom-core",
- "serde",
- "sha2 0.11.1",
- "similar 3.2.0",
 ]
 
 [[package]]

@@ -46,7 +46,7 @@ impl InProcessBackend {
         let mut persisted: PersistedSessionFilesystem = from_json(payload)?;
         persisted.filesystem.edits = edits
             .into_iter()
-            .map(|edit| loom_workspace::WorkspaceEditHistory {
+            .map(|edit| loom_sessionfs::WorkspaceEditHistory {
                 id: edit.id,
                 path: edit.path,
                 before: edit.before,
@@ -175,7 +175,7 @@ impl InProcessBackend {
         let mut persisted: PersistedSessionFilesystem = from_json(payload)?;
         persisted.filesystem.edits = edits
             .into_iter()
-            .map(|edit| loom_workspace::WorkspaceEditHistory {
+            .map(|edit| loom_sessionfs::WorkspaceEditHistory {
                 id: edit.id,
                 path: edit.path,
                 before: edit.before,

@@ -7,7 +7,7 @@ Loom's Rust crates declare their license in each crate's `Cargo.toml`:
 - Crates that do not depend on AGPL code use `GPL-3.0-only`: `loom-build`,
   `loom-core`, `loom-model`, `loom-session`, `loom-persistence`,
   `loom-providers`, `loom-agent`, `loom-context`, `loom-process`,
-  `loom-tools`, `loom-vcs`, and `loom-workspace`.
+  `loom-tools`, `loom-vcs`, and `loom-sessionfs`.
 - `loom-protocol` and crates that depend on it use `AGPL-3.0-only`:
   `loom-local`, `loom-server`, `loom-cli`, and `loom-ui`.
 - The native UI also includes the AGPL-licensed server crate. The combined

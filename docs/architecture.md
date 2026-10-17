@@ -110,7 +110,7 @@ Suggested backend boundaries:
   listing supports depth/glob/entry limits, edits can batch exact replacements,
   commands accept a timeout, and oversized output keeps both ends with an
   explicit omitted-byte report.
-- `loom-workspace`: session-root file trees, file contents, watches, edits,
+- `loom-sessionfs`: session-root file trees, file contents, watches, edits,
   snapshots, and repository-instruction discovery.
 - `loom-process`: commands, terminals, task supervision, output streaming, and
   cancellation.
@@ -122,7 +122,7 @@ Suggested backend boundaries:
   backend implementation. It re-exports the domain types it carries from
   `loom-core` and `loom-model`, so the wire format is defined by those types.
   The backend crates (`loom-agent`, `loom-context`, `loom-tools`,
-  `loom-workspace`, `loom-process`, `loom-vcs`) use only the domain crates and
+  `loom-sessionfs`, `loom-process`, `loom-vcs`) use only the domain crates and
   do not depend on `loom-protocol`; `loom-server` maps domain state to the
   protocol.
 - `loom-server`: listeners, authentication, connection management, and
@@ -168,10 +168,10 @@ coordination rules for concurrent file edits and Git operations. The
 filesystem boundary does not by itself promise OS-level process sandboxing;
 process isolation is a separate backend security capability.
 
-`loom-workspace` is the session-filesystem service, despite the crate's
-historical name. It owns file trees, contents, watches, edits, snapshots,
-checkpoints, and repository-instruction discovery rooted at one session
-filesystem. It validates and resolves session-relative paths, but does not
+`loom-sessionfs` is the session-filesystem service. It owns file trees,
+contents, watches, edits, snapshots, checkpoints, and repository-instruction
+discovery rooted at one session filesystem. It validates and resolves
+session-relative paths, but does not
 own the durable workspace record or its settings. The session owns its
 repository membership. The worker node coordinates attach, detach, and
 fork-copy operations, using the filesystem service for paths and files and
@@ -346,7 +346,7 @@ crates/
   loom-context/
   loom-persistence/
   loom-tools/
-  loom-workspace/
+  loom-sessionfs/
   loom-process/
   loom-vcs/
   loom-protocol/

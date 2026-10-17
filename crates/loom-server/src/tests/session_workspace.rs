@@ -7,7 +7,7 @@ use super::*;
 #[test]
 fn workspace_config_is_persisted_and_excludes_access_tokens() {
     let path =
-        std::env::temp_dir().join(format!("loom-workspace-config-{}.db", WorkspaceId::new()));
+        std::env::temp_dir().join(format!("loom-sessionfs-config-{}.db", WorkspaceId::new()));
     let workspace_id;
     let config = WorkspaceConfig {
         revision: 1,

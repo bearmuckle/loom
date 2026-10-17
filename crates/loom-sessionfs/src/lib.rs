@@ -1608,7 +1608,7 @@ mod tests {
 
     fn workspace() -> (Workspace, PathBuf) {
         let session_id = AgentSessionId::new();
-        let root = std::env::temp_dir().join(format!("loom-workspace-{session_id}"));
+        let root = std::env::temp_dir().join(format!("loom-sessionfs-{session_id}"));
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("README.md"), "hello\n").unwrap();
         fs::write(root.join("src/lib.rs"), "pub fn answer() -> u8 { 1 }\n").unwrap();
