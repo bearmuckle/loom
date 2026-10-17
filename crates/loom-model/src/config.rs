@@ -100,16 +100,18 @@ impl ProviderConfig {
     /// Official OpenAI API, exposed separately from OpenAI-compatible gateways.
     pub fn openai(model: impl Into<ModelId>) -> Self {
         let id = ProviderId::new(OPENAI_PROVIDER_ID);
+        let model = model.into();
+        let context_window = declared_context_window(model.as_str());
         Self {
             id: id.clone(),
             kind: ProviderKind::OpenAi,
             display_name: "OpenAI".to_owned(),
             endpoint: Some(OPENAI_API_ENDPOINT.to_owned()),
             models: vec![ModelDescriptor {
-                id: model.into(),
+                id: model,
                 provider: id,
                 display_name: "OpenAI model".to_owned(),
-                context_window: None,
+                context_window,
                 max_input_tokens: None,
                 max_output_tokens: None,
                 capabilities: ModelCapabilities {
@@ -204,6 +206,48 @@ impl ProviderConfig {
         self
     }
 }
+
+/// Input context windows declared for the OpenAI model families the catalog
+/// accepts (`openai_model_supported` in `crates/loom-providers/src/github.rs`).
+///
+/// OpenAI model discovery cannot supply these: `api.openai.com` publishes no
+/// window, and `discovered_context_window` only reads Copilot's
+/// `capabilities.limits` or a `context_length` field. Without a declaration a
+/// hosted OpenAI run budgets with the unknown-model fallback instead of the
+/// real window, which forces compaction on every large tool result.
+///
+/// Names match exactly or with a versioned suffix (`gpt-4.1-2025-04-14`). A
+/// discovered window or a client-supplied `context_options.context_window`
+/// takes precedence over this table. The `gpt-6` value is a conservative floor
+/// consistent with the Copilot descriptor for the same families.
+pub fn declared_context_window(model: &str) -> Option<u32> {
+    DECLARED_CONTEXT_WINDOWS
+        .iter()
+        .find_map(|(family, window)| {
+            let matches = model == *family
+                || model
+                    .strip_prefix(family)
+                    .is_some_and(|suffix| suffix.starts_with('-'));
+            matches.then_some(*window)
+        })
+}
+
+const DECLARED_CONTEXT_WINDOWS: &[(&str, u32)] = &[
+    ("gpt-4.1", 1_047_576),
+    ("gpt-4.1-mini", 1_047_576),
+    ("gpt-4.1-nano", 1_047_576),
+    ("gpt-4o", 128_000),
+    ("gpt-4o-mini", 128_000),
+    ("gpt-5", 400_000),
+    ("gpt-5-mini", 400_000),
+    ("gpt-5-nano", 400_000),
+    ("o3", 200_000),
+    ("o3-mini", 200_000),
+    ("o4-mini", 200_000),
+    ("gpt-6-astra", 128_000),
+    ("gpt-6-sol", 128_000),
+    ("gpt-6-luna", 128_000),
+];
 
 pub fn github_copilot_descriptor() -> ModelDescriptor {
     ModelDescriptor {

@@ -529,13 +529,23 @@ impl ProviderRegistry {
                     id: ModelId::new(id),
                     provider: provider_id.clone(),
                     display_name: id.to_owned(),
-                    context_window: discovered_context_window(model).or_else(|| {
-                        config
-                            .models
-                            .iter()
-                            .find(|configured| configured.id.as_str() == id)
-                            .and_then(|configured| configured.context_window)
-                    }),
+                    context_window: discovered_context_window(model)
+                        .or_else(|| {
+                            config
+                                .models
+                                .iter()
+                                .find(|configured| configured.id.as_str() == id)
+                                .and_then(|configured| configured.context_window)
+                        })
+                        // The official OpenAI API publishes no window, so fall back
+                        // to the declared family table there. A gateway or local
+                        // runtime may serve the same name with a different real
+                        // window, so the table does not apply to those kinds.
+                        .or_else(|| {
+                            (config.kind == ProviderKind::OpenAi)
+                                .then_some(id)
+                                .and_then(declared_context_window)
+                        }),
                     max_input_tokens: discovered_input_tokens(model).or_else(|| {
                         config
                             .models

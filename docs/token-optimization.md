@@ -1,7 +1,10 @@
 # Token usage and compression
 
 Status: investigation for [#289](https://github.com/bearmuckle/loom/issues/289).
-No behavior changed. Measurements are from a debug build of `12c5f3a` in this
+No behavior changed except recommendation 1, which now declares context
+windows for the hosted OpenAI families (see
+[Recommendations](#recommendations-in-order)). Measurements are from a debug
+build of `12c5f3a` in this
 checkout; the throwaway measurement tests were removed after recording the
 numbers below (see [Measurements](#measurements)).
 
@@ -11,11 +14,12 @@ numbers below (see [Measurements](#measurements)).
   normal agent run on this repository pays about **2,294 tokens** before the
   task text or conversation, and a project-manager run about **3,734 tokens**.
 - One maximum-size tool result (64 KiB) is **~12,600 tokens** of Rust source.
-- An OpenAI provider configured today always runs on the **8,192-token
-  fallback window**, because its model catalog records no `context_window` and
-  discovery has nothing to read. That leaves roughly 3,800 tokens for the
-  conversation, so a single large tool result forces compaction, which drops
-  history (the model re-reads) and rewrites the prompt prefix (cache misses).
+- An OpenAI provider configured before recommendation 1 was implemented ran on
+  the **8,192-token fallback window**, because its model catalog recorded no
+  `context_window` and discovery has nothing to read. That left roughly 3,800
+  tokens for the conversation, so a single large tool result forced compaction,
+  which drops history (the model re-reads) and rewrites the prompt prefix
+  (cache misses). The declared windows in recommendation 1 remove that.
 - Cached input tokens are recorded but priced at the full input rate, and
   DeepSeek's cache-hit counters are not parsed, so caching is currently
   invisible in cost and in the UI.
@@ -137,13 +141,23 @@ issue's "if any high quality crates are available do use" is: use
 
 ## Recommendations, in order
 
-1. **Declare context windows for hosted models (S).** Add windows to the
-   built-in descriptors for the families `openai_model_supported` already
-   lists, and keep the 8,192 fallback only for genuinely unknown models. This
-   is the largest saving available: it removes the re-read and compaction loop
-   on every OpenAI run without changing prompt content. Also surface the
-   `context_options.context_window` override in the client; it is persisted
-   today but not reachable from the UI.
+1. **Declare context windows for hosted models (S). Implemented.**
+   `declared_context_window` (`crates/loom-model/src/config.rs`) declares the
+   input windows for the families `openai_model_supported` already lists:
+   `gpt-4.1`/`gpt-4.1-mini`/`gpt-4.1-nano` = 1,047,576; `gpt-4o`/`gpt-4o-mini`
+   = 128,000; `gpt-5`/`gpt-5-mini`/`gpt-5-nano` = 400,000;
+   `o3`/`o3-mini`/`o4-mini` = 200,000; and `gpt-6-astra`/`gpt-6-sol`/`gpt-6-luna`
+   = 128,000 (a conservative floor consistent with the Copilot descriptor).
+   Names match exactly or with a versioned suffix (`gpt-4.1-2025-04-14`).
+   `ProviderConfig::openai` records the value, and OpenAI discovery falls back
+   to the table when the endpoint publishes no window and the configured
+   descriptor has none; a discovered or client-supplied window still wins. The
+   table is not applied to `OpenAiCompatible` or `Ollama`, where a gateway may
+   serve the same name with a different real window, so the 8,192 fallback
+   stays for genuinely unknown models. This is the largest saving available: it
+   removes the re-read and compaction loop on every OpenAI run without changing
+   prompt content. Still open: surface the `context_options.context_window`
+   override in the client; it is persisted today but not reachable from the UI.
 2. **Make usage accounting honest (S).** Price cached input tokens separately
    (or discount them), parse DeepSeek's `prompt_cache_hit_tokens` and
    `prompt_cache_miss_tokens`, and expose a cache-hit ratio in the usage

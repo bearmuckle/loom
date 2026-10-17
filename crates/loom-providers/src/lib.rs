@@ -21,8 +21,8 @@ pub use loom_model::{
     GITHUB_REPOSITORY_CREDENTIAL_REF, ModelProvider, OPENAI_API_ENDPOINT, OPENAI_DEFAULT_MODEL,
     OPENAI_PROVIDER_ID, ProviderConfig, ProviderDescriptor, ProviderHealth, ProviderHealthState,
     ProviderKind, ProviderSummary, ProviderUsageKey, ProviderUsageRecord, ProviderUsageSummary,
-    UnavailableProvider, UsageLedger, deterministic_descriptor, estimate_tokens,
-    github_copilot_descriptor,
+    UnavailableProvider, UsageLedger, declared_context_window, deterministic_descriptor,
+    estimate_tokens, github_copilot_descriptor,
 };
 use serde::Deserialize;
 
@@ -1212,6 +1212,15 @@ mod tests {
                 "gpt-6-luna"
             ]
         );
+        // The official API publishes no window, so discovery falls back to the
+        // declared family table (or, for the configured model, its descriptor).
+        assert_eq!(models[0].context_window, Some(1_047_576));
+        assert_eq!(models[1].context_window, Some(200_000));
+        assert_eq!(models[2].context_window, Some(128_000));
+        assert_eq!(models[3].context_window, Some(128_000));
+        assert_eq!(models[4].context_window, Some(128_000));
+        // An id outside the table never gains a window.
+        assert_eq!(declared_context_window("fixture-model"), None);
         server
             .join()
             .expect("fixture server panicked")
@@ -1310,6 +1319,40 @@ mod tests {
             .describe_model(&ModelId::new(DEEPSEEK_DEFAULT_MODEL))
             .unwrap();
         assert_eq!(restored.max_output_tokens, Some(DEEPSEEK_MAX_OUTPUT_TOKENS));
+    }
+
+    #[test]
+    fn restore_configs_backfills_missing_model_context_windows() {
+        let credentials = Arc::new(InMemoryCredentialStore::default());
+        let registry = ProviderRegistry::with_credentials(credentials);
+        registry
+            .register(ProviderConfig::openai(OPENAI_DEFAULT_MODEL))
+            .unwrap();
+        registry
+            .configure_api_key_provider(
+                &ProviderId::new(OPENAI_PROVIDER_ID),
+                "openai-key".to_owned(),
+            )
+            .unwrap();
+
+        // Simulate a configuration persisted before the model declared a
+        // context window.
+        let mut configs = registry.export_configs().unwrap();
+        for config in &mut configs {
+            for model in &mut config.models {
+                model.context_window = None;
+            }
+        }
+        registry.restore_configs(configs).unwrap();
+
+        let restored = registry
+            .describe_model(&ModelId::new(OPENAI_DEFAULT_MODEL))
+            .unwrap();
+        assert_eq!(
+            restored.context_window,
+            declared_context_window(OPENAI_DEFAULT_MODEL)
+        );
+        assert_eq!(restored.context_window, Some(128_000));
     }
 
     #[test]
@@ -1979,7 +2022,7 @@ mod tests {
             if !request_text.contains("discovery-key") {
                 return Err("fixture request did not contain the expected discovery key".to_owned());
             }
-            let body = r#"{"data":[{"id":"discovered/model"}]}"#;
+            let body = r#"{"data":[{"id":"discovered/model"},{"id":"gpt-4.1"}]}"#;
             write_response(&mut stream, "application/json", body)
         });
         let credentials = Arc::new(InMemoryCredentialStore::default());
@@ -2014,6 +2057,10 @@ mod tests {
             .unwrap();
         assert_eq!(models[0].id.as_str(), "discovered/model");
         assert_eq!(models[0].context_window, None);
+        // The declared OpenAI family table is not applied to a gateway, which
+        // may serve the same model name with a different real window.
+        assert_eq!(models[1].id.as_str(), "gpt-4.1");
+        assert_eq!(models[1].context_window, None);
         assert_eq!(models[0].provider.as_str(), "gateway");
         assert_eq!(
             registry.pricing(&ModelId::new("discovered/model")).unwrap(),

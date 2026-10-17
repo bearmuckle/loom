@@ -20,8 +20,8 @@ pub use config::{
     DEEPSEEK_MAX_OUTPUT_TOKENS, DEEPSEEK_PROVIDER_ID, GITHUB_COPILOT_API_ENDPOINT,
     GITHUB_COPILOT_CREDENTIAL_REF, GITHUB_COPILOT_DEFAULT_MODEL, GITHUB_COPILOT_PROVIDER_ID,
     GITHUB_REPOSITORY_CREDENTIAL_REF, OPENAI_API_ENDPOINT, OPENAI_DEFAULT_MODEL,
-    OPENAI_PROVIDER_ID, ProviderConfig, ProviderUsageKey, UsageLedger, deterministic_descriptor,
-    github_copilot_descriptor,
+    OPENAI_PROVIDER_ID, ProviderConfig, ProviderUsageKey, UsageLedger, declared_context_window,
+    deterministic_descriptor, github_copilot_descriptor,
 };
 pub use events::{
     MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES, MAX_AGENT_RUN_MESSAGE_PAGE_SIZE,
@@ -247,7 +247,8 @@ pub enum ModelStreamEvent {
 mod tests {
     use super::{
         CompletionOptions, FinishReason, MessageRole, ModelCapabilities, ModelId, ModelMessage,
-        ModelStreamEvent, ProviderHealth, ProviderId, ProviderKind, ProviderSummary, TokenUsage,
+        ModelStreamEvent, OPENAI_DEFAULT_MODEL, ProviderConfig, ProviderHealth, ProviderId,
+        ProviderKind, ProviderSummary, TokenUsage, declared_context_window,
     };
 
     #[test]
@@ -342,6 +343,54 @@ mod tests {
             }
         );
         assert_eq!(TokenUsage::default().cached_input_tokens, 0);
+    }
+
+    #[test]
+    fn declared_context_windows_cover_the_supported_openai_families() {
+        for (model, window) in [
+            ("gpt-4.1", 1_047_576),
+            ("gpt-4.1-mini", 1_047_576),
+            ("gpt-4.1-nano", 1_047_576),
+            ("gpt-4o", 128_000),
+            ("gpt-4o-mini", 128_000),
+            ("gpt-5", 400_000),
+            ("gpt-5-mini", 400_000),
+            ("gpt-5-nano", 400_000),
+            ("o3", 200_000),
+            ("o3-mini", 200_000),
+            ("o4-mini", 200_000),
+            ("gpt-6-astra", 128_000),
+            ("gpt-6-sol", 128_000),
+            ("gpt-6-luna", 128_000),
+        ] {
+            assert_eq!(declared_context_window(model), Some(window), "{model}");
+        }
+        assert_eq!(
+            declared_context_window("gpt-4.1-2025-04-14"),
+            Some(1_047_576)
+        );
+        assert_eq!(declared_context_window("o3-mini-2025-01-31"), Some(200_000));
+        for unknown in ["fixture-model", "gpt-6-audio", "text-embedding-3-small", ""] {
+            assert_eq!(declared_context_window(unknown), None, "{unknown}");
+        }
+    }
+
+    #[test]
+    fn openai_provider_config_records_the_declared_context_window() {
+        let config = ProviderConfig::openai(OPENAI_DEFAULT_MODEL);
+        assert_eq!(
+            config.models[0].context_window,
+            declared_context_window(OPENAI_DEFAULT_MODEL)
+        );
+        assert_eq!(config.models[0].context_window, Some(128_000));
+        assert_eq!(
+            ProviderConfig::openai("gpt-4.1").models[0].context_window,
+            Some(1_047_576)
+        );
+        assert_eq!(
+            ProviderConfig::openai("fixture-model").models[0].context_window,
+            None
+        );
     }
 
     #[test]
