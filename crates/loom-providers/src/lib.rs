@@ -1233,7 +1233,10 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || -> std::result::Result<(), String> {
             let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
-            let request = read_request_headers(&mut stream)?;
+            let request = read_request_with_body(&mut stream)?;
+            let body: serde_json::Value =
+                serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(body["model"], "gpt-4o");
             if !request.starts_with("POST /v1/chat/completions ")
                 || !request.contains("Bearer openai-request-key")
             {
@@ -1249,9 +1252,12 @@ mod tests {
         });
         let registry =
             ProviderRegistry::with_credentials(Arc::new(InMemoryCredentialStore::default()));
-        let mut config = ProviderConfig::openai("fixture-model");
+        // Copilot sorts before OpenAI and exposes the same real raw ID.
+        let mut copilot = ProviderConfig::github_copilot(CredentialRef::new("missing-copilot"));
+        copilot.models[0].id = ModelId::new("gpt-4o");
+        registry.register(copilot).unwrap();
+        let mut config = ProviderConfig::openai("gpt-4o");
         config.endpoint = Some(format!("http://{address}/v1/chat/completions"));
-        config.models[0].id = ModelId::new("fixture-model");
         registry.register(config).unwrap();
         registry
             .configure_api_key_provider(
@@ -1260,7 +1266,10 @@ mod tests {
             )
             .unwrap();
         let request = ModelRequest {
-            model: ModelId::new("fixture-model"),
+            model: ModelId::for_provider(
+                &ProviderId::new(OPENAI_PROVIDER_ID),
+                &ModelId::new("gpt-4o"),
+            ),
             messages: vec![ModelMessage::new(MessageRole::User, "hello")],
             tools: Vec::new(),
             options: Default::default(),

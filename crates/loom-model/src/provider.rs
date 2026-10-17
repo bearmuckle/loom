@@ -170,17 +170,19 @@ impl ModelProvider for UnavailableProvider {
 }
 
 pub fn estimate_tokens(request: &ModelRequest) -> u64 {
+    let selection = request.model.provider_model();
+    let model = selection.as_ref().map_or(&request.model, |(_, raw)| raw);
     let message_tokens = request
         .messages
         .iter()
-        .map(|message| estimate_message_tokens_with_model(&request.model, message))
+        .map(|message| estimate_message_tokens_with_model(model, message))
         .sum::<u64>();
     let tool_tokens = request
         .tools
         .iter()
         .map(|tool| {
-            estimate_text_tokens(&request.model, &tool.description)
-                + estimate_text_tokens(&request.model, &tool.input_schema.to_string())
+            estimate_text_tokens(model, &tool.description)
+                + estimate_text_tokens(model, &tool.input_schema.to_string())
                 + 1
         })
         .sum::<u64>();
@@ -320,6 +322,26 @@ pub struct ProviderUsageRecord {
 mod tests {
     use super::*;
     use crate::MessageRole;
+
+    #[test]
+    fn qualified_models_use_the_raw_tokenizer_for_messages_and_tools() {
+        let mut request = ModelRequest {
+            model: ModelId::new("gpt-4o"),
+            messages: vec![ModelMessage::new(
+                MessageRole::User,
+                "hello world 雪".repeat(20),
+            )],
+            tools: vec![crate::ToolDefinition {
+                name: "search".to_owned(),
+                description: "Find records".to_owned(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            options: Default::default(),
+        };
+        let raw_count = estimate_tokens(&request);
+        request.model = ModelId::for_provider(&ProviderId::new("openai"), &request.model);
+        assert_eq!(estimate_tokens(&request), raw_count);
+    }
 
     #[test]
     fn reasoning_content_counts_toward_the_message_budget() {

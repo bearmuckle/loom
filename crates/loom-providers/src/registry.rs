@@ -588,23 +588,53 @@ impl ProviderRegistry {
         Ok(models)
     }
 
-    pub fn describe_model(&self, model: &ModelId) -> Result<ModelDescriptor> {
+    /// Resolve once against configured providers, including unavailable ones:
+    /// a missing credential must never silently reroute an explicit selection.
+    fn resolve_model(&self, model: &ModelId) -> Result<(ProviderConfig, ModelDescriptor)> {
         let configurations = self
             .configurations
             .lock()
             .map_err(|_| internal_lock_error("provider configuration"))?;
-        configurations
+        let selection = model.provider_model();
+        let raw = selection.as_ref().map_or(model, |(_, raw)| raw);
+        let mut matches = configurations
             .values()
-            .flat_map(|config| config.models.iter())
-            .find(|descriptor| &descriptor.id == model)
-            .cloned()
-            .ok_or_else(|| {
-                LoomError::new(
-                    ErrorCode::ProviderUnavailable,
-                    format!("model '{}' is not configured", model.as_str()),
-                    false,
-                )
-            })
+            .filter(|config| selection.as_ref().is_none_or(|(id, _)| &config.id == id))
+            .filter_map(|config| {
+                config
+                    .models
+                    .iter()
+                    .find(|item| &item.id == raw)
+                    .map(|descriptor| (config, descriptor))
+            });
+        let Some((config, descriptor)) = matches.next() else {
+            return Err(LoomError::new(
+                ErrorCode::ProviderUnavailable,
+                format!("model '{}' is not configured", model.as_str()),
+                false,
+            ));
+        };
+        if matches.next().is_some() {
+            let providers = configurations
+                .values()
+                .filter(|config| config.models.iter().any(|item| &item.id == raw))
+                .map(|config| ModelId::for_provider(&config.id, raw).as_str().to_owned())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(LoomError::invalid_request(format!(
+                "model '{}' is ambiguous; select an explicit provider-qualified model: {providers}",
+                model.as_str()
+            )));
+        }
+        let mut descriptor = descriptor.clone();
+        descriptor.provider = config.id.clone();
+        Ok((config.clone(), descriptor))
+    }
+
+    pub fn describe_model(&self, model: &ModelId) -> Result<ModelDescriptor> {
+        let (_, mut descriptor) = self.resolve_model(model)?;
+        descriptor.id = model.clone();
+        Ok(descriptor)
     }
 
     pub fn negotiate_capabilities(
@@ -631,40 +661,9 @@ impl ProviderRegistry {
         model: &ModelId,
         deterministic_cursor: usize,
     ) -> Result<Box<dyn ModelProvider>> {
-        let config = {
-            let configurations = self
-                .configurations
-                .lock()
-                .map_err(|_| internal_lock_error("provider configuration"))?;
-            configurations
-                .values()
-                .find(|config| {
-                    config
-                        .models
-                        .iter()
-                        .any(|descriptor| &descriptor.id == model)
-                })
-                .cloned()
-                .ok_or_else(|| {
-                    LoomError::new(
-                        ErrorCode::ProviderUnavailable,
-                        format!("model '{}' is not configured", model.as_str()),
-                        false,
-                    )
-                })?
-        };
-        let descriptor = config
-            .models
-            .iter()
-            .find(|descriptor| &descriptor.id == model)
-            .cloned()
-            .ok_or_else(|| {
-                LoomError::new(
-                    ErrorCode::ProviderUnavailable,
-                    format!("model '{}' is not configured", model.as_str()),
-                    false,
-                )
-            })?;
+        let (config, descriptor) = self.resolve_model(model)?;
+        let mut selector_descriptor = descriptor.clone();
+        selector_descriptor.id = model.clone();
         let provider: Box<dyn ModelProvider> = match config.kind {
             ProviderKind::Deterministic => {
                 Box::new(DeterministicProvider::demo().with_cursor(deterministic_cursor))
@@ -726,11 +725,14 @@ impl ProviderRegistry {
                     .with_model_descriptor(descriptor),
             ),
         };
-        Ok(Box::new(AccountingProvider {
-            inner: provider,
-            ledger: Arc::clone(&self.usage),
-            input_cost_micros_per_1k: config.input_cost_micros_per_1k,
-            output_cost_micros_per_1k: config.output_cost_micros_per_1k,
+        Ok(Box::new(SelectedModelProvider {
+            descriptor: selector_descriptor,
+            inner: Box::new(AccountingProvider {
+                inner: provider,
+                ledger: Arc::clone(&self.usage),
+                input_cost_micros_per_1k: config.input_cost_micros_per_1k,
+                output_cost_micros_per_1k: config.output_cost_micros_per_1k,
+            }),
         }))
     }
 
@@ -765,31 +767,11 @@ impl ProviderRegistry {
     }
 
     pub fn pricing(&self, model: &ModelId) -> Result<(u64, u64)> {
-        let configurations = self
-            .configurations
-            .lock()
-            .map_err(|_| internal_lock_error("provider configuration"))?;
-        configurations
-            .values()
-            .find(|config| {
-                config
-                    .models
-                    .iter()
-                    .any(|descriptor| &descriptor.id == model)
-            })
-            .map(|config| {
-                (
-                    config.input_cost_micros_per_1k,
-                    config.output_cost_micros_per_1k,
-                )
-            })
-            .ok_or_else(|| {
-                LoomError::new(
-                    ErrorCode::ProviderUnavailable,
-                    format!("model '{}' is not configured", model.as_str()),
-                    false,
-                )
-            })
+        let (config, _) = self.resolve_model(model)?;
+        Ok((
+            config.input_cost_micros_per_1k,
+            config.output_cost_micros_per_1k,
+        ))
     }
 
     pub fn export_configs(&self) -> Result<Vec<ProviderConfig>> {
@@ -919,7 +901,7 @@ impl ProviderRegistry {
             )
         })?;
         let result = self
-            .create_provider(&model.id)
+            .create_provider(&ModelId::for_provider(provider_id, &model.id))
             .and_then(|mut provider| provider.health_check());
         let mut health = self
             .health
@@ -948,6 +930,48 @@ impl ProviderRegistry {
 
     pub fn health_check(&self, provider_id: &ProviderId) -> Result<ProviderHealth> {
         self.check_health(provider_id)
+    }
+}
+
+/// Keep selector identity outside the adapter and raw identity at its boundary.
+/// Accounting remains inside this wrapper so persisted usage stays provider/raw.
+struct SelectedModelProvider {
+    inner: Box<dyn ModelProvider>,
+    descriptor: ModelDescriptor,
+}
+
+impl SelectedModelProvider {
+    fn raw_request(&self, request: &ModelRequest) -> ModelRequest {
+        let mut request = request.clone();
+        request.model = self.inner.descriptor().id.clone();
+        request
+    }
+}
+
+impl ModelProvider for SelectedModelProvider {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn stream(
+        &mut self,
+        request: &ModelRequest,
+        cancel: &CancellationToken,
+        sink: &mut dyn ModelStreamSink,
+    ) -> Result<()> {
+        self.inner.stream(&self.raw_request(request), cancel, sink)
+    }
+
+    fn count_tokens(&self, request: &ModelRequest) -> u64 {
+        self.inner.count_tokens(&self.raw_request(request))
+    }
+
+    fn health_check(&mut self) -> Result<()> {
+        self.inner.health_check()
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
     }
 }
 
@@ -1041,5 +1065,224 @@ fn fill_missing_model_limits(config: &mut ProviderConfig, known: &ProviderConfig
         model.context_window = model.context_window.or(descriptor.context_window);
         model.max_input_tokens = model.max_input_tokens.or(descriptor.max_input_tokens);
         model.max_output_tokens = model.max_output_tokens.or(descriptor.max_output_tokens);
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use loom_model::CollectingSink;
+
+    fn shared_registry() -> ProviderRegistry {
+        let credentials = Arc::new(InMemoryCredentialStore::default());
+        credentials.insert(CredentialRef::new("openai-key"), "test-openai");
+        credentials.insert(CredentialRef::new("copilot-key"), "test-copilot");
+        let registry = ProviderRegistry::with_credentials(credentials);
+        let mut openai = ProviderConfig::openai("gpt-4o").with_pricing(100, 200);
+        openai.credential = Some(CredentialRef::new("openai-key"));
+        openai.models[0].context_window = Some(128_000);
+        let mut copilot = ProviderConfig::github_copilot(CredentialRef::new("copilot-key"))
+            .with_pricing(300, 400);
+        copilot.models[0].id = ModelId::new("gpt-4o");
+        copilot.models[0].context_window = Some(64_000);
+        copilot.models[0].capabilities.vision = !openai.models[0].capabilities.vision;
+        registry.register(openai).unwrap();
+        registry.register(copilot).unwrap();
+        registry
+    }
+
+    #[test]
+    fn shared_real_model_ids_select_exact_provider_metadata_and_adapter() {
+        let registry = shared_registry();
+        let raw = ModelId::new("gpt-4o");
+        for (id, window, pricing) in [
+            (OPENAI_PROVIDER_ID, 128_000, (100, 200)),
+            (GITHUB_COPILOT_PROVIDER_ID, 64_000, (300, 400)),
+        ] {
+            let provider_id = ProviderId::new(id);
+            let selector = ModelId::for_provider(&provider_id, &raw);
+            let descriptor = registry.describe_model(&selector).unwrap();
+            assert_eq!(descriptor.id, selector);
+            assert_eq!(descriptor.provider, provider_id);
+            assert_eq!(descriptor.context_window, Some(window));
+            assert_eq!(registry.pricing(&selector).unwrap(), pricing);
+            let mut adapter = registry.create_provider(&selector).unwrap();
+            assert_eq!(adapter.descriptor(), &descriptor);
+            assert_eq!(adapter.list_models(), vec![descriptor.clone()]);
+            assert_eq!(adapter.capabilities(), descriptor.capabilities);
+            assert_eq!(
+                registry
+                    .negotiate_capabilities(
+                        &selector,
+                        ModelCapabilities {
+                            streaming: true,
+                            tool_calling: true,
+                            vision: true,
+                            json_mode: true,
+                        }
+                    )
+                    .unwrap(),
+                descriptor.capabilities
+            );
+            adapter.reset();
+        }
+        // The API/storage catalog stays raw for old clients and saved configs.
+        assert!(
+            registry
+                .list_models()
+                .unwrap()
+                .iter()
+                .all(|model| model.id == raw)
+        );
+        assert!(
+            registry
+                .list_providers()
+                .unwrap()
+                .iter()
+                .all(|provider| provider.models[0].id == raw)
+        );
+        assert!(
+            registry
+                .export_configs()
+                .unwrap()
+                .iter()
+                .all(|config| config.models[0].id == raw)
+        );
+    }
+
+    #[test]
+    fn raw_shared_ids_are_ambiguous_even_when_one_provider_is_unavailable() {
+        let registry = shared_registry();
+        let raw = ModelId::new("gpt-4o");
+        for error in [
+            registry.describe_model(&raw).unwrap_err(),
+            registry.pricing(&raw).unwrap_err(),
+            registry.create_provider(&raw).err().unwrap(),
+        ] {
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+            assert!(error.message.contains("ambiguous"));
+            assert!(error.message.contains(OPENAI_PROVIDER_ID));
+            assert!(error.message.contains(GITHUB_COPILOT_PROVIDER_ID));
+        }
+        let selector = ModelId::for_provider(&ProviderId::new(GITHUB_COPILOT_PROVIDER_ID), &raw);
+        registry
+            .configurations
+            .lock()
+            .unwrap()
+            .get_mut(&ProviderId::new(GITHUB_COPILOT_PROVIDER_ID))
+            .unwrap()
+            .credential = Some(CredentialRef::new("missing-credential"));
+        assert!(registry.create_provider(&selector).is_err());
+        assert!(registry.create_provider(&raw).is_err());
+        // Removing the provider (or the selected model) never selects OpenAI.
+        registry
+            .configurations
+            .lock()
+            .unwrap()
+            .remove(&ProviderId::new(GITHUB_COPILOT_PROVIDER_ID));
+        assert!(registry.describe_model(&selector).is_err());
+        assert!(registry.pricing(&selector).is_err());
+        assert!(registry.create_provider(&selector).is_err());
+        assert_eq!(
+            registry.describe_model(&raw).unwrap().provider.as_str(),
+            OPENAI_PROVIDER_ID
+        );
+        assert!(registry.create_provider(&raw).is_ok());
+        assert_eq!(registry.pricing(&raw).unwrap(), (100, 200));
+        let missing = ModelId::for_provider(
+            &ProviderId::new(OPENAI_PROVIDER_ID),
+            &ModelId::new("missing"),
+        );
+        assert!(registry.create_provider(&missing).is_err());
+    }
+
+    struct RawBoundaryProvider {
+        descriptor: ModelDescriptor,
+    }
+
+    impl ModelProvider for RawBoundaryProvider {
+        fn descriptor(&self) -> &ModelDescriptor {
+            &self.descriptor
+        }
+        fn stream(
+            &mut self,
+            request: &ModelRequest,
+            _: &CancellationToken,
+            sink: &mut dyn ModelStreamSink,
+        ) -> Result<()> {
+            assert_eq!(request.model, self.descriptor.id);
+            assert_eq!(openai_request_payload(request)["model"], "gpt-4o");
+            assert!(!uses_responses_endpoint(request.model.as_str()));
+            sink.emit(ModelStreamEvent::Usage {
+                usage: TokenUsage {
+                    input_tokens: 1000,
+                    output_tokens: 1000,
+                    cached_input_tokens: 0,
+                },
+            })?;
+            Ok(())
+        }
+        fn count_tokens(&self, request: &ModelRequest) -> u64 {
+            assert_eq!(request.model, self.descriptor.id);
+            42
+        }
+    }
+
+    #[test]
+    fn selector_boundary_preserves_raw_requests_and_usage_keys() {
+        let registry = shared_registry();
+        let raw = ModelId::new("gpt-4o");
+        let request = ModelRequest {
+            model: raw.clone(),
+            messages: vec![],
+            tools: vec![],
+            options: Default::default(),
+        };
+        for id in [OPENAI_PROVIDER_ID, GITHUB_COPILOT_PROVIDER_ID] {
+            let provider_id = ProviderId::new(id);
+            let selector = ModelId::for_provider(&provider_id, &raw);
+            let descriptor = registry.describe_model(&selector).unwrap();
+            let (_, raw_descriptor) = registry.resolve_model(&selector).unwrap();
+            let mut adapter = SelectedModelProvider {
+                descriptor,
+                inner: Box::new(AccountingProvider {
+                    inner: Box::new(RawBoundaryProvider {
+                        descriptor: raw_descriptor,
+                    }),
+                    ledger: Arc::clone(&registry.usage),
+                    input_cost_micros_per_1k: 100,
+                    output_cost_micros_per_1k: 200,
+                }),
+            };
+            let mut request = request.clone();
+            request.model = selector.clone();
+            assert_eq!(adapter.count_tokens(&request), 42);
+            assert!(adapter.health_check().is_ok());
+            adapter
+                .stream(
+                    &request,
+                    &CancellationToken::new(),
+                    &mut CollectingSink::default(),
+                )
+                .unwrap();
+            assert_eq!(request.model, selector);
+            let ledger = registry.usage().unwrap();
+            assert_eq!(ledger.summary(None, Some(&selector)).requests, 1);
+            assert_eq!(
+                ledger.summary(Some(&provider_id), Some(&raw)).cost_micros,
+                300
+            );
+            let other = ProviderId::new(if id == OPENAI_PROVIDER_ID {
+                GITHUB_COPILOT_PROVIDER_ID
+            } else {
+                OPENAI_PROVIDER_ID
+            });
+            assert_eq!(ledger.summary(Some(&other), Some(&selector)).requests, 0);
+            assert!(ledger.aggregates.keys().all(|key| key.model == raw));
+        }
+        assert_eq!(
+            registry.usage().unwrap().summary(None, Some(&raw)).requests,
+            2
+        );
     }
 }

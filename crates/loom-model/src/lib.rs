@@ -74,6 +74,21 @@ impl ModelId {
         Self(value.into())
     }
 
+    /// Select a raw model from one exact provider using a reserved, versioned
+    /// encoding that is reversible even when identifiers contain delimiters.
+    /// Provider configuration and wire payloads must keep the raw model ID.
+    pub fn for_provider(provider: &ProviderId, model: &ModelId) -> Self {
+        let pair =
+            serde_json::to_string(&(provider, model)).expect("string identifiers always serialize");
+        Self::new(format!("loom:model:v1:{pair}"))
+    }
+
+    /// Decode an explicit provider selection. Ordinary raw IDs are not split
+    /// by separators; malformed or unknown-version selectors return `None`.
+    pub fn provider_model(&self) -> Option<(ProviderId, ModelId)> {
+        serde_json::from_str(self.as_str().strip_prefix("loom:model:v1:")?).ok()
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -250,6 +265,30 @@ mod tests {
         ModelStreamEvent, OPENAI_DEFAULT_MODEL, ProviderConfig, ProviderHealth, ProviderId,
         ProviderKind, ProviderSummary, TokenUsage, declared_context_window,
     };
+
+    #[test]
+    fn provider_model_selections_round_trip_arbitrary_identifiers() {
+        for provider in ["openai", "a/b:c\"\\\n雪", ""] {
+            for raw in ["gpt-4o", "org/model:tag", "loom:model:v1:[\"a\",\"b\"]", ""] {
+                let provider = ProviderId::new(provider);
+                let raw = ModelId::new(raw);
+                let selector = ModelId::for_provider(&provider, &raw);
+                assert_eq!(selector.provider_model(), Some((provider, raw)));
+                let saved = serde_json::to_string(&selector).unwrap();
+                assert_eq!(serde_json::from_str::<ModelId>(&saved).unwrap(), selector);
+            }
+        }
+        for raw in [
+            "gpt-4o",
+            "org/model",
+            "loom:model:v1:invalid",
+            "loom:model:v1:[1,2]",
+            "loom:model:v1:[\"a\"]",
+            "loom:model:v2:[\"a\",\"b\"]",
+        ] {
+            assert_eq!(ModelId::new(raw).provider_model(), None);
+        }
+    }
 
     #[test]
     fn identifiers_and_messages_serialize_as_stable_values() {
