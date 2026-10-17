@@ -38,6 +38,12 @@ pub(crate) fn apply_project_agent_states(
 impl LoomView {
     pub(crate) fn refresh_active_project_snapshot(&mut self, cx: &mut Context<Self>) {
         let session_id = self.active_session.id;
+        if self.project_snapshot_refreshing.is_some() {
+            // Do not clear invalidations received while the request is pending.
+            // This also queues a refresh for the latest selection after a switch.
+            self.project_snapshot_stale = true;
+            return;
+        }
         let backend = match self.backend_for_session(session_id) {
             Ok(backend) => backend,
             Err(error) => {
@@ -46,6 +52,7 @@ impl LoomView {
             }
         };
         self.project_snapshot_stale = false;
+        self.project_snapshot_refreshing = Some(session_id);
         let request = backend.submit(RequestEnvelope::new(ClientRequest::Project(
             ProjectRequest::GetProjectSnapshotForSession { session_id },
         )));
@@ -54,7 +61,9 @@ impl LoomView {
                 .background_spawn(async move { request.wait().await })
                 .await;
             view.update(cx, |view, cx| {
+                view.project_snapshot_refreshing = None;
                 if view.active_session.id != session_id {
+                    view.refresh_active_project_snapshot(cx);
                     return;
                 }
                 let mut reload_sessions = false;
@@ -87,6 +96,11 @@ impl LoomView {
                 if reload_sessions {
                     view.reload_sessions(cx);
                 }
+                // Only a new invalidation queues another request; an error by
+                // itself must not cause an immediate retry loop.
+                if view.project_snapshot_stale {
+                    view.refresh_active_project_snapshot(cx);
+                }
                 view.schedule_project_poll(cx);
                 cx.notify();
             })
@@ -102,35 +116,34 @@ impl LoomView {
     /// Requests are issued one project at a time: a returned snapshot covers all
     /// of its agent sessions, and sessions that become covered are skipped.
     pub(crate) fn refresh_missing_project_snapshots(&mut self, cx: &mut Context<Self>) {
-        let pending = uncovered_session_ids(&self.sessions, &self.project_tree_snapshots)
-            .into_iter()
-            .filter_map(|session_id| {
-                self.session_node_ids
-                    .get(&session_id)
-                    .map(|node_id| (session_id, node_id.clone()))
-            })
-            .collect::<Vec<_>>();
-        if pending.is_empty() {
+        if self.missing_project_snapshots_refreshing {
             return;
         }
+        self.missing_project_snapshots_refreshing = true;
         cx.spawn(async move |view, cx| {
-            for (session_id, node_id) in pending {
-                let already_covered = view
-                    .update(cx, |view, _| {
-                        !uncovered_session_ids(&view.sessions, &view.project_tree_snapshots)
-                            .contains(&session_id)
-                    })
-                    .unwrap_or(true);
-                if already_covered {
-                    continue;
-                }
-                let backend = view
-                    .update(cx, |view, _| view.node_backends.get(&node_id).cloned())
-                    .ok()
-                    .flatten();
-                let Some(backend) = backend else {
-                    continue;
+            // A reload can change the session list while a request is pending.
+            // Re-read it after every response, but attempt each session only
+            // once in this scan, including standalone sessions and failures.
+            let mut attempted = std::collections::HashSet::new();
+            loop {
+                let next = view.update(cx, |view, _| {
+                    let next = uncovered_session_ids(&view.sessions, &view.project_tree_snapshots)
+                        .into_iter()
+                        .filter(|session_id| !attempted.contains(session_id))
+                        .find_map(|session_id| {
+                            let node_id = view.session_node_ids.get(&session_id)?;
+                            let backend = view.node_backends.get(node_id)?.clone();
+                            Some((session_id, backend))
+                        });
+                    if next.is_none() {
+                        view.missing_project_snapshots_refreshing = false;
+                    }
+                    next
+                });
+                let Ok(Some((session_id, backend))) = next else {
+                    break;
                 };
+                attempted.insert(session_id);
                 let request = backend.submit(RequestEnvelope::new(ClientRequest::Project(
                     ProjectRequest::GetProjectSnapshotForSession { session_id },
                 )));

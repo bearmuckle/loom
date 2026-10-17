@@ -532,6 +532,9 @@ pub(crate) struct LoomView {
         loom_protocol::GitDiff,
     )>,
     project_snapshot_stale: bool,
+    /// At most one active-pane snapshot request, across selection changes.
+    project_snapshot_refreshing: Option<AgentSessionId>,
+    missing_project_snapshots_refreshing: bool,
     project_feed_after_sequence: Option<EventSequence>,
     project_feed_epoch: Option<String>,
     project_poll_scheduled: bool,
@@ -1708,6 +1711,8 @@ impl LoomView {
             project_tree_snapshots: Vec::new(),
             project_child_review: None,
             project_snapshot_stale: false,
+            project_snapshot_refreshing: None,
+            missing_project_snapshots_refreshing: false,
             project_feed_after_sequence: None,
             project_feed_epoch: None,
             project_poll_scheduled: false,
