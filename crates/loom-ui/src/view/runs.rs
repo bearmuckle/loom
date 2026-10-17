@@ -301,6 +301,10 @@ impl LoomView {
         // the older pages the backfill names. A scroll-triggered older page stays
         // a single request.
         let mut backfill = before_ordinal.is_none().then(ReopenTranscriptBackfill::new);
+        // The event cursor as the backfill starts. A poll dispatched before it
+        // can still land between two pages and apply timeline items the
+        // rebuild would not know about.
+        let cursor_before = self.after_sequence;
         self.transcript_loading = true;
         cx.notify();
         cx.spawn(async move |view, cx| {
@@ -333,10 +337,22 @@ impl LoomView {
                             );
                             if next.is_none() {
                                 if backfill.is_some() {
-                                    // The backfill is done, so rebuild once from
-                                    // every loaded message and activity row to
-                                    // put them in one chronological order.
-                                    view.rebuild_transcript_from_loaded_messages();
+                                    let cursor_after = view.after_sequence;
+                                    if transcript_rebuild_after_backfill(
+                                        cursor_before,
+                                        cursor_after,
+                                    ) {
+                                        // The backfill is done, so rebuild once
+                                        // from every loaded message and
+                                        // activity row to put them in one
+                                        // chronological order.
+                                        view.rebuild_transcript_from_loaded_messages();
+                                    }
+                                    // An event landed mid-backfill, so keep the
+                                    // per-page prepend result: the rebuild would
+                                    // drop the item that event applied, which is
+                                    // worse than the order the prepend leaves.
+                                    // The next reopen reorders.
                                 }
                                 view.transcript_loading = false;
                             }

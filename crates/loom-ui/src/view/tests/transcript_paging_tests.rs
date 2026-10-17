@@ -667,6 +667,29 @@ fn reopen_backfill_follows_older_pages_until_it_stops() {
     );
 }
 
+/// A reopen rebuilds the timeline when its backfill stops only if no event
+/// landed while it ran: the rebuild keeps just the transcript messages and
+/// activities, so an event-applied item would be dropped (GitHub issue #261).
+#[test]
+fn backfill_rebuild_waits_for_an_unchanged_event_cursor() {
+    // The cursor never moved, or was absent both times.
+    assert!(transcript_rebuild_after_backfill(None, None));
+    assert!(transcript_rebuild_after_backfill(
+        Some(EventSequence::new(7)),
+        Some(EventSequence::new(7))
+    ));
+
+    // A poll landed mid-backfill and advanced the cursor.
+    assert!(!transcript_rebuild_after_backfill(
+        Some(EventSequence::new(7)),
+        Some(EventSequence::new(8))
+    ));
+    assert!(!transcript_rebuild_after_backfill(
+        None,
+        Some(EventSequence::new(1))
+    ));
+}
+
 /// The end state the reopen backfill produces: the newest page of a tool-heavy
 /// run holds no user turn and no assistant text, and the older page that carries
 /// them lands ahead of the tool traffic (GitHub issue #261).

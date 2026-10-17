@@ -158,7 +158,9 @@ impl LoomView {
                     }
                 }
             }
-            // Place every page and activity row in one chronological order.
+            // Place every page and activity row in one chronological order. This
+            // path is synchronous, so no event can be applied while it runs and
+            // no guard on the rebuild is needed.
             self.rebuild_transcript_from_loaded_messages();
         }
         self.ensure_session_task_message(self.active_session.id);

@@ -836,6 +836,20 @@ pub(crate) fn unseen_transcript_messages(
         .collect()
 }
 
+/// Whether a reopen's backfill may rebuild the timeline once it stops.
+///
+/// The rebuild keeps only `transcript_messages` plus activities, so a timeline
+/// item applied from an event while the backfill ran has no transcript ordinal
+/// and would be discarded. A poll that lands between two pages advances the
+/// event cursor, so a moved cursor refuses the rebuild: the per-page prepend
+/// result stays, and the next reopen puts the rows in order.
+pub(crate) fn transcript_rebuild_after_backfill(
+    cursor_before: Option<EventSequence>,
+    cursor_after: Option<EventSequence>,
+) -> bool {
+    cursor_before == cursor_after
+}
+
 pub(crate) fn merge_node_sessions(
     current: &[AgentSessionSnapshot],
     current_owners: &BTreeMap<AgentSessionId, String>,
