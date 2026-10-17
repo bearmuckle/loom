@@ -12,14 +12,14 @@ use loom_core::{
     InteractionId, LimitKind, LimitStatus, LoomError, PolicyEvaluation, Result, RunId,
     SessionLimits, StepId, Timestamp, UsageSnapshot,
 };
-use loom_model::{
-    CancellationToken, CompletionOptions, MessageRole, ModelId, ModelMessage, ModelProvider,
-    ModelRequest, ModelStreamEvent, StreamFlow, ToolCall,
-};
-pub use loom_protocol::{
+pub use loom_model::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, AgentEvent,
     AgentInteractionRecord, AgentPlan, AgentPlanStep, AgentRunSnapshot, AgentRunState,
     ApprovalDecision, FileActivityOperation, ProjectJoinContinuation,
+};
+use loom_model::{
+    CancellationToken, CompletionOptions, MessageRole, ModelId, ModelMessage, ModelProvider,
+    ModelRequest, ModelStreamEvent, StreamFlow, ToolCall,
 };
 use loom_tools::{ToolExecutor, ToolKind, ToolResult};
 use serde::{Deserialize, Serialize};
@@ -105,7 +105,7 @@ pub struct AgentRuntimeState {
     #[serde(default)]
     pub last_queued_direction_sequence: u64,
     #[serde(default)]
-    pub attempts: Vec<loom_protocol::AgentRunAttemptRecord>,
+    pub attempts: Vec<loom_model::AgentRunAttemptRecord>,
     pub pending_approval: Option<ToolCall>,
     #[serde(default)]
     pub pending_tool_execution: Option<ToolCall>,
@@ -123,7 +123,7 @@ pub struct AgentRuntimeState {
     pub context_inspection: Option<ContextInspection>,
     /// Summary and exclusive boundary in the repaired conversation history.
     #[serde(default)]
-    pub context_checkpoint: Option<loom_protocol::ContextSummary>,
+    pub context_checkpoint: Option<loom_core::ContextSummary>,
     pub provider_cursor: usize,
     pub step_id: Option<StepId>,
     pub step_index: u32,
@@ -296,7 +296,7 @@ pub struct AgentRuntime {
     session_id: AgentSessionId,
     task: AgentTask,
     run: AgentRunSnapshot,
-    attempts: Vec<loom_protocol::AgentRunAttemptRecord>,
+    attempts: Vec<loom_model::AgentRunAttemptRecord>,
     plan: AgentPlan,
     provider: Option<Box<dyn ModelProvider>>,
     tools: ToolExecutor,
@@ -316,7 +316,7 @@ pub struct AgentRuntime {
     options: AgentRuntimeOptions,
     usage: UsageSnapshot,
     context_inspection: Option<ContextInspection>,
-    context_checkpoint: Option<loom_protocol::ContextSummary>,
+    context_checkpoint: Option<loom_core::ContextSummary>,
     provider_cursor: usize,
     step_id: Option<StepId>,
     step_index: u32,
@@ -1800,7 +1800,7 @@ mod tests {
         assert_eq!(recovered_state.last_failed_call.unwrap().id, call_id);
         assert!(recovered_state.interactions.iter().any(|interaction| {
             interaction.attempt_id == attempt_id
-                && interaction.status == loom_protocol::AgentInteractionStatus::Approved
+                && interaction.status == loom_model::AgentInteractionStatus::Approved
                 && interaction.decision == Some(ApprovalDecision::Approved)
         }));
         assert!(!root.join("loom-m1-demo.txt").exists());
@@ -2192,7 +2192,7 @@ mod tests {
                 .iter()
                 .any(|interaction| {
                     interaction.id == interaction_id
-                        && interaction.status == loom_protocol::AgentInteractionStatus::Pending
+                        && interaction.status == loom_model::AgentInteractionStatus::Pending
                 })
         );
 
@@ -2217,7 +2217,7 @@ mod tests {
                 .iter()
                 .any(|interaction| {
                     interaction.id == interaction_id
-                        && interaction.status == loom_protocol::AgentInteractionStatus::Answered
+                        && interaction.status == loom_model::AgentInteractionStatus::Answered
                         && interaction.resolved_at.is_some()
                 })
         );

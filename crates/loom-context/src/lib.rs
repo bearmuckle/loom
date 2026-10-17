@@ -1,10 +1,10 @@
-use loom_core::{ErrorCode, LoomError, Result, Timestamp};
-pub use loom_model::estimate_message_tokens;
-use loom_model::{MessageRole, ModelMessage};
-pub use loom_protocol::{
+pub use loom_core::{
     ContextAssemblyOptions, ContextBudget, ContextInspection, ContextItem, ContextItemKind,
     ContextSummary,
 };
+use loom_core::{ErrorCode, LoomError, Result, Timestamp};
+pub use loom_model::estimate_message_tokens;
+use loom_model::{MessageRole, ModelMessage};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_OUTPUT_RESERVE: u64 = 1_024;

@@ -14,7 +14,7 @@ use git2::{
     build::{CheckoutBuilder, RepoBuilder},
 };
 use loom_core::{ErrorCode, LoomError, Result, Timestamp};
-pub use loom_protocol::{
+pub use loom_core::{
     GitBranch, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,
     GitFileStatusKind, GitRepositoryStatus,
 };

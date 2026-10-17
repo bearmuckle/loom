@@ -546,7 +546,7 @@ impl AgentRuntime {
                     self.pending_approval = Some(PendingApproval { call: call.clone() });
                     self.run.control_revision = control_revision;
                     let interaction_id = self.open_interaction(
-                        loom_protocol::AgentInteractionKind::ToolApproval,
+                        loom_model::AgentInteractionKind::ToolApproval,
                         "Tool approval requested".to_owned(),
                         Some(call.id),
                         control_revision,
@@ -701,7 +701,7 @@ impl AgentRuntime {
                     };
                     let control_revision = self.next_control_revision()?;
                     let interaction_id = self.open_interaction(
-                        loom_protocol::AgentInteractionKind::UserInput,
+                        loom_model::AgentInteractionKind::UserInput,
                         prompt.to_owned(),
                         None,
                         control_revision,
@@ -1083,7 +1083,7 @@ impl AgentRuntime {
         }
         reserve = reserve.min(u64::from(u32::MAX));
         options.reserved_output_tokens = Some(reserve);
-        let budget = loom_protocol::ContextBudget::new(
+        let budget = loom_core::ContextBudget::new(
             options.context_window,
             options.max_input_tokens,
             reserve,
@@ -1178,8 +1178,8 @@ impl AgentRuntime {
         if provider.descriptor().context_window.is_none()
             && self.options.context.context_window.is_none()
         {
-            inspection.items.push(loom_protocol::ContextItem {
-                kind: loom_protocol::ContextItemKind::SystemInstructions,
+            inspection.items.push(loom_core::ContextItem {
+                kind: loom_core::ContextItemKind::SystemInstructions,
                 label: "Model context window unknown; using an 8192-token fallback".to_owned(),
                 estimated_tokens: 0,
                 included: true,

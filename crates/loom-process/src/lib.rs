@@ -13,7 +13,7 @@ use std::{
 };
 
 use loom_core::{ErrorCode, EventSequence, LoomError, Result, TaskId, TerminalId, Timestamp};
-pub use loom_protocol::{
+pub use loom_core::{
     TaskArtifact, TaskEvent, TaskEventRecord, TaskEvidenceLink, TaskKind, TaskSnapshot, TaskSpec,
     TaskStatus, TerminalEvent, TerminalEventRecord, TerminalSnapshot, TerminalStatus,
     TerminalStream,

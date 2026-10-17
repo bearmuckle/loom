@@ -91,7 +91,7 @@ impl AgentRuntime {
             ));
         }
         let interaction_id = self.pending_interaction_id(
-            loom_protocol::AgentInteractionKind::ToolApproval,
+            loom_model::AgentInteractionKind::ToolApproval,
             attempt_id,
             expected_control_revision,
             Some(tool_call_id),
@@ -101,7 +101,7 @@ impl AgentRuntime {
         self.run.control_revision = control_revision;
         self.resolve_interaction(
             interaction_id,
-            loom_protocol::AgentInteractionStatus::Approved,
+            loom_model::AgentInteractionStatus::Approved,
             Some(ApprovalDecision::Approved),
         )?;
         self.pending_tool_execution = Some(pending.call.clone());
@@ -158,7 +158,7 @@ impl AgentRuntime {
             ));
         }
         let interaction_id = self.pending_interaction_id(
-            loom_protocol::AgentInteractionKind::ToolApproval,
+            loom_model::AgentInteractionKind::ToolApproval,
             attempt_id,
             expected_control_revision,
             Some(tool_call_id),
@@ -168,7 +168,7 @@ impl AgentRuntime {
         self.run.control_revision = control_revision;
         self.resolve_interaction(
             interaction_id,
-            loom_protocol::AgentInteractionStatus::Rejected,
+            loom_model::AgentInteractionStatus::Rejected,
             Some(ApprovalDecision::Rejected),
         )?;
         let mut events = vec![AgentEvent::ToolApprovalDecided {
@@ -394,7 +394,7 @@ impl AgentRuntime {
         }
         let interaction_id = if self.pending_input.is_some() {
             Some(self.pending_interaction_id(
-                loom_protocol::AgentInteractionKind::UserInput,
+                loom_model::AgentInteractionKind::UserInput,
                 attempt_id,
                 expected_control_revision,
                 None,
@@ -406,7 +406,7 @@ impl AgentRuntime {
         if let Some(interaction_id) = interaction_id {
             self.resolve_interaction(
                 interaction_id,
-                loom_protocol::AgentInteractionStatus::Answered,
+                loom_model::AgentInteractionStatus::Answered,
                 None,
             )?;
         }
@@ -460,7 +460,7 @@ impl AgentRuntime {
         }
         let previous_interaction = if self.pending_input.is_some() {
             Some(self.pending_interaction_id(
-                loom_protocol::AgentInteractionKind::UserInput,
+                loom_model::AgentInteractionKind::UserInput,
                 self.run.attempt_id,
                 self.run.control_revision,
                 None,
@@ -472,12 +472,12 @@ impl AgentRuntime {
         if let Some(interaction_id) = previous_interaction {
             self.resolve_interaction(
                 interaction_id,
-                loom_protocol::AgentInteractionStatus::Abandoned,
+                loom_model::AgentInteractionStatus::Abandoned,
                 None,
             )?;
         }
         let interaction_id = self.open_interaction(
-            loom_protocol::AgentInteractionKind::UserInput,
+            loom_model::AgentInteractionKind::UserInput,
             prompt.clone(),
             None,
             control_revision,
@@ -658,7 +658,7 @@ impl AgentRuntime {
         let started_at = Timestamp::now();
         self.run.updated_at = started_at;
         self.run.state = AgentRunState::Planning;
-        self.attempts.push(loom_protocol::AgentRunAttemptRecord {
+        self.attempts.push(loom_model::AgentRunAttemptRecord {
             run_id: self.run.id,
             session_id: self.session_id,
             id: self.run.attempt_id,

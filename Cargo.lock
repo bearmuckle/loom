@@ -4416,7 +4416,6 @@ dependencies = [
  "loom-context",
  "loom-core",
  "loom-model",
- "loom-protocol",
  "loom-providers",
  "loom-tools",
  "serde",
@@ -4452,7 +4451,6 @@ version = "0.1.0"
 dependencies = [
  "loom-core",
  "loom-model",
- "loom-protocol",
  "serde",
 ]
 
@@ -4517,7 +4515,6 @@ version = "0.1.0"
 dependencies = [
  "log",
  "loom-core",
- "loom-protocol",
  "portable-pty",
 ]
 
@@ -4600,7 +4597,6 @@ dependencies = [
  "log",
  "loom-core",
  "loom-model",
- "loom-protocol",
  "loom-vcs",
  "loom-workspace",
  "regex",
@@ -4646,7 +4642,6 @@ version = "0.1.0"
 dependencies = [
  "git2",
  "loom-core",
- "loom-protocol",
 ]
 
 [[package]]
@@ -4655,7 +4650,6 @@ version = "0.1.0"
 dependencies = [
  "ignore",
  "loom-core",
- "loom-protocol",
  "serde",
  "sha2 0.11.1",
  "similar 3.2.0",

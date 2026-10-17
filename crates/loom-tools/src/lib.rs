@@ -14,8 +14,8 @@ use loom_core::{
     ActionKind, AgentSessionId, ApprovalPolicy, PolicyEvaluation, ProjectWorktreeBaseRefresh,
     Result, Timestamp,
 };
+pub use loom_model::ToolResult;
 use loom_model::{CancellationToken, ToolCall, ToolDefinition};
-pub use loom_protocol::ToolResult;
 use loom_vcs::{BranchPushReport, GitService};
 use loom_workspace::{Workspace, WorkspaceEdit};
 use regex::RegexBuilder;

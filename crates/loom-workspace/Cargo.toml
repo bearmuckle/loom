@@ -3,12 +3,11 @@ name = "loom-workspace"
 description = "Workspace snapshots, scoped edits, watches, and checkpoints for Loom."
 version.workspace = true
 edition.workspace = true
-license = "AGPL-3.0-only"
+license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
 loom-core.workspace = true
-loom-protocol.workspace = true
 serde.workspace = true
 ignore.workspace = true
 sha2.workspace = true

@@ -74,8 +74,11 @@ The backend is a Rust service and library that can run:
 
 Suggested backend boundaries:
 
+- `loom-build`: shared build-script stamping of the release version and git
+  revision.
 - `loom-core`: identifiers, errors, timestamps, permissions, capability
-  negotiation, and shared domain types.
+  negotiation, and shared domain types, including source-control status and
+  diff records.
 - `loom-session`: durable agent sessions, conversation history, reconnect
   state, forks, handoff, and lifecycle.
 - `loom-agent`: agent loop, planning, tool-call dispatch, interruption,
@@ -95,9 +98,9 @@ Suggested backend boundaries:
   session, run, filesystem, feed, project) behind a `Persistence` supertrait.
   Durable state is written in per-mutation transactions, and large immutable
   payloads live in a content-addressed store inside SQLite. It uses a single
-  typed schema (currently version 4, with an in-place ladder from version 2);
-  a database written by an unsupported revision is rejected unchanged and must
-  be wiped. `FilePersistence` and `FilePersistence::in_memory()` share the same
+  typed schema (currently version 7, with an in-place upgrade ladder from
+  version 2); a database written by an unsupported revision is rejected
+  unchanged. `FilePersistence` and `FilePersistence::in_memory()` share the same
   schema, repository, and serialization code path. The crate depends only on
   neutral domain crates (`loom-core`/`loom-model`), never on the protocol
   contract or `loom-session`/`loom-providers`.
@@ -116,8 +119,12 @@ Suggested backend boundaries:
 - `loom-protocol`: versioned request/response/event schemas, the serializable
   data-transfer types they carry, and codecs. It depends only on `loom-core`
   and `loom-model`, so a client can speak the contract without linking the
-  backend implementation; the backend crates depend on the contract and
-  produce its types.
+  backend implementation. It re-exports the domain types it carries from
+  `loom-core` and `loom-model`, so the wire format is defined by those types.
+  The backend crates (`loom-agent`, `loom-context`, `loom-tools`,
+  `loom-workspace`, `loom-process`, `loom-vcs`) use only the domain crates and
+  do not depend on `loom-protocol`; `loom-server` maps domain state to the
+  protocol.
 - `loom-server`: listeners, authentication, connection management, and
   deployment configuration. The composition root owns the `InProcessBackend`,
   whose request dispatch is split into per-domain modules under `dispatch/`,
@@ -289,9 +296,10 @@ raw keys.
 
 The persistence layer stores typed SQLite tables covering session state, the
 authoritative event journal, serializable agent runtime state, workspace state
-and checkpoints, policy decisions, provider health, and usage ledgers. It uses
-a single baseline schema; a database written by another revision is rejected
-unchanged and must be wiped. A runtime that was executing during a process
+and checkpoints, policy decisions, provider health, and usage ledgers. The
+schema is at version 7 and databases from version 2 onward are upgraded in
+place; a database written by an unsupported revision is rejected unchanged. A
+runtime that was executing during a process
 crash is recovered in `paused` state so a new connection must explicitly
 resume it.
 
@@ -329,6 +337,7 @@ The repository is a Rust workspace:
 
 ```text
 crates/
+  loom-build/
   loom-core/
   loom-session/
   loom-agent/

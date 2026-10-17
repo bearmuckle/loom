@@ -3,12 +3,11 @@ name = "loom-vcs"
 description = "Scoped Git status, diff, index, branch, and commit integration for Loom."
 version.workspace = true
 edition.workspace = true
-license = "AGPL-3.0-only"
+license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
 loom-core.workspace = true
-loom-protocol.workspace = true
 
 # libgit2 uses macOS's SecureTransport framework for HTTPS, but `git2`'s
 # `https` feature still links `openssl-sys`. The release workflow builds the

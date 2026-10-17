@@ -1,4 +1,4 @@
-use loom_core::Timestamp;
+use crate::Timestamp;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

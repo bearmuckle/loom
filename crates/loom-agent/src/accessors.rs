@@ -188,18 +188,14 @@ impl AgentRuntime {
         let mut interaction_id = None;
         if self.pending_input.is_some() {
             let pending = self.pending_interaction_id(
-                loom_protocol::AgentInteractionKind::UserInput,
+                loom_model::AgentInteractionKind::UserInput,
                 attempt_id,
                 control_revision,
                 None,
             )?;
             interaction_id = Some(pending);
             let revision = self.next_control_revision()?;
-            self.resolve_interaction(
-                pending,
-                loom_protocol::AgentInteractionStatus::Answered,
-                None,
-            )?;
+            self.resolve_interaction(pending, loom_model::AgentInteractionStatus::Answered, None)?;
             self.run.control_revision = revision;
             self.pending_input = None;
         }

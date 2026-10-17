@@ -257,7 +257,7 @@ impl AgentRuntime {
 
     pub(crate) fn open_interaction(
         &mut self,
-        kind: loom_protocol::AgentInteractionKind,
+        kind: loom_model::AgentInteractionKind,
         prompt: String,
         tool_call_id: Option<loom_core::ToolCallId>,
         control_revision: u64,
@@ -270,7 +270,7 @@ impl AgentRuntime {
             attempt_id: self.run.attempt_id,
             control_revision,
             kind,
-            status: loom_protocol::AgentInteractionStatus::Pending,
+            status: loom_model::AgentInteractionStatus::Pending,
             tool_call_id,
             prompt,
             decision: None,
@@ -282,7 +282,7 @@ impl AgentRuntime {
 
     pub(crate) fn pending_interaction_id(
         &self,
-        kind: loom_protocol::AgentInteractionKind,
+        kind: loom_model::AgentInteractionKind,
         attempt_id: loom_core::RunAttemptId,
         control_revision: u64,
         tool_call_id: Option<loom_core::ToolCallId>,
@@ -292,7 +292,7 @@ impl AgentRuntime {
             .rev()
             .find(|interaction| {
                 interaction.kind == kind
-                    && interaction.status == loom_protocol::AgentInteractionStatus::Pending
+                    && interaction.status == loom_model::AgentInteractionStatus::Pending
                     && interaction.attempt_id == attempt_id
                     && interaction.control_revision == control_revision
                     && interaction.tool_call_id == tool_call_id
@@ -310,7 +310,7 @@ impl AgentRuntime {
     pub(crate) fn resolve_interaction(
         &mut self,
         interaction_id: InteractionId,
-        status: loom_protocol::AgentInteractionStatus,
+        status: loom_model::AgentInteractionStatus,
         decision: Option<ApprovalDecision>,
     ) -> Result<()> {
         let interaction = self
@@ -324,7 +324,7 @@ impl AgentRuntime {
                     false,
                 )
             })?;
-        if interaction.status != loom_protocol::AgentInteractionStatus::Pending {
+        if interaction.status != loom_model::AgentInteractionStatus::Pending {
             return Err(LoomError::invalid_state(
                 "run interaction has already been resolved",
             ));
@@ -339,9 +339,9 @@ impl AgentRuntime {
         let resolved_at = Timestamp::now();
         for interaction in &mut self.interactions {
             if interaction.attempt_id == attempt_id
-                && interaction.status == loom_protocol::AgentInteractionStatus::Pending
+                && interaction.status == loom_model::AgentInteractionStatus::Pending
             {
-                interaction.status = loom_protocol::AgentInteractionStatus::Abandoned;
+                interaction.status = loom_model::AgentInteractionStatus::Abandoned;
                 interaction.resolved_at = Some(resolved_at);
             }
         }

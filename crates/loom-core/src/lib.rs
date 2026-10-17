@@ -12,6 +12,7 @@ mod process;
 mod project;
 mod session;
 mod time;
+mod vcs;
 mod version;
 mod workspace;
 
@@ -59,6 +60,10 @@ pub use session::{
     AgentSessionSnapshot, AgentSessionState, SessionEvent, SessionEventRecord, SessionManagerState,
 };
 pub use time::Timestamp;
+pub use vcs::{
+    GitBranch, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,
+    GitFileStatusKind, GitRepositoryStatus,
+};
 pub use version::{CURRENT_PROTOCOL_VERSION, ProtocolVersion};
 pub use workspace::{WorkspaceManagerState, WorkspaceRecord};
 

@@ -11,8 +11,6 @@ use loom_model::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-mod vcs;
-
 pub use loom_core::{
     CURRENT_PROTOCOL_VERSION, Checkpoint, CheckpointFile, ClonedRepository, ContextAssemblyOptions,
     ContextBudget, ContextFileKind, ContextFileReference, ContextInspection, ContextItem,
@@ -25,6 +23,10 @@ pub use loom_core::{
     WorkspaceControl, WorkspaceEdit, WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind,
     WorkspaceRecord,
 };
+pub use loom_core::{
+    GitBranch, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,
+    GitFileStatusKind, GitRepositoryStatus,
+};
 pub use loom_model::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, AgentEvent,
     AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
@@ -35,10 +37,6 @@ pub use loom_model::{
     MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, ProjectJoinContinuation, ServerEvent, ServerEventEnvelope,
     ToolResult, ToolResultKind, WorkspaceEvent, WorkspaceEventEnvelope, WorkspaceFeedEvent,
     tool_result_kind,
-};
-pub use vcs::{
-    GitBranch, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,
-    GitFileStatusKind, GitRepositoryStatus,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

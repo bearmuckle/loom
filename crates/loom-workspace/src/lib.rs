@@ -18,7 +18,7 @@ use similar::TextDiff;
 mod instructions;
 
 pub use instructions::MAX_CONTEXT_FILE_BYTES;
-pub use loom_protocol::{
+pub use loom_core::{
     Checkpoint, CheckpointFile, ContextFileKind, ContextFileReference, RevertResult,
     SessionFilesystemChange, SessionFilesystemFile, SessionFilesystemSnapshot, UndoResult,
     WorkspaceChangeKind, WorkspaceControl, WorkspaceEdit, WorkspaceEditResult, WorkspaceEntry,

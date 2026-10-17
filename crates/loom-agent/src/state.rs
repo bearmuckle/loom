@@ -79,25 +79,25 @@ impl AgentRuntime {
         }
         let resolved_at = Timestamp::now();
         for interaction in &mut state.interactions {
-            if interaction.status != loom_protocol::AgentInteractionStatus::Pending {
+            if interaction.status != loom_model::AgentInteractionStatus::Pending {
                 continue;
             }
             let active = interaction.attempt_id == state.run.attempt_id
                 && interaction.control_revision == state.run.control_revision
                 && match interaction.kind {
-                    loom_protocol::AgentInteractionKind::ToolApproval => state
+                    loom_model::AgentInteractionKind::ToolApproval => state
                         .pending_approval
                         .as_ref()
                         .is_some_and(|call| interaction.tool_call_id == Some(call.id)),
-                    loom_protocol::AgentInteractionKind::UserInput => state.pending_input.is_some(),
+                    loom_model::AgentInteractionKind::UserInput => state.pending_input.is_some(),
                 };
             if !active {
-                interaction.status = loom_protocol::AgentInteractionStatus::Abandoned;
+                interaction.status = loom_model::AgentInteractionStatus::Abandoned;
                 interaction.resolved_at = Some(resolved_at);
             }
         }
         if state.attempts.is_empty() {
-            state.attempts.push(loom_protocol::AgentRunAttemptRecord {
+            state.attempts.push(loom_model::AgentRunAttemptRecord {
                 run_id: state.run.id,
                 session_id: state.session_id,
                 id: state.run.attempt_id,
