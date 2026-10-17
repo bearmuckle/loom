@@ -33,13 +33,73 @@ pub(crate) struct WorkerSectionHeader {
     pub(crate) subtitle_color: Rgba,
 }
 
+/// The sessions and project snapshots a pane's rows resolve their menu data
+/// from.
+///
+/// One `Rc` per list content means rendering a row never clones a session or a
+/// project snapshot, and a menu clones the single snapshot it needs only when
+/// it opens.
+#[derive(Debug, Default)]
+pub(crate) struct ProjectListData {
+    /// Every known session, by id, so a row finds the session it selects.
+    sessions: BTreeMap<AgentSessionId, AgentSessionSnapshot>,
+    /// Every known project snapshot, by root session id, which is the session a
+    /// project row selects.
+    projects: BTreeMap<AgentSessionId, loom_core::ProjectSnapshot>,
+}
+
+impl ProjectListData {
+    fn new(sessions: &[AgentSessionSnapshot], projects: &[&loom_core::ProjectSnapshot]) -> Self {
+        let mut data = Self::default();
+        for session in sessions {
+            data.sessions.insert(session.id, session.clone());
+        }
+        for project in projects {
+            data.projects
+                .entry(project.root_session_id)
+                .or_insert_with(|| (*project).clone());
+        }
+        data
+    }
+
+    /// Whether these maps already hold exactly these sessions and snapshots, so
+    /// a frame reuses them instead of cloning every snapshot again.
+    fn covers(
+        &self,
+        sessions: &[AgentSessionSnapshot],
+        projects: &[&loom_core::ProjectSnapshot],
+    ) -> bool {
+        self.sessions.len() == sessions.len()
+            && sessions
+                .iter()
+                .all(|session| self.sessions.get(&session.id) == Some(session))
+            && self.projects.len() == projects.len()
+            && projects
+                .iter()
+                .all(|project| self.projects.get(&project.root_session_id) == Some(*project))
+    }
+}
+
 /// The content the project list was last handed, kept so the view can skip
 /// redundant updates instead of rebuilding the list on every frame.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct ProjectListView {
     pub(crate) sections: Vec<ProjectListSection>,
     pub(crate) headers: Vec<WorkerSectionHeader>,
     pub(crate) layout: ResponsiveLayout,
+    /// The snapshots rows resolve their menus from, shared with every row.
+    pub(crate) data: Rc<ProjectListData>,
+}
+
+impl PartialEq for ProjectListView {
+    /// Compares the rendered content plus whether the shared snapshots were
+    /// rebuilt, without walking every snapshot on a frame that reuses them.
+    fn eq(&self, other: &Self) -> bool {
+        self.sections == other.sections
+            && self.headers == other.headers
+            && self.layout == other.layout
+            && Rc::ptr_eq(&self.data, &other.data)
+    }
 }
 
 impl ProjectListView {
@@ -87,6 +147,7 @@ impl ProjectListDelegate {
                 sections: Vec::new(),
                 headers: Vec::new(),
                 layout,
+                data: Rc::new(ProjectListData::default()),
             },
         }
     }
@@ -116,23 +177,17 @@ impl ListDelegate for ProjectListDelegate {
         &mut self,
         ix: IndexPath,
         _window: &mut Window,
-        cx: &mut Context<ListState<Self>>,
+        _cx: &mut Context<ListState<Self>>,
     ) -> Option<ListItem> {
-        let row = self
-            .content
-            .sections
-            .get(ix.section)?
-            .rows
-            .get(ix.row)?
-            .clone();
+        let row = self.content.sections.get(ix.section)?.rows.get(ix.row)?;
         let row_index = self.content.row_number(ix);
         let view = self.view.upgrade();
         Some(render_project_row(
-            &row,
+            row,
             row_index,
             self.content.layout,
             view.as_ref(),
-            cx,
+            &self.content.data,
         ))
     }
 
@@ -270,17 +325,8 @@ fn render_project_row(
     row_index: usize,
     layout: ResponsiveLayout,
     view: Option<&Entity<LoomView>>,
-    cx: &App,
+    data: &Rc<ProjectListData>,
 ) -> ListItem {
-    let session = view.and_then(|view| {
-        view.read(cx)
-            .sessions
-            .iter()
-            .find(|session| session.id == row.session_id)
-            .cloned()
-    });
-    let project = view.and_then(|view| view.read(cx).project_snapshot_for(row.session_id));
-
     let mut title_line = div()
         .flex()
         .items_center()
@@ -352,21 +398,33 @@ fn render_project_row(
         .gap_1()
         .overflow_hidden();
     if let (Some(summary), Some(view)) = (row.summary.clone(), view) {
-        let agents = row.agents.clone();
         let menu_view = view.clone();
+        let menu_data = data.clone();
+        let agents = row.agents.clone();
+        let root_session_id = row.session_id;
         detail_trailing = detail_trailing.child(
             Button::new(("project-agents", row_index))
                 .label(summary.clone())
                 .ghost()
                 .small()
                 .accessibility_label(summary)
-                .dropdown_menu(move |menu, _, _| project_agent_menu(menu, &agents, &menu_view)),
+                .dropdown_menu(move |menu, window, cx| {
+                    project_agent_menu(
+                        menu,
+                        &agents,
+                        root_session_id,
+                        &menu_data,
+                        &menu_view,
+                        window,
+                        cx,
+                    )
+                }),
         );
     }
-    if let (true, Some(view), Some(session)) = (layout.phone, view, session.clone()) {
+    if let (true, Some(view)) = (layout.phone, view) {
         let menu_view = view.clone();
-        let menu_session = session.clone();
-        let menu_project = project.clone();
+        let menu_data = data.clone();
+        let session_id = row.session_id;
         detail_trailing = detail_trailing.child(
             Button::new(("project-menu", row_index))
                 .icon(Icon::new(IconName::Ellipsis))
@@ -374,12 +432,7 @@ fn render_project_row(
                 .small()
                 .accessibility_label("Project actions")
                 .dropdown_menu(move |menu, _, _| {
-                    LoomView::build_project_session_context_menu(
-                        menu,
-                        menu_session.clone(),
-                        menu_project.clone(),
-                        menu_view.clone(),
-                    )
+                    project_session_menu(menu, session_id, &menu_data, &menu_view)
                 }),
         );
     }
@@ -396,21 +449,18 @@ fn render_project_row(
         .child(title_line)
         .child(detail_line);
     // Right-click reaches the same menu the phone's ellipsis opens.
-    let content = match (view, session) {
-        (Some(view), Some(session)) => {
+    let content = match view {
+        Some(view) => {
             let menu_view = view.clone();
+            let menu_data = data.clone();
+            let session_id = row.session_id;
             content
                 .context_menu(move |menu, _, _| {
-                    LoomView::build_project_session_context_menu(
-                        menu,
-                        session.clone(),
-                        project.clone(),
-                        menu_view.clone(),
-                    )
+                    project_session_menu(menu, session_id, &menu_data, &menu_view)
                 })
                 .into_any_element()
         }
-        _ => content.into_any_element(),
+        None => content.into_any_element(),
     };
     ListItem::new(("project-row", row_index))
         .mx_1()
@@ -421,24 +471,60 @@ fn render_project_row(
         .child(content)
 }
 
-/// The dropdown menu of a project row: one item per delegated agent, each
-/// opening that agent's transcript.
+/// The project row's own context menu, built from the row's session and the
+/// snapshot that covers it.
+///
+/// Both are cloned here rather than while rendering, so a frame that only draws
+/// the row never copies a snapshot.
+fn project_session_menu(
+    menu: PopupMenu,
+    session_id: AgentSessionId,
+    data: &ProjectListData,
+    view: &Entity<LoomView>,
+) -> PopupMenu {
+    let Some(session) = data.sessions.get(&session_id).cloned() else {
+        return menu;
+    };
+    let project = data.projects.get(&session_id).cloned();
+    LoomView::build_project_session_context_menu(menu, session, project, view.clone())
+}
+
+/// The dropdown menu of a project row: one submenu per delegated agent, built
+/// from that agent's child controls so the row's summary still reaches them.
 fn project_agent_menu(
     mut menu: PopupMenu,
     agents: &[ProjectAgentRow],
+    root_session_id: AgentSessionId,
+    data: &Rc<ProjectListData>,
     view: &Entity<LoomView>,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
     for agent in agents {
-        let session_id = agent.session_id;
+        let agent_session_id = agent.session_id;
+        let menu_data = data.clone();
         let menu_view = view.clone();
         let label = format!(
             "{} · {}",
             agent.name,
             session_status_pill(agent.state, None).label
         );
-        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-            menu_view.update(cx, |view, cx| view.open_project_agent(session_id, cx));
-        }));
+        // The agent's menu is the child-control menu, which opens with
+        // "Open transcript" for a delegated session.
+        menu = menu.submenu(label, window, cx, move |menu, _, _| {
+            let (Some(session), Some(project)) = (
+                menu_data.sessions.get(&agent_session_id).cloned(),
+                menu_data.projects.get(&root_session_id).cloned(),
+            ) else {
+                return menu;
+            };
+            LoomView::build_project_session_context_menu(
+                menu,
+                session,
+                Some(project),
+                menu_view.clone(),
+            )
+        });
     }
     menu
 }
@@ -486,9 +572,10 @@ impl LoomView {
     /// Derives the pane's project rows and hands them to the list, creating it
     /// on the first frame.
     ///
-    /// The list is only rebuilt when the derived rows, the headings, or the
-    /// layout change, and the highlight is only moved when the project that
-    /// owns the active session changes, so this cannot notify in a loop.
+    /// The list is only rebuilt when the derived rows, the headings, the layout,
+    /// or the shared snapshots change, and the highlight is only moved when they
+    /// change or the project that owns the active session changes, so this
+    /// cannot notify in a loop.
     pub(crate) fn sync_project_list(
         &mut self,
         layout: ResponsiveLayout,
@@ -533,10 +620,20 @@ impl LoomView {
             .iter()
             .map(|section| self.worker_section_header(&section.node_id))
             .collect::<Vec<_>>();
+        // Rows resolve the session and project snapshot their menus need from
+        // these shared maps, so a frame reuses them and a menu copies one
+        // snapshot only when it opens.
+        let data = match self.project_list_view.as_ref() {
+            Some(listed) if listed.data.covers(&self.sessions, &projects) => {
+                Rc::clone(&listed.data)
+            }
+            _ => Rc::new(ProjectListData::new(&self.sessions, &projects)),
+        };
         let view_content = ProjectListView {
             sections: model.sections,
             headers,
             layout,
+            data,
         };
 
         let list = match self.project_list.clone() {
@@ -570,8 +667,10 @@ impl LoomView {
         }
 
         // The highlight follows the project that owns the active session, so a
-        // sub agent keeps its project's row selected.
-        if self.project_list_active != model.selected {
+        // sub agent keeps its project's row selected. Re-applying it when the
+        // rows change matters too: a filter or a row disappearing can move the
+        // selected project to other coordinates, or drop it entirely.
+        if changed || self.project_list_active != model.selected {
             self.project_list_active = model.selected;
             let index = self
                 .project_list_view
@@ -608,8 +707,8 @@ impl LoomView {
         self.navigate_to_session(session, cx);
     }
 
-    /// Opens a session from the left pane. A project row, an agent summary item,
-    /// and the row's context menu all take this path.
+    /// Opens a session from the left pane. A project row and an agent's
+    /// submenu item both take this path.
     pub(crate) fn navigate_to_session(
         &mut self,
         session: AgentSessionSnapshot,
@@ -628,44 +727,6 @@ impl LoomView {
             self.dismiss_surfaces();
         }
         cx.notify();
-    }
-
-    /// Opens a delegated agent's transcript, the way its project row's summary
-    /// menu offers it.
-    pub(crate) fn open_project_agent(
-        &mut self,
-        session_id: AgentSessionId,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(session) = self
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
-            .cloned()
-        else {
-            return;
-        };
-        self.navigate_to_session(session, cx);
-    }
-
-    /// The known project snapshot that covers a session, for its row's context
-    /// menu.
-    fn project_snapshot_for(
-        &self,
-        session_id: AgentSessionId,
-    ) -> Option<loom_core::ProjectSnapshot> {
-        let covers = |project: &&loom_core::ProjectSnapshot| {
-            project.root_session_id == session_id
-                || project
-                    .agents
-                    .iter()
-                    .any(|agent| agent.session_id == session_id)
-        };
-        self.project_tree_snapshots
-            .iter()
-            .find(covers)
-            .or_else(|| self.project_snapshot.as_ref().filter(covers))
-            .cloned()
     }
 
     /// Renders the pane's project list: one scrolling region for every worker

@@ -218,8 +218,9 @@ fn applying_a_project_snapshot_stops_the_project_row_activity(cx: &mut TestAppCo
             window.try_find(("project-activity", 0usize)).is_none(),
             "a project whose agents have finished must not keep animating"
         );
-        // The child's row pill is fed by this state, so it reads as finished
-        // instead of the stale "Working" it showed before.
+        // The project row's agent summary is fed by this state, so the
+        // manager is counted as done instead of as the stale running agent it
+        // showed before.
         let manager_state = view
             .read(cx)
             .sessions

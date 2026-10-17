@@ -648,24 +648,52 @@ fn the_phone_drawer_closes_when_a_project_row_is_selected(cx: &mut TestAppContex
     .unwrap();
 }
 
-/// The agent summary is a menu: it lists the project's agents and opens the
-/// transcript of the one that is picked.
-#[gpui_kit::test]
-fn the_agent_summary_opens_an_agents_transcript(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let (handle, view) = open_nested_project(cx);
+/// Opens the first project row's agent summary menu.
+fn open_summary_menu(cx: &mut TestAppContext, handle: gpui_kit::WindowHandle<Root>) {
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
         window.click(("project-agents", 0usize), cx);
     })
     .unwrap();
     cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
+}
+
+/// Opens the submenu of the agent at `agent_index` in the summary menu that is
+/// already open. The submenu is where that agent's transcript and child
+/// controls live.
+fn open_agent_submenu(
+    cx: &mut TestAppContext,
+    handle: gpui_kit::WindowHandle<Root>,
+    agent_index: usize,
+) {
     cx.update_window(handle.into(), |_, window, cx| {
-        window.render_frame(cx);
-        let mut menu = window.within("popup-menu");
+        window.within("popup-menu").hover(agent_index, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
+}
+
+/// The agent summary is a menu: it lists the project's agents and each agent's
+/// submenu opens that agent's transcript.
+#[gpui_kit::test]
+fn the_agent_summary_opens_an_agents_transcript(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (handle, view) = open_nested_project(cx);
+    open_summary_menu(cx, handle);
+    cx.update_window(handle.into(), |_, window, _| {
+        let menu = window.within("popup-menu");
         assert_eq!(menu.find(0usize).label(), Some("Manager · Working"));
         assert_eq!(menu.find(1usize).label(), Some("Worker · Done"));
-        menu.click(1usize, cx);
+    })
+    .unwrap();
+
+    open_agent_submenu(cx, handle, 1);
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.within("submenu").click(0usize, cx);
     })
     .unwrap();
     cx.run_until_parked();
@@ -674,8 +702,29 @@ fn the_agent_summary_opens_an_agents_transcript(cx: &mut TestAppContext) {
         assert_eq!(
             view.read(cx).active_session.name,
             "Worker",
-            "the agent menu opens that agent's transcript"
+            "the agent submenu opens that agent's transcript"
         );
+    })
+    .unwrap();
+}
+
+/// Summarising an agent on its project row must not hide its child controls:
+/// the agent's submenu carries the same control menu a child row used to.
+#[gpui_kit::test]
+fn an_agent_submenu_keeps_the_child_controls_reachable(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (handle, _view) = open_nested_project(cx);
+    open_summary_menu(cx, handle);
+    // The manager is running for its project root, so it can be paused.
+    open_agent_submenu(cx, handle, 0);
+    cx.update_window(handle.into(), |_, window, _| {
+        let submenu = window.within("submenu");
+        assert_eq!(
+            submenu.find(0usize).label(),
+            Some("Open transcript"),
+            "the agent's transcript stays the first item"
+        );
+        assert_eq!(submenu.find(1usize).label(), Some("Pause child"));
     })
     .unwrap();
 }
@@ -697,6 +746,65 @@ fn right_clicking_a_project_row_opens_its_context_menu(cx: &mut TestAppContext) 
         let menu = window.within("popup-menu");
         assert_eq!(menu.find(0usize).label(), Some("Rename"));
         assert_eq!(menu.find(1usize).label(), Some("Archive project"));
+    })
+    .unwrap();
+}
+
+/// Narrowing the list with the filter keeps the highlight on the selected
+/// project instead of leaving it on the coordinates the row used to have.
+#[gpui_kit::test]
+fn the_filter_moves_the_highlight_with_the_selected_project(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let rendered = Rc::new(RefCell::new(None));
+    let rendered_for_window = rendered.clone();
+    let handle = cx.open_window(size(px(1280.), px(800.)), move |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.active_session.name = "alpha".to_owned();
+            let mut second = view.active_session.clone();
+            second.id = AgentSessionId::new();
+            second.name = "beta".to_owned();
+            for session in [&view.active_session, &second] {
+                view.session_node_ids
+                    .insert(session.id, view.default_backend_node_id.clone());
+            }
+            view.sessions = vec![view.active_session.clone(), second.clone()];
+            // The selected project starts on the second row; filtering the
+            // other project out moves it to the first.
+            view.active_session = second;
+            view
+        });
+        *rendered_for_window.borrow_mut() = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let view = rendered
+        .borrow_mut()
+        .take()
+        .expect("the window built the view");
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let list = view.read(cx).project_list.clone().expect("the list exists");
+        assert_eq!(
+            list.read(cx).selected_index(),
+            Some(IndexPath::new(1).section(0)),
+            "the selected project starts on its own row"
+        );
+        view.update(cx, |view, cx| {
+            if let Some(filter) = view.session_filter_input.clone() {
+                filter.update(cx, |state, cx| state.focus(window, cx));
+            }
+        });
+        window.input("beta", cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find(("project-name", 1usize)).is_none(),
+            "the filter leaves one row"
+        );
+        assert_eq!(
+            list.read(cx).selected_index(),
+            Some(IndexPath::new(0).section(0)),
+            "the highlight moves with the selected project"
+        );
     })
     .unwrap();
 }

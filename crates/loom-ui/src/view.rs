@@ -540,7 +540,8 @@ pub(crate) struct LoomView {
     project_list: Option<Entity<ListState<render::sidebar::ProjectListDelegate>>>,
     /// Keeps the list's own selection and confirm events wired to this view.
     project_list_subscription: Option<Subscription>,
-    /// The rows, headings, and layout the list was last synchronized to.
+    /// The rows, headings, layout, and shared snapshots the list was last
+    /// synchronized to.
     project_list_view: Option<render::sidebar::ProjectListView>,
     /// The project row the list was last synchronized to highlight.
     project_list_active: Option<AgentSessionId>,

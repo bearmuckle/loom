@@ -389,6 +389,9 @@ restart. Existing run-recovery behavior remains covered by its restart tests.
    independent. Project archive is rejected while any child task is queued,
    blocked, or running; after tasks are terminal, archive the descendant
    sessions with the root.
+6. **Implemented:** the left pane lists one row per project and summarises that
+   project's delegated agents on the row; an agent's transcript and child
+   controls are reached through the row's agent summary menu.
 
 **Exit:** users can inspect, message through the manager, and control each
 child independently; project state reconstructs after reconnect.
