@@ -897,7 +897,30 @@ impl InProcessConnection {
             | ClientRequest::Access(loom_protocol::AccessRequest::RevokeSessionAccess {
                 session_id: requested_session,
                 ..
-            }) => session_id = Some(*requested_session),
+            })
+            | ClientRequest::Collaboration(
+                loom_protocol::CollaborationRequest::SendPeerMessage {
+                    session_id: requested_session,
+                    ..
+                },
+            ) => session_id = Some(*requested_session),
+            ClientRequest::Collaboration(loom_protocol::CollaborationRequest::DirectAgent {
+                run_id: requested_run,
+                ..
+            })
+            | ClientRequest::Collaboration(
+                loom_protocol::CollaborationRequest::AnswerAgentQuestion {
+                    run_id: requested_run,
+                    ..
+                },
+            )
+            | ClientRequest::Collaboration(loom_protocol::CollaborationRequest::ControlRun {
+                run_id: requested_run,
+                ..
+            })
+            | ClientRequest::Collaboration(loom_protocol::CollaborationRequest::GetRunRevision {
+                run_id: requested_run,
+            }) => run_id = Some(*requested_run),
         }
 
         if let ClientRequest::Repository(RepositoryRequest::AttachSessionRepository {

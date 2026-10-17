@@ -2,6 +2,7 @@
 
 use super::*;
 
+mod collaboration;
 mod events;
 mod filesystem;
 mod project;

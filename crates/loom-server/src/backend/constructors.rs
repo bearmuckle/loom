@@ -270,6 +270,7 @@ impl InProcessBackend {
             Capability::WriteSessionFilesystem,
             Capability::ReadSessionRoster,
             Capability::ManageSessionAccess,
+            Capability::SendPeerMessage,
         ];
         if persistence.is_some() {
             supported_capabilities.extend([
@@ -313,6 +314,7 @@ impl InProcessBackend {
             idempotency_store: IdempotencyStore::new(),
             admissions: AdmissionService::new(),
             access: Arc::new(AccessService::new()),
+            collaboration: CollaborationService::new(),
             self_reference: Mutex::new(Weak::new()),
             request_lifecycle: RwLock::new(0),
             persistence_failed: AtomicBool::new(false),
@@ -327,6 +329,17 @@ impl InProcessBackend {
             .self_reference
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&backend);
+        // Connects and disconnects push the new roster to the session feeds.
+        let weak = Arc::downgrade(&backend);
+        backend
+            .access
+            .set_roster_listener(Arc::new(move |sessions: Vec<AgentSessionId>| {
+                if let Some(backend) = weak.upgrade() {
+                    for session_id in sessions {
+                        backend.publish_roster(session_id);
+                    }
+                }
+            }));
         // Access is restored first: restoring sessions can save state, and a
         // save rewrites the stored grants from memory.
         if let Some(persistence) = &backend.persistence {

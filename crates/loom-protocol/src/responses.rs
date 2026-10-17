@@ -438,6 +438,43 @@ pub enum ServerResponse {
     Task(TaskResponse),
     Project(ProjectResponse),
     Access(AccessResponse),
+    Collaboration(CollaborationResponse),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum CollaborationResponse {
+    /// The stored peer chat entry.
+    PeerMessageSent { entry: Box<CollaborationEntry> },
+
+    /// The outcome of a direction, answer, or run control request.
+    RunAction(Box<RunActionOutcome>),
+
+    RunRevision {
+        run_id: RunId,
+        revision: RunRevision,
+    },
+}
+
+/// Whether a run-scoped collaboration request was applied.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
+pub enum RunActionOutcome {
+    /// Applied. `entry.revision` and `revision` are the run's revision after
+    /// the action.
+    Accepted {
+        entry: CollaborationEntry,
+        revision: RunRevision,
+        run: AgentRunSnapshot,
+    },
+    /// Not applied, because the run moved past the expected revision (most
+    /// often because someone else acted first). Nothing was changed.
+    Conflict {
+        expected: RunRevision,
+        current: RunRevision,
+        run: AgentRunSnapshot,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

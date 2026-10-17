@@ -106,6 +106,18 @@ pub enum ServerEvent {
         provider_id: ProviderId,
         health: ProviderHealth,
     },
+    /// An attributed peer chat message, agent direction, answer, run control
+    /// action, or access change. Persisted in the session history; peer chat
+    /// entries are never assembled into model context.
+    Collaboration {
+        entry: loom_core::CollaborationEntry,
+    },
+    /// The session roster changed: someone connected, disconnected, or had
+    /// their role granted, changed, or revoked. Carries the full roster so
+    /// clients replace their copy instead of polling.
+    SessionRosterChanged {
+        entries: Vec<loom_core::RosterEntry>,
+    },
 }
 
 impl From<SessionEventRecord> for ServerEventEnvelope {

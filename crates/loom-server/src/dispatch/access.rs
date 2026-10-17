@@ -42,6 +42,7 @@ impl InProcessConnection {
                      {session_id}",
                     grant.role.as_str()
                 );
+                self.record_access_change(session_id, participant_id, Some(grant.role))?;
                 AccessResponse::SessionGrant(grant)
             }
             AccessRequest::SetSessionRole {
@@ -60,6 +61,7 @@ impl InProcessConnection {
                     "[loom-server] participant {participant_id} is now {} in session {session_id}",
                     grant.role.as_str()
                 );
+                self.record_access_change(session_id, participant_id, Some(grant.role))?;
                 AccessResponse::SessionGrant(grant)
             }
             AccessRequest::RevokeSessionAccess {
@@ -71,6 +73,7 @@ impl InProcessConnection {
                 log::info!(
                     "[loom-server] revoked participant {participant_id} from session {session_id}"
                 );
+                self.record_access_change(session_id, participant_id, None)?;
                 AccessResponse::SessionAccessRevoked {
                     session_id,
                     participant_id,
@@ -78,5 +81,30 @@ impl InProcessConnection {
             }
         };
         Ok(ServerResponse::Access(response))
+    }
+
+    /// Records an attributed access change in the session history and pushes
+    /// the new roster to the session's readers.
+    fn record_access_change(
+        &self,
+        session_id: AgentSessionId,
+        participant_id: loom_core::ParticipantId,
+        role: Option<loom_core::SessionRole>,
+    ) -> Result<()> {
+        self.backend
+            .record_collaboration(loom_core::CollaborationEntry {
+                session_id,
+                run_id: None,
+                author: self.author(session_id)?,
+                recipient: loom_core::Recipient::People,
+                kind: loom_core::CollaborationEntryKind::AccessChanged {
+                    participant: self.backend.access.identity(participant_id),
+                    role,
+                },
+                revision: None,
+                created_at: Timestamp::now(),
+            })?;
+        self.backend.publish_roster(session_id);
+        self.backend.persist_state()
     }
 }

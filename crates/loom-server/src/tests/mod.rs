@@ -37,6 +37,7 @@ use super::*;
 use support::*;
 
 mod access;
+mod collaboration;
 mod event_pages;
 mod feed;
 mod filesystem;

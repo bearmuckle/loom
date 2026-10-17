@@ -249,7 +249,10 @@ impl LoomView {
                     self.review.mark_changes_unread_from_event();
                 }
             }
-            ServerEvent::Terminal { .. } | ServerEvent::Task { .. } => {}
+            ServerEvent::Terminal { .. }
+            | ServerEvent::Task { .. }
+            | ServerEvent::Collaboration { .. }
+            | ServerEvent::SessionRosterChanged { .. } => {}
             ServerEvent::ProviderHealthChanged {
                 provider_id,
                 health,

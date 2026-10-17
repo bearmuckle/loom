@@ -1522,6 +1522,12 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
                 health.state
             );
         }
+        ServerEvent::Collaboration { entry } => {
+            println!("Collaboration: {:?} -> {:?}", entry.author, entry.recipient);
+        }
+        ServerEvent::SessionRosterChanged { entries } => {
+            println!("Roster changed: {} people", entries.len());
+        }
     }
 }
 

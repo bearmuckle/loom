@@ -33,7 +33,12 @@ use tokio::sync::Notify;
 #[derive(Default)]
 pub(crate) struct AccessService {
     state: Mutex<AccessState>,
+    /// Called, outside the state lock, with the sessions whose roster changed
+    /// because a person connected or disconnected.
+    roster_listener: Mutex<Option<RosterListener>>,
 }
+
+pub(crate) type RosterListener = Arc<dyn Fn(Vec<AgentSessionId>) + Send + Sync>;
 
 #[derive(Default)]
 struct AccessState {
@@ -96,13 +101,63 @@ impl ConnectionPresence {
 
 impl Drop for ConnectionPresence {
     fn drop(&mut self) {
-        self.service.state().connections.remove(&self.id);
+        let sessions = {
+            let mut state = self.service.state();
+            state.connections.remove(&self.id);
+            state.sessions_of(self.participant.id)
+        };
+        self.service.notify_roster(sessions);
+    }
+}
+
+impl AccessState {
+    fn sessions_of(&self, participant: ParticipantId) -> Vec<AgentSessionId> {
+        self.grants
+            .iter()
+            .filter(|(_, grants)| grants.contains_key(&participant))
+            .map(|(session_id, _)| *session_id)
+            .collect()
     }
 }
 
 impl AccessService {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Installs the callback that pushes roster changes to session feeds.
+    pub(crate) fn set_roster_listener(&self, listener: RosterListener) {
+        *self
+            .roster_listener
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(listener);
+    }
+
+    fn notify_roster(&self, sessions: Vec<AgentSessionId>) {
+        if sessions.is_empty() {
+            return;
+        }
+        let listener = self
+            .roster_listener
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(listener) = listener {
+            listener(sessions);
+        }
+    }
+
+    /// The directory entry for a person, falling back to the id as the name.
+    pub(crate) fn identity(&self, participant: ParticipantId) -> ParticipantIdentity {
+        ParticipantIdentity {
+            id: participant,
+            display_name: self
+                .state()
+                .participants
+                .get(&participant)
+                .cloned()
+                .unwrap_or_else(|| participant.to_string()),
+        }
     }
 
     fn state(&self) -> MutexGuard<'_, AccessState> {
@@ -119,7 +174,7 @@ impl AccessService {
     /// Registers a live connection for `identity`.
     pub(crate) fn connect(self: &Arc<Self>, identity: &ParticipantIdentity) -> ConnectionPresence {
         let revoked = Arc::new(Notify::new());
-        let id = {
+        let (id, sessions) = {
             let mut state = self.state();
             state
                 .participants
@@ -135,8 +190,9 @@ impl AccessService {
                     revoked: Arc::clone(&revoked),
                 },
             );
-            id
+            (id, state.sessions_of(identity.id))
         };
+        self.notify_roster(sessions);
         ConnectionPresence {
             id,
             participant: identity.clone(),

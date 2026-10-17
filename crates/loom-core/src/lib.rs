@@ -1,4 +1,5 @@
 mod capability;
+mod collaboration;
 mod command_env;
 mod context;
 mod error;
@@ -18,6 +19,10 @@ mod version;
 mod workspace;
 
 pub use capability::{Capability, CapabilitySet};
+pub use collaboration::{
+    Author, CollaborationEntry, CollaborationEntryKind, MAX_COLLABORATION_TEXT_BYTES, Recipient,
+    RunControlAction, RunRevision,
+};
 #[cfg(unix)]
 pub use command_env::BASELINE_PATH_DIRECTORIES;
 pub use command_env::{baseline_path, child_path};

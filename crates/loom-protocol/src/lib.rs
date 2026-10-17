@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use loom_core::{
+    Author, CollaborationEntry, CollaborationEntryKind, MAX_COLLABORATION_TEXT_BYTES, Recipient,
+    RunControlAction, RunRevision,
+};
+pub use loom_core::{
     CURRENT_PROTOCOL_VERSION, Checkpoint, CheckpointFile, ClonedRepository, ContextAssemblyOptions,
     ContextBudget, ContextFileKind, ContextFileReference, ContextInspection, ContextItem,
     ContextItemKind, ContextSummary, GITHUB_REPOSITORY_QUERY_MIN_CHARS, GitHubRepository,
@@ -539,6 +543,29 @@ impl ClientRequest {
             Self::Access(AccessRequest::GetSessionRoster { .. }) => {
                 Some(Capability::ReadSessionRoster)
             }
+            Self::Collaboration(CollaborationRequest::SendPeerMessage { .. }) => {
+                Some(Capability::SendPeerMessage)
+            }
+            Self::Collaboration(CollaborationRequest::DirectAgent { .. })
+            | Self::Collaboration(CollaborationRequest::AnswerAgentQuestion { .. }) => {
+                Some(Capability::ControlAgentRun)
+            }
+            Self::Collaboration(CollaborationRequest::ControlRun { action, .. }) => {
+                Some(match action {
+                    RunControlAction::Approve { .. } | RunControlAction::Reject { .. } => {
+                        Capability::ApproveAgentAction
+                    }
+                    RunControlAction::Pause => Capability::PauseAgentRun,
+                    RunControlAction::Resume => Capability::ResumeAgentRun,
+                    RunControlAction::Interrupt | RunControlAction::Retry => {
+                        Capability::ControlAgentRun
+                    }
+                    RunControlAction::RetryFromCheckpoint { .. } => Capability::RetryFromCheckpoint,
+                })
+            }
+            Self::Collaboration(CollaborationRequest::GetRunRevision { .. }) => {
+                Some(Capability::ReadAgentRun)
+            }
         }
     }
 
@@ -599,6 +626,7 @@ impl ClientRequest {
             | Self::Project(ProjectRequest::GetProjectSnapshotForSession { .. })
             | Self::Project(ProjectRequest::ListProjectAgentMessages { .. })
             | Self::Project(ProjectRequest::GetProjectChildReview { .. })
+            | Self::Collaboration(CollaborationRequest::GetRunRevision { .. })
             | Self::Access(AccessRequest::GetSessionRoster { .. }) => Some(Observer),
             Self::Run(RunRequest::StartSessionAgentRun { .. })
             | Self::Run(RunRequest::StartSessionAgentRunWithOptions { .. })
@@ -626,9 +654,11 @@ impl ClientRequest {
             | Self::Project(ProjectRequest::SendProjectAgentMessage { .. })
             | Self::Project(ProjectRequest::ControlProjectChild { .. })
             | Self::Project(ProjectRequest::IntegrateProjectChild { .. })
-            | Self::Project(ProjectRequest::CleanupProjectChildWorktree { .. }) => {
-                Some(Participant)
-            }
+            | Self::Project(ProjectRequest::CleanupProjectChildWorktree { .. })
+            | Self::Collaboration(CollaborationRequest::SendPeerMessage { .. })
+            | Self::Collaboration(CollaborationRequest::DirectAgent { .. })
+            | Self::Collaboration(CollaborationRequest::AnswerAgentQuestion { .. })
+            | Self::Collaboration(CollaborationRequest::ControlRun { .. }) => Some(Participant),
             Self::Session(SessionRequest::RenameAgentSession { .. })
             | Self::Session(SessionRequest::ArchiveAgentSession { .. })
             | Self::Session(SessionRequest::DeleteAgentSession { .. })
@@ -726,7 +756,8 @@ impl ClientRequest {
             | Self::Access(AccessRequest::GetSessionRoster { session_id })
             | Self::Access(AccessRequest::GrantSessionAccess { session_id, .. })
             | Self::Access(AccessRequest::SetSessionRole { session_id, .. })
-            | Self::Access(AccessRequest::RevokeSessionAccess { session_id, .. }) => {
+            | Self::Access(AccessRequest::RevokeSessionAccess { session_id, .. })
+            | Self::Collaboration(CollaborationRequest::SendPeerMessage { session_id, .. }) => {
                 Some(Session(*session_id))
             }
             Self::Run(RunRequest::GetAgentRun { run_id })
@@ -745,6 +776,10 @@ impl ClientRequest {
             | Self::Run(RunRequest::RetryAgentFromCheckpoint { run_id, .. })
             | Self::Run(RunRequest::AttachRunEvidence { run_id, .. })
             | Self::Usage(UsageRequest::GetRunUsage { run_id })
+            | Self::Collaboration(CollaborationRequest::DirectAgent { run_id, .. })
+            | Self::Collaboration(CollaborationRequest::AnswerAgentQuestion { run_id, .. })
+            | Self::Collaboration(CollaborationRequest::ControlRun { run_id, .. })
+            | Self::Collaboration(CollaborationRequest::GetRunRevision { run_id })
             | Self::Context(ContextRequest::InspectAgentContext { run_id }) => Some(Run(*run_id)),
             Self::Project(ProjectRequest::GetProjectSnapshot { project_id }) => {
                 Some(Project(*project_id))
@@ -804,6 +839,10 @@ impl ClientRequest {
                 | Self::Access(AccessRequest::GrantSessionAccess { .. })
                 | Self::Access(AccessRequest::SetSessionRole { .. })
                 | Self::Access(AccessRequest::RevokeSessionAccess { .. })
+                | Self::Collaboration(CollaborationRequest::SendPeerMessage { .. })
+                | Self::Collaboration(CollaborationRequest::DirectAgent { .. })
+                | Self::Collaboration(CollaborationRequest::AnswerAgentQuestion { .. })
+                | Self::Collaboration(CollaborationRequest::ControlRun { .. })
         )
     }
 }
@@ -1010,8 +1049,89 @@ mod run_message_protocol_tests {
     }
 
     #[test]
+    fn collaboration_requests_need_participants_and_round_trip() {
+        let session_id = AgentSessionId::new();
+        let run_id = RunId::new();
+        let expected = RunRevision {
+            attempt_id: loom_core::RunAttemptId::new(),
+            control_revision: 3,
+            action_sequence: 1,
+        };
+        let peer = ClientRequest::Collaboration(CollaborationRequest::SendPeerMessage {
+            session_id,
+            text: "lunch?".to_owned(),
+        });
+        assert_eq!(
+            peer.required_capability(),
+            Some(Capability::SendPeerMessage)
+        );
+        assert_eq!(peer.required_session_role(), Some(SessionRole::Participant));
+        assert_eq!(
+            peer.access_target(),
+            Some(AccessTarget::Session(session_id))
+        );
+        assert!(peer.is_retryable_mutation());
+        for (request, capability) in [
+            (
+                ClientRequest::Collaboration(CollaborationRequest::DirectAgent {
+                    run_id,
+                    expected,
+                    text: "go".to_owned(),
+                }),
+                Capability::ControlAgentRun,
+            ),
+            (
+                ClientRequest::Collaboration(CollaborationRequest::AnswerAgentQuestion {
+                    run_id,
+                    expected,
+                    text: "yes".to_owned(),
+                }),
+                Capability::ControlAgentRun,
+            ),
+            (
+                ClientRequest::Collaboration(CollaborationRequest::ControlRun {
+                    run_id,
+                    expected,
+                    action: RunControlAction::Pause,
+                }),
+                Capability::PauseAgentRun,
+            ),
+            (
+                ClientRequest::Collaboration(CollaborationRequest::ControlRun {
+                    run_id,
+                    expected,
+                    action: RunControlAction::Approve {
+                        tool_call_id: ToolCallId::new(),
+                    },
+                }),
+                Capability::ApproveAgentAction,
+            ),
+        ] {
+            assert_eq!(request.required_capability(), Some(capability));
+            assert_eq!(
+                request.required_session_role(),
+                Some(SessionRole::Participant)
+            );
+            assert_eq!(request.access_target(), Some(AccessTarget::Run(run_id)));
+            let encoded = serde_json::to_value(&request).unwrap();
+            assert_eq!(encoded["type"], "collaboration");
+            assert_eq!(
+                serde_json::from_value::<ClientRequest>(encoded).unwrap(),
+                request
+            );
+        }
+        let revision =
+            ClientRequest::Collaboration(CollaborationRequest::GetRunRevision { run_id });
+        assert_eq!(
+            revision.required_session_role(),
+            Some(SessionRole::Observer)
+        );
+        assert!(!revision.is_retryable_mutation());
+    }
+
+    #[test]
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 3));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 4));
         let project_id = ProjectId::new();
         let request = ClientRequest::Project(ProjectRequest::GetProjectSnapshot { project_id });
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));

@@ -554,6 +554,55 @@ pub enum ClientRequest {
     Task(TaskRequest),
     Project(ProjectRequest),
     Access(AccessRequest),
+    Collaboration(CollaborationRequest),
+}
+
+/// Multi-user messages and run actions with server-side attribution.
+///
+/// The author of every request is the person (or operator) the connection
+/// authenticated as; no request names it. Every request here needs the
+/// participant role, except [`CollaborationRequest::GetRunRevision`], which
+/// any reader may send.
+///
+/// Ordering and conflicts: run-scoped requests carry the [`RunRevision`] the
+/// sender decided against. The server serializes them per run and accepts
+/// one only when that revision is still current; otherwise it answers
+/// [`RunActionOutcome::Conflict`] with the current revision and applies
+/// nothing. See [`RunRevision`].
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum CollaborationRequest {
+    /// Chat to the other people in the session. Stored in the session
+    /// history, never added to model context, and never starts or continues
+    /// a run.
+    SendPeerMessage {
+        session_id: AgentSessionId,
+        text: String,
+    },
+
+    /// A follow-up direction to the agent of a run.
+    DirectAgent {
+        run_id: RunId,
+        expected: RunRevision,
+        text: String,
+    },
+
+    /// An answer to the question the agent is waiting on.
+    AnswerAgentQuestion {
+        run_id: RunId,
+        expected: RunRevision,
+        text: String,
+    },
+
+    /// Approve, reject, pause, resume, interrupt, or retry a run.
+    ControlRun {
+        run_id: RunId,
+        expected: RunRevision,
+        action: RunControlAction,
+    },
+
+    /// The run's current revision, to decide an action against.
+    GetRunRevision { run_id: RunId },
 }
 
 /// Multi-user identity, session access, and presence.

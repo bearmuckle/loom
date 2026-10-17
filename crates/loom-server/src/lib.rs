@@ -101,6 +101,7 @@ use util::*;
 use services::access::AccessService;
 pub use services::access::ConnectionPresence;
 use services::admission::AdmissionService;
+use services::collaboration::{CollaborationService, run_revision};
 use services::credential::CredentialService;
 #[cfg(test)]
 use services::idempotency::{
@@ -366,6 +367,8 @@ pub struct InProcessBackend {
     admissions: AdmissionService,
     /// Participant directory, session grants, and connection presence.
     access: Arc<AccessService>,
+    /// Per-run ordering of people's directions and control actions.
+    collaboration: CollaborationService,
     self_reference: Mutex<Weak<InProcessBackend>>,
     request_lifecycle: RwLock<u8>,
     persistence_failed: AtomicBool,
