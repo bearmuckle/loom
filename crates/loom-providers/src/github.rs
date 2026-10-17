@@ -82,6 +82,10 @@ impl GitHubCopilotAuthenticator {
         })
     }
 
+    /// Polls until the user authorizes the device code or it expires.
+    ///
+    /// This sleeps the calling thread between polls, so it must only be called
+    /// from a synchronous worker thread, never from async code.
     pub fn poll(&self, device: &GitHubDeviceCode) -> Result<String> {
         let deadline = Instant::now() + Duration::from_secs(device.expires_in);
         let mut interval = Duration::from_secs(device.interval.max(1));

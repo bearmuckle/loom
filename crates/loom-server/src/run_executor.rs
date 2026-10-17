@@ -99,8 +99,19 @@ pub(crate) struct RunTask {
 
 impl RunTask {
     /// Blocks until the task (or its admission) has finished.
+    ///
+    /// Intended for synchronous callers. On a multi-thread Tokio worker it
+    /// yields the worker with `block_in_place`; on a current-thread runtime it
+    /// cannot, so callers there must not use it.
     pub(crate) fn wait(&self) {
-        self.completion.wait();
+        match Handle::try_current() {
+            Ok(current)
+                if current.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+            {
+                tokio::task::block_in_place(|| self.completion.wait());
+            }
+            _ => self.completion.wait(),
+        }
     }
 
     /// Returns the panic message if the blocking body panicked.
@@ -181,23 +192,29 @@ impl RunExecutor {
         RunTask { completion }
     }
 
-    /// Schedules an unbounded blocking task, used for cheap per-run helpers
-    /// such as the transcript-fragment flusher.
-    pub(crate) fn spawn_blocking<T>(&self, _name: impl Into<String>, task: T) -> RunTask
+    /// Schedules a cheap per-run helper, such as the transcript-fragment
+    /// flusher, on its own named thread. It does not use Tokio's blocking pool,
+    /// so helpers cannot grow that pool; each is owned by a run that holds a
+    /// concurrency permit, which bounds how many exist.
+    pub(crate) fn spawn_blocking<T>(&self, name: impl Into<String>, task: T) -> RunTask
     where
         T: FnOnce() + Send + 'static,
     {
         let completion = std::sync::Arc::new(RunCompletion::default());
         let task_completion = std::sync::Arc::clone(&completion);
-        let handle = self.handle.spawn_blocking(move || {
-            task();
-        });
-        self.handle.spawn(async move {
-            if let Err(error) = handle.await {
-                task_completion.panic(error.to_string());
+        let spawned = std::thread::Builder::new().name(name.into()).spawn({
+            let completion = std::sync::Arc::clone(&completion);
+            move || {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)).is_err() {
+                    completion.panic("helper thread panicked");
+                }
+                completion.finish();
             }
-            task_completion.finish();
         });
+        if let Err(error) = spawned {
+            task_completion.panic(format!("could not start helper thread: {error}"));
+            task_completion.finish();
+        }
         RunTask { completion }
     }
 }
