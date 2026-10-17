@@ -32,6 +32,7 @@ impl LoomView {
             .collect::<Vec<_>>();
         if self.output_detail.shows_activity() && self.show_reasoning && !reasoning.is_empty() {
             let first_part_index = reasoning[0].0;
+            let key = tool_element_id(index, first_part_index);
             let combined = reasoning
                 .iter()
                 .map(|(_, text)| text.trim())
@@ -41,9 +42,11 @@ impl LoomView {
                 index,
                 first_part_index,
                 &combined,
-                self.expanded_reasoning
-                    .contains(&tool_element_id(index, first_part_index))
-                    || self.output_detail.expands_activity(),
+                disclosure_expanded(
+                    &self.expanded_reasoning,
+                    &key,
+                    self.output_detail.expands_activity(),
+                ),
                 parent,
             ));
         }
@@ -142,7 +145,9 @@ impl LoomView {
                     .w_full()
                     .accessibility_label("Reasoning")
                     .on_click(move |_, _, cx| {
-                        parent_for_toggle.update(cx, |this, cx| this.toggle_reasoning(key, cx));
+                        parent_for_toggle.update(cx, |this, cx| {
+                            this.set_reasoning_expanded(key, !expanded, cx)
+                        });
                     })
                     .child(
                         div()
@@ -187,9 +192,9 @@ impl LoomView {
     /// and invocation count. Expanding it shows the existing per-tool
     /// presentation. A run that is blocked on an approval or an input decision
     /// opens automatically so the control stays reachable, and the High output
-    /// detail level opens it because the level says so. The latter is a display
-    /// default rather than a lock: clicking the line still records the user's
-    /// own expansion state.
+    /// detail level opens it because the level says so. Both are display
+    /// defaults rather than a lock: a click records the user's own choice, which
+    /// wins over them.
     pub(crate) fn render_tool_usage(
         &self,
         parts: &[AssistantPart],
@@ -213,9 +218,11 @@ impl LoomView {
         };
         let status_label = status.label();
         let key = tool_element_id(index, first_part_index);
-        let expanded = self.expanded_tool_usage.contains(&key)
-            || tool_needs_attention(&tools)
-            || self.output_detail.expands_activity();
+        let expanded = disclosure_expanded(
+            &self.expanded_tool_usage,
+            &key,
+            tool_needs_attention(&tools) || self.output_detail.expands_activity(),
+        );
         let total_ms = tools.iter().filter_map(|tool| tool.elapsed_ms).sum::<u64>();
         let duration = (total_ms > 0).then(|| format_duration(total_ms));
         let summary = tool_usage_summary(&tools);
@@ -243,7 +250,9 @@ impl LoomView {
                         "Tools used: {summary}, {status_label}{accessibility_notes}"
                     ))
                     .on_click(move |_, _, cx| {
-                        parent_for_toggle.update(cx, |this, cx| this.toggle_tool_usage(key, cx));
+                        parent_for_toggle.update(cx, |this, cx| {
+                            this.set_tool_usage_expanded(key, !expanded, cx)
+                        });
                     })
                     .child(
                         div()
@@ -362,11 +371,13 @@ impl LoomView {
         // A group starts collapsed like the summary above it; only a call that
         // needs the user opens it, so a running group does not flicker open and
         // shut as each call settles. The High output detail level also opens it
-        // because the level says so, which is a display default rather than a
-        // lock on the click state.
-        let expanded = self.expanded_tool_groups.contains(&key)
-            || tool_needs_attention(&tools)
-            || self.output_detail.expands_activity();
+        // because the level says so. Both are display defaults rather than a
+        // lock: a click records the user's own choice, which wins over them.
+        let expanded = disclosure_expanded(
+            &self.expanded_tool_groups,
+            &key,
+            tool_needs_attention(&tools) || self.output_detail.expands_activity(),
+        );
         let total_ms = tools.iter().filter_map(|tool| tool.elapsed_ms).sum::<u64>();
         let duration = (total_ms > 0).then(|| format_duration(total_ms));
         let label = tool_group_label(&first.name, tools.len());
@@ -392,7 +403,9 @@ impl LoomView {
                     .w_full()
                     .accessibility_label(format!("{label}, {status_label}{accessibility_notes}"))
                     .on_click(move |_, _, cx| {
-                        parent_for_toggle.update(cx, |this, cx| this.toggle_tool_group(key, cx));
+                        parent_for_toggle.update(cx, |this, cx| {
+                            this.set_tool_group_expanded(key, !expanded, cx)
+                        });
                     })
                     .child(
                         div()
@@ -492,21 +505,25 @@ impl LoomView {
             ToolPartStatus::Queued | ToolPartStatus::Cancelled => rgb(0x94a3b8),
         };
         let duration = part.elapsed_ms.map(format_duration);
-        // Active and approval-gated work stays open; finished successes collapse
+        // Active and approval-gated work starts open; finished successes collapse
         // so the transcript stays scannable. A failure is collapsed too, and a
         // block with nothing to reveal has no disclosure control at all. The
-        // High output detail level opens every block because the level says so;
-        // that is a display default rather than a lock on the click state.
+        // High output detail level opens every block because the level says so.
+        // Every one of those is a display default rather than a lock: a click
+        // records the user's own choice, which wins over them.
         let expandable = tool_has_body(part);
         let expanded = expandable
-            && (self.expanded_tools.contains(&part.id)
-                || self.output_detail.expands_activity()
-                || matches!(
-                    part.status,
-                    ToolPartStatus::Running
-                        | ToolPartStatus::AwaitingApproval
-                        | ToolPartStatus::AwaitingInput
-                ));
+            && disclosure_expanded(
+                &self.expanded_tools,
+                &part.id,
+                self.output_detail.expands_activity()
+                    || matches!(
+                        part.status,
+                        ToolPartStatus::Running
+                            | ToolPartStatus::AwaitingApproval
+                            | ToolPartStatus::AwaitingInput
+                    ),
+            );
         let call_id = part.id;
         let parent_for_toggle = parent.clone();
         let awaiting = part.status == ToolPartStatus::AwaitingApproval
@@ -532,7 +549,9 @@ impl LoomView {
                     .accessibility_label(format!("{}: {}", part.title, part.status.label()))
                     .on_click(move |_, _, cx| {
                         if expandable {
-                            parent_for_toggle.update(cx, |this, cx| this.toggle_tool(call_id, cx));
+                            parent_for_toggle.update(cx, |this, cx| {
+                                this.set_tool_expanded(call_id, !expanded, cx)
+                            });
                         }
                     })
                     .child(

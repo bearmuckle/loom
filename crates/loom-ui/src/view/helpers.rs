@@ -572,6 +572,75 @@ pub(crate) fn session_events_request(
     }))
 }
 
+/// The message-content bytes a reopen's transcript backfill may load before it
+/// stops following older pages.
+pub(crate) const REOPEN_TRANSCRIPT_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+
+/// The messages a reopen's transcript backfill may load before it stops
+/// following older pages.
+pub(crate) const REOPEN_TRANSCRIPT_MESSAGE_BUDGET: usize = 2_048;
+
+/// Follows the older transcript pages of a reopened run.
+///
+/// A reopen always requests one transcript page: the newest
+/// `MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE` messages. In a tool-heavy run that
+/// window is assistant tool calls plus their results, with no user turn and
+/// almost no assistant text, so the restored session rendered the injected task
+/// row plus one tool-only assistant turn and read as an incomplete event
+/// (GitHub issue #261, https://github.com/bearmuckle/loom/issues/261).
+/// Scroll-triggered autoload exists, but the scroller starts at the newest row,
+/// so nothing asks for the interleaved conversation on a reopen.
+///
+/// This state machine accumulates the pages a reopen loads and names the cursor
+/// of the next older page, or stops at a budget so one restore cannot stream an
+/// arbitrarily long transcript into the timeline.
+#[derive(Debug, Default)]
+pub(crate) struct ReopenTranscriptBackfill {
+    messages: usize,
+    bytes: usize,
+}
+
+impl ReopenTranscriptBackfill {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records one applied page and returns the cursor of the next older page,
+    /// or `None` when the backfill must stop.
+    ///
+    /// `requested_before` is the cursor the page was requested with. A page that
+    /// names a cursor which is not older than that one is not followed, so a
+    /// repeated cursor cannot ask for the same page forever.
+    pub(crate) fn record_page(
+        &mut self,
+        requested_before: Option<u64>,
+        page: &[TranscriptMessage],
+        next_before: Option<u64>,
+        has_older: bool,
+    ) -> Option<u64> {
+        self.messages = self.messages.saturating_add(page.len());
+        self.bytes = page.iter().fold(self.bytes, |bytes, (_, _, message)| {
+            bytes
+                .saturating_add(message.content.len())
+                .saturating_add(message.reasoning_content.as_deref().map_or(0, str::len))
+        });
+        if !has_older || self.exhausted() {
+            return None;
+        }
+        // Ordinals start at zero, so a cursor of zero names nothing older.
+        let next = next_before.filter(|next| *next > 0)?;
+        if requested_before.is_some_and(|before| next >= before) {
+            return None;
+        }
+        Some(next)
+    }
+
+    fn exhausted(&self) -> bool {
+        self.messages >= REOPEN_TRANSCRIPT_MESSAGE_BUDGET
+            || self.bytes >= REOPEN_TRANSCRIPT_BYTE_BUDGET
+    }
+}
+
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn load_transcript_page_sync(
     connection: &ClientConnection,
@@ -765,6 +834,20 @@ pub(crate) fn unseen_transcript_messages(
                 .then_some((ordinal, timeline_ordinal, message))
         })
         .collect()
+}
+
+/// Whether a reopen's backfill may rebuild the timeline once it stops.
+///
+/// The rebuild keeps only `transcript_messages` plus activities, so a timeline
+/// item applied from an event while the backfill ran has no transcript ordinal
+/// and would be discarded. A poll that lands between two pages advances the
+/// event cursor, so a moved cursor refuses the rebuild: the per-page prepend
+/// result stays, and the next reopen puts the rows in order.
+pub(crate) fn transcript_rebuild_after_backfill(
+    cursor_before: Option<EventSequence>,
+    cursor_after: Option<EventSequence>,
+) -> bool {
+    cursor_before == cursor_after
 }
 
 pub(crate) fn merge_node_sessions(
@@ -1793,6 +1876,18 @@ pub(crate) fn run_tool_parts(parts: &[AssistantPart]) -> Vec<&ToolPart> {
             _ => None,
         })
         .collect()
+}
+
+/// Whether a transcript disclosure is open. A choice the user recorded wins
+/// over `automatic`, which is the state the output detail level or a running,
+/// approval-gated, or input-gated tool would open on its own. Without that
+/// precedence the disclosure would spring back open after every click.
+pub(crate) fn disclosure_expanded<K: Ord>(
+    choices: &BTreeMap<K, bool>,
+    key: &K,
+    automatic: bool,
+) -> bool {
+    choices.get(key).copied().unwrap_or(automatic)
 }
 
 /// Renders a tool result as a patch when it looks like one, otherwise as code.

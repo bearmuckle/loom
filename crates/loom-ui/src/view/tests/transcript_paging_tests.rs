@@ -562,3 +562,425 @@ fn restored_assistant_reasoning_is_shown_above_its_text() {
     };
     assert_eq!(turn.parts, vec![AssistantPart::Text("plain".to_owned())]);
 }
+
+/// The newest page of a tool-heavy run: assistant tool calls and their results,
+/// with no user turn and no assistant text. That window is what a reopen loads
+/// first, and what the backfill below has to look past (GitHub issue #261).
+fn tool_only_page(first_ordinal: u64, calls: u64) -> Vec<(u64, u64, ModelMessage)> {
+    let mut page = Vec::new();
+    for index in 0..calls {
+        let call = loom_model::ToolCall {
+            id: ToolCallId::new(),
+            name: "read_file".to_owned(),
+            arguments: serde_json::json!({"path": format!("src/{index}.rs")}),
+        };
+        let mut assistant = ModelMessage::new(MessageRole::Assistant, "");
+        assistant.tool_calls = vec![call.clone()];
+        let ordinal = first_ordinal + index * 2;
+        page.push((ordinal, ordinal, assistant));
+        let mut result = ModelMessage::new(MessageRole::Tool, "fn main() {}");
+        result.tool_call_id = Some(call.id);
+        result.name = Some("read_file".to_owned());
+        page.push((ordinal + 1, ordinal + 1, result));
+    }
+    page
+}
+
+fn timeline_position(view: &LoomView, predicate: impl Fn(&TimelineItem) -> bool) -> Option<usize> {
+    view.timeline.iter().position(predicate)
+}
+
+#[test]
+fn reopen_backfill_follows_older_pages_until_it_stops() {
+    let page = |count: usize| {
+        (0..count)
+            .map(|index| {
+                let mut message = ModelMessage::new(MessageRole::Assistant, "");
+                message.reasoning_content = Some("reasoning".to_owned());
+                (index as u64, index as u64, message)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // A tool-only newest page still names the page before it, so the walk
+    // continues past the window a reopen shows on its own.
+    let mut backfill = ReopenTranscriptBackfill::new();
+    assert_eq!(
+        backfill.record_page(None, &page(32), Some(40), true),
+        Some(40)
+    );
+    // Pages keep following while both budgets hold.
+    assert_eq!(
+        backfill.record_page(Some(40), &page(32), Some(8), true),
+        Some(8)
+    );
+
+    // `has_older` false ends the walk even when the page names a cursor.
+    let mut backfill = ReopenTranscriptBackfill::new();
+    assert_eq!(backfill.record_page(None, &page(4), Some(40), false), None);
+
+    // The byte budget ends the walk.
+    let mut backfill = ReopenTranscriptBackfill::new();
+    let large = ModelMessage::new(
+        MessageRole::Assistant,
+        "x".repeat(REOPEN_TRANSCRIPT_BYTE_BUDGET),
+    );
+    assert_eq!(
+        backfill.record_page(None, &[(0, 0, large)], Some(40), true),
+        None
+    );
+
+    // The message budget ends the walk.
+    let mut backfill = ReopenTranscriptBackfill::new();
+    assert_eq!(
+        backfill.record_page(
+            None,
+            &page(REOPEN_TRANSCRIPT_MESSAGE_BUDGET),
+            Some(40),
+            true
+        ),
+        None
+    );
+
+    // A missing cursor, and a cursor of zero, name nothing older.
+    let mut backfill = ReopenTranscriptBackfill::new();
+    assert_eq!(backfill.record_page(None, &page(4), None, true), None);
+    let mut backfill = ReopenTranscriptBackfill::new();
+    assert_eq!(backfill.record_page(None, &page(4), Some(0), true), None);
+
+    // A cursor that does not move older cannot be followed, or the same page
+    // would be requested forever.
+    let mut backfill = ReopenTranscriptBackfill::new();
+    assert_eq!(
+        backfill.record_page(Some(40), &page(4), Some(40), true),
+        None
+    );
+    let mut backfill = ReopenTranscriptBackfill::new();
+    assert_eq!(
+        backfill.record_page(Some(40), &page(4), Some(41), true),
+        None
+    );
+    let mut backfill = ReopenTranscriptBackfill::new();
+    assert_eq!(
+        backfill.record_page(Some(40), &page(4), Some(39), true),
+        Some(39)
+    );
+}
+
+/// A reopen rebuilds the timeline when its backfill stops only if no event
+/// landed while it ran: the rebuild keeps just the transcript messages and
+/// activities, so an event-applied item would be dropped (GitHub issue #261).
+#[test]
+fn backfill_rebuild_waits_for_an_unchanged_event_cursor() {
+    // The cursor never moved, or was absent both times.
+    assert!(transcript_rebuild_after_backfill(None, None));
+    assert!(transcript_rebuild_after_backfill(
+        Some(EventSequence::new(7)),
+        Some(EventSequence::new(7))
+    ));
+
+    // A poll landed mid-backfill and advanced the cursor.
+    assert!(!transcript_rebuild_after_backfill(
+        Some(EventSequence::new(7)),
+        Some(EventSequence::new(8))
+    ));
+    assert!(!transcript_rebuild_after_backfill(
+        None,
+        Some(EventSequence::new(1))
+    ));
+}
+
+/// The end state the reopen backfill produces: the newest page of a tool-heavy
+/// run holds no user turn and no assistant text, and the older page that carries
+/// them lands ahead of the tool traffic (GitHub issue #261).
+#[gpui_kit::test]
+fn reopen_backfill_restores_the_user_turn_ahead_of_tool_traffic(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        let session_id = view.active_session.id;
+        let run_id = RunId::new();
+        let task = "restore the reopened conversation".to_owned();
+        view.active_run_id = Some(run_id);
+        view.session_task_cache.insert(session_id, task.clone());
+        view.ensure_session_task_message(session_id);
+
+        view.apply_transcript_page(run_id, None, tool_only_page(40, 16), Some(39), true);
+        assert!(
+            matches!(view.timeline.first(), Some(TimelineItem::User(text)) if text == &task),
+            "the task row is the only user row"
+        );
+        assert_eq!(
+            view.timeline
+                .iter()
+                .filter(|item| matches!(item, TimelineItem::User(_)))
+                .count(),
+            1,
+            "the newest tool-only page adds no user follow-up: {:?}",
+            view.timeline
+        );
+        assert!(
+            timeline_position(&view, |item| matches!(
+                item,
+                TimelineItem::Assistant(turn)
+                    if turn.parts.iter().any(|part| matches!(part, AssistantPart::Tool(_)))
+            ))
+            .is_some(),
+            "the newest page's tool traffic is shown"
+        );
+
+        // The older page the backfill names carries the user's question and the
+        // agent's answer.
+        view.apply_transcript_page(
+            run_id,
+            Some(39),
+            vec![
+                (
+                    3,
+                    3,
+                    ModelMessage::new(MessageRole::User, "why is the conversation empty?"),
+                ),
+                (
+                    4,
+                    4,
+                    ModelMessage::new(
+                        MessageRole::Assistant,
+                        "The newest page held only tool calls.",
+                    ),
+                ),
+            ],
+            None,
+            false,
+        );
+        // The backfill loop rebuilds once it stops, so this is its end state.
+        view.rebuild_transcript_from_loaded_messages();
+
+        let question = timeline_position(&view, |item| {
+            matches!(item, TimelineItem::User(text) if text == "why is the conversation empty?")
+        })
+        .expect("the user question is loaded");
+        // The restored answer and the tool traffic belong to one agent turn, so
+        // their order is the order of its parts.
+        let turn_index = timeline_position(&view, |item| {
+            matches!(
+                item,
+                TimelineItem::Assistant(turn)
+                    if turn.parts.iter().any(|part| matches!(
+                        part,
+                        AssistantPart::Text(text) if text.contains("only tool calls")
+                    ))
+            )
+        })
+        .expect("the assistant answer is loaded");
+        let TimelineItem::Assistant(turn) = &view.timeline[turn_index] else {
+            panic!("expected an assistant turn");
+        };
+        let answer = turn
+            .parts
+            .iter()
+            .position(|part| {
+                matches!(
+                    part,
+                    AssistantPart::Text(text) if text.contains("only tool calls")
+                )
+            })
+            .expect("the assistant answer part is shown");
+        let tool = turn
+            .parts
+            .iter()
+            .position(|part| matches!(part, AssistantPart::Tool(_)))
+            .expect("the tool traffic is shown");
+        assert!(
+            question < turn_index,
+            "the question precedes the restored turn"
+        );
+        assert!(
+            answer < tool,
+            "the restored answer precedes the tool traffic: {:?}",
+            view.timeline
+        );
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
+}
+
+/// The oldest page carries the run's original user message, whose text is the
+/// run's task, and that row is already pinned above the transcript.
+#[gpui_kit::test]
+fn the_oldest_page_keeps_the_task_question_once(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        let session_id = view.active_session.id;
+        let run_id = RunId::new();
+        let task = "restore the reopened conversation".to_owned();
+        view.active_run_id = Some(run_id);
+        view.session_task_cache.insert(session_id, task.clone());
+        view.ensure_session_task_message(session_id);
+        view.apply_transcript_page(run_id, None, tool_only_page(40, 2), Some(39), true);
+
+        view.apply_transcript_page(
+            run_id,
+            Some(39),
+            vec![
+                (0, 0, ModelMessage::new(MessageRole::User, task.clone())),
+                (
+                    1,
+                    1,
+                    ModelMessage::new(MessageRole::Assistant, "Working on it."),
+                ),
+            ],
+            None,
+            false,
+        );
+
+        let task_rows = view
+            .timeline
+            .iter()
+            .filter(|item| matches!(item, TimelineItem::User(text) if text == &task))
+            .count();
+        assert_eq!(
+            task_rows, 1,
+            "the task question is shown once: {:?}",
+            view.timeline
+        );
+        assert!(
+            matches!(view.timeline.first(), Some(TimelineItem::User(text)) if text == &task),
+            "the task row stays at the top"
+        );
+        assert!(
+            view.transcript_messages.contains_key(&0),
+            "the page's ordinal bookkeeping keeps the message for a later rebuild"
+        );
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
+}
+
+/// A page load keeps only its own messages, so the activities an event batch
+/// rebuilt from further back in the run stay where the first page's rebuild put
+/// them. The rebuild that ends the backfill orders both sources together.
+#[gpui_kit::test]
+fn the_final_rebuild_orders_activity_rows_with_the_older_messages(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        let session_id = view.active_session.id;
+        let run_id = RunId::new();
+        let task = "restore the reopened conversation".to_owned();
+        view.active_run_id = Some(run_id);
+        view.session_task_cache.insert(session_id, task.clone());
+        view.ensure_session_task_message(session_id);
+
+        // The replay already rebuilt this search, whose timeline ordinal sits
+        // between the two messages the older page below carries.
+        let call = loom_model::ToolCall {
+            id: ToolCallId::new(),
+            name: "search_text".to_owned(),
+            arguments: serde_json::json!({"query": "SampleCount"}),
+        };
+        let activity_id = ActivityId::new();
+        view.activity_records.insert(
+            activity_id,
+            AgentActivityRecord {
+                id: activity_id,
+                run_id,
+                timeline_ordinal: 4,
+                parent_id: None,
+                step_id: None,
+                kind: AgentActivityKind::Search,
+                status: AgentActivityStatus::Completed,
+                started_at: Timestamp::from_unix_millis(1),
+                completed_at: None,
+                elapsed_ms: None,
+                data: AgentActivityData::Search {
+                    call: call.clone(),
+                    query: "SampleCount".to_owned(),
+                    path: None,
+                    result: Some(ToolResult::success(
+                        &call,
+                        "src/lib.rs:12:let count = SampleCount::new();".to_owned(),
+                    )),
+                },
+            },
+        );
+        view.apply_transcript_page(run_id, None, tool_only_page(40, 2), Some(39), true);
+        view.apply_transcript_page(
+            run_id,
+            Some(39),
+            vec![
+                (
+                    3,
+                    3,
+                    ModelMessage::new(MessageRole::User, "why is the conversation empty?"),
+                ),
+                (
+                    4,
+                    5,
+                    ModelMessage::new(MessageRole::User, "check one more thing"),
+                ),
+            ],
+            None,
+            false,
+        );
+        // Before the rebuild the prepended messages sit ahead of the activity,
+        // whose ordinal places it between them.
+        let question_position = |view: &LoomView| {
+            timeline_position(view, |item| {
+                matches!(item, TimelineItem::User(text) if text == "why is the conversation empty?")
+            })
+        };
+        let follow_up_position = |view: &LoomView| {
+            timeline_position(view, |item| {
+                matches!(item, TimelineItem::User(text) if text == "check one more thing")
+            })
+        };
+        let search_position = |view: &LoomView| {
+            timeline_position(view, |item| {
+                matches!(
+                    item,
+                    TimelineItem::Assistant(turn)
+                        if turn.parts.iter().any(|part| matches!(
+                            part,
+                            AssistantPart::Tool(part) if part.name == "search_text"
+                        ))
+                )
+            })
+        };
+        assert!(
+            search_position(&view) > follow_up_position(&view),
+            "the prepend alone leaves the activity row behind both messages: {:?}",
+            view.timeline
+        );
+
+        view.rebuild_transcript_from_loaded_messages();
+
+        let question = question_position(&view).expect("the question is loaded");
+        let search = search_position(&view).expect("the search row is shown");
+        let follow_up = follow_up_position(&view).expect("the follow-up is loaded");
+        assert!(
+            question < search && search < follow_up,
+            "the search row sits between the older messages: {:?}",
+            view.timeline
+        );
+        let task_rows = view
+            .timeline
+            .iter()
+            .filter(|item| matches!(item, TimelineItem::User(text) if text == &task))
+            .count();
+        assert_eq!(
+            task_rows, 1,
+            "the run's original user message is not duplicated: {:?}",
+            view.timeline
+        );
+        assert!(
+            matches!(view.timeline.first(), Some(TimelineItem::User(text)) if text == &task),
+            "the task row stays at the top"
+        );
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
+}

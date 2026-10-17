@@ -1253,6 +1253,50 @@ impl LoomView {
                                 }),
                             false,
                             phone,
+                        ))
+                        // How much of the agent's own output the transcript
+                        // shows belongs with the agent settings, not with the
+                        // window appearance ones.
+                        .child(settings_row(
+                            "Show model reasoning",
+                            "Reveal the model's thinking above each answer",
+                            Switch::new("show-reasoning-toggle")
+                                .checked(self.show_reasoning)
+                                .accessibility_label("Show model reasoning")
+                                .on_change({
+                                    let view = cx.entity();
+                                    move |_checked, _window, cx| {
+                                        view.update(cx, |view, cx| {
+                                            view.toggle_show_reasoning(cx);
+                                        });
+                                    }
+                                }),
+                            false,
+                            phone,
+                        ))
+                        .child(settings_row(
+                            "Output detail",
+                            self.output_detail.description(),
+                            settings_choice_container(
+                                OutputDetail::ALL
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(index, detail)| {
+                                        let selected = detail == self.output_detail;
+                                        settings_choice_chip(
+                                            ("output-detail", index),
+                                            detail.label(),
+                                            selected,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.set_output_detail(detail, cx);
+                                            }),
+                                        )
+                                        .into_any_element()
+                                    })
+                                    .collect(),
+                            ),
+                            false,
+                            phone,
                         )),
                 )
                 .into_any_element(),
@@ -1557,13 +1601,13 @@ impl LoomView {
                         .child(settings_row(
                             "Theme",
                             "Follow the system or choose a palette",
-                            appearance_choice_container(
+                            settings_choice_container(
                                 ThemeChoice::ALL
                                     .into_iter()
                                     .enumerate()
                                     .map(|(index, choice)| {
                                         let selected = choice == self.theme_choice;
-                                        appearance_choice_chip(
+                                        settings_choice_chip(
                                             ("theme-choice", index),
                                             choice.label(),
                                             selected,
@@ -1634,47 +1678,6 @@ impl LoomView {
                                             );
                                         })),
                                 ),
-                            false,
-                            phone,
-                        ))
-                        .child(settings_row(
-                            "Show model reasoning",
-                            "Reveal the model's thinking above each answer",
-                            Switch::new("show-reasoning-toggle")
-                                .checked(self.show_reasoning)
-                                .accessibility_label("Show model reasoning")
-                                .on_change({
-                                    let view = cx.entity();
-                                    move |_checked, _window, cx| {
-                                        view.update(cx, |view, cx| {
-                                            view.toggle_show_reasoning(cx);
-                                        });
-                                    }
-                                }),
-                            false,
-                            phone,
-                        ))
-                        .child(settings_row(
-                            "Output detail",
-                            self.output_detail.description(),
-                            appearance_choice_container(
-                                OutputDetail::ALL
-                                    .into_iter()
-                                    .enumerate()
-                                    .map(|(index, detail)| {
-                                        let selected = detail == self.output_detail;
-                                        appearance_choice_chip(
-                                            ("output-detail", index),
-                                            detail.label(),
-                                            selected,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.set_output_detail(detail, cx);
-                                            }),
-                                        )
-                                        .into_any_element()
-                                    })
-                                    .collect(),
-                            ),
                             false,
                             phone,
                         )),

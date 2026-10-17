@@ -643,10 +643,14 @@ pub(crate) struct LoomView {
     /// Whether the Plan tab's checklist is collapsed to its header.
     pub(crate) plan_collapsed: bool,
     pub(crate) activity_records: BTreeMap<ActivityId, AgentActivityRecord>,
-    pub(crate) expanded_tools: BTreeSet<ToolCallId>,
-    pub(crate) expanded_tool_groups: BTreeSet<u64>,
-    pub(crate) expanded_tool_usage: BTreeSet<u64>,
-    pub(crate) expanded_reasoning: BTreeSet<u64>,
+    /// The user's expansion choice per transcript disclosure, where `true` is
+    /// open. A recorded choice always wins over the output detail level and
+    /// over a block that opens automatically because its tool is running or
+    /// blocked on the user, so the disclosure the user closed stays closed.
+    pub(crate) expanded_tools: BTreeMap<ToolCallId, bool>,
+    pub(crate) expanded_tool_groups: BTreeMap<u64, bool>,
+    pub(crate) expanded_tool_usage: BTreeMap<u64, bool>,
+    pub(crate) expanded_reasoning: BTreeMap<u64, bool>,
     pub(crate) approval_request_in_flight: bool,
     approval_settings_request_in_flight: bool,
     pub(crate) archive_request_in_flight: bool,
@@ -1331,9 +1335,9 @@ fn settings_stepper(
         .child(increase)
 }
 
-/// The pill container shared by the appearance choice rows, so the theme and
-/// output detail rows read as one kind of control.
-fn appearance_choice_container(children: Vec<gpui_kit::AnyElement>) -> impl IntoElement {
+/// The pill container shared by the settings choice rows, so the theme and
+/// agent output rows read as one kind of control.
+fn settings_choice_container(children: Vec<gpui_kit::AnyElement>) -> impl IntoElement {
     div()
         .flex()
         .flex_wrap()
@@ -1345,9 +1349,9 @@ fn appearance_choice_container(children: Vec<gpui_kit::AnyElement>) -> impl Into
         .children(children)
 }
 
-/// One choice chip of an appearance row. The id carries test support so render
+/// One choice chip of a settings row. The id carries test support so render
 /// tests can click a specific choice.
-fn appearance_choice_chip(
+fn settings_choice_chip(
     id: (&'static str, usize),
     label: &str,
     selected: bool,
@@ -1648,13 +1652,24 @@ struct SessionSourceDialog {
     error: Option<String>,
 }
 
+/// What the virtual transcript list keys its measurements on: the row count and
+/// the last row's content, plus the presentation settings that change a row's
+/// height without changing its text.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TimelineRevision {
+    item_count: usize,
+    last_item_len: usize,
+    output_detail: OutputDetail,
+    show_reasoning: bool,
+}
+
 pub(crate) struct TimelineView {
     parent: Entity<LoomView>,
     scroller: Entity<MessageScrollerState>,
     parent_subscription: Option<Subscription>,
     scroller_subscription: Option<Subscription>,
     session_id: Option<AgentSessionId>,
-    timeline_revision: (usize, usize),
+    timeline_revision: TimelineRevision,
 }
 
 impl LoomView {
@@ -1762,10 +1777,10 @@ impl LoomView {
             plan: None,
             plan_collapsed: false,
             activity_records: BTreeMap::new(),
-            expanded_tools: BTreeSet::new(),
-            expanded_tool_groups: BTreeSet::new(),
-            expanded_tool_usage: BTreeSet::new(),
-            expanded_reasoning: BTreeSet::new(),
+            expanded_tools: BTreeMap::new(),
+            expanded_tool_groups: BTreeMap::new(),
+            expanded_tool_usage: BTreeMap::new(),
+            expanded_reasoning: BTreeMap::new(),
             approval_request_in_flight: false,
             approval_settings_request_in_flight: false,
             archive_request_in_flight: false,

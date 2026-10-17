@@ -478,32 +478,49 @@ impl LoomView {
         cx.notify();
     }
 
-    pub(crate) fn toggle_tool(&mut self, tool_id: ToolCallId, cx: &mut Context<Self>) {
-        if !self.expanded_tools.remove(&tool_id) {
-            self.expanded_tools.insert(tool_id);
-        }
+    /// Records the user's expansion choice for one tool block. A recorded
+    /// choice wins over the output detail level and over a block that opens
+    /// automatically, so the user can always close an expanded block.
+    pub(crate) fn set_tool_expanded(
+        &mut self,
+        tool_id: ToolCallId,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.expanded_tools.insert(tool_id, expanded);
         cx.notify();
     }
 
-    pub(crate) fn toggle_tool_group(&mut self, key: u64, cx: &mut Context<Self>) {
-        if !self.expanded_tool_groups.remove(&key) {
-            self.expanded_tool_groups.insert(key);
-        }
+    /// Records the user's expansion choice for one same-kind tool group.
+    pub(crate) fn set_tool_group_expanded(
+        &mut self,
+        key: u64,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.expanded_tool_groups.insert(key, expanded);
         cx.notify();
     }
 
-    /// Expands or collapses the single summary line for a run of tool calls.
-    pub(crate) fn toggle_tool_usage(&mut self, key: u64, cx: &mut Context<Self>) {
-        if !self.expanded_tool_usage.remove(&key) {
-            self.expanded_tool_usage.insert(key);
-        }
+    /// Records the user's expansion choice for the single summary line of a run
+    /// of tool calls.
+    pub(crate) fn set_tool_usage_expanded(
+        &mut self,
+        key: u64,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.expanded_tool_usage.insert(key, expanded);
         cx.notify();
     }
 
-    pub(crate) fn toggle_reasoning(&mut self, key: u64, cx: &mut Context<Self>) {
-        if !self.expanded_reasoning.remove(&key) {
-            self.expanded_reasoning.insert(key);
-        }
+    pub(crate) fn set_reasoning_expanded(
+        &mut self,
+        key: u64,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.expanded_reasoning.insert(key, expanded);
         cx.notify();
     }
 }

@@ -99,7 +99,7 @@ fn open_scenario(
             view.sessions = vec![view.active_session.clone()];
             scenario(&mut view);
             // Tool blocks sit behind the collapsed usage summary.
-            view.expanded_tool_usage.insert(0);
+            view.expanded_tool_usage.insert(0, true);
             view
         });
         *rendered_for_window.borrow_mut() = Some(view.clone());
@@ -314,7 +314,7 @@ fn a_long_failure_reads_as_a_summary_while_its_output_stays_reachable(cx: &mut T
         });
         // The note summarizes the reason, so the disclosure has to hold the
         // rest of it.
-        view.expanded_tools.insert(call.id);
+        view.expanded_tools.insert(call.id, true);
     });
     cx.update_window(handle, |_, window, cx| {
         window.render_frame(cx);
