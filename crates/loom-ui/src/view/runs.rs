@@ -296,32 +296,66 @@ impl LoomView {
             }
         };
         let transcript_generation = self.transcript_generation;
+        // A reopen's first page is the newest window, which a tool-heavy run
+        // fills with tool traffic and no user turn, so that call keeps following
+        // the older pages the backfill names. A scroll-triggered older page stays
+        // a single request.
+        let mut backfill = before_ordinal.is_none().then(ReopenTranscriptBackfill::new);
         self.transcript_loading = true;
         cx.notify();
         cx.spawn(async move |view, cx| {
-            let result = load_transcript_page(backend, run_id, before_ordinal).await;
-            view.update(cx, |view, cx| {
-                if view.active_run_id != Some(run_id)
-                    || view.transcript_generation != transcript_generation
-                {
-                    return;
-                }
-                view.transcript_loading = false;
-                match result {
-                    Ok((messages, next_before, has_older)) => {
-                        view.apply_transcript_page(
-                            run_id,
-                            before_ordinal,
-                            messages,
-                            next_before,
-                            has_older,
-                        );
+            let mut before_ordinal = before_ordinal;
+            loop {
+                let result = load_transcript_page(backend.clone(), run_id, before_ordinal).await;
+                let next = view.update(cx, |view, cx| {
+                    if view.active_run_id != Some(run_id)
+                        || view.transcript_generation != transcript_generation
+                    {
+                        // A newer load owns transcript_loading.
+                        return None;
                     }
-                    Err(error) => view.record_backend_error("load conversation history", error),
-                }
-                cx.notify();
-            })
-            .ok();
+                    match result {
+                        Ok((messages, next_before, has_older)) => {
+                            let next = backfill.as_mut().and_then(|backfill| {
+                                backfill.record_page(
+                                    before_ordinal,
+                                    &messages,
+                                    next_before,
+                                    has_older,
+                                )
+                            });
+                            view.apply_transcript_page(
+                                run_id,
+                                before_ordinal,
+                                messages,
+                                next_before,
+                                has_older,
+                            );
+                            if next.is_none() {
+                                if backfill.is_some() {
+                                    // The backfill is done, so rebuild once from
+                                    // every loaded message and activity row to
+                                    // put them in one chronological order.
+                                    view.rebuild_transcript_from_loaded_messages();
+                                }
+                                view.transcript_loading = false;
+                            }
+                            cx.notify();
+                            next
+                        }
+                        Err(error) => {
+                            view.record_backend_error("load conversation history", error);
+                            view.transcript_loading = false;
+                            cx.notify();
+                            None
+                        }
+                    }
+                });
+                let Ok(Some(next)) = next else {
+                    break;
+                };
+                before_ordinal = Some(next);
+            }
         })
         .detach();
     }
@@ -359,29 +393,23 @@ impl LoomView {
         if before_ordinal.is_none() {
             // The first page replaces the message portion of the transcript with
             // the messages loaded from it (and any newer durable message it does
-            // not cover yet), so rebuild that portion. Compute the insertion
-            // index after the retain: dropping the message portion can
-            // empty the timeline, and an index derived from the pre-retain
-            // first row would be out of bounds for the splice below.
-            self.timeline
-                .retain(|item| !matches!(item, TimelineItem::User(_) | TimelineItem::Assistant(_)));
-            let ordered_items = timeline_items_from_messages(
-                self.transcript_messages
-                    .iter()
-                    .map(|(ordinal, (timeline_ordinal, message))| {
-                        (*ordinal, *timeline_ordinal, message.clone())
-                    })
-                    .collect(),
-                self.activity_records.values().cloned().collect(),
-            );
-            let insertion_index = self.transcript_insertion_index();
-            self.timeline
-                .splice(insertion_index..insertion_index, ordered_items);
+            // not cover yet), so rebuild that portion.
+            self.rebuild_transcript_from_loaded_messages();
         } else {
             // Older pages only add content ahead of what is loaded. Build just
             // those rows and prepend them so turns streamed since the request
             // (which are not in the page) are not discarded.
-            let ordered_items = timeline_items_from_messages(messages, Vec::new());
+            let mut ordered_items = timeline_items_from_messages(messages, Vec::new());
+            // The oldest page carries the run's original user message, whose
+            // text is the run's task, and the task row is already pinned above
+            // the transcript. Adding it again would show the question twice.
+            let task = self.session_task_cache.get(&self.active_session.id);
+            if let Some(task) = task
+                && matches!(self.timeline.first(), Some(TimelineItem::User(text)) if text == task)
+            {
+                ordered_items
+                    .retain(|item| !matches!(item, TimelineItem::User(text) if text == task));
+            }
             let insertion_index = self.transcript_insertion_index();
             self.timeline
                 .splice(insertion_index..insertion_index, ordered_items);
@@ -391,6 +419,35 @@ impl LoomView {
         }
         self.transcript_before_ordinal = next_before;
         self.transcript_has_older = has_older;
+        self.ensure_session_task_message(self.active_session.id);
+    }
+
+    /// Rebuilds the message portion of the timeline from every transcript
+    /// message and activity loaded so far.
+    ///
+    /// A backfill applies its pages one at a time after the first page already
+    /// rebuilt the timeline, so an activity-derived tool row would otherwise
+    /// stay where that rebuild placed it rather than between the messages whose
+    /// timeline ordinals surround it. Rebuilding from the whole loaded set once
+    /// the backfill ends puts every row in one chronological order.
+    pub(crate) fn rebuild_transcript_from_loaded_messages(&mut self) {
+        // Dropping the message portion can empty the timeline, so compute the
+        // insertion index after the retain: an index derived from the pre-retain
+        // first row would be out of bounds for the splice below.
+        self.timeline
+            .retain(|item| !matches!(item, TimelineItem::User(_) | TimelineItem::Assistant(_)));
+        let ordered_items = timeline_items_from_messages(
+            self.transcript_messages
+                .iter()
+                .map(|(ordinal, (timeline_ordinal, message))| {
+                    (*ordinal, *timeline_ordinal, message.clone())
+                })
+                .collect(),
+            self.activity_records.values().cloned().collect(),
+        );
+        let insertion_index = self.transcript_insertion_index();
+        self.timeline
+            .splice(insertion_index..insertion_index, ordered_items);
         self.ensure_session_task_message(self.active_session.id);
     }
 

@@ -79,14 +79,13 @@ impl LoomView {
             }
             result => result,
         };
-        let mut needs_transcript_page = false;
         let fallback_projection = match snapshot_result {
             Ok(ServerResponse::Session(SessionResponse::AgentSessionSnapshot(projection))) => {
-                // Any projection that carries a run is paged, whether or not it
-                // already holds messages: a snapshot carries the messages its
-                // live run handle knows, which is not necessarily the run's
-                // whole transcript.
-                needs_transcript_page = projection.active_run.is_some();
+                // Any run the projection carries is paged, whether or not the
+                // snapshot already holds messages: a snapshot carries the
+                // messages its live run handle knows, which is not necessarily
+                // the run's whole transcript. A session whose only run arrives
+                // with the event batch is paged too, below.
                 // The fallback snapshot carries the durable cursor, so the
                 // events request below stays bounded to what was journaled after
                 // it instead of asking for the whole retained journal.
@@ -130,13 +129,37 @@ impl LoomView {
         ) {
             self.record_backend_error("load session events", error);
         }
-        if needs_transcript_page && let Some(run_id) = self.active_run_id {
-            match load_transcript_page_sync(&self.connection, run_id, None) {
-                Ok((messages, next_before, has_older)) => {
-                    self.apply_transcript_page(run_id, None, messages, next_before, has_older);
+        if let Some(run_id) = self.active_run_id {
+            let mut backfill = ReopenTranscriptBackfill::new();
+            let mut before_ordinal = None;
+            loop {
+                if self.active_run_id != Some(run_id) {
+                    break;
                 }
-                Err(error) => self.record_backend_error("load conversation history", error),
+                match load_transcript_page_sync(&self.connection, run_id, before_ordinal) {
+                    Ok((messages, next_before, has_older)) => {
+                        let next =
+                            backfill.record_page(before_ordinal, &messages, next_before, has_older);
+                        self.apply_transcript_page(
+                            run_id,
+                            before_ordinal,
+                            messages,
+                            next_before,
+                            has_older,
+                        );
+                        let Some(next) = next else {
+                            break;
+                        };
+                        before_ordinal = Some(next);
+                    }
+                    Err(error) => {
+                        self.record_backend_error("load conversation history", error);
+                        break;
+                    }
+                }
             }
+            // Place every page and activity row in one chronological order.
+            self.rebuild_transcript_from_loaded_messages();
         }
         self.ensure_session_task_message(self.active_session.id);
         if let Some(run) = &self.active_run {
@@ -561,13 +584,8 @@ impl LoomView {
         // messages its live run handle knows was never paged: when the initial
         // event batch was non-empty, the timeline stayed exactly that batch, and
         // a window of one event showed as the whole conversation (GitHub issue
-        // #261).
-        let needs_transcript_page = match &snapshot_response.result {
-            Ok(ServerResponse::Session(SessionResponse::AgentSessionSnapshot(projection))) => {
-                projection.active_run.is_some()
-            }
-            _ => false,
-        };
+        // #261). The gate reads the rebuilt run instead of the snapshot, so a
+        // run established only by the event batch is paged too.
         let event_batch_len = match &events_response.result {
             Ok(ServerResponse::Events(EventsResponse::SessionEvents { events, .. }))
             | Ok(ServerResponse::Events(EventsResponse::SessionEventsSnapshot {
@@ -660,13 +678,14 @@ impl LoomView {
         }
         // The reopen ladder's outcome, so a live deployment shows which durable
         // half rebuilt the conversation and what the event window added to it.
+        let needs_transcript_page = self.active_run_id.is_some();
         log::info!(
             "[loom-ui] reopen session {session_id}: {event_batch_len} events at cursor {request_cursor:?}, durable projection {fallback_latest_sequence:?} carrying {fallback_message_count} messages, transcript page needed {needs_transcript_page}, active run {:?}, timeline {timeline_before} -> {}",
             self.active_run_id,
             self.timeline.len()
         );
         self.ensure_session_task_message(session_id);
-        if needs_transcript_page && self.active_run_id.is_some() {
+        if needs_transcript_page {
             self.begin_transcript_page(None, cx);
         }
         self.refresh_review(cx);
