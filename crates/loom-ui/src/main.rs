@@ -12,6 +12,7 @@ mod backend_host;
 #[cfg(target_family = "wasm")]
 mod browser;
 mod connection;
+mod preferences;
 mod state;
 mod syntax;
 mod theme;

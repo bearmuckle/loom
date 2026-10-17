@@ -4638,6 +4638,7 @@ dependencies = [
  "loom-server",
  "loom-vcs",
  "open",
+ "serde",
  "serde_json",
  "tokio",
  "ttf-parser",

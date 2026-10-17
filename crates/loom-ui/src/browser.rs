@@ -229,7 +229,7 @@ fn saved_connection(storage: &Storage) -> Result<(Option<String>, Option<String>
     Ok((remote, token))
 }
 
-fn browser_storage() -> Result<Storage, LoomError> {
+pub(crate) fn browser_storage() -> Result<Storage, LoomError> {
     web_sys::window()
         .ok_or_else(|| LoomError::invalid_request("no browser window is available"))?
         .local_storage()
@@ -466,7 +466,7 @@ impl BrowserConnection {
     }
 }
 
-fn describe_js(value: &JsValue) -> String {
+pub(crate) fn describe_js(value: &JsValue) -> String {
     value
         .as_string()
         .or_else(|| js_sys::Error::from(value.clone()).message().as_string())

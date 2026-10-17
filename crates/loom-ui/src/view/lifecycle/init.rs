@@ -1,4 +1,5 @@
 use super::*;
+use crate::preferences::UiPreferences;
 
 impl LoomView {
     #[cfg(not(target_family = "wasm"))]
@@ -216,6 +217,7 @@ impl LoomView {
             .iter()
             .map(|node| (node.status.node_id.clone(), worker_node_display_name(node)))
             .collect();
+        let preferences = UiPreferences::load();
         let mut view = Self {
             backend,
             connection: connection.clone(),
@@ -305,8 +307,8 @@ impl LoomView {
             provider_setup_status: BTreeMap::new(),
             theme_choice: ThemeChoice::System,
             font_scale_percent: DEFAULT_FONT_SCALE_PERCENT,
-            show_reasoning: false,
-            output_detail: OutputDetail::default(),
+            show_reasoning: preferences.show_reasoning,
+            output_detail: preferences.output_detail,
             appearance_subscription: None,
             shortcut_interceptor: None,
             after_sequence: None,
@@ -428,6 +430,7 @@ impl LoomView {
         let node_input_initial = format!("{} {}", options.remote(), options.token())
             .trim()
             .to_owned();
+        let preferences = UiPreferences::load();
 
         Self {
             connected: demo_mode,
@@ -531,8 +534,8 @@ impl LoomView {
             provider_setup_status: BTreeMap::new(),
             theme_choice: ThemeChoice::System,
             font_scale_percent: DEFAULT_FONT_SCALE_PERCENT,
-            show_reasoning: false,
-            output_detail: OutputDetail::default(),
+            show_reasoning: preferences.show_reasoning,
+            output_detail: preferences.output_detail,
             appearance_subscription: None,
             shortcut_interceptor: None,
             after_sequence: None,
@@ -727,6 +730,7 @@ impl LoomView {
             .map(|node| (node.status.node_id.clone(), worker_node_display_name(node)))
             .collect();
 
+        let preferences = UiPreferences::load();
         let view = Self {
             connected: true,
             browser_demo_mode: false,
@@ -811,8 +815,8 @@ impl LoomView {
             provider_setup_status: BTreeMap::new(),
             theme_choice: ThemeChoice::System,
             font_scale_percent: DEFAULT_FONT_SCALE_PERCENT,
-            show_reasoning: false,
-            output_detail: OutputDetail::default(),
+            show_reasoning: preferences.show_reasoning,
+            output_detail: preferences.output_detail,
             appearance_subscription: None,
             shortcut_interceptor: None,
             after_sequence: None,

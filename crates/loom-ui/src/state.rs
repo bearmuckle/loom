@@ -18,6 +18,7 @@ use loom_protocol::{
     AgentPlanProgress, AgentRunState, GitDiff, GitRepositoryStatus, SessionFilesystemChange,
     SessionFilesystemFile, WorkspaceEntry,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::MAX_TIMELINE_OUTPUT;
 
@@ -120,7 +121,8 @@ impl ThemeChoice {
 /// The level is presentation-only, like `show_reasoning`: it never changes what
 /// is sent to a provider. `Medium` is today's transcript, so the default keeps
 /// the existing reading experience.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum OutputDetail {
     /// Only the agent's replies: no reasoning and no tool activity.
     Low,

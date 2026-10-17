@@ -1112,6 +1112,7 @@ impl LoomView {
     /// setting is presentation-only, so it never affects the provider request.
     pub(crate) fn toggle_show_reasoning(&mut self, cx: &mut Context<Self>) {
         self.show_reasoning = !self.show_reasoning;
+        self.persist_ui_preferences();
         cx.notify();
     }
 
@@ -1120,7 +1121,18 @@ impl LoomView {
     /// keeps the transcript that existed before the setting.
     pub(crate) fn set_output_detail(&mut self, detail: OutputDetail, cx: &mut Context<Self>) {
         self.output_detail = detail;
+        self.persist_ui_preferences();
         cx.notify();
+    }
+
+    /// Writes the client-local presentation settings after a change. The
+    /// backend never sees them, and a failed write must not interrupt the UI.
+    fn persist_ui_preferences(&self) {
+        UiPreferences {
+            show_reasoning: self.show_reasoning,
+            output_detail: self.output_detail,
+        }
+        .save();
     }
 
     pub(crate) fn observe_system_appearance(

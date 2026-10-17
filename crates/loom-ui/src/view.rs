@@ -72,6 +72,7 @@ use std::fs;
 use crate::{
     MAX_REVIEW_CHANGES, MAX_REVIEW_DIFF,
     connection::{BackendWorker, ClientConnection, ConnectionCleanupGuard},
+    preferences::UiPreferences,
     state::{
         AssistantPart, AssistantTurn, EvidenceText, FilesState, GitHubLoginKind, GitHubLoginState,
         InspectorTab, OutputDetail, PlanState, PlanStepStatus, ProjectDeleteDialogState,
