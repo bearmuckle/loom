@@ -13,12 +13,12 @@ fn review_composer_and_worker_controls_toggle(cx: &mut TestAppContext) {
         assert!(!view.review.open);
 
         let tool_id = loom_core::ToolCallId::new();
-        view.toggle_tool(tool_id, cx);
-        view.toggle_tool(tool_id, cx);
-        view.toggle_tool_group(7, cx);
-        view.toggle_tool_group(7, cx);
-        view.toggle_reasoning(9, cx);
-        view.toggle_reasoning(9, cx);
+        view.set_tool_expanded(tool_id, true, cx);
+        view.set_tool_expanded(tool_id, false, cx);
+        view.set_tool_group_expanded(7, true, cx);
+        view.set_tool_group_expanded(7, false, cx);
+        view.set_reasoning_expanded(9, true, cx);
+        view.set_reasoning_expanded(9, false, cx);
 
         assert!(!view.show_reasoning);
         view.toggle_show_reasoning(cx);

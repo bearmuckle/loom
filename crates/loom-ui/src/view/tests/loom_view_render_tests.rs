@@ -1438,8 +1438,8 @@ fn repeated_tool_calls_collapse_into_a_group(cx: &mut TestAppContext) {
         assert!(window.try_find(("tool-header", 0u64)).is_some());
         let view = view.downcast::<LoomView>().unwrap();
         view.update(cx, |view, _| {
-            assert!(view.expanded_tool_usage.contains(&0));
-            assert!(view.expanded_tool_groups.contains(&0));
+            assert_eq!(view.expanded_tool_usage.get(&0), Some(&true));
+            assert_eq!(view.expanded_tool_groups.get(&0), Some(&true));
         });
     })
     .unwrap();
@@ -1493,7 +1493,7 @@ fn tool_usage_summary_lines_collapse_by_default(cx: &mut TestAppContext) {
         assert!(window.try_find(("tool-header", 1u64)).is_some());
         assert!(window.try_find(("tool-header", 2u64)).is_some());
         view.update(cx, |view, _| {
-            assert!(view.expanded_tool_usage.contains(&0));
+            assert_eq!(view.expanded_tool_usage.get(&0), Some(&true));
         });
     })
     .unwrap();
@@ -1540,7 +1540,7 @@ fn a_running_tool_usage_stays_collapsed_until_expanded(cx: &mut TestAppContext) 
         window.render_frame(cx);
         assert!(window.try_find(("tool-header", 0u64)).is_some());
         view.update(cx, |view, _| {
-            assert!(view.expanded_tool_usage.contains(&0));
+            assert_eq!(view.expanded_tool_usage.get(&0), Some(&true));
         });
     })
     .unwrap();
@@ -1572,7 +1572,7 @@ fn a_running_tool_group_stays_collapsed_until_expanded(cx: &mut TestAppContext) 
             streaming: false,
         })];
         // Reveal the group row behind the usage summary.
-        view.expanded_tool_usage.insert(0);
+        view.expanded_tool_usage.insert(0, true);
         view
     });
     cx.update_window(handle.into(), |view, window, cx| {
@@ -1584,7 +1584,7 @@ fn a_running_tool_group_stays_collapsed_until_expanded(cx: &mut TestAppContext) 
         window.render_frame(cx);
         assert!(window.try_find(("tool-header", 0u64)).is_some());
         view.update(cx, |view, _| {
-            assert!(view.expanded_tool_groups.contains(&0));
+            assert_eq!(view.expanded_tool_groups.get(&0), Some(&true));
         });
     })
     .unwrap();
@@ -1657,7 +1657,7 @@ fn recovered_failures_do_not_condemn_the_tool_summary(cx: &mut TestAppContext) {
             streaming: false,
         })];
         // Expand the usage summary so the same-kind group row also renders.
-        view.expanded_tool_usage.insert(0);
+        view.expanded_tool_usage.insert(0, true);
         view
     });
     cx.update_window(handle.into(), |_, window, cx| {
@@ -1726,7 +1726,7 @@ fn reasoning_and_tool_cycles_gather_into_one_agent_entry(cx: &mut TestAppContext
         window.click(("reasoning-header", 0u64), cx);
         window.render_frame(cx);
         view.update(cx, |view, _| {
-            assert!(view.expanded_reasoning.contains(&0));
+            assert_eq!(view.expanded_reasoning.get(&0), Some(&true));
         });
 
         window.click(("tool-usage-header", 1u64), cx);
@@ -2296,7 +2296,7 @@ fn tool_blocks_toggle_and_show_inline_approvals(cx: &mut TestAppContext) {
         window.click(("tool-header", 0u64), cx);
         window.render_frame(cx);
         view.update(cx, |view, _| {
-            assert!(view.expanded_tools.contains(&call.id));
+            assert_eq!(view.expanded_tools.get(&call.id), Some(&true));
             // Late activity updates keep the block in place and reveal approval.
             view.consume_agent_event(&loom_protocol::AgentEvent::ActivityRecorded {
                 run_id,
@@ -2375,12 +2375,12 @@ fn action_only_tools_hide_their_result_body(cx: &mut TestAppContext) {
             ],
             streaming: false,
         })];
-        view.expanded_tools.insert(read_id);
-        view.expanded_tools.insert(command_id);
-        view.expanded_tools.insert(failed_command_id);
-        view.expanded_tools.insert(search_id);
+        view.expanded_tools.insert(read_id, true);
+        view.expanded_tools.insert(command_id, true);
+        view.expanded_tools.insert(failed_command_id, true);
+        view.expanded_tools.insert(search_id, true);
         // Reveal the tool blocks behind the usage summary.
-        view.expanded_tool_usage.insert(0);
+        view.expanded_tool_usage.insert(0, true);
         view
     });
     cx.update_window(handle.into(), |_, window, cx| {
@@ -2470,15 +2470,15 @@ fn bodyless_tools_have_no_disclosure_and_failures_start_collapsed(cx: &mut TestA
         window.render_frame(cx);
         view.update(cx, |view, _| {
             assert!(
-                !view.expanded_tools.contains(&read_id),
+                !view.expanded_tools.contains_key(&read_id),
                 "a tool with nothing to reveal has no disclosure to toggle"
             );
             assert!(
-                !view.expanded_tools.contains(&failed_read_id),
+                !view.expanded_tools.contains_key(&failed_read_id),
                 "a failed read has no workspace-independent body to reveal"
             );
             assert!(
-                !view.expanded_tools.contains(&search_id),
+                !view.expanded_tools.contains_key(&search_id),
                 "a settled result starts collapsed"
             );
         });
@@ -2488,13 +2488,13 @@ fn bodyless_tools_have_no_disclosure_and_failures_start_collapsed(cx: &mut TestA
         window.click(("tool-header", 2u64), cx);
         window.render_frame(cx);
         view.update(cx, |view, _| {
-            assert!(view.expanded_tools.contains(&search_id))
+            assert_eq!(view.expanded_tools.get(&search_id), Some(&true))
         });
         assert!(window.try_find(("copy-tool-output", 2u64)).is_some());
         window.click(("tool-header", 2u64), cx);
         window.render_frame(cx);
         view.update(cx, |view, _| {
-            assert!(!view.expanded_tools.contains(&search_id))
+            assert_eq!(view.expanded_tools.get(&search_id), Some(&false))
         });
         assert!(window.try_find(("copy-tool-output", 2u64)).is_none());
     })
@@ -4883,7 +4883,7 @@ fn transcript_renders_all_message_and_activity_variants(cx: &mut TestAppContext)
         },
     };
     render_scenario(cx, |view| {
-        view.expanded_tools.insert(call.id);
+        view.expanded_tools.insert(call.id, true);
         view.activity_records.insert(activity.id, activity);
         view.plan = Some(crate::state::PlanState {
             steps: vec!["Inspect".to_owned(), "Edit".to_owned()],
@@ -5113,6 +5113,81 @@ fn high_output_detail_opens_the_disclosures_without_a_click(cx: &mut TestAppCont
             assert!(view.expanded_tool_usage.is_empty());
             assert!(view.expanded_tools.is_empty());
         });
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn high_output_detail_lets_the_user_close_an_open_disclosure(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.output_detail = OutputDetail::High;
+        view.show_reasoning = true;
+        view.sessions = vec![view.active_session.clone()];
+        view.timeline = vec![output_detail_turn()];
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find(("copy-tool-output", 0u64)).is_some());
+
+        // A click closes the summary the level opened, and the level must not
+        // spring it back open on the next frame.
+        window.click(("tool-usage-header", 0u64), cx);
+        window.render_frame(cx);
+        assert!(window.try_find(("tool-usage-header", 0u64)).is_some());
+        assert!(window.try_find(("tool-header", 0u64)).is_none());
+        assert!(window.try_find(("copy-tool-output", 0u64)).is_none());
+
+        // The gathered reasoning disclosure is the user's to close as well.
+        window.click(("reasoning-header", 1u64), cx);
+        window.render_frame(cx);
+        assert!(window.try_find(("reasoning-header", 1u64)).is_some());
+        assert!(window.try_find(("reasoning-body", 1u64)).is_none());
+
+        // Clicking again opens the summary, so the choice toggles both ways.
+        window.click(("tool-usage-header", 0u64), cx);
+        window.render_frame(cx);
+        assert!(window.try_find(("copy-tool-output", 0u64)).is_some());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_running_tool_block_can_be_closed_after_it_opens(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.timeline = vec![TimelineItem::Assistant(AssistantTurn {
+            parts: vec![AssistantPart::Tool(Box::new(ToolPart {
+                id: ToolCallId::new(),
+                name: "web_search".to_owned(),
+                title: "Web search \"needle\"".to_owned(),
+                status: ToolPartStatus::Running,
+                detail: None,
+                output: Some(r#"{"results":[]}"#.to_owned()),
+                elapsed_ms: None,
+                approval_pending: false,
+                policy: None,
+            }))],
+            streaming: false,
+        })];
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("tool-usage-header", 0u64), cx);
+        window.render_frame(cx);
+        // A running call opens its own block so its progress is visible.
+        assert!(window.try_find(("copy-tool-output", 0u64)).is_some());
+
+        // The user can still close it while it runs.
+        window.click(("tool-header", 0u64), cx);
+        window.render_frame(cx);
+        assert!(window.try_find(("tool-header", 0u64)).is_some());
+        assert!(window.try_find(("copy-tool-output", 0u64)).is_none());
     })
     .unwrap();
 }

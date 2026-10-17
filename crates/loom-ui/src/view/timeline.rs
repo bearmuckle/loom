@@ -8,14 +8,14 @@ impl TimelineView {
             parent_subscription: None,
             scroller_subscription: None,
             session_id: None,
-            timeline_revision: (0, 0),
+            timeline_revision: TimelineRevision::default(),
         }
     }
 
     fn sync_list(
         &mut self,
         item_count: usize,
-        timeline_revision: (usize, usize),
+        timeline_revision: TimelineRevision,
         session_changed: bool,
         prepend_count: usize,
         cx: &mut Context<Self>,
@@ -60,14 +60,20 @@ impl Render for TimelineView {
             if session_changed {
                 self.session_id = Some(session_id);
             }
-            let timeline_revision = (
+            let timeline_revision = TimelineRevision {
                 item_count,
-                parent_state
+                last_item_len: parent_state
                     .timeline
                     .last()
                     .map(|item| format!("{item:?}").len())
                     .unwrap_or_default(),
-            );
+                // The detail level and the reasoning switch change how tall a
+                // row renders without changing its content, so they belong in
+                // the revision: a change re-measures the rows instead of
+                // leaving the virtual list on the old heights.
+                output_detail: parent_state.output_detail,
+                show_reasoning: parent_state.show_reasoning,
+            };
             (
                 item_count,
                 session_changed,

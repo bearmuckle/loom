@@ -1795,6 +1795,18 @@ pub(crate) fn run_tool_parts(parts: &[AssistantPart]) -> Vec<&ToolPart> {
         .collect()
 }
 
+/// Whether a transcript disclosure is open. A choice the user recorded wins
+/// over `automatic`, which is the state the output detail level or a running,
+/// approval-gated, or input-gated tool would open on its own. Without that
+/// precedence the disclosure would spring back open after every click.
+pub(crate) fn disclosure_expanded<K: Ord>(
+    choices: &BTreeMap<K, bool>,
+    key: &K,
+    automatic: bool,
+) -> bool {
+    choices.get(key).copied().unwrap_or(automatic)
+}
+
 /// Renders a tool result as a patch when it looks like one, otherwise as code.
 pub(crate) fn render_tool_output(
     id: impl Into<gpui_kit::ElementId>,

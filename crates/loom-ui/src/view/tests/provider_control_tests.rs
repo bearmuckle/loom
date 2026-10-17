@@ -87,7 +87,7 @@ fn reasoning_visibility_toggle_round_trips(cx: &mut TestAppContext) {
     let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
         let mut view = LoomView::new_for_test(cx.focus_handle());
         assert!(!view.show_reasoning);
-        view.show_surface(CoveringSurface::Settings(SettingsSection::Appearance));
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Agents));
         view
     });
     cx.run_until_parked();
@@ -116,7 +116,7 @@ fn output_detail_choices_round_trip(cx: &mut TestAppContext) {
     let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
         let mut view = LoomView::new_for_test(cx.focus_handle());
         assert_eq!(view.output_detail, crate::state::OutputDetail::Medium);
-        view.show_surface(CoveringSurface::Settings(SettingsSection::Appearance));
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Agents));
         view
     });
     cx.run_until_parked();
@@ -155,6 +155,40 @@ fn output_detail_choices_round_trip(cx: &mut TestAppContext) {
         view.update(cx, |view, _| {
             assert_eq!(view.output_detail, crate::state::OutputDetail::Low);
         });
+    })
+    .unwrap();
+}
+
+/// The settings that describe how much of the agent's own output the
+/// transcript shows belong to the Agents section, not to Appearance, which is
+/// about the window's look.
+#[gpui_kit::test]
+fn agent_output_settings_live_in_the_agents_section(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Agents));
+        view
+    });
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("show-reasoning-toggle").is_some());
+        assert!(window.try_find(("output-detail", 0usize)).is_some());
+        assert!(window.try_find(("output-detail", 2usize)).is_some());
+        let view = window.root::<LoomView>().unwrap().unwrap();
+        view.update(cx, |view, _| {
+            view.show_surface(CoveringSurface::Settings(SettingsSection::Appearance));
+        });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        // Appearance keeps only the look of the window: theme and font size.
+        assert!(window.try_find(("theme-choice", 0usize)).is_some());
+        assert!(window.try_find("show-reasoning-toggle").is_none());
+        assert!(window.try_find(("output-detail", 0usize)).is_none());
     })
     .unwrap();
 }
