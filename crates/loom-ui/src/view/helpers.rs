@@ -1653,6 +1653,7 @@ pub(crate) fn tool_icon(name: &str) -> AssetIconName {
         "github_get_pull_request" => AssetIconName::GitBranch,
         "github_create_pull_request" => AssetIconName::GitMerge,
         "github_push_branch" => AssetIconName::ArrowUp,
+        "github_list_remote_refs" => AssetIconName::List,
         "github_list_issues" => AssetIconName::List,
         "github_get_issue" => AssetIconName::FileText,
         "github_get_comments" => AssetIconName::MessageSquare,
@@ -1692,6 +1693,7 @@ pub(crate) fn tool_group_label(name: &str, count: usize) -> String {
         "github_get_pull_request" => format!("Read {count} pull requests"),
         "github_create_pull_request" => format!("Opened {count} pull requests"),
         "github_push_branch" => format!("Pushed {count} branches"),
+        "github_list_remote_refs" => format!("Listed remote refs {count} times"),
         "github_list_issues" => format!("Listed issues {count} times"),
         "github_get_issue" => format!("Read {count} issues"),
         "github_get_comments" => format!("Read comments {count} times"),
@@ -1738,6 +1740,7 @@ pub(crate) fn tool_usage_label(name: &str) -> &str {
         "github_get_pull_request" => "Read PR",
         "github_create_pull_request" => "Open PR",
         "github_push_branch" => "Push",
+        "github_list_remote_refs" => "Read refs",
         "github_list_issues" => "List issues",
         "github_get_issue" => "Read issue",
         "github_get_comments" => "Read comments",
@@ -2084,6 +2087,7 @@ pub(crate) fn tool_detail(call: &loom_model::ToolCall) -> Option<String> {
         | "github_get_pull_request"
         | "github_create_pull_request"
         | "github_push_branch"
+        | "github_list_remote_refs"
         | "github_list_issues"
         | "github_get_issue"
         | "github_get_comments"
@@ -2402,15 +2406,68 @@ pub(crate) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
             (Some(repository), _, _) => format!("Open pull request in {repository}"),
             _ => "Open pull request".to_owned(),
         },
-        "github_push_branch" => match (
-            string_argument(arguments, "repository"),
-            string_argument(arguments, "branch"),
-        ) {
-            (Some(repository), Some(branch)) => format!("Push {branch} to {repository}"),
-            (Some(repository), None) => format!("Push branch to {repository}"),
-            (None, Some(branch)) => format!("Push {branch}"),
-            (None, None) => "Push branch".to_owned(),
-        },
+        "github_push_branch" => {
+            let repository = string_argument(arguments, "repository");
+            let branch = string_argument(arguments, "branch");
+            let remote_branch = string_argument(arguments, "remote_branch");
+            let tag = arguments
+                .get("tag")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let delete = arguments
+                .get("delete")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let target = branch.as_deref().or(remote_branch.as_deref());
+            if delete {
+                match (repository, target) {
+                    (Some(repository), Some(target)) => {
+                        format!("Delete {target} from {repository}")
+                    }
+                    (Some(repository), None) => format!("Delete remote ref in {repository}"),
+                    (None, Some(target)) => format!("Delete {target}"),
+                    (None, None) => "Delete remote ref".to_owned(),
+                }
+            } else if tag {
+                match (repository, target) {
+                    (Some(repository), Some(tag)) => format!("Push tag {tag} to {repository}"),
+                    (Some(repository), None) => format!("Push tag to {repository}"),
+                    (None, Some(tag)) => format!("Push tag {tag}"),
+                    (None, None) => "Push tag".to_owned(),
+                }
+            } else {
+                match (repository, branch) {
+                    (Some(repository), Some(branch)) => match remote_branch {
+                        Some(remote) => format!("Push {branch} to {remote} in {repository}"),
+                        None => format!("Push {branch} to {repository}"),
+                    },
+                    (Some(repository), None) => match remote_branch {
+                        Some(remote) => format!("Push to {remote} in {repository}"),
+                        None => format!("Push branch to {repository}"),
+                    },
+                    (None, Some(branch)) => match remote_branch {
+                        Some(remote) => format!("Push {branch} to {remote}"),
+                        None => format!("Push {branch}"),
+                    },
+                    (None, None) => match remote_branch {
+                        Some(remote) => format!("Push to {remote}"),
+                        None => "Push branch".to_owned(),
+                    },
+                }
+            }
+        }
+        "github_list_remote_refs" => {
+            let repository = string_argument(arguments, "repository");
+            let branch = string_argument(arguments, "branch");
+            match (repository, branch) {
+                (Some(repository), Some(branch)) => {
+                    format!("Read refs of {repository} for {branch}")
+                }
+                (Some(repository), None) => format!("Read refs of {repository}"),
+                (None, Some(branch)) => format!("Read remote refs for {branch}"),
+                (None, None) => "Read remote refs".to_owned(),
+            }
+        }
         "github_list_issues" => string_argument(arguments, "repository").map_or_else(
             || "List issues".to_owned(),
             |repository| format!("List issues in {repository}"),
