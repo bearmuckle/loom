@@ -532,6 +532,9 @@ pub(crate) struct LoomView {
         loom_protocol::GitDiff,
     )>,
     project_snapshot_stale: bool,
+    /// At most one active-pane snapshot request, across selection changes.
+    project_snapshot_refreshing: Option<AgentSessionId>,
+    missing_project_snapshots_refreshing: bool,
     project_feed_after_sequence: Option<EventSequence>,
     project_feed_epoch: Option<String>,
     project_poll_scheduled: bool,
@@ -551,6 +554,8 @@ pub(crate) struct LoomView {
     /// Sources reported per session while its lookup is in flight, and the set
     /// of sessions already asked about, so a project is only looked up once.
     session_source_lookups: BTreeMap<AgentSessionId, (Option<String>, Option<String>)>,
+    /// Serializes background source discovery across render-triggered refreshes.
+    session_source_request_in_flight: bool,
     /// Last session-list error per worker node, so a worker that failed to load
     /// is distinguishable from one that simply has no projects.
     node_session_load_errors: BTreeMap<String, String>,
@@ -1708,6 +1713,8 @@ impl LoomView {
             project_tree_snapshots: Vec::new(),
             project_child_review: None,
             project_snapshot_stale: false,
+            project_snapshot_refreshing: None,
+            missing_project_snapshots_refreshing: false,
             project_feed_after_sequence: None,
             project_feed_epoch: None,
             project_poll_scheduled: false,
@@ -1717,6 +1724,7 @@ impl LoomView {
             project_list_active: None,
             session_sources: BTreeMap::new(),
             session_source_lookups: BTreeMap::new(),
+            session_source_request_in_flight: false,
             node_session_load_errors: BTreeMap::new(),
             active_session: active_session.clone(),
             active_run: None,

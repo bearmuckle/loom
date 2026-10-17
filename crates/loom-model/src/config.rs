@@ -347,11 +347,16 @@ impl UsageLedger {
         provider: Option<&ProviderId>,
         model: Option<&ModelId>,
     ) -> ProviderUsageSummary {
+        let selection = model.and_then(ModelId::provider_model);
+        let raw = selection.as_ref().map(|(_, raw)| raw).or(model);
         self.aggregates
             .iter()
             .filter(|(key, _)| {
                 provider.is_none_or(|provider| &key.provider == provider)
-                    && model.is_none_or(|model| &key.model == model)
+                    && selection
+                        .as_ref()
+                        .is_none_or(|(provider, _)| &key.provider == provider)
+                    && raw.is_none_or(|model| &key.model == model)
             })
             .fold(
                 ProviderUsageSummary::default(),

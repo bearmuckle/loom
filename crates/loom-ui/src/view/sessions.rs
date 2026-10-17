@@ -695,9 +695,8 @@ impl LoomView {
         cx.notify();
     }
 
-    /// The most projects whose source is looked up in one refresh, so opening
-    /// the client does not issue a request per project at once.
-    pub(crate) const SESSION_SOURCE_LOOKUPS_PER_REFRESH: usize = 6;
+    /// At most one project is selected for background source discovery.
+    pub(crate) const SESSION_SOURCE_LOOKUPS_PER_REFRESH: usize = 1;
 
     /// Remembers the active project's main source from the sources its session
     /// load just refreshed, so opening a project fills its row's second line.
@@ -747,52 +746,68 @@ impl LoomView {
         }
     }
 
-    /// Asks the backend where each project without a known source came from, so
-    /// a project row can show its main source without the project being opened.
-    /// Every project is asked at most once, and the fan-out per refresh is
-    /// bounded.
+    /// Discovers sources with one request outstanding across all refreshes.
+    /// Answers advance discovery without waiting for another render.
     pub(crate) fn refresh_session_source_labels(&mut self, cx: &mut Context<Self>) {
-        for session_id in self.session_source_lookup_candidates() {
-            self.session_source_lookups.insert(session_id, (None, None));
-            self.dispatch(
-                cx,
-                ClientRequest::Repository(RepositoryRequest::ListSessionRepositories {
-                    session_id,
-                }),
-                move |view, response, _| {
-                    if let Ok(ServerResponse::Repository(
-                        RepositoryResponse::SessionRepositories { repositories },
-                    )) = response.result
-                    {
-                        view.record_session_source_candidate(
-                            session_id,
-                            repositories
-                                .first()
-                                .map(|repository| repository.source.clone()),
-                            None,
-                        );
-                    }
-                },
-            );
-            self.dispatch(
-                cx,
-                ClientRequest::Filesystem(FilesystemRequest::ListSessionDirectories { session_id }),
-                move |view, response, _| {
-                    if let Ok(ServerResponse::Filesystem(
-                        FilesystemResponse::SessionDirectories { directories },
-                    )) = response.result
-                    {
-                        view.record_session_source_candidate(
-                            session_id,
-                            None,
-                            directories
-                                .first()
-                                .map(|directory| directory.source.clone()),
-                        );
-                    }
-                },
-            );
+        if self.session_source_request_in_flight {
+            return;
         }
+        let Some(session_id) = self.session_source_lookup_candidates().first().copied() else {
+            return;
+        };
+        self.session_source_request_in_flight = true;
+        self.session_source_lookups.insert(session_id, (None, None));
+        self.dispatch(
+            cx,
+            ClientRequest::Repository(RepositoryRequest::ListSessionRepositories { session_id }),
+            move |view, response, cx| {
+                if let Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositories {
+                    repositories,
+                })) = response.result
+                {
+                    if let Some(repository) = repositories.first() {
+                        view.record_session_source_candidate(
+                            session_id,
+                            Some(repository.source.clone()),
+                            None,
+                        );
+                    } else {
+                        // Keep the single-flight guard set during the fallback.
+                        view.discover_session_directory_source(session_id, cx);
+                        return;
+                    }
+                }
+                view.session_source_request_in_flight = false;
+                view.refresh_session_source_labels(cx);
+            },
+        );
+    }
+
+    fn discover_session_directory_source(
+        &mut self,
+        session_id: AgentSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch(
+            cx,
+            ClientRequest::Filesystem(FilesystemRequest::ListSessionDirectories { session_id }),
+            move |view, response, cx| {
+                if let Ok(ServerResponse::Filesystem(FilesystemResponse::SessionDirectories {
+                    directories,
+                })) = response.result
+                {
+                    view.record_session_source_candidate(
+                        session_id,
+                        None,
+                        directories
+                            .first()
+                            .map(|directory| directory.source.clone()),
+                    );
+                }
+                view.session_source_request_in_flight = false;
+                view.refresh_session_source_labels(cx);
+            },
+        );
     }
 
     /// Projects whose main source is still unknown, in list order and bounded
@@ -893,6 +908,8 @@ impl LoomView {
             let models = catalog.models;
             view.update(cx, |view, cx| {
                 view.record_model_discovery_errors(catalog.discovery_errors);
+                view.node_model_provider_names
+                    .insert(node_id.clone(), catalog.provider_names);
                 view.node_model_catalogs
                     .insert(node_id.clone(), models.clone());
                 view.default_models = models.clone();

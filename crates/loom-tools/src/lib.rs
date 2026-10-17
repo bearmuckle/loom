@@ -16,7 +16,7 @@ use loom_core::{
 };
 pub use loom_model::ToolResult;
 use loom_model::{CancellationToken, ToolCall, ToolDefinition};
-use loom_vcs::{BranchPushReport, GitService};
+use loom_vcs::{BranchPush, GitService, PushReport, RemoteRef, RemoteRefsReport};
 use loom_workspace::{Workspace, WorkspaceEdit};
 use regex::RegexBuilder;
 use scraper::{Html, Selector};
@@ -78,6 +78,7 @@ pub enum ToolKind {
     GitHubGetBranchChecks,
     GitHubCreatePullRequest,
     GitHubPushBranch,
+    GitHubListRemoteRefs,
     GitHubListIssues,
     GitHubListIssueTypes,
     GitHubGetIssue,
@@ -109,6 +110,7 @@ impl ToolKind {
             "github_get_branch_checks" => Some(Self::GitHubGetBranchChecks),
             "github_create_pull_request" => Some(Self::GitHubCreatePullRequest),
             "github_push_branch" => Some(Self::GitHubPushBranch),
+            "github_list_remote_refs" => Some(Self::GitHubListRemoteRefs),
             "github_list_issues" => Some(Self::GitHubListIssues),
             "github_list_issue_types" => Some(Self::GitHubListIssueTypes),
             "github_get_issue" => Some(Self::GitHubGetIssue),
@@ -143,6 +145,7 @@ impl ToolKind {
             Self::GitHubGetBranchChecks => "github_get_branch_checks",
             Self::GitHubCreatePullRequest => "github_create_pull_request",
             Self::GitHubPushBranch => "github_push_branch",
+            Self::GitHubListRemoteRefs => "github_list_remote_refs",
             Self::GitHubListIssues => "github_list_issues",
             Self::GitHubListIssueTypes => "github_list_issue_types",
             Self::GitHubGetIssue => "github_get_issue",
@@ -188,7 +191,8 @@ impl ToolKind {
             | Self::GitHubListIssueTypes
             | Self::GitHubGetIssue
             | Self::GitHubGetComments
-            | Self::GitHubGetBranchChecks => ActionKind::Network,
+            | Self::GitHubGetBranchChecks
+            | Self::GitHubListRemoteRefs => ActionKind::Network,
             // Destructive classifies an audited, hard-to-reverse action for the
             // user to decide about: the default policy and
             // `ApprovalPolicy::auto_approve` both allow this kind, and a user
@@ -538,6 +542,7 @@ impl ToolExecutor {
                 | ToolKind::GitHubGetIssue
                 | ToolKind::GitHubGetComments
                 | ToolKind::GitHubGetBranchChecks
+                | ToolKind::GitHubListRemoteRefs
                 | ToolKind::GitHubCreatePullRequest
                 | ToolKind::GitHubCreateIssue
                 | ToolKind::GitHubUpdateIssue
@@ -659,6 +664,7 @@ impl ToolExecutor {
             ToolKind::GitHubGetBranchChecks => self.github_get_branch_checks(call),
             ToolKind::GitHubCreatePullRequest => self.github_create_pull_request(call),
             ToolKind::GitHubPushBranch => self.github_push_branch(call),
+            ToolKind::GitHubListRemoteRefs => self.github_list_remote_refs(call),
             ToolKind::GitHubListIssues => self.github_list_issues(call),
             ToolKind::GitHubListIssueTypes => self.github_list_issue_types(call),
             ToolKind::GitHubGetIssue => self.github_get_issue(call),
@@ -1840,69 +1846,18 @@ impl ToolExecutor {
             Ok(arguments) => arguments,
             Err(error) => return ToolResult::failure(call, error),
         };
-        let token = match self.github_token.as_deref() {
-            Some(token) => token,
-            None => return ToolResult::failure(call, GITHUB_NOT_CONNECTED),
-        };
-        if !valid_github_repository(&arguments.repository) {
-            return ToolResult::failure(call, "repository must be in owner/name format");
-        }
-        let cwd = match arguments
-            .path
-            .as_deref()
-            .map_or_else(|| Ok(self.root.clone()), |path| self.resolve_relative(path))
-        {
-            Ok(cwd) => cwd,
+        let delete = arguments.delete.unwrap_or(false);
+        let tag = arguments.tag.unwrap_or(false);
+        let dry_run = arguments.dry_run.unwrap_or(false);
+        let branch = match normalize_push_name(arguments.branch.as_deref(), "branch") {
+            Ok(branch) => branch,
             Err(error) => return ToolResult::failure(call, error),
         };
-        let service = match GitService::open(&cwd) {
-            Ok(service) => service,
-            Err(error) => return ToolResult::failure(call, error.message),
-        };
-        let origin = match service.remote_url("origin") {
-            Ok(Some(origin)) => origin,
-            Ok(None) => {
-                return ToolResult::failure(
-                    call,
-                    "the repository has no 'origin' remote to push to",
-                );
-            }
-            Err(error) => return ToolResult::failure(call, error.message),
-        };
-        let target = match classify_push_remote(&origin) {
-            Some(PushRemote::GitHub(repository)) => {
-                if !repository.eq_ignore_ascii_case(&arguments.repository) {
-                    return ToolResult::failure(
-                        call,
-                        format!(
-                            "the 'origin' remote points at {repository}, not the requested repository {}",
-                            arguments.repository
-                        ),
-                    );
-                }
-                repository
-            }
-            Some(PushRemote::Local) => origin.clone(),
-            None => {
-                return ToolResult::failure(
-                    call,
-                    format!("the 'origin' remote is not a GitHub repository URL: {origin}"),
-                );
-            }
-        };
-        let branch = match arguments.branch {
-            Some(branch) => branch,
-            None => match service.current_branch() {
-                Ok(Some(branch)) => branch,
-                Ok(None) => {
-                    return ToolResult::failure(
-                        call,
-                        "the repository is not on a local branch; specify a branch to push",
-                    );
-                }
-                Err(error) => return ToolResult::failure(call, error.message),
-            },
-        };
+        let remote_branch =
+            match normalize_push_name(arguments.remote_branch.as_deref(), "remote_branch") {
+                Ok(remote_branch) => remote_branch,
+                Err(error) => return ToolResult::failure(call, error),
+            };
         // A lease turns the push into a force-with-lease rewrite; without one the
         // push stays fast-forward-only, exactly as it was before a lease existed.
         let lease = match arguments.lease.as_deref().map(str::trim) {
@@ -1914,29 +1869,195 @@ impl ToolExecutor {
             }
             lease => lease.map(str::to_owned),
         };
-        let pushed = match lease.as_deref() {
-            Some(lease) => service.push_branch_force_with_lease_authenticated(
-                &branch,
-                lease,
-                token,
-                GITHUB_PUSH_REMOTE_READ_DEADLINE,
-            ),
-            None => {
-                service.push_branch_authenticated(&branch, token, GITHUB_PUSH_REMOTE_READ_DEADLINE)
+        if let Err(error) = validate_push_arguments(
+            tag,
+            delete,
+            branch.as_deref(),
+            remote_branch.as_deref(),
+            lease.as_deref(),
+        ) {
+            return ToolResult::failure(call, error);
+        }
+        let token = match self.github_token.as_deref() {
+            Some(token) => token,
+            None => return ToolResult::failure(call, GITHUB_NOT_CONNECTED),
+        };
+        let (service, target) =
+            match self.github_remote_target(&arguments.repository, arguments.path.as_deref()) {
+                Ok(target) => target,
+                Err(error) => return ToolResult::failure(call, error),
+            };
+        let deadline = GITHUB_PUSH_REMOTE_READ_DEADLINE;
+        // The name a branch push reports: the requested branch, or the current
+        // branch when the caller left it out.
+        let mut pushed_branch = branch.clone().unwrap_or_default();
+        let pushed = if delete {
+            let refname = if tag {
+                match branch.as_deref() {
+                    Some(tag_name) => format!("refs/tags/{tag_name}"),
+                    None => {
+                        return ToolResult::failure(
+                            call,
+                            "deleting a tag needs branch naming the tag to delete",
+                        );
+                    }
+                }
+            } else {
+                let name = match remote_branch.as_deref().or(branch.as_deref()) {
+                    Some(name) => name.to_owned(),
+                    None => match service.current_branch() {
+                        Ok(Some(current)) => current,
+                        Ok(None) => {
+                            return ToolResult::failure(
+                                call,
+                                "the repository is not on a local branch; specify a branch or remote_branch to delete",
+                            );
+                        }
+                        Err(error) => return ToolResult::failure(call, error.message),
+                    },
+                };
+                format!("refs/heads/{name}")
+            };
+            service.delete_remote_ref_authenticated(&refname, dry_run, token, deadline)
+        } else if tag {
+            match branch.as_deref() {
+                Some(tag_name) => {
+                    service.push_tag_authenticated(tag_name, dry_run, token, deadline)
+                }
+                None => {
+                    return ToolResult::failure(
+                        call,
+                        "pushing a tag needs branch naming the local tag to push",
+                    );
+                }
             }
+        } else {
+            let local = match branch.as_deref() {
+                Some(branch) => branch.to_owned(),
+                None => match service.current_branch() {
+                    Ok(Some(branch)) => branch,
+                    Ok(None) => {
+                        return ToolResult::failure(
+                            call,
+                            "the repository is not on a local branch; specify a branch to push",
+                        );
+                    }
+                    Err(error) => return ToolResult::failure(call, error.message),
+                },
+            };
+            pushed_branch = local.clone();
+            service.push_branch_authenticated(
+                BranchPush {
+                    branch: &local,
+                    remote_branch: remote_branch.as_deref(),
+                    lease: lease.as_deref(),
+                    dry_run,
+                },
+                token,
+                deadline,
+            )
         };
         match pushed {
             Ok(report) => {
-                // The push already succeeded, so the base drift is reported
-                // next to the result: a branch pushed from a checkout that is
-                // many commits behind its base opens a stale pull request.
-                let freshness = checkout_base_freshness_note(&service, Some(token));
-                let result =
-                    github_push_result(&target, &branch, lease.as_deref(), &report, &freshness);
+                // The push already succeeded, so the base drift is reported next
+                // to a branch update: a branch pushed from a checkout that is
+                // many commits behind its base opens a stale pull request. A tag
+                // or a delete publishes no branch, so there is no base to report.
+                let freshness = (!report.deleted && report.refname.starts_with("refs/heads/"))
+                    .then(|| checkout_base_freshness_note(&service, Some(token)));
+                let label = if pushed_branch.is_empty() {
+                    report.refname.as_str()
+                } else {
+                    pushed_branch.as_str()
+                };
+                let result = github_push_result(
+                    &target,
+                    label,
+                    lease.as_deref(),
+                    &report,
+                    freshness.as_deref(),
+                );
                 ToolResult::success(call, self.limit_output(result))
             }
             Err(error) => ToolResult::failure(call, error.message),
         }
+    }
+
+    /// Reads the refs the `origin` remote advertises, so a caller can use one as
+    /// the lease of a force-with-lease push and see a branch's ahead/behind
+    /// state without a checkpoint fetch.
+    fn github_list_remote_refs(&self, call: &ToolCall) -> ToolResult {
+        let arguments: GitHubListRemoteRefsArguments = match parse_arguments(call) {
+            Ok(arguments) => arguments,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let branch = match normalize_push_name(arguments.branch.as_deref(), "branch") {
+            Ok(branch) => branch,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let token = match self.github_token.as_deref() {
+            Some(token) => token,
+            None => return ToolResult::failure(call, GITHUB_NOT_CONNECTED),
+        };
+        let (service, _target) =
+            match self.github_remote_target(&arguments.repository, arguments.path.as_deref()) {
+                Ok(target) => target,
+                Err(error) => return ToolResult::failure(call, error),
+            };
+        match service.remote_refs_authenticated(
+            branch.as_deref(),
+            token,
+            GITHUB_PUSH_REMOTE_READ_DEADLINE,
+        ) {
+            Ok(report) => ToolResult::success(
+                call,
+                self.limit_output(github_remote_refs_result(&report, branch.as_deref())),
+            ),
+            Err(error) => ToolResult::failure(call, error.message),
+        }
+    }
+
+    /// Resolves the checkout at `path` and its `origin` remote to the target a
+    /// push or a remote read reports. A repository the caller did not name and an
+    /// origin that is neither GitHub nor a local path are refused the same way for
+    /// both tools.
+    fn github_remote_target(
+        &self,
+        repository: &str,
+        path: Option<&str>,
+    ) -> std::result::Result<(GitService, String), String> {
+        if !valid_github_repository(repository) {
+            return Err("repository must be in owner/name format".to_owned());
+        }
+        let cwd = match path {
+            Some(path) => self.resolve_relative(path)?,
+            None => self.root.clone(),
+        };
+        let service = GitService::open(&cwd).map_err(|error| error.message)?;
+        let origin = match service
+            .remote_url("origin")
+            .map_err(|error| error.message)?
+        {
+            Some(origin) => origin,
+            None => return Err("the repository has no 'origin' remote".to_owned()),
+        };
+        let target = match classify_push_remote(&origin) {
+            Some(PushRemote::GitHub(remote_repository)) => {
+                if !remote_repository.eq_ignore_ascii_case(repository) {
+                    return Err(format!(
+                        "the 'origin' remote points at {remote_repository}, not the requested repository {repository}"
+                    ));
+                }
+                remote_repository
+            }
+            Some(PushRemote::Local) => origin.clone(),
+            None => {
+                return Err(format!(
+                    "the 'origin' remote is not a GitHub repository URL: {origin}"
+                ));
+            }
+        };
+        Ok((service, target))
     }
 
     /// The connected account's token, or the shared "not connected" failure.
@@ -2781,9 +2902,25 @@ struct GitHubPushBranchArguments {
     repository: String,
     branch: Option<String>,
     path: Option<String>,
+    /// Remote branch to update when it differs from the local branch name.
+    remote_branch: Option<String>,
+    /// Delete the remote ref instead of pushing to it.
+    delete: Option<bool>,
+    /// Push the local tag named by `branch` instead of a branch.
+    tag: Option<bool>,
+    /// Report the update without sending it.
+    dry_run: Option<bool>,
     /// The revision the caller believes the remote branch is at. Supplying it asks
     /// for a force-with-lease rewrite instead of a fast-forward-only push.
     lease: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubListRemoteRefsArguments {
+    repository: String,
+    path: Option<String>,
+    /// Local branch to report ahead/behind for.
+    branch: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2890,46 +3027,210 @@ fn encode_github_path_segment(segment: &str) -> String {
     encoded
 }
 
-/// Renders what a push changed: the remote ref it updated, the revision that ref
-/// held before the push, the revision it holds now, and the commit range the
-/// update landed, followed by the existing base-freshness note.
+/// Trims and rejects a blank ref name, so a caller that meant to omit an
+/// argument cannot silently push or delete the wrong ref.
+fn normalize_push_name(
+    value: Option<&str>,
+    label: &str,
+) -> std::result::Result<Option<String>, String> {
+    match value.map(str::trim) {
+        Some("") => Err(format!(
+            "{label} must name a ref; a blank {label} cannot be pushed or deleted"
+        )),
+        Some(value) => Ok(Some(value.to_owned())),
+        None => Ok(None),
+    }
+}
+
+/// Refuses argument combinations that would have to guess what the caller meant,
+/// before any remote is contacted.
+fn validate_push_arguments(
+    tag: bool,
+    delete: bool,
+    branch: Option<&str>,
+    remote_branch: Option<&str>,
+    lease: Option<&str>,
+) -> std::result::Result<(), String> {
+    if tag && remote_branch.is_some() {
+        return Err(
+            "tag and remote_branch cannot be combined: a tag is pushed to refs/tags/<branch>"
+                .to_owned(),
+        );
+    }
+    if delete && lease.is_some() {
+        return Err(
+            "delete and lease cannot be combined: a lease rewrites a branch, while a delete removes the ref"
+                .to_owned(),
+        );
+    }
+    if tag && lease.is_some() {
+        return Err(
+            "tag and lease cannot be combined: a lease only applies to a branch push".to_owned(),
+        );
+    }
+    if tag && branch.is_none() {
+        return Err(if delete {
+            "deleting a tag needs branch naming the tag to delete".to_owned()
+        } else {
+            "pushing a tag needs branch naming the local tag to push".to_owned()
+        });
+    }
+    Ok(())
+}
+
+/// Renders what a push, a tag push, or a delete changed: the remote ref it
+/// updated, the revision that ref held before the call, the revision it holds
+/// now, and the commit range the update landed, followed by the base-freshness
+/// note a branch push reports.
 ///
-/// Every revision stated here comes from the push itself, so a caller can confirm
+/// Every revision stated here comes from the call itself, so a caller can confirm
 /// what reached the remote without fetching, and a ref the remote did not have is
 /// stated as such instead of being left blank. A push that was asked to rewrite
 /// the ref names the lease it verified, so the report says why rewriting was
-/// allowed.
+/// allowed. A dry run renders the same facts with what would have happened
+/// instead of what did.
 fn github_push_result(
     target: &str,
     branch: &str,
     lease: Option<&str>,
-    report: &BranchPushReport,
-    freshness: &str,
+    report: &PushReport,
+    freshness: Option<&str>,
 ) -> String {
-    let headline = match lease {
-        Some(lease) => format!(
-            "Force-pushed branch '{branch}' to {target} with force-with-lease: the remote {} still held {lease}.",
-            report.refname
-        ),
-        None => format!("Pushed branch '{branch}' to {target}."),
-    };
     let previous = report
         .previous_revision
         .clone()
         .unwrap_or_else(|| "the ref did not exist".to_owned());
-    let landed = match (report.previous_revision.as_deref(), report.commits) {
-        (Some(previous), Some(commits)) => {
-            format!("{commits} commits from {previous}..{}", report.revision)
+    if report.deleted {
+        let headline = if report.dry_run {
+            format!(
+                "Dry run: would delete {} from {target}; nothing was written.",
+                report.refname
+            )
+        } else {
+            format!("Deleted {} from {target}.", report.refname)
+        };
+        return format!(
+            "{headline}\nRemote ref: {}\nPrevious remote revision: {previous}",
+            report.refname
+        );
+    }
+    let is_tag = report.refname.starts_with("refs/tags/");
+    let tag_name = report.refname.strip_prefix("refs/tags/").unwrap_or(branch);
+    let headline = if is_tag {
+        if report.dry_run {
+            format!("Dry run: would push tag '{tag_name}' to {target}; nothing was written.")
+        } else {
+            format!("Pushed tag '{tag_name}' to {target}.")
         }
-        _ => format!(
-            "the remote ref did not exist, so the push created it at {}",
-            report.revision
-        ),
+    } else {
+        match (lease, report.dry_run) {
+            (Some(lease), true) => format!(
+                "Dry run: would force-push branch '{branch}' to {target} with force-with-lease: the remote {} still held {lease}; nothing was written.",
+                report.refname
+            ),
+            (Some(lease), false) => format!(
+                "Force-pushed branch '{branch}' to {target} with force-with-lease: the remote {} still held {lease}.",
+                report.refname
+            ),
+            (None, true) => {
+                format!("Dry run: would push branch '{branch}' to {target}; nothing was written.")
+            }
+            (None, false) => format!("Pushed branch '{branch}' to {target}."),
+        }
     };
-    format!(
-        "{headline}\nRemote ref: {}\nPrevious remote revision: {previous}\nNew revision: {}\nLanded: {landed}\nBase freshness: {freshness}",
-        report.refname, report.revision
-    )
+    let landed = match (
+        report.previous_revision.as_deref(),
+        report.commits,
+        report.revision.as_deref(),
+    ) {
+        (Some(previous), Some(commits), Some(revision)) => {
+            format!("{commits} commits from {previous}..{revision}")
+        }
+        (_, _, Some(revision)) => {
+            format!("the remote ref did not exist, so the push created it at {revision}")
+        }
+        _ => "the update left no revision behind".to_owned(),
+    };
+    let mut result = format!(
+        "{headline}\nRemote ref: {}\nPrevious remote revision: {previous}",
+        report.refname
+    );
+    if let Some(revision) = report.revision.as_deref() {
+        result.push_str(&format!("\nNew revision: {revision}"));
+    }
+    result.push_str(&format!(
+        "\n{}: {landed}",
+        if report.dry_run {
+            "Would land"
+        } else {
+            "Landed"
+        }
+    ));
+    if let Some(fast_forward) = report.fast_forward {
+        result.push_str(&format!(
+            "\nFast-forward: {}",
+            if fast_forward { "yes" } else { "no" }
+        ));
+        if report.dry_run && !fast_forward {
+            result.push_str(
+                "\nThe update is not a fast-forward, so the remote would refuse it without a lease.",
+            );
+        }
+    }
+    if let Some(freshness) = freshness {
+        result.push_str(&format!("\nBase freshness: {freshness}"));
+    }
+    result
+}
+
+/// Renders the refs the `origin` remote advertises: the remote, its heads and
+/// tags one `refname revision` line each, the tracking line of a local branch,
+/// and a note when a requested branch is not advertised at all.
+fn github_remote_refs_result(report: &RemoteRefsReport, branch: Option<&str>) -> String {
+    let mut lines = vec![format!("Remote: {}", report.remote), "Heads:".to_owned()];
+    push_remote_ref_lines(&mut lines, &report.heads);
+    lines.push("Tags:".to_owned());
+    push_remote_ref_lines(&mut lines, &report.tags);
+    if let Some(tracking) = &report.tracking {
+        lines.push(format!(
+            "Tracking '{}': local refs/heads/{} {} is {} ahead and {} behind origin/{} {}",
+            tracking.branch,
+            tracking.branch,
+            tracking.local_revision,
+            commit_count(tracking.ahead),
+            commit_count(tracking.behind),
+            tracking.branch,
+            tracking.remote_revision
+        ));
+    }
+    if let Some(branch) = branch
+        && !report
+            .heads
+            .iter()
+            .any(|head| head.refname == format!("refs/heads/{branch}"))
+    {
+        lines.push(format!(
+            "The 'origin' remote does not advertise 'refs/heads/{branch}'; a push would create it."
+        ));
+    }
+    lines.join("\n")
+}
+
+/// Appends one `refname revision` line per ref, or `none` for an empty list.
+fn push_remote_ref_lines(lines: &mut Vec<String>, refs: &[RemoteRef]) {
+    if refs.is_empty() {
+        lines.push("none".to_owned());
+        return;
+    }
+    lines.extend(
+        refs.iter()
+            .map(|reference| format!("{} {}", reference.refname, reference.revision)),
+    );
+}
+
+/// `1 commit` or `N commits`, so a tracking line reads naturally.
+fn commit_count(count: usize) -> String {
+    format!("{count} commit{}", if count == 1 { "" } else { "s" })
 }
 
 /// Describes how far the checkout at `service` has drifted from the default
@@ -3208,14 +3509,32 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolKind::GitHubPushBranch.name().to_owned(),
-            description: "Push a local branch in the workspace to the GitHub repository's origin remote using the connected account, so a pull request can be opened, and report the remote ref's previous revision, its new revision, and the commit range landed. The result also states how far the checkout's base has drifted from origin. Supplying `lease` asks for a force-with-lease rewrite instead of a fast-forward-only push: a force push rewrites published history, and it is safe only because the tool refuses the push unless the remote branch still holds exactly the lease revision. This is a destructive action: it requires enabled GitHub write access and an approval policy that permits destructive actions; the default policy and automatic approvals allow it, and a user who gates destructive actions is prompted for each call.".to_owned(),
+            description: "Push a local branch in the workspace to the GitHub repository's origin remote using the connected account, so a pull request can be opened, and report the remote ref's previous revision, its new revision, and the commit range landed. `remote_branch` targets a remote branch name distinct from the local one; `tag` pushes the local tag named by `branch` to refs/tags/<branch>; `delete` removes the remote ref named by `remote_branch`, `branch`, or the current branch instead of pushing it; and `dry_run` performs the reads and reports what would change without writing to the remote. The result also states how far the checkout's base has drifted from origin. Supplying `lease` asks for a force-with-lease rewrite instead of a fast-forward-only push: a force push rewrites published history, and it is safe only because the tool refuses the push unless the remote branch still holds exactly the lease revision. This is a destructive action: it requires enabled GitHub write access and an approval policy that permits destructive actions; the default policy and automatic approvals allow it, and a user who gates destructive actions is prompted for each call.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "repository": {"type": "string", "description": "Repository in owner/name format; must match the checkout's origin."},
-                    "branch": {"type": "string", "description": "Branch to push. Defaults to the current branch."},
+                    "branch": {"type": "string", "description": "Branch to push, local tag to push when `tag` is set, or tag to delete when `delete` and `tag` are set. Defaults to the current branch for a branch push or a branch delete."},
+                    "remote_branch": {"type": "string", "description": "Remote branch to update or delete when it differs from the local branch name. Cannot be combined with `tag`."},
+                    "delete": {"type": "boolean", "description": "Delete the remote ref instead of pushing to it. Needs no local ref and cannot be combined with `lease`."},
+                    "tag": {"type": "boolean", "description": "Push the local tag named by `branch` to refs/tags/<branch>, or delete that tag when `delete` is also set. Cannot be combined with `remote_branch` or `lease`."},
+                    "dry_run": {"type": "boolean", "description": "Perform the remote reads and report what would change without writing to the remote."},
                     "path": {"type": "string", "description": "Workspace-relative path to the Git checkout. Defaults to the workspace root."},
                     "lease": {"type": "string", "description": "Full commit id the remote branch is expected to still be at, as reported by a previous push or read from the remote. Supplying it rewrites published history with a force-with-lease update, which is safe only because the push is refused unless the remote branch still holds this exact revision; omit it for a fast-forward-only push."}
+                },
+                "required": ["repository"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: ToolKind::GitHubListRemoteRefs.name().to_owned(),
+            description: "Read the refs the origin remote advertises for a GitHub repository: its heads and tags, plus the ahead/behind state of a named local branch, so the lease revision for github_push_branch and the branch's tracking state can be read without a checkpoint fetch. Requires a connected GitHub account and approval for network access.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repository": {"type": "string", "description": "Repository in owner/name format; must match the checkout's origin."},
+                    "path": {"type": "string", "description": "Workspace-relative path to the Git checkout. Defaults to the workspace root."},
+                    "branch": {"type": "string", "description": "Local branch to report ahead/behind for. The remote head of the same name must exist."}
                 },
                 "required": ["repository"],
                 "additionalProperties": false
@@ -4343,6 +4662,7 @@ mod tests {
             "github_list_pull_requests",
             "github_get_pull_request",
             "github_get_branch_checks",
+            "github_list_remote_refs",
             "github_create_pull_request",
             "github_list_issues",
             "github_list_issue_types",
@@ -4520,6 +4840,345 @@ mod tests {
         fs::remove_dir_all(bare).unwrap();
     }
 
+    /// The revision a bare origin holds for the full ref name `refname`, or an
+    /// empty string when it holds no such ref.
+    fn remote_ref_revision(bare: &Path, refname: &str) -> String {
+        let output = Command::new("git")
+            .args(["rev-parse", "--verify", "-q", refname])
+            .current_dir(bare)
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    #[test]
+    fn github_push_branch_targets_a_remote_branch_name() {
+        let root = std::env::temp_dir().join(format!("loom-push-{}", AgentSessionId::new()));
+        let branch = init_git_repository(&root);
+        let bare = origin_remote(&root, &branch);
+        let previous = remote_revision(&bare, &branch);
+        fs::write(root.join("README.md"), "second\n").unwrap();
+        run_git(&root, &["add", "--", "README.md"]);
+        run_git(&root, &["commit", "-qm", "second"]);
+        let landed = revision(&root, "HEAD");
+
+        let executor = github_executor(&root, &MockGitHub::start(Vec::new()));
+        let pushed = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name", "remote_branch": "loom/target"}),
+        ));
+
+        assert!(pushed.success, "{}", pushed.output);
+        assert!(
+            pushed.output.contains("Remote ref: refs/heads/loom/target"),
+            "{}",
+            pushed.output
+        );
+        assert!(
+            pushed.output.contains(&format!("New revision: {landed}")),
+            "{}",
+            pushed.output
+        );
+        assert_eq!(remote_ref_revision(&bare, "refs/heads/loom/target"), landed);
+        // The local branch's own remote ref keeps the revision it had.
+        assert_eq!(remote_revision(&bare, &branch), previous);
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(bare).unwrap();
+    }
+
+    #[test]
+    fn github_push_branch_dry_run_reports_without_writing() {
+        let root = std::env::temp_dir().join(format!("loom-push-{}", AgentSessionId::new()));
+        let branch = init_git_repository(&root);
+        let bare = origin_remote(&root, &branch);
+        let previous = remote_revision(&bare, &branch);
+        fs::write(root.join("README.md"), "second\n").unwrap();
+        run_git(&root, &["add", "--", "README.md"]);
+        run_git(&root, &["commit", "-qm", "second"]);
+        let landed = revision(&root, "HEAD");
+
+        let executor = github_executor(&root, &MockGitHub::start(Vec::new()));
+        let pushed = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name", "dry_run": true}),
+        ));
+
+        assert!(pushed.success, "{}", pushed.output);
+        assert!(
+            pushed.output.contains("Dry run: would push branch"),
+            "{}",
+            pushed.output
+        );
+        assert!(
+            pushed
+                .output
+                .contains(&format!("Previous remote revision: {previous}")),
+            "{}",
+            pushed.output
+        );
+        assert!(
+            pushed.output.contains(&format!("New revision: {landed}")),
+            "{}",
+            pushed.output
+        );
+        assert!(
+            pushed
+                .output
+                .contains(&format!("Would land: 1 commits from {previous}..{landed}")),
+            "{}",
+            pushed.output
+        );
+        assert!(
+            pushed.output.contains("Fast-forward: yes"),
+            "{}",
+            pushed.output
+        );
+        assert_eq!(remote_revision(&bare, &branch), previous);
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(bare).unwrap();
+    }
+
+    #[test]
+    fn github_push_branch_delete_removes_a_remote_ref() {
+        let root = std::env::temp_dir().join(format!("loom-push-{}", AgentSessionId::new()));
+        let branch = init_git_repository(&root);
+        let bare = origin_remote(&root, &branch);
+        let previous = remote_revision(&bare, &branch);
+
+        let executor = github_executor(&root, &MockGitHub::start(Vec::new()));
+        let dry_run = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name", "delete": true, "dry_run": true}),
+        ));
+        assert!(dry_run.success, "{}", dry_run.output);
+        assert!(
+            dry_run
+                .output
+                .contains(&format!("Dry run: would delete refs/heads/{branch}")),
+            "{}",
+            dry_run.output
+        );
+        assert_eq!(remote_revision(&bare, &branch), previous);
+
+        let deleted = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name", "delete": true}),
+        ));
+        assert!(deleted.success, "{}", deleted.output);
+        assert!(
+            deleted
+                .output
+                .contains(&format!("Deleted refs/heads/{branch} from")),
+            "{}",
+            deleted.output
+        );
+        assert!(
+            deleted
+                .output
+                .contains(&format!("Previous remote revision: {previous}")),
+            "{}",
+            deleted.output
+        );
+        assert!(!deleted.output.contains("New revision:"));
+        assert!(remote_revision(&bare, &branch).is_empty());
+
+        // A ref the remote no longer advertises cannot be deleted again.
+        let absent = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name", "delete": true}),
+        ));
+        assert!(!absent.success, "{}", absent.output);
+        assert!(
+            absent.output.contains("nothing to delete"),
+            "{}",
+            absent.output
+        );
+
+        // A ref named by remote_branch is deleted without a local branch of that
+        // name existing.
+        let pushed = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name", "remote_branch": "loom/gone"}),
+        ));
+        assert!(pushed.success, "{}", pushed.output);
+        let deleted = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name", "delete": true, "remote_branch": "loom/gone"}),
+        ));
+        assert!(deleted.success, "{}", deleted.output);
+        assert!(
+            deleted.output.contains("Deleted refs/heads/loom/gone"),
+            "{}",
+            deleted.output
+        );
+        assert!(remote_ref_revision(&bare, "refs/heads/loom/gone").is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(bare).unwrap();
+    }
+
+    #[test]
+    fn github_push_branch_pushes_a_tag() {
+        let root = std::env::temp_dir().join(format!("loom-push-{}", AgentSessionId::new()));
+        let branch = init_git_repository(&root);
+        let bare = origin_remote(&root, &branch);
+        run_git(&root, &["tag", "v1"]);
+        let tag_revision = revision(&root, "refs/tags/v1");
+
+        let executor = github_executor(&root, &MockGitHub::start(Vec::new()));
+        let pushed = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name", "tag": true, "branch": "v1"}),
+        ));
+
+        assert!(pushed.success, "{}", pushed.output);
+        assert!(
+            pushed.output.contains("Pushed tag 'v1' to"),
+            "{}",
+            pushed.output
+        );
+        assert!(
+            pushed.output.contains("Remote ref: refs/tags/v1"),
+            "{}",
+            pushed.output
+        );
+        assert_eq!(remote_ref_revision(&bare, "refs/tags/v1"), tag_revision);
+
+        // A tag the remote does not have is reported by a dry run and not pushed.
+        run_git(&root, &["tag", "v2"]);
+        let dry_run = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name", "tag": true, "branch": "v2", "dry_run": true}),
+        ));
+        assert!(dry_run.success, "{}", dry_run.output);
+        assert!(
+            dry_run.output.contains("Dry run: would push tag 'v2'"),
+            "{}",
+            dry_run.output
+        );
+        assert!(remote_ref_revision(&bare, "refs/tags/v2").is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(bare).unwrap();
+    }
+
+    #[test]
+    fn github_push_branch_refuses_conflicting_arguments() {
+        let root = workspace();
+        let executor = ToolExecutor::new(&root)
+            .unwrap()
+            .with_github_token(Some("test-token".to_owned()))
+            .with_github_write_access(true);
+        for (arguments, expected) in [
+            (
+                serde_json::json!({"repository": "owner/name", "tag": true, "branch": "v1", "remote_branch": "main"}),
+                "tag and remote_branch cannot be combined",
+            ),
+            (
+                serde_json::json!({"repository": "owner/name", "delete": true, "lease": "abc"}),
+                "delete and lease cannot be combined",
+            ),
+            (
+                serde_json::json!({"repository": "owner/name", "tag": true, "branch": "v1", "lease": "abc"}),
+                "tag and lease cannot be combined",
+            ),
+            (
+                serde_json::json!({"repository": "owner/name", "branch": "  "}),
+                "blank branch cannot",
+            ),
+            (
+                serde_json::json!({"repository": "owner/name", "remote_branch": ""}),
+                "blank remote_branch cannot",
+            ),
+            (
+                serde_json::json!({"repository": "owner/name", "tag": true}),
+                "pushing a tag needs branch",
+            ),
+            (
+                serde_json::json!({"repository": "owner/name", "tag": true, "delete": true}),
+                "deleting a tag needs branch",
+            ),
+        ] {
+            let refused = executor.execute(&call("github_push_branch", arguments));
+            assert!(!refused.success, "{}", refused.output);
+            assert!(refused.output.contains(expected), "{}", refused.output);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The refs read exists so the lease a force push needs can be read from the
+    /// remote instead of being guessed from a cached ref.
+    #[test]
+    fn github_list_remote_refs_reads_the_head_used_as_a_lease() {
+        let root = std::env::temp_dir().join(format!("loom-push-{}", AgentSessionId::new()));
+        let branch = init_git_repository(&root);
+        let bare = origin_remote(&root, &branch);
+        let previous = remote_revision(&bare, &branch);
+        // Rewrite the tip, so only a lease can update the remote ref.
+        fs::write(root.join("README.md"), "rewritten\n").unwrap();
+        run_git(&root, &["commit", "-q", "--amend", "-m", "rewritten"]);
+        let rewritten = revision(&root, "HEAD");
+
+        let executor = github_executor(&root, &MockGitHub::start(Vec::new()));
+        let refused = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name"}),
+        ));
+        assert!(!refused.success, "{}", refused.output);
+
+        let listed = executor.execute(&call(
+            "github_list_remote_refs",
+            serde_json::json!({"repository": "owner/name", "branch": branch}),
+        ));
+        assert!(listed.success, "{}", listed.output);
+        assert!(
+            listed
+                .output
+                .contains(&format!("refs/heads/{branch} {previous}")),
+            "{}",
+            listed.output
+        );
+        assert!(listed.output.contains("Tracking"), "{}", listed.output);
+        assert!(
+            listed.output.contains("1 commit ahead"),
+            "{}",
+            listed.output
+        );
+        assert!(listed.output.contains("Tags:\nnone"), "{}", listed.output);
+
+        // The revision the read reported is what the force-with-lease push accepts.
+        let pushed = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name", "lease": previous}),
+        ));
+        assert!(pushed.success, "{}", pushed.output);
+        assert_eq!(remote_revision(&bare, &branch), rewritten);
+
+        // A branch the remote does not advertise is reported as creatable.
+        let absent = executor.execute(&call(
+            "github_list_remote_refs",
+            serde_json::json!({"repository": "owner/name", "branch": "loom/absent"}),
+        ));
+        assert!(absent.success, "{}", absent.output);
+        assert!(
+            absent
+                .output
+                .contains("does not advertise 'refs/heads/loom/absent'"),
+            "{}",
+            absent.output
+        );
+        assert!(
+            absent.output.contains("a push would create it"),
+            "{}",
+            absent.output
+        );
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(bare).unwrap();
+    }
+
     /// A caller must be able to confirm what reached the remote without fetching,
     /// so every push states the ref, the revision it replaced, the revision it
     /// left behind, and the range it landed.
@@ -4601,6 +5260,26 @@ mod tests {
             serde_json::json!({"repository": "owner/name"}),
         ));
         assert!(!refused.success, "{}", refused.output);
+        assert_eq!(remote_revision(&bare, &branch), previous);
+
+        // A leased dry run reports the rewrite it would perform and the fact that
+        // the update is not a fast-forward.
+        let dry_run = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name", "lease": previous, "dry_run": true}),
+        ));
+        assert!(dry_run.success, "{}", dry_run.output);
+        assert!(
+            dry_run.output.contains("Dry run: would force-push branch"),
+            "{}",
+            dry_run.output
+        );
+        assert!(dry_run.output.contains("still held"), "{}", dry_run.output);
+        assert!(
+            dry_run.output.contains("would refuse it without a lease"),
+            "{}",
+            dry_run.output
+        );
         assert_eq!(remote_revision(&bare, &branch), previous);
 
         let pushed = executor.execute(&call(
@@ -6600,6 +7279,7 @@ mod helper_tests {
             ToolKind::GitHubGetBranchChecks,
             ToolKind::GitHubCreatePullRequest,
             ToolKind::GitHubPushBranch,
+            ToolKind::GitHubListRemoteRefs,
             ToolKind::GitHubListIssues,
             ToolKind::GitHubListIssueTypes,
             ToolKind::GitHubGetIssue,
@@ -6630,6 +7310,7 @@ mod helper_tests {
                 | ToolKind::GitHubGetBranchChecks
                 | ToolKind::GitHubCreatePullRequest
                 | ToolKind::GitHubPushBranch
+                | ToolKind::GitHubListRemoteRefs
                 | ToolKind::GitHubListIssues
                 | ToolKind::GitHubListIssueTypes
                 | ToolKind::GitHubGetIssue

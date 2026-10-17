@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS run_summaries (
     updated_at INTEGER NOT NULL CHECK(updated_at >= started_at),
     completed_at INTEGER CHECK(completed_at IS NULL OR completed_at >= started_at),
     task TEXT NOT NULL CHECK(length(task) <= 1048576),
-    model TEXT NOT NULL CHECK(length(model) <= 256),
+    model TEXT NOT NULL CHECK(length(CAST(model AS BLOB)) <= 4096),
     summary TEXT CHECK(summary IS NULL OR length(summary) <= 1048576),
     input_tokens INTEGER NOT NULL CHECK(input_tokens >= 0),
     output_tokens INTEGER NOT NULL CHECK(output_tokens >= 0),
@@ -988,6 +988,28 @@ fn migration_column_exists(
 /// the idempotent baseline batches run again, so an upgraded database also
 /// gains baseline objects that its own revision predates.
 fn migrate_schema(connection: &Connection, from_version: u32) -> Result<()> {
+    // Rebuilding a referenced table with foreign keys enabled would cascade
+    // deletes into its dependents. SQLite requires toggling this before BEGIN.
+    let foreign_keys: bool = connection
+        .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+        .map_err(|error| {
+            persistence_error(format!("could not read foreign keys: {error}"), true)
+        })?;
+    connection
+        .pragma_update(None, "foreign_keys", false)
+        .map_err(|error| {
+            persistence_error(format!("could not disable foreign keys: {error}"), true)
+        })?;
+    let result = migrate_schema_transaction(connection, from_version);
+    let restore = connection
+        .pragma_update(None, "foreign_keys", foreign_keys)
+        .map_err(|error| {
+            persistence_error(format!("could not restore foreign keys: {error}"), true)
+        });
+    result.and(restore)
+}
+
+fn migrate_schema_transaction(connection: &Connection, from_version: u32) -> Result<()> {
     let transaction = connection.unchecked_transaction().map_err(|error| {
         persistence_error(
             format!("could not start persistence schema migration: {error}"),
@@ -1082,6 +1104,33 @@ fn migrate_schema(connection: &Connection, from_version: u32) -> Result<()> {
                 }
                 version = 7;
             }
+            // v8 stores bounded provider-qualified model selectors. Create the
+            // replacement first; renaming the original rewrites dependent FKs.
+            7 => {
+                if migration_table_exists(&transaction, "run_summaries")? {
+                    let definition = DATABASE_SCHEMA
+                        .split_once("CREATE TABLE IF NOT EXISTS run_summaries (")
+                        .expect("baseline contains run_summaries")
+                        .1
+                        .split_once("CREATE INDEX IF NOT EXISTS runs_by_session_activity")
+                        .expect("baseline contains run summary indexes")
+                        .0;
+                    transaction
+                        .execute_batch(&format!(
+                            "CREATE TABLE run_summaries_v8 ({definition}\n\
+                             INSERT INTO run_summaries_v8 SELECT * FROM run_summaries;\n\
+                             DROP TABLE run_summaries;\n\
+                             ALTER TABLE run_summaries_v8 RENAME TO run_summaries;"
+                        ))
+                        .map_err(|error| {
+                            persistence_error(
+                                format!("could not migrate persistence schema to v8: {error}"),
+                                true,
+                            )
+                        })?;
+                }
+                version = 8;
+            }
             other => return Err(unsupported_database_error(other)),
         }
     }
@@ -1089,6 +1138,24 @@ fn migrate_schema(connection: &Connection, from_version: u32) -> Result<()> {
     // revision that already had them, so re-apply the idempotent batches to
     // fill in anything an older database is missing.
     apply_baseline_schema(&transaction)?;
+    let invalid_foreign_keys: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_check)",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not check migrated foreign keys: {error}"),
+                true,
+            )
+        })?;
+    if invalid_foreign_keys {
+        return Err(persistence_error(
+            "migrated database has invalid foreign keys".to_owned(),
+            false,
+        ));
+    }
     transaction
         .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
         .map_err(|error| {

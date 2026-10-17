@@ -191,16 +191,7 @@ impl LoomView {
         let model_catalog = list_models(&connection)?;
         let models = model_catalog.models;
         let model_provider_names = model_catalog.provider_names;
-        let model = if models.contains(&options.model) {
-            options.model.clone()
-        } else {
-            models
-                .iter()
-                .find(|model| model.as_str() == GITHUB_COPILOT_DEFAULT_MODEL)
-                .cloned()
-                .or_else(|| models.first().cloned())
-                .unwrap_or_else(|| options.model.clone())
-        };
+        let model = preferred_model_choice(&models, &options.model);
         let node_model_catalogs =
             BTreeMap::from([(default_backend_node_id.clone(), models.clone())]);
         info!(
@@ -255,6 +246,8 @@ impl LoomView {
             project_tree_snapshots: Vec::new(),
             project_child_review: None,
             project_snapshot_stale: false,
+            project_snapshot_refreshing: None,
+            missing_project_snapshots_refreshing: false,
             project_feed_after_sequence: None,
             project_feed_epoch: None,
             project_poll_scheduled: false,
@@ -264,6 +257,7 @@ impl LoomView {
             project_list_active: None,
             session_sources: BTreeMap::new(),
             session_source_lookups: BTreeMap::new(),
+            session_source_request_in_flight: false,
             node_session_load_errors: BTreeMap::new(),
             active_session: session.clone(),
             active_run: run.clone(),
@@ -461,6 +455,8 @@ impl LoomView {
             project_tree_snapshots: Vec::new(),
             project_child_review: None,
             project_snapshot_stale: false,
+            project_snapshot_refreshing: None,
+            missing_project_snapshots_refreshing: false,
             project_feed_after_sequence: None,
             project_feed_epoch: None,
             project_poll_scheduled: false,
@@ -470,6 +466,7 @@ impl LoomView {
             project_list_active: None,
             session_sources: BTreeMap::new(),
             session_source_lookups: BTreeMap::new(),
+            session_source_request_in_flight: false,
             node_session_load_errors: BTreeMap::new(),
             active_session,
             active_run: None,
@@ -713,8 +710,7 @@ impl LoomView {
         let model_provider_names = model_catalog.provider_names;
         let model = options
             .model()
-            .cloned()
-            .filter(|model| models.contains(model))
+            .map(|model| preferred_model_choice(&models, model))
             .or_else(|| models.first().cloned())
             .unwrap_or_else(|| ModelId::new("default"));
         let node_model_catalogs =
@@ -757,6 +753,8 @@ impl LoomView {
             project_tree_snapshots: Vec::new(),
             project_child_review: None,
             project_snapshot_stale: false,
+            project_snapshot_refreshing: None,
+            missing_project_snapshots_refreshing: false,
             project_feed_after_sequence: None,
             project_feed_epoch: None,
             project_poll_scheduled: false,
@@ -766,6 +764,7 @@ impl LoomView {
             project_list_active: None,
             session_sources: BTreeMap::new(),
             session_source_lookups: BTreeMap::new(),
+            session_source_request_in_flight: false,
             node_session_load_errors: BTreeMap::new(),
             active_session: session.clone(),
             active_run: None,

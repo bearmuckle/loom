@@ -25,10 +25,13 @@ impl InProcessConnection {
                 "child name must contain 1 to 128 bytes",
             ));
         }
-        if spec.model_id.trim().is_empty() || spec.model_id.len() > 512 {
-            return Err(LoomError::invalid_request(
-                "delegated task model ID must contain 1 to 512 bytes",
-            ));
+        if spec.model_id.trim().is_empty()
+            || spec.model_id.len() > loom_persistence::MAX_MODEL_ID_BYTES
+        {
+            return Err(LoomError::invalid_request(format!(
+                "delegated task model ID must contain 1 to {} bytes",
+                loom_persistence::MAX_MODEL_ID_BYTES
+            )));
         }
         if self.backend.persistence.is_none() {
             return Err(LoomError::new(

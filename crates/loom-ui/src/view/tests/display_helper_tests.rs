@@ -485,6 +485,85 @@ fn github_tools_get_readable_titles_and_no_json_detail() {
     );
     assert_eq!(tool_detail(&call), None);
 
+    // A target remote branch, a tag, and a delete all read differently.
+    call.arguments = json!({
+        "repository": "owner/name",
+        "branch": "fix",
+        "remote_branch": "loom/fix"
+    });
+    assert_eq!(
+        tool_title("github_push_branch", &call.arguments),
+        "Push fix to loom/fix in owner/name"
+    );
+    call.arguments = json!({"repository": "owner/name", "branch": "fix", "delete": true});
+    assert_eq!(
+        tool_title("github_push_branch", &call.arguments),
+        "Delete fix from owner/name"
+    );
+    call.arguments = json!({"repository": "owner/name", "tag": true, "branch": "v1"});
+    assert_eq!(
+        tool_title("github_push_branch", &call.arguments),
+        "Push tag v1 to owner/name"
+    );
+    assert_eq!(tool_detail(&call), None);
+
+    // Every degenerate argument combination still reads as one line.
+    for (arguments, expected) in [
+        (
+            json!({"repository": "owner/name", "delete": true}),
+            "Delete remote ref in owner/name",
+        ),
+        (json!({"branch": "fix", "delete": true}), "Delete fix"),
+        (json!({"delete": true}), "Delete remote ref"),
+        (
+            json!({"repository": "owner/name", "tag": true}),
+            "Push tag to owner/name",
+        ),
+        (json!({"tag": true, "branch": "v1"}), "Push tag v1"),
+        (json!({"tag": true}), "Push tag"),
+        (
+            json!({"repository": "owner/name", "remote_branch": "loom/fix"}),
+            "Push to loom/fix in owner/name",
+        ),
+        (
+            json!({"repository": "owner/name"}),
+            "Push branch to owner/name",
+        ),
+        (
+            json!({"branch": "fix", "remote_branch": "loom/fix"}),
+            "Push fix to loom/fix",
+        ),
+        (json!({"branch": "fix"}), "Push fix"),
+        (json!({"remote_branch": "loom/fix"}), "Push to loom/fix"),
+        (json!({}), "Push branch"),
+        (
+            json!({"repository": "owner/name"}),
+            "Read refs of owner/name",
+        ),
+        (json!({"branch": "main"}), "Read remote refs for main"),
+        (json!({}), "Read remote refs"),
+    ] {
+        let tool = if expected.starts_with("Read") {
+            "github_list_remote_refs"
+        } else {
+            "github_push_branch"
+        };
+        assert_eq!(tool_title(tool, &arguments), expected, "{arguments}");
+    }
+
+    call.arguments = json!({"repository": "owner/name", "branch": "main"});
+    assert_eq!(
+        tool_title("github_list_remote_refs", &call.arguments),
+        "Read refs of owner/name for main"
+    );
+    assert_eq!(tool_detail(&call), None);
+    assert_eq!(
+        tool_group_label("github_list_remote_refs", 2),
+        "Listed remote refs 2 times"
+    );
+    assert_eq!(tool_usage_label("github_list_remote_refs"), "Read refs");
+    assert_eq!(tool_icon("github_list_remote_refs"), AssetIconName::List);
+
     call.arguments = json!({"repository": "owner/name", "state": "open"});
     assert_eq!(
         tool_title("github_list_issues", &call.arguments),
