@@ -195,7 +195,7 @@ pub(crate) fn save_run_summary_rows(
             ));
         }
         if summary.snapshot.task.len() > 1024 * 1024
-            || summary.snapshot.model.as_str().len() > 256
+            || summary.snapshot.model.as_str().len() > MAX_MODEL_ID_BYTES
             || summary
                 .snapshot
                 .summary

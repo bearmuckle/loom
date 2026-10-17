@@ -5,6 +5,85 @@ use super::support::*;
 use super::*;
 
 #[test]
+fn qualified_model_selectors_round_trip_with_bounded_storage() {
+    let path = std::env::temp_dir().join(format!("loom-model-selector-{}.db", Uuid::new_v4()));
+    let store = FilePersistence::open(&path).unwrap();
+    let mut manager = SessionManager::default();
+    let (session, _) = manager
+        .create_in_workspace(WorkspaceId::new(), "Selectors")
+        .unwrap();
+    store
+        .save_state_with_sessions(&manager.export_state())
+        .unwrap();
+    let run_id = RunId::new();
+    let model = ModelId::for_provider(
+        &loom_model::ProviderId::new("provider/\"\\".repeat(20)),
+        &ModelId::new("model/\"\\".repeat(32)),
+    );
+    assert!(model.as_str().len() > 512);
+    let summary = DurableRunSummary {
+        snapshot: AgentRunSnapshot {
+            id: run_id,
+            attempt_id: loom_core::RunAttemptId::new(),
+            control_revision: 0,
+            session_id: session.id,
+            task: "persist qualified selector".to_owned(),
+            model: model.clone(),
+            state: AgentRunState::Executing,
+            started_at: Timestamp::from_unix_millis(1000),
+            updated_at: Timestamp::from_unix_millis(1000),
+            completed_at: None,
+            summary: None,
+            evidence: Vec::new(),
+            approval_policy: None,
+        },
+        usage: UsageSnapshot::default(),
+        attempts: None,
+        execution_state: None,
+        interactions: None,
+    };
+    let mut summaries = BTreeMap::from([(run_id, summary)]);
+    {
+        let mut connection = Connection::open(&path).unwrap();
+        let transaction = connection.transaction().unwrap();
+        save_run_summary_rows(&transaction, &summaries).unwrap();
+        transaction.commit().unwrap();
+    }
+    drop(store);
+    let store = FilePersistence::open(&path).unwrap();
+    assert_eq!(
+        store.load_run_summaries().unwrap()[&run_id].snapshot.model,
+        model
+    );
+    let mut connection = Connection::open(&path).unwrap();
+    for value in [
+        "x".repeat(MAX_MODEL_ID_BYTES),
+        "é".repeat(MAX_MODEL_ID_BYTES / 2),
+    ] {
+        summaries.get_mut(&run_id).unwrap().snapshot.model = ModelId::new(value);
+        let transaction = connection.transaction().unwrap();
+        save_run_summary_rows(&transaction, &summaries).unwrap();
+        transaction.commit().unwrap();
+    }
+    for value in [
+        "x".repeat(MAX_MODEL_ID_BYTES + 1),
+        "é".repeat(MAX_MODEL_ID_BYTES / 2 + 1),
+    ] {
+        summaries.get_mut(&run_id).unwrap().snapshot.model = ModelId::new(value.clone());
+        let transaction = connection.transaction().unwrap();
+        assert!(save_run_summary_rows(&transaction, &summaries).is_err());
+        drop(transaction);
+        assert!(
+            connection
+                .execute("UPDATE run_summaries SET model=?1", [value])
+                .is_err()
+        );
+    }
+    drop((connection, store));
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn queued_run_directions_validate_and_read_lazily() {
     let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
     let store = FilePersistence::open(&path).unwrap();

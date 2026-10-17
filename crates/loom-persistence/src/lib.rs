@@ -71,9 +71,11 @@ pub use schema::*;
 /// column where the payload column already exists. The upgrade path
 /// additionally re-applies the idempotent baseline batches, so a bump is what
 /// hands new baseline objects (such as indexes) to existing databases.
-const DATABASE_SCHEMA_VERSION: u32 = 7;
+const DATABASE_SCHEMA_VERSION: u32 = 8;
 /// Oldest schema version that the migration ladder can upgrade in place.
 const DATABASE_MIN_MIGRATABLE_VERSION: u32 = 2;
+/// Maximum UTF-8 bytes stored for a raw or provider-qualified model selector.
+pub const MAX_MODEL_ID_BYTES: usize = 4096;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const INLINE_CONTENT_BYTES: usize = 4096;

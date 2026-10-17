@@ -31,7 +31,7 @@ impl ToolExtension for ProjectAgentTools {
                     "properties": {
                         "child_name": {"type": "string", "minLength": 1, "maxLength": 128},
                         "intent": {"type": "string", "minLength": 1, "maxLength": 16384},
-                        "model_id": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Optional provider/model ID. Omit this field or use `current` to reuse this agent's model."},
+                        "model_id": {"type": "string", "minLength": 1, "maxLength": loom_persistence::MAX_MODEL_ID_BYTES, "description": "Optional provider/model ID. Omit this field or use `current` to reuse this agent's model."},
                         "context_references": {
                             "type": "array",
                             "maxItems": 128,
@@ -78,7 +78,7 @@ impl ToolExtension for ProjectAgentTools {
                     "properties": {
                         "child_name": {"type": "string", "minLength": 1, "maxLength": 128},
                         "intent": {"type": "string", "minLength": 1, "maxLength": 16384},
-                        "model_id": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Optional provider/model ID. Omit this field or use `current` to reuse this agent's model."},
+                        "model_id": {"type": "string", "minLength": 1, "maxLength": loom_persistence::MAX_MODEL_ID_BYTES, "description": "Optional provider/model ID. Omit this field or use `current` to reuse this agent's model."},
                         "context_references": {
                             "type": "array",
                             "maxItems": 128,

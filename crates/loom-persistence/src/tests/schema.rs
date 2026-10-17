@@ -5,6 +5,114 @@ use super::support::*;
 use super::*;
 
 #[test]
+fn migrates_populated_v7_model_storage_without_cascading_dependents() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(&super::super::schema::DATABASE_SCHEMA.replace(
+            "length(CAST(model AS BLOB)) <= 4096",
+            "length(model) <= 256",
+        ))
+        .unwrap();
+    connection.execute_batch(
+        "PRAGMA foreign_keys=ON;
+         PRAGMA user_version=7;
+         INSERT INTO sessions VALUES (zeroblob(16), zeroblob(16), 'session', 'idle', 1, 1);
+         INSERT INTO run_summaries VALUES (
+             zeroblob(16), zeroblob(16), zeroblob(16), 0, 'executing', 1, 1, NULL,
+             'task', 'legacy-model', NULL, 0, 0, 0, 0, 0, 0);
+         INSERT INTO run_attempts VALUES (
+             zeroblob(16), zeroblob(16), zeroblob(16), 1, 'executing', NULL, 1, NULL);
+         INSERT INTO run_execution_state (
+             run_id, session_id, attempt_id, control_revision, state, step_index,
+             provider_cursor, next_message_id
+         ) VALUES (zeroblob(16), zeroblob(16), zeroblob(16), 0, 'executing', 0, 0, 0);
+         INSERT INTO run_messages (run_id, session_id, ordinal, role)
+             VALUES (zeroblob(16), zeroblob(16), 0, 'assistant');
+         INSERT INTO run_plan_steps VALUES (zeroblob(16), zeroblob(16), 0, 'step', 'keep plan');
+         INSERT INTO run_evidence VALUES (zeroblob(16), zeroblob(16), 0, 'evidence', 'keep://uri');
+         INSERT INTO run_queued_directions VALUES (zeroblob(16), zeroblob(16), 0, 'keep direction', 1);"
+    ).unwrap();
+    super::super::schema::initialize_schema(&connection).unwrap();
+    for table in [
+        "run_summaries",
+        "run_attempts",
+        "run_execution_state",
+        "run_messages",
+        "run_plan_steps",
+        "run_evidence",
+        "run_queued_directions",
+    ] {
+        let count: i64 = connection
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1, "migration must preserve {table}");
+    }
+    let model: String = connection
+        .query_row("SELECT model FROM run_summaries", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(model, "legacy-model");
+    let selector = ModelId::for_provider(
+        &loom_model::ProviderId::new("provider"),
+        &ModelId::new("m".repeat(256)),
+    );
+    connection
+        .execute("UPDATE run_summaries SET model=?1", [selector.as_str()])
+        .unwrap();
+    assert!(
+        connection
+            .execute(
+                "UPDATE run_summaries SET model=?1",
+                ["x".repeat(MAX_MODEL_ID_BYTES + 1)]
+            )
+            .is_err()
+    );
+    let foreign_keys: bool = connection
+        .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+        .unwrap();
+    assert!(foreign_keys);
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, DATABASE_SCHEMA_VERSION);
+    super::super::schema::initialize_schema(&connection).unwrap();
+    connection.execute("DELETE FROM run_summaries", []).unwrap();
+    let remaining: i64 = connection
+        .query_row("SELECT count(*) FROM run_messages", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "foreign key cascades remain active after migration"
+    );
+}
+
+#[test]
+fn failed_v8_migration_rolls_back_and_restores_foreign_keys() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(super::super::schema::DATABASE_SCHEMA)
+        .unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+         PRAGMA user_version=7;
+         INSERT INTO run_queued_directions VALUES (zeroblob(16), zeroblob(16), 0, 'orphan', 1);
+         PRAGMA foreign_keys=ON;",
+        )
+        .unwrap();
+    assert!(super::super::schema::initialize_schema(&connection).is_err());
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 7);
+    let foreign_keys: bool = connection
+        .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+        .unwrap();
+    assert!(foreign_keys);
+}
+
+#[test]
 fn sqlite_connections_are_lazy_shared_by_clones_and_observe_other_handles() {
     let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
     let first = FilePersistence::open(&path).unwrap();
@@ -395,6 +503,18 @@ fn opens_and_migrates_an_older_schema_in_place() {
                 ""
             };
             connection
+                .execute_batch(
+                    super::super::schema::DATABASE_SCHEMA
+                        .split_once("CREATE TABLE IF NOT EXISTS run_summaries (")
+                        .unwrap()
+                        .1
+                        .split_once("CREATE INDEX IF NOT EXISTS runs_by_session_activity")
+                        .map(|(definition, _)| format!("CREATE TABLE run_summaries ({definition}"))
+                        .unwrap()
+                        .as_str(),
+                )
+                .unwrap();
+            connection
                 .execute_batch(&format!(
                     "CREATE TABLE run_messages (
                         run_id BLOB NOT NULL,
@@ -409,13 +529,6 @@ fn opens_and_migrates_an_older_schema_in_place() {
                         {reasoning_column}
                         fragments TEXT NOT NULL DEFAULT '[]',
                         PRIMARY KEY(run_id, ordinal)
-                    ) WITHOUT ROWID, STRICT;
-                    CREATE TABLE run_summaries (
-                        run_id BLOB NOT NULL,
-                        session_id BLOB NOT NULL,
-                        updated_at INTEGER,
-                        state TEXT,
-                        PRIMARY KEY(run_id, session_id)
                     ) WITHOUT ROWID, STRICT;
                     CREATE TABLE run_execution_state (
                         run_id BLOB PRIMARY KEY NOT NULL,
@@ -528,7 +641,8 @@ fn migrates_a_v6_database_by_adding_the_worktree_base_refresh_column() {
                      project_id BLOB NOT NULL,
                      status TEXT NOT NULL,
                      updated_at INTEGER NOT NULL,
-                     base_revision TEXT NOT NULL
+                     base_revision TEXT NOT NULL,
+                     UNIQUE(project_id, task_id)
                  ) STRICT;
                  INSERT INTO project_worktrees(task_id, project_id, status, updated_at, base_revision)
                      VALUES (x'00000000000000000000000000000001',

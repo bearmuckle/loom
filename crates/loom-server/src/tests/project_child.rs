@@ -5,6 +5,42 @@ use super::support::*;
 use super::*;
 
 #[test]
+fn delegated_model_selector_size_matches_durable_storage() {
+    let backend = InProcessBackend::new();
+    let connection = backend.connect();
+    for (model_id, expected_code) in [
+        (" ".to_owned(), ErrorCode::InvalidRequest),
+        (
+            "m".repeat(loom_persistence::MAX_MODEL_ID_BYTES + 1),
+            ErrorCode::InvalidRequest,
+        ),
+        (
+            "m".repeat(loom_persistence::MAX_MODEL_ID_BYTES),
+            ErrorCode::UnsupportedCapability,
+        ),
+    ] {
+        let error = connection
+            .create_project_child(
+                RequestId::new(),
+                AgentSessionId::new(),
+                "Child".to_owned(),
+                loom_core::DelegatedTaskSpec {
+                    intent: "test model size".to_owned(),
+                    model_id,
+                    context_references: Vec::new(),
+                    dependencies: Vec::new(),
+                    code_change: false,
+                    permissions: Default::default(),
+                },
+            )
+            .unwrap_err();
+        // A selector at the bound passes size validation and reaches the
+        // ephemeral-backend storage requirement instead.
+        assert_eq!(error.code, expected_code);
+    }
+}
+
+#[test]
 fn m5_session_projections_reconnect_and_archive_authoritatively() {
     let root = git_repository();
     let backend = InProcessBackend::new();

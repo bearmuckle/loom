@@ -551,6 +551,10 @@ fn a_running_run_keeps_the_policy_it_pinned_when_the_session_policy_changes() {
 
 #[test]
 fn completed_runs_keep_indexed_summaries_without_restoring_runtime_objects() {
+    let model = ModelId::for_provider(
+        &loom_model::ProviderId::new("deterministic"),
+        &ModelId::new("deterministic/demo"),
+    );
     let persistence =
         std::env::temp_dir().join(format!("loom-server-state-{}.db", WorkspaceId::new()));
     let (run_id, session_root_base) = {
@@ -583,7 +587,7 @@ fn completed_runs_keep_indexed_summaries_without_restoring_runtime_objects() {
             RunRequest::StartSessionAgentRun {
                 session_id: session.id,
                 task: "answer briefly".to_owned(),
-                model: ModelId::new("deterministic/demo"),
+                model: model.clone(),
                 system_instructions: None,
                 repository_instructions: None,
             },
@@ -611,6 +615,7 @@ fn completed_runs_keep_indexed_summaries_without_restoring_runtime_objects() {
         response.result,
         Ok(ServerResponse::Run(RunResponse::AgentRun(snapshot)))
             if snapshot.state == AgentRunState::Completed
+                && snapshot.model == model
                 && snapshot.approval_policy == Some(loom_core::ApprovalPolicy::auto_approve())
     ));
     let projection = connection.request(RequestEnvelope::new(ClientRequest::Run(
