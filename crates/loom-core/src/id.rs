@@ -72,6 +72,8 @@ uuid_id!(TaskId);
 uuid_id!(WorkspaceId);
 uuid_id!(RepositoryId);
 uuid_id!(ProjectManagerWaitId);
+uuid_id!(ParticipantId);
+uuid_id!(CredentialId);
 
 impl RequestId {
     /// Returns the immutable Unix-millisecond issue time for UUIDv7 request IDs.

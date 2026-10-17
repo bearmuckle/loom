@@ -470,26 +470,29 @@ impl InProcessBackend {
             let session = self.sessions()?.get(runtime_state.session_id)?;
             let workspace = self.restore_session_filesystem(session.id)?;
             let mut recovery_reason = None;
-            let provider =
-                match self.provider_at(&runtime_state.task.model, runtime_state.provider_cursor) {
-                    Ok(provider) => provider,
-                    Err(error) => {
-                        let descriptor = self
-                            .providers
-                            .describe_model(&runtime_state.task.model)
-                            .unwrap_or_else(|_| ModelDescriptor {
-                                id: runtime_state.task.model.clone(),
-                                provider: ProviderId::new("recovered"),
-                                display_name: "Unavailable persisted model".to_owned(),
-                                context_window: None,
-                                max_input_tokens: None,
-                                max_output_tokens: None,
-                                capabilities: ModelCapabilities::default(),
-                            });
-                        recovery_reason = Some(error.message.clone());
-                        Box::new(UnavailableProvider::new(descriptor, error))
-                    }
-                };
+            let provider = match self.provider_for_run(
+                run_id,
+                &runtime_state.task.model,
+                runtime_state.provider_cursor,
+            ) {
+                Ok(provider) => provider,
+                Err(error) => {
+                    let descriptor = self
+                        .providers
+                        .describe_model(&runtime_state.task.model)
+                        .unwrap_or_else(|_| ModelDescriptor {
+                            id: runtime_state.task.model.clone(),
+                            provider: ProviderId::new("recovered"),
+                            display_name: "Unavailable persisted model".to_owned(),
+                            context_window: None,
+                            max_input_tokens: None,
+                            max_output_tokens: None,
+                            capabilities: ModelCapabilities::default(),
+                        });
+                    recovery_reason = Some(error.message.clone());
+                    Box::new(UnavailableProvider::new(descriptor, error))
+                }
+            };
             let tools = ToolExecutor::new_with_workspace(workspace)
                 .with_build_cache_root(self.build_cache_root())
                 .with_github_token(self.providers.github_account_token().ok())

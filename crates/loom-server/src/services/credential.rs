@@ -9,6 +9,9 @@ use super::*;
 struct GitHubCopilotLoginRecord {
     status: GitHubCopilotLoginStatus,
     expires_at: Instant,
+    /// The person who started the sign-in; `None` for an operator. Only the
+    /// initiator or an operator (administrator) may read its status.
+    initiator: Option<loom_core::ParticipantId>,
 }
 
 /// Owns the in-flight GitHub Copilot device-login records for this worker.
@@ -28,6 +31,7 @@ impl CredentialService {
 
     /// Drops completed logins older than `retention`, then records a new pending
     /// login unless too many are already pending.
+    #[cfg(test)]
     pub(crate) fn begin_pending(
         &self,
         login_id: String,
@@ -35,6 +39,19 @@ impl CredentialService {
         retention: Duration,
         max_pending: usize,
         expires_at: Instant,
+    ) -> Result<()> {
+        self.begin_pending_for(login_id, now, retention, max_pending, expires_at, None)
+    }
+
+    /// [`Self::begin_pending`] for a sign-in started by `initiator`.
+    pub(crate) fn begin_pending_for(
+        &self,
+        login_id: String,
+        now: Instant,
+        retention: Duration,
+        max_pending: usize,
+        expires_at: Instant,
+        initiator: Option<loom_core::ParticipantId>,
     ) -> Result<()> {
         let mut logins = self.logins();
         logins.retain(|_, login| login.expires_at + retention > now);
@@ -54,6 +71,7 @@ impl CredentialService {
             GitHubCopilotLoginRecord {
                 status: GitHubCopilotLoginStatus::Pending,
                 expires_at,
+                initiator,
             },
         );
         Ok(())
@@ -80,10 +98,24 @@ impl CredentialService {
 
     /// Returns the login status, materializing an expired pending login as a
     /// failure.
+    #[cfg(test)]
     pub(crate) fn status(&self, login_id: &str, now: Instant) -> Result<GitHubCopilotLoginStatus> {
+        self.status_for(login_id, now, None)
+    }
+
+    /// The status as seen by `requester`. A person sees only a sign-in they
+    /// started; anyone else's reads as not found, so its existence does not
+    /// leak. `None` is an operator, which sees every sign-in.
+    pub(crate) fn status_for(
+        &self,
+        login_id: &str,
+        now: Instant,
+        requester: Option<loom_core::ParticipantId>,
+    ) -> Result<GitHubCopilotLoginStatus> {
         let mut logins = self.logins();
         let login = logins
             .get_mut(login_id)
+            .filter(|login| requester.is_none() || login.initiator == requester)
             .ok_or_else(|| LoomError::not_found("GitHub Copilot sign-in", login_id))?;
         if matches!(login.status, GitHubCopilotLoginStatus::Pending) && now >= login.expires_at {
             login.status = GitHubCopilotLoginStatus::Failed {

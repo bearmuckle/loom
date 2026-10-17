@@ -67,6 +67,8 @@ pub const MAX_FRAME_BYTES_ENV: &str = "LOOM_MAX_FRAME_BYTES";
 /// reason carrying the same size-and-limit explanation, because there is no
 /// request id to answer under.
 const CLOSE_MESSAGE_TOO_BIG: u16 = 1009;
+/// Close code sent when a person's session access is revoked.
+const CLOSE_POLICY_VIOLATION: u16 = 1008;
 const DEFAULT_OUTGOING_CAPACITY: usize = 128;
 /// Most ordinary requests one connection may have in flight at once.
 ///
@@ -911,9 +913,35 @@ async fn handle_socket(socket: WebSocket, state: RemoteState, auth: AuthSession)
         .heartbeat_interval
         .checked_mul(3)
         .unwrap_or(state.config.heartbeat_interval);
+    // A person losing access ends this connection, and with it every live
+    // event subscription it carries. The client reconnects and is then held to
+    // its remaining grants. Operator connections are never signalled.
+    let presence = connection.presence().cloned();
+    let revoked = presence.as_ref().map(|presence| presence.revoked());
+    let revoked_wait = async {
+        match &revoked {
+            Some(revoked) => revoked.notified().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(revoked_wait);
+    let touch = || {
+        if let Some(presence) = &presence {
+            presence.touch();
+        }
+    };
 
     loop {
         tokio::select! {
+            () = &mut revoked_wait => {
+                let _ = message_sender
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CLOSE_POLICY_VIOLATION,
+                        reason: "session access was revoked".into(),
+                    })))
+                    .await;
+                break;
+            }
             control_message = control_receiver.recv() => {
                 if matches!(control_message, Some(ConnectionControl::Backpressure)) {
                     break;
@@ -934,6 +962,7 @@ async fn handle_socket(socket: WebSocket, state: RemoteState, auth: AuthSession)
                 match incoming {
                     Ok(Message::Text(text)) => {
                         last_activity = Instant::now();
+                        touch();
                         if let Some(close) = process_text(
                             text.as_bytes(),
                             &connection,
@@ -951,6 +980,7 @@ async fn handle_socket(socket: WebSocket, state: RemoteState, auth: AuthSession)
                     }
                     Ok(Message::Binary(bytes)) => {
                         last_activity = Instant::now();
+                        touch();
                         if let Some(close) = process_text(
                             &bytes,
                             &connection,
@@ -965,12 +995,14 @@ async fn handle_socket(socket: WebSocket, state: RemoteState, auth: AuthSession)
                     }
                     Ok(Message::Ping(payload)) => {
                         last_activity = Instant::now();
+                        touch();
                         if message_sender.try_send(Message::Pong(payload)).is_err() {
                             break;
                         }
                     }
                     Ok(Message::Pong(_)) => {
                         last_activity = Instant::now();
+                        touch();
                     }
                     Ok(Message::Close(_)) | Err(_) => break,
                 }
@@ -982,6 +1014,9 @@ async fn handle_socket(socket: WebSocket, state: RemoteState, auth: AuthSession)
     }
     drop(message_sender);
     let _ = writer.await;
+    // Dropping the connection's last clone removes it from the roster; the
+    // aborted tasks above released theirs.
+    drop(connection);
 }
 
 /// Handles one inbound frame, returning the close frame that ends the
@@ -1865,6 +1900,136 @@ mod unit_tests {
         ));
 
         drop(connection);
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn revoking_access_closes_only_the_revoked_persons_sockets() {
+        use loom_core::{ParticipantId, ParticipantIdentity};
+        use loom_protocol::{AccessRequest, SessionRequest};
+
+        let backend = InProcessBackend::new();
+        let auth = Arc::new(AuthTokenStore::new());
+        let person = |name: &str| ParticipantIdentity {
+            id: ParticipantId::new(),
+            display_name: name.to_owned(),
+        };
+        let owner = person("Owner");
+        let guest = person("Guest");
+        let owner_token = auth
+            .issue_for_participant(AuthorizationScope::all(), owner.clone())
+            .unwrap();
+        let guest_token = auth
+            .issue_for_participant(AuthorizationScope::all(), guest.clone())
+            .unwrap();
+        backend
+            .register_participants(&[owner.clone(), guest.clone()])
+            .unwrap();
+        let server = RemoteServer::new(
+            backend.clone(),
+            auth.clone(),
+            RemoteServerConfig::local_ephemeral(),
+        )
+        .bind()
+        .await
+        .unwrap();
+
+        let negotiate = || {
+            RequestEnvelope::new(ClientRequest::Control(ControlRequest::Negotiate {
+                client_version: loom_core::CURRENT_PROTOCOL_VERSION,
+                capabilities: backend.supported_capabilities.clone(),
+            }))
+        };
+        let mut owner_socket = WebSocketTransport::new(server.websocket_url(), owner_token.token)
+            .connect()
+            .await
+            .unwrap();
+        owner_socket.request(negotiate()).await.unwrap();
+        let workspace = match owner_socket
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::CreateWorkspace {
+                    name: "Shared".to_owned(),
+                },
+            )))
+            .await
+            .unwrap()
+            .result
+            .unwrap()
+        {
+            ServerResponse::Workspace(loom_protocol::WorkspaceResponse::WorkspaceCreated(
+                workspace,
+            )) => workspace,
+            response => panic!("unexpected workspace response: {response:?}"),
+        };
+        let session_id = match owner_socket
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Pairing".to_owned(),
+                },
+            )))
+            .await
+            .unwrap()
+            .result
+            .unwrap()
+        {
+            ServerResponse::Session(loom_protocol::SessionResponse::AgentSessionCreated(
+                session,
+            )) => session.id,
+            response => panic!("unexpected session response: {response:?}"),
+        };
+        let grant = owner_socket
+            .request(RequestEnvelope::new(ClientRequest::Access(
+                AccessRequest::GrantSessionAccess {
+                    session_id,
+                    participant_id: guest.id,
+                },
+            )))
+            .await
+            .unwrap();
+        assert!(grant.result.is_ok());
+
+        let mut guest_socket = WebSocketTransport::new(server.websocket_url(), guest_token.token)
+            .connect()
+            .await
+            .unwrap();
+        guest_socket.request(negotiate()).await.unwrap();
+        let read = || {
+            RequestEnvelope::new(ClientRequest::Session(SessionRequest::GetAgentSession {
+                session_id,
+            }))
+        };
+        assert!(guest_socket.request(read()).await.unwrap().result.is_ok());
+
+        let revoked = owner_socket
+            .request(RequestEnvelope::new(ClientRequest::Access(
+                AccessRequest::RevokeSessionAccess {
+                    session_id,
+                    participant_id: guest.id,
+                },
+            )))
+            .await
+            .unwrap();
+        assert!(revoked.result.is_ok());
+
+        // The revoked person's socket, and every subscription on it, ends.
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match guest_socket.request(read()).await {
+                    Err(_) => break,
+                    Ok(response) if response.result.is_err() => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Ok(response) => panic!("revoked read succeeded: {response:?}"),
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "the revoked socket was not closed");
+        // Other people stay connected.
+        assert!(owner_socket.request(read()).await.unwrap().result.is_ok());
+
+        drop((owner_socket, guest_socket));
         server.stop().await.unwrap();
     }
 

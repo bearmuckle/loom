@@ -707,6 +707,7 @@ impl ProjectAgentTools {
             negotiated_capabilities: Arc::new(Mutex::new(None)),
             auth: None,
             max_response_bytes: None,
+            presence: None,
         })
     }
 
@@ -756,6 +757,7 @@ impl ProjectAgentTools {
             negotiated_capabilities: Arc::new(Mutex::new(None)),
             auth: None,
             max_response_bytes: None,
+            presence: None,
         };
         match connection.load_project_snapshot(self.project_id) {
             Ok(project)

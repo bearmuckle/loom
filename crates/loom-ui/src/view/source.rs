@@ -10,6 +10,11 @@ impl LoomView {
         purpose: SessionSourceDialogPurpose,
         cx: &mut Context<Self>,
     ) {
+        if purpose == SessionSourceDialogPurpose::AddToSession && !self.can_manage_sources() {
+            self.record_status("Only the session owner can attach repositories.");
+            cx.notify();
+            return;
+        }
         let target_node_id = match purpose {
             SessionSourceDialogPurpose::StartSession => self.default_backend_node_id.clone(),
             SessionSourceDialogPurpose::AddToSession => self
@@ -152,6 +157,25 @@ impl LoomView {
     }
 
     /// The worker node the source dialog targets.
+    /// The session a repository search is for, or `None` when this connection
+    /// may not search.
+    ///
+    /// Adding a source to a session names that session, so the worker checks
+    /// the caller owns it. A search for a new project names no session: an
+    /// operator connection may do that, but a connection bound to a person
+    /// must name a session it owns, so it cannot search before one exists.
+    pub(crate) fn repository_search_session(&self) -> Option<Option<AgentSessionId>> {
+        let purpose = self.source_dialog.as_ref()?.purpose;
+        match purpose {
+            SessionSourceDialogPurpose::AddToSession => self
+                .can_manage_sources()
+                .then_some(Some(self.active_session.id)),
+            SessionSourceDialogPurpose::StartSession => {
+                (!self.collaboration.is_participant_bound()).then_some(None)
+            }
+        }
+    }
+
     pub(crate) fn source_node_id(&self) -> Option<String> {
         self.source_dialog
             .as_ref()
@@ -283,6 +307,9 @@ impl LoomView {
         let Some(node_id) = self.source_node_id() else {
             return;
         };
+        let Some(session_id) = self.repository_search_session() else {
+            return;
+        };
         self.repository_search_generation = self.repository_search_generation.wrapping_add(1);
         let generation = self.repository_search_generation;
         self.repository_search_query = query.clone();
@@ -294,7 +321,10 @@ impl LoomView {
         self.dispatch_to_node(
             cx,
             node_id,
-            ClientRequest::Repository(RepositoryRequest::SearchGitHubRepositories { query }),
+            ClientRequest::Repository(RepositoryRequest::SearchGitHubRepositories {
+                query,
+                session_id,
+            }),
             move |view, response, _| {
                 if view.repository_search_generation != generation {
                     return;

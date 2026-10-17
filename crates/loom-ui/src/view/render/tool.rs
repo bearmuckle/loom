@@ -689,7 +689,8 @@ impl LoomView {
                 );
             }
         }
-        if awaiting && !self.approval_request_in_flight {
+        if awaiting && !self.approval_request_in_flight && self.collaboration.permissions().can_act
+        {
             let parent_for_approve = parent.clone();
             let parent_for_reject = parent.clone();
             block = block.child(
@@ -754,6 +755,14 @@ impl LoomView {
                 if has_block_markdown(text) {
                     bubble = bubble.w_full().content(BubbleContent::new().w_full());
                 }
+                // In a shared session the sender is named with their role, so
+                // a direction reads "Name · Role -> Agent" rather than "You".
+                let speaker = match self.collaboration.author_of(text) {
+                    Some(author @ loom_core::Author::Participant { .. }) => {
+                        format!("{} -> Agent", crate::collaboration::author_label(author))
+                    }
+                    _ => "You".to_owned(),
+                };
                 div()
                     .w_full()
                     .px_3()
@@ -769,7 +778,7 @@ impl LoomView {
                                     .items_center()
                                     .justify_end()
                                     .gap_2()
-                                    .child(div().text_xs().text_color(rgb(0xbfdbfe)).child("You"))
+                                    .child(div().text_xs().text_color(rgb(0xbfdbfe)).child(speaker))
                                     .child(
                                         div().w(px(3.)).h(px(13.)).rounded_full().bg(rgb(0x60a5fa)),
                                     ),
@@ -783,6 +792,7 @@ impl LoomView {
                     .into_any()
             }
             TimelineItem::Assistant(turn) => self.render_assistant_turn(turn, index, parent),
+            TimelineItem::Collaboration(entry) => render_collaboration_entry(entry, index),
             TimelineItem::System(note) => {
                 // A clarification request is a question for the user to answer,
                 // not a status line, so it gets its own component instead of the
@@ -1009,5 +1019,68 @@ fn outcome_note((condition, note): (ToolPartStatus, String)) -> gpui_kit::AnyEle
     div()
         .text_color(outcome_note_color(condition))
         .child(note)
+        .into_any()
+}
+
+/// An attributed history entry that is not a message to the agent.
+///
+/// Peer chat is a leading-edge, outlined bubble with a "Peer chat · not sent
+/// to the agent" label, so it never reads as an agent turn (no accent bar) or
+/// as the trailing-edge direction bubble. Run control and access changes are a
+/// compact attributed line.
+fn render_collaboration_entry(
+    entry: &loom_core::CollaborationEntry,
+    index: usize,
+) -> gpui_kit::AnyElement {
+    let heading = crate::collaboration::entry_heading(entry);
+    let text = crate::collaboration::entry_text(entry);
+    if matches!(
+        entry.kind,
+        loom_core::CollaborationEntryKind::PeerMessage { .. }
+    ) {
+        return div()
+            .id(("peer-chat", index))
+            .test_support()
+            .w_full()
+            .px_3()
+            .py_2()
+            .flex()
+            .flex_col()
+            .child(
+                Bubble::new()
+                    .alignment(MessageAlignment::Start)
+                    .with_variant(BubbleVariant::Outline)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_xs().text_color(rgb(0x86efac)).child(heading))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x64748b))
+                                    .child("Peer chat · not sent to the agent"),
+                            ),
+                    )
+                    .child(div().mt_1().child(render_timeline_text(
+                        format!("transcript-peer-{index}"),
+                        text,
+                        0xd1fae5,
+                    ))),
+            )
+            .into_any();
+    }
+    div()
+        .id(("collaboration-entry", index))
+        .test_support()
+        .px_3()
+        .py_1()
+        .flex()
+        .items_center()
+        .gap_2()
+        .text_xs()
+        .child(div().text_color(rgb(0x93c5fd)).child(heading))
+        .child(div().text_color(rgb(0x94a3b8)).child(text))
         .into_any()
 }

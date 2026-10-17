@@ -60,6 +60,15 @@ pub enum Capability {
     ReadProjectChildReview,
     IntegrateProjectChild,
     CleanupProjectChildWorktree,
+    /// Allows reading a session roster: who has access, their role, and their
+    /// aggregated presence.
+    ReadSessionRoster,
+    /// Allows granting, promoting, demoting, and revoking session access. The
+    /// backend additionally requires the caller to own the session.
+    ManageSessionAccess,
+    /// Allows sending peer chat to the people in a session. The backend
+    /// additionally requires the participant role.
+    SendPeerMessage,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

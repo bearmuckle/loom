@@ -250,6 +250,11 @@ impl LoomView {
                 }
             }
             ServerEvent::Terminal { .. } | ServerEvent::Task { .. } => {}
+            ServerEvent::Collaboration { entry } => self.consume_collaboration_entry(entry),
+            ServerEvent::SessionRosterChanged { entries } => {
+                self.collaboration
+                    .replace_roster(self.active_session.id, entries.clone());
+            }
             ServerEvent::ProviderHealthChanged {
                 provider_id,
                 health,
@@ -342,7 +347,10 @@ impl LoomView {
                 self.timeline.push(TimelineItem::System(SystemNote {
                     tone: SystemTone::Error,
                     heading: Some(format!("agent · {}", error.code)),
-                    text: error.message.clone(),
+                    text: match crate::collaboration::provider_auth_recovery(error) {
+                        Some(hint) => format!("{}\n\n{hint}", error.message),
+                        None => error.message.clone(),
+                    },
                     // The provider's own retry policy owns this failure, and the
                     // note has no control to offer, so it stays a message.
                     details: Some(error.to_string()),

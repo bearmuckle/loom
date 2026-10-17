@@ -488,31 +488,46 @@ impl LoomView {
             } else {
                 github_body.child(div().mt_2().child(cloned_rows))
             };
-            github_body = github_body.child(
-                div()
-                    .mt_3()
-                    .mb_1()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(rgb(0x5c6572))
-                    .child(div().flex_1().h(px(1.)).bg(rgb(0x232c39)))
-                    .child("Find another repository")
-                    .child(div().flex_1().h(px(1.)).bg(rgb(0x232c39))),
-            );
-            github_body = github_body.child(
-                KitInput::new(
-                    self.repository_filter_input
-                        .as_ref()
-                        .expect("repository filter initialized before rendering"),
-                )
-                .id("github-repository-filter")
-                .small()
-                .into_any_element(),
-            );
-            github_body = if !query_ready {
-                github_body.child(
+            if self.repository_search_session().is_none() {
+                // A connection bound to a person searches only for a session
+                // it owns, so the search stays hidden here.
+                dialog_body = github_body.child(
+                    div()
+                        .id("repository-search-unavailable")
+                        .test_support()
+                        .mt_3()
+                        .text_xs()
+                        .text_color(rgb(0x8f98a6))
+                        .child(
+                            "Only a session owner can search GitHub. Use a repository already cloned on this worker.",
+                        ),
+                );
+            } else {
+                github_body = github_body.child(
+                    div()
+                        .mt_3()
+                        .mb_1()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_xs()
+                        .text_color(rgb(0x5c6572))
+                        .child(div().flex_1().h(px(1.)).bg(rgb(0x232c39)))
+                        .child("Find another repository")
+                        .child(div().flex_1().h(px(1.)).bg(rgb(0x232c39))),
+                );
+                github_body = github_body.child(
+                    KitInput::new(
+                        self.repository_filter_input
+                            .as_ref()
+                            .expect("repository filter initialized before rendering"),
+                    )
+                    .id("github-repository-filter")
+                    .small()
+                    .into_any_element(),
+                );
+                github_body = if !query_ready {
+                    github_body.child(
                     div()
                         .mt_1()
                         .text_xs()
@@ -521,57 +536,58 @@ impl LoomView {
                             "Type at least {GITHUB_REPOSITORY_QUERY_MIN_CHARS} characters to search GitHub."
                         )),
                 )
-            } else if dialog.repositories_loading {
-                github_body.child(
-                    div()
-                        .mt_2()
-                        .text_sm()
-                        .text_color(rgb(0x8f98a6))
-                        .child("Searching GitHub…"),
-                )
-            } else if let Some(error) = &dialog.error {
-                github_body
-                    .child(
+                } else if dialog.repositories_loading {
+                    github_body.child(
                         div()
                             .mt_2()
                             .text_sm()
-                            .text_color(rgb(0xfca5a5))
-                            .child(error.clone()),
+                            .text_color(rgb(0x8f98a6))
+                            .child("Searching GitHub…"),
                     )
-                    .child(
+                } else if let Some(error) = &dialog.error {
+                    github_body
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_sm()
+                                .text_color(rgb(0xfca5a5))
+                                .child(error.clone()),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .text_color(rgb(0x8f98a6))
+                                .child("Connect GitHub in Settings to browse repositories."),
+                        )
+                        .child(
+                            Button::new("connect-github-from-repository-picker")
+                                .label("Open GitHub settings")
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.source_dialog = None;
+                                    this.open_settings_from_menu(cx);
+                                })),
+                        )
+                } else if dialog.repositories.is_empty() {
+                    github_body.child(
                         div()
                             .mt_2()
-                            .text_xs()
+                            .text_sm()
                             .text_color(rgb(0x8f98a6))
-                            .child("Connect GitHub in Settings to browse repositories."),
+                            .child(format!("No repositories match \"{repository_query}\".")),
                     )
-                    .child(
-                        Button::new("connect-github-from-repository-picker")
-                            .label("Open GitHub settings")
-                            .small()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.source_dialog = None;
-                                this.open_settings_from_menu(cx);
-                            })),
+                } else {
+                    github_body.child(
+                        div()
+                            .mt_2()
+                            .max_h(px(240.))
+                            .overflow_y_scrollbar()
+                            .child(repository_rows),
                     )
-            } else if dialog.repositories.is_empty() {
-                github_body.child(
-                    div()
-                        .mt_2()
-                        .text_sm()
-                        .text_color(rgb(0x8f98a6))
-                        .child(format!("No repositories match \"{repository_query}\".")),
-                )
-            } else {
-                github_body.child(
-                    div()
-                        .mt_2()
-                        .max_h(px(240.))
-                        .overflow_y_scrollbar()
-                        .child(repository_rows),
-                )
-            };
-            dialog_body = github_body;
+                };
+                dialog_body = github_body;
+            }
         } else {
             dialog_body = dialog_body
                 .text_sm()

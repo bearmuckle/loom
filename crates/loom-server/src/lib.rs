@@ -98,13 +98,17 @@ mod util;
 use run_executor::RunExecutor;
 use util::*;
 
+use services::access::AccessService;
+pub use services::access::ConnectionPresence;
 use services::admission::AdmissionService;
+use services::collaboration::{CollaborationService, run_revision};
 use services::credential::CredentialService;
 #[cfg(test)]
 use services::idempotency::{
     IDEMPOTENCY_RETENTION, LEGACY_IDEMPOTENCY_RETENTION, trim_idempotency_cache,
 };
 use services::idempotency::{IdempotencyRecord, IdempotencyStore};
+use services::provider_credentials::{PinnedCredentialProvider, ProviderCredentialService};
 
 const FEED_PRUNE_AFTER_NEW_SEQUENCES: u64 = 64;
 const FEED_PRUNE_AFTER_NEW_BYTES: usize = 4 * 1024 * 1024;
@@ -126,7 +130,10 @@ struct GitHubApiUser {
     name: Option<String>,
 }
 
-pub use auth::{AuthSession, AuthTokenStore, AuthorizationScope, IssuedToken};
+pub use auth::{
+    AuthSession, AuthTokenStore, AuthorizationScope, IssuedToken, ParticipantTokenEntry,
+    parse_participant_tokens, participant_id_for_token, validate_display_name,
+};
 pub use deployment::{
     DEFAULT_DEPLOYMENT_ROLE, DEPLOYMENT_ROLE_ENV, DiagnosticsSettings, EGRESS_POLICY,
     ExecutionContext, ProcessAccount, ProcessContext, TlsState, diagnostics_lines, startup_summary,
@@ -153,7 +160,7 @@ pub use retention::{
 };
 pub use serve::{
     ServingBackend, bind_exposure_warning, ensure_state_database, ensure_state_database_with,
-    open_backend, start_remote_server,
+    open_backend, start_remote_server, start_remote_server_with_participants,
 };
 
 const DEFAULT_EVENT_RETENTION: usize = 4096;
@@ -344,6 +351,9 @@ pub struct InProcessBackend {
     supported_capabilities: CapabilitySet,
     providers: ProviderRegistry,
     credentials: CredentialService,
+    /// Participant-owned provider credentials, session selections, and run
+    /// pins. Secrets stay in the backend's private credential store.
+    provider_credentials: Arc<ProviderCredentialService>,
     persistence: Option<Arc<dyn Persistence>>,
     run_executor: RunExecutor,
     session_root_base: PathBuf,
@@ -359,6 +369,10 @@ pub struct InProcessBackend {
     archive_retention_stored: AtomicBool,
     idempotency_store: IdempotencyStore,
     admissions: AdmissionService,
+    /// Participant directory, session grants, and connection presence.
+    access: Arc<AccessService>,
+    /// Per-run ordering of people's directions and control actions.
+    collaboration: CollaborationService,
     self_reference: Mutex<Weak<InProcessBackend>>,
     request_lifecycle: RwLock<u8>,
     persistence_failed: AtomicBool,
@@ -511,6 +525,10 @@ pub struct InProcessConnection {
     /// [`RemoteServerConfig::max_frame_bytes`], because the server must not send
     /// a frame larger than the limit it advertises to its clients.
     max_response_bytes: Option<usize>,
+    /// The live presence of the person this connection authenticated as.
+    /// Present only for connections bound to a participant; dropping the last
+    /// clone of the connection removes it from the roster.
+    presence: Option<Arc<ConnectionPresence>>,
 }
 
 impl InProcessConnection {
@@ -520,7 +538,19 @@ impl InProcessConnection {
             negotiated_capabilities: Arc::new(Mutex::new(None)),
             auth: None,
             max_response_bytes: None,
+            presence: None,
         }
+    }
+
+    /// The person this connection is bound to, if any.
+    pub fn participant(&self) -> Option<&loom_core::ParticipantIdentity> {
+        self.auth.as_ref().and_then(AuthSession::participant)
+    }
+
+    /// Presence handle of this connection, so a transport can refresh
+    /// liveness and observe revocation.
+    pub fn presence(&self) -> Option<&Arc<ConnectionPresence>> {
+        self.presence.as_ref()
     }
 
     /// Bounds every response this connection sends to `max_response_bytes`.

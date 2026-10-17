@@ -1033,7 +1033,9 @@ pub(crate) fn session_id_for_request(
         | ClientRequest::Run(RunRequest::RetryAgentFromCheckpoint { .. })
         | ClientRequest::Usage(UsageRequest::GetRunUsage { .. })
         | ClientRequest::Context(ContextRequest::InspectAgentContext { .. })
-        | ClientRequest::Run(RunRequest::AttachRunEvidence { .. }) => Some(active_session_id),
+        | ClientRequest::Run(RunRequest::AttachRunEvidence { .. })
+        | ClientRequest::Collaboration(_)
+        | ClientRequest::Access(_) => Some(active_session_id),
         _ => None,
     }
 }

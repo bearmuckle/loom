@@ -42,6 +42,7 @@ impl LoomView {
         self.review.repositories_loaded = false;
         self.review.usage = UsageState::default();
         self.review.files = FilesState::default();
+        self.collaboration.reset_session();
     }
 
     /// Loads a session synchronously.
@@ -464,6 +465,7 @@ impl LoomView {
         }
         self.ensure_session_task_message(session.id);
         self.begin_session_data_load(session.id, cx);
+        self.refresh_collaboration(cx);
         cx.notify();
     }
 

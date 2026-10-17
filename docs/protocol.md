@@ -420,6 +420,107 @@ approval, and pending input are updated from events as they are journaled; the
 message transcript in a projection is refreshed at each step boundary, so a
 transcript may lag the event stream by one in-flight model call.
 
+## Multi-user sessions
+
+Protocol 11.3 adds identity, roles, and presence; 11.4 adds attributed chat
+and ordered run actions. Provider credential selection uses the same 11.4
+version.
+
+### Identity and roles
+
+A bearer token loaded from `loom-server --participants-file` is bound to a
+person. The server derives the participant id and display name from the
+token; no request names its own author. Operator tokens are not bound to a
+person and are governed by token scope only.
+
+Each session grants every person one role:
+
+| Role | Allowed |
+| --- | --- |
+| `observer` | Read the session, its runs, roster, revisions, and credential metadata. |
+| `participant` | Everything an observer can, plus peer chat, agent direction and answers, approve/reject, pause/resume/interrupt/retry, terminals, tasks, and edits. |
+| `owner` | Everything a participant can, plus grants and roles, credential selection, repository search and attach/detach, rename, archive, delete, and approval policy. |
+
+`ClientRequest::required_session_role` returns the least role a request needs.
+New grants start as `observer`. The session creator is its owner. The last
+owner cannot be demoted or revoked. Revocation fails the person's later
+requests and closes their WebSocket connections with close code 1008.
+
+### Access requests
+
+`ClientRequest::Access(AccessRequest)`:
+
+- `GetCurrentParticipant` → `CurrentParticipant { participant }` (`None` for
+  an operator connection).
+- `ListParticipants` → `Participants`.
+- `GetSessionRoster { session_id }` → `SessionRoster { entries }`. One
+  `RosterEntry` per person: identity, role, presence (`online`, `away`,
+  `offline`), connection count, last activity. A connection silent for 45 s is
+  stale; a live person idle for 5 min is away.
+- `GrantSessionAccess`, `SetSessionRole` → `SessionGrant`;
+  `RevokeSessionAccess` → `SessionAccessRevoked`. Owner only.
+- `ListProviderCredentials` → `ProviderCredentials`: the caller's own
+  credentials plus the worker default. Metadata only (provider, owner label,
+  version, revoked); secrets never leave the worker.
+- `SelectSessionCredential { session_id, credential_id }` →
+  `SessionCredential`. Owner only. Applies to later runs.
+- `GetSessionCredential { session_id }` → `SessionCredential { selection,
+  credential }`; both `None` means the worker default.
+- `GetRunCredential { run_id }` → `RunCredential { pin }`. Each run pins
+  credential id, version, provider, and model when it starts; `pin` is `None`
+  for runs started before pinning.
+- `RevokeProviderCredential { credential_id }` →
+  `ProviderCredentialRevoked`. Runs pinned to it fail their next provider call.
+
+A missing, revoked, or mismatched credential fails with
+`provider_authentication` and a recovery hint (the owner signs in again or
+selects another credential). There is no fallback to another account.
+
+`RepositoryRequest::SearchGitHubRepositories` takes an optional `session_id`.
+A participant-bound connection must name a session it owns; operator
+connections may omit it.
+
+### Collaboration requests
+
+`ClientRequest::Collaboration(CollaborationRequest)`:
+
+- `SendPeerMessage { session_id, text }` → `PeerMessageSent { entry }`. Peer
+  chat is stored in the session history, is never added to model context, and
+  never starts or continues a run.
+- `DirectAgent { run_id, expected, text }`,
+  `AnswerAgentQuestion { run_id, expected, text }`, and
+  `ControlRun { run_id, expected, action }` → `RunAction(RunActionOutcome)`.
+- `GetRunRevision { run_id }` → `RunRevision { revision }`. Observer role.
+
+Sends need the participant role. Text is limited to 16 KiB.
+
+### Ordering and conflicts
+
+`RunRevision` is `{ attempt_id, control_revision, action_sequence }`. The
+server serializes every direction, answer, and control action on a run. An
+action is applied only if its `expected` revision equals the current one; it
+then advances `action_sequence` and answers `Accepted { entry, revision, run }`.
+Otherwise it answers `Conflict { expected, current, run }` and changes
+nothing. Two people acting on the same revision get one acceptance and one
+conflict, in the order the server received them.
+
+Clients send the revision they decided against (from `GetRunRevision`, the
+last outcome, or the last `Collaboration` event). On `Conflict` a client
+should keep the user's draft, adopt `current`, show the new run state, and let
+the user decide again. Legacy `RunRequest` variants pass through the same gate
+without a revision check, so they are ordered and attributed too.
+
+### Events
+
+- `ServerEvent::Collaboration { entry }`: a `CollaborationEntry` with
+  `author` (`participant` with identity and role, or `operator`), `recipient`
+  (`agent` or `people`), `kind` (`peer_message`, `agent_direction`,
+  `agent_answer`, `run_control`, `access_changed`), optional `run_id` and
+  `revision`, and `created_at`. Persisted in the session history.
+- `ServerEvent::SessionRosterChanged { entries }`: the full roster after a
+  connect, disconnect, grant, role change, or revoke. Clients replace their
+  copy.
+
 ## Reconnect and consistency
 
 The backend event stream is authoritative. A client connection should:

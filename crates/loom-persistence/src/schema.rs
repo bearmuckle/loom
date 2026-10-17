@@ -458,6 +458,28 @@ CREATE TABLE IF NOT EXISTS archive_retention_policy (
     sub_agent_retention_ms INTEGER DEFAULT 600000
         CHECK(sub_agent_retention_ms IS NULL OR sub_agent_retention_ms > 0)
 ) STRICT;
+-- People the backend knows. Identity is derived by the server from the
+-- credential a connection authenticated with; the display name is the one the
+-- operator bound to that credential.
+CREATE TABLE IF NOT EXISTS participants (
+    participant_id BLOB PRIMARY KEY NOT NULL CHECK(length(participant_id) = 16),
+    display_name TEXT NOT NULL
+        CHECK(length(trim(display_name)) > 0 AND length(CAST(display_name AS BLOB)) <= 128)
+) WITHOUT ROWID, STRICT;
+-- One person's role in one session. A grant disappears with its session.
+CREATE TABLE IF NOT EXISTS session_grants (
+    session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+        CHECK(length(session_id) = 16),
+    participant_id BLOB NOT NULL REFERENCES participants(participant_id) ON DELETE CASCADE
+        CHECK(length(participant_id) = 16),
+    role TEXT NOT NULL CHECK(role IN ('observer', 'participant', 'owner')),
+    granted_by BLOB CHECK(granted_by IS NULL OR length(granted_by) = 16),
+    granted_at INTEGER NOT NULL CHECK(granted_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= granted_at),
+    PRIMARY KEY(session_id, participant_id)
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS session_grants_by_participant
+    ON session_grants(participant_id, session_id);
 CREATE TABLE IF NOT EXISTS provider_configs (
     provider_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(provider_id)) > 0),
     config TEXT NOT NULL CHECK(length(config) <= 65536)
@@ -1154,6 +1176,11 @@ fn migrate_schema_transaction(connection: &Connection, from_version: u32) -> Res
                         })?;
                 }
                 version = 9;
+            }
+            // v10 adds participants and session grants. Both are new baseline
+            // tables, which the re-applied baseline below creates.
+            9 => {
+                version = 10;
             }
             other => return Err(unsupported_database_error(other)),
         }

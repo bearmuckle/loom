@@ -69,6 +69,17 @@ impl ProviderRegistry {
         self.credentials.resolve(reference)
     }
 
+    /// The credential store private to this backend installation: the scoped
+    /// API-key store when one is configured, otherwise the main store.
+    pub fn instance_credentials(&self) -> Result<Arc<dyn CredentialStore>> {
+        Ok(self
+            .api_key_credentials
+            .lock()
+            .map_err(|_| internal_lock_error("API-key credential store"))?
+            .clone()
+            .unwrap_or_else(|| Arc::clone(&self.credentials)))
+    }
+
     /// Migrate resolvable legacy OpenAI-compatible credentials into this
     /// backend's scoped store. The legacy entry remains in place so another
     /// backend that has not been opened yet can migrate its own saved config.
@@ -661,7 +672,47 @@ impl ProviderRegistry {
         model: &ModelId,
         deterministic_cursor: usize,
     ) -> Result<Box<dyn ModelProvider>> {
+        self.create_provider_with_credential(model, deterministic_cursor, None)
+    }
+
+    /// The provider id that serves `model`.
+    pub fn provider_id_for_model(&self, model: &ModelId) -> Result<ProviderId> {
+        Ok(self.resolve_model(model)?.0.id)
+    }
+
+    /// Creates a provider for `model`, authenticating with `secret` instead of
+    /// the provider's configured credential when one is given.
+    ///
+    /// The caller resolves a pinned secret itself, so a pinned credential that
+    /// is missing fails before this call and never falls back to the
+    /// configured credential.
+    pub fn create_provider_with_secret(
+        &self,
+        model: &ModelId,
+        deterministic_cursor: usize,
+        secret: Option<String>,
+    ) -> Result<Box<dyn ModelProvider>> {
+        self.create_provider_with_credential(model, deterministic_cursor, secret)
+    }
+
+    fn create_provider_with_credential(
+        &self,
+        model: &ModelId,
+        deterministic_cursor: usize,
+        pinned_secret: Option<String>,
+    ) -> Result<Box<dyn ModelProvider>> {
         let (config, descriptor) = self.resolve_model(model)?;
+        let resolve_secret = |config: &ProviderConfig| -> Result<String> {
+            if let Some(secret) = &pinned_secret {
+                return Ok(secret.clone());
+            }
+            Ok(config
+                .credential
+                .as_ref()
+                .map(|reference| self.resolve_credential(reference))
+                .transpose()?
+                .unwrap_or_default())
+        };
         let mut selector_descriptor = descriptor.clone();
         selector_descriptor.id = model.clone();
         let provider: Box<dyn ModelProvider> = match config.kind {
@@ -675,12 +726,7 @@ impl ProviderRegistry {
                         config.id.as_str()
                     ))
                 })?;
-                let secret = config
-                    .credential
-                    .as_ref()
-                    .map(|reference| self.resolve_credential(reference))
-                    .transpose()?
-                    .unwrap_or_default();
+                let secret = resolve_secret(&config)?;
                 Box::new(OpenAiCompatibleProvider::with_descriptor(
                     endpoint, secret, descriptor,
                 ))
@@ -688,12 +734,7 @@ impl ProviderRegistry {
 
             ProviderKind::OpenAi => {
                 let endpoint = config.endpoint.as_deref().unwrap_or(OPENAI_API_ENDPOINT);
-                let secret = config
-                    .credential
-                    .as_ref()
-                    .map(|reference| self.resolve_credential(reference))
-                    .transpose()?
-                    .unwrap_or_default();
+                let secret = resolve_secret(&config)?;
                 Box::new(OpenAiCompatibleProvider::with_descriptor(
                     endpoint, secret, descriptor,
                 ))
@@ -710,19 +751,17 @@ impl ProviderRegistry {
             }
             ProviderKind::DeepSeek => {
                 let endpoint = config.endpoint.as_deref().unwrap_or(DEEPSEEK_API_ENDPOINT);
-                let secret = config
-                    .credential
-                    .as_ref()
-                    .map(|reference| self.resolve_credential(reference))
-                    .transpose()?
-                    .unwrap_or_default();
+                let secret = resolve_secret(&config)?;
                 Box::new(OpenAiCompatibleProvider::with_descriptor(
                     endpoint, secret, descriptor,
                 ))
             }
             ProviderKind::GitHubCopilot => Box::new(
-                self.create_github_copilot_provider(&config)?
-                    .with_model_descriptor(descriptor),
+                match pinned_secret.clone() {
+                    Some(secret) => self.github_copilot_provider_with_token(&config, secret),
+                    None => self.create_github_copilot_provider(&config)?,
+                }
+                .with_model_descriptor(descriptor),
             ),
         };
         Ok(Box::new(SelectedModelProvider {
@@ -750,12 +789,20 @@ impl ProviderRegistry {
                 false,
             )
         })?;
-        let github_token = self.credentials.resolve(credential)?;
+        let github_token = self.resolve_credential(credential)?;
+        Ok(self.github_copilot_provider_with_token(config, github_token))
+    }
+
+    fn github_copilot_provider_with_token(
+        &self,
+        config: &ProviderConfig,
+        github_token: String,
+    ) -> GitHubCopilotProvider {
         let endpoint = config
             .endpoint
             .as_deref()
             .unwrap_or(GITHUB_COPILOT_API_ENDPOINT);
-        Ok(GitHubCopilotProvider::with_descriptor(
+        GitHubCopilotProvider::with_descriptor(
             endpoint,
             github_token,
             config
@@ -763,7 +810,7 @@ impl ProviderRegistry {
                 .first()
                 .cloned()
                 .unwrap_or_else(github_copilot_descriptor),
-        ))
+        )
     }
 
     pub fn pricing(&self, model: &ModelId) -> Result<(u64, u64)> {

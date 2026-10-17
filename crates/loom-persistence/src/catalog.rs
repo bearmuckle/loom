@@ -178,6 +178,81 @@ impl FilePersistence {
         Ok(settings)
     }
 
+    /// Loads known participants and every session grant.
+    pub fn load_session_access(
+        &self,
+    ) -> Result<(BTreeMap<ParticipantId, String>, Vec<SessionGrant>)> {
+        if !self.path.exists() {
+            return Ok((BTreeMap::new(), Vec::new()));
+        }
+        let connection = self.connection()?;
+        let read_error = |error: rusqlite::Error| {
+            persistence_error(format!("could not read session access: {error}"), true)
+        };
+        let mut participants = BTreeMap::new();
+        {
+            let mut statement = connection
+                .prepare("SELECT participant_id, display_name FROM participants")
+                .map_err(read_error)?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(read_error)?;
+            for row in rows {
+                let (id, name) = row.map_err(read_error)?;
+                participants.insert(
+                    ParticipantId::from_uuid(decode_uuid(&id, "participant id")?),
+                    name,
+                );
+            }
+        }
+        let mut grants = Vec::new();
+        let mut statement = connection
+            .prepare(
+                "SELECT session_id, participant_id, role, granted_by, granted_at, updated_at
+                 FROM session_grants ORDER BY session_id, participant_id",
+            )
+            .map_err(read_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(read_error)?;
+        for row in rows {
+            let (session_id, participant_id, role, granted_by, granted_at, updated_at) =
+                row.map_err(read_error)?;
+            let role = SessionRole::parse(&role).ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted session role '{role}' is invalid"),
+                    false,
+                )
+            })?;
+            grants.push(SessionGrant {
+                session_id: AgentSessionId::from_uuid(decode_uuid(&session_id, "session id")?),
+                participant_id: ParticipantId::from_uuid(decode_uuid(
+                    &participant_id,
+                    "participant id",
+                )?),
+                role,
+                granted_by: granted_by
+                    .map(|id| decode_uuid(&id, "grantor id").map(ParticipantId::from_uuid))
+                    .transpose()?,
+                granted_at: decode_timestamp(granted_at)?,
+                updated_at: decode_timestamp(updated_at)?,
+            });
+        }
+        Ok((participants, grants))
+    }
+
     /// Loads the singleton archive-retention policy this worker applies, or
     /// `None` when the database never stored one.
     ///
@@ -1236,6 +1311,55 @@ pub(crate) fn save_session_settings_rows(
                 true,
             )
         })?;
+    save_session_access_rows(transaction, settings)
+}
+
+/// Replaces the stored participants and session grants with `settings`.
+///
+/// Grants are rewritten as a whole, because the set is small and a revoke has
+/// to remove rows. A grant for a session that is not stored is skipped, so a
+/// session deleted concurrently cannot fail the write.
+fn save_session_access_rows(
+    transaction: &Transaction<'_>,
+    settings: &DurableSessionSettings,
+) -> Result<()> {
+    let write_error = |error: rusqlite::Error| {
+        persistence_error(format!("could not save session access: {error}"), true)
+    };
+    transaction
+        .execute("DELETE FROM session_grants", [])
+        .map_err(write_error)?;
+    transaction
+        .execute("DELETE FROM participants", [])
+        .map_err(write_error)?;
+    for (id, name) in &settings.participants {
+        transaction
+            .execute(
+                "INSERT INTO participants(participant_id, display_name) VALUES (?1, ?2)",
+                params![id.as_uuid().as_bytes().as_slice(), name],
+            )
+            .map_err(write_error)?;
+    }
+    for grant in &settings.session_grants {
+        transaction
+            .execute(
+                "INSERT INTO session_grants(
+                    session_id, participant_id, role, granted_by, granted_at, updated_at
+                 )
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6
+                 WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?1)
+                   AND EXISTS (SELECT 1 FROM participants WHERE participant_id = ?2)",
+                params![
+                    grant.session_id.as_uuid().as_bytes().as_slice(),
+                    grant.participant_id.as_uuid().as_bytes().as_slice(),
+                    grant.role.as_str(),
+                    grant.granted_by.map(|id| id.as_uuid().as_bytes().to_vec()),
+                    encode_timestamp(grant.granted_at)?,
+                    encode_timestamp(grant.updated_at.max(grant.granted_at))?,
+                ],
+            )
+            .map_err(write_error)?;
+    }
     Ok(())
 }
 

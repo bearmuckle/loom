@@ -88,6 +88,15 @@ impl Render for LoomView {
             }
             self.clear_composer_on_render = false;
         }
+        // A refused send hands the text back so the person can review the run
+        // and send again without retyping it. Only an empty composer is
+        // refilled, so newer typing is never overwritten.
+        if let Some(draft) = self.collaboration.restore_draft.take()
+            && let Some(input) = self.composer_input.as_ref()
+            && input.read(cx).value().trim().is_empty()
+        {
+            input.update(cx, |state, cx| state.set_value(draft, window, cx));
+        }
         if self.pending_completion_accept {
             self.pending_completion_accept = false;
             self.accept_composer_completion(window, cx);
@@ -433,9 +442,13 @@ impl Render for LoomView {
                                 let repositories = self.session_repositories.clone();
                                 let directories = self.session_directories.clone();
                                 let selected_repository_id = self.selected_repository_id;
+                                // Only owners attach or detach sources; others
+                                // review the checkouts already attached.
+                                let manage = self.can_manage_sources();
                                 move |mut menu, window, cx| {
                                     menu = menu.label("Session sources");
                                     let add_view = view.clone();
+                                    if manage {
                                     menu = menu.item(PopupMenuItem::new("Add source…").on_click(
                                         move |_, _, cx| {
                                             add_view.update(cx, |this, cx| {
@@ -446,6 +459,7 @@ impl Render for LoomView {
                                             });
                                         },
                                     ));
+                                    }
                                     if directories.is_empty() && repositories.is_empty() {
                                         menu = menu.separator().label("No sources attached");
                                     } else {
@@ -479,6 +493,9 @@ impl Render for LoomView {
                                                         }),
                                                 );
                                             }
+                                            if !manage {
+                                                return menu;
+                                            }
                                             menu.item(PopupMenuItem::new("Detach source")
                                                 .on_click(move |_, _, cx| {
                                                     detach_view.update(cx, |this, cx| {
@@ -500,7 +517,7 @@ impl Render for LoomView {
                                             let select_view = view.clone();
                                             let detach_view = view.clone();
                                             let source_menu = PopupMenu::build(window, cx, |menu, _, _| {
-                                                menu.label(repository.source.clone()).item(
+                                                let menu = menu.label(repository.source.clone()).item(
                                                     PopupMenuItem::new("Select for review")
                                                         .checked(selected_repository_id == Some(repository_id))
                                                         .on_click(move |_, _, cx| {
@@ -509,7 +526,11 @@ impl Render for LoomView {
                                                             });
                                                         }),
                                                 )
-                                                .item(
+;
+                                                if !manage {
+                                                    return menu;
+                                                }
+                                                menu.item(
                                                     PopupMenuItem::new("Detach source")
                                                         .on_click(move |_, _, cx| {
                                                             detach_view.update(cx, |this, cx| {

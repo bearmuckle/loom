@@ -1,10 +1,13 @@
 mod capability;
+mod collaboration;
 mod command_env;
 mod context;
+mod credential;
 mod error;
 mod filesystem;
 mod id;
 mod limits;
+mod participant;
 #[cfg(not(target_family = "wasm"))]
 mod paths;
 mod policy;
@@ -17,6 +20,10 @@ mod version;
 mod workspace;
 
 pub use capability::{Capability, CapabilitySet};
+pub use collaboration::{
+    Author, CollaborationEntry, CollaborationEntryKind, MAX_COLLABORATION_TEXT_BYTES, Recipient,
+    RunControlAction, RunRevision,
+};
 #[cfg(unix)]
 pub use command_env::BASELINE_PATH_DIRECTORIES;
 pub use command_env::{baseline_path, child_path};
@@ -24,6 +31,7 @@ pub use context::{
     ContextAssemblyOptions, ContextBudget, ContextInspection, ContextItem, ContextItemKind,
     ContextSummary,
 };
+pub use credential::{ProviderCredentialMetadata, RunCredentialPin, SessionCredentialSelection};
 pub use error::{ErrorCode, LoomError, Result};
 pub use filesystem::{
     Checkpoint, CheckpointFile, ClonedRepository, ContextFileKind, ContextFileReference,
@@ -34,11 +42,15 @@ pub use filesystem::{
     WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind,
 };
 pub use id::{
-    ActivityId, AgentMessageId, AgentSessionId, CheckpointId, EventSequence, InteractionId,
-    ProjectId, ProjectManagerWaitId, RepositoryId, RequestId, RunAttemptId, RunId, StepId, TaskId,
-    TerminalId, ToolCallId, WorkspaceId,
+    ActivityId, AgentMessageId, AgentSessionId, CheckpointId, CredentialId, EventSequence,
+    InteractionId, ParticipantId, ProjectId, ProjectManagerWaitId, RepositoryId, RequestId,
+    RunAttemptId, RunId, StepId, TaskId, TerminalId, ToolCallId, WorkspaceId,
 };
 pub use limits::{LimitKind, LimitStatus, SessionLimits, UsageSnapshot};
+pub use participant::{
+    MAX_PARTICIPANT_DISPLAY_NAME_BYTES, ParticipantIdentity, PresenceStatus, RosterEntry,
+    SessionGrant, SessionRole,
+};
 #[cfg(not(target_family = "wasm"))]
 pub use paths::{
     bind_key, config_dir, create_private_dir, instance_dir, state_dir, state_root, token_path,

@@ -664,6 +664,9 @@ pub(crate) struct LoomView {
     pub(crate) archived_sessions: ArchivedSessionsState,
     pub(crate) pending_approval: Option<ToolCall>,
     pub(crate) pending_input: Option<String>,
+    /// Multi-user identity, roster, composer recipient, run revision, and
+    /// credential state for the active session.
+    pub(crate) collaboration: crate::collaboration::CollaborationState,
     composer_input: Option<Entity<TextareaState>>,
     composer_placeholder: Option<String>,
     composer_completion: Option<ComposerCompletion>,
@@ -1873,6 +1876,7 @@ impl LoomView {
             archived_sessions: ArchivedSessionsState::default(),
             pending_approval: None,
             pending_input: None,
+            collaboration: crate::collaboration::CollaborationState::default(),
             composer_input: None,
             composer_placeholder: None,
             composer_completion: None,
@@ -2004,6 +2008,7 @@ impl LoomView {
 }
 
 mod archive;
+mod collaboration;
 mod composer;
 mod connectivity;
 mod helpers;

@@ -437,4 +437,91 @@ pub enum ServerResponse {
     Terminal(TerminalResponse),
     Task(TaskResponse),
     Project(ProjectResponse),
+    Access(AccessResponse),
+    Collaboration(CollaborationResponse),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum CollaborationResponse {
+    /// The stored peer chat entry.
+    PeerMessageSent { entry: Box<CollaborationEntry> },
+
+    /// The outcome of a direction, answer, or run control request.
+    RunAction(Box<RunActionOutcome>),
+
+    RunRevision {
+        run_id: RunId,
+        revision: RunRevision,
+    },
+}
+
+/// Whether a run-scoped collaboration request was applied.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
+pub enum RunActionOutcome {
+    /// Applied. `entry.revision` and `revision` are the run's revision after
+    /// the action.
+    Accepted {
+        entry: CollaborationEntry,
+        revision: RunRevision,
+        run: AgentRunSnapshot,
+    },
+    /// Not applied, because the run moved past the expected revision (most
+    /// often because someone else acted first). Nothing was changed.
+    Conflict {
+        expected: RunRevision,
+        current: RunRevision,
+        run: AgentRunSnapshot,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum AccessResponse {
+    /// The connection's identity. `None` for an unrestricted operator
+    /// connection that is not bound to a person.
+    CurrentParticipant {
+        participant: Option<ParticipantIdentity>,
+    },
+
+    Participants {
+        participants: Vec<ParticipantIdentity>,
+    },
+
+    SessionRoster {
+        session_id: AgentSessionId,
+        entries: Vec<RosterEntry>,
+    },
+
+    /// The grant after a grant, promotion, or demotion.
+    SessionGrant(SessionGrant),
+
+    SessionAccessRevoked {
+        session_id: AgentSessionId,
+        participant_id: ParticipantId,
+    },
+
+    ProviderCredentials {
+        credentials: Vec<ProviderCredentialMetadata>,
+    },
+
+    /// The session's selected credential; both fields are `None` when the
+    /// session uses the worker default.
+    SessionCredential {
+        session_id: AgentSessionId,
+        selection: Option<SessionCredentialSelection>,
+        credential: Option<ProviderCredentialMetadata>,
+    },
+
+    /// `pin` is `None` for a run started before credential pinning existed.
+    RunCredential {
+        run_id: RunId,
+        pin: Option<RunCredentialPin>,
+    },
+
+    ProviderCredentialRevoked {
+        credential_id: CredentialId,
+    },
 }

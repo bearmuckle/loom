@@ -268,6 +268,9 @@ impl InProcessBackend {
             Capability::ReadProject,
             Capability::ReadSessionFilesystem,
             Capability::WriteSessionFilesystem,
+            Capability::ReadSessionRoster,
+            Capability::ManageSessionAccess,
+            Capability::SendPeerMessage,
         ];
         if persistence.is_some() {
             supported_capabilities.extend([
@@ -302,6 +305,7 @@ impl InProcessBackend {
             supported_capabilities: CapabilitySet::new(supported_capabilities),
             providers,
             credentials: CredentialService::new(),
+            provider_credentials: Arc::new(ProviderCredentialService::default()),
             persistence,
             run_executor: RunExecutor::with_defaults(),
             session_root_base,
@@ -310,6 +314,8 @@ impl InProcessBackend {
             archive_retention_stored: AtomicBool::new(false),
             idempotency_store: IdempotencyStore::new(),
             admissions: AdmissionService::new(),
+            access: Arc::new(AccessService::new()),
+            collaboration: CollaborationService::new(),
             self_reference: Mutex::new(Weak::new()),
             request_lifecycle: RwLock::new(0),
             persistence_failed: AtomicBool::new(false),
@@ -324,6 +330,26 @@ impl InProcessBackend {
             .self_reference
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&backend);
+        // Connects and disconnects push the new roster to the session feeds.
+        let weak = Arc::downgrade(&backend);
+        backend
+            .access
+            .set_roster_listener(Arc::new(move |sessions: Vec<AgentSessionId>| {
+                if let Some(backend) = weak.upgrade() {
+                    for session_id in sessions {
+                        backend.publish_roster(session_id);
+                    }
+                }
+            }));
+        // Access is restored first: restoring sessions can save state, and a
+        // save rewrites the stored grants from memory.
+        if let Some(persistence) = &backend.persistence {
+            let (participants, grants) = persistence.load_session_access()?;
+            backend.access.restore(participants, grants);
+        }
+        backend
+            .provider_credentials
+            .restore(backend.providers.instance_credentials()?.as_ref())?;
         backend.restore_persisted()?;
         // The stored retention policy is loaded here rather than in the restore
         // path, so a start that was given an explicit flag can tell that it

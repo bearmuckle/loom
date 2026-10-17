@@ -152,6 +152,8 @@ impl InProcessConnection {
                 for event in history {
                     journal.append_server_event(event.protocol_version, target_id, event.event);
                 }
+                drop(journal);
+                self.grant_creator_ownership(target_id);
                 Ok(ServerResponse::Session(
                     SessionResponse::AgentSessionForked(snapshot),
                 ))

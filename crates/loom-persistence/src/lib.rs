@@ -13,14 +13,14 @@ use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, Checkpoint,
     CheckpointFile, CheckpointId, ContextAssemblyOptions, ContextInspection, ContextSummary,
     DelegatedTaskRecord, DelegatedTaskSpec, DelegatedTaskStatus, ErrorCode, EventSequence,
-    InteractionId, LoomError, PolicyDecision, ProjectAgentPermissions, ProjectAgentRecord,
-    ProjectId, ProjectManagerWaitId, ProjectManagerWaitRecord, ProjectManagerWaitStatus,
-    ProjectSnapshot, ProjectWorktreeBaseRefresh, ProjectWorktreeCleanupDisposition,
-    ProjectWorktreeRecord, ProjectWorktreeStatus, RepositoryId, RequestId, Result, RunAttemptId,
-    RunId, SessionDirectory, SessionFilesystemChange, SessionLimits, SessionManagerState,
-    SessionRepository, StepId, TaskContextReference, TaskId, Timestamp, ToolCallId, UsageSnapshot,
-    WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl, WorkspaceId, WorkspaceManagerState,
-    WorkspaceRecord,
+    InteractionId, LoomError, ParticipantId, PolicyDecision, ProjectAgentPermissions,
+    ProjectAgentRecord, ProjectId, ProjectManagerWaitId, ProjectManagerWaitRecord,
+    ProjectManagerWaitStatus, ProjectSnapshot, ProjectWorktreeBaseRefresh,
+    ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord, ProjectWorktreeStatus, RepositoryId,
+    RequestId, Result, RunAttemptId, RunId, SessionDirectory, SessionFilesystemChange,
+    SessionGrant, SessionLimits, SessionManagerState, SessionRepository, SessionRole, StepId,
+    TaskContextReference, TaskId, Timestamp, ToolCallId, UsageSnapshot, WorkspaceChangeKind,
+    WorkspaceConfig, WorkspaceControl, WorkspaceId, WorkspaceManagerState, WorkspaceRecord,
 };
 use loom_model::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
@@ -71,7 +71,7 @@ pub use schema::*;
 /// column where the payload column already exists. The upgrade path
 /// additionally re-applies the idempotent baseline batches, so a bump is what
 /// hands new baseline objects (such as indexes) to existing databases.
-const DATABASE_SCHEMA_VERSION: u32 = 9;
+const DATABASE_SCHEMA_VERSION: u32 = 10;
 /// Oldest schema version that the migration ladder can upgrade in place.
 const DATABASE_MIN_MIGRATABLE_VERSION: u32 = 2;
 /// Maximum UTF-8 bytes stored for a raw or provider-qualified model selector.
@@ -164,6 +164,11 @@ pub struct DurableSessionSettings {
     /// bucket so one state save writes it in the same transaction as the
     /// settings it sits beside.
     pub archive_retention: DurableArchiveRetentionPolicy,
+    /// Display names of the people the backend knows, by participant id.
+    pub participants: BTreeMap<ParticipantId, String>,
+    /// Session access grants. A grant whose session or participant is not
+    /// part of the same write is dropped by the database.
+    pub session_grants: Vec<SessionGrant>,
 }
 
 /// Durable form of the worker node's archive-retention policy.

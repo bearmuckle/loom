@@ -2,6 +2,7 @@ use super::*;
 
 mod accessors;
 mod archive;
+mod collaboration;
 mod constructors;
 mod filesystem;
 mod persistence;

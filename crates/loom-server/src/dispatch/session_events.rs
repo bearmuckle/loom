@@ -113,14 +113,22 @@ impl InProcessConnection {
                         // same snapshot carries.
                         let window = self.bound_workspace_snapshot(events)?;
                         let oldest_sequence = window.oldest_sequence.unwrap_or(oldest_sequence);
+                        let readable = self.readable_sessions()?;
                         return Ok(ServerResponse::Events(
                             EventsResponse::WorkspaceEventsSnapshot {
                                 workspace_id,
                                 sessions: self
                                     .backend
                                     .sessions()?
-                                    .list_in_workspace(Some(workspace_id), true),
-                                events: window.events,
+                                    .list_in_workspace(Some(workspace_id), true)
+                                    .into_iter()
+                                    .filter(|session| {
+                                        readable
+                                            .as_ref()
+                                            .is_none_or(|readable| readable.contains(&session.id))
+                                    })
+                                    .collect(),
+                                events: filter_workspace_feed(window.events, readable.as_ref()),
                                 oldest_sequence,
                                 latest_sequence,
                                 stream_epoch: current_stream_epoch,
@@ -133,7 +141,10 @@ impl InProcessConnection {
                     let page = self.bound_workspace_events(events)?;
                     return Ok(ServerResponse::Events(EventsResponse::WorkspaceEvents {
                         workspace_id,
-                        events: page.events,
+                        events: filter_workspace_feed(
+                            page.events,
+                            self.readable_sessions()?.as_ref(),
+                        ),
                         stream_epoch: current_stream_epoch,
                         next_after_sequence: page.next_after_sequence,
                     }));
@@ -202,8 +213,23 @@ impl InProcessConnection {
                     }
                 }
                 let batch = self.bound_event_batch(events)?;
+                // A person reading the cross-session stream sees only the
+                // sessions they hold a grant in.
+                let readable = if session_id.is_none() {
+                    self.readable_sessions()?
+                } else {
+                    None
+                };
                 Ok(ServerResponse::Events(EventsResponse::SessionEvents {
-                    events: batch.events,
+                    events: batch
+                        .events
+                        .into_iter()
+                        .filter(|event| {
+                            readable
+                                .as_ref()
+                                .is_none_or(|readable| readable.contains(&event.session_id))
+                        })
+                        .collect(),
                     stream_epoch: session_id.map(|_| self.backend.node_id.clone()),
                     next_after_sequence: batch.next_after_sequence,
                 }))
@@ -221,4 +247,21 @@ impl InProcessConnection {
             _ => unreachable!("request was routed to the wrong dispatch domain"),
         }
     }
+}
+
+/// Keeps workspace-level events and the session events a person may read.
+fn filter_workspace_feed(
+    events: Vec<WorkspaceFeedEvent>,
+    readable: Option<&BTreeSet<AgentSessionId>>,
+) -> Vec<WorkspaceFeedEvent> {
+    let Some(readable) = readable else {
+        return events;
+    };
+    events
+        .into_iter()
+        .filter(|event| match event {
+            WorkspaceFeedEvent::Session(event) => readable.contains(&event.session_id),
+            WorkspaceFeedEvent::Workspace(_) => true,
+        })
+        .collect()
 }

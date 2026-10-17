@@ -89,6 +89,11 @@ pub enum RepositoryRequest {
     /// filters them locally.
     SearchGitHubRepositories {
         query: String,
+        /// Session the search is for. A connection bound to a person must name
+        /// a session it owns: only a session owner may browse with the
+        /// worker's GitHub credential. Operator connections may omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<AgentSessionId>,
     },
 
     /// List repositories already cloned and cached on this worker node.
@@ -553,4 +558,122 @@ pub enum ClientRequest {
     Terminal(TerminalRequest),
     Task(TaskRequest),
     Project(ProjectRequest),
+    Access(AccessRequest),
+    Collaboration(CollaborationRequest),
+}
+
+/// Multi-user messages and run actions with server-side attribution.
+///
+/// The author of every request is the person (or operator) the connection
+/// authenticated as; no request names it. Every request here needs the
+/// participant role, except [`CollaborationRequest::GetRunRevision`], which
+/// any reader may send.
+///
+/// Ordering and conflicts: run-scoped requests carry the [`RunRevision`] the
+/// sender decided against. The server serializes them per run and accepts
+/// one only when that revision is still current; otherwise it answers
+/// [`RunActionOutcome::Conflict`] with the current revision and applies
+/// nothing. See [`RunRevision`].
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum CollaborationRequest {
+    /// Chat to the other people in the session. Stored in the session
+    /// history, never added to model context, and never starts or continues
+    /// a run.
+    SendPeerMessage {
+        session_id: AgentSessionId,
+        text: String,
+    },
+
+    /// A follow-up direction to the agent of a run.
+    DirectAgent {
+        run_id: RunId,
+        expected: RunRevision,
+        text: String,
+    },
+
+    /// An answer to the question the agent is waiting on.
+    AnswerAgentQuestion {
+        run_id: RunId,
+        expected: RunRevision,
+        text: String,
+    },
+
+    /// Approve, reject, pause, resume, interrupt, or retry a run.
+    ControlRun {
+        run_id: RunId,
+        expected: RunRevision,
+        action: RunControlAction,
+    },
+
+    /// The run's current revision, to decide an action against.
+    GetRunRevision { run_id: RunId },
+}
+
+/// Multi-user identity, session access, and presence.
+///
+/// The caller's identity always comes from the credential its connection
+/// authenticated with; no request names the caller. A participant is named by
+/// its stable [`ParticipantId`], never by a display name.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum AccessRequest {
+    /// The identity bound to this connection.
+    GetCurrentParticipant,
+
+    /// People the backend knows, so an owner can pick whom to grant access to.
+    ListParticipants,
+
+    /// One entry per person with access to the session: role and presence
+    /// aggregated across that person's connections.
+    GetSessionRoster { session_id: AgentSessionId },
+
+    /// Grants a person access to a session. Owner only. A new grant always
+    /// starts as [`SessionRole::Observer`]; promote it with
+    /// [`AccessRequest::SetSessionRole`]. Granting an existing grantee is a
+    /// no-op that keeps the current role.
+    GrantSessionAccess {
+        session_id: AgentSessionId,
+        participant_id: ParticipantId,
+    },
+
+    /// Promotes or demotes an existing grant. Owner only. The last owner of a
+    /// session cannot be demoted.
+    SetSessionRole {
+        session_id: AgentSessionId,
+        participant_id: ParticipantId,
+        role: SessionRole,
+    },
+
+    /// Removes a person's access. Owner only. Their in-flight requests and
+    /// live event subscriptions for the session end; other people are not
+    /// affected. The last owner of a session cannot be revoked.
+    RevokeSessionAccess {
+        session_id: AgentSessionId,
+        participant_id: ParticipantId,
+    },
+
+    /// Provider credentials the caller may select: their own, plus the
+    /// worker-wide default. Metadata only; secrets never leave the worker.
+    ListProviderCredentials,
+
+    /// Selects the provider credential later runs of the session use. Owner
+    /// only, and only a credential the owner holds (or the worker default).
+    /// A run that already started keeps the credential it pinned.
+    SelectSessionCredential {
+        session_id: AgentSessionId,
+        credential_id: CredentialId,
+    },
+
+    /// The session's selected credential, so clients can show whose account
+    /// a run will use before it starts.
+    GetSessionCredential { session_id: AgentSessionId },
+
+    /// The credential and model a run pinned when it started.
+    GetRunCredential { run_id: RunId },
+
+    /// Revokes one of the caller's own credentials, in every version. Runs
+    /// pinned to it fail their next provider call with an authentication
+    /// error instead of switching to another account.
+    RevokeProviderCredential { credential_id: CredentialId },
 }

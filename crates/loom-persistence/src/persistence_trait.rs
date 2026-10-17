@@ -97,6 +97,8 @@ pub trait SessionRepository: Send + Sync {
     ) -> Result<Option<DurableRunSummary>>;
     fn load_sessions(&self) -> Result<Option<SessionManagerState>>;
     fn load_session_settings(&self) -> Result<DurableSessionSettings>;
+    /// Loads known participants and every stored session grant.
+    fn load_session_access(&self) -> Result<(BTreeMap<ParticipantId, String>, Vec<SessionGrant>)>;
     fn load_session_usage(
         &self,
         session_id: AgentSessionId,
@@ -119,6 +121,9 @@ impl SessionRepository for FilePersistence {
     }
     fn load_session_settings(&self) -> Result<DurableSessionSettings> {
         FilePersistence::load_session_settings(self)
+    }
+    fn load_session_access(&self) -> Result<(BTreeMap<ParticipantId, String>, Vec<SessionGrant>)> {
+        FilePersistence::load_session_access(self)
     }
     fn load_session_usage(
         &self,
@@ -144,6 +149,9 @@ impl<T: SessionRepository + ?Sized> SessionRepository for Arc<T> {
     }
     fn load_session_settings(&self) -> Result<DurableSessionSettings> {
         (**self).load_session_settings()
+    }
+    fn load_session_access(&self) -> Result<(BTreeMap<ParticipantId, String>, Vec<SessionGrant>)> {
+        (**self).load_session_access()
     }
     fn load_session_usage(
         &self,

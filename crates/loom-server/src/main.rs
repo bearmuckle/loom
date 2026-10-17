@@ -24,9 +24,9 @@ use loom_server::{
     InProcessBackend, Instance, InstanceLayout, InstanceOptions, MAX_FRAME_BYTES_ENV,
     ProcessContext, RemoteServerConfig, ReopenBackoff, ServerTlsConfig, ServingBackend, TlsState,
     apply_startup_archive_retention, diagnostics_lines, fail_stop_record_path, open_backend,
-    reopen_after_fail_stop, resolve_archive_retention_with_sub_agent, resolve_max_frame_bytes,
-    run_archive_retention_sweeps, start_remote_server, startup_summary,
-    sweep_archive_retention_at_startup,
+    parse_participant_tokens, reopen_after_fail_stop, resolve_archive_retention_with_sub_agent,
+    resolve_max_frame_bytes, run_archive_retention_sweeps, start_remote_server_with_participants,
+    startup_summary, sweep_archive_retention_at_startup,
 };
 
 /// The bind address used when `--bind` is not supplied.
@@ -92,6 +92,9 @@ struct ServerOptions {
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     allow_insecure_remote: bool,
+    /// JSON file of per-person bearer tokens; see
+    /// [`loom_server::ParticipantTokenEntry`].
+    participants_file: Option<PathBuf>,
 }
 
 impl Default for ServerOptions {
@@ -110,6 +113,7 @@ impl Default for ServerOptions {
             tls_cert: None,
             tls_key: None,
             allow_insecure_remote: false,
+            participants_file: None,
         }
     }
 }
@@ -223,6 +227,16 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
                 options.tls_key = Some(PathBuf::from(required_value(&mut args, "--tls-key")?));
             }
             "--allow-insecure-remote" => options.allow_insecure_remote = true,
+            "--participants-file" => {
+                options.participants_file = Some(PathBuf::from(required_value(
+                    &mut args,
+                    "--participants-file",
+                )?));
+            }
+            value if value.starts_with("--participants-file=") => {
+                options.participants_file =
+                    Some(PathBuf::from(&value["--participants-file=".len()..]));
+            }
             "--help" | "-h" => return Ok(ParsedArgs::Help),
             "--version" | "-V" => return Ok(ParsedArgs::Version),
             value if value.starts_with("--bind=") => {
@@ -314,7 +328,7 @@ fn help_text() -> String {
          [--archive-retention-force-discard <bool>] \
          [--max-frame-bytes <bytes>] \
          [--tls-cert <pem> --tls-key <pem>] \
-         [--allow-insecure-remote] [--diagnostics]\n\
+         [--allow-insecure-remote] [--participants-file <path>] [--diagnostics]\n\
          \n\
          A standalone Loom backend that serves the remote WebSocket protocol.\n\
          \n\
@@ -344,6 +358,9 @@ fn help_text() -> String {
          \x20 --tls-key <pem>       PEM private key matching --tls-cert\n\
          \x20 --allow-insecure-remote\n\
          \x20                        allow a plaintext ws:// bind beyond loopback\n\
+         \x20 --participants-file <path>\n\
+         \x20                        JSON array of {{\"token\", \"display_name\", optional \
+         \"participant_id\"}} entries, one bearer token per person for shared sessions\n\
          \x20 --diagnostics         print the resolved deployment context and exit\n\
          \x20 -h, --help            print this help and exit\n\
          \x20 -V, --version         print the version and exit\n\
@@ -469,7 +486,20 @@ async fn start(
         allow_insecure_remote: options.allow_insecure_remote,
         ..RemoteServerConfig::default()
     };
-    start_remote_server(backend, instance.token().token(), config).await
+    let participants = match &options.participants_file {
+        Some(path) => {
+            let contents = std::fs::read_to_string(path).map_err(|error| {
+                LoomError::invalid_request(format!(
+                    "could not read --participants-file '{}': {error}",
+                    path.display()
+                ))
+            })?;
+            parse_participant_tokens(&contents)?
+        }
+        None => Vec::new(),
+    };
+    start_remote_server_with_participants(backend, instance.token().token(), &participants, config)
+        .await
 }
 
 fn serve_blocking(options: ServerOptions) -> Result<(), LoomError> {

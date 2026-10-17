@@ -49,28 +49,29 @@ impl InProcessConnection {
             ));
         }
         let workspace = self.backend.restore_session_filesystem(state.session_id)?;
-        let provider = match self
-            .backend
-            .provider_at(&state.task.model, state.provider_cursor)
-        {
-            Ok(provider) => provider,
-            Err(error) => {
-                let descriptor = self
-                    .backend
-                    .providers
-                    .describe_model(&state.task.model)
-                    .unwrap_or_else(|_| ModelDescriptor {
-                        id: state.task.model.clone(),
-                        provider: ProviderId::new("recovered"),
-                        display_name: "Unavailable persisted model".to_owned(),
-                        context_window: None,
-                        max_input_tokens: None,
-                        max_output_tokens: None,
-                        capabilities: ModelCapabilities::default(),
-                    });
-                Box::new(UnavailableProvider::new(descriptor, error))
-            }
-        };
+        let provider =
+            match self
+                .backend
+                .provider_for_run(run_id, &state.task.model, state.provider_cursor)
+            {
+                Ok(provider) => provider,
+                Err(error) => {
+                    let descriptor = self
+                        .backend
+                        .providers
+                        .describe_model(&state.task.model)
+                        .unwrap_or_else(|_| ModelDescriptor {
+                            id: state.task.model.clone(),
+                            provider: ProviderId::new("recovered"),
+                            display_name: "Unavailable persisted model".to_owned(),
+                            context_window: None,
+                            max_input_tokens: None,
+                            max_output_tokens: None,
+                            capabilities: ModelCapabilities::default(),
+                        });
+                    Box::new(UnavailableProvider::new(descriptor, error))
+                }
+            };
         let tools = ToolExecutor::new_with_workspace(workspace)
             .with_build_cache_root(self.backend.build_cache_root())
             .with_github_token(self.backend.providers.github_account_token().ok())
@@ -472,7 +473,9 @@ impl InProcessConnection {
                 false,
             ));
         }
-        let provider = self.backend.provider(&input.model)?;
+        let (credential_pin, provider) = self
+            .backend
+            .provider_for_new_run(input.session_id, &input.model)?;
         let (input_cost_micros_per_1k, output_cost_micros_per_1k) =
             self.backend.providers.pricing(&input.model)?;
         input.options.input_cost_micros_per_1k = input_cost_micros_per_1k;
@@ -691,6 +694,9 @@ impl InProcessConnection {
             runtime.set_project_message_cursor(execution.last_project_message_sequence);
         }
         let run_id = runtime.run_id();
+        // The credential is pinned before the run is observable, so no
+        // follow-up or later sign-in can change which account it uses.
+        self.backend.pin_run_credential(run_id, credential_pin)?;
         // The run is registered, and its events observable, before any model
         // work starts, so a second client can control it immediately.
         let handle = self.backend.register_runtime(runtime);
