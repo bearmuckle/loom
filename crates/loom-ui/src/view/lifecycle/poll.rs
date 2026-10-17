@@ -59,6 +59,7 @@ impl LoomView {
             self.project_poll_scheduled = false;
             return;
         };
+        self.project_poll_scheduled = true;
         let project_id = project.project_id;
         let root_session_id = project.root_session_id;
         let workspace_id = self.active_session.workspace_id;
@@ -87,7 +88,6 @@ impl LoomView {
                     view.project_poll_scheduled = false;
                     return;
                 }
-                view.project_poll_scheduled = false;
                 match response.result {
                     Ok(ServerResponse::Events(EventsResponse::WorkspaceEvents {
                         workspace_id: response_workspace,
@@ -158,10 +158,12 @@ impl LoomView {
                             view.project_feed_after_sequence
                                 .map_or(next, |current| current.max(next)),
                         );
-                        view.project_poll_scheduled = false;
                         view.poll_project_once(cx);
                     }
-                    None => view.schedule_project_poll(cx),
+                    None => {
+                        view.project_poll_scheduled = false;
+                        view.schedule_project_poll(cx);
+                    }
                 }
             },
         );
@@ -173,6 +175,7 @@ impl LoomView {
     /// finds more events than fit keeps asking for the pages that follow instead
     /// of leaving the rest of the backlog for the next poll cadence.
     pub(crate) fn poll_run_once(&mut self, cx: &mut Context<Self>) {
+        self.run_poll_scheduled = true;
         let request_cursor = self.after_sequence;
         self.dispatch(
             cx,
@@ -229,7 +232,6 @@ impl LoomView {
                 if view.project_snapshot_stale {
                     view.refresh_active_project_snapshot(cx);
                 }
-                view.run_poll_scheduled = false;
                 match continuation {
                     // Keep draining the pages the backend named without waiting
                     // for the next poll cadence; each answer advances the cursor,
@@ -238,7 +240,10 @@ impl LoomView {
                         view.after_sequence = Some(next);
                         view.poll_run_once(cx);
                     }
-                    None => view.schedule_run_poll(cx),
+                    None => {
+                        view.run_poll_scheduled = false;
+                        view.schedule_run_poll(cx);
+                    }
                 }
             },
         );

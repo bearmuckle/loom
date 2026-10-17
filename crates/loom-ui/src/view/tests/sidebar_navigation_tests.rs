@@ -387,6 +387,210 @@ fn source_lookups_skip_delegated_agents_and_stay_bounded(cx: &mut TestAppContext
     .unwrap();
 }
 
+/// Delayed replies model browser transport overlap rather than the synchronous
+/// in-memory backend. Repeated renders/refreshes must not enqueue another job.
+#[gpui_kit::test]
+fn source_discovery_is_single_flight_and_drains_all_rows(cx: &mut TestAppContext) {
+    use loom_protocol::{
+        ClientRequest, FilesystemRequest, FilesystemResponse, RepositoryRequest,
+        RepositoryResponse, ResponseEnvelope, ServerResponse,
+    };
+
+    let (backend, jobs) = crate::backend_host::BackendWorker::deferred_for_test();
+    let view = cx.new(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.node_backends
+            .insert(view.default_backend_node_id.clone(), backend);
+        view.sessions.clear();
+        for _ in 0..12 {
+            let mut session = view.active_session.clone();
+            session.id = loom_core::AgentSessionId::new();
+            view.session_node_ids
+                .insert(session.id, view.default_backend_node_id.clone());
+            view.sessions.push(session);
+        }
+        let cached_id = view.sessions[10].id;
+        view.session_sources.insert(cached_id, "cached".to_owned());
+        let root_id = view.sessions[0].id;
+        let child_id = view.sessions[11].id;
+        let project_id = loom_core::ProjectId::from_uuid(*root_id.as_uuid());
+        view.project_tree_snapshots = vec![loom_core::ProjectSnapshot {
+            project_id,
+            root_session_id: root_id,
+            agents: vec![agent_record(child_id, project_id, Some(root_id), 2)],
+            tasks: Vec::new(),
+            worktrees: Vec::new(),
+        }];
+        view.refresh_session_source_labels(cx);
+        view
+    });
+    let ids = cx.update(|cx| {
+        view.read(cx)
+            .sessions
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>()
+    });
+    for (index, session_id) in ids[..10].iter().copied().enumerate() {
+        let job = jobs.try_recv().expect("next row starts without a render");
+        assert!(matches!(job.request.request,
+            ClientRequest::Repository(RepositoryRequest::ListSessionRepositories { session_id: id })
+                if id == session_id));
+        for _ in 0..20 {
+            view.update(cx, |view, cx| view.refresh_session_source_labels(cx));
+        }
+        cx.run_until_parked();
+        assert!(jobs.try_recv().is_err(), "repository request overlapped");
+        let repositories = if index % 2 == 0 {
+            vec![loom_core::SessionRepository {
+                id: loom_core::RepositoryId::new(),
+                source: format!("repository-{index}"),
+                path: "repo".to_owned(),
+                revision: None,
+                attached_at: loom_core::Timestamp::from_unix_millis(1),
+            }]
+        } else {
+            Vec::new()
+        };
+        job.reply
+            .send(ResponseEnvelope::success(
+                job.request.request_id,
+                ServerResponse::Repository(RepositoryResponse::SessionRepositories {
+                    repositories,
+                }),
+            ))
+            .unwrap();
+        cx.run_until_parked();
+        if index % 2 == 1 {
+            let job = jobs
+                .try_recv()
+                .expect("empty repository list falls back to folder");
+            assert!(matches!(job.request.request,
+                ClientRequest::Filesystem(FilesystemRequest::ListSessionDirectories { session_id: id })
+                    if id == session_id));
+            for _ in 0..20 {
+                view.update(cx, |view, cx| view.refresh_session_source_labels(cx));
+            }
+            cx.run_until_parked();
+            assert!(jobs.try_recv().is_err(), "directory request overlapped");
+            let directories = if index == 9 {
+                Vec::new()
+            } else {
+                vec![loom_core::SessionDirectory {
+                    source: format!("directory-{index}"),
+                    path: "folder".to_owned(),
+                }]
+            };
+            job.reply
+                .send(ResponseEnvelope::success(
+                    job.request.request_id,
+                    ServerResponse::Filesystem(FilesystemResponse::SessionDirectories {
+                        directories,
+                    }),
+                ))
+                .unwrap();
+            cx.run_until_parked();
+        }
+    }
+    for _ in 0..20 {
+        view.update(cx, |view, cx| view.refresh_session_source_labels(cx));
+    }
+    cx.run_until_parked();
+    assert!(
+        jobs.try_recv().is_err(),
+        "completed discovery must stay cached"
+    );
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(!view.session_source_request_in_flight);
+        assert_eq!(view.session_source_lookups.len(), 10);
+        assert_eq!(view.session_sources.len(), 10);
+        for (index, id) in ids[..9].iter().enumerate() {
+            let prefix = if index % 2 == 0 {
+                "repository"
+            } else {
+                "directory"
+            };
+            assert_eq!(view.session_sources[id], format!("{prefix}-{index}"));
+        }
+        assert!(!view.session_sources.contains_key(&ids[9]));
+        assert_eq!(view.session_sources[&ids[10]], "cached");
+        assert!(!view.session_source_lookups.contains_key(&ids[11]));
+    });
+}
+
+#[gpui_kit::test]
+fn source_discovery_advances_after_failed_or_unexpected_replies(cx: &mut TestAppContext) {
+    use loom_protocol::{FilesystemResponse, RepositoryResponse, ResponseEnvelope, ServerResponse};
+
+    let (backend, jobs) = crate::backend_host::BackendWorker::deferred_for_test();
+    let view = cx.new(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.node_backends
+            .insert(view.default_backend_node_id.clone(), backend);
+        view.sessions.clear();
+        for _ in 0..4 {
+            let mut session = view.active_session.clone();
+            session.id = loom_core::AgentSessionId::new();
+            view.session_node_ids
+                .insert(session.id, view.default_backend_node_id.clone());
+            view.sessions.push(session);
+        }
+        view.refresh_session_source_labels(cx);
+        view
+    });
+    for index in 0..4 {
+        let job = jobs.try_recv().expect("failure must not strand later rows");
+        assert!(jobs.try_recv().is_err());
+        match index {
+            0 => job
+                .reply
+                .send(ResponseEnvelope::failure(
+                    job.request.request_id,
+                    loom_core::LoomError::invalid_request("test failure"),
+                ))
+                .unwrap(),
+            1 => job
+                .reply
+                .send(ResponseEnvelope::success(
+                    job.request.request_id,
+                    ServerResponse::Filesystem(FilesystemResponse::SessionDirectories {
+                        directories: Vec::new(),
+                    }),
+                ))
+                .unwrap(),
+            2 => drop(job.reply),
+            _ => {
+                job.reply
+                    .send(ResponseEnvelope::success(
+                        job.request.request_id,
+                        ServerResponse::Repository(RepositoryResponse::SessionRepositories {
+                            repositories: Vec::new(),
+                        }),
+                    ))
+                    .unwrap();
+                cx.run_until_parked();
+                let directory = jobs.try_recv().expect("directory fallback");
+                assert!(jobs.try_recv().is_err());
+                directory
+                    .reply
+                    .send(ResponseEnvelope::failure(
+                        directory.request.request_id,
+                        loom_core::LoomError::invalid_request("directory failure"),
+                    ))
+                    .unwrap();
+            }
+        }
+        cx.run_until_parked();
+    }
+    view.update(cx, |view, cx| {
+        assert!(!view.session_source_request_in_flight);
+        assert_eq!(view.session_source_lookups.len(), 4);
+        view.refresh_session_source_labels(cx);
+    });
+    assert!(jobs.try_recv().is_err());
+}
+
 /// One agent record of a project snapshot.
 fn agent_record(
     session_id: loom_core::AgentSessionId,

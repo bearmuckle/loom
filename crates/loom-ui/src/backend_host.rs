@@ -60,12 +60,26 @@ pub(crate) struct BackendWorker {
 
 #[cfg(not(target_family = "wasm"))]
 #[allow(dead_code)]
-struct Job {
-    request: RequestEnvelope,
-    reply: oneshot::Sender<ResponseEnvelope>,
+pub(crate) struct Job {
+    pub(crate) request: RequestEnvelope,
+    pub(crate) reply: oneshot::Sender<ResponseEnvelope>,
 }
 
 impl BackendWorker {
+    /// A backend whose requests remain pending until the test replies.
+    #[cfg(all(not(target_family = "wasm"), test))]
+    pub(crate) fn deferred_for_test() -> (Self, mpsc::Receiver<Job>) {
+        let (jobs, incoming) = mpsc::channel();
+        (
+            Self {
+                jobs,
+                test_connection: None,
+                secure_for_secrets: true,
+            },
+            incoming,
+        )
+    }
+
     #[cfg(all(not(target_family = "wasm"), test))]
     pub(crate) fn spawn(connection: ClientConnection) -> Self {
         let secure_for_secrets = connection.secure_for_secrets();
