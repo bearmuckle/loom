@@ -952,9 +952,29 @@ impl ProjectAgentTools {
             Ok(tasks) => tasks,
             Err(error) => return ToolResult::failure(call, error.message),
         };
-        let sessions = match connection.backend.sessions() {
-            Ok(sessions) => sessions,
-            Err(error) => return ToolResult::failure(call, error.message),
+        // Read the child names before the per-child inspection below. That
+        // inspection restores a child filesystem, which locks the same session
+        // manager, and holding this non-reentrant guard across it self-deadlocks
+        // the tool thread and stalls every request behind the lock.
+        let names = {
+            let sessions = match connection.backend.sessions() {
+                Ok(sessions) => sessions,
+                Err(error) => return ToolResult::failure(call, error.message),
+            };
+            project
+                .agents
+                .iter()
+                .filter(|agent| agent.parent_session_id == Some(self.session_id))
+                .map(|agent| {
+                    (
+                        agent.session_id,
+                        sessions
+                            .get(agent.session_id)
+                            .map(|session| session.name.clone())
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
         };
         let mut children = Vec::new();
         for agent in project
@@ -970,10 +990,7 @@ impl ProjectAgentTools {
             {
                 continue;
             }
-            let name = sessions
-                .get(agent.session_id)
-                .map(|session| session.name.clone())
-                .unwrap_or_default();
+            let name = names.get(&agent.session_id).cloned().unwrap_or_default();
             // The durable run summary carries the failure reason captured when
             // the child run failed, so the parent can tell an interrupted child
             // apart from one that produced nothing usable.

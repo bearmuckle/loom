@@ -2161,6 +2161,47 @@ fn listing_a_code_child_reports_its_checkout_state_only_for_a_finished_task() {
     removed.shutdown();
 }
 
+#[test]
+fn listing_a_code_child_restores_a_lazy_filesystem_without_deadlocking() {
+    let fixture = project_code_child_fixture();
+    fs::write(fixture.child_checkout.join("in-progress.txt"), "work\n").unwrap();
+    complete_project_code_child(&fixture);
+    // Persist the child filesystem record, then simulate a restored backend:
+    // the record is durable but the in-memory checkout is lazy, so inspecting
+    // it restores it on demand.
+    fixture.backend.flush().unwrap();
+    fixture
+        .backend
+        .persisted_session_filesystems()
+        .unwrap()
+        .insert(fixture.worktree.child_session_id);
+    fixture
+        .backend
+        .session_filesystems()
+        .unwrap()
+        .remove(&fixture.worktree.child_session_id);
+    let tools = code_child_manager_tools(&fixture);
+    let listing = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "list_project_children".to_owned(),
+        arguments: serde_json::json!({}),
+    });
+    assert!(listing.success, "{}", listing.output);
+    let listing: serde_json::Value = serde_json::from_str(&listing.output).unwrap();
+    let child = listing["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["task_id"] == serde_json::json!(fixture.task_id))
+        .expect("the child should be listed");
+    assert_eq!(
+        child["worktree_uncommitted_path_count"],
+        serde_json::json!(1)
+    );
+    assert_eq!(child["worktree_note"], serde_json::Value::Null);
+    fixture.shutdown();
+}
+
 /// The manager's child-control and inspection tools for one code child fixture,
 /// so a test acts through the same surface a manager uses.
 fn code_child_manager_tools(fixture: &ProjectCodeChildFixture) -> ToolExecutor {
