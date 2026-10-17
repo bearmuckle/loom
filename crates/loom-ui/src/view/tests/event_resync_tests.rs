@@ -1,10 +1,105 @@
 //! Regression tests for conversation resync and event-batch application.
-//!
-//! The reported symptom (GitHub issue #223) was that the conversation
-//! sometimes collapsed to only the latest event, or duplicated events until a
-//! reload. Both come from the session event poll: a
-//! `SessionEventsSnapshot` used to be treated as a full replacement of the
-//! conversation, and a re-delivered event batch used to be applied twice.
+
+#[cfg(not(target_family = "wasm"))]
+#[gpui_kit::test]
+fn event_page_continuations_keep_poll_ownership(cx: &mut TestAppContext) {
+    for project_feed in [false, true] {
+        let (backend, requests) = crate::backend_host::BackendWorker::deferred_for_test();
+        let view = cx.new(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.backend = backend.clone();
+            view.node_backends
+                .insert(view.default_backend_node_id.clone(), backend);
+            view.run_state = Some(AgentRunState::Executing);
+            let root = view.active_session.id;
+            view.session_node_ids
+                .insert(root, view.default_backend_node_id.clone());
+            let project_id = loom_core::ProjectId::from_uuid(*root.as_uuid());
+            view.project_snapshot = Some(loom_core::ProjectSnapshot {
+                project_id,
+                root_session_id: root,
+                agents: vec![loom_core::ProjectAgentRecord {
+                    session_id: AgentSessionId::new(),
+                    project_id,
+                    parent_session_id: Some(root),
+                    depth: 2,
+                    state: AgentSessionState::Executing,
+                    task_summary: None,
+                    output_cursor: EventSequence::default(),
+                    updated_at: Timestamp::from_unix_millis(1),
+                }],
+                tasks: Vec::new(),
+                worktrees: Vec::new(),
+            });
+            if project_feed {
+                view.poll_project_once(cx);
+            } else {
+                view.poll_run_once(cx);
+            }
+            view
+        });
+        let workspace_id = view.read_with(cx, |view, _| view.active_session.workspace_id);
+        let page = |next_after_sequence| {
+            ServerResponse::Events(if project_feed {
+                EventsResponse::WorkspaceEvents {
+                    workspace_id,
+                    events: Vec::new(),
+                    stream_epoch: Some("test".to_owned()),
+                    next_after_sequence,
+                }
+            } else {
+                EventsResponse::SessionEvents {
+                    events: Vec::new(),
+                    stream_epoch: Some("test".to_owned()),
+                    next_after_sequence,
+                }
+            })
+        };
+        let first = requests.try_recv().unwrap();
+        first
+            .reply
+            .send(ResponseEnvelope::success(
+                first.request.request_id,
+                page(Some(EventSequence::new(1))),
+            ))
+            .unwrap();
+        cx.run_until_parked();
+        let second = requests.try_recv().expect("the next page starts promptly");
+        view.update(cx, |view, cx| {
+            if project_feed {
+                assert!(view.project_poll_scheduled);
+                view.schedule_project_poll(cx);
+            } else {
+                assert!(view.run_poll_scheduled);
+                view.schedule_run_poll(cx);
+                view.start_run_poll_if_idle(cx);
+            }
+            // Stop the cadence after the final page so the test needs no timer.
+            view.run_state = None;
+            view.project_snapshot = None;
+        });
+        cx.run_until_parked();
+        assert!(requests.try_recv().is_err(), "a pending page owns the poll");
+        second
+            .reply
+            .send(ResponseEnvelope::success(
+                second.request.request_id,
+                page(None),
+            ))
+            .unwrap();
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.run_poll_scheduled);
+            assert!(!view.project_poll_scheduled);
+        });
+        assert!(requests.try_recv().is_err());
+    }
+}
+// The reported symptom (GitHub issue #223) was that the conversation
+// sometimes collapsed to only the latest event, or duplicated events until a
+// reload. Both come from the session event poll: a
+// `SessionEventsSnapshot` used to be treated as a full replacement of the
+// conversation, and a re-delivered event batch used to be applied twice.
 
 use super::*;
 use gpui_kit::{TestAppContext, px, size};
