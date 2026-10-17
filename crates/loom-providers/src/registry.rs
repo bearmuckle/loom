@@ -959,6 +959,13 @@ impl ModelProvider for SelectedModelProvider {
         cancel: &CancellationToken,
         sink: &mut dyn ModelStreamSink,
     ) -> Result<()> {
+        if request.model != self.descriptor.id {
+            return Err(LoomError::invalid_request(format!(
+                "request model '{}' does not match provider model '{}'",
+                request.model.as_str(),
+                self.descriptor.id.as_str()
+            )));
+        }
         self.inner.stream(&self.raw_request(request), cancel, sink)
     }
 
@@ -1194,6 +1201,31 @@ mod selection_tests {
             &ModelId::new("missing"),
         );
         assert!(registry.create_provider(&missing).is_err());
+    }
+
+    #[test]
+    fn selected_provider_rejects_a_request_for_another_provider_before_dispatch() {
+        let registry = shared_registry();
+        let raw = ModelId::new("gpt-4o");
+        let selected = ModelId::for_provider(&ProviderId::new(OPENAI_PROVIDER_ID), &raw);
+        let other = ModelId::for_provider(&ProviderId::new(GITHUB_COPILOT_PROVIDER_ID), &raw);
+        let mut adapter = registry.create_provider(&selected).unwrap();
+        for model in [other, raw] {
+            let request = ModelRequest {
+                model,
+                messages: vec![],
+                tools: vec![],
+                options: Default::default(),
+            };
+            let mut sink = CollectingSink::default();
+            let error = adapter
+                .stream(&request, &CancellationToken::new(), &mut sink)
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+            assert!(error.message.contains("does not match"));
+            assert!(sink.events.is_empty());
+        }
+        assert_eq!(registry.usage().unwrap().summary(None, None).requests, 0);
     }
 
     struct RawBoundaryProvider {
