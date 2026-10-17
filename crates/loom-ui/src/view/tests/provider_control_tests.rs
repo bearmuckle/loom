@@ -2,6 +2,211 @@ use super::*;
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{TestAppContext, px, size};
 
+#[test]
+fn model_choice_labels_preserve_overlapping_provider_models_and_fallbacks() {
+    let openai = ModelId::new("openai/gpt-5");
+    let copilot = ModelId::new("github-copilot/gpt-5");
+    let names = BTreeMap::from([
+        (
+            openai.clone(),
+            crate::connection::provider_name_for_id("openai"),
+        ),
+        (
+            copilot.clone(),
+            crate::connection::provider_name_for_id("github-copilot"),
+        ),
+    ]);
+    let models = vec![openai.clone(), copilot.clone()];
+    let choices = model_choice_labels(&models, Some(&names));
+    assert_eq!(choices.len(), 2);
+    assert_eq!(choices["OpenAI · openai/gpt-5"], openai);
+    assert_eq!(choices["GitHub Copilot · github-copilot/gpt-5"], copilot);
+    assert_eq!(
+        choices,
+        model_choice_labels(&[copilot.clone(), openai.clone()], Some(&names))
+    );
+    assert_eq!(model_choice_label(&openai, None), "Provider · openai/gpt-5");
+    assert_eq!(
+        model_choice_label(&copilot, Some(&BTreeMap::new())),
+        "Provider · github-copilot/gpt-5"
+    );
+    assert!(model_choice_labels(&[], None).is_empty());
+}
+
+#[test]
+fn qualified_model_choice_labels_disambiguate_the_same_raw_model() {
+    let raw = ModelId::new("gpt-5");
+    let openai = ModelId::for_provider(&loom_model::ProviderId::new("openai"), &raw);
+    let copilot = ModelId::for_provider(&loom_model::ProviderId::new("github-copilot"), &raw);
+    let choices = model_choice_labels(&[openai.clone(), copilot.clone()], None);
+    assert_eq!(choices["OpenAI · gpt-5"], openai);
+    assert_eq!(choices["GitHub Copilot · gpt-5"], copilot);
+    let custom = ModelId::for_provider(&loom_model::ProviderId::new("my_custom-provider"), &raw);
+    assert_eq!(
+        model_choice_label(&custom, None),
+        "My Custom Provider · gpt-5"
+    );
+}
+
+#[test]
+fn legacy_model_choices_require_a_unique_provider() {
+    let raw = ModelId::new("gpt-5");
+    let openai = ModelId::for_provider(&loom_model::ProviderId::new("openai"), &raw);
+    let copilot = ModelId::for_provider(&loom_model::ProviderId::new("github-copilot"), &raw);
+    let unique = vec![openai.clone()];
+    let ambiguous = vec![openai.clone(), copilot.clone()];
+    assert_eq!(resolve_model_choice(&unique, &raw), Some(openai.clone()));
+    assert_eq!(preferred_model_choice(&unique, &raw), openai);
+    assert_eq!(resolve_model_choice(&ambiguous, &raw), None);
+    assert_eq!(preferred_model_choice(&ambiguous, &raw), raw);
+    assert_eq!(resolve_model_choice(&unique, &copilot), None);
+    assert_eq!(preferred_model_choice(&unique, &copilot), copilot);
+    assert_eq!(preferred_model_choice(&[], &raw), raw);
+    assert_eq!(
+        preferred_model_choice(&unique, &ModelId::new("missing")),
+        unique[0]
+    );
+    assert!(
+        validate_model_for_node(
+            &BTreeMap::from([("worker".to_owned(), unique)]),
+            "worker",
+            &raw
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_model_for_node(
+            &BTreeMap::from([("worker".to_owned(), ambiguous)]),
+            "worker",
+            &raw
+        )
+        .is_err()
+    );
+}
+
+#[gpui_kit::test]
+fn model_select_labels_use_worker_names_for_options_and_selected_values(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        let openai = ModelId::new("openai/gpt-5");
+        let copilot = ModelId::new("github-copilot/gpt-5");
+        view.models = vec![openai.clone(), copilot.clone()];
+        view.default_models = view.models.clone();
+        view.model = copilot.clone();
+        view.default_model = openai.clone();
+        view.node_model_provider_names.insert(
+            view.default_backend_node_id.clone(),
+            BTreeMap::from([
+                (openai.clone(), "OpenAI".to_owned()),
+                (copilot.clone(), "GitHub Copilot".to_owned()),
+            ]),
+        );
+        view.sync_model_select_states(window, cx);
+        assert_eq!(
+            view.model_select_items,
+            vec![
+                "GitHub Copilot · github-copilot/gpt-5",
+                "OpenAI · openai/gpt-5"
+            ]
+        );
+        assert_eq!(view.default_model_select_items, view.model_select_items);
+        assert_eq!(
+            view.model_select_value.as_deref(),
+            Some("GitHub Copilot · github-copilot/gpt-5")
+        );
+        assert_eq!(
+            view.default_model_select_value.as_deref(),
+            Some("OpenAI · openai/gpt-5")
+        );
+        assert_eq!(
+            view.model_select_choices["GitHub Copilot · github-copilot/gpt-5"],
+            copilot
+        );
+        assert_eq!(
+            view.default_model_select_choices["OpenAI · openai/gpt-5"],
+            openai
+        );
+
+        view.session_node_ids
+            .insert(view.active_session.id, "worker".to_owned());
+        view.node_model_provider_names.insert(
+            "worker".to_owned(),
+            BTreeMap::from([(copilot.clone(), "Worker Copilot".to_owned())]),
+        );
+        view.sync_model_select_states(window, cx);
+        assert_eq!(
+            view.model_select_value.as_deref(),
+            Some("Worker Copilot · github-copilot/gpt-5")
+        );
+        assert_eq!(
+            view.model_select_choices["Worker Copilot · github-copilot/gpt-5"],
+            copilot
+        );
+        assert_eq!(
+            view.default_model_select_value.as_deref(),
+            Some("OpenAI · openai/gpt-5")
+        );
+
+        // A selected model can outlive its catalog during a refresh.
+        view.models.clear();
+        view.sync_model_select_states(window, cx);
+        assert_eq!(
+            view.model_select_value.as_deref(),
+            Some("Worker Copilot · github-copilot/gpt-5")
+        );
+        view.node_model_provider_names.remove("worker");
+        view.sync_model_select_states(window, cx);
+        assert_eq!(
+            view.model_select_value.as_deref(),
+            Some("Provider · github-copilot/gpt-5")
+        );
+        let raw = ModelId::new("gpt-5");
+        let openai = ModelId::for_provider(&loom_model::ProviderId::new("openai"), &raw);
+        let copilot = ModelId::for_provider(&loom_model::ProviderId::new("github-copilot"), &raw);
+        view.models = vec![openai.clone(), copilot.clone()];
+        view.default_models = view.models.clone();
+        view.model = copilot.clone();
+        view.default_model = openai.clone();
+        view.sync_model_select_states(window, cx);
+        assert_eq!(
+            view.model_select_items,
+            vec!["GitHub Copilot · gpt-5", "OpenAI · gpt-5"]
+        );
+        assert_eq!(view.default_model_select_items, view.model_select_items);
+        assert_eq!(
+            view.model_select_value.as_deref(),
+            Some("GitHub Copilot · gpt-5")
+        );
+        assert_eq!(
+            view.default_model_select_value.as_deref(),
+            Some("OpenAI · gpt-5")
+        );
+        assert_eq!(view.model_select_choices["GitHub Copilot · gpt-5"], copilot);
+        assert_eq!(view.default_model_select_choices["OpenAI · gpt-5"], openai);
+        view.model = raw.clone();
+        view.default_model = raw.clone();
+        view.sync_model_select_states(window, cx);
+        assert_eq!(view.model, raw);
+        assert_eq!(view.default_model, raw);
+        assert_eq!(view.model_select_value.as_deref(), Some("Provider · gpt-5"));
+        view.models = vec![openai.clone()];
+        view.default_models = view.models.clone();
+        view.node_model_catalogs
+            .insert("worker".to_owned(), view.models.clone());
+        view.model_catalog_node_id = Some("worker".to_owned());
+        view.sync_model_select_states(window, cx);
+        assert_eq!(view.model, openai);
+        assert_eq!(view.default_model, openai);
+        assert_eq!(view.session_models[&view.active_session.id], openai);
+        view.select_model(raw.clone(), cx);
+        view.select_default_model(raw, cx);
+        assert_eq!(view.model, openai);
+        assert_eq!(view.default_model, openai);
+        view
+    });
+}
+
 #[gpui_kit::test]
 fn provider_model_and_mode_controls_update_state(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);

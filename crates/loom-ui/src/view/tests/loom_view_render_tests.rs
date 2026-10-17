@@ -323,7 +323,10 @@ fn connection_bootstrap_creates_and_attaches_a_local_workspace_session(cx: &mut 
         view.owned_backend = Some(local_backend);
         assert_eq!(view.workspaces.len(), 1);
         assert_eq!(view.sessions.len(), 1);
-        assert!(view.models.contains(&ModelId::new("deterministic/demo")));
+        assert!(view.models.contains(&ModelId::for_provider(
+            &loom_model::ProviderId::new("deterministic"),
+            &ModelId::new("deterministic/demo"),
+        )));
         assert_eq!(view.session_directories.len(), 1);
         // Avoid starting the live worker's delayed status poll in this synchronous UI test.
         view.worker_nodes.clear();

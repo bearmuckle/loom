@@ -119,21 +119,15 @@ impl LoomView {
                         if view.default_backend_node_id == node_id {
                             view.default_models = models.clone();
                             #[cfg(target_family = "wasm")]
-                            let preferred_model = view
-                                .browser_model
-                                .as_ref()
-                                .filter(|model| models.contains(model))
-                                .cloned();
+                            {
+                                let preferred =
+                                    view.browser_model.as_ref().unwrap_or(&view.default_model);
+                                view.default_model = preferred_model_choice(&models, preferred);
+                            }
                             #[cfg(not(target_family = "wasm"))]
-                            let preferred_model = None;
-                            if let Some(model) = preferred_model.or_else(|| {
-                                if models.contains(&view.default_model) {
-                                    None
-                                } else {
-                                    models.first().cloned()
-                                }
-                            }) {
-                                view.default_model = model;
+                            {
+                                view.default_model =
+                                    preferred_model_choice(&models, &view.default_model);
                             }
                         }
                         let active_node_id = view

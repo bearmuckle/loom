@@ -513,6 +513,13 @@ impl LoomView {
     }
 
     pub(crate) fn sync_model_select_states(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(model) = resolve_model_choice(&self.models, &self.model) {
+            self.model = model.clone();
+            self.session_models.insert(self.active_session.id, model);
+        }
+        if let Some(model) = resolve_model_choice(&self.default_models, &self.default_model) {
+            self.default_model = model;
+        }
         let active_node = self
             .session_node_ids
             .get(&self.active_session.id)
@@ -527,16 +534,8 @@ impl LoomView {
             model_choice_labels(&self.default_models, default_provider_names);
         let items = model_choices.keys().cloned().collect::<Vec<_>>();
         let default_items = default_model_choices.keys().cloned().collect::<Vec<_>>();
-        let model_value = model_choices
-            .iter()
-            .find(|(_, model)| *model == &self.model)
-            .map(|(label, _)| label.clone())
-            .unwrap_or_else(|| self.model.as_str().to_owned());
-        let default_model_value = default_model_choices
-            .iter()
-            .find(|(_, model)| *model == &self.default_model)
-            .map(|(label, _)| label.clone())
-            .unwrap_or_else(|| self.default_model.as_str().to_owned());
+        let model_value = model_choice_label(&self.model, active_provider_names);
+        let default_model_value = model_choice_label(&self.default_model, default_provider_names);
         self.model_select_choices = model_choices;
         self.default_model_select_choices = default_model_choices;
         let model_needs_sync = self.model_select_items != items
@@ -648,6 +647,7 @@ impl LoomView {
             cx.notify();
             return;
         }
+        let model = resolve_model_choice(&self.models, &model).unwrap_or(model);
         self.session_models
             .insert(self.active_session.id, model.clone());
         self.model = model;
@@ -767,7 +767,7 @@ impl LoomView {
     }
 
     pub(crate) fn select_default_model(&mut self, model: ModelId, cx: &mut Context<Self>) {
-        if !self.default_models.contains(&model) {
+        let Some(resolved_model) = resolve_model_choice(&self.default_models, &model) else {
             self.record_backend_error(
                 "select default model",
                 LoomError::invalid_state(format!(
@@ -777,7 +777,8 @@ impl LoomView {
             );
             cx.notify();
             return;
-        }
+        };
+        let model = resolved_model;
         self.default_model = model.clone();
         #[cfg(target_family = "wasm")]
         {

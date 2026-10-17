@@ -191,16 +191,7 @@ impl LoomView {
         let model_catalog = list_models(&connection)?;
         let models = model_catalog.models;
         let model_provider_names = model_catalog.provider_names;
-        let model = if models.contains(&options.model) {
-            options.model.clone()
-        } else {
-            models
-                .iter()
-                .find(|model| model.as_str() == GITHUB_COPILOT_DEFAULT_MODEL)
-                .cloned()
-                .or_else(|| models.first().cloned())
-                .unwrap_or_else(|| options.model.clone())
-        };
+        let model = preferred_model_choice(&models, &options.model);
         let node_model_catalogs =
             BTreeMap::from([(default_backend_node_id.clone(), models.clone())]);
         info!(
@@ -713,8 +704,7 @@ impl LoomView {
         let model_provider_names = model_catalog.provider_names;
         let model = options
             .model()
-            .cloned()
-            .filter(|model| models.contains(model))
+            .map(|model| preferred_model_choice(&models, model))
             .or_else(|| models.first().cloned())
             .unwrap_or_else(|| ModelId::new("default"));
         let node_model_catalogs =

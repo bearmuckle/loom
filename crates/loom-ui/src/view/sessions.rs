@@ -893,6 +893,8 @@ impl LoomView {
             let models = catalog.models;
             view.update(cx, |view, cx| {
                 view.record_model_discovery_errors(catalog.discovery_errors);
+                view.node_model_provider_names
+                    .insert(node_id.clone(), catalog.provider_names);
                 view.node_model_catalogs
                     .insert(node_id.clone(), models.clone());
                 view.default_models = models.clone();

@@ -18,7 +18,7 @@ use loom_core::{
     AgentSessionSnapshot, Capability, CapabilitySet, ErrorCode, LoomError, WorkspaceId,
     WorkspaceRecord,
 };
-use loom_model::{ModelId, ProviderSummary};
+use loom_model::{ModelId, ProviderId, ProviderSummary};
 #[cfg(not(target_family = "wasm"))]
 use loom_protocol::AgentRunSnapshot;
 use loom_protocol::{
@@ -814,14 +814,14 @@ fn model_catalog_from_descriptors(descriptors: Vec<loom_model::ModelDescriptor>)
         .iter()
         .map(|descriptor| {
             (
-                descriptor.id.clone(),
+                ModelId::for_provider(&descriptor.provider, &descriptor.id),
                 provider_name_for_id(descriptor.provider.as_str()),
             )
         })
         .collect();
     let models = descriptors
         .into_iter()
-        .map(|descriptor| descriptor.id)
+        .map(|descriptor| ModelId::for_provider(&descriptor.provider, &descriptor.id))
         .collect();
     ModelCatalog {
         models,
@@ -867,8 +867,9 @@ fn include_discovered_models(
     match result {
         Ok(ServerResponse::Provider(ProviderResponse::Models { models: discovered })) => {
             for model in discovered {
-                provider_names.insert(model.id.clone(), provider_name.to_owned());
-                models.push(model.id);
+                let id = ModelId::for_provider(&ProviderId::new(provider_id), &model.id);
+                provider_names.insert(id.clone(), provider_name.to_owned());
+                models.push(id);
             }
         }
         Err(error) => discovery_errors.push(ModelDiscoveryError {
@@ -901,15 +902,22 @@ pub(crate) async fn list_models_from_backend(
     providers.retain(|provider: &ProviderSummary| provider.is_usable());
     let mut models = providers
         .iter()
-        .flat_map(|provider| provider.models.iter().map(|model| model.id.clone()))
-        .collect::<Vec<_>>();
-    let mut provider_names = providers
-        .iter()
         .flat_map(|provider| {
             provider
                 .models
                 .iter()
-                .map(|model| (model.id.clone(), provider.display_name.clone()))
+                .map(|model| ModelId::for_provider(&provider.id, &model.id))
+        })
+        .collect::<Vec<_>>();
+    let mut provider_names = providers
+        .iter()
+        .flat_map(|provider| {
+            provider.models.iter().map(|model| {
+                (
+                    ModelId::for_provider(&provider.id, &model.id),
+                    provider.display_name.clone(),
+                )
+            })
         })
         .collect::<BTreeMap<_, _>>();
     let mut discovery_errors = Vec::new();
@@ -993,7 +1001,7 @@ mod tests {
         WorkspaceRecord,
     };
     use loom_model::ModelId;
-    use loom_protocol::{RepositoryResponse, ServerResponse, WorkspaceConfig};
+    use loom_protocol::{ProviderResponse, RepositoryResponse, ServerResponse, WorkspaceConfig};
     use loom_server::{AuthTokenStore, AuthorizationScope, RemoteServer, RemoteServerConfig};
     use std::sync::Arc;
 
@@ -1190,6 +1198,56 @@ mod tests {
                 .iter()
                 .any(|workspace| workspace == &external)
         );
+    }
+
+    #[test]
+    fn model_catalogs_preserve_same_model_from_distinct_providers() {
+        let descriptor = |provider: &str| loom_model::ModelDescriptor {
+            id: ModelId::new("gpt-5"),
+            provider: loom_model::ProviderId::new(provider),
+            display_name: "GPT-5".to_owned(),
+            context_window: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
+            capabilities: loom_model::ModelCapabilities::default(),
+        };
+        let mut catalog = super::model_catalog_from_descriptors(vec![
+            descriptor("openai"),
+            descriptor("github-copilot"),
+        ]);
+        assert_eq!(catalog.models.len(), 2);
+        assert_ne!(catalog.models[0], catalog.models[1]);
+        assert_eq!(catalog.provider_names[&catalog.models[0]], "OpenAI");
+        assert_eq!(catalog.provider_names[&catalog.models[1]], "GitHub Copilot");
+        for (provider, name) in [
+            ("openai", "Worker OpenAI"),
+            ("github-copilot", "Worker Copilot"),
+        ] {
+            include_discovered_models(
+                provider,
+                name,
+                Ok(ServerResponse::Provider(ProviderResponse::Models {
+                    models: vec![descriptor(provider)],
+                })),
+                &mut catalog.models,
+                &mut catalog.provider_names,
+                &mut catalog.discovery_errors,
+            );
+        }
+        catalog.models.sort();
+        catalog.models.dedup();
+        assert_eq!(catalog.models.len(), 2);
+        for model in &catalog.models {
+            let (provider, raw) = model.provider_model().unwrap();
+            assert_eq!(raw, ModelId::new("gpt-5"));
+            let expected = if provider.as_str() == "openai" {
+                "Worker OpenAI"
+            } else {
+                "Worker Copilot"
+            };
+            assert_eq!(catalog.provider_names[model], expected);
+        }
+        assert!(catalog.discovery_errors.is_empty());
     }
 
     #[test]

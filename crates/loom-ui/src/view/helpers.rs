@@ -1054,6 +1054,42 @@ pub(crate) fn assigned_node_id(
         })
 }
 
+/// Resolve legacy raw IDs only when exactly one provider offers the model.
+/// Explicit provider selections never fall back to another provider.
+pub(crate) fn resolve_model_choice(models: &[ModelId], model: &ModelId) -> Option<ModelId> {
+    if models.contains(model) {
+        return Some(model.clone());
+    }
+    if model.provider_model().is_some() {
+        return None;
+    }
+    let mut matches = models.iter().filter(|candidate| {
+        candidate
+            .provider_model()
+            .is_some_and(|(_, raw)| raw == *model)
+    });
+    let first = matches.next()?;
+    matches.next().is_none().then(|| first.clone())
+}
+
+/// Preserve unavailable explicit selections and ambiguous legacy IDs so they
+/// cannot silently switch providers. Only an absent legacy default may reset.
+pub(crate) fn preferred_model_choice(models: &[ModelId], model: &ModelId) -> ModelId {
+    resolve_model_choice(models, model).unwrap_or_else(|| {
+        if model.provider_model().is_some()
+            || models.iter().any(|candidate| {
+                candidate
+                    .provider_model()
+                    .is_some_and(|(_, raw)| raw == *model)
+            })
+        {
+            model.clone()
+        } else {
+            models.first().cloned().unwrap_or_else(|| model.clone())
+        }
+    })
+}
+
 pub(crate) fn validate_model_for_node(
     node_model_catalogs: &BTreeMap<String, Vec<ModelId>>,
     node_id: &str,
@@ -1062,10 +1098,34 @@ pub(crate) fn validate_model_for_node(
     let Some(models) = node_model_catalogs.get(node_id) else {
         return Err("model availability has not been checked".to_owned());
     };
-    if models.contains(model) {
+    if resolve_model_choice(models, model).is_some() {
         Ok(())
     } else {
-        Err(format!("model '{}' is not configured", model.as_str()))
+        Err(format!(
+            "model '{}' is not configured or is ambiguous; select a provider",
+            model.as_str()
+        ))
+    }
+}
+
+/// Keep the provider visible in both Select options and the selected value.
+/// Model IDs remain untouched because they carry provider-specific routing.
+pub(crate) fn model_choice_label(
+    model: &ModelId,
+    provider_names: Option<&BTreeMap<ModelId, String>>,
+) -> String {
+    let provider = provider_names.and_then(|names| names.get(model));
+    if let Some((provider_id, raw_model)) = model.provider_model() {
+        let provider = provider
+            .cloned()
+            .unwrap_or_else(|| crate::connection::provider_name_for_id(provider_id.as_str()));
+        format!("{provider} · {}", raw_model.as_str())
+    } else {
+        format!(
+            "{} · {}",
+            provider.map(String::as_str).unwrap_or("Provider"),
+            model.as_str()
+        )
     }
 }
 
@@ -1073,21 +1133,10 @@ pub(crate) fn model_choice_labels(
     models: &[ModelId],
     provider_names: Option<&BTreeMap<ModelId, String>>,
 ) -> BTreeMap<String, ModelId> {
-    let mut labels = BTreeMap::new();
-    for model in models {
-        let provider = provider_names
-            .and_then(|names| names.get(model))
-            .map(String::as_str)
-            .unwrap_or("Provider");
-        let short = model.as_str().to_owned();
-        let label = if labels.contains_key(&short) {
-            format!("{provider} · {short}")
-        } else {
-            short
-        };
-        labels.insert(label, model.clone());
-    }
-    labels
+    models
+        .iter()
+        .map(|model| (model_choice_label(model, provider_names), model.clone()))
+        .collect()
 }
 
 /// Opens a URL in a new tab/window. Natively this shells out to the OS's
