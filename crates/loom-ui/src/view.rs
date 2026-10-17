@@ -554,6 +554,8 @@ pub(crate) struct LoomView {
     /// Sources reported per session while its lookup is in flight, and the set
     /// of sessions already asked about, so a project is only looked up once.
     session_source_lookups: BTreeMap<AgentSessionId, (Option<String>, Option<String>)>,
+    /// Serializes background source discovery across render-triggered refreshes.
+    session_source_request_in_flight: bool,
     /// Last session-list error per worker node, so a worker that failed to load
     /// is distinguishable from one that simply has no projects.
     node_session_load_errors: BTreeMap<String, String>,
@@ -1722,6 +1724,7 @@ impl LoomView {
             project_list_active: None,
             session_sources: BTreeMap::new(),
             session_source_lookups: BTreeMap::new(),
+            session_source_request_in_flight: false,
             node_session_load_errors: BTreeMap::new(),
             active_session: active_session.clone(),
             active_run: None,
