@@ -23,6 +23,7 @@ mod event_resync_tests;
 mod github_sign_in_tests;
 mod lifecycle_source_action_tests;
 mod local_source_path_tests;
+mod loom_mark_tests;
 mod loom_view_render_tests;
 mod new_project_pane_tests;
 mod policy_decision_tests;

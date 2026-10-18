@@ -1249,6 +1249,53 @@ fn settings_provider_views_and_theme_actions_update_the_view_state(cx: &mut Test
         .unwrap();
 }
 
+/// The working indicator is the Loom mark rather than a generic spinner: it
+/// paints while work is in flight, keeps the 14px box the spinner used so the
+/// status line does not change height, and disappears once nothing is running.
+#[gpui_kit::test]
+fn run_status_paints_the_loom_mark_only_while_work_is_in_flight(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.run_state = Some(loom_protocol::AgentRunState::Executing);
+        view
+    });
+    cx.update_window(handle.into(), |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        window.render_frame(cx);
+        let mark = window.find("loom-mark").bounds();
+        assert_eq!(mark.size.width, px(14.));
+        assert_eq!(mark.size.height, px(14.));
+
+        // A finished run keeps the status line but shows no mark.
+        view.update(cx, |view, _| {
+            view.run_state = Some(loom_protocol::AgentRunState::Completed)
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("loom-mark").is_none());
+    })
+    .unwrap();
+}
+
+/// Sending a message has no run state to report yet, so the mark carries the
+/// waiting state on its own there.
+#[gpui_kit::test]
+fn run_status_paints_the_loom_mark_while_sending(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.sending_message = true;
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("loom-mark").bounds().size.width, px(14.));
+    })
+    .unwrap();
+}
+
 #[gpui_kit::test]
 fn parked_runs_keep_polling_until_terminal(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);

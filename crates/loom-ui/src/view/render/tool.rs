@@ -923,8 +923,9 @@ impl LoomView {
         timeline_view
     }
 
-    /// The single line that carries run progress: spinner, state, elapsed, and
-    /// the interrupt hint. Run state lives here instead of the session header.
+    /// The single line that carries run progress: the Loom mark, state,
+    /// elapsed, and the interrupt hint. Run state lives here instead of the
+    /// session header.
     pub(crate) fn render_run_status(&self) -> gpui_kit::Div {
         let running = self.run_is_active();
         let mut row = div()
@@ -939,7 +940,7 @@ impl LoomView {
                 .run_state
                 .map(run_state_color)
                 .unwrap_or_else(|| rgb(0x93c5fd));
-            row = row.child(Spinner::new().small().color(color.into()));
+            row = row.child(loom_mark(color));
         }
         if let Some(state) = self.run_state {
             let label = if self.project_has_live_children() && !self.run_is_active() {

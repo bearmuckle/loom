@@ -21,7 +21,6 @@ use gpui_kit::component::input::{
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::scroll::ScrollableElement;
-use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{
     Icon, IconName, IndexPath, Sizable,
     badge::Badge,
@@ -346,6 +345,7 @@ use loom_local::{
     PeerCredentialStore, RemoteConnectionOptions, UiOptions, backend_persistence_path,
     prepare_workspace,
 };
+use mark::loom_mark;
 
 /// The native remote transport settings implied by the launcher options: the
 /// additional CA to trust for `wss://`, and whether plaintext `ws://` beyond
@@ -2069,6 +2069,7 @@ mod composer;
 mod connectivity;
 mod helpers;
 mod lifecycle;
+mod mark;
 mod project;
 mod providers;
 mod render;
