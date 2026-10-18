@@ -404,7 +404,7 @@ pub(crate) enum GitHubLoginState {
     Error(String),
 }
 
-/// Which GitHub credential the active device-login flow is acquiring.
+/// Which GitHub device-login flow is acquiring what.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GitHubLoginKind {
     /// Copilot model access, obtained from the Copilot app.
@@ -412,6 +412,9 @@ pub(crate) enum GitHubLoginKind {
     /// Repository access for clone, push, and pull requests, obtained from the
     /// GitHub CLI OAuth app.
     Repository,
+    /// This client's own identity on the connected worker: the person is bound
+    /// to the connection instead of a credential being stored.
+    Identity,
 }
 
 impl GitHubLoginKind {
@@ -425,6 +428,17 @@ impl GitHubLoginKind {
             Self::Repository => {
                 "GitHub repository sign-in requires a secure worker connection (wss:// or loopback ws://)."
             }
+            Self::Identity => {
+                "Signing in requires a secure worker connection (wss:// or loopback ws://)."
+            }
+        }
+    }
+
+    /// The pane heading for this kind of flow.
+    pub(crate) fn pane_title(self) -> &'static str {
+        match self {
+            Self::Identity => "Sign in to this worker",
+            Self::Copilot | Self::Repository => "Connect GitHub account",
         }
     }
 }

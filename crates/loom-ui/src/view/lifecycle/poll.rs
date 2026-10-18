@@ -407,32 +407,29 @@ impl LoomView {
                         let credentials = PeerCredentialStore::new();
                         let token = match credentials.get(workspace_id, &candidate_url) {
                             Ok(Some(token)) => token,
-                            Ok(None) => {
-                                return Err((
-                                    WorkerConnectionStage::CredentialRead,
-                                    LoomError::new(
-                                        ErrorCode::AuthenticationRequired,
-                                        "no saved worker credential was found",
-                                        false,
-                                    ),
-                                    false,
-                                ));
-                            }
+                            // No saved credential means this node was connected
+                            // unsigned; reconnect it the same way so it can
+                            // offer a GitHub sign-in again instead of failing.
+                            Ok(None) => String::new(),
                             Err(error) => {
                                 return Err((WorkerConnectionStage::CredentialRead, error, false));
                             }
                         };
+                        let unsigned = token.is_empty();
                         let connection =
                             ClientConnection::remote(candidate_url.clone(), token, &remote_options)
                                 .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
-                        if let Err(error) = negotiate(&connection).map(|_| ()) {
-                            let cleanup_failed = connection.close().is_err();
-                            return Err((
-                                WorkerConnectionStage::Negotiation,
-                                error,
-                                cleanup_failed,
-                            ));
-                        }
+                        let negotiation = match negotiate(&connection) {
+                            Ok(negotiation) => negotiation,
+                            Err(error) => {
+                                let cleanup_failed = connection.close().is_err();
+                                return Err((
+                                    WorkerConnectionStage::Negotiation,
+                                    error,
+                                    cleanup_failed,
+                                ));
+                            }
+                        };
                         let status = match worker_node_status(&connection) {
                             Ok(status) => status,
                             Err(error) => {
@@ -440,10 +437,18 @@ impl LoomView {
                                 return Err((WorkerConnectionStage::Status, error, cleanup_failed));
                             }
                         };
+                        let pre_login = unsigned
+                            && current_participant(&connection)
+                                .map(|participant| participant.is_none())
+                                .unwrap_or(false);
                         Ok::<_, (WorkerConnectionStage, LoomError, bool)>((
                             connection,
                             status,
                             candidate_url,
+                            pre_login,
+                            negotiation
+                                .capabilities
+                                .contains(loom_core::Capability::GitHubSignIn),
                         ))
                     })
                     .await;
@@ -455,7 +460,17 @@ impl LoomView {
                             && node.connection.is_none()
                     });
                     match result {
-                        Ok((connection, status, connected_url)) if is_pending => {
+                        Ok((connection, status, connected_url, pre_login, offers_sign_in))
+                            if is_pending =>
+                        {
+                            view.github_sign_in_available |= offers_sign_in;
+                            // Marked before the node is attached, because
+                            // attaching reloads every connected worker's
+                            // sessions and a pre-login connection is refused
+                            // that read.
+                            if pre_login {
+                                view.mark_node_pre_login(status.node_id.clone());
+                            }
                             view.attach_reconnected_worker_node(
                                 id,
                                 &connected_url,
@@ -464,7 +479,7 @@ impl LoomView {
                                 cx,
                             );
                         }
-                        Ok((connection, _, _)) => {
+                        Ok((connection, _, _, _, _)) => {
                             cx.spawn(async move |view, cx| {
                                 let result =
                                     cx.background_spawn(async move { connection.close() })                                    .await;

@@ -88,15 +88,15 @@ use crate::{
 
 #[cfg(not(target_family = "wasm"))]
 use crate::connection::{
-    attach_session_repository, create_session_in_workspace, create_workspace,
+    attach_session_repository, create_session_in_workspace, create_workspace, current_participant,
     list_models_from_backend, list_workspace_sessions, list_workspaces, redact_secret,
     unexpected_response,
 };
 #[cfg(target_family = "wasm")]
 use crate::connection::{
     attach_session_repository_async, create_session_in_workspace_async, create_workspace_async,
-    list_models_from_backend, list_workspace_sessions_async, list_workspaces_async,
-    probe_worker_connection,
+    current_participant_async, list_models_from_backend, list_workspace_sessions_async,
+    list_workspaces_async, probe_worker_connection,
 };
 #[cfg(target_family = "wasm")]
 use crate::connection::{redact_secret, unexpected_response};
@@ -670,6 +670,20 @@ pub(crate) struct LoomView {
     /// Multi-user identity, roster, composer recipient, run revision, and
     /// credential state for the active session.
     pub(crate) collaboration: crate::collaboration::CollaborationState,
+    /// Worker nodes whose transport was opened without an operator token, so a
+    /// fresh connection to them is pre-login and may only sign in with GitHub.
+    pub(crate) unsigned_nodes: BTreeSet<String>,
+    /// Worker nodes known to await a GitHub sign-in: the connection is bound to
+    /// no person and the worker refuses everything but signing in. A signed-in
+    /// node leaves this set while staying in `unsigned_nodes`, so signing out
+    /// returns it to the sign-in prompt.
+    pub(crate) awaiting_sign_in_nodes: BTreeSet<String>,
+    /// Whether the connected worker advertises `git_hub_sign_in`, which is what
+    /// lets a person join the roster by signing in.
+    pub(crate) github_sign_in_available: bool,
+    /// The node the GitHub sign-in pane is signing in to, remembered from the
+    /// control that opened it so a device flow targets one worker.
+    pub(crate) github_login_node_id: Option<String>,
     composer_input: Option<Entity<TextareaState>>,
     composer_placeholder: Option<String>,
     composer_completion: Option<ComposerCompletion>,
@@ -1886,6 +1900,10 @@ impl LoomView {
             pending_approval: None,
             pending_input: None,
             collaboration: crate::collaboration::CollaborationState::default(),
+            unsigned_nodes: BTreeSet::new(),
+            awaiting_sign_in_nodes: BTreeSet::new(),
+            github_sign_in_available: false,
+            github_login_node_id: None,
             composer_input: None,
             composer_placeholder: None,
             composer_completion: None,

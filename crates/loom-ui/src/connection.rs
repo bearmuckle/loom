@@ -15,17 +15,17 @@ use std::time::Duration;
 #[cfg(target_family = "wasm")]
 use futures_channel::oneshot;
 use loom_core::{
-    AgentSessionSnapshot, Capability, CapabilitySet, ErrorCode, LoomError, WorkspaceId,
-    WorkspaceRecord,
+    AgentSessionSnapshot, Capability, CapabilitySet, ErrorCode, LoomError, ParticipantIdentity,
+    WorkspaceId, WorkspaceRecord,
 };
 use loom_model::{ModelId, ProviderId, ProviderSummary};
 #[cfg(not(target_family = "wasm"))]
 use loom_protocol::AgentRunSnapshot;
 use loom_protocol::{
-    CURRENT_PROTOCOL_VERSION, ClientRequest, ControlRequest, ControlResponse, NegotiationResult,
-    ProviderRequest, ProviderResponse, RepositoryRequest, RepositoryResponse, RequestEnvelope,
-    ResponseEnvelope, ServerResponse, SessionRepository, SessionResponse, WorkerNodeStatus,
-    WorkspaceConfig, WorkspaceRequest, WorkspaceResponse,
+    AccessRequest, AccessResponse, CURRENT_PROTOCOL_VERSION, ClientRequest, ControlRequest,
+    ControlResponse, NegotiationResult, ProviderRequest, ProviderResponse, RepositoryRequest,
+    RepositoryResponse, RequestEnvelope, ResponseEnvelope, ServerResponse, SessionRepository,
+    SessionResponse, WorkerNodeStatus, WorkspaceConfig, WorkspaceRequest, WorkspaceResponse,
 };
 #[cfg(not(target_family = "wasm"))]
 use loom_protocol::{RunRequest, RunResponse};
@@ -99,6 +99,30 @@ fn native_transport_tls_supported() -> bool {
 #[cfg(target_family = "wasm")]
 fn native_transport_tls_supported() -> bool {
     true
+}
+
+/// Prefix for the bearer token subprotocol. A browser `WebSocket` cannot set an
+/// `Authorization` header during the handshake, so the token travels in
+/// `Sec-WebSocket-Protocol` instead of the URL.
+///
+/// Native builds carry it only so the handshake rule is tested once for both
+/// transports.
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+pub(crate) const BEARER_SUBPROTOCOL_PREFIX: &str = "loom.bearer.";
+
+/// The subprotocols a browser handshake offers for `token`.
+///
+/// An empty token offers none at all: the upgrade then carries no credential
+/// and the worker accepts it as a pre-login connection that may sign in with
+/// GitHub. Offering an empty `loom.bearer.` protocol instead would read as a
+/// failed credential.
+#[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+pub(crate) fn browser_subprotocols(token: &str) -> Vec<String> {
+    if token.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!("{BEARER_SUBPROTOCOL_PREFIX}{token}")]
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -372,6 +396,46 @@ pub(crate) fn negotiation_capabilities() -> CapabilitySet {
             .copied()
             .chain(transport_specific),
     )
+}
+
+/// The identity the worker bound to this connection.
+///
+/// `None` means no person is bound: an operator token keeps its unrestricted
+/// authority without a person, and a connection accepted without a credential
+/// is still pre-login. The caller tells those apart by whether it sent a
+/// token, and treats only the second as waiting for a GitHub sign-in.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn current_participant(
+    connection: &ClientConnection,
+) -> Result<Option<ParticipantIdentity>, LoomError> {
+    let response = connection.request_with_timeout(
+        RequestEnvelope::new(ClientRequest::Access(AccessRequest::GetCurrentParticipant)),
+        Duration::from_secs(15),
+    );
+    match response.result? {
+        ServerResponse::Access(AccessResponse::CurrentParticipant { participant }) => {
+            Ok(participant)
+        }
+        response => Err(unexpected_response("current participant", response)),
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) async fn current_participant_async(
+    connection: &ClientConnection,
+) -> Result<Option<ParticipantIdentity>, LoomError> {
+    let response = request_with_timeout(
+        connection,
+        RequestEnvelope::new(ClientRequest::Access(AccessRequest::GetCurrentParticipant)),
+        BROWSER_REQUEST_TIMEOUT_MILLIS,
+    )
+    .await?;
+    match response.result? {
+        ServerResponse::Access(AccessResponse::CurrentParticipant { participant }) => {
+            Ok(participant)
+        }
+        response => Err(unexpected_response("current participant", response)),
+    }
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -994,7 +1058,7 @@ pub(crate) fn unexpected_response(operation: &str, response: ServerResponse) -> 
 mod tests {
     use super::{
         ClientConnection, ClientRequest, LoomError, NATIVE_ONLY_NEGOTIATION_CAPABILITIES,
-        RequestEnvelope, SHARED_NEGOTIATION_CAPABILITIES, WorkspaceRequest,
+        RequestEnvelope, SHARED_NEGOTIATION_CAPABILITIES, WorkspaceRequest, browser_subprotocols,
         create_session_in_workspace, create_workspace, describe_startup_connection_error,
         include_discovered_models, list_models, list_workspace_sessions, list_workspaces,
         negotiate, negotiation_capabilities, provider_name_for_id, redact_secret,
@@ -1063,6 +1127,15 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(unique.len(), SHARED_NEGOTIATION_CAPABILITIES.len());
         assert_eq!(unique.len(), wasm.iter().count());
+    }
+
+    #[test]
+    fn an_empty_token_offers_no_bearer_subprotocol() {
+        assert!(browser_subprotocols("").is_empty());
+        assert_eq!(
+            browser_subprotocols("browser-secret"),
+            vec!["loom.bearer.browser-secret".to_owned()]
+        );
     }
 
     #[test]

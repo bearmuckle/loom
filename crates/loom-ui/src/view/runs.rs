@@ -158,7 +158,7 @@ impl LoomView {
     }
 
     pub(crate) fn approve_pending_action(&mut self, cx: &mut Context<Self>) {
-        if !self.collaboration.permissions().can_act {
+        if !self.session_permissions().can_act {
             return;
         }
         if self.approval_request_in_flight {
@@ -189,7 +189,7 @@ impl LoomView {
     }
 
     pub(crate) fn reject_pending_action(&mut self, cx: &mut Context<Self>) {
-        if !self.collaboration.permissions().can_act {
+        if !self.session_permissions().can_act {
             return;
         }
         if self.approval_request_in_flight {
@@ -272,7 +272,7 @@ impl LoomView {
     }
 
     pub(crate) fn interrupt_active_run(&mut self, cx: &mut Context<Self>) {
-        if !self.collaboration.permissions().can_act {
+        if !self.session_permissions().can_act {
             return;
         }
         if self.active_run_id.is_none() {

@@ -152,6 +152,14 @@ impl SessionPermissions {
         can_manage: true,
     };
 
+    /// No control is usable: the connection is not bound to a person yet, so it
+    /// has no role and no grants. It is distinct from an observer, who can read
+    /// the session.
+    pub(crate) const LOCKED: Self = Self {
+        can_act: false,
+        can_manage: false,
+    };
+
     pub(crate) const fn for_role(role: Option<SessionRole>) -> Self {
         match role {
             None => Self::UNRESTRICTED,
@@ -542,6 +550,22 @@ impl CollaborationState {
         self.seen_entries.clear();
         self.request_in_flight = false;
         self.access = AccessRequestsState::default();
+    }
+
+    /// Clears the state a sign-out makes stale.
+    ///
+    /// The connection keeps running (an operator token stays usable), so the
+    /// identity answer is treated as known with no person bound rather than as
+    /// unloaded, and the role-derived permissions collapse to an anonymous
+    /// connection until a person signs in again.
+    pub(crate) fn reset_after_sign_out(&mut self) {
+        self.identity = None;
+        self.reset_session();
+        self.directory.clear();
+        self.credentials.clear();
+        self.restore_draft = None;
+        self.identity_loaded = true;
+        self.support = CollaborationSupport::Supported;
     }
 
     /// Whether the connection may ask for access: a bound person who is an

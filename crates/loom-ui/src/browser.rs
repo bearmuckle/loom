@@ -24,7 +24,9 @@ const SAVED_DEFAULT_MODEL_KEY: &str = "loom.default_model";
 
 /// Configuration read from the page's URL query string.
 ///
-/// Example: `index.html?remote=ws://127.0.0.1:8791/ws&token=demo-token`.
+/// Example: `index.html?remote=ws://127.0.0.1:8791/ws`. The token is optional:
+/// with none the page connects unsigned and offers a GitHub sign-in, and with
+/// one it is an operator connection.
 pub(crate) struct BrowserOptions {
     remote: String,
     token: String,
@@ -128,7 +130,9 @@ impl BrowserOptions {
     }
 
     pub(crate) fn is_configured(&self) -> bool {
-        !self.remote.trim().is_empty() && !self.token.trim().is_empty()
+        // A URL alone is enough: the token is the optional operator credential,
+        // and without one the client signs in with GitHub instead.
+        !self.remote.trim().is_empty()
     }
 
     pub(crate) fn persist_connection(&self) -> Result<(), LoomError> {
@@ -249,11 +253,6 @@ pub(crate) fn browser_storage() -> Result<Storage, LoomError> {
         })
 }
 
-/// Prefix for the bearer token subprotocol. A browser `WebSocket` cannot set an
-/// `Authorization` header during the handshake, so the token travels in
-/// `Sec-WebSocket-Protocol` instead of the URL.
-const BEARER_SUBPROTOCOL_PREFIX: &str = "loom.bearer.";
-
 struct SocketState {
     socket: WebSocket,
     ready: bool,
@@ -292,9 +291,9 @@ pub(crate) struct BrowserConnection {
 impl BrowserConnection {
     pub(crate) fn connect(remote: &str, token: &str) -> Result<Self, LoomError> {
         let protocols = js_sys::Array::new();
-        protocols.push(&JsValue::from_str(&format!(
-            "{BEARER_SUBPROTOCOL_PREFIX}{token}"
-        )));
+        for protocol in crate::connection::browser_subprotocols(token) {
+            protocols.push(&JsValue::from_str(&protocol));
+        }
         let socket = WebSocket::new_with_str_sequence(remote, &protocols).map_err(|_| {
             LoomError::new(
                 ErrorCode::InvalidRequest,

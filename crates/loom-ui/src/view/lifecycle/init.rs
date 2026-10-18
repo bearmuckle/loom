@@ -27,6 +27,9 @@ impl LoomView {
         focus_handle: FocusHandle,
     ) -> Result<Self, LoomError> {
         info!("bootstrapping backend connection");
+        // A remote worker without a token is an unsigned connection: it is
+        // accepted as pre-login and signs in with GitHub instead.
+        let mut unsigned = false;
         let (connection, workspace_root, owned_backend) = if let Some(remote_url) = &options.remote
         {
             info!("connecting to remote backend");
@@ -35,12 +38,11 @@ impl LoomView {
                     "remote URL must not contain credentials; provide the access token separately",
                 ));
             }
-            let token = options.token.as_deref().ok_or_else(|| {
-                LoomError::invalid_request("remote connections require LOOM_TOKEN to be set")
-            })?;
+            let token = options.token.clone().unwrap_or_default();
+            unsigned = token.trim().is_empty();
             let connection = ClientConnection::remote(
                 remote_url.clone(),
-                token.to_owned(),
+                token,
                 &remote_connection_options(options),
             )?;
             let workspace_root = options
@@ -72,21 +74,51 @@ impl LoomView {
                 Some(crate::local_backend::OwnedBackend::managed(worker)),
             )
         };
-        let remote_cleanup_guard = Some(ConnectionCleanupGuard::new(connection.clone()));
+        let mut remote_cleanup_guard = Some(ConnectionCleanupGuard::new(connection.clone()));
         info!("worker transport connected; negotiating protocol");
-        let server_protocol_version = Some(negotiate(&connection)?.protocol_version);
+        let negotiation = negotiate(&connection)?;
+        let server_protocol_version = Some(negotiation.protocol_version);
         let backend_endpoint = options.remote.clone();
-        let mut view = Self::initialize_from_connection(
-            options,
-            connection,
-            workspace_root,
-            false,
-            remote_cleanup_guard,
-            focus_handle,
-            true,
-            server_protocol_version,
-            backend_endpoint,
-        )?;
+        let remote_options = remote_connection_options(options);
+        let pre_login = unsigned && current_participant(&connection)?.is_none();
+        let mut view = if pre_login {
+            info!(
+                "worker accepted the connection without a credential; waiting for a GitHub \
+                 sign-in"
+            );
+            Self::new_pre_login(
+                connection.clone(),
+                worker_node_status(&connection)?,
+                WorkspaceConfig::default(),
+                server_protocol_version,
+                backend_endpoint,
+                negotiation
+                    .capabilities
+                    .contains(loom_core::Capability::GitHubSignIn),
+                options.remote.is_none(),
+                false,
+                focus_handle,
+            )
+        } else {
+            Self::initialize_from_connection(
+                options,
+                connection,
+                workspace_root,
+                false,
+                remote_cleanup_guard.take(),
+                focus_handle,
+                true,
+                server_protocol_version,
+                backend_endpoint,
+            )?
+        };
+        if let Some(guard) = &mut remote_cleanup_guard {
+            guard.disarm();
+        }
+        view.remote_options = remote_options;
+        view.github_sign_in_available = negotiation
+            .capabilities
+            .contains(loom_core::Capability::GitHubSignIn);
         view.owned_backend = owned_backend;
         Ok(view)
     }
@@ -225,6 +257,10 @@ impl LoomView {
             workspaces,
             node_workspaces: BTreeMap::new(),
             local_directory_sources_available: options.remote.is_none(),
+            unsigned_nodes: BTreeSet::new(),
+            awaiting_sign_in_nodes: BTreeSet::new(),
+            github_sign_in_available: false,
+            github_login_node_id: None,
             local_current_directory: (options.remote.is_none()
                 && !demo_workspace
                 && !workspace_root.as_os_str().is_empty())
@@ -430,6 +466,10 @@ impl LoomView {
 
         Self {
             connected: demo_mode,
+            unsigned_nodes: BTreeSet::new(),
+            awaiting_sign_in_nodes: BTreeSet::new(),
+            github_sign_in_available: false,
+            github_login_node_id: None,
             browser_demo_mode: demo_mode,
             backend,
             connection,
@@ -630,6 +670,236 @@ impl LoomView {
         }
     }
 
+    /// Builds the view for a worker that accepted the connection without a
+    /// credential.
+    ///
+    /// Such a connection is pre-login: the worker refuses the workspace,
+    /// session, provider, and collaboration reads until a person signs in, so
+    /// the view starts with no workspace state and shows the sign-in prompt in
+    /// place of the composer. Signing in then runs the same load path a
+    /// successful connect uses.
+    #[allow(clippy::too_many_arguments)]
+    fn new_pre_login(
+        connection: ClientConnection,
+        node_status: WorkerNodeStatus,
+        workspace_config: WorkspaceConfig,
+        server_protocol_version: Option<ProtocolVersion>,
+        backend_endpoint: Option<String>,
+        github_sign_in_available: bool,
+        local_directory_sources_available: bool,
+        browser_client: bool,
+        focus_handle: FocusHandle,
+    ) -> Self {
+        let default_backend_node_id = node_status.node_id.clone();
+        let worker_nodes = initial_worker_nodes(
+            node_status,
+            connection.clone(),
+            &workspace_config,
+            backend_endpoint.as_deref(),
+        );
+        let backend = BackendWorker::spawn(connection.clone());
+        let node_backends = BTreeMap::from([(default_backend_node_id.clone(), backend.clone())]);
+        let node_names = worker_nodes
+            .iter()
+            .map(|node| (node.status.node_id.clone(), worker_node_display_name(node)))
+            .collect();
+        let workspace_id = WorkspaceId::new();
+        let active_session = empty_session_snapshot(workspace_id);
+        let model = ModelId::new("default");
+        let preferences = UiPreferences::load();
+        let mut unsigned_nodes = BTreeSet::new();
+        unsigned_nodes.insert(default_backend_node_id.clone());
+        let mut awaiting_sign_in_nodes = BTreeSet::new();
+        awaiting_sign_in_nodes.insert(default_backend_node_id.clone());
+        let mut collaboration = crate::collaboration::CollaborationState::default();
+        // The identity answer is known to be "no person": the worker accepted
+        // the upgrade without a credential and refuses everything else.
+        collaboration.identity_loaded = true;
+        collaboration.support = crate::collaboration::CollaborationSupport::Supported;
+        Self {
+            #[cfg(target_family = "wasm")]
+            connected: true,
+            #[cfg(target_family = "wasm")]
+            browser_demo_mode: false,
+            connection: connection.clone(),
+            #[cfg(not(target_family = "wasm"))]
+            owned_backend: None,
+            server_protocol_version,
+            backend_endpoint,
+            #[cfg(not(target_family = "wasm"))]
+            remote_options: RemoteConnectionOptions::default(),
+            browser_client,
+            backend,
+            default_backend_node_id: default_backend_node_id.clone(),
+            node_backends,
+            node_names,
+            session_node_ids: BTreeMap::new(),
+            workspace_id,
+            workspaces: Vec::new(),
+            node_workspaces: BTreeMap::new(),
+            local_directory_sources_available,
+            local_current_directory: None,
+            sessions: Vec::new(),
+            project_snapshot: None,
+            project_tree_snapshots: Vec::new(),
+            project_child_review: None,
+            project_snapshot_stale: false,
+            project_snapshot_refreshing: None,
+            missing_project_snapshots_refreshing: false,
+            project_feed_after_sequence: None,
+            project_feed_epoch: None,
+            project_poll_scheduled: false,
+            project_list: None,
+            project_list_subscription: None,
+            project_list_view: None,
+            project_list_active: None,
+            session_sources: BTreeMap::new(),
+            session_source_lookups: BTreeMap::new(),
+            session_source_request_in_flight: false,
+            node_session_load_errors: BTreeMap::new(),
+            active_session: active_session.clone(),
+            active_run: None,
+            active_run_id: None,
+            context_inspection: None,
+            default_model: model.clone(),
+            session_models: BTreeMap::new(),
+            auto_approve_actions: true,
+            session_auto_approve_actions: BTreeMap::new(),
+            ask_before_destructive_actions: false,
+            session_ask_before_destructive_actions: BTreeMap::new(),
+            session_task_cache: BTreeMap::new(),
+            optimistic_messages: Vec::new(),
+            sending_message: false,
+            status_banner: None,
+            reconnecting: None,
+            connectivity_attempt_in_flight: false,
+            status_details_open: false,
+            model: model.clone(),
+            models: vec![model.clone()],
+            default_models: vec![model.clone()],
+            node_model_catalogs: BTreeMap::from([(default_backend_node_id.clone(), vec![model])]),
+            node_model_provider_names: BTreeMap::new(),
+            model_catalog_node_id: Some(default_backend_node_id.clone()),
+            model_refreshes_in_flight: BTreeSet::new(),
+            model_catalog_refreshed_at: BTreeMap::new(),
+            model_select: None,
+            default_model_select: None,
+            model_select_subscription: None,
+            default_model_select_subscription: None,
+            model_select_items: Vec::new(),
+            default_model_select_items: Vec::new(),
+            model_select_value: None,
+            default_model_select_value: None,
+            model_select_choices: BTreeMap::new(),
+            default_model_select_choices: BTreeMap::new(),
+            covering_surface: None,
+            providers: Vec::new(),
+            providers_node_id: None,
+            provider_api_key_inputs: BTreeMap::new(),
+            provider_setup_status: BTreeMap::new(),
+            theme_choice: preferences.theme_choice,
+            font_scale_percent: preferences.font_scale_percent,
+            show_reasoning: preferences.show_reasoning,
+            output_detail: preferences.output_detail,
+            appearance_subscription: None,
+            shortcut_interceptor: None,
+            after_sequence: None,
+            event_stream_epoch: None,
+            timeline: Vec::new(),
+            transcript_before_ordinal: None,
+            transcript_loaded_ordinals: BTreeSet::new(),
+            transcript_messages: BTreeMap::new(),
+            transcript_has_older: false,
+            transcript_loading: false,
+            transcript_generation: 0,
+            transcript_prepend_count: 0,
+            timeline_view: None,
+            plan: None,
+            plan_collapsed: false,
+            activity_records: BTreeMap::new(),
+            expanded_tools: BTreeMap::new(),
+            expanded_tool_groups: BTreeMap::new(),
+            expanded_tool_usage: BTreeMap::new(),
+            expanded_reasoning: BTreeMap::new(),
+            approval_request_in_flight: false,
+            approval_settings_request_in_flight: false,
+            archive_request_in_flight: false,
+            archived_sessions: ArchivedSessionsState::default(),
+            pending_approval: None,
+            pending_input: None,
+            collaboration,
+            unsigned_nodes,
+            awaiting_sign_in_nodes,
+            github_sign_in_available,
+            github_login_node_id: None,
+            composer_input: None,
+            composer_placeholder: None,
+            composer_completion: None,
+            pending_completion_accept: false,
+            suppress_completion_once: false,
+            command_palette_open: false,
+            command_palette_input: None,
+            command_palette_selection: 0,
+            session_filter_input: None,
+            review_filter_input: None,
+            input_subscriptions: Vec::new(),
+            clear_composer_on_render: false,
+            clear_node_on_render: false,
+            access_note_input: None,
+            access_deny_inputs: BTreeMap::new(),
+            clear_access_note: false,
+            clear_access_deny_reason: None,
+            rename_input_state: None,
+            source_path_input: None,
+            repository_filter_input: None,
+            cloned_repositories: Vec::new(),
+            cloned_repositories_loading: false,
+            repository_search_generation: 0,
+            repository_search_query: String::new(),
+            pending_source_path: None,
+            composer_focus_handle: focus_handle,
+            session_state: active_session.state,
+            run_state: None,
+            review: ReviewState::default(),
+            session_repositories: Vec::new(),
+            session_directories: Vec::new(),
+            selected_repository_id: None,
+            session_drawer_open: false,
+            rename_dialog: None,
+            project_delete_dialog: None,
+            source_dialog: None,
+            #[cfg(target_family = "wasm")]
+            welcome_dialog_dismissed: false,
+            demo_workspace: false,
+            login_enabled: true,
+            github_connected: false,
+            github_repository_connected: false,
+            github_write_access: false,
+            github_login: None,
+            github_login_kind: GitHubLoginKind::Copilot,
+            next_worker_node_id: worker_nodes.len() as u64,
+            worker_nodes,
+            worker_node_polls_scheduled: BTreeSet::new(),
+            workspace_config,
+            node_input_initial: String::new(),
+            node_input_state: None,
+            run_poll_scheduled: false,
+            #[cfg(target_family = "wasm")]
+            browser_workspace: None,
+            #[cfg(target_family = "wasm")]
+            browser_model: None,
+            #[cfg(target_family = "wasm")]
+            browser_window_initialized: false,
+            #[cfg(target_family = "wasm")]
+            visibility_subscription: None,
+            #[cfg(target_family = "wasm")]
+            browser_resume_in_flight: false,
+            browser_startup_error: None,
+            browser_starting: false,
+            browser_connection_lost: None,
+        }
+    }
+
     /// Builds the view for the browser client: connects to a remote backend
     /// over the in-page WebSocket transport and resolves the same project /
     /// session / model state that native's remote-mode bootstrap resolves,
@@ -656,6 +926,31 @@ impl LoomView {
         let mut cleanup_guard = ConnectionCleanupGuard::new(connection.clone());
         let negotiation = negotiate_async(&connection).await?;
         let node_status = worker_node_status_async(&connection).await?;
+        let github_sign_in_available = negotiation
+            .capabilities
+            .contains(loom_core::Capability::GitHubSignIn);
+        // A page that names a worker but no token connects unsigned: the worker
+        // accepts it as pre-login, so there is no workspace to load until the
+        // person signs in.
+        let unsigned = options.token().trim().is_empty();
+        let pre_login = unsigned && current_participant_async(&connection).await?.is_none();
+        if pre_login {
+            if let Err(error) = options.persist_connection() {
+                log::warn!("[loom-ui] could not save the bootstrap worker config: {error}");
+            }
+            cleanup_guard.disarm();
+            return Ok(Self::new_pre_login(
+                connection,
+                node_status,
+                WorkspaceConfig::default(),
+                Some(negotiation.protocol_version),
+                (!options.remote().is_empty()).then(|| options.remote().to_owned()),
+                github_sign_in_available,
+                false,
+                true,
+                focus_handle,
+            ));
+        }
         let default_backend_node_id = node_status.node_id.clone();
         let mut workspaces = list_workspaces_async(&connection).await?;
         let workspace = match active_workspace(&workspaces) {
@@ -760,6 +1055,10 @@ impl LoomView {
         let preferences = UiPreferences::load();
         let view = Self {
             connected: true,
+            unsigned_nodes: BTreeSet::new(),
+            awaiting_sign_in_nodes: BTreeSet::new(),
+            github_sign_in_available,
+            github_login_node_id: None,
             browser_demo_mode: false,
             backend,
             connection: connection.clone(),
@@ -1053,7 +1352,7 @@ impl LoomView {
             .to_owned();
         let mut parts = value.split_whitespace();
         let Some(url) = parts.next() else {
-            self.record_status("Enter a node URL followed by its access token");
+            self.record_status("Enter a worker URL, optionally followed by its access token");
             cx.notify();
             return;
         };
@@ -1076,19 +1375,10 @@ impl LoomView {
             cx.notify();
             return;
         }
-        let Some(token) = parts.next().map(str::to_owned) else {
-            self.set_worker_node_connection_failure(
-                id,
-                &url,
-                worker_connection_failure_detail(
-                    WorkerConnectionStage::InputValidation,
-                    &LoomError::invalid_request("missing access token"),
-                    None,
-                ),
-            );
-            cx.notify();
-            return;
-        };
+        // The token is optional: without one the client connects unsigned and
+        // signs in with GitHub, and with one it is an operator connection that
+        // works exactly as before.
+        let token = parts.next().map(str::to_owned).unwrap_or_default();
         let workspace_id = self.workspace_id;
         let remote_options = self.remote_options.clone();
         let submitted_value = value;
@@ -1098,17 +1388,24 @@ impl LoomView {
         cx.spawn(async move |view, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let connection =
-                        ClientConnection::remote(connect_url, token.clone(), &remote_options)
-                        .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
-                    if let Err(error) = negotiate(&connection).map(|_| ()) {
-                        let cleanup_failed = connection.close().is_err();
-                        return Err((
-                            WorkerConnectionStage::Negotiation,
-                            error,
-                            cleanup_failed,
-                        ));
-                    }
+                    let unsigned = token.trim().is_empty();
+                    let connection = ClientConnection::remote(
+                        connect_url,
+                        token.clone(),
+                        &remote_options,
+                    )
+                    .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
+                    let negotiation = match negotiate(&connection) {
+                        Ok(negotiation) => negotiation,
+                        Err(error) => {
+                            let cleanup_failed = connection.close().is_err();
+                            return Err((
+                                WorkerConnectionStage::Negotiation,
+                                error,
+                                cleanup_failed,
+                            ));
+                        }
+                    };
                     let status = match worker_node_status(&connection) {
                         Ok(status) => status,
                         Err(error) => {
@@ -1120,21 +1417,35 @@ impl LoomView {
                             ));
                         }
                     };
-                    let credential_detail = PeerCredentialStore::new()
-                        .set(workspace_id, &node_url, &token)
-                        .err()
-                        .map(|error| {
-                            worker_connection_failure_detail(
-                                WorkerConnectionStage::CredentialSave,
-                                &error,
-                                Some(&token),
-                            )
-                        });
+                    // A worker that accepted the upgrade without a credential
+                    // is pre-login: it reports no person and refuses the rest
+                    // until someone signs in.
+                    let pre_login = unsigned
+                        && current_participant(&connection)
+                            .map(|participant| participant.is_none())
+                            .unwrap_or(false);
+                    let credentials = PeerCredentialStore::new();
+                    let credential_result = if token.is_empty() {
+                        credentials.delete(workspace_id, &node_url)
+                    } else {
+                        credentials.set(workspace_id, &node_url, &token)
+                    };
+                    let credential_detail = credential_result.err().map(|error| {
+                        worker_connection_failure_detail(
+                            WorkerConnectionStage::CredentialSave,
+                            &error,
+                            Some(&token),
+                        )
+                    });
                     Ok::<_, (WorkerConnectionStage, LoomError, bool)>((
                         connection,
                         status,
                         node_url,
                         credential_detail,
+                        pre_login,
+                        negotiation
+                            .capabilities
+                            .contains(loom_core::Capability::GitHubSignIn),
                     ))
                 })
                 .await;
@@ -1146,7 +1457,21 @@ impl LoomView {
                         && node.connection_state == WorkerConnectionState::Connecting
                 });
                 match result {
-                    Ok((connection, status, connected_url, credential_detail)) if is_pending => {
+                    Ok((
+                        connection,
+                        status,
+                        connected_url,
+                        credential_detail,
+                        pre_login,
+                        offers_sign_in,
+                    )) if is_pending => {
+                        view.github_sign_in_available |= offers_sign_in;
+                        // Marked before the node is added, because adding it
+                        // reloads every connected worker's sessions and a
+                        // pre-login connection is refused that read.
+                        if pre_login {
+                            view.mark_node_pre_login(status.node_id.clone());
+                        }
                         view.add_worker_node(
                             connection,
                             status,
@@ -1162,7 +1487,7 @@ impl LoomView {
                             view.clear_node_on_render = true;
                         }
                     }
-                    Ok((connection, _, _, _)) => {
+                    Ok((connection, _, _, _, _, _)) => {
                         if let Err(error) = connection.close() {
                             view.record_status(format!(
                                 "A completed worker connection was discarded, but the transport could not be closed: {}",
@@ -1207,7 +1532,7 @@ impl LoomView {
         self.browser_starting = false;
         let mut parts = value.split_whitespace();
         let Some(url) = parts.next() else {
-            self.record_status("Enter a node URL followed by its access token");
+            self.record_status("Enter a worker URL, optionally followed by its access token");
             cx.notify();
             return;
         };
@@ -1230,19 +1555,9 @@ impl LoomView {
             cx.notify();
             return;
         }
-        let Some(token) = parts.next().map(str::to_owned) else {
-            self.set_worker_node_connection_failure(
-                id,
-                &url,
-                worker_connection_failure_detail(
-                    WorkerConnectionStage::InputValidation,
-                    &LoomError::invalid_request("missing access token"),
-                    None,
-                ),
-            );
-            cx.notify();
-            return;
-        };
+        // Without a token the browser connects unsigned and signs in with
+        // GitHub; with one it is an operator connection as before.
+        let token = parts.next().map(str::to_owned).unwrap_or_default();
         let submitted_value = value;
         if !self.connected {
             self.browser_startup_error = None;
@@ -1254,16 +1569,20 @@ impl LoomView {
         let view = cx.entity();
         cx.spawn(async move |_, cx| {
             let result = async {
+                let unsigned = token.trim().is_empty();
                 let connection = ClientConnection::browser(&url, &token)
                     .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
-                if let Err(error) = negotiate_async(&connection).await.map(|_| ()) {
-                    let cleanup_failed = connection.close().is_err();
-                    return Err((
-                        WorkerConnectionStage::Negotiation,
-                        error,
-                        cleanup_failed,
-                    ));
-                }
+                let negotiation = match negotiate_async(&connection).await {
+                    Ok(negotiation) => negotiation,
+                    Err(error) => {
+                        let cleanup_failed = connection.close().is_err();
+                        return Err((
+                            WorkerConnectionStage::Negotiation,
+                            error,
+                            cleanup_failed,
+                        ));
+                    }
+                };
                 let status = match worker_node_status_async(&connection).await {
                     Ok(status) => status,
                     Err(error) => {
@@ -1275,7 +1594,20 @@ impl LoomView {
                         ));
                     }
                 };
-                Ok::<_, (WorkerConnectionStage, LoomError, bool)>((connection, status, node_url))
+                let pre_login = unsigned
+                    && current_participant_async(&connection)
+                        .await
+                        .map(|participant| participant.is_none())
+                        .unwrap_or(false);
+                Ok::<_, (WorkerConnectionStage, LoomError, bool)>((
+                    connection,
+                    status,
+                    node_url,
+                    pre_login,
+                    negotiation
+                        .capabilities
+                        .contains(loom_core::Capability::GitHubSignIn),
+                ))
             }
             .await;
             view.update(cx, |view, cx| {
@@ -1286,7 +1618,16 @@ impl LoomView {
                         && node.connection_state == WorkerConnectionState::Connecting
                 });
                 match result {
-                    Ok((connection, status, connected_url)) if is_pending => {
+                    Ok((connection, status, connected_url, pre_login, offers_sign_in))
+                        if is_pending =>
+                    {
+                        view.github_sign_in_available |= offers_sign_in;
+                        // Marked before the node is added, because adding it
+                        // reloads every connected worker's sessions and a
+                        // pre-login connection is refused that read.
+                        if pre_login {
+                            view.mark_node_pre_login(status.node_id.clone());
+                        }
                         view.add_worker_node(connection, status, connected_url, None, cx);
                         if view
                             .node_input_state
@@ -1296,7 +1637,7 @@ impl LoomView {
                             view.clear_node_on_render = true;
                         }
                     }
-                    Ok((connection, _, _)) => {
+                    Ok((connection, _, _, _, _)) => {
                         if let Err(error) = connection.close() {
                             view.record_status(format!(
                                 "A completed worker connection was discarded, but the transport could not be closed: {}",
@@ -1529,7 +1870,7 @@ impl LoomView {
             Ok(_) => {
                 self.browser_connection_lost = None;
                 self.open_settings_from_menu(cx);
-                self.record_status("Enter a worker URL and access token to reconnect");
+                self.record_status("Enter a worker URL to reconnect");
                 cx.notify();
                 return;
             }

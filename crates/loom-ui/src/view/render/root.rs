@@ -405,8 +405,9 @@ impl Render for LoomView {
                                                 .truncate()
                                                 .text_xs()
                                                 .text_color(rgb(0x8f98a6))
-                                                .child(
-                                                    self.review
+                                                .child({
+                                                    let mut detail = self
+                                                        .review
                                                         .vcs
                                                         .as_ref()
                                                         .map(|status| {
@@ -433,8 +434,20 @@ impl Render for LoomView {
                                                                 1 => "1 source".to_owned(),
                                                                 count => format!("{count} sources"),
                                                             }
-                                                        }),
-                                                ),
+                                                        });
+                                                    // The person this connection is
+                                                    // signed in as, so the header
+                                                    // says who is acting.
+                                                    if let Some(identity) =
+                                                        &self.collaboration.identity
+                                                    {
+                                                        detail.push_str(&format!(
+                                                            "  ·  signed in as {}",
+                                                            identity.display_name
+                                                        ));
+                                                    }
+                                                    detail
+                                                }),
                                         )
                                     }),
                             ),

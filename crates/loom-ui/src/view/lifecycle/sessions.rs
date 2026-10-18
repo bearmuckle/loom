@@ -67,12 +67,31 @@ impl LoomView {
     /// Each worker is an independent backend with its own workspaces. Listing
     /// only the home workspace id would hide a worker's pre-existing projects,
     /// so every workspace on the node is listed and its sessions merged under
-    /// that node's owner.
+    /// that node's owner. A node waiting for a GitHub sign-in is skipped,
+    /// because the worker refuses its workspace and session reads until a
+    /// person is bound.
     pub(crate) fn reload_sessions(&mut self, cx: &mut Context<Self>) {
+        self.reload_sessions_inner(false, cx);
+    }
+
+    /// Reloads the worker state a pre-login connection was refused and opens a
+    /// session from it.
+    ///
+    /// This is the load path a successful connect uses, so signing in fills the
+    /// same state: workspaces, sessions, project snapshots, and models. The
+    /// pre-login view had no session at all, so the worker's newest one is
+    /// opened once the reload lands.
+    pub(crate) fn reload_after_sign_in(&mut self, _node_id: String, cx: &mut Context<Self>) {
+        self.finish_browser_startup();
+        self.reload_sessions_inner(true, cx);
+    }
+
+    fn reload_sessions_inner(&mut self, open_landing: bool, cx: &mut Context<Self>) {
         let node_backends = self
             .worker_nodes
             .iter()
             .filter(|node| node.connection.is_some() && node.status.online)
+            .filter(|node| !self.awaiting_sign_in_nodes.contains(&node.status.node_id))
             .filter_map(|node| {
                 self.node_backends
                     .get(&node.status.node_id)
@@ -119,6 +138,19 @@ impl LoomView {
                 {
                     view.active_session = active.clone();
                     view.session_state = active.state;
+                }
+                if open_landing
+                    && !view
+                        .sessions
+                        .iter()
+                        .any(|session| session.id == view.active_session.id)
+                    && let Some(newest) = view
+                        .sessions
+                        .iter()
+                        .max_by_key(|session| session.updated_at)
+                        .cloned()
+                {
+                    view.select_session(newest, cx);
                 }
                 view.refresh_missing_project_snapshots(cx);
                 cx.notify();

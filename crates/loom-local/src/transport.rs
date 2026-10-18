@@ -16,7 +16,7 @@ use tokio_tungstenite::{
     Connector, MaybeTlsStream, connect_async_tls_with_config,
     tungstenite::{
         Error as TungsteniteError, Message as ClientMessage, client::IntoClientRequest,
-        http::header::AUTHORIZATION,
+        handshake::client::Request as HandshakeRequest, http::header::AUTHORIZATION,
     },
 };
 
@@ -185,17 +185,22 @@ impl WebSocketTransport {
 
     pub async fn connect(&self) -> Result<WebSocketConnection> {
         if let Some(host) = insecure_remote_host(&self.url) {
+            let credential = if self.bearer_token.is_empty() {
+                "the sign-in exchange"
+            } else {
+                "the worker access token"
+            };
             if !self.allow_insecure_remote {
                 return Err(LoomError::invalid_request(format!(
-                    "refusing to send the worker access token over plaintext ws:// to '{host}'; \
+                    "refusing to send {credential} over plaintext ws:// to '{host}'; \
                      use wss:// with a trusted certificate, connect to a loopback worker, or \
                      pass --allow-insecure-remote to accept an unencrypted connection"
                 )));
             }
             log::warn!(
                 "connecting to '{host}' over plaintext ws:// because insecure remote access was \
-                 explicitly allowed; the worker access token and all protocol traffic are not \
-                 protected in transit"
+                 explicitly allowed; {credential} and all protocol traffic are not protected in \
+                 transit"
             );
         }
         let mut request = self.url.clone().into_client_request().map_err(|_| {
@@ -203,10 +208,7 @@ impl WebSocketTransport {
                 "invalid WebSocket URL; provide a valid ws:// or wss:// endpoint",
             )
         })?;
-        let value = format!("Bearer {}", self.bearer_token)
-            .parse()
-            .map_err(|_| LoomError::invalid_request("bearer token contains invalid characters"))?;
-        request.headers_mut().insert(AUTHORIZATION, value);
+        apply_bearer_token(&mut request, &self.bearer_token)?;
         let connector = self.tls_client_config.clone().map(Connector::Rustls);
         let (socket, _) = connect_async_tls_with_config(request, None, false, connector)
             .await
@@ -418,6 +420,24 @@ impl WebSocketConnection {
             .await
             .map_err(socket_error)
     }
+}
+
+/// Adds the operator credential to a WebSocket handshake.
+///
+/// An empty token means the upgrade carries no credential at all: the worker
+/// accepts it as a pre-login connection that may only negotiate, read its
+/// identity, and sign in with GitHub. Such a connection sends no
+/// `Authorization` header rather than an empty one, so the worker cannot read
+/// it as a failed credential.
+fn apply_bearer_token(request: &mut HandshakeRequest, bearer_token: &str) -> Result<()> {
+    if bearer_token.is_empty() {
+        return Ok(());
+    }
+    let value = format!("Bearer {bearer_token}")
+        .parse()
+        .map_err(|_| LoomError::invalid_request("bearer token contains invalid characters"))?;
+    request.headers_mut().insert(AUTHORIZATION, value);
+    Ok(())
 }
 
 fn socket_error(error: impl std::fmt::Display) -> LoomError {
@@ -635,6 +655,26 @@ mod tests {
             oversized_inbound_frame_action(b"{not-json", awaited),
             OversizedFrameAction::Drain
         );
+    }
+
+    #[test]
+    fn an_empty_token_sends_no_credential() {
+        let handshake = |token: &str| {
+            let mut request = "ws://127.0.0.1:1/ws".into_client_request().unwrap();
+            apply_bearer_token(&mut request, token).unwrap();
+            request
+        };
+        assert!(
+            !handshake("").headers().contains_key(AUTHORIZATION),
+            "an unsigned upgrade must carry no Authorization header"
+        );
+        assert_eq!(
+            handshake("worker-secret").headers()[AUTHORIZATION],
+            "Bearer worker-secret"
+        );
+        let mut invalid = "ws://127.0.0.1:1/ws".into_client_request().unwrap();
+        let error = apply_bearer_token(&mut invalid, "bad\nheader").unwrap_err();
+        assert!(error.message.contains("invalid characters"), "{error}");
     }
 
     #[test]

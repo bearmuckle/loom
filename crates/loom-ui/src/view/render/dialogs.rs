@@ -915,6 +915,66 @@ impl LoomView {
             .into_any_element()
     }
 
+    /// The sign-in row of the WORKERS section.
+    ///
+    /// A worker is reachable either with an operator access token or by signing
+    /// in with GitHub; this row names which state the selected worker is in and
+    /// offers the action that fits.
+    fn render_worker_sign_in_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let node_id = self.default_backend_node_id.clone();
+        let awaiting_sign_in = self.node_awaits_sign_in(&node_id);
+        let identity = self
+            .collaboration
+            .identity
+            .as_ref()
+            .filter(|_| !awaiting_sign_in)
+            .map(|identity| identity.display_name.clone());
+        let mut row = div()
+            .id("worker-sign-in-row")
+            .test_support()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_xs()
+            .text_color(rgb(0x8f98a6));
+        if let Some(login) = identity {
+            row = row
+                .child(
+                    div()
+                        .flex_1()
+                        .truncate()
+                        .child(format!("Signed in as {login}")),
+                )
+                .child(
+                    Button::new("worker-sign-out-github")
+                        .label("Sign out")
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(|view, _, _, cx| view.sign_out_github(cx))),
+                );
+            return row;
+        }
+        let message = if awaiting_sign_in {
+            "This worker is waiting for a GitHub sign-in."
+        } else {
+            "Sign in with GitHub to join this worker's roster, or connect with its access token."
+        };
+        row = row.child(div().flex_1().child(message));
+        if self.offers_github_sign_in() {
+            row = row.child(
+                Button::new("worker-sign-in-github")
+                    .label("Sign in with GitHub")
+                    .outline()
+                    .xsmall()
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.begin_identity_sign_in(node_id.clone(), cx);
+                    })),
+            );
+        }
+        row
+    }
+
     pub(crate) fn render_github_login_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(state) = &self.github_login else {
             return div().into_any();
@@ -1066,7 +1126,7 @@ impl LoomView {
                         div()
                             .text_sm()
                             .text_color(rgb(0xf3f4f6))
-                            .child("Connect GitHub account"),
+                            .child(self.github_login_kind.pane_title()),
                     )
                     .child(
                         div()
@@ -1631,8 +1691,10 @@ impl LoomView {
                             ),
                     )
                     .child(div().text_xs().text_color(rgb(0x64748b)).child(
-                        "Use: ws://host:port/ws token · URLs are shared; access tokens are not",
+                        "Use: ws://host:port/ws [access token] · Leave the token empty to sign in \
+                         with GitHub. URLs are shared; access tokens are not",
                     ))
+                    .child(self.render_worker_sign_in_row(cx))
                     .into_any_element()
             }
             SettingsSection::Appearance => div()

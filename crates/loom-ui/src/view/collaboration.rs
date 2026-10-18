@@ -8,16 +8,72 @@ use loom_protocol::{
 
 use super::*;
 use crate::collaboration::{
-    CollaborationSupport, ComposerRoute, ControlRoute, addressing_for, is_unsupported_error,
-    route_composer, route_control,
+    CollaborationSupport, ComposerRoute, ControlRoute, SessionPermissions, addressing_for,
+    is_unsupported_error, route_composer, route_control,
 };
-use loom_core::RunControlAction;
+use loom_core::{GitHubSignInStatus, ParticipantIdentity, RunControlAction};
+
+impl LoomView {
+    /// The worker node the active session lives on.
+    pub(crate) fn active_node_id(&self) -> &str {
+        self.session_node_ids
+            .get(&self.active_session.id)
+            .map(String::as_str)
+            .unwrap_or(&self.default_backend_node_id)
+    }
+
+    /// The backend that serves the active session's node.
+    pub(crate) fn active_node_backend(&self) -> Option<BackendWorker> {
+        self.node_backends.get(self.active_node_id()).cloned()
+    }
+
+    /// Whether `node_id` is a connection opened without a credential that has
+    /// not signed in yet.
+    pub(crate) fn node_awaits_sign_in(&self, node_id: &str) -> bool {
+        self.awaiting_sign_in_nodes.contains(node_id)
+    }
+
+    /// Whether the active connection waits for a GitHub sign-in.
+    ///
+    /// A pre-login connection is neither an operator nor a person: it holds no
+    /// identity and no grants, so nothing that needs either may be used until
+    /// someone signs in.
+    pub(crate) fn awaits_sign_in(&self) -> bool {
+        self.node_awaits_sign_in(self.active_node_id()) && self.collaboration.identity.is_none()
+    }
+
+    /// What the active connection may do. A connection waiting for sign-in is
+    /// locked rather than unrestricted, because `UNRESTRICTED` is what an
+    /// operator token earns.
+    pub(crate) fn session_permissions(&self) -> SessionPermissions {
+        if self.awaits_sign_in() {
+            SessionPermissions::LOCKED
+        } else {
+            self.collaboration.permissions()
+        }
+    }
+
+    /// Whether the connected worker advertises `git_hub_sign_in`.
+    pub(crate) fn offers_github_sign_in(&self) -> bool {
+        self.github_sign_in_available
+    }
+}
 
 impl LoomView {
     /// Loads who this connection is, then the active session's roster and
     /// credential. Called on session selection.
     pub(crate) fn refresh_collaboration(&mut self, cx: &mut Context<Self>) {
         let session_id = self.active_session.id;
+        if self.node_awaits_sign_in(self.active_node_id()) {
+            // A pre-login connection may read only its identity, worker status,
+            // and capabilities. The roster and credential reads are refused
+            // until it signs in, so asking for them would only report errors.
+            self.collaboration.identity_loaded = true;
+            self.collaboration.identity = None;
+            self.collaboration.support = CollaborationSupport::Supported;
+            cx.notify();
+            return;
+        }
         if !self.collaboration.identity_loaded {
             self.dispatch(
                 cx,
@@ -73,7 +129,7 @@ impl LoomView {
 
     /// Loads the people directory an owner grants access from.
     pub(crate) fn refresh_participant_directory(&mut self, cx: &mut Context<Self>) {
-        if !self.collaboration.permissions().can_manage {
+        if !self.session_permissions().can_manage {
             return;
         }
         self.dispatch(
@@ -146,7 +202,7 @@ impl LoomView {
         request: AccessRequest,
         cx: &mut Context<Self>,
     ) {
-        if !self.collaboration.permissions().can_manage {
+        if !self.session_permissions().can_manage {
             return;
         }
         let session_id = self.active_session.id;
@@ -212,7 +268,7 @@ impl LoomView {
                 },
             );
         }
-        if self.collaboration.permissions().can_manage {
+        if self.session_permissions().can_manage {
             self.dispatch(
                 cx,
                 ClientRequest::Access(AccessRequest::ListProviderCredentials),
@@ -234,7 +290,7 @@ impl LoomView {
         credential_id: CredentialId,
         cx: &mut Context<Self>,
     ) {
-        if !self.collaboration.permissions().can_manage {
+        if !self.session_permissions().can_manage {
             return;
         }
         let session_id = self.active_session.id;
@@ -265,7 +321,7 @@ impl LoomView {
     /// state select. Returns `false` when nothing was sent, so the caller keeps
     /// the draft.
     pub(crate) fn send_composer_text(&mut self, text: String, cx: &mut Context<Self>) -> bool {
-        let permissions = self.collaboration.permissions();
+        let permissions = self.session_permissions();
         let addressing = addressing_for(&text, &self.collaboration.roster);
         let run = self
             .active_run
@@ -289,7 +345,11 @@ impl LoomView {
         let ordered = self.collaboration.uses_ordered_path();
         match route {
             ComposerRoute::ReadOnly => {
-                self.record_status("Observers can read this session but not send messages.");
+                if self.awaits_sign_in() {
+                    self.record_status("Sign in to this worker to send messages and start runs.");
+                } else {
+                    self.record_status("Observers can read this session but not send messages.");
+                }
                 false
             }
             ComposerRoute::PeerMessage => {
@@ -534,7 +594,7 @@ impl LoomView {
     /// run. Uses the ordered `ControlRun` request against the last revision
     /// seen (read first when unknown); older workers get the legacy request.
     pub(crate) fn control_run(&mut self, action: RunControlAction, cx: &mut Context<Self>) {
-        if !self.collaboration.permissions().can_act {
+        if !self.session_permissions().can_act {
             self.clear_control_in_flight(&action);
             return;
         }
@@ -771,6 +831,12 @@ impl LoomView {
 
     /// Refreshes everything the People tab shows.
     pub(crate) fn refresh_people(&mut self, cx: &mut Context<Self>) {
+        if self.awaits_sign_in() {
+            // The tab shows the sign-in action in place of the roster, and the
+            // pre-login worker refuses every read it would issue.
+            cx.notify();
+            return;
+        }
         let session_id = self.active_session.id;
         self.refresh_roster(session_id, cx);
         self.refresh_participant_directory(cx);
@@ -1008,7 +1074,119 @@ impl LoomView {
 
     /// Whether a repository may be searched or attached from this connection.
     pub(crate) fn can_manage_sources(&self) -> bool {
-        self.collaboration.permissions().can_manage
+        self.session_permissions().can_manage
+    }
+
+    /// Applies a sign-in status the worker reported for `node_id`.
+    ///
+    /// The status is read from `Access/GetGitHubSignInStatus` while the pane
+    /// polls; a `SignedIn` binds the person and ends the wait, and a `Failed`
+    /// keeps the pane open with the worker's reason.
+    pub(crate) fn apply_github_sign_in_status(
+        &mut self,
+        node_id: &str,
+        status: GitHubSignInStatus,
+        cx: &mut Context<Self>,
+    ) {
+        match status {
+            GitHubSignInStatus::Pending => {}
+            GitHubSignInStatus::SignedIn { participant } => {
+                self.complete_identity_sign_in(node_id.to_owned(), participant, cx);
+            }
+            GitHubSignInStatus::Failed { message } => {
+                self.github_login = Some(GitHubLoginState::Error(message));
+                cx.notify();
+            }
+        }
+    }
+
+    /// Binds the identity the worker reported and reloads what the pre-login
+    /// connection was refused.
+    ///
+    /// The worker refused the workspace, session, and collaboration reads
+    /// while this connection was pre-login, so they run again through the same
+    /// load path a successful connect uses.
+    pub(crate) fn complete_identity_sign_in(
+        &mut self,
+        node_id: String,
+        participant: ParticipantIdentity,
+        cx: &mut Context<Self>,
+    ) {
+        self.awaiting_sign_in_nodes.remove(&node_id);
+        let signed_in_the_active_node = self.active_node_id() == node_id;
+        if signed_in_the_active_node {
+            self.collaboration.identity = Some(participant.clone());
+            self.collaboration.identity_loaded = true;
+            self.collaboration.support = CollaborationSupport::Supported;
+        }
+        self.record_status(format!("Signed in as {}", participant.display_name));
+        // The pane was opened for this flow and has nothing left to show. A
+        // surface the user opened meanwhile is left alone.
+        if self.github_login_open() {
+            self.close_covering_surface();
+        } else {
+            self.github_login = None;
+        }
+        self.reload_after_sign_in(node_id, cx);
+        if signed_in_the_active_node {
+            // The roster, credential, and attributed history were refused while
+            // the connection was pre-login, so they are read again now.
+            self.refresh_people(cx);
+            self.load_collaboration_history(cx);
+        }
+        cx.notify();
+    }
+
+    /// Signs the active connection out of GitHub.
+    pub(crate) fn sign_out_github(&mut self, cx: &mut Context<Self>) {
+        let node_id = self.active_node_id().to_owned();
+        let Some(backend) = self.active_node_backend() else {
+            self.record_status("The selected worker is not connected.");
+            cx.notify();
+            return;
+        };
+        let pending = backend.submit(RequestEnvelope::new(ClientRequest::Access(
+            AccessRequest::SignOutGitHub,
+        )));
+        cx.spawn(async move |view, cx| {
+            let response = pending.wait().await;
+            view.update(cx, |view, cx| {
+                view.finish_sign_out_github(&node_id, response, cx)
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Applies the answer to `Access/SignOutGitHub`.
+    pub(crate) fn finish_sign_out_github(
+        &mut self,
+        node_id: &str,
+        response: ResponseEnvelope,
+        cx: &mut Context<Self>,
+    ) {
+        match response.result {
+            Ok(ServerResponse::Access(AccessResponse::SignedOutGitHub)) => {
+                self.collaboration.reset_after_sign_out();
+                if self.unsigned_nodes.contains(node_id) {
+                    // The connection was accepted without a credential, so
+                    // signing out returns it to the pre-login state and to the
+                    // sign-in prompt. An operator token keeps its authority.
+                    self.awaiting_sign_in_nodes.insert(node_id.to_owned());
+                }
+                self.record_status("Signed out of GitHub");
+                if !self.awaits_sign_in() {
+                    self.refresh_people(cx);
+                }
+            }
+            Err(error) => self.record_backend_error("sign out of GitHub", error),
+            Ok(response) => self.record_backend_error(
+                "sign out of GitHub",
+                unexpected_response("sign out of GitHub", response),
+            ),
+        }
+        cx.notify();
     }
 }
 

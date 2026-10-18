@@ -70,6 +70,43 @@ clients such as scripts and CI.
 - A signed-in person holds no session access until an owner grants a role, so
   sharing a worker does not share its sessions.
 
+### Signing in from a client
+
+A client holds no per-person token; it signs in on the connection it already
+has. Per-person tokens are retired, and an operator token is the only bearer
+credential left.
+
+1. Open Settings → Workers, enter the worker URL (for example
+   `ws://127.0.0.1:8765/ws`), and leave the access token empty. An empty token
+   sends no credential at all: the native client omits the `Authorization`
+   header and the browser client offers no `loom.bearer.` subprotocol.
+2. Select Connect. The worker accepts the upgrade as a pre-login connection,
+   which may only negotiate, read worker status and its own identity, and sign
+   in. The client shows a sign-in prompt where the composer would be, and the
+   roster, credential, and run controls stay disabled.
+3. Select Sign in with GitHub, either from the Sign in row or from the People
+   tab, and complete the device flow. The pane shows the user code and the
+   verification URL and polls the worker until the account is bound. A refused
+   or expired sign-in is reported in the pane with the worker's reason.
+4. The worker binds the GitHub account to the connection. The client then loads
+   the workspaces, sessions, and roster it was refused while pre-login, and the
+   signed-in login appears in the session header and the People tab. Signing in
+   is what puts a person in the roster; an owner still grants the role.
+5. Select Sign out to end the binding. The person leaves the roster of every
+   session they could see, and a connection accepted without a credential
+   returns to the sign-in prompt. An operator connection keeps its authority.
+
+An operator token still behaves exactly as it did: enter it after the URL, and
+the connection has unrestricted authority with no person bound. It may also
+sign in on top of the token, and the worker refuses a second sign-in while one
+identity is bound, so sign out before switching accounts.
+
+The browser client is configured with `?remote=<url>` and an optional
+`&token=<token>`; a URL alone connects unsigned, and the token no longer has to
+appear in the query string. Both clients press the same device flow, which needs
+a secure connection (`wss://`, or `ws://` on loopback) because the device code
+and the resulting identity travel over it.
+
 Egress required for sign-in, from the backend itself:
 
 - `github.com` — the device authorization (`/login/device/code`) and token

@@ -9,7 +9,10 @@ impl LoomView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let permissions = self.collaboration.permissions();
+        if self.awaits_sign_in() {
+            return self.render_sign_in_prompt(cx).into_any_element();
+        }
+        let permissions = self.session_permissions();
         let composer = self
             .composer_input
             .as_ref()
@@ -310,6 +313,52 @@ impl LoomView {
                             ),
                     ),
             )
+            .into_any_element()
+    }
+
+    /// The sign-in prompt that stands in for the composer on a pre-login
+    /// connection, which may read, sign in, and do nothing else.
+    fn render_sign_in_prompt(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let node_id = self.active_node_id().to_owned();
+        let mut body = div().flex().flex_col().gap_2().child(
+            div()
+                .text_sm()
+                .text_color(rgb(0xe5e7eb))
+                .child("Sign in to this worker to send messages and start runs."),
+        );
+        if self.offers_github_sign_in() {
+            body = body.child(
+                Button::new("composer-sign-in-github")
+                    .label("Sign in with GitHub")
+                    .primary()
+                    .small()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.begin_identity_sign_in(node_id.clone(), cx);
+                    })),
+            );
+        } else {
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x8f98a6))
+                    .child("This worker does not offer GitHub sign-in."),
+            );
+        }
+        div()
+            .id("composer-sign-in-prompt")
+            .test_support()
+            .w_full()
+            .px_3()
+            .pt_3()
+            .pb(px(12.))
+            .bg(rgb(0x17191f))
+            .border_t_1()
+            .border_color(rgb(0x30343f))
+            .when_some(self.status_banner.clone(), |element, banner| {
+                element.child(self.render_status_banner(&banner, cx))
+            })
+            .child(body)
+            .into_any_element()
     }
 
     /// Pause, Resume, and Retry for the active run, shown only in the states

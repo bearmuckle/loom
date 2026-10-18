@@ -265,15 +265,87 @@ impl LoomView {
 
     fn render_roster_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let state = &self.collaboration;
-        let manage = state.permissions().can_manage && state.is_participant_bound();
+        let sign_in_required = self.awaits_sign_in();
+        let manage = self.session_permissions().can_manage && state.is_participant_bound();
         let mut body = div().flex().flex_col().gap_2();
-        if !state.is_participant_bound() && state.roster.is_empty() {
-            body = body.child(empty_note(
-                "This connection is not bound to a person, so the session has no roster. \
-                 Start the worker with --participants-file to share it.",
-            ));
+        if sign_in_required {
+            body = body
+                .child(
+                    div()
+                        .id("roster-sign-in-required")
+                        .test_support()
+                        .text_size(card_value_font())
+                        .text_color(rgb(0xe5e7eb))
+                        .child("You are not signed in to this worker."),
+                )
+                .child(div().text_xs().text_color(rgb(0x8f98a6)).child(
+                    "Signing in with GitHub puts you in the roster. You start read-only, and an \
+                     owner grants the role you need.",
+                ));
+            if self.offers_github_sign_in() {
+                let node_id = self.active_node_id().to_owned();
+                body = body.child(
+                    Button::new("people-sign-in-github")
+                        .label("Sign in with GitHub")
+                        .primary()
+                        .small()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.begin_identity_sign_in(node_id.clone(), cx);
+                        })),
+                );
+            }
+        } else if !state.is_participant_bound() && state.roster.is_empty() {
+            if self.offers_github_sign_in() {
+                body = body
+                    .child(empty_note(
+                        "This connection reports no person, so the session has no roster. \
+                         Signing in with GitHub is what puts a person in it; an owner then \
+                         grants a role.",
+                    ))
+                    .child({
+                        let node_id = self.active_node_id().to_owned();
+                        Button::new("roster-sign-in-github")
+                            .label("Sign in with GitHub")
+                            .outline()
+                            .xsmall()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.begin_identity_sign_in(node_id.clone(), cx);
+                            }))
+                    });
+            } else {
+                body = body.child(empty_note(
+                    "This connection reports no person and the worker does not offer GitHub \
+                     sign-in, so the session has no roster.",
+                ));
+            }
         } else if state.roster.is_empty() {
             body = body.child(empty_note("Loading people…"));
+        }
+        if let Some(identity) = &state.identity {
+            body = body.child(
+                div()
+                    .id("signed-in-identity")
+                    .test_support()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_xs()
+                            .text_color(rgb(0x8f98a6))
+                            .child(format!("Signed in as {}", identity.display_name)),
+                    )
+                    .child(
+                        Button::new("sign-out-github")
+                            .label("Sign out")
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(|this, _, _, cx| this.sign_out_github(cx))),
+                    ),
+            );
         }
         let me = state.identity.as_ref().map(|identity| identity.id);
         for (index, entry) in state.roster.iter().enumerate() {
@@ -447,7 +519,7 @@ impl LoomView {
                 }),
             ));
         }
-        if state.permissions().can_manage && !state.credentials.is_empty() {
+        if self.session_permissions().can_manage && !state.credentials.is_empty() {
             let view = cx.entity();
             let choices = state
                 .credentials

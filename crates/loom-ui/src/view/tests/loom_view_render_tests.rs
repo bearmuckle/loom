@@ -216,7 +216,9 @@ fn empty_session_view_renders_without_a_backend_round_trip(cx: &mut TestAppConte
 }
 
 #[gpui_kit::test]
-fn startup_rejects_credential_bearing_remote_urls_and_missing_tokens(cx: &mut TestAppContext) {
+fn startup_rejects_credential_bearing_remote_urls_and_applies_the_plaintext_guard(
+    cx: &mut TestAppContext,
+) {
     cx.update(gpui_kit::init);
     let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
         let options = |remote: &str, token: Option<&str>| super::UiOptions {
@@ -239,12 +241,15 @@ fn startup_rejects_credential_bearing_remote_urls_and_missing_tokens(cx: &mut Te
         };
         assert!(error.message.contains("must not contain credentials"));
 
+        // A URL without a token is an unsigned connection, so the token is no
+        // longer a startup requirement; the plaintext guard still decides.
         let error =
             match LoomView::try_new(&options("ws://worker.example", None), cx.focus_handle()) {
                 Err(error) => error,
-                Ok(_) => panic!("remote connection without a token was accepted"),
+                Ok(_) => panic!("a plaintext remote without the opt-in was accepted"),
             };
-        assert!(error.message.contains("require LOOM_TOKEN"));
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains("allow-insecure-remote"), "{error}");
 
         let error = match LoomView::try_new(
             &options("not a WebSocket URL", Some("token")),
@@ -2072,15 +2077,14 @@ fn worker_connection_rejects_empty_credentialed_and_duplicate_inputs(cx: &mut Te
         );
         view.connect_worker_node(cx);
         assert_eq!(view.worker_nodes.len(), 1);
-        view.node_input_initial = "wss://worker-without-token.example/ws".to_owned();
+        // A URL without a token is a valid unsigned connection, so the attempt
+        // starts instead of being refused for the missing token.
+        view.node_input_initial = "ws://127.0.0.1:1/ws".to_owned();
         view.connect_worker_node(cx);
         assert_eq!(view.worker_nodes.len(), 2);
-        assert!(
-            view.worker_nodes[1]
-                .connection_detail
-                .as_deref()
-                .unwrap()
-                .contains("URL followed by its access token")
+        assert_eq!(
+            view.worker_nodes[1].connection_state,
+            WorkerConnectionState::Connecting
         );
         view
     });

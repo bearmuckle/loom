@@ -1,6 +1,18 @@
 use super::*;
 
 impl LoomView {
+    /// Records that `node_id` accepted the connection without an operator
+    /// token and has no person bound yet.
+    ///
+    /// The worker refuses every read but the identity, worker status, and
+    /// capabilities on such a connection, so the view shows a GitHub sign-in
+    /// instead of the controls that would need an identity or an operator
+    /// token.
+    pub(crate) fn mark_node_pre_login(&mut self, node_id: String) {
+        self.unsigned_nodes.insert(node_id.clone());
+        self.awaiting_sign_in_nodes.insert(node_id);
+    }
+
     pub(crate) fn add_worker_node(
         &mut self,
         connection: ClientConnection,

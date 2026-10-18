@@ -689,8 +689,7 @@ impl LoomView {
                 );
             }
         }
-        if awaiting && !self.approval_request_in_flight && self.collaboration.permissions().can_act
-        {
+        if awaiting && !self.approval_request_in_flight && self.session_permissions().can_act {
             let parent_for_approve = parent.clone();
             let parent_for_reject = parent.clone();
             block = block.child(
