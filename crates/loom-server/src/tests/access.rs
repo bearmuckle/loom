@@ -183,6 +183,7 @@ fn roles_gate_reads_actions_and_access_management() {
     let events = send(
         &guest_connection,
         ClientRequest::Events(EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: None,
             workspace_id: None,
             after_sequence: None,
@@ -585,6 +586,7 @@ fn active_runs_keep_their_pinned_credential_and_secrets_stay_on_the_worker() {
     let events = send(
         &guest_connection,
         ClientRequest::Events(EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: Some(session_id),
             workspace_id: None,
             after_sequence: None,
@@ -809,6 +811,7 @@ fn request_events(connection: &InProcessConnection) -> Vec<ServerEvent> {
     match send(
         connection,
         ClientRequest::Events(EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: None,
             workspace_id: None,
             after_sequence: None,
@@ -955,6 +958,7 @@ fn access_requests_are_filed_listed_and_decided_by_owners() {
     let history = match send(
         &owner_connection,
         ClientRequest::Events(EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: Some(session_id),
             workspace_id: None,
             after_sequence: None,

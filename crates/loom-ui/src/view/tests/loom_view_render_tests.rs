@@ -722,7 +722,7 @@ fn session_activation_resets_projection_and_resolves_backend_ownership(cx: &mut 
         assert!(view.review.selected_path.is_none());
         assert!(
             view.backend_for_request(&loom_protocol::ClientRequest::Session(
-                SessionRequest::GetAgentSessionSnapshot { session_id }
+                SessionRequest::GetAgentSessionSnapshot { activity_detail: loom_protocol::ActivityDetail::Full, session_id }
             ))
             .is_ok()
         );

@@ -44,6 +44,7 @@ fn stored_destructive_decision(view: &LoomView) -> PolicyDecision {
         .connection
         .request(RequestEnvelope::new(ClientRequest::Session(
             SessionRequest::GetAgentSessionSnapshot {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: view.active_session.id,
             },
         )));

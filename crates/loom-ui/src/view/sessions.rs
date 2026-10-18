@@ -52,10 +52,12 @@ impl LoomView {
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn load_session(&mut self, session: AgentSessionSnapshot) {
         self.activate_session(session);
+        let activity_detail = self.output_detail.activity_detail(self.show_reasoning);
         let metadata_response =
             self.connection
                 .request(RequestEnvelope::new(ClientRequest::Session(
                     SessionRequest::GetAgentSessionInitialState {
+                        activity_detail,
                         session_id: self.active_session.id,
                     },
                 )));
@@ -63,6 +65,7 @@ impl LoomView {
             self.connection
                 .request(RequestEnvelope::new(ClientRequest::Session(
                     SessionRequest::GetAgentSessionSnapshot {
+                        activity_detail,
                         session_id: self.active_session.id,
                     },
                 )))
@@ -136,7 +139,12 @@ impl LoomView {
                 if self.active_run_id != Some(run_id) {
                     break;
                 }
-                match load_transcript_page_sync(&self.connection, run_id, before_ordinal) {
+                match load_transcript_page_sync(
+                    &self.connection,
+                    run_id,
+                    before_ordinal,
+                    activity_detail,
+                ) {
                     Ok((messages, next_before, has_older)) => {
                         let next =
                             backfill.record_page(before_ordinal, &messages, next_before, has_older);
@@ -490,8 +498,12 @@ impl LoomView {
             }
         };
         let mut event_stream_epoch = self.event_stream_epoch.clone();
+        let activity_detail = self.output_detail.activity_detail(self.show_reasoning);
         let snapshot_request = backend.submit(RequestEnvelope::new(ClientRequest::Session(
-            SessionRequest::GetAgentSessionInitialState { session_id },
+            SessionRequest::GetAgentSessionInitialState {
+                activity_detail,
+                session_id,
+            },
         )));
         cx.spawn(async move |view, cx| {
             let mut snapshot = cx
@@ -500,7 +512,10 @@ impl LoomView {
             if snapshot.result.is_err() {
                 snapshot = backend
                     .submit(RequestEnvelope::new(ClientRequest::Session(
-                        SessionRequest::GetAgentSessionSnapshot { session_id },
+                        SessionRequest::GetAgentSessionSnapshot {
+                            activity_detail,
+                            session_id,
+                        },
                     )))
                     .wait()
                     .await;
@@ -528,6 +543,7 @@ impl LoomView {
                 session_id,
                 request_cursor,
                 event_stream_epoch.clone(),
+                activity_detail,
             ));
             let mut events = cx
                 .background_spawn(async move { events_request.wait().await })
@@ -546,7 +562,10 @@ impl LoomView {
                 ))
             ) {
                 let refresh_request = backend.submit(RequestEnvelope::new(ClientRequest::Session(
-                    SessionRequest::GetAgentSessionInitialState { session_id },
+                    SessionRequest::GetAgentSessionInitialState {
+                        activity_detail,
+                        session_id,
+                    },
                 )));
                 let mut refreshed = cx
                     .background_spawn(async move { refresh_request.wait().await })
@@ -565,6 +584,7 @@ impl LoomView {
                         session_id,
                         request_cursor,
                         event_stream_epoch.clone(),
+                        activity_detail,
                     ));
                     events = cx
                         .background_spawn(async move { retry_request.wait().await })
@@ -582,6 +602,7 @@ impl LoomView {
                     session_id,
                     request_cursor,
                     event_stream_epoch.clone(),
+                    activity_detail,
                 ));
                 let page = cx
                     .background_spawn(async move { page_request.wait().await })

@@ -1,5 +1,22 @@
 use super::*;
 
+/// How much activity content a client asks a read to carry.
+///
+/// This is a request projection, not a permission: the backend answers the
+/// same records at every level and only empties the content the level does
+/// not render. `Replies` carries the agent's replies plus a blocking approval
+/// or input prompt, with no reasoning and no tool content; `Activity` carries
+/// replies and tool activity without provider reasoning; `Full` carries
+/// everything.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityDetail {
+    Replies,
+    Activity,
+    #[default]
+    Full,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ControlRequest {
@@ -204,16 +221,25 @@ pub enum SessionRequest {
 
     GetAgentSessionSnapshot {
         session_id: AgentSessionId,
+        /// Content projection for this read; an omitted field means `full`.
+        #[serde(default)]
+        activity_detail: ActivityDetail,
     },
 
     /// Returns session/run metadata without materializing the run transcript.
     /// Clients can load conversation history through the bounded message-page API.
     GetAgentSessionSnapshotMetadata {
         session_id: AgentSessionId,
+        /// Content projection for this read; an omitted field means `full`.
+        #[serde(default)]
+        activity_detail: ActivityDetail,
     },
 
     GetAgentSessionInitialState {
         session_id: AgentSessionId,
+        /// Content projection for this read; an omitted field means `full`.
+        #[serde(default)]
+        activity_detail: ActivityDetail,
     },
 
     RenameAgentSession {
@@ -251,11 +277,17 @@ pub enum EventsRequest {
         /// Backend-instance identity paired with `after_sequence`.
         #[serde(default)]
         stream_epoch: Option<String>,
+        /// Content projection for this read; an omitted field means `full`.
+        #[serde(default)]
+        activity_detail: ActivityDetail,
     },
 
     GetRecentSessionEvents {
         session_id: AgentSessionId,
         limit: u32,
+        /// Content projection for this read; an omitted field means `full`.
+        #[serde(default)]
+        activity_detail: ActivityDetail,
     },
 }
 
@@ -294,6 +326,9 @@ pub enum RunRequest {
         run_id: RunId,
         before_ordinal: Option<u64>,
         limit: u32,
+        /// Content projection for this read; an omitted field means `full`.
+        #[serde(default)]
+        activity_detail: ActivityDetail,
     },
 
     GetAgentRunMessageContentRange {
@@ -305,6 +340,9 @@ pub enum RunRequest {
 
     GetAgentRunSnapshot {
         run_id: RunId,
+        /// Content projection for this read; an omitted field means `full`.
+        #[serde(default)]
+        activity_detail: ActivityDetail,
     },
 
     GetRunCheckpoint {

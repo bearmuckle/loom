@@ -484,7 +484,12 @@ fn asynchronous_page_loader_uses_the_bounded_transcript_endpoint() {
         .build()
         .unwrap();
     let (messages, next_before, has_older) = runtime
-        .block_on(load_transcript_page(worker, run_id, None))
+        .block_on(load_transcript_page(
+            worker,
+            run_id,
+            None,
+            loom_protocol::ActivityDetail::Full,
+        ))
         .unwrap();
     assert_eq!(next_before, Some(0));
     assert!(!has_older);

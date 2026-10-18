@@ -70,9 +70,11 @@ impl LoomView {
             .collect::<BTreeSet<_>>();
         let request_cursor = self.project_feed_after_sequence;
         let stream_epoch = self.project_feed_epoch.clone();
+        let activity_detail = self.output_detail.activity_detail(self.show_reasoning);
         self.dispatch(
             cx,
             ClientRequest::Events(EventsRequest::GetSessionEvents {
+                activity_detail,
                 session_id: None,
                 workspace_id: Some(workspace_id),
                 after_sequence: request_cursor,
@@ -177,9 +179,11 @@ impl LoomView {
     pub(crate) fn poll_run_once(&mut self, cx: &mut Context<Self>) {
         self.run_poll_scheduled = true;
         let request_cursor = self.after_sequence;
+        let activity_detail = self.output_detail.activity_detail(self.show_reasoning);
         self.dispatch(
             cx,
             ClientRequest::Events(EventsRequest::GetSessionEvents {
+                activity_detail,
                 session_id: Some(self.active_session.id),
                 workspace_id: None,
                 after_sequence: request_cursor,

@@ -100,6 +100,7 @@ fn history(connection: &InProcessConnection, session_id: AgentSessionId) -> Vec<
     let events = match send(
         connection,
         ClientRequest::Events(EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: Some(session_id),
             workspace_id: None,
             after_sequence: None,
@@ -530,6 +531,7 @@ fn roster_and_role_changes_are_pushed_and_revoked_people_stop_reading() {
         send(
             &guest_connection,
             ClientRequest::Events(EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: Some(session_id),
                 workspace_id: None,
                 after_sequence: None,

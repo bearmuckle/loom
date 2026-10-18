@@ -739,9 +739,11 @@ impl ClientRequest {
             })
             | Self::Events(EventsRequest::GetRecentSessionEvents { session_id, .. })
             | Self::Session(SessionRequest::GetAgentSession { session_id })
-            | Self::Session(SessionRequest::GetAgentSessionSnapshot { session_id })
-            | Self::Session(SessionRequest::GetAgentSessionSnapshotMetadata { session_id })
-            | Self::Session(SessionRequest::GetAgentSessionInitialState { session_id })
+            | Self::Session(SessionRequest::GetAgentSessionSnapshot { session_id, .. })
+            | Self::Session(SessionRequest::GetAgentSessionSnapshotMetadata {
+                session_id, ..
+            })
+            | Self::Session(SessionRequest::GetAgentSessionInitialState { session_id, .. })
             | Self::Session(SessionRequest::RenameAgentSession { session_id, .. })
             | Self::Session(SessionRequest::ArchiveAgentSession { session_id })
             | Self::Session(SessionRequest::DeleteAgentSession { session_id, .. })
@@ -829,7 +831,7 @@ impl ClientRequest {
             | Self::Run(RunRequest::GetAgentRunMessagePage { run_id, .. })
             | Self::Run(RunRequest::GetAgentRunTranscriptPage { run_id, .. })
             | Self::Run(RunRequest::GetAgentRunMessageContentRange { run_id, .. })
-            | Self::Run(RunRequest::GetAgentRunSnapshot { run_id })
+            | Self::Run(RunRequest::GetAgentRunSnapshot { run_id, .. })
             | Self::Run(RunRequest::GetRunCheckpoint { run_id })
             | Self::Run(RunRequest::ApproveAgentAction { run_id, .. })
             | Self::Run(RunRequest::RejectAgentAction { run_id, .. })
@@ -1267,7 +1269,7 @@ mod run_message_protocol_tests {
 
     #[test]
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 6));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 7));
         let project_id = ProjectId::new();
         let request = ClientRequest::Project(ProjectRequest::GetProjectSnapshot { project_id });
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));
@@ -1493,6 +1495,7 @@ mod run_message_protocol_tests {
     fn stream_epoch_fields_default_for_sequence_only_peers() {
         let request =
             RequestEnvelope::new(ClientRequest::Events(EventsRequest::GetSessionEvents {
+                activity_detail: ActivityDetail::Full,
                 session_id: Some(AgentSessionId::new()),
                 workspace_id: None,
                 after_sequence: Some(EventSequence::new(12)),
@@ -1538,6 +1541,46 @@ mod run_message_protocol_tests {
                 next_after_sequence: None,
             })
         );
+    }
+
+    #[test]
+    fn activity_detail_defaults_to_full_and_round_trips_every_level() {
+        let session_id = AgentSessionId::new();
+        let event_stream = |activity_detail| {
+            ClientRequest::Events(EventsRequest::GetSessionEvents {
+                activity_detail,
+                session_id: Some(session_id),
+                workspace_id: None,
+                after_sequence: None,
+                stream_epoch: None,
+            })
+        };
+
+        // A request from a client that predates the field reads as `full`, so
+        // the backend answers it exactly as it did before.
+        let request = event_stream(ActivityDetail::Full);
+        let mut encoded = serde_json::to_value(RequestEnvelope::new(request.clone())).unwrap();
+        // The request is a tagged enum nested in the envelope, so its payload
+        // sits two `data` levels down.
+        encoded["request"]["data"]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("activity_detail");
+        let decoded = decode_request(encoded.to_string().as_bytes()).unwrap();
+        assert_eq!(decoded.request, request);
+
+        // Every level round-trips, and encodes as the name a client sends.
+        for (detail, name) in [
+            (ActivityDetail::Replies, "replies"),
+            (ActivityDetail::Activity, "activity"),
+            (ActivityDetail::Full, "full"),
+        ] {
+            let request = event_stream(detail);
+            let encoded = encode_request(&RequestEnvelope::new(request.clone())).unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(json["request"]["data"]["data"]["activity_detail"], name);
+            assert_eq!(decode_request(&encoded).unwrap().request, request);
+        }
     }
 
     #[test]
@@ -1663,7 +1706,10 @@ mod run_message_protocol_tests {
     fn transcript_page_and_range_frames_round_trip_with_their_capability() {
         let session_id = AgentSessionId::new();
         let metadata_request =
-            ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata { session_id });
+            ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata {
+                activity_detail: ActivityDetail::Full,
+                session_id,
+            });
         assert_eq!(
             metadata_request.required_capability(),
             Some(Capability::ReadAgentSession)
@@ -1671,7 +1717,10 @@ mod run_message_protocol_tests {
         let encoded = encode_request(&RequestEnvelope::new(metadata_request)).unwrap();
         assert_eq!(
             decode_request(&encoded).unwrap().request,
-            ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata { session_id })
+            ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata {
+                activity_detail: ActivityDetail::Full,
+                session_id
+            })
         );
 
         let run_id = RunId::new();
@@ -1705,6 +1754,7 @@ mod run_message_protocol_tests {
             })
         );
         let transcript_request = ClientRequest::Run(RunRequest::GetAgentRunTranscriptPage {
+            activity_detail: ActivityDetail::Full,
             run_id,
             before_ordinal: Some(12),
             limit: 16,
@@ -1718,6 +1768,7 @@ mod run_message_protocol_tests {
                 .unwrap()
                 .request,
             ClientRequest::Run(RunRequest::GetAgentRunTranscriptPage {
+                activity_detail: ActivityDetail::Full,
                 run_id,
                 before_ordinal: Some(12),
                 limit: 16,

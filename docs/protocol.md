@@ -431,14 +431,45 @@ approval, and pending input are updated from events as they are journaled; the
 message transcript in a projection is refreshed at each step boundary, so a
 transcript may lag the event stream by one in-flight model call.
 
+## Activity detail
+
+Protocol 11.7 adds `activity_detail` to the requests that carry transcript
+content: `GetSessionEvents`, `GetRecentSessionEvents`, `GetAgentRunSnapshot`,
+`GetAgentRunTranscriptPage`, `GetAgentSessionSnapshot`,
+`GetAgentSessionSnapshotMetadata`, and `GetAgentSessionInitialState`. It has
+three values:
+
+- `replies`: the agent's replies plus a blocking approval or input prompt, with
+  no provider reasoning and no tool content.
+- `activity`: replies and tool activity, without provider reasoning.
+- `full`: everything.
+
+The value is a projection, not a permission. A reduced level empties content
+fields but never drops an event or message record, because sequence numbers,
+message ordinals, page cursors, and client idempotency depend on the records
+staying. Cursors, ordinals, and page boundaries are therefore identical at
+every level, and a client can change levels without losing its place. A
+blocking approval or input prompt keeps its tool arguments at every level,
+because those arguments are the control the person answers. Run control state,
+usage, the plan, and the run summary are likewise returned unchanged.
+
+An omitted field means `full`, so a request that does not carry it (including
+one from an older client) is answered exactly as before.
+
+Changing the level re-reads the run: content the client did not fetch cannot be
+shown later, so a level that renders more than the last read has to ask again.
+Levels that need the same projection change only the display.
+
 ## Multi-user sessions
 
 Protocol 11.3 adds identity, roles, and presence; 11.4 adds attributed chat
 and ordered run actions. Provider credential selection uses the same 11.4
-version. 11.5 adds access requests. 11.6 adds GitHub sign-in. Every addition is
-a new enum variant or capability, so clients of an older 11.x minor keep
-working; they simply never send the new requests or negotiate the new
-capability.
+version. 11.5 adds access requests. 11.6 adds GitHub sign-in. 11.7 adds the
+activity-detail projection. Every addition is a new enum variant, a capability,
+or a field with a compatible default (an omitted field keeps the older
+behavior), so clients of an older 11.x minor keep working; they simply never
+send the new requests, negotiate the new capability, or ask for the new
+behavior.
 
 ### Signing in with GitHub
 

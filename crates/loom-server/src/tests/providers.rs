@@ -308,6 +308,7 @@ fn pause_resume_fork_and_provider_discovery_are_protocol_operations() {
     assert_ne!(forked_id, session_id);
     let forked_settings = connection.request(RequestEnvelope::new(ClientRequest::Session(
         SessionRequest::GetAgentSessionSnapshot {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: forked_id,
         },
     )));

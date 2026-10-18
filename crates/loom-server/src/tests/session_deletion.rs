@@ -886,6 +886,7 @@ fn deleting_a_session_removes_its_feed_rows() {
         connection
             .request(RequestEnvelope::new(ClientRequest::Events(
                 EventsRequest::GetRecentSessionEvents {
+                    activity_detail: loom_protocol::ActivityDetail::Full,
                     session_id: deleted_session.id,
                     limit: 16,
                 },
@@ -899,6 +900,7 @@ fn deleting_a_session_removes_its_feed_rows() {
     let workspace_events = connection
         .request(RequestEnvelope::new(ClientRequest::Events(
             EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: None,
                 workspace_id: Some(workspace_record.id),
                 after_sequence: None,

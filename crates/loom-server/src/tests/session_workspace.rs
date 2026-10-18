@@ -571,6 +571,7 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
         let events = match connection
             .request(RequestEnvelope::new(ClientRequest::Events(
                 EventsRequest::GetSessionEvents {
+                    activity_detail: loom_protocol::ActivityDetail::Full,
                     session_id: Some(session_id),
                     workspace_id: None,
                     after_sequence: None,
@@ -610,7 +611,10 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     let connection = backend.connect();
     negotiate_m3(&connection);
     let recovered_session = connection.request(RequestEnvelope::new(ClientRequest::Session(
-        SessionRequest::GetAgentSessionSnapshot { session_id },
+        SessionRequest::GetAgentSessionSnapshot {
+            activity_detail: loom_protocol::ActivityDetail::Full,
+            session_id,
+        },
     )));
     let ServerResponse::Session(SessionResponse::AgentSessionSnapshot(recovered_session)) =
         recovered_session.result.unwrap()
@@ -620,7 +624,10 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     assert!(!recovered_session.auto_approve_actions);
     assert_eq!(recovered_session.approval_policy, ApprovalPolicy::default());
     let detail = connection.request(RequestEnvelope::new(ClientRequest::Run(
-        RunRequest::GetAgentRunSnapshot { run_id },
+        RunRequest::GetAgentRunSnapshot {
+            activity_detail: loom_protocol::ActivityDetail::Full,
+            run_id,
+        },
     )));
     let ServerResponse::Run(RunResponse::AgentRunSnapshot(detail)) = detail.result.unwrap() else {
         panic!("unexpected run snapshot response");
@@ -671,7 +678,10 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
             && interaction.status == AgentInteractionStatus::Pending
     }));
     let recovered_snapshot = connection.request(RequestEnvelope::new(ClientRequest::Run(
-        RunRequest::GetAgentRunSnapshot { run_id },
+        RunRequest::GetAgentRunSnapshot {
+            activity_detail: loom_protocol::ActivityDetail::Full,
+            run_id,
+        },
     )));
     let ServerResponse::Run(RunResponse::AgentRunSnapshot(projection)) =
         recovered_snapshot.result.unwrap()
@@ -901,6 +911,7 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     );
     let events = connection.request(RequestEnvelope::new(ClientRequest::Events(
         EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: Some(session_id),
             workspace_id: None,
             after_sequence: None,
@@ -967,6 +978,7 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
             let events = match connection
                 .request(RequestEnvelope::new(ClientRequest::Events(
                     EventsRequest::GetSessionEvents {
+                        activity_detail: loom_protocol::ActivityDetail::Full,
                         session_id: Some(session_id),
                         workspace_id: None,
                         after_sequence: None,
@@ -1199,6 +1211,7 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     negotiate_m3(&restored_connection);
     let metadata = restored_connection.request(RequestEnvelope::new(ClientRequest::Session(
         SessionRequest::GetAgentSessionSnapshotMetadata {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: recovery_session_id,
         },
     )));
@@ -1215,6 +1228,7 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     );
     let initial = restored_connection.request(RequestEnvelope::new(ClientRequest::Session(
         SessionRequest::GetAgentSessionInitialState {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: recovery_session_id,
         },
     )));
@@ -1263,6 +1277,7 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     assert!(!content.is_empty());
     let invalid_page = restored_connection.request(RequestEnvelope::new(ClientRequest::Run(
         RunRequest::GetAgentRunTranscriptPage {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             run_id,
             before_ordinal: None,
             limit: 0,
@@ -1274,6 +1289,7 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     );
     let transcript_page = restored_connection.request(RequestEnvelope::new(ClientRequest::Run(
         RunRequest::GetAgentRunTranscriptPage {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             run_id,
             before_ordinal: None,
             limit: MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE,
@@ -1298,7 +1314,10 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     assert!(!has_older);
 
     let projection = restored_connection.request(RequestEnvelope::new(ClientRequest::Run(
-        RunRequest::GetAgentRunSnapshot { run_id },
+        RunRequest::GetAgentRunSnapshot {
+            activity_detail: loom_protocol::ActivityDetail::Full,
+            run_id,
+        },
     )));
     let ServerResponse::Run(RunResponse::AgentRunSnapshot(projection)) = projection.result.unwrap()
     else {
@@ -1318,6 +1337,7 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     assert!(execution.pending_tool_execution.is_none());
     let events = restored_connection.request(RequestEnvelope::new(ClientRequest::Events(
         EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: Some(recovery_session_id),
             workspace_id: None,
             after_sequence: None,
@@ -1552,6 +1572,7 @@ fn workspace_reconnect_feed_isolated_and_pruned_cursors_resync_to_workspace_snap
         for workspace_id in [workspace_a, workspace_b] {
             let response = connection.request(RequestEnvelope::new(ClientRequest::Events(
                 EventsRequest::GetSessionEvents {
+                    activity_detail: loom_protocol::ActivityDetail::Full,
                     session_id: None,
                     workspace_id: Some(workspace_id),
                     after_sequence: None,
@@ -1575,6 +1596,7 @@ fn workspace_reconnect_feed_isolated_and_pruned_cursors_resync_to_workspace_snap
 
         let ambiguous = connection.request(RequestEnvelope::new(ClientRequest::Events(
             EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: Some(session_a),
                 workspace_id: Some(workspace_a),
                 after_sequence: None,
@@ -1584,6 +1606,7 @@ fn workspace_reconnect_feed_isolated_and_pruned_cursors_resync_to_workspace_snap
         assert!(ambiguous.result.is_err());
         let unknown = connection.request(RequestEnvelope::new(ClientRequest::Events(
             EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: None,
                 workspace_id: Some(WorkspaceId::new()),
                 after_sequence: None,
@@ -1609,6 +1632,7 @@ fn workspace_reconnect_feed_isolated_and_pruned_cursors_resync_to_workspace_snap
     negotiate(&connection);
     let stale = connection.request(RequestEnvelope::new(ClientRequest::Events(
         EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: None,
             workspace_id: Some(workspace_a),
             after_sequence: Some(EventSequence::new(1)),
@@ -1638,6 +1662,7 @@ fn workspace_reconnect_feed_isolated_and_pruned_cursors_resync_to_workspace_snap
 
     let events_b = connection.request(RequestEnvelope::new(ClientRequest::Events(
         EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: None,
             workspace_id: Some(workspace_b),
             after_sequence: None,
@@ -1661,6 +1686,7 @@ fn workspace_reconnect_feed_isolated_and_pruned_cursors_resync_to_workspace_snap
 
     let advanced_cursor = connection.request(RequestEnvelope::new(ClientRequest::Events(
         EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: None,
             workspace_id: Some(workspace_a),
             after_sequence: Some(global_cursor),
@@ -1728,6 +1754,7 @@ fn workspace_rename_and_config_changes_are_durable_workspace_events() {
     negotiate(&connection);
     let response = connection.request(RequestEnvelope::new(ClientRequest::Events(
         EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: None,
             workspace_id: Some(workspace_id),
             after_sequence: Some(EventSequence::default()),
@@ -1804,6 +1831,7 @@ fn workspace_event_requests_require_workspace_event_capability() {
     let unsupported_events = limited.request(RequestEnvelope::with_version(
         CURRENT_PROTOCOL_VERSION,
         ClientRequest::Events(EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: None,
             workspace_id: Some(workspace.id),
             after_sequence: Some(EventSequence::default()),
@@ -1819,6 +1847,7 @@ fn workspace_event_requests_require_workspace_event_capability() {
     negotiate(&current);
     let current_events = current.request(RequestEnvelope::new(ClientRequest::Events(
         EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: None,
             workspace_id: Some(workspace.id),
             after_sequence: Some(EventSequence::default()),

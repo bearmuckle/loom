@@ -396,6 +396,7 @@ fn retained_session_events(
     let response = connection
         .request(RequestEnvelope::new(ClientRequest::Events(
             EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id,
                 workspace_id: None,
                 after_sequence,
@@ -419,6 +420,7 @@ fn snapshotted_session_events(
     let response = connection
         .request(RequestEnvelope::new(ClientRequest::Events(
             EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: Some(session_id),
                 workspace_id: None,
                 after_sequence: None,
@@ -760,6 +762,7 @@ fn run_message_page_flushes_a_live_run_s_buffered_tail() {
 
     let transcript = connection.request(RequestEnvelope::new(ClientRequest::Run(
         RunRequest::GetAgentRunTranscriptPage {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             run_id,
             before_ordinal: None,
             limit: MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE,
@@ -1037,6 +1040,7 @@ fn reconnect_feed_payloads_load_lazily_and_keep_pruned_cursor_after_restart() {
     negotiate(&connection);
     let stale = connection.request(RequestEnvelope::new(ClientRequest::Events(
         EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: Some(session_id),
             workspace_id: None,
             after_sequence: Some(EventSequence::new(1)),
@@ -1059,6 +1063,7 @@ fn reconnect_feed_payloads_load_lazily_and_keep_pruned_cursor_after_restart() {
 
     let changed_epoch = connection.request(RequestEnvelope::new(ClientRequest::Events(
         EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: Some(session_id),
             workspace_id: None,
             after_sequence: Some(EventSequence::new(3)),
@@ -1080,6 +1085,7 @@ fn reconnect_feed_payloads_load_lazily_and_keep_pruned_cursor_after_restart() {
 
     let current = connection.request(RequestEnvelope::new(ClientRequest::Events(
         EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: Some(session_id),
             workspace_id: None,
             after_sequence: Some(EventSequence::new(2)),

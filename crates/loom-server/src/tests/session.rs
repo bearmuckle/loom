@@ -139,6 +139,7 @@ fn explicit_limits_and_context_inspection_are_durable_protocol_state() {
     let events = match connection
         .request(RequestEnvelope::new(ClientRequest::Events(
             EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: Some(session_id),
                 workspace_id: None,
                 after_sequence: None,

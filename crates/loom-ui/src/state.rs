@@ -15,8 +15,8 @@ use loom_core::{
 };
 use loom_model::ProviderUsageSummary;
 use loom_protocol::{
-    AgentPlanProgress, AgentRunState, GitDiff, GitRepositoryStatus, SessionFilesystemChange,
-    SessionFilesystemFile,
+    ActivityDetail, AgentPlanProgress, AgentRunState, GitDiff, GitRepositoryStatus,
+    SessionFilesystemChange, SessionFilesystemFile,
 };
 use serde::{Deserialize, Serialize};
 
@@ -99,9 +99,11 @@ impl ThemeChoice {
 
 /// How much agent activity the transcript shows.
 ///
-/// The level is presentation-only, like `show_reasoning`: it never changes what
-/// is sent to a provider. `Medium` is today's transcript, so the default keeps
-/// the existing reading experience.
+/// The level is a display preference, not a provider setting: it never changes
+/// what is sent to a provider. It does decide what the client asks the backend
+/// to send, through [`Self::activity_detail`], so a level that renders less does
+/// not download what it would not show. `Medium` is today's transcript, so the
+/// default keeps the existing reading experience.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum OutputDetail {
@@ -146,6 +148,20 @@ impl OutputDetail {
     /// still records a preference.
     pub(crate) const fn expands_activity(self) -> bool {
         matches!(self, Self::High)
+    }
+
+    /// The activity content this level needs a read to carry.
+    ///
+    /// `Low` renders only the agent's replies, so it asks for `Replies`;
+    /// `Medium` and `High` render the same tool activity and differ only in how
+    /// much of it is open, so both ask for the same detail. Reasoning is part of
+    /// what `High` renders, so it is only fetched while the user shows it.
+    pub(crate) const fn activity_detail(self, show_reasoning: bool) -> ActivityDetail {
+        match self {
+            Self::Low => ActivityDetail::Replies,
+            Self::Medium | Self::High if show_reasoning => ActivityDetail::Full,
+            Self::Medium | Self::High => ActivityDetail::Activity,
+        }
     }
 }
 
@@ -1311,6 +1327,36 @@ mod tests {
         assert!(matches!(turn.parts[1], AssistantPart::Tool(_)));
         assert!(matches!(turn.parts[2], AssistantPart::Text(ref text) if text == "Next response"));
         assert!(turn.streaming);
+    }
+
+    #[test]
+    fn activity_detail_follows_the_level_and_the_reasoning_setting() {
+        // Low renders only replies, so it never asks for reasoning.
+        assert_eq!(
+            OutputDetail::Low.activity_detail(false),
+            ActivityDetail::Replies
+        );
+        assert_eq!(
+            OutputDetail::Low.activity_detail(true),
+            ActivityDetail::Replies
+        );
+        // Medium and High render the same data and differ in the display only.
+        assert_eq!(
+            OutputDetail::Medium.activity_detail(false),
+            ActivityDetail::Activity
+        );
+        assert_eq!(
+            OutputDetail::High.activity_detail(false),
+            ActivityDetail::Activity
+        );
+        assert_eq!(
+            OutputDetail::Medium.activity_detail(true),
+            ActivityDetail::Full
+        );
+        assert_eq!(
+            OutputDetail::High.activity_detail(true),
+            ActivityDetail::Full
+        );
     }
 
     #[test]

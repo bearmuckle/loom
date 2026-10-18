@@ -57,6 +57,7 @@ fn session_events_request(
     after_sequence: Option<EventSequence>,
 ) -> RequestEnvelope {
     RequestEnvelope::new(ClientRequest::Events(EventsRequest::GetSessionEvents {
+        activity_detail: loom_protocol::ActivityDetail::Full,
         session_id: Some(session_id),
         workspace_id: None,
         after_sequence,
@@ -254,6 +255,7 @@ fn a_recent_events_batch_keeps_its_caller_sized_tail() {
     // no page to follow.
     let response = connection.request(RequestEnvelope::new(ClientRequest::Events(
         EventsRequest::GetRecentSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id,
             limit: 3,
         },
@@ -352,6 +354,7 @@ fn stale_epoch_request(
     after_sequence: Option<EventSequence>,
 ) -> RequestEnvelope {
     RequestEnvelope::new(ClientRequest::Events(EventsRequest::GetSessionEvents {
+        activity_detail: loom_protocol::ActivityDetail::Full,
         session_id: Some(session_id),
         workspace_id: None,
         after_sequence,
@@ -524,6 +527,7 @@ fn a_workspace_feed_above_the_response_bound_is_delivered_in_followable_pages() 
     loop {
         let response = connection.request(RequestEnvelope::new(ClientRequest::Events(
             EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: None,
                 workspace_id: Some(workspace_id),
                 after_sequence: cursor,

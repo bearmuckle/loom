@@ -38,7 +38,10 @@ fn wait_for_session_state(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let response = connection.request(RequestEnvelope::new(ClientRequest::Session(
-            SessionRequest::GetAgentSessionSnapshot { session_id },
+            SessionRequest::GetAgentSessionSnapshot {
+                activity_detail: loom_protocol::ActivityDetail::Full,
+                session_id,
+            },
         )));
         if let Ok(ServerResponse::Session(SessionResponse::AgentSessionSnapshot(projection))) =
             response.result
@@ -102,6 +105,7 @@ fn reopening_a_session_with_a_concurrent_event_restores_durable_run_state(cx: &m
     // view pages separately) and the events journaled after its cursor.
     let initial = connection.request(RequestEnvelope::new(ClientRequest::Session(
         SessionRequest::GetAgentSessionInitialState {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: session.id,
         },
     )));
@@ -261,6 +265,7 @@ fn reopening_from_a_snapshot_that_carries_messages_keeps_the_conversation(cx: &m
     // full session snapshot, which carries the run's messages.
     let snapshot = connection.request(RequestEnvelope::new(ClientRequest::Session(
         SessionRequest::GetAgentSessionSnapshot {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: session.id,
         },
     )));
@@ -471,6 +476,7 @@ fn session_load_from_a_stale_snapshot_restores_durable_run_state(cx: &mut TestAp
     // view pages separately.
     let initial = connection.request(RequestEnvelope::new(ClientRequest::Session(
         SessionRequest::GetAgentSessionInitialState {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: session.id,
         },
     )));
@@ -607,6 +613,7 @@ fn apply_event_snapshot_restores_durable_run_state_and_conversation(cx: &mut Tes
     // messages, so the projection alone can rebuild the conversation.
     let snapshot = connection.request(RequestEnvelope::new(ClientRequest::Session(
         SessionRequest::GetAgentSessionSnapshot {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: session.id,
         },
     )));

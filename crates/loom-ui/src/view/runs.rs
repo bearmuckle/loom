@@ -335,12 +335,15 @@ impl LoomView {
         // can still land between two pages and apply timeline items the
         // rebuild would not know about.
         let cursor_before = self.after_sequence;
+        let activity_detail = self.output_detail.activity_detail(self.show_reasoning);
         self.transcript_loading = true;
         cx.notify();
         cx.spawn(async move |view, cx| {
             let mut before_ordinal = before_ordinal;
             loop {
-                let result = load_transcript_page(backend.clone(), run_id, before_ordinal).await;
+                let result =
+                    load_transcript_page(backend.clone(), run_id, before_ordinal, activity_detail)
+                        .await;
                 let next = view.update(cx, |view, cx| {
                     if view.active_run_id != Some(run_id)
                         || view.transcript_generation != transcript_generation

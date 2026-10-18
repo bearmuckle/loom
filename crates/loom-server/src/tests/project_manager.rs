@@ -160,6 +160,7 @@ fn delegated_children_and_direct_messages_are_durable_and_bounded() {
     }
     let root_events = connection.request(RequestEnvelope::new(ClientRequest::Events(
         EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: Some(root),
             workspace_id: None,
             after_sequence: Some(EventSequence::default()),
@@ -3803,6 +3804,7 @@ fn project_coordination_exchange_and_transcripts_survive_restart() {
     assert!(!recovered_child_runtime_config.project_child_control_enabled);
     let child_detail = reopened_connection.request(RequestEnvelope::new(ClientRequest::Run(
         RunRequest::GetAgentRunSnapshot {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             run_id: child_run_id,
         },
     )));
@@ -3822,6 +3824,7 @@ fn project_coordination_exchange_and_transcripts_survive_restart() {
     }));
     let root_detail = reopened_connection.request(RequestEnvelope::new(ClientRequest::Run(
         RunRequest::GetAgentRunSnapshot {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             run_id: root_run_id,
         },
     )));

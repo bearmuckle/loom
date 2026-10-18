@@ -612,6 +612,7 @@ async fn m4_demo_remote(
         let response = second
             .request(RequestEnvelope::new(ClientRequest::Events(
                 EventsRequest::GetSessionEvents {
+                    activity_detail: loom_protocol::ActivityDetail::Full,
                     session_id: Some(session.id),
                     workspace_id: None,
                     after_sequence: after,
@@ -975,6 +976,7 @@ fn demonstrate_m3_recovery(
     loop {
         let events = recovered.request(RequestEnvelope::new(ClientRequest::Events(
             EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: Some(session_id),
                 workspace_id: None,
                 after_sequence,
@@ -1219,6 +1221,7 @@ fn stream_run(
     loop {
         let response = connection.request(RequestEnvelope::new(ClientRequest::Events(
             EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: Some(session_id),
                 workspace_id: None,
                 after_sequence: after,

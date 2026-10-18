@@ -13,25 +13,34 @@ impl InProcessConnection {
                     snapshot,
                 )))
             }
-            ClientRequest::Session(SessionRequest::GetAgentSessionSnapshot { session_id }) => Ok(
-                ServerResponse::Session(SessionResponse::AgentSessionSnapshot(Box::new(
-                    self.session_snapshot_projection(session_id, true)?,
-                ))),
-            ),
-            ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata {
+            ClientRequest::Session(SessionRequest::GetAgentSessionSnapshot {
                 session_id,
-            }) => Ok(ServerResponse::Session(
-                SessionResponse::AgentSessionSnapshot(Box::new(
-                    self.session_snapshot_projection(session_id, false)?,
-                )),
-            )),
-            ClientRequest::Session(SessionRequest::GetAgentSessionInitialState { session_id }) => {
+                activity_detail,
+            }) => {
                 Ok(ServerResponse::Session(
-                    SessionResponse::AgentSessionInitialState(Box::new(
-                        self.session_initial_state(session_id)?,
+                    SessionResponse::AgentSessionSnapshot(Box::new(
+                        self.session_snapshot_projection(session_id, true, activity_detail)?,
                     )),
                 ))
             }
+            ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata {
+                session_id,
+                activity_detail,
+            }) => {
+                Ok(ServerResponse::Session(
+                    SessionResponse::AgentSessionSnapshot(Box::new(
+                        self.session_snapshot_projection(session_id, false, activity_detail)?,
+                    )),
+                ))
+            }
+            ClientRequest::Session(SessionRequest::GetAgentSessionInitialState {
+                session_id,
+                activity_detail,
+            }) => Ok(ServerResponse::Session(
+                SessionResponse::AgentSessionInitialState(Box::new(
+                    self.session_initial_state(session_id, activity_detail)?,
+                )),
+            )),
             ClientRequest::Session(SessionRequest::RenameAgentSession { session_id, name }) => {
                 let (snapshot, record) = self.backend.sessions()?.rename(session_id, name)?;
                 self.backend.journal()?.append_session(record);

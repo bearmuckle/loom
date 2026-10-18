@@ -718,7 +718,10 @@ fn session_snapshot_request_targets_its_session() {
     let session_id = AgentSessionId::new();
     assert_eq!(
         session_id_for_request(
-            &ClientRequest::Session(SessionRequest::GetAgentSessionSnapshot { session_id }),
+            &ClientRequest::Session(SessionRequest::GetAgentSessionSnapshot {
+                activity_detail: loom_protocol::ActivityDetail::Full,
+                session_id
+            }),
             AgentSessionId::new()
         ),
         Some(session_id)
@@ -778,6 +781,7 @@ fn session_request_routing_covers_explicit_active_and_non_session_requests() {
             session_id: session,
         }),
         ClientRequest::Session(SessionRequest::GetAgentSessionSnapshot {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: session,
         }),
         ClientRequest::Session(SessionRequest::RenameAgentSession {
@@ -788,6 +792,7 @@ fn session_request_routing_covers_explicit_active_and_non_session_requests() {
             session_id: session,
         }),
         ClientRequest::Events(EventsRequest::GetRecentSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: session,
             limit: 5,
         }),
@@ -969,6 +974,7 @@ fn session_request_routing_covers_explicit_active_and_non_session_requests() {
     assert_eq!(
         session_id_for_request(
             &ClientRequest::Events(EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: None,
                 workspace_id: None,
                 after_sequence: None,
@@ -981,6 +987,7 @@ fn session_request_routing_covers_explicit_active_and_non_session_requests() {
     assert_eq!(
         session_id_for_request(
             &ClientRequest::Events(EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: Some(session),
                 workspace_id: None,
                 after_sequence: None,

@@ -169,6 +169,7 @@ fn session_scoped_tokens_are_limited_to_their_sessions_and_source_roots() {
         scoped
             .request(RequestEnvelope::new(ClientRequest::Events(
                 EventsRequest::GetSessionEvents {
+                    activity_detail: loom_protocol::ActivityDetail::Full,
                     session_id: None,
                     workspace_id: None,
                     after_sequence: None,

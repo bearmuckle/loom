@@ -986,24 +986,57 @@ impl LoomView {
         }
     }
 
-    /// Toggles whether provider reasoning is shown in the transcript. The
-    /// setting is presentation-only, so it never affects the provider request.
+    /// Toggles whether provider reasoning is shown in the transcript.
+    ///
+    /// Reasoning is content the backend only sends when the client asks for it,
+    /// so showing it re-reads the active session when the level would render it;
+    /// the backend never sees the setting itself, only the projection it implies.
     pub(crate) fn toggle_show_reasoning(&mut self, cx: &mut Context<Self>) {
+        let projection_before = self.output_detail.activity_detail(self.show_reasoning);
         self.show_reasoning = !self.show_reasoning;
         self.persist_ui_preferences();
+        if self.output_detail.activity_detail(self.show_reasoning) != projection_before {
+            self.reread_active_session_for_projection(cx);
+        }
         cx.notify();
     }
 
-    /// Sets how much agent activity the transcript shows. The setting is
-    /// presentation-only, so it never affects the provider request; `Medium`
-    /// keeps the transcript that existed before the setting.
+    /// Sets how much agent activity the transcript shows.
+    ///
+    /// The level decides the projection the client asks for, so a level that
+    /// renders more than the last read fetched has to read the session again.
+    /// `Medium` and `High` ask for the same projection and differ only in how
+    /// much of it is open, so switching between them never re-reads.
     pub(crate) fn set_output_detail(&mut self, detail: OutputDetail, cx: &mut Context<Self>) {
         let changed = self.output_detail != detail;
+        let projection_changed = self.output_detail.activity_detail(self.show_reasoning)
+            != detail.activity_detail(self.show_reasoning);
         self.output_detail = detail;
         if changed {
             self.persist_ui_preferences();
         }
+        if projection_changed {
+            self.reread_active_session_for_projection(cx);
+        }
         cx.notify();
+    }
+
+    /// Re-reads the active session after the activity projection changed.
+    ///
+    /// Content the client did not fetch cannot be shown, so a level that needs
+    /// more than the last read starts the same load an interactive selection
+    /// does. The reset before it keeps the partial projection from being shown
+    /// as the conversation until the read answers.
+    fn reread_active_session_for_projection(&mut self, cx: &mut Context<Self>) {
+        if !self
+            .sessions
+            .iter()
+            .any(|session| session.id == self.active_session.id)
+        {
+            return;
+        }
+        self.reset_projection();
+        self.begin_session_data_load(self.active_session.id, cx);
     }
 
     /// Writes the client-local presentation settings after a change. The

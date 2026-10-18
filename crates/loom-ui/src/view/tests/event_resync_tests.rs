@@ -402,6 +402,7 @@ fn a_rebuild_ends_at_the_durable_cursor_on_both_paths(cx: &mut TestAppContext) {
         let batch = match connection
             .request(RequestEnvelope::new(ClientRequest::Events(
                 EventsRequest::GetSessionEvents {
+                    activity_detail: loom_protocol::ActivityDetail::Full,
                     session_id: Some(session.id),
                     workspace_id: None,
                     after_sequence: None,
@@ -524,7 +525,10 @@ fn wait_for_session_state(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let response = connection.request(RequestEnvelope::new(ClientRequest::Session(
-            SessionRequest::GetAgentSessionSnapshot { session_id },
+            SessionRequest::GetAgentSessionSnapshot {
+                activity_detail: loom_protocol::ActivityDetail::Full,
+                session_id,
+            },
         )));
         if let Ok(ServerResponse::Session(SessionResponse::AgentSessionSnapshot(projection))) =
             response.result
@@ -703,6 +707,7 @@ fn session_event_snapshot_resync_keeps_the_conversation(cx: &mut TestAppContext)
         // the rebuild read: the cursor matches the backend's latest sequence.
         let latest = connection.request(RequestEnvelope::new(ClientRequest::Events(
             EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: Some(session.id),
                 workspace_id: None,
                 after_sequence: None,
@@ -757,6 +762,7 @@ fn a_resync_follows_every_bounded_event_page() {
     let request_page = |after_sequence| match connection
         .request(RequestEnvelope::new(ClientRequest::Events(
             EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: Some(session.id),
                 workspace_id: None,
                 after_sequence,
@@ -784,7 +790,13 @@ fn a_resync_follows_every_bounded_event_page() {
     assert_eq!(continuation, Some(first_page_head));
 
     // Following the pages returns the whole backlog as one batch.
-    let response = collect_session_events_sync(&connection, session.id, None, None);
+    let response = collect_session_events_sync(
+        &connection,
+        session.id,
+        None,
+        None,
+        loom_protocol::ActivityDetail::Full,
+    );
     let ServerResponse::Events(EventsResponse::SessionEvents {
         events,
         next_after_sequence,
@@ -1092,6 +1104,7 @@ fn a_poll_drains_every_bounded_event_page(cx: &mut TestAppContext) {
     let first_page_head = connection
         .request(RequestEnvelope::new(ClientRequest::Events(
             EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: Some(session.id),
                 workspace_id: None,
                 after_sequence: None,

@@ -22,9 +22,11 @@ impl InProcessConnection {
                 run_id,
                 before_ordinal,
                 limit,
+                activity_detail,
             }) => {
-                let (messages, next_before, has_older) =
+                let (mut messages, next_before, has_older) =
                     self.run_transcript_page(run_id, before_ordinal, limit)?;
+                project_transcript_messages(&mut messages, activity_detail);
                 Ok(ServerResponse::Run(RunResponse::AgentRunTranscriptPage {
                     run_id,
                     messages,
@@ -50,9 +52,14 @@ impl InProcessConnection {
                     )?,
                 },
             )),
-            ClientRequest::Run(RunRequest::GetAgentRunSnapshot { run_id }) => {
+            ClientRequest::Run(RunRequest::GetAgentRunSnapshot {
+                run_id,
+                activity_detail,
+            }) => {
+                let mut projection = self.run_snapshot_projection(run_id)?;
+                project_run_projection(&mut projection, activity_detail);
                 Ok(ServerResponse::Run(RunResponse::AgentRunSnapshot(
-                    Box::new(self.run_snapshot_projection(run_id)?),
+                    Box::new(projection),
                 )))
             }
             ClientRequest::Run(RunRequest::GetRunCheckpoint { run_id }) => {

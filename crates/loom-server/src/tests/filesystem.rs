@@ -1360,6 +1360,7 @@ fn forked_session_filesystem_and_policy_survive_restart_and_checkpoint_revert() 
 
         let snapshot = connection.request(RequestEnvelope::new(ClientRequest::Session(
             SessionRequest::GetAgentSessionSnapshot {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: fork_session_id,
             },
         )));
@@ -1417,6 +1418,7 @@ fn forked_session_filesystem_and_policy_survive_restart_and_checkpoint_revert() 
 
         let events = connection.request(RequestEnvelope::new(ClientRequest::Events(
             EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: Some(fork_session_id),
                 workspace_id: None,
                 after_sequence: None,

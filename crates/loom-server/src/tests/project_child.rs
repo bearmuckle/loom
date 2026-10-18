@@ -120,6 +120,7 @@ fn m5_session_projections_reconnect_and_archive_authoritatively() {
 
     let snapshot = connection.request(RequestEnvelope::new(ClientRequest::Session(
         SessionRequest::GetAgentSessionSnapshot {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: session.id,
         },
     )));
@@ -137,6 +138,7 @@ fn m5_session_projections_reconnect_and_archive_authoritatively() {
 
     let metadata = connection.request(RequestEnvelope::new(ClientRequest::Session(
         SessionRequest::GetAgentSessionSnapshotMetadata {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: session.id,
         },
     )));
@@ -156,7 +158,10 @@ fn m5_session_projections_reconnect_and_archive_authoritatively() {
             .is_some_and(|run| run.messages.is_empty())
     );
     let run = connection.request(RequestEnvelope::new(ClientRequest::Run(
-        RunRequest::GetAgentRunSnapshot { run_id },
+        RunRequest::GetAgentRunSnapshot {
+            activity_detail: loom_protocol::ActivityDetail::Full,
+            run_id,
+        },
     )));
     let ServerResponse::Run(RunResponse::AgentRunSnapshot(run)) = run.result.unwrap() else {
         panic!("unexpected run snapshot response");
@@ -873,6 +878,7 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
         if run.id == run_id && run.state == AgentRunState::AwaitingApproval));
     let approval_events = connection.request(RequestEnvelope::new(ClientRequest::Events(
         EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: Some(resumable_session_id),
             workspace_id: None,
             after_sequence: None,

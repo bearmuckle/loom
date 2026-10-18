@@ -4,10 +4,12 @@ impl InProcessConnection {
     pub(crate) fn session_initial_state(
         &self,
         session_id: AgentSessionId,
+        activity_detail: ActivityDetail,
     ) -> Result<AgentSessionInitialState> {
         for _ in 0..4 {
             let before = self.latest_session_event_sequence(session_id)?;
-            let mut projection = self.session_snapshot_projection(session_id, false)?;
+            let mut projection =
+                self.session_snapshot_projection(session_id, false, activity_detail)?;
             let after = self.latest_session_event_sequence(session_id)?;
             if before == after {
                 projection.latest_sequence = after;
@@ -289,6 +291,7 @@ impl InProcessConnection {
         &self,
         session_id: AgentSessionId,
         include_messages: bool,
+        activity_detail: ActivityDetail,
     ) -> Result<AgentSessionSnapshotProjection> {
         let session = self.backend.sessions()?.get(session_id)?;
         let (loaded_ids, latest_loaded) = {
@@ -335,7 +338,7 @@ impl InProcessConnection {
                 self.load_persisted_run_state(summary, include_messages)
             }
         };
-        let active_run = match (latest_loaded, latest_persisted) {
+        let mut active_run = match (latest_loaded, latest_persisted) {
             (Some(handle), Some(summary)) => {
                 let projection = handle.snapshot_projection(include_messages);
                 if projection.run.updated_at >= summary.snapshot.updated_at {
@@ -357,6 +360,9 @@ impl InProcessConnection {
             .unwrap_or_else(|| self.latest_session_event_sequence(session_id))?;
         let approval_policy = self.policy(session_id)?;
         let auto_approve_actions = self.auto_approve_actions(session_id)?;
+        if let Some(projection) = active_run.as_mut() {
+            project_run_projection(projection, activity_detail);
+        }
         Ok(AgentSessionSnapshotProjection {
             session,
             active_run,

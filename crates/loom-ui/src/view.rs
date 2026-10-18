@@ -50,17 +50,18 @@ use loom_model::GITHUB_COPILOT_DEFAULT_MODEL;
 use loom_model::{MessageRole, ModelId, ModelMessage, ProviderKind, ProviderSummary, ToolCall};
 use loom_protocol::GitHubCopilotLoginStatus;
 use loom_protocol::{
-    AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent, AgentRunSnapshot,
-    AgentRunSnapshotProjection, AgentRunState, CURRENT_PROTOCOL_VERSION, ClientRequest,
-    ClonedRepository, ContextRequest, ContextResponse, ControlRequest, ControlResponse,
-    EventsRequest, EventsResponse, FileActivityOperation, FilesystemRequest, FilesystemResponse,
-    GITHUB_REPOSITORY_QUERY_MIN_CHARS, GitFileStatusKind, GitHubRepository, GitRepositoryStatus,
-    MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, ProjectChildControlAction, ProjectRequest, ProjectResponse,
-    ProviderRequest, ProviderResponse, RepositoryRequest, RepositoryResponse, RequestEnvelope,
-    ResponseEnvelope, RunRequest, RunResponse, ServerEvent, ServerResponse, SessionDirectory,
-    SessionRepository, SessionRequest, SessionResponse, TaskRequest, TerminalRequest, UsageRequest,
-    UsageResponse, WorkerNodeConfig, WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig,
-    WorkspaceFeedEvent, WorkspaceRequest, WorkspaceResponse,
+    ActivityDetail, AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent,
+    AgentRunSnapshot, AgentRunSnapshotProjection, AgentRunState, CURRENT_PROTOCOL_VERSION,
+    ClientRequest, ClonedRepository, ContextRequest, ContextResponse, ControlRequest,
+    ControlResponse, EventsRequest, EventsResponse, FileActivityOperation, FilesystemRequest,
+    FilesystemResponse, GITHUB_REPOSITORY_QUERY_MIN_CHARS, GitFileStatusKind, GitHubRepository,
+    GitRepositoryStatus, MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, ProjectChildControlAction,
+    ProjectRequest, ProjectResponse, ProviderRequest, ProviderResponse, RepositoryRequest,
+    RepositoryResponse, RequestEnvelope, ResponseEnvelope, RunRequest, RunResponse, ServerEvent,
+    ServerResponse, SessionDirectory, SessionRepository, SessionRequest, SessionResponse,
+    TaskRequest, TerminalRequest, UsageRequest, UsageResponse, WorkerNodeConfig,
+    WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, WorkspaceFeedEvent, WorkspaceRequest,
+    WorkspaceResponse,
 };
 #[cfg(not(target_family = "wasm"))]
 #[cfg(not(target_family = "wasm"))]
@@ -408,10 +409,12 @@ async fn load_transcript_page(
     backend: BackendWorker,
     run_id: RunId,
     before_ordinal: Option<u64>,
+    activity_detail: ActivityDetail,
 ) -> Result<TranscriptPage, LoomError> {
     let response = backend
         .submit(RequestEnvelope::new(ClientRequest::Run(
             RunRequest::GetAgentRunTranscriptPage {
+                activity_detail,
                 run_id,
                 before_ordinal,
                 limit: MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE,
@@ -621,12 +624,14 @@ pub(crate) struct LoomView {
     provider_setup_status: BTreeMap<loom_model::ProviderId, String>,
     pub(crate) theme_choice: ThemeChoice,
     font_scale_percent: u16,
-    /// Whether provider reasoning is shown in the transcript. Off by default;
-    /// this is presentation-only and never changes what is sent to providers.
+    /// Whether provider reasoning is shown in the transcript. Off by default.
+    /// The setting is never sent to a provider or a backend; it only selects
+    /// whether a read asks for reasoning content.
     pub(crate) show_reasoning: bool,
     /// How much agent activity the transcript shows. `Medium` is the default and
-    /// matches the transcript without this setting; like `show_reasoning` it is
-    /// presentation-only and never changes what is sent to providers.
+    /// matches the transcript without this setting. Like `show_reasoning` it is
+    /// a display preference, and it also decides the projection a read asks for,
+    /// so a level never downloads content it would not render.
     pub(crate) output_detail: OutputDetail,
     appearance_subscription: Option<Subscription>,
     /// App-wide keystroke interceptor for shortcuts that must work regardless

@@ -113,6 +113,7 @@ fn runs_deterministic_agent_through_approvals() {
     loop {
         let response = connection.request(RequestEnvelope::new(ClientRequest::Events(
             EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: Some(session_id),
                 workspace_id: None,
                 after_sequence: after,
@@ -257,6 +258,7 @@ fn runs_deterministic_agent_through_approvals() {
     ));
     let history = connection.request(RequestEnvelope::new(ClientRequest::Events(
         EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: Some(session_id),
             workspace_id: None,
             after_sequence: None,
@@ -314,7 +316,10 @@ fn policy_decisions_are_visible_and_can_stop_agent_writes() {
         response => panic!("unexpected response: {response:?}"),
     };
     let default_settings = connection.request(RequestEnvelope::new(ClientRequest::Session(
-        SessionRequest::GetAgentSessionSnapshot { session_id },
+        SessionRequest::GetAgentSessionSnapshot {
+            activity_detail: loom_protocol::ActivityDetail::Full,
+            session_id,
+        },
     )));
     let ServerResponse::Session(SessionResponse::AgentSessionSnapshot(default_settings)) =
         default_settings.result.unwrap()
@@ -353,6 +358,7 @@ fn policy_decisions_are_visible_and_can_stop_agent_writes() {
     ));
     let other_settings = connection.request(RequestEnvelope::new(ClientRequest::Session(
         SessionRequest::GetAgentSessionSnapshot {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: other_session_id,
         },
     )));
@@ -382,6 +388,7 @@ fn policy_decisions_are_visible_and_can_stop_agent_writes() {
     await_settled_run(&connection, run_id);
     let events = connection.request(RequestEnvelope::new(ClientRequest::Events(
         EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: Some(session_id),
             workspace_id: None,
             after_sequence: None,
@@ -520,7 +527,10 @@ fn a_running_run_keeps_the_policy_it_pinned_when_the_session_policy_changes() {
     assert_ne!(run.approval_policy, Some(changed.clone()));
 
     let projection = connection.request(RequestEnvelope::new(ClientRequest::Run(
-        RunRequest::GetAgentRunSnapshot { run_id },
+        RunRequest::GetAgentRunSnapshot {
+            activity_detail: loom_protocol::ActivityDetail::Full,
+            run_id,
+        },
     )));
     let ServerResponse::Run(RunResponse::AgentRunSnapshot(projection)) = projection.result.unwrap()
     else {
@@ -530,6 +540,7 @@ fn a_running_run_keeps_the_policy_it_pinned_when_the_session_policy_changes() {
 
     let session_snapshot = connection.request(RequestEnvelope::new(ClientRequest::Session(
         SessionRequest::GetAgentSessionSnapshot {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: session.id,
         },
     )));
@@ -619,7 +630,10 @@ fn completed_runs_keep_indexed_summaries_without_restoring_runtime_objects() {
                 && snapshot.approval_policy == Some(loom_core::ApprovalPolicy::auto_approve())
     ));
     let projection = connection.request(RequestEnvelope::new(ClientRequest::Run(
-        RunRequest::GetAgentRunSnapshot { run_id },
+        RunRequest::GetAgentRunSnapshot {
+            activity_detail: loom_protocol::ActivityDetail::Full,
+            run_id,
+        },
     )));
     assert!(matches!(
         projection.result,
@@ -806,6 +820,7 @@ fn a_running_model_call_can_be_interrupted_without_blocking_the_request() {
     for _ in 0..1_000 {
         let events = observer.request(RequestEnvelope::new(ClientRequest::Events(
             EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: Some(session_id),
                 workspace_id: None,
                 after_sequence: None,
@@ -1058,4 +1073,167 @@ fn transcript_page_content_is_bounded_and_marks_truncation() {
     assert!(!truncated);
     assert_eq!(content, "short");
     assert_eq!(bounded_transcript_content(&[], 0), (String::new(), false));
+}
+
+/// A read at a reduced `activity_detail` keeps the run's records and empties the
+/// tool content the level does not render, while `full` returns everything.
+#[test]
+fn reduced_activity_detail_empties_tool_content_without_dropping_records() {
+    let backend = InProcessBackend::new();
+    let connection = backend.connect();
+    negotiate_m5(&connection);
+    let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Activity detail workspace".to_owned(),
+        },
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+        workspace.result.unwrap()
+    else {
+        panic!("unexpected workspace response");
+    };
+    let session = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
+            workspace_id: workspace.id,
+            name: "Activity detail".to_owned(),
+        },
+    )));
+    let ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) =
+        session.result.unwrap()
+    else {
+        panic!("unexpected session response");
+    };
+    let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id: session.id,
+            task: "create a demo file".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            system_instructions: None,
+            repository_instructions: None,
+        },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunStarted(started)) = started.result.unwrap() else {
+        panic!("unexpected run response");
+    };
+    let run_id = started.id;
+    assert_eq!(
+        await_settled_run(&connection, run_id).state,
+        AgentRunState::Completed
+    );
+
+    let transcript = |activity_detail| {
+        let response = connection.request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::GetAgentRunTranscriptPage {
+                run_id,
+                before_ordinal: None,
+                limit: MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE,
+                activity_detail,
+            },
+        )));
+        let Ok(ServerResponse::Run(RunResponse::AgentRunTranscriptPage { messages, .. })) =
+            response.result
+        else {
+            panic!("unexpected transcript page response");
+        };
+        messages
+    };
+    let tool_call_keys = |messages: &[loom_protocol::AgentRunTranscriptMessage]| {
+        messages
+            .iter()
+            .flat_map(|message| message.message.tool_calls.iter())
+            .map(|call| (call.id, call.name.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    let full = transcript(ActivityDetail::Full);
+    let replies = transcript(ActivityDetail::Replies);
+    // The reduced read keeps every record at its ordinal, so a cursor or an
+    // ordinal a client already holds still names the same message.
+    assert_eq!(full.len(), replies.len());
+    assert!(
+        full.iter()
+            .zip(&replies)
+            .all(|(full, replies)| full.ordinal == replies.ordinal
+                && full.timeline_ordinal == replies.timeline_ordinal)
+    );
+    assert_eq!(tool_call_keys(&full), tool_call_keys(&replies));
+    assert!(
+        full.iter().any(
+            |message| message.message.role == loom_model::MessageRole::Tool
+                && !message.message.content.is_empty()
+        ),
+        "the full read carries the tool result"
+    );
+    assert!(
+        replies
+            .iter()
+            .filter(|message| message.message.role == loom_model::MessageRole::Tool)
+            .all(|message| message.message.content.is_empty())
+    );
+    assert!(
+        full.iter()
+            .flat_map(|message| message.message.tool_calls.iter())
+            .any(|call| call.arguments != serde_json::Value::Null)
+    );
+    assert!(
+        replies
+            .iter()
+            .flat_map(|message| message.message.tool_calls.iter())
+            .all(|call| call.arguments == serde_json::Value::Null)
+    );
+
+    let session_snapshot = |activity_detail| {
+        let response = connection.request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::GetAgentSessionSnapshot {
+                session_id: session.id,
+                activity_detail,
+            },
+        )));
+        let Ok(ServerResponse::Session(SessionResponse::AgentSessionSnapshot(snapshot))) =
+            response.result
+        else {
+            panic!("unexpected session snapshot response");
+        };
+        snapshot.active_run.expect("the session carries its run")
+    };
+    let full = session_snapshot(ActivityDetail::Full);
+    let replies = session_snapshot(ActivityDetail::Replies);
+    assert_eq!(full.messages.len(), replies.messages.len());
+    assert_eq!(full.activities.len(), replies.activities.len());
+    assert_eq!(
+        full.message_timeline_ordinals,
+        replies.message_timeline_ordinals
+    );
+    let keeps_result = |activity: &loom_protocol::AgentActivityRecord| match &activity.data {
+        loom_protocol::AgentActivityData::ModelTurn { .. } => false,
+        loom_protocol::AgentActivityData::ToolCall { result, .. }
+        | loom_protocol::AgentActivityData::File { result, .. }
+        | loom_protocol::AgentActivityData::Search { result, .. }
+        | loom_protocol::AgentActivityData::Command { result, .. } => result.is_some(),
+    };
+    assert!(
+        full.activities.iter().any(keeps_result),
+        "the full session projection carries a tool result"
+    );
+    assert!(
+        replies
+            .activities
+            .iter()
+            .all(|activity| !keeps_result(activity)),
+        "a replies read carries no tool result"
+    );
+    assert!(
+        replies
+            .activities
+            .iter()
+            .all(|activity| match &activity.data {
+                loom_protocol::AgentActivityData::ModelTurn { .. } => true,
+                loom_protocol::AgentActivityData::ToolCall { call, .. }
+                | loom_protocol::AgentActivityData::File { call, .. }
+                | loom_protocol::AgentActivityData::Search { call, .. }
+                | loom_protocol::AgentActivityData::Command { call, .. } =>
+                    call.arguments == serde_json::Value::Null,
+            })
+    );
+    fs::remove_dir_all(&backend.session_root_base).unwrap();
 }

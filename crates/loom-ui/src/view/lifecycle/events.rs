@@ -9,6 +9,7 @@ impl LoomView {
         mut fallback: Option<AgentRunSnapshotProjection>,
     ) -> Result<(), LoomError> {
         let session_id = self.active_session.id;
+        let activity_detail = self.output_detail.activity_detail(self.show_reasoning);
         for resync_attempt in 0..=1 {
             // The backend bounds an events batch to one response frame, so the
             // pages of a larger backlog are followed here and the rebuild below
@@ -18,6 +19,7 @@ impl LoomView {
                 session_id,
                 after_sequence,
                 self.event_stream_epoch.clone(),
+                activity_detail,
             );
             match response.result? {
                 ServerResponse::Events(EventsResponse::SessionEvents {
@@ -45,7 +47,10 @@ impl LoomView {
                     let refreshed =
                         self.connection
                             .request(RequestEnvelope::new(ClientRequest::Session(
-                                SessionRequest::GetAgentSessionInitialState { session_id },
+                                SessionRequest::GetAgentSessionInitialState {
+                                    session_id,
+                                    activity_detail,
+                                },
                             )));
                     if let Ok(ServerResponse::Session(SessionResponse::AgentSessionInitialState(
                         initial,

@@ -20,6 +20,7 @@ fn creates_session_and_reads_event_stream() {
 
     let events = connection.request(RequestEnvelope::new(ClientRequest::Events(
         EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: Some(session_id),
             workspace_id: None,
             after_sequence: None,
@@ -35,7 +36,10 @@ fn creates_session_and_reads_event_stream() {
     assert_eq!(events[0].session_id, session_id);
 
     let initial = connection.request(RequestEnvelope::new(ClientRequest::Session(
-        SessionRequest::GetAgentSessionInitialState { session_id },
+        SessionRequest::GetAgentSessionInitialState {
+            activity_detail: loom_protocol::ActivityDetail::Full,
+            session_id,
+        },
     )));
     let ServerResponse::Session(SessionResponse::AgentSessionInitialState(initial)) =
         initial.result.unwrap()
@@ -59,6 +63,7 @@ fn creates_session_and_reads_event_stream() {
 
     let resumed = connection.request(RequestEnvelope::new(ClientRequest::Events(
         EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
             session_id: Some(session_id),
             workspace_id: None,
             after_sequence: Some(initial.cursor),

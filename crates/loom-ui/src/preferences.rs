@@ -2,8 +2,10 @@
 //!
 //! These settings describe how this client renders agent output. They are not
 //! workspace state: the backend never sees them and they do not travel to other
-//! clients or workers. Native builds keep them in `config_dir()`; the browser
-//! build keeps them in `localStorage`.
+//! clients or workers. What the backend does see is the activity projection a
+//! level implies for one read (`activity_detail` on the requests that carry
+//! transcript content), never the setting itself. Native builds keep them in
+//! `config_dir()`; the browser build keeps them in `localStorage`.
 
 use loom_core::{ErrorCode, LoomError};
 use serde::{Deserialize, Serialize};

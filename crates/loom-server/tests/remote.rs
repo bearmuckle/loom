@@ -249,6 +249,7 @@ async fn events(
     match connection
         .request(RequestEnvelope::new(ClientRequest::Events(
             EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: Some(session_id),
                 workspace_id: None,
                 after_sequence,
@@ -1052,6 +1053,7 @@ async fn stale_cursors_return_a_snapshot_fallback() {
     let response = connection
         .request(RequestEnvelope::new(ClientRequest::Events(
             EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: Some(first.id),
                 workspace_id: None,
                 after_sequence: Some(EventSequence::new(1)),
@@ -1079,6 +1081,7 @@ async fn stale_cursors_return_a_snapshot_fallback() {
     let resumed = connection
         .request(RequestEnvelope::new(ClientRequest::Events(
             EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: Some(first.id),
                 workspace_id: None,
                 after_sequence: Some(EventSequence::new(6)),
@@ -1109,6 +1112,7 @@ async fn session_cursor_before_creation_ignores_other_sessions_events() {
     let response = connection
         .request(RequestEnvelope::new(ClientRequest::Events(
             EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: Some(target_session.id),
                 workspace_id: None,
                 after_sequence: Some(EventSequence::default()),
@@ -1496,6 +1500,7 @@ async fn a_batch_above_the_frame_limit_is_delivered_in_followable_pages() {
         let response = connection
             .request(RequestEnvelope::new(ClientRequest::Events(
                 EventsRequest::GetSessionEvents {
+                    activity_detail: loom_protocol::ActivityDetail::Full,
                     session_id: Some(session.id),
                     workspace_id: None,
                     after_sequence: cursor,
@@ -1546,6 +1551,7 @@ async fn a_batch_above_the_frame_limit_is_delivered_in_followable_pages() {
     let drained = connection
         .request(RequestEnvelope::new(ClientRequest::Events(
             EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
                 session_id: Some(session.id),
                 workspace_id: None,
                 after_sequence: Some(latest),

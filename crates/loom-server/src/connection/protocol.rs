@@ -604,12 +604,15 @@ impl InProcessConnection {
             })
             | ClientRequest::Session(SessionRequest::GetAgentSessionSnapshot {
                 session_id: requested_session,
+                ..
             })
             | ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata {
                 session_id: requested_session,
+                ..
             })
             | ClientRequest::Session(SessionRequest::GetAgentSessionInitialState {
                 session_id: requested_session,
+                ..
             })
             | ClientRequest::Session(SessionRequest::RenameAgentSession {
                 session_id: requested_session,
@@ -844,6 +847,7 @@ impl InProcessConnection {
             })
             | ClientRequest::Run(RunRequest::GetAgentRunSnapshot {
                 run_id: requested_run,
+                ..
             })
             | ClientRequest::Run(RunRequest::GetRunCheckpoint {
                 run_id: requested_run,

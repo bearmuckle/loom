@@ -12,6 +12,7 @@ impl InProcessConnection {
                 workspace_id,
                 after_sequence,
                 stream_epoch,
+                activity_detail,
             }) => {
                 if session_id.is_some() && workspace_id.is_some() {
                     return Err(LoomError::invalid_request(
@@ -128,9 +129,13 @@ impl InProcessConnection {
                                             .is_none_or(|readable| readable.contains(&session.id))
                                     })
                                     .collect(),
-                                events: self.filter_private_workspace_events(
-                                    filter_workspace_feed(window.events, readable.as_ref()),
-                                )?,
+                                events: {
+                                    let mut events = self.filter_private_workspace_events(
+                                        filter_workspace_feed(window.events, readable.as_ref()),
+                                    )?;
+                                    project_workspace_feed_events(&mut events, activity_detail);
+                                    events
+                                },
                                 oldest_sequence,
                                 latest_sequence,
                                 stream_epoch: current_stream_epoch,
@@ -143,10 +148,15 @@ impl InProcessConnection {
                     let page = self.bound_workspace_events(events)?;
                     return Ok(ServerResponse::Events(EventsResponse::WorkspaceEvents {
                         workspace_id,
-                        events: self.filter_private_workspace_events(filter_workspace_feed(
-                            page.events,
-                            self.readable_sessions()?.as_ref(),
-                        ))?,
+                        events: {
+                            let mut events =
+                                self.filter_private_workspace_events(filter_workspace_feed(
+                                    page.events,
+                                    self.readable_sessions()?.as_ref(),
+                                ))?;
+                            project_workspace_feed_events(&mut events, activity_detail);
+                            events
+                        },
                         stream_epoch: current_stream_epoch,
                         next_after_sequence: page.next_after_sequence,
                     }));
@@ -205,7 +215,11 @@ impl InProcessConnection {
                         return Ok(ServerResponse::Events(
                             EventsResponse::SessionEventsSnapshot {
                                 session: self.backend.sessions()?.get(session_id)?,
-                                events: self.filter_private_events(window.events)?,
+                                events: {
+                                    let mut events = self.filter_private_events(window.events)?;
+                                    project_envelopes(&mut events, activity_detail);
+                                    events
+                                },
                                 oldest_sequence,
                                 latest_sequence: session_latest_sequence
                                     .unwrap_or(journal.next_sequence),
@@ -237,19 +251,31 @@ impl InProcessConnection {
                     })
                     .collect();
                 Ok(ServerResponse::Events(EventsResponse::SessionEvents {
-                    events: self.filter_private_events(events)?,
+                    events: {
+                        let mut events = self.filter_private_events(events)?;
+                        project_envelopes(&mut events, activity_detail);
+                        events
+                    },
                     stream_epoch: session_id.map(|_| self.backend.node_id.clone()),
                     next_after_sequence: batch.next_after_sequence,
                 }))
             }
-            ClientRequest::Events(EventsRequest::GetRecentSessionEvents { session_id, limit }) => {
+            ClientRequest::Events(EventsRequest::GetRecentSessionEvents {
+                session_id,
+                limit,
+                activity_detail,
+            }) => {
                 // This batch is a tail the caller sized with `limit`, not a batch
                 // that grows with the journal, so its own bound is the count the
                 // caller asked for; the resync path is the one that pages.
                 Ok(ServerResponse::Events(EventsResponse::SessionEvents {
-                    events: self.filter_private_events(
-                        self.recent_session_events(session_id, limit as usize)?,
-                    )?,
+                    events: {
+                        let mut events = self.filter_private_events(
+                            self.recent_session_events(session_id, limit as usize)?,
+                        )?;
+                        project_envelopes(&mut events, activity_detail);
+                        events
+                    },
                     stream_epoch: Some(self.backend.node_id.clone()),
                     next_after_sequence: None,
                 }))

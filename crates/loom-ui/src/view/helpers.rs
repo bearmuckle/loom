@@ -554,15 +554,25 @@ pub(crate) fn collect_session_events_sync(
     session_id: AgentSessionId,
     after_sequence: Option<EventSequence>,
     stream_epoch: Option<String>,
+    activity_detail: ActivityDetail,
 ) -> ResponseEnvelope {
     let mut cursor = after_sequence;
     let mut epoch = stream_epoch;
-    let mut response =
-        connection.request(session_events_request(session_id, cursor, epoch.clone()));
+    let mut response = connection.request(session_events_request(
+        session_id,
+        cursor,
+        epoch.clone(),
+        activity_detail,
+    ));
     while let Some((next, page_epoch)) = events_page_continuation(&response, cursor) {
         cursor = Some(next);
         epoch = page_epoch.or(epoch);
-        let page = connection.request(session_events_request(session_id, cursor, epoch.clone()));
+        let page = connection.request(session_events_request(
+            session_id,
+            cursor,
+            epoch.clone(),
+            activity_detail,
+        ));
         response = merged_event_page(response, page);
     }
     response
@@ -573,8 +583,10 @@ pub(crate) fn session_events_request(
     session_id: AgentSessionId,
     after_sequence: Option<EventSequence>,
     stream_epoch: Option<String>,
+    activity_detail: ActivityDetail,
 ) -> RequestEnvelope {
     RequestEnvelope::new(ClientRequest::Events(EventsRequest::GetSessionEvents {
+        activity_detail,
         session_id: Some(session_id),
         workspace_id: None,
         after_sequence,
@@ -656,9 +668,11 @@ pub(crate) fn load_transcript_page_sync(
     connection: &ClientConnection,
     run_id: RunId,
     before_ordinal: Option<u64>,
+    activity_detail: ActivityDetail,
 ) -> Result<TranscriptPage, LoomError> {
     let response = connection.request(RequestEnvelope::new(ClientRequest::Run(
         RunRequest::GetAgentRunTranscriptPage {
+            activity_detail,
             run_id,
             before_ordinal,
             limit: MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE,
@@ -934,9 +948,14 @@ pub(crate) fn session_id_for_request(
 ) -> Option<AgentSessionId> {
     match request {
         ClientRequest::Session(SessionRequest::GetAgentSession { session_id })
-        | ClientRequest::Session(SessionRequest::GetAgentSessionSnapshot { session_id })
-        | ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata { session_id })
-        | ClientRequest::Session(SessionRequest::GetAgentSessionInitialState { session_id })
+        | ClientRequest::Session(SessionRequest::GetAgentSessionSnapshot { session_id, .. })
+        | ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata {
+            session_id,
+            ..
+        })
+        | ClientRequest::Session(SessionRequest::GetAgentSessionInitialState {
+            session_id, ..
+        })
         | ClientRequest::Session(SessionRequest::RenameAgentSession { session_id, .. })
         | ClientRequest::Session(SessionRequest::ArchiveAgentSession { session_id })
         | ClientRequest::Events(EventsRequest::GetRecentSessionEvents { session_id, .. })
@@ -3128,6 +3147,23 @@ pub(crate) fn initial_worker_nodes(
 mod tests {
     use super::*;
     use loom_protocol::WorkspaceChangeKind;
+
+    #[test]
+    fn a_low_detail_read_asks_for_replies_only() {
+        let request = session_events_request(
+            AgentSessionId::new(),
+            None,
+            None,
+            OutputDetail::Low.activity_detail(false),
+        );
+        let ClientRequest::Events(EventsRequest::GetSessionEvents {
+            activity_detail, ..
+        }) = request.request
+        else {
+            panic!("expected a session events request");
+        };
+        assert_eq!(activity_detail, loom_protocol::ActivityDetail::Replies);
+    }
 
     #[test]
     fn source_labels_stay_short_and_name_the_owner() {
