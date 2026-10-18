@@ -345,6 +345,11 @@ const SHARED_NEGOTIATION_CAPABILITIES: &[Capability] = &[
     Capability::ConfigureProviders,
     Capability::ReadWorkspaceConfig,
     Capability::BrowseGitHubRepositories,
+    // The roster, composer, and sign-in-dialog prompts key off the negotiated
+    // capability, so a client that omits it is told the worker offers no
+    // sign-in even when it does. A worker that disables sign-in still reports
+    // the refusal when a sign-in starts.
+    Capability::GitHubSignIn,
     Capability::ConfigureApprovalPolicy,
     Capability::ReadVcsStatus,
     Capability::ReadVcsDiff,
@@ -1084,6 +1089,20 @@ mod tests {
         let capabilities = negotiation_capabilities();
         assert!(capabilities.contains(Capability::ReadUsage));
         assert!(capabilities.contains(Capability::InspectContext));
+    }
+
+    #[test]
+    fn current_client_contract_negotiates_github_sign_in() {
+        assert!(negotiation_capabilities().contains(Capability::GitHubSignIn));
+    }
+
+    #[test]
+    fn a_worker_that_offers_sign_in_negotiates_it_with_the_client() {
+        let connection = ClientConnection::InProcess(Box::new(
+            crate::local_backend::OwnedBackend::new().connect(),
+        ));
+        let negotiation = negotiate(&connection).unwrap();
+        assert!(negotiation.capabilities.contains(Capability::GitHubSignIn));
     }
 
     #[test]
