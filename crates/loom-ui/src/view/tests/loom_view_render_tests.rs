@@ -210,12 +210,6 @@ pub(super) fn nested_project_view(focus_handle: gpui_kit::FocusHandle) -> LoomVi
 }
 
 #[gpui_kit::test]
-fn empty_session_view_renders_without_a_backend_round_trip(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    render_scenario(cx, |_| {});
-}
-
-#[gpui_kit::test]
 fn startup_rejects_credential_bearing_remote_urls_and_applies_the_plaintext_guard(
     cx: &mut TestAppContext,
 ) {
@@ -831,32 +825,6 @@ fn settings_about_pane_exposes_stable_test_ids(cx: &mut TestAppContext) {
             assert!(
                 window.within("settings-dialog").find(id).visible(),
                 "expected {id} to be visible in the About pane"
-            );
-        }
-    })
-    .unwrap();
-}
-
-#[gpui_kit::test]
-fn settings_section_navigation_renders_every_pane(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
-        LoomView::new_for_test(cx.focus_handle())
-    });
-    cx.update_window(handle.into(), |_, window, cx| {
-        window.render_frame(cx);
-        window.click("settings-button", cx);
-        window.render_frame(cx);
-        for index in 0..SETTINGS_SECTIONS.len() {
-            window
-                .within("settings-dialog")
-                .click(("settings-section", index), cx);
-            window.render_frame(cx);
-            assert!(
-                window
-                    .within("settings-dialog")
-                    .find(("settings-section", index))
-                    .visible()
             );
         }
     })

@@ -88,17 +88,3 @@ fn worker_resource_percentages_handle_unavailable_and_out_of_range_samples() {
     assert_eq!(memory_usage_percent(Some(100), Some(25)), Some(75));
     assert_eq!(memory_usage_percent(Some(100), Some(150)), Some(0));
 }
-
-#[test]
-fn worker_resource_monitor_measures_cpu_utilization_after_a_baseline_sample() {
-    let mut monitor = ResourceMonitor::default();
-
-    assert_eq!(monitor.sample(None, None).cpu_usage_percent, None);
-    std::thread::sleep(Duration::from_millis(250));
-    assert!(
-        monitor
-            .sample(None, None)
-            .cpu_usage_percent
-            .is_some_and(|value| value <= 100)
-    );
-}

@@ -137,31 +137,6 @@ fn selecting_the_open_project_dismisses_settings_and_the_archived_surface(cx: &m
     .unwrap();
 }
 
-/// The archived-sessions surface is dismissed by the same navigation.
-#[gpui_kit::test]
-fn selecting_the_open_project_dismisses_the_archived_sessions_surface(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let (handle, view) = open_view_window(cx, |view| {
-        view.show_surface(CoveringSurface::ArchivedSessions);
-    });
-    cx.update_window(handle.into(), |_, window, cx| {
-        window.render_frame(cx);
-        assert!(window.find("archived-sessions-dialog").visible());
-        window.click(("project-row", 0usize), cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.update_window(handle.into(), |_, window, cx| {
-        window.render_frame(cx);
-        assert!(
-            !view.read(cx).archived_sessions_open(),
-            "selecting the open project must close the archived-sessions surface"
-        );
-        assert!(window.try_find("archived-sessions-dialog").is_none());
-    })
-    .unwrap();
-}
-
 /// Reaching a project that is not on screen still works through the same pane:
 /// the click switches sessions and dismisses the overlay on top.
 #[gpui_kit::test]

@@ -575,6 +575,12 @@ fn run_control_view(
 #[gpui_kit::test]
 fn run_control_buttons_follow_run_state_and_role(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
+    // One window renders every case: each pair only changes the fields the
+    // controls read, so a fresh window per case would spend the frame budget
+    // on rebuilding the same view.
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        run_control_view(cx, AgentRunState::Executing, SessionRole::Participant)
+    });
     let cases = [
         (
             AgentRunState::Executing,
@@ -613,9 +619,21 @@ fn run_control_buttons_follow_run_state_and_role(cx: &mut TestAppContext) {
         ),
     ];
     for (state, role, expected) in cases {
-        let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
-            run_control_view(cx, state, role)
-        });
+        handle
+            .update(cx, |view, _window, _cx| {
+                let me = view
+                    .collaboration
+                    .identity
+                    .clone()
+                    .expect("the view is bound to the person it renders as");
+                view.collaboration
+                    .replace_roster(view.active_session.id, vec![roster(&me, role)]);
+                let run = run_snapshot(view, state);
+                view.active_run_id = Some(run.id);
+                view.active_run = Some(run);
+                view.run_state = Some(state);
+            })
+            .unwrap();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             let shown =
@@ -627,6 +645,7 @@ fn run_control_buttons_follow_run_state_and_role(cx: &mut TestAppContext) {
         handle
             .update(cx, |view, _window, _cx| {
                 view.active_run_id = None;
+                view.active_run = None;
                 view.run_state = None;
             })
             .unwrap();

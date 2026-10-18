@@ -3160,6 +3160,8 @@ mod tests {
     fn sizing_and_formatting_helpers() {
         assert_eq!(composer_height("", false), 28.0);
         assert_eq!(composer_height("a\nb", false), 48.0);
+        // Both layouts clamp a long draft to their own maximum height.
+        assert_eq!(composer_height(&"x\n".repeat(20), false), 168.0);
         assert_eq!(composer_height("", true), 44.0);
         assert_eq!(composer_height("a\nb", true), 64.0);
         assert_eq!(composer_height(&"x\n".repeat(20), true), 184.0);

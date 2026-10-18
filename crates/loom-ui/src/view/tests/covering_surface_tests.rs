@@ -124,8 +124,14 @@ fn assert_on_screen(
 #[gpui_kit::test]
 fn every_ordered_pair_leaves_exactly_one_surface_on_screen(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
+    // One window serves every pair: the pair only changes what covers the
+    // conversation, so a window per first surface would re-render the same
+    // session for no extra coverage.
+    let (handle, view) = open_view_window(cx);
     for first in CoveringSurface::ALL {
-        let (handle, view) = open_view_window(cx);
+        // Each row starts from an uncovered conversation, so the first opener
+        // is checked on its own rather than as a replacement.
+        view.update(cx, |view, _cx| view.close_covering_surface());
         open_surface(cx, handle, &view, first);
         assert_on_screen(cx, handle, &view, Some(first));
         for second in CoveringSurface::ALL {
@@ -199,8 +205,8 @@ fn the_settings_sections_open_and_close_as_one_surface(cx: &mut TestAppContext) 
 #[gpui_kit::test]
 fn escape_closes_the_surface_on_screen(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
+    let (handle, view) = open_view_window(cx);
     for surface in CoveringSurface::ALL {
-        let (handle, view) = open_view_window(cx);
         open_surface(cx, handle, &view, surface);
         assert_on_screen(cx, handle, &view, Some(surface));
         let consumed = view.update(cx, |view, cx| view.handle_escape(cx));
@@ -215,6 +221,7 @@ fn escape_closes_the_surface_on_screen(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn each_surface_closes_from_its_own_control(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
+    let (handle, view) = open_view_window(cx);
     for (surface, control, pane) in [
         (
             CoveringSurface::ArchivedSessions,
@@ -233,7 +240,6 @@ fn each_surface_closes_from_its_own_control(cx: &mut TestAppContext) {
             "source-dialog-pane",
         ),
     ] {
-        let (handle, view) = open_view_window(cx);
         open_surface(cx, handle, &view, surface);
         assert_on_screen(cx, handle, &view, Some(surface));
         cx.update_window(handle.into(), |_, window, cx| {
@@ -305,8 +311,8 @@ fn a_submitted_rename_steps_its_dialog_aside(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 fn opening_a_surface_puts_the_secondary_chrome_away(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
+    let (handle, view) = open_view_window(cx);
     for surface in CoveringSurface::ALL {
-        let (handle, view) = open_view_window(cx);
         view.update(cx, |view, cx| {
             view.session_drawer_open = true;
             view.review.open = true;

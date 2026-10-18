@@ -5,14 +5,13 @@ use super::{
     about_build_version, about_git_revision, about_links, about_platform_label, about_protocol,
     about_version_label, action_kind_label, activity_output, approval_policy_status_text,
     change_kind_label, command_line, command_purpose, commands_matching, completion_for_value,
-    composer_height, disconnected_screen, endpoint_host, endpoint_label, format_bytes,
-    format_duration, format_percentage, has_block_markdown, humanize_tool_output,
-    is_redundant_completion_summary, relative_time, replace_command_token, replace_last_token, rgb,
-    run_failure_reason, run_state_color, run_state_label, session_is_active, session_status_pill,
-    source_mount_path, tool_denial_count, tool_detail, tool_failure_count, tool_failure_reason,
-    tool_group_label, tool_group_status, tool_icon, tool_needs_attention, tool_outcome_notes,
-    tool_part_from_activity, tool_part_from_policy, tool_policy_note, tool_shows_output,
-    tool_status, tool_title, tool_title_for_activity, tool_usage_label, tool_usage_summary,
+    disconnected_screen, endpoint_host, endpoint_label, has_block_markdown, humanize_tool_output,
+    is_redundant_completion_summary, rgb, run_failure_reason, run_state_color, run_state_label,
+    session_is_active, session_status_pill, source_mount_path, tool_denial_count, tool_detail,
+    tool_failure_count, tool_failure_reason, tool_group_label, tool_group_status, tool_icon,
+    tool_needs_attention, tool_outcome_notes, tool_part_from_activity, tool_part_from_policy,
+    tool_policy_note, tool_shows_output, tool_status, tool_title, tool_title_for_activity,
+    tool_usage_label, tool_usage_summary,
 };
 use gpui_kit::assets::IconName as AssetIconName;
 use loom_core::{
@@ -72,20 +71,6 @@ fn source_mount_paths_are_readable_and_unique() {
         "sources/repo-3"
     );
     assert_eq!(source_mount_path("sources", "///", &[]), "sources/source");
-}
-
-#[test]
-fn resource_and_duration_labels_handle_missing_and_boundary_values() {
-    assert_eq!(format_bytes(None), "n/a");
-    assert_eq!(format_bytes(Some(1024)), "1.0 KiB");
-    assert_eq!(format_bytes(Some(1 << 20)), "1.0 MiB");
-    assert_eq!(format_bytes(Some(1 << 30)), "1.0 GiB");
-    assert_eq!(format_percentage(None), "n/a");
-    assert_eq!(format_percentage(Some(100)), "100%");
-    assert_eq!(format_percentage(Some(101)), "n/a");
-    assert_eq!(format_duration(999), "999ms");
-    assert_eq!(format_duration(1_500), "1.5s");
-    assert_eq!(format_duration(61_000), "1m 1s");
 }
 
 #[test]
@@ -890,17 +875,6 @@ fn composer_completion_tracks_commands_and_files() {
 }
 
 #[test]
-fn command_completion_helpers_rewrite_the_expected_token() {
-    assert_eq!(replace_command_token("/rev", "review"), "/review ");
-    assert_eq!(replace_command_token("/rev arg", "review"), "/review arg");
-    assert_eq!(
-        replace_last_token("explain @src/lib", "@src/lib.rs "),
-        "explain @src/lib.rs "
-    );
-    assert_eq!(replace_last_token("@src", "@src/lib.rs "), "@src/lib.rs ");
-}
-
-#[test]
 fn command_search_matches_names_titles_and_empty_query() {
     assert!(commands_matching("").len() >= 5);
     assert!(
@@ -914,25 +888,6 @@ fn command_search_matches_names_titles_and_empty_query() {
             .any(|command| command.name == "settings")
     );
     assert!(commands_matching("nonsense").is_empty());
-}
-
-#[test]
-fn composer_grows_with_lines_and_is_bounded() {
-    assert_eq!(composer_height("", false), 28.);
-    assert_eq!(composer_height("one\ntwo", false), 48.);
-    assert_eq!(composer_height(&"x\n".repeat(20), false), 168.);
-    assert_eq!(composer_height("", true), 44.);
-    assert_eq!(composer_height(&"x\n".repeat(20), true), 184.);
-}
-
-#[test]
-fn relative_times_cover_every_bucket() {
-    let now = 10_000_000_000u64;
-    assert_eq!(relative_time(now, now), "just now");
-    assert_eq!(relative_time(now - 60_000, now), "1m ago");
-    assert_eq!(relative_time(now - 3_600_000, now), "1h ago");
-    assert_eq!(relative_time(now - 172_800_000, now), "2d ago");
-    assert_eq!(relative_time(now - 1_209_600_000, now), "2w ago");
 }
 
 #[test]

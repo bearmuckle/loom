@@ -130,10 +130,9 @@ impl LoomView {
                 let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
             }
             #[cfg(not(target_family = "wasm"))]
-            cx.background_spawn(async move {
-                std::thread::sleep(Duration::from_millis(delay));
-            })
-            .await;
+            cx.background_executor()
+                .timer(Duration::from_millis(delay))
+                .await;
             view.update(cx, |view, cx| {
                 view.connectivity_attempt_in_flight = false;
                 if view.reconnecting.is_some() {

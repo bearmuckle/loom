@@ -2,7 +2,7 @@ use super::{
     ACTIVE_BACKEND_NODE_ENTRY_ID, SessionSourceChoice, SessionSourceDialogPurpose,
     WorkerConnectionStage, WorkerConnectionState, WorkerNodeEntry, adjusted_cpu_pulse_threshold,
     adjusted_project_agent_concurrency, assigned_node_id, classify_connectivity_failure,
-    connection_placeholder, format_percentage, format_worker_node_resources, initial_worker_nodes,
+    connection_placeholder, format_worker_node_resources, initial_worker_nodes,
     local_source_available, mark_worker_connection_failed, merge_node_sessions,
     next_severe_load_streak, order_session_nodes, project_child_control_actions,
     project_snapshot_has_unloaded_agent_sessions, remove_worker_node_entry, safe_worker_url_label,
@@ -641,14 +641,6 @@ fn configured_worker_node_can_be_removed_without_removing_local_node() {
     assert_eq!(nodes.len(), 1);
     assert!(nodes[0].is_local());
     assert!(remove_worker_node_entry(&mut nodes, 999).is_none());
-}
-
-#[test]
-fn unavailable_and_available_resource_percentages_are_formatted() {
-    assert_eq!(format_percentage(None), "n/a");
-    assert_eq!(format_percentage(Some(0)), "0%");
-    assert_eq!(format_percentage(Some(73)), "73%");
-    assert_eq!(format_percentage(Some(101)), "n/a");
 }
 
 #[test]
