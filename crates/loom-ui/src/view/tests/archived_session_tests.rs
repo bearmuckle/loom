@@ -611,6 +611,361 @@ fn loading_archived_sessions_reuses_a_project_snapshot_the_client_already_has(
     });
 }
 
+/// Writes a durable state file holding a project root and a real delegated
+/// child, with only the child archived, and returns the workspace and the two
+/// session ids a restored worker reports for them.
+///
+/// The rows are the ones the backend itself writes when a project manager
+/// delegates: `create_project_child` stores the child session, its hierarchy
+/// edge, and its delegated task in one transaction. A backend that reopens the
+/// file therefore projects a genuine project tree instead of a synthetic one.
+fn seed_archived_delegated_child(
+    state_path: &std::path::Path,
+) -> (WorkspaceId, AgentSessionId, AgentSessionId) {
+    let persistence =
+        loom_persistence::FilePersistence::open(state_path).expect("durable state file");
+    let workspace_id = WorkspaceId::new();
+    let root_id = AgentSessionId::new();
+    let created_at = Timestamp::now();
+    let root = AgentSessionSnapshot {
+        id: root_id,
+        workspace_id,
+        name: "Manager".to_owned(),
+        state: AgentSessionState::Idle,
+        created_at,
+        updated_at: created_at,
+    };
+    persistence
+        .save_state_with_sessions(&loom_core::SessionManagerState {
+            sessions: BTreeMap::from([(root_id, root)]),
+            next_sequence: EventSequence::new(1),
+        })
+        .expect("seed the project root");
+
+    let child_id = AgentSessionId::new();
+    let child = AgentSessionSnapshot {
+        id: child_id,
+        workspace_id,
+        name: "Researcher".to_owned(),
+        state: AgentSessionState::Archived,
+        created_at,
+        updated_at: created_at,
+    };
+    // A completed task is not resumed when the worker reopens, so the child
+    // stays exactly as the previous run left it.
+    let task = loom_core::DelegatedTaskRecord {
+        task_id: loom_core::TaskId::new(),
+        project_id: loom_core::ProjectId::from_uuid(*root_id.as_uuid()),
+        requester_session_id: root_id,
+        target_session_id: child_id,
+        child_name: child.name.clone(),
+        intent: "Inspect the archived-session pane".to_owned(),
+        model_id: "deterministic/demo".to_owned(),
+        context_references: Vec::new(),
+        dependencies: Vec::new(),
+        code_change: false,
+        permissions: loom_core::ProjectAgentPermissions::default(),
+        status: loom_core::DelegatedTaskStatus::Completed,
+        created_at,
+        updated_at: created_at,
+    };
+    persistence
+        .create_project_child(
+            loom_core::RequestId::new(),
+            &child,
+            EventSequence::new(2),
+            &task,
+        )
+        .expect("create the delegated child");
+    (workspace_id, root_id, child_id)
+}
+
+#[gpui_kit::test]
+fn an_archived_sub_agent_of_a_durable_project_is_never_listed(cx: &mut TestAppContext) {
+    let state_path =
+        std::env::temp_dir().join(format!("loom-ui-archived-child-{}", uuid::Uuid::new_v4()));
+    let (workspace_id, root_id, child_id) = seed_archived_delegated_child(&state_path);
+
+    // A durable worker restores the real hierarchy, so a load of the pane asks
+    // the worker itself which project the archived session belongs to.
+    let backend =
+        crate::local_backend::OwnedBackend::new_persistent_with_github_copilot(state_path.clone())
+            .expect("durable backend");
+    let connection = ClientConnection::InProcess(Box::new(backend.connect()));
+    crate::connection::negotiate(&connection).unwrap();
+    let workspaces = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::ListWorkspaces,
+        )))
+        .result
+    {
+        Ok(ServerResponse::Workspace(WorkspaceResponse::Workspaces { workspaces })) => workspaces,
+        response => panic!("listing workspaces failed: {response:?}"),
+    };
+    assert!(
+        workspaces
+            .iter()
+            .all(|workspace| workspace.id != workspace_id),
+        "the pre-seeded workspace is only known through its sessions"
+    );
+
+    let view = cx.new(|cx| {
+        let mut view = view_over_connection(&connection, cx);
+        view.workspace_id = workspace_id;
+        // The pane lists the workspaces the client already knows, so the seeded
+        // workspace is one it holds but the worker never had to create.
+        view.workspaces = vec![WorkspaceRecord {
+            id: workspace_id,
+            name: "Archived child".to_owned(),
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+        }];
+        view.active_session = AgentSessionSnapshot {
+            id: root_id,
+            workspace_id,
+            name: "Manager".to_owned(),
+            state: AgentSessionState::Idle,
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+        };
+        view.open_archived_sessions(cx);
+        view
+    });
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        let view = view.read(cx);
+        // Only the delegated child is archived, and the load really saw it.
+        let archived = view
+            .archived_sessions
+            .entries
+            .iter()
+            .map(|entry| entry.session.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            archived,
+            vec![child_id],
+            "the child is the only archived session"
+        );
+        // The worker's authoritative projection names the child as a project
+        // member, which is what the pane has to go by.
+        let project = view
+            .archived_sessions
+            .projects
+            .iter()
+            .find(|project| project.root_session_id == root_id)
+            .expect("the worker projected the project the child belongs to");
+        assert!(
+            project
+                .agents
+                .iter()
+                .any(|agent| agent.session_id == child_id && agent.depth == 2),
+            "{project:?}"
+        );
+        let groups = view.grouped_archived_sessions(Timestamp::now().as_unix_millis());
+        assert!(
+            groups.is_empty(),
+            "an archived sub agent is neither a project row nor a no-project row: {groups:?}"
+        );
+    });
+    backend.shutdown().ok();
+}
+
+#[gpui_kit::test]
+fn an_archived_project_whose_cached_tree_predates_a_delegation_still_hides_the_child(
+    cx: &mut TestAppContext,
+) {
+    let day = 86_400_000u64;
+    let now = 1_700_000_000_000u64;
+    let root = AgentSessionId::new();
+    let child = AgentSessionId::new();
+    let view = cx.new(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        // The client's cached tree was captured before the child was delegated.
+        // An archived project's tree is never refreshed: only the sessions in
+        // `view.sessions` are requested again, and archived ones are not in it,
+        // so this tree stays stale for as long as the project is archived.
+        view.project_tree_snapshots = vec![project_snapshot(root, &[])];
+        view
+    });
+
+    view.update(cx, |view, cx| {
+        view.finish_archived_sessions_load(
+            vec![
+                entry(archived_session(root, "Checkout flow", now - 30 * day)),
+                entry(archived_session(child, "Researcher", now - 29 * day)),
+            ],
+            vec![
+                // The stale cached tree comes first and names only the root;
+                // the projection fetched for the archived child comes last and
+                // names both. The load has to keep the second one: the first
+                // only describes the project as it looked before the
+                // delegation.
+                project_snapshot(root, &[]),
+                project_snapshot(root, &[child]),
+            ],
+            RetentionPolicyState::Unavailable,
+            false,
+            Vec::new(),
+            cx,
+        );
+    });
+
+    cx.update(|cx| {
+        let view = view.read(cx);
+        let groups = view.grouped_archived_sessions(now);
+        assert_eq!(
+            groups.len(),
+            1,
+            "one project row and no no-project group: {groups:?}"
+        );
+        let group = &groups[0];
+        assert_eq!(group.project_root, Some(root));
+        assert_eq!(group.label, "Checkout flow");
+        assert_eq!(group.rows.len(), 1);
+        let row = &group.rows[0];
+        assert_eq!(row.session_id, root);
+        assert!(row.is_project);
+        // The archived root still dates the row, and the tree it deletes is the
+        // one the authoritative projection describes.
+        assert_eq!(row.age, archived_age_label(now - 30 * day, now));
+        assert_eq!(row.session_count, 2, "the whole tree, not just the root");
+        assert!(
+            group.rows.iter().all(|row| row.session_id != child),
+            "the child has no row of its own: {group:?}"
+        );
+        assert_eq!(
+            view.archived_sessions.projects.len(),
+            1,
+            "one projection per project is kept"
+        );
+        assert_eq!(
+            view.archived_sessions.projects[0].agents.len(),
+            2,
+            "the projection naming the child wins over the stale cached one"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn a_more_complete_cached_tree_still_wins_over_a_one_member_fallback(cx: &mut TestAppContext) {
+    let now = 1_700_000_000_000u64;
+    let root = AgentSessionId::new();
+    let child = AgentSessionId::new();
+    let standalone = AgentSessionId::new();
+    let view = cx.new(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.project_tree_snapshots = vec![project_snapshot(root, &[child])];
+        view
+    });
+
+    view.update(cx, |view, cx| {
+        view.finish_archived_sessions_load(
+            vec![
+                entry(archived_session(child, "Researcher", now)),
+                entry(archived_session(standalone, "Standalone", now - 60_000)),
+            ],
+            vec![
+                // The worker answered with its single-member fallback for the
+                // project; the client's own tree names more members and has to
+                // stay the one the pane groups by.
+                project_snapshot(root, &[]),
+                project_snapshot(root, &[child]),
+            ],
+            RetentionPolicyState::Unavailable,
+            false,
+            Vec::new(),
+            cx,
+        );
+    });
+
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.archived_sessions.projects.len(), 1);
+        assert_eq!(
+            view.archived_sessions.projects[0].agents.len(),
+            2,
+            "the more complete snapshot wins whichever order it arrives in"
+        );
+        let groups = view.grouped_archived_sessions(now);
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert_eq!(groups[0].project_root, None);
+        assert_eq!(
+            groups[0]
+                .rows
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Standalone"],
+            "the covered sub agent is not listed and the standalone session still is"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn a_sub_agent_named_only_by_a_cached_tree_is_not_listed(cx: &mut TestAppContext) {
+    let now = 1_700_000_000_000u64;
+    let root = AgentSessionId::new();
+    let child = AgentSessionId::new();
+    let first_sibling = AgentSessionId::new();
+    let second_sibling = AgentSessionId::new();
+    let standalone = AgentSessionId::new();
+    let view = cx.new(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        // The sidebar holds the tree that names the archived child.
+        view.project_tree_snapshots = vec![project_snapshot(root, &[child])];
+        view
+    });
+
+    view.update(cx, |view, cx| {
+        view.finish_archived_sessions_load(
+            vec![
+                entry(archived_session(child, "Researcher", now)),
+                entry(archived_session(standalone, "Standalone", now - 60_000)),
+            ],
+            // `reload_archived_sessions` passes the cached trees first and the
+            // projections it fetched last, so a load sees both. A stale
+            // projection of the same project names other members and not the
+            // child, and it is the more complete one, so it is the one kept: the
+            // pane must still hide every member any projection names.
+            vec![
+                project_snapshot(root, &[child]),
+                project_snapshot(root, &[first_sibling, second_sibling]),
+            ],
+            RetentionPolicyState::Unavailable,
+            false,
+            Vec::new(),
+            cx,
+        );
+    });
+
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.archived_sessions.projects.len(), 1);
+        let kept = &view.archived_sessions.projects[0];
+        assert_eq!(
+            kept.agents.len(),
+            4,
+            "the kept projection holds every member either projection names"
+        );
+        assert!(
+            kept.agents.iter().any(|agent| agent.session_id == child),
+            "the member named only by the cached tree survives de-duplication"
+        );
+        let groups = view.grouped_archived_sessions(now);
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert_eq!(
+            groups[0]
+                .rows
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Standalone"],
+            "a session any known snapshot names as a member is never a plain row"
+        );
+    });
+}
+
 #[gpui_kit::test]
 fn forcing_a_delete_removes_the_session_from_a_durable_worker(cx: &mut TestAppContext) {
     // A durable worker is required: an in-memory one refuses every delete.

@@ -4655,6 +4655,7 @@ dependencies = [
  "loom-core",
  "loom-local",
  "loom-model",
+ "loom-persistence",
  "loom-protocol",
  "loom-server",
  "open",

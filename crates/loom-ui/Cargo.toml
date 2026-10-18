@@ -83,6 +83,9 @@ uuid.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
+# Tests seed a durable state file so a restored in-process worker reports a real
+# delegated project child instead of a synthetic one.
+loom-persistence.workspace = true
 # Tests drive the view against an in-process backend instead of a child process.
 loom-server.workspace = true
 tokio.workspace = true

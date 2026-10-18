@@ -385,12 +385,77 @@ pub(crate) fn project_deletion_consequence(name: &str, session_count: usize) -> 
     }
 }
 
+/// The most complete projection of each project, in the order each project is
+/// first seen.
+///
+/// One project can be projected more than once: the client's cached tree, the
+/// sidebar's active snapshot, and the pane's own load all describe it. A cached
+/// tree may have been captured before a member was delegated, and an archived
+/// project's tree is never refreshed, while the projection a load fetches last
+/// is the authoritative one. The projection naming the most agents therefore
+/// decides the row, and every member any other projection names is kept, so no
+/// sub-agent is ever grouped as a project of its own or listed as a plain row.
+///
+/// The kept member list is a union, so it can name a session that has since been
+/// deleted: a row's `session_count` and its deletion wording are therefore an
+/// upper bound. The worker re-reads the real tree when the deletion is
+/// submitted, so this never widens what a deletion removes.
+pub(crate) fn most_complete_snapshots(
+    projects: &[loom_core::ProjectSnapshot],
+) -> Vec<loom_core::ProjectSnapshot> {
+    let mut kept: Vec<loom_core::ProjectSnapshot> = Vec::new();
+    for project in projects {
+        match kept
+            .iter_mut()
+            .find(|entry| entry.project_id == project.project_id)
+        {
+            Some(entry) if project.agents.len() > entry.agents.len() => {
+                let mut replacement = project.clone();
+                keep_members_named_by(&mut replacement, entry);
+                *entry = replacement;
+            }
+            Some(entry) => keep_members_named_by(entry, project),
+            None => kept.push(project.clone()),
+        }
+    }
+    kept
+}
+
+/// Adds every agent `other` names that `snapshot` does not, in a deterministic
+/// order.
+fn keep_members_named_by(
+    snapshot: &mut loom_core::ProjectSnapshot,
+    other: &loom_core::ProjectSnapshot,
+) {
+    let missing = other
+        .agents
+        .iter()
+        .filter(|agent| {
+            !snapshot
+                .agents
+                .iter()
+                .any(|kept| kept.session_id == agent.session_id)
+        })
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return;
+    }
+    snapshot.agents.extend(missing.into_iter().cloned());
+    snapshot
+        .agents
+        .sort_by_key(|agent| (agent.depth, agent.session_id));
+}
+
 /// Groups archived sessions by the project the backend projects for them.
 ///
 /// A project the client can resolve that covers at least one archived session
 /// contributes exactly one row: its members are deleted with it and are never
 /// listed on their own. A session that only covers itself is not a project, and
 /// it joins the sessions no project covers in one explicit trailing group.
+///
+/// A session any known snapshot names as a project member is hidden, even when
+/// the snapshot kept for its project does not name it: the pane never shows a
+/// sub-agent as a plain row.
 pub(crate) fn archived_session_groups(
     entries: &[ArchivedSessionEntry],
     projects: &[loom_core::ProjectSnapshot],
@@ -415,7 +480,10 @@ pub(crate) fn archived_session_groups(
         .collect::<BTreeSet<_>>();
     let mut grouped = BTreeSet::new();
     let mut groups = Vec::new();
-    for project in projects.iter().filter(|project| is_project_tree(project)) {
+    for project in most_complete_snapshots(projects)
+        .iter()
+        .filter(|project| is_project_tree(project))
+    {
         // Only an archived project root yields a row.
         let mut members = project
             .agents
@@ -544,6 +612,22 @@ pub(crate) struct ArchivedSessionsState {
 }
 
 impl LoomView {
+    /// The archived-session rows the surface draws, grouped by project.
+    ///
+    /// Only the projections the last load kept are consulted, because
+    /// `reload_archived_sessions` already feeds every cached tree into that load
+    /// and `finish_archived_sessions_load` stores the union of their members.
+    /// Grouping here therefore hides a session any tree named as a project member
+    /// without cloning every cached tree on each frame.
+    pub(crate) fn grouped_archived_sessions(&self, now_millis: u64) -> Vec<ArchivedSessionGroup> {
+        archived_session_groups(
+            &self.archived_sessions.entries,
+            &self.archived_sessions.projects,
+            &self.known_session_names(),
+            now_millis,
+        )
+    }
+
     /// Opens the archived-sessions surface and loads what it shows.
     pub(crate) fn open_archived_sessions(&mut self, cx: &mut Context<Self>) {
         // The surface covers the central area, so opening it closes whatever
@@ -836,11 +920,9 @@ impl LoomView {
             .into_iter()
             .filter(|entry| seen_sessions.insert(entry.session.id))
             .collect();
-        let mut seen_projects = BTreeSet::new();
-        self.archived_sessions.projects = projects
-            .into_iter()
-            .filter(|project| seen_projects.insert(project.project_id))
-            .collect();
+        // One projection per project: the one naming the most agents, so a
+        // stale cached tree never displaces the authoritative snapshot.
+        self.archived_sessions.projects = most_complete_snapshots(&projects);
         self.archived_sessions.retention = retention;
         // The editor starts from the policy the worker reports and is offered
         // only when the worker can store a change. A load discards an unapplied

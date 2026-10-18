@@ -1,7 +1,7 @@
 use super::*;
 use crate::view::archive::{
-    ArchivedSessionRow, RetentionPolicyState, RetentionPolicyText, archived_session_groups,
-    project_row_consequence, retention_window_choices, sub_agent_retention_window_choices,
+    ArchivedSessionRow, RetentionPolicyState, RetentionPolicyText, project_row_consequence,
+    retention_window_choices, sub_agent_retention_window_choices,
 };
 use gpui_kit::WeakEntity;
 use gpui_kit::component::checkbox::Checkbox;
@@ -30,13 +30,7 @@ impl LoomView {
     ) -> gpui_kit::AnyElement {
         let phone = layout.phone;
         let now = Timestamp::now().as_unix_millis();
-        let session_names = self.known_session_names();
-        let groups = archived_session_groups(
-            &self.archived_sessions.entries,
-            &self.archived_sessions.projects,
-            &session_names,
-            now,
-        );
+        let groups = self.grouped_archived_sessions(now);
         let mut content = div().w_full().flex().flex_col().gap_4();
 
         content = content.child(
