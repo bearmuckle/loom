@@ -340,13 +340,17 @@ pub struct RemoteServerConfig {
     /// Who may sign in to this listener with a GitHub account, and where the
     /// device flow and account verification call go.
     ///
-    /// An empty allowlist disables sign-in: a WebSocket upgrade without a
-    /// credential is then refused, exactly as it was before sign-in existed.
-    /// When it is enabled, such an upgrade is accepted as a pre-login
-    /// connection, which may only sign in until a person is bound to it.
+    /// Sign-in is enabled unless the policy is switched off, and an empty
+    /// allowlist then accepts any GitHub account. A WebSocket upgrade without a
+    /// credential is accepted as a pre-login connection, which may only sign in
+    /// until a person is bound to it; a disabled policy refuses such an upgrade,
+    /// exactly as it was before sign-in existed.
     pub github_sign_in: GitHubSignInConfig,
     /// Most connections may be accepted without a credential, waiting to sign
     /// in, at once. It defaults to [`DEFAULT_MAX_ANONYMOUS_CONNECTIONS`].
+    ///
+    /// A slot is released as soon as the connection is bound to a person, so a
+    /// signed-in client does not hold one.
     pub max_anonymous_connections: usize,
     /// How long such a connection may wait to sign in before the listener
     /// closes it. It defaults to [`DEFAULT_SIGN_IN_TIMEOUT`].
@@ -955,9 +959,9 @@ async fn handle_socket(
     socket: WebSocket,
     state: RemoteState,
     connection: InProcessConnection,
-    // Held for the lifetime of the connection: the slot a listener reserves for
-    // a connection that has no credential yet.
-    _anonymous: Option<OwnedSemaphorePermit>,
+    // The slot a listener reserves for a connection that has no credential yet.
+    // Released once a person is bound to the connection, see the loop below.
+    mut anonymous: Option<OwnedSemaphorePermit>,
 ) {
     // The connection carries the listener's frame limit, so an events batch it
     // answers with is bounded to a frame its clients accept instead of reaching
@@ -1002,6 +1006,11 @@ async fn handle_socket(
     };
 
     loop {
+        // A connection that signed in no longer waits for anything, so it gives
+        // its pre-login slot back instead of holding one for the whole session.
+        if anonymous.is_some() && connection.participant().is_some() {
+            anonymous = None;
+        }
         let presence = connection.presence();
         let revoked = presence.as_ref().map(|presence| presence.revoked());
         let revoked_wait = async {
@@ -1913,7 +1922,7 @@ mod unit_tests {
     use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 
     use super::super::AuthorizationScope;
-    use super::{AuthTokenStore, InProcessBackend};
+    use super::{AuthTokenStore, GitHubSignInConfig, InProcessBackend};
     use tokio_tungstenite::{
         connect_async,
         tungstenite::{Error as TungsteniteClientError, error::UrlError, http::StatusCode},
@@ -1956,10 +1965,18 @@ mod unit_tests {
         let backend = InProcessBackend::new();
         let auth = std::sync::Arc::new(AuthTokenStore::new());
         let token = auth.issue(AuthorizationScope::all()).unwrap();
-        let server = RemoteServer::new(backend, auth, RemoteServerConfig::local_ephemeral())
-            .bind()
-            .await
-            .unwrap();
+        // Sign-in is off, so the bearer token is the only way in.
+        let server = RemoteServer::new(
+            backend,
+            auth,
+            RemoteServerConfig {
+                github_sign_in: GitHubSignInConfig::disabled(),
+                ..RemoteServerConfig::local_ephemeral()
+            },
+        )
+        .bind()
+        .await
+        .unwrap();
 
         match connect_async(server.websocket_url()).await {
             Err(TungsteniteClientError::Http(response)) => {

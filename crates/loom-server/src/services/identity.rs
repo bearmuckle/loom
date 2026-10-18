@@ -37,12 +37,18 @@ pub const GITHUB_USER_API_URL: &str = "https://api.github.com/user";
 
 /// Who may sign in to this worker, and where the device flow runs.
 ///
-/// An empty allowlist disables sign-in: the listener then refuses a token-less
-/// WebSocket upgrade exactly as it did before sign-in existed. A login is
-/// matched case-insensitively because GitHub logins are.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Sign-in is enabled unless it is switched off: a WebSocket upgrade without a
+/// credential is then accepted as a pre-login connection, and any GitHub
+/// account may sign in. Such a person starts with no session grants, so they
+/// see nothing until an owner grants access. An allowlist narrows who may sign
+/// in at all, which is what a worker reachable from an untrusted network
+/// wants. A login is matched case-insensitively because GitHub logins are.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitHubSignInConfig {
-    /// GitHub logins allowed to sign in, as typed on the worker's command line.
+    /// Whether people may sign in with GitHub at all.
+    pub enabled: bool,
+    /// GitHub logins allowed to sign in, as typed on the worker's command
+    /// line. Empty allows every GitHub account.
     pub allowlist: Vec<String>,
     /// OAuth app client id; `None` uses the embedded GitHub CLI public client.
     pub client_id: Option<String>,
@@ -54,6 +60,19 @@ pub struct GitHubSignInConfig {
     pub user_api_url: Option<String>,
 }
 
+impl Default for GitHubSignInConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            allowlist: Vec::new(),
+            client_id: None,
+            device_code_url: None,
+            access_token_url: None,
+            user_api_url: None,
+        }
+    }
+}
+
 impl GitHubSignInConfig {
     /// A policy that allows exactly `allowlist` (case-insensitively) to sign in.
     pub fn new(allowlist: impl IntoIterator<Item = String>) -> Self {
@@ -63,12 +82,21 @@ impl GitHubSignInConfig {
         }
     }
 
-    /// Whether GitHub sign-in is enabled at all.
-    pub fn is_enabled(&self) -> bool {
-        !self.allowlist.is_empty()
+    /// A policy that refuses sign-in entirely, for a worker whose clients all
+    /// hold an operator token.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
     }
 
-    /// How many logins may sign in.
+    /// Whether GitHub sign-in is enabled at all.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// How many logins may sign in; zero means any GitHub account may.
     pub fn allowlist_size(&self) -> usize {
         self.allowlist.len()
     }
@@ -76,9 +104,14 @@ impl GitHubSignInConfig {
     /// Whether `login` may sign in to this worker.
     pub fn allows_login(&self, login: &str) -> bool {
         let login = login.trim();
-        self.allowlist
-            .iter()
-            .any(|allowed| allowed.trim().eq_ignore_ascii_case(login))
+        if !self.is_enabled() {
+            return false;
+        }
+        self.allowlist.is_empty()
+            || self
+                .allowlist
+                .iter()
+                .any(|allowed| allowed.trim().eq_ignore_ascii_case(login))
     }
 
     /// The account endpoint the sign-in reads.
@@ -276,18 +309,28 @@ mod tests {
 
     #[test]
     fn the_allowlist_is_optional_case_insensitive_and_trimmed() {
-        let disabled = GitHubSignInConfig::default();
+        // Sign-in is on by default and then accepts any GitHub account: such a
+        // person holds no session grants until an owner grants one.
+        let open = GitHubSignInConfig::default();
+        assert!(open.is_enabled());
+        assert_eq!(open.allowlist_size(), 0);
+        assert!(open.allows_login("octocat"));
+        assert!(open.allows_login("Anyone"));
+
+        let restricted =
+            GitHubSignInConfig::new([" OctoCat ".to_owned(), "bjornharrtell".to_owned()]);
+        assert!(restricted.is_enabled());
+        assert_eq!(restricted.allowlist_size(), 2);
+        assert!(restricted.allows_login("octocat"));
+        assert!(restricted.allows_login("OCTOCAT"));
+        assert!(restricted.allows_login("  bjornharrtell "));
+        assert!(!restricted.allows_login("mallory"));
+        assert!(!restricted.allows_login(""));
+
+        // A worker whose clients all hold an operator token can switch it off.
+        let disabled = GitHubSignInConfig::disabled();
         assert!(!disabled.is_enabled());
         assert!(!disabled.allows_login("octocat"));
-
-        let policy = GitHubSignInConfig::new([" OctoCat ".to_owned(), "bjornharrtell".to_owned()]);
-        assert!(policy.is_enabled());
-        assert_eq!(policy.allowlist_size(), 2);
-        assert!(policy.allows_login("octocat"));
-        assert!(policy.allows_login("OCTOCAT"));
-        assert!(policy.allows_login("  bjornharrtell "));
-        assert!(!policy.allows_login("mallory"));
-        assert!(!policy.allows_login(""));
     }
 
     #[test]

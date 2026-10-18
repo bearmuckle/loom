@@ -441,11 +441,13 @@ capability.
 
 ### Signing in with GitHub
 
-An interactive client is not expected to hold a per-person bearer token. When
-the worker operator allows GitHub sign-in (`loom-server --allow-github-login
-<login>`, repeatable), a WebSocket upgrade that carries **no** credential at all
-is accepted and the connection starts *pre-login*: it has no participant
-identity and no session grants. A pre-login connection may only:
+An interactive client is not expected to hold a per-person bearer token. GitHub
+sign-in is enabled on a worker unless the operator switches it off
+(`loom-server --no-github-sign-in`), and `--allow-github-login <login>`
+(repeatable) narrows who may sign in; with no allowlist any GitHub account may.
+A WebSocket upgrade that carries **no** credential at all is accepted and the
+connection starts *pre-login*: it has no participant identity and no session
+grants. A pre-login connection may only:
 
 - `Negotiate` and `DiscoverCapabilities` (capability `git_hub_sign_in`);
 - `GetWorkerNodeStatus`, so a client can show which worker it reached;
@@ -453,11 +455,12 @@ identity and no session grants. A pre-login connection may only:
 - `Access/StartGitHubSignIn`, `Access/GetGitHubSignInStatus`, and
   `Access/SignOutGitHub`.
 
-Every other request fails with `authentication_required`. When sign-in is not
-enabled (no `--allow-github-login`), or when a credential is presented, the
+Every other request fails with `authentication_required`. When sign-in is
+disabled (`--no-github-sign-in`), or when a credential is presented, the
 upgrade behaves exactly as before: an operator bearer token is required. The
-listener bounds how many connections may wait to sign in at once and closes one
-that is still unsigned after its sign-in window.
+listener bounds how many connections may wait to sign in at once, releases that
+slot once a person is bound, and closes a connection that is still unsigned
+after its sign-in window.
 
 A sign-in is a GitHub device flow:
 

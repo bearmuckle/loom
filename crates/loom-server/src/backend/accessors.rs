@@ -58,8 +58,9 @@ impl InProcessBackend {
     /// Replaces the worker's GitHub sign-in policy.
     ///
     /// A listener sets the policy it was started with here, and an in-process
-    /// caller can do the same before it connects. An empty allowlist leaves
-    /// sign-in disabled.
+    /// caller can do the same before it connects. The default policy enables
+    /// sign-in for any GitHub account; [`GitHubSignInConfig::disabled`] turns it
+    /// off, and an allowlist narrows who may sign in.
     pub fn set_github_sign_in_config(&self, config: GitHubSignInConfig) {
         self.identity.configure(config);
     }

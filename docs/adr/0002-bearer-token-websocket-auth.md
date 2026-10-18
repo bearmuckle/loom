@@ -41,8 +41,10 @@ account id, which then has to be granted a session role like any other person.
 
 Properties of the amended decision:
 
-- The listener still refuses a token-less upgrade when sign-in is not enabled,
-  so nothing changes for a deployment that does not opt in.
+- The listener accepts a token-less upgrade only while sign-in is enabled. It
+  is enabled by default, so a deployment that shares sessions needs no opt-in;
+  `--no-github-sign-in` restores the bearer-token-only behaviour, and
+  `--allow-github-login` narrows who may sign in.
 - How many connections may wait to sign in at once is bounded, and a connection
   that stays unsigned past its window is closed.
 - The sign-in asks only for the `read:user` scope and never stores the GitHub

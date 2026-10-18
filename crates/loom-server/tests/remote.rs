@@ -328,11 +328,21 @@ async fn upgrade_without_a_credential(
 }
 
 #[tokio::test]
-async fn an_upgrade_without_a_credential_is_refused_unless_sign_in_is_enabled() {
-    let (_backend, _auth, _token, server) = server().await;
+async fn an_upgrade_without_a_credential_is_refused_when_sign_in_is_disabled() {
+    let server = RemoteServer::new(
+        InProcessBackend::new(),
+        Arc::new(AuthTokenStore::new()),
+        RemoteServerConfig {
+            github_sign_in: GitHubSignInConfig::disabled(),
+            ..RemoteServerConfig::local_ephemeral()
+        },
+    )
+    .bind()
+    .await
+    .unwrap();
     assert!(
         upgrade_without_a_credential(&server).await.is_err(),
-        "a worker without GitHub sign-in must refuse a token-less upgrade"
+        "a worker with GitHub sign-in switched off must refuse a token-less upgrade"
     );
     server.stop().await.unwrap();
 }

@@ -93,9 +93,12 @@ struct ServerOptions {
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     allow_insecure_remote: bool,
-    /// GitHub logins allowed to sign in to this worker. Empty leaves sign-in
-    /// disabled and refuses a token-less WebSocket upgrade.
+    /// GitHub logins allowed to sign in to this worker. Empty allows every
+    /// GitHub account, which starts with no session grant.
     allow_github_login: Vec<String>,
+    /// Refuses GitHub sign-in, so a WebSocket upgrade must carry an operator
+    /// bearer token.
+    no_github_sign_in: bool,
     /// OAuth app client id for the sign-in device flow; `None` uses the
     /// embedded GitHub CLI public client.
     github_oauth_client_id: Option<String>,
@@ -118,6 +121,7 @@ impl Default for ServerOptions {
             tls_key: None,
             allow_insecure_remote: false,
             allow_github_login: Vec::new(),
+            no_github_sign_in: false,
             github_oauth_client_id: None,
         }
     }
@@ -153,11 +157,14 @@ impl ServerOptions {
 
     /// The GitHub sign-in policy these flags ask for.
     ///
-    /// An empty `--allow-github-login` set leaves sign-in disabled, so a
-    /// token-less WebSocket upgrade is refused as before. The client id is
-    /// reported separately at startup, so an operator can see which OAuth app
-    /// the device flow uses.
+    /// Sign-in is on unless `--no-github-sign-in` was given, and an empty
+    /// `--allow-github-login` set lets any GitHub account sign in. The client
+    /// id is reported separately at startup, so an operator can see which OAuth
+    /// app the device flow uses.
     fn github_sign_in_config(&self) -> GitHubSignInConfig {
+        if self.no_github_sign_in {
+            return GitHubSignInConfig::disabled();
+        }
         let config = GitHubSignInConfig::new(
             self.allow_github_login
                 .iter()
@@ -251,6 +258,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
                 options.tls_key = Some(PathBuf::from(required_value(&mut args, "--tls-key")?));
             }
             "--allow-insecure-remote" => options.allow_insecure_remote = true,
+            "--no-github-sign-in" => options.no_github_sign_in = true,
             "--allow-github-login" => options
                 .allow_github_login
                 .push(required_value(&mut args, "--allow-github-login")?),
@@ -359,7 +367,8 @@ fn help_text() -> String {
          [--max-frame-bytes <bytes>] \
          [--tls-cert <pem> --tls-key <pem>] \
          [--allow-insecure-remote] [--diagnostics] \
-         [--allow-github-login <login> ...] [--github-oauth-client-id <id>]\n\
+         [--allow-github-login <login> ...] [--no-github-sign-in] \
+         [--github-oauth-client-id <id>]\n\
          \n\
          A standalone Loom backend that serves the remote WebSocket protocol.\n\
          \n\
@@ -390,8 +399,10 @@ fn help_text() -> String {
          \x20 --allow-insecure-remote\n\
          \x20                        allow a plaintext ws:// bind beyond loopback\n\
          \x20 --allow-github-login <login>\n\
-         \x20                        let this GitHub login sign in to a shared session; \
-         repeat for each person (sign-in stays off when no login is allowed)\n\
+         \x20                        restrict sign-in to this GitHub login; repeat for each \
+         person (default: any GitHub account may sign in, starting with no session access)\n\
+         \x20 --no-github-sign-in   refuse GitHub sign-in, so every client must present \
+         an operator bearer token\n\
          \x20 --github-oauth-client-id <id>\n\
          \x20                        OAuth app client id for the sign-in device flow \
          (default: the embedded GitHub CLI public client id)\n\
@@ -755,11 +766,22 @@ mod tests {
         assert!(!defaults.allow_insecure_remote);
         assert_eq!(defaults.archive_retention, None);
         assert_eq!(defaults.archive_retention_force_discard, None);
-        // GitHub sign-in stays off until a login is allowed, and the embedded
-        // GitHub CLI client id is the default OAuth app.
+        // GitHub sign-in is on by default and lets any GitHub account in; the
+        // embedded GitHub CLI client id is the default OAuth app.
         assert!(defaults.allow_github_login.is_empty());
+        assert!(!defaults.no_github_sign_in);
         assert_eq!(defaults.github_oauth_client_id, None);
-        assert!(!defaults.github_sign_in_config().is_enabled());
+        let open = defaults.github_sign_in_config();
+        assert!(open.is_enabled());
+        assert_eq!(open.allowlist_size(), 0);
+        assert!(open.allows_login("octocat"));
+
+        // An allowlist and an off switch narrow or disable it.
+        let restricted = serve_options(&["--allow-github-login", "octocat"]);
+        assert!(restricted.github_sign_in_config().allows_login("octocat"));
+        assert!(!restricted.github_sign_in_config().allows_login("mallory"));
+        let disabled = serve_options(&["--no-github-sign-in"]);
+        assert!(!disabled.github_sign_in_config().is_enabled());
 
         let spaced = serve_options(&[
             "--bind",

@@ -481,11 +481,22 @@ fn an_operator_token_connection_stays_unbound_until_it_signs_in() {
 
 #[test]
 fn sign_in_is_refused_when_the_worker_does_not_allow_it() {
-    let backend = InProcessBackend::new();
+    let backend = pre_login_backend(GitHubSignInConfig::disabled());
     assert!(!backend.github_sign_in_enabled());
     let connection = backend.connect_pre_login();
     negotiate(&connection);
     let error = access(&connection, AccessRequest::StartGitHubSignIn).unwrap_err();
     assert_eq!(error.code, ErrorCode::UnsupportedCapability);
     assert!(error.message.contains("--allow-github-login"), "{error}");
+}
+
+#[test]
+fn a_worker_without_a_configured_allowlist_accepts_any_github_account() {
+    // The default policy lets a person sign in and then start with no session
+    // grants, so a worker needs no configuration to be usable by people.
+    let backend = InProcessBackend::new();
+    let config = backend.github_sign_in_config();
+    assert!(backend.github_sign_in_enabled());
+    assert!(config.allows_login("anyone"));
+    assert!(config.allows_login("OctoCat"));
 }

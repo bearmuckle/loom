@@ -45,13 +45,16 @@ GitHub account instead of receiving a bearer token of their own; per-person
 tokens are retired. Operator bearer tokens remain, but only for headless
 clients such as scripts and CI.
 
-- Sign-in is enabled by listing the GitHub logins that may use the worker:
-  `loom-server --allow-github-login <login>`, repeatable, matched
-  case-insensitively. With no `--allow-github-login`, the worker refuses a
-  WebSocket upgrade that carries no credential and behaves exactly as before.
+- Sign-in is on by default: an upgrade without a credential becomes a
+  pre-login connection, and any GitHub account may sign in and then start with
+  no session access until an owner grants a role. `loom-server
+  --allow-github-login <login>` (repeatable, matched case-insensitively) narrows
+  who may sign in at all, which is what a worker reachable from an untrusted
+  network wants. `--no-github-sign-in` turns sign-in off, so every client must
+  present an operator bearer token.
 - The startup log names whether sign-in is enabled, how many logins are
-  allowed, and where the OAuth client id came from. Using the embedded client id
-  logs a warning as well.
+  allowed (or that any GitHub account may), and where the OAuth client id came
+  from. Using the embedded client id logs a warning as well.
 - `--github-oauth-client-id <id>` selects the OAuth app the device flow uses.
   Without it the worker uses the public GitHub CLI client id compiled into
   `loom-providers`, which works without registering anything but is shared by

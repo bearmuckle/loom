@@ -173,10 +173,14 @@ pub fn report_github_sign_in(config: &GitHubSignInConfig) {
     } else {
         "the embedded GitHub CLI OAuth app"
     };
+    let scope = if config.allowlist_size() == 0 {
+        "any GitHub account".to_owned()
+    } else {
+        format!("{} allowlisted login(s)", config.allowlist_size())
+    };
     log::info!(
-        "GitHub sign-in is enabled for {} allowlisted login(s); the device flow uses the OAuth \
-         client id from {client_id_source}",
-        config.allowlist_size()
+        "GitHub sign-in is enabled for {scope}; the device flow uses the OAuth client id from \
+         {client_id_source}"
     );
     if config.client_id.is_none() {
         log::warn!(
