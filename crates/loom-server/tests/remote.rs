@@ -631,6 +631,65 @@ async fn an_unrestricted_operator_sign_in_adopts_every_ownerless_session() {
     assert_eq!(entries[0].participant, participant);
     assert_eq!(entries[0].role, loom_core::SessionRole::Owner);
 
+    // A second client that never signed in sees both effects of the adoption.
+    // Its own roster read shows the new owner, and the session feed it reads
+    // carries the pushed roster and the attributed history entry that a manual
+    // grant of the same role produces, so a co-owner or a second admin window
+    // learns of the change without an unrelated refresh.
+    let observer = auth
+        .insert("observer-token", AuthorizationScope::all())
+        .unwrap();
+    let mut observer_connection =
+        WebSocketTransport::new(server.websocket_url(), observer.token.clone())
+            .connect()
+            .await
+            .unwrap();
+    negotiate_with(&mut observer_connection, sign_in_capabilities()).await;
+    let observed = session_roster(&mut observer_connection, session.id).await;
+    assert_eq!(observed.len(), 1, "{observed:?}");
+    assert_eq!(observed[0].participant, participant);
+    assert_eq!(observed[0].role, loom_core::SessionRole::Owner);
+    let journaled = events(&mut observer_connection, session.id, None).await;
+    let pushed = journaled
+        .iter()
+        .filter_map(|envelope| match &envelope.event {
+            ServerEvent::SessionRosterChanged { entries } => Some(entries),
+            _ => None,
+        })
+        .next_back()
+        .expect("the adoption publishes the session's roster");
+    assert!(
+        pushed
+            .iter()
+            .any(|entry| entry.participant == participant
+                && entry.role == loom_core::SessionRole::Owner),
+        "{pushed:?}"
+    );
+    let recorded = journaled
+        .iter()
+        .filter_map(|envelope| match &envelope.event {
+            ServerEvent::Collaboration { entry } => match &entry.kind {
+                loom_core::CollaborationEntryKind::AccessChanged {
+                    participant: changed,
+                    role,
+                } => Some((entry.author.clone(), changed.id, *role)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recorded,
+        vec![(
+            loom_core::Author::Participant {
+                participant: participant.clone(),
+                role: loom_core::SessionRole::Owner,
+            },
+            participant.id,
+            Some(loom_core::SessionRole::Owner),
+        )]
+    );
+
     // The grant is real authority: an owner-only request now succeeds, where
     // the same connection was held to the role it had before the sign-in.
     let renamed = connection

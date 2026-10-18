@@ -5,7 +5,9 @@
 //! sign in or out. Every other request is refused until a person signs in, and
 //! that gate lives here beside the binding it waits for.
 
-use loom_core::{ErrorCode, GitHubSignInStatus, LoomError, ParticipantIdentity, Result};
+use loom_core::{
+    ErrorCode, GitHubSignInStatus, LoomError, ParticipantIdentity, Result, SessionRole,
+};
 use loom_protocol::{AccessRequest, AccessResponse, ClientRequest, ControlRequest};
 
 use super::*;
@@ -117,10 +119,15 @@ impl InProcessConnection {
     /// manager. Archived sessions are included: they still exist and may be
     /// unarchived, so a person who owns the others is not locked out of them. A
     /// session that already has a grant is left untouched, which covers every
-    /// session that already has an owner. A failed save is logged with the
-    /// sessions it covers and does not fail the sign-in: the identity binding
-    /// was saved already, so the person stays signed in and only the grants are
-    /// not durable.
+    /// session that already has an owner.
+    ///
+    /// Each adopted session is announced like a manual grant of the same role:
+    /// [`Self::record_access_change`] pushes the new roster to the session's
+    /// live readers and records the change as an attributed history entry,
+    /// which also saves the state. A session whose record fails is logged by
+    /// id and does not stop the others or fail the sign-in: the identity
+    /// binding was saved already, so the person stays signed in and only that
+    /// session's entry and save are missing.
     fn adopt_ownerless_sessions_for(&self, identity: &ParticipantIdentity) {
         if !self.adopts_ownerless_sessions() {
             return;
@@ -153,19 +160,17 @@ impl InProcessConnection {
             identity.display_name,
             adopted.len()
         );
-        if let Err(error) = self.backend.persist_state() {
-            log::error!(
-                "[loom-server] {} signed in, but the ownership of {} session(s) was not saved: \
-                 {}; the sessions are {}",
-                identity.display_name,
-                adopted.len(),
-                error.message,
-                adopted
-                    .iter()
-                    .map(AgentSessionId::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+        for session_id in adopted {
+            if let Err(error) =
+                self.record_access_change(session_id, identity.id, Some(SessionRole::Owner))
+            {
+                log::error!(
+                    "[loom-server] {} signed in and now owns session {session_id}, but the change \
+                     was not recorded or saved: {}",
+                    identity.display_name,
+                    error.message
+                );
+            }
         }
     }
 

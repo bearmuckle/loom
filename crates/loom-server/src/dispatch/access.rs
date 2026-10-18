@@ -313,7 +313,11 @@ impl InProcessConnection {
 
     /// Records an attributed access change in the session history and pushes
     /// the new roster to the session's readers.
-    fn record_access_change(
+    ///
+    /// Every access change goes through here, including a sign-in adopting a
+    /// session that had no owner, so a change is announced and attributed the
+    /// same way whichever path made it.
+    pub(crate) fn record_access_change(
         &self,
         session_id: AgentSessionId,
         participant_id: loom_core::ParticipantId,
