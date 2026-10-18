@@ -256,6 +256,10 @@ impl LoomView {
                                     .flex_none()
                                     .items_center()
                                     .gap_2()
+                                    .when(permissions.can_act, |element| {
+                                        element
+                                            .children(self.render_run_control_buttons(layout, cx))
+                                    })
                                     .when(
                                         self.run_can_interrupt() && permissions.can_act,
                                         |element| {
@@ -297,6 +301,54 @@ impl LoomView {
                             ),
                     ),
             )
+    }
+
+    /// Pause, Resume, and Retry for the active run, shown only in the states
+    /// the server accepts them.
+    fn render_run_control_buttons(
+        &self,
+        layout: ResponsiveLayout,
+        cx: &mut Context<Self>,
+    ) -> Vec<Button> {
+        let mut buttons = Vec::new();
+        let candidates = [
+            (
+                self.run_can_pause(),
+                "pause-run",
+                "Pause",
+                loom_core::RunControlAction::Pause,
+            ),
+            (
+                self.run_can_resume(),
+                "resume-run",
+                "Resume",
+                loom_core::RunControlAction::Resume,
+            ),
+            (
+                self.run_can_retry(),
+                "retry-run",
+                "Retry",
+                loom_core::RunControlAction::Retry,
+            ),
+        ];
+        for (visible, id, label, action) in candidates {
+            if !visible {
+                continue;
+            }
+            buttons.push(
+                Button::new(id)
+                    .label(label)
+                    .outline()
+                    .when(layout.phone, |button| {
+                        button.small().h(layout.control_size())
+                    })
+                    .when(!layout.phone, |button| button.small())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.control_run(action.clone(), cx);
+                    })),
+            );
+        }
+        buttons
     }
 
     /// The explicit Agent / People recipient switch. People sends peer chat,

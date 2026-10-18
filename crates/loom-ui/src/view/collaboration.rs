@@ -986,7 +986,7 @@ impl LoomView {
                     &request,
                     &decision,
                 );
-                self.clear_access_deny_reason = true;
+                self.clear_access_deny_reason = Some(request.id);
                 if self.active_session.id == session_id
                     && matches!(
                         decision,

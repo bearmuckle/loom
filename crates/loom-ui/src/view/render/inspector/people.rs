@@ -125,6 +125,27 @@ impl LoomView {
         Some(card("Request access", body).into_any_element())
     }
 
+    /// Creates a deny-reason input for each pending request that lacks one
+    /// and drops the inputs of requests that are no longer pending.
+    pub(crate) fn sync_access_deny_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pending: Vec<_> = self
+            .collaboration
+            .access
+            .pending
+            .iter()
+            .map(|request| request.id)
+            .collect();
+        self.access_deny_inputs
+            .retain(|request_id, _| pending.contains(request_id));
+        for request_id in pending {
+            self.access_deny_inputs
+                .entry(request_id)
+                .or_insert_with(|| {
+                    cx.new(|cx| InputState::new(window, cx).placeholder("Optional reason to deny"))
+                });
+        }
+    }
+
     /// The owner's list of pending access requests.
     fn render_pending_requests_card(&self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
         let state = &self.collaboration;
@@ -142,7 +163,7 @@ impl LoomView {
             let role_view = cx.entity();
             let approve_view = cx.entity();
             let deny_view = cx.entity();
-            let deny_input = self.access_deny_input.clone();
+            let deny_input = self.access_deny_inputs.get(&request_id).cloned();
             body = body.child(
                 div()
                     .id(("access-request", index))
@@ -229,13 +250,15 @@ impl LoomView {
                                         });
                                     }),
                             ),
-                    ),
+                    )
+                    .when_some(self.access_deny_inputs.get(&request_id), |row, input| {
+                        row.child(
+                            KitInput::new(input)
+                                .id(("access-deny-reason", index))
+                                .small(),
+                        )
+                    }),
             );
-        }
-        if !access.pending.is_empty()
-            && let Some(input) = self.access_deny_input.as_ref()
-        {
-            body = body.child(KitInput::new(input).id("access-deny-reason").small());
         }
         Some(card("Access requests", body).into_any_element())
     }

@@ -535,7 +535,7 @@ fn owner_sees_pending_requests_until_resolved(cx: &mut TestAppContext) {
     });
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
-        assert!(window.find("access-deny-reason").visible());
+        assert!(window.find(("access-deny-reason", 0usize)).visible());
     })
     .unwrap();
     handle
@@ -549,6 +549,206 @@ fn owner_sees_pending_requests_until_resolved(cx: &mut TestAppContext) {
             });
             assert!(view.collaboration.access.pending.is_empty());
             assert!(view.collaboration.access.outcome.is_none());
+        })
+        .unwrap();
+}
+
+fn run_control_view(
+    cx: &mut Context<LoomView>,
+    state: AgentRunState,
+    role: SessionRole,
+) -> LoomView {
+    let mut view = LoomView::new_for_test(cx.focus_handle());
+    view.sessions = vec![view.active_session.clone()];
+    let me = person("Nadia");
+    view.collaboration.identity = Some(me.clone());
+    view.collaboration.support = crate::collaboration::CollaborationSupport::Supported;
+    view.collaboration
+        .replace_roster(view.active_session.id, vec![roster(&me, role)]);
+    let run = run_snapshot(&view, state);
+    view.active_run_id = Some(run.id);
+    view.active_run = Some(run);
+    view.run_state = Some(state);
+    view
+}
+
+#[gpui_kit::test]
+fn run_control_buttons_follow_run_state_and_role(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let cases = [
+        (
+            AgentRunState::Executing,
+            SessionRole::Participant,
+            [true, false, false],
+        ),
+        (
+            AgentRunState::Paused,
+            SessionRole::Participant,
+            [false, true, false],
+        ),
+        (
+            AgentRunState::Failed,
+            SessionRole::Owner,
+            [false, false, true],
+        ),
+        (
+            AgentRunState::Completed,
+            SessionRole::Owner,
+            [false, false, false],
+        ),
+        (
+            AgentRunState::Executing,
+            SessionRole::Observer,
+            [false, false, false],
+        ),
+        (
+            AgentRunState::Paused,
+            SessionRole::Observer,
+            [false, false, false],
+        ),
+        (
+            AgentRunState::Failed,
+            SessionRole::Observer,
+            [false, false, false],
+        ),
+    ];
+    for (state, role, expected) in cases {
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+            run_control_view(cx, state, role)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let shown =
+                ["pause-run", "resume-run", "retry-run"].map(|id| window.try_find(id).is_some());
+            assert_eq!(shown, expected, "{state:?} as {role:?}");
+        })
+        .unwrap();
+        // A live run keeps polling past the test body.
+        handle
+            .update(cx, |view, _window, _cx| {
+                view.active_run_id = None;
+                view.run_state = None;
+            })
+            .unwrap();
+    }
+}
+
+#[gpui_kit::test]
+fn clicking_pause_dispatches_the_run_control(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = run_control_view(cx, AgentRunState::Executing, SessionRole::Participant);
+        // The legacy path sends the pause directly; the in-memory worker does
+        // not know the run and refuses it, which proves the click was routed.
+        view.collaboration.support = crate::collaboration::CollaborationSupport::Legacy;
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("pause-run", cx);
+    })
+    .unwrap();
+    // The request is already sent; drop the live run so polling stops.
+    handle
+        .update(cx, |view, _window, _cx| {
+            view.active_run_id = None;
+            view.run_state = None;
+        })
+        .unwrap();
+    cx.run_until_parked();
+    handle
+        .update(cx, |view, _window, _cx| {
+            let heading = view
+                .status_banner
+                .as_ref()
+                .and_then(|banner| banner.heading.clone())
+                .unwrap_or_default();
+            assert!(heading.starts_with("Pause"), "banner: {heading:?}");
+        })
+        .unwrap();
+}
+
+#[gpui_kit::test]
+fn each_pending_request_has_its_own_deny_reason(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        let owner = person("Owner");
+        view.collaboration.identity = Some(owner.clone());
+        view.collaboration.support = crate::collaboration::CollaborationSupport::Supported;
+        view.collaboration.replace_roster(
+            view.active_session.id,
+            vec![roster(&owner, SessionRole::Owner)],
+        );
+        for name in ["Nadia", "Omar"] {
+            let request = access_request(&view, &person(name), SessionRole::Participant);
+            view.consume_event(&ServerEvent::SessionAccessRequested { request });
+        }
+        view.review.open = true;
+        view.review.tab = InspectorTab::People;
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    let (first, second) = handle
+        .update(cx, |view, window, cx| {
+            let pending = view.collaboration.access.pending.clone();
+            assert_eq!(view.access_deny_inputs.len(), 2);
+            let first = pending[0].clone();
+            let second = pending[1].clone();
+            for (request, text) in [(&first, "spam"), (&second, "later")] {
+                view.access_deny_inputs[&request.id]
+                    .update(cx, |state, cx| state.set_value(text, window, cx));
+            }
+            (first, second)
+        })
+        .unwrap();
+    handle
+        .update(cx, |view, _window, cx| {
+            let reason = |view: &LoomView, id, cx: &App| {
+                view.access_deny_inputs[&id].read(cx).value().to_string()
+            };
+            assert_eq!(reason(view, first.id, cx), "spam");
+            assert_eq!(reason(view, second.id, cx), "later");
+            // Resolving the first clears only its row and drops its input.
+            view.finish_access_decision(
+                "deny request",
+                view.active_session.id,
+                ResponseEnvelope::success(
+                    loom_core::RequestId::new(),
+                    ServerResponse::Access(
+                        loom_protocol::AccessResponse::SessionAccessRequestResolved {
+                            request: first.clone(),
+                            decision: loom_protocol::AccessRequestDecision::Denied {
+                                reason: Some("spam".to_owned()),
+                            },
+                            grant: None,
+                        },
+                    ),
+                ),
+                cx,
+            );
+            assert_eq!(view.clear_access_deny_reason, Some(first.id));
+        })
+        .unwrap();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find(("access-deny-reason", 0usize)).visible());
+        assert!(window.try_find(("access-deny-reason", 1usize)).is_none());
+    })
+    .unwrap();
+    handle
+        .update(cx, |view, _window, cx| {
+            assert_eq!(view.access_deny_inputs.len(), 1);
+            assert!(!view.access_deny_inputs.contains_key(&first.id));
+            assert_eq!(
+                view.access_deny_inputs[&second.id]
+                    .read(cx)
+                    .value()
+                    .to_string(),
+                "later"
+            );
         })
         .unwrap();
 }

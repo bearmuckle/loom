@@ -682,10 +682,10 @@ pub(crate) struct LoomView {
     clear_node_on_render: bool,
     /// The requester's note for an access request.
     access_note_input: Option<Entity<InputState>>,
-    /// An owner's reason for denying an access request.
-    access_deny_input: Option<Entity<InputState>>,
+    /// Per-request deny reasons, created lazily for pending requests.
+    access_deny_inputs: BTreeMap<loom_protocol::AccessRequestId, Entity<InputState>>,
     clear_access_note: bool,
-    clear_access_deny_reason: bool,
+    clear_access_deny_reason: Option<loom_protocol::AccessRequestId>,
     rename_input_state: Option<Entity<InputState>>,
     source_path_input: Option<Entity<InputState>>,
     repository_filter_input: Option<Entity<InputState>>,
@@ -1897,9 +1897,9 @@ impl LoomView {
             clear_composer_on_render: false,
             clear_node_on_render: false,
             access_note_input: None,
-            access_deny_input: None,
+            access_deny_inputs: BTreeMap::new(),
             clear_access_note: false,
-            clear_access_deny_reason: false,
+            clear_access_deny_reason: None,
             rename_input_state: None,
             source_path_input: None,
             repository_filter_input: None,

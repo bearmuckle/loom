@@ -168,18 +168,14 @@ impl Render for LoomView {
                 .new(|cx| InputState::new(window, cx).placeholder("Optional note for the owners"));
             self.access_note_input = Some(input);
         }
-        if self.access_deny_input.is_none() {
-            let input =
-                cx.new(|cx| InputState::new(window, cx).placeholder("Optional reason to deny"));
-            self.access_deny_input = Some(input);
-        }
+        self.sync_access_deny_inputs(window, cx);
         if std::mem::take(&mut self.clear_access_note)
             && let Some(input) = self.access_note_input.as_ref()
         {
             input.update(cx, |state, cx| state.set_value("", window, cx));
         }
-        if std::mem::take(&mut self.clear_access_deny_reason)
-            && let Some(input) = self.access_deny_input.as_ref()
+        if let Some(request_id) = self.clear_access_deny_reason.take()
+            && let Some(input) = self.access_deny_inputs.get(&request_id)
         {
             input.update(cx, |state, cx| state.set_value("", window, cx));
         }

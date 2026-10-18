@@ -256,6 +256,21 @@ impl LoomView {
             )
     }
 
+    /// Whether the active run can be paused: live and not already paused.
+    pub(crate) fn run_can_pause(&self) -> bool {
+        self.run_can_interrupt() && self.run_state != Some(AgentRunState::Paused)
+    }
+
+    /// Whether the active run is paused and can be resumed.
+    pub(crate) fn run_can_resume(&self) -> bool {
+        self.active_run_id.is_some() && self.run_state == Some(AgentRunState::Paused)
+    }
+
+    /// Whether the active run failed; the server retries a failed tool step.
+    pub(crate) fn run_can_retry(&self) -> bool {
+        self.active_run_id.is_some() && self.run_state == Some(AgentRunState::Failed)
+    }
+
     pub(crate) fn interrupt_active_run(&mut self, cx: &mut Context<Self>) {
         if !self.collaboration.permissions().can_act {
             return;
