@@ -797,6 +797,9 @@ fn only_owners_browse_repositories_and_only_operators_configure_providers() {
             access_token: "token".to_owned(),
         },
         ProviderRequest::ConfigureGitHubWriteAccess { enabled: true },
+        ProviderRequest::RemoveApiKeyProvider {
+            provider_id: loom_model::ProviderId::new("openai"),
+        },
     ] {
         denied(send(&owner_connection, ClientRequest::Provider(request)));
     }

@@ -511,6 +511,7 @@ impl ClientRequest {
             Self::Provider(ProviderRequest::ListProviders) => Some(Capability::ListProviders),
             Self::Provider(ProviderRequest::ConfigureGitHubCopilot { .. })
             | Self::Provider(ProviderRequest::ConfigureApiKeyProvider { .. })
+            | Self::Provider(ProviderRequest::RemoveApiKeyProvider { .. })
             | Self::Provider(ProviderRequest::StartGitHubCopilotLogin)
             | Self::Provider(ProviderRequest::GetGitHubCopilotLoginStatus { .. })
             | Self::Provider(ProviderRequest::ConfigureGitHubRepository { .. })
@@ -1269,7 +1270,7 @@ mod run_message_protocol_tests {
 
     #[test]
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 7));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 8));
         let project_id = ProjectId::new();
         let request = ClientRequest::Project(ProjectRequest::GetProjectSnapshot { project_id });
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));

@@ -414,6 +414,10 @@ pub enum ProviderRequest {
         api_key: String,
     },
 
+    RemoveApiKeyProvider {
+        provider_id: ProviderId,
+    },
+
     StartGitHubCopilotLogin,
 
     GetGitHubCopilotLoginStatus {

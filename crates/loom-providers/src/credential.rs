@@ -10,6 +10,16 @@ pub trait CredentialStore: Send + Sync {
             false,
         ))
     }
+
+    /// Drops a stored secret, reporting whether it was there. Stores that keep
+    /// secrets elsewhere may refuse removal instead of silently leaving them.
+    fn remove(&self, _reference: &CredentialRef) -> Result<bool> {
+        Err(LoomError::new(
+            ErrorCode::InvalidState,
+            "credential store does not support removal",
+            false,
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -151,6 +161,10 @@ impl CredentialStore for FileCredentialStore {
     fn store(&self, reference: &CredentialRef, secret: String) -> Result<()> {
         self.insert(reference.clone(), secret)
     }
+
+    fn remove(&self, reference: &CredentialRef) -> Result<bool> {
+        FileCredentialStore::remove(self, reference)
+    }
 }
 
 pub fn credential_store_error(path: &Path, error: impl fmt::Display) -> LoomError {
@@ -244,6 +258,17 @@ impl CredentialStore for InMemoryCredentialStore {
             })?
             .insert(reference.as_str().to_owned(), secret);
         Ok(())
+    }
+
+    fn remove(&self, reference: &CredentialRef) -> Result<bool> {
+        let mut values = self.values.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "credential store lock was poisoned",
+                true,
+            )
+        })?;
+        Ok(values.remove(reference.as_str()).is_some())
     }
 }
 

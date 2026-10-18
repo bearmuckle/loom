@@ -1305,6 +1305,26 @@ fn settings_section_heading(label: &str) -> impl IntoElement {
         .child(label.to_owned())
 }
 
+/// A small rounded status chip used by provider and connection rows.
+fn settings_status_pill(label: impl Into<String>, positive: bool) -> impl IntoElement {
+    let (foreground, background) = if positive {
+        (0x9ad7bd, 0x10291f)
+    } else {
+        (0xfef3c7, 0x2a2313)
+    };
+    let label = label.into();
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .rounded_full()
+        .px_2()
+        .py_1()
+        .bg(rgb(background))
+        .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(rgb(foreground)))
+        .child(div().text_xs().text_color(rgb(foreground)).child(label))
+}
+
 /// The rounded surface that groups related settings rows.
 fn settings_card() -> gpui_kit::Div {
     div()

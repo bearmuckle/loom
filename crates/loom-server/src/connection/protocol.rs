@@ -983,6 +983,7 @@ impl InProcessConnection {
             | ClientRequest::Provider(ProviderRequest::GetProviderHealth { .. }) => {}
             ClientRequest::Provider(ProviderRequest::ConfigureGitHubCopilot { .. })
             | ClientRequest::Provider(ProviderRequest::ConfigureApiKeyProvider { .. })
+            | ClientRequest::Provider(ProviderRequest::RemoveApiKeyProvider { .. })
             | ClientRequest::Provider(ProviderRequest::ConfigureGitHubRepository { .. }) => {}
             ClientRequest::Access(loom_protocol::AccessRequest::GetCurrentParticipant)
             | ClientRequest::Access(loom_protocol::AccessRequest::ListParticipants)
@@ -1245,6 +1246,7 @@ impl InProcessConnection {
             ClientRequest::Provider(
                 ProviderRequest::ConfigureGitHubCopilot { .. }
                     | ProviderRequest::ConfigureApiKeyProvider { .. }
+                    | ProviderRequest::RemoveApiKeyProvider { .. }
                     | ProviderRequest::ConfigureGitHubRepository { .. }
                     | ProviderRequest::StartGitHubRepositoryLogin
                     | ProviderRequest::GetGitHubRepositoryLoginStatus { .. }

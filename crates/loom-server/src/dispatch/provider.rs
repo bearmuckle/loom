@@ -57,6 +57,15 @@ impl InProcessConnection {
                     ProviderResponse::ProviderConfigured,
                 ))
             }
+            ClientRequest::Provider(ProviderRequest::RemoveApiKeyProvider { provider_id }) => {
+                self.backend
+                    .providers
+                    .remove_api_key_provider(&provider_id)?;
+                self.backend.persist_state()?;
+                Ok(ServerResponse::Provider(
+                    ProviderResponse::ProviderConfigured,
+                ))
+            }
             ClientRequest::Provider(ProviderRequest::StartGitHubCopilotLogin) => {
                 self.start_github_copilot_login()
             }

@@ -199,6 +199,7 @@ ListProviders / ListModels
 DiscoverProviderModels
 GetProviderHealth
 ConfigureGitHubCopilot
+ConfigureApiKeyProvider / RemoveApiKeyProvider
 StartGitHubCopilotLogin / GetGitHubCopilotLoginStatus
 GetRunUsage
 InspectAgentContext
@@ -243,7 +244,9 @@ new clients do not offer setup on older workers. `ConfigureApiKeyProvider`
 accepts a provider ID and API key for a registered API-key provider and returns
 only `ProviderConfigured`; the secret-bearing request is excluded from the
 durable idempotency journal. The client requires WSS for remote workers
-(loopback WS is allowed) before sending the key.
+(loopback WS is allowed) before sending the key. `RemoveApiKeyProvider` takes
+only the provider ID and returns `ProviderConfigured`; it drops the stored
+secret and leaves the provider in the catalog so it can be configured again.
 
 Provider configuration remains in each backend's SQLite database. Newly
 entered API keys are stored in a sibling `<database-stem>.credentials.json`
@@ -272,7 +275,10 @@ A device flow is also how a person signs in (`Access/StartGitHubSignIn`, see
 configuration: it asks only for `read:user`, uses the token to read the GitHub
 account once, and never stores it. Worker-wide provider configuration, including
 `ConfigureGitHubCopilot`, stays with operator connections, while a person's
-`StartGitHubCopilotLogin` adds a version of their own credential.
+`StartGitHubCopilotLogin` adds a version of their own credential. A provider
+device login also asks for `read:user`, so when it completes on a connection
+with no person the worker binds that account too: the provider sign-in doubles
+as the worker sign-in for an operator token.
 
 Important event families include `AgentMessageDelta`,
 `AgentPlanProposed`, `AgentStepStarted`, `ToolCallRequested`,
@@ -465,11 +471,11 @@ Levels that need the same projection change only the display.
 Protocol 11.3 adds identity, roles, and presence; 11.4 adds attributed chat
 and ordered run actions. Provider credential selection uses the same 11.4
 version. 11.5 adds access requests. 11.6 adds GitHub sign-in. 11.7 adds the
-activity-detail projection. Every addition is a new enum variant, a capability,
-or a field with a compatible default (an omitted field keeps the older
-behavior), so clients of an older 11.x minor keep working; they simply never
-send the new requests, negotiate the new capability, or ask for the new
-behavior.
+activity-detail projection. 11.8 adds provider API-key removal. Every addition
+is a new enum variant, a capability, or a field with a compatible default (an
+omitted field keeps the older behavior), so clients of an older 11.x minor keep
+working; they simply never send the new requests, negotiate the new capability,
+or ask for the new behavior.
 
 ### Signing in with GitHub
 

@@ -83,6 +83,57 @@ fn api_key_provider_configuration_is_backend_scoped_and_recovers_without_persist
 }
 
 #[test]
+fn an_operator_removes_an_api_key_through_the_protocol() {
+    let root = std::env::temp_dir().join(format!("loom-api-key-remove-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("backend.sqlite");
+    let backend = InProcessBackend::new_persistent(&path).unwrap();
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+    let provider_id = ProviderId::new("openai-compatible");
+
+    let configured = connection.request(RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::ConfigureApiKeyProvider {
+            provider_id: provider_id.clone(),
+            api_key: "openai-key-to-drop".to_owned(),
+        },
+    )));
+    assert!(
+        matches!(
+            &configured.result,
+            Ok(ServerResponse::Provider(
+                ProviderResponse::ProviderConfigured
+            ))
+        ),
+        "{:?}",
+        configured.result
+    );
+
+    let removed = connection.request(RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::RemoveApiKeyProvider {
+            provider_id: provider_id.clone(),
+        },
+    )));
+    assert!(matches!(
+        removed.result,
+        Ok(ServerResponse::Provider(
+            ProviderResponse::ProviderConfigured
+        ))
+    ));
+    let provider = backend
+        .provider_registry()
+        .list_providers()
+        .unwrap()
+        .into_iter()
+        .find(|provider| provider.id == provider_id)
+        .unwrap();
+    assert!(provider.credential_id.is_none());
+    drop(connection);
+    drop(backend);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn github_access_tokens_are_not_persisted_in_sqlite() {
     let root = std::env::temp_dir().join(format!("loom-github-token-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();

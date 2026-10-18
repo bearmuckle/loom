@@ -954,6 +954,70 @@ impl LoomView {
         );
     }
 
+    /// Drops the API key configured for `provider_id` on the scoped worker.
+    pub(crate) fn remove_api_key_provider(
+        &mut self,
+        provider_id: loom_model::ProviderId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(node_id) = self.providers_node_id.clone() else {
+            self.provider_setup_status.insert(
+                provider_id,
+                "Choose a worker before removing an API key".to_owned(),
+            );
+            cx.notify();
+            return;
+        };
+        self.provider_setup_status.insert(
+            provider_id.clone(),
+            format!(
+                "Removing API key from {}…",
+                self.node_names
+                    .get(&node_id)
+                    .map_or("worker", String::as_str)
+            ),
+        );
+        cx.notify();
+        self.dispatch_to_node(
+            cx,
+            node_id.clone(),
+            ClientRequest::Provider(ProviderRequest::RemoveApiKeyProvider {
+                provider_id: provider_id.clone(),
+            }),
+            move |view, response, cx| match response.result {
+                Ok(ServerResponse::Provider(ProviderResponse::ProviderConfigured)) => {
+                    view.provider_setup_status.insert(
+                        provider_id.clone(),
+                        format!(
+                            "API key removed from {}",
+                            view.node_names
+                                .get(&node_id)
+                                .map_or("worker", String::as_str)
+                        ),
+                    );
+                    view.record_status(format!("Provider API key removed on {node_id}"));
+                    view.load_provider_scope(node_id.clone(), cx);
+                    view.refresh_models_for_node_async(node_id, cx);
+                }
+                Err(error) => {
+                    view.provider_setup_status.insert(
+                        provider_id.clone(),
+                        format!("Could not remove API key: {}", error.message),
+                    );
+                    view.record_backend_error("remove provider API key", error);
+                }
+                Ok(response) => {
+                    let error = unexpected_response("provider API key removal", response);
+                    view.provider_setup_status.insert(
+                        provider_id.clone(),
+                        format!("Could not remove API key: {}", error.message),
+                    );
+                    view.record_backend_error("remove provider API key", error);
+                }
+            },
+        );
+    }
+
     /// Closes the settings dialog, which is the surface its own close control
     /// belongs to.
     pub(crate) fn close_settings(

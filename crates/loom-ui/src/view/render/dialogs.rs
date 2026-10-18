@@ -939,6 +939,7 @@ impl LoomView {
             .gap_2()
             .text_xs()
             .text_color(rgb(0x8f98a6));
+        let can_sign_in = self.login_enabled && self.offers_github_sign_in();
         if let Some(login) = identity {
             row = row
                 .child(
@@ -947,32 +948,43 @@ impl LoomView {
                         .truncate()
                         .child(format!("Signed in as {login}")),
                 )
+                .when(can_sign_in, |element| {
+                    element.child(
+                        Button::new("worker-reauth-github")
+                            .label("Re-authenticate")
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener({
+                                let node_id = node_id.clone();
+                                move |view, _, _, cx| {
+                                    view.reauthenticate_github(node_id.clone(), cx);
+                                }
+                            })),
+                    )
+                })
                 .child(
                     Button::new("worker-sign-out-github")
                         .label("Sign out")
                         .ghost()
                         .xsmall()
-                        .on_click(cx.listener(|view, _, _, cx| view.sign_out_github(cx))),
+                        .on_click(cx.listener({
+                            let node_id = node_id.clone();
+                            move |view, _, _, cx| {
+                                view.sign_out_github_for_node(node_id.clone(), cx);
+                            }
+                        })),
                 );
             return row;
         }
-        if operator {
-            // The operator token is the credential: signing in would only add
-            // attribution, and asking for a second GitHub account here makes a
-            // working connection look incomplete.
-            return row.child(
-                div()
-                    .flex_1()
-                    .child("Connected with an access token; no GitHub account is linked."),
-            );
-        }
         let message = if awaiting_sign_in {
             "This worker is waiting for a GitHub sign-in."
+        } else if operator {
+            "Connected with an access token. Link a GitHub account for attribution."
         } else {
             "Sign in with GitHub to join this worker's roster."
         };
         row = row.child(div().flex_1().child(message));
-        if self.offers_github_sign_in() {
+        if can_sign_in {
             row = row.child(
                 Button::new("worker-sign-in-github")
                     .label("Sign in with GitHub")
@@ -1476,33 +1488,26 @@ impl LoomView {
                                     .flex()
                                     .items_center()
                                     .gap_3()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(if self.github_connected {
-                                                rgb(0x9ad7bd)
-                                            } else {
-                                                rgb(0xfef3c7)
-                                            })
-                                            .child(if self.github_connected {
-                                                "Connected"
-                                            } else {
-                                                "Not connected"
-                                            }),
-                                    )
-                                    .when(
-                                        !self.github_connected && self.login_enabled,
-                                        |element| {
-                                            element.child(
-                                                Button::new("connect-github-account")
-                                                    .label("Connect GitHub")
-                                                    .small()
-                                                    .on_click(
-                                                        cx.listener(Self::toggle_github_login),
-                                                    ),
-                                            )
+                                    .child(settings_status_pill(
+                                        if self.github_connected {
+                                            "connected"
+                                        } else {
+                                            "not connected"
                                         },
-                                    ),
+                                        self.github_connected,
+                                    ))
+                                    .when(self.login_enabled, |element| {
+                                        element.child(
+                                            Button::new("connect-github-account")
+                                                .label(if self.github_connected {
+                                                    "Reconnect"
+                                                } else {
+                                                    "Connect GitHub"
+                                                })
+                                                .small()
+                                                .on_click(cx.listener(Self::toggle_github_login)),
+                                        )
+                                    }),
                             ),
                     ),
                 )
@@ -1514,33 +1519,28 @@ impl LoomView {
                             .flex()
                             .items_center()
                             .gap_3()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(if self.github_repository_connected {
-                                        rgb(0x9ad7bd)
-                                    } else {
-                                        rgb(0xfef3c7)
-                                    })
-                                    .child(if self.github_repository_connected {
-                                        "Authorized"
-                                    } else {
-                                        "Not authorized"
-                                    }),
-                            )
-                            .when(
-                                !self.github_repository_connected && self.login_enabled,
-                                |element| {
-                                    element.child(
-                                        Button::new("connect-github-repository")
-                                            .label("Authorize")
-                                            .small()
-                                            .on_click(
-                                                cx.listener(Self::authorize_github_repository),
-                                            ),
-                                    )
+                            .child(settings_status_pill(
+                                if self.github_repository_connected {
+                                    "authorized"
+                                } else {
+                                    "not authorized"
                                 },
-                            ),
+                                self.github_repository_connected,
+                            ))
+                            .when(self.login_enabled, |element| {
+                                element.child(
+                                    Button::new("connect-github-repository")
+                                        .label(if self.github_repository_connected {
+                                            "Re-authorize"
+                                        } else {
+                                            "Authorize"
+                                        })
+                                        .small()
+                                        .on_click(cx.listener(
+                                            Self::authorize_github_repository,
+                                        )),
+                                )
+                            }),
                         true,
                         phone,
                     )),
@@ -2002,45 +2002,85 @@ impl LoomView {
                 let api_key_configurable = provider.api_key_configurable;
                 let configured = provider.credential_id.is_some();
                 let provider_id = provider.id.clone();
+                let model_count = provider.models.len();
+                let models = format!(
+                    "{model_count} model{}",
+                    if model_count == 1 { "" } else { "s" }
+                );
+                let (status, positive) = if !api_key_configurable {
+                    ("ready", true)
+                } else if configured {
+                    ("key set", true)
+                } else {
+                    ("key needed", false)
+                };
+                let detail = if api_key_configurable {
+                    format!("{models} · API key provider")
+                } else {
+                    format!("{models} · no API key needed")
+                };
                 let mut card = settings_card().child(
                     div()
+                        .w_full()
+                        .flex()
+                        .items_start()
+                        .gap_3()
                         .px_4()
                         .py_3()
                         .child(
                             div()
-                                .text_sm()
-                                .text_color(rgb(0xf3f4f6))
-                                .child(provider.display_name.clone()),
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(0xf3f4f6))
+                                        .child(provider.display_name.clone()),
+                                )
+                                .child(div().text_xs().text_color(rgb(0x8f98a6)).child(detail)),
                         )
-                        // Keyless API providers advertise a seeded default model,
-                        // so only claim models once the provider is usable.
-                        .when(configured || !api_key_configurable, |element| {
-                            element.child(div().text_xs().text_color(rgb(0x8f98a6)).child(format!(
-                                "{} model{} available",
-                                provider.models.len(),
-                                if provider.models.len() == 1 { "" } else { "s" }
-                            )))
-                        })
-                        .when(api_key_configurable, |element| {
-                            element.child(div().text_xs().text_color(rgb(0x8f98a6)).child(
-                                if configured {
-                                    "API key configured".to_owned()
-                                } else {
-                                    "API key not configured".to_owned()
-                                },
-                            ))
-                        }),
+                        .child(settings_status_pill(status, positive)),
                 );
                 if api_key_configurable {
+                    let mut actions = div()
+                        .w_full()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .px_4()
+                        .pb_3();
                     if let Some(input) = self.provider_api_key_inputs.get(&provider.id) {
-                        card = card.child(
-                            div().px_4().pb_3().child(
+                        actions = actions.child(
+                            div().flex_1().min_w(px(160.)).child(
                                 KitInput::new(input)
                                     .id(format!("provider-api-key-input-{}", provider.id.as_str()))
                                     .small(),
                             ),
                         );
                     }
+                    let save_id = provider_id.clone();
+                    actions = actions.child(
+                        Button::new(format!("configure-api-key-{}", provider.id.as_str()))
+                            .label("Save key")
+                            .small()
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.configure_api_key_provider(save_id.clone(), window, cx);
+                            })),
+                    );
+                    if configured {
+                        let remove_id = provider_id.clone();
+                        actions = actions.child(
+                            Button::new(format!("remove-api-key-{}", provider.id.as_str()))
+                                .label("Remove key")
+                                .danger()
+                                .xsmall()
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.remove_api_key_provider(remove_id.clone(), cx);
+                                })),
+                        );
+                    }
+                    card = card.child(actions);
                     if let Some(status) = self.provider_setup_status.get(&provider.id) {
                         card = card.child(
                             div()
@@ -2052,41 +2092,26 @@ impl LoomView {
                                 .child(status.clone()),
                         );
                     }
-                    card = card.child(
-                        div().px_4().pb_3().child(
-                            Button::new(format!("configure-api-key-{}", provider.id.as_str()))
-                                .label("Save API key")
-                                .small()
-                                .on_click(cx.listener(move |view, _, window, cx| {
-                                    view.configure_api_key_provider(
-                                        provider_id.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                })),
-                        ),
-                    );
-                    if provider.credential_id.is_some() {
+                    if configured {
                         let node_id = self
                             .providers_node_id
                             .clone()
                             .unwrap_or_else(|| self.default_backend_node_id.clone());
                         card = card.child(
-                            div()
-                                .id(format!("refresh-provider-models-{}", provider.id.as_str()))
-                                .mx_4()
-                                .mb_3()
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .bg(rgb(0x242833))
-                                .hover(|style| style.bg(rgb(0x293244)))
-                                .text_sm()
-                                .cursor_pointer()
-                                .child("Refresh models")
-                                .on_click(cx.listener(move |view, _, _, cx| {
-                                    view.refresh_models_for_node_async(node_id.clone(), cx);
-                                })),
+                            div().px_4().pb_3().child(
+                                Button::new(format!(
+                                    "refresh-provider-models-{}",
+                                    provider.id.as_str()
+                                ))
+                                .label("Refresh models")
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(
+                                    move |view, _, _, cx| {
+                                        view.refresh_models_for_node_async(node_id.clone(), cx);
+                                    },
+                                )),
+                            ),
                         );
                     }
                 }

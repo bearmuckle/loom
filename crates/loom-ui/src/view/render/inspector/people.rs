@@ -298,9 +298,20 @@ impl LoomView {
             if self.node_uses_operator_token(self.active_node_id()) {
                 body = body.child(empty_note(
                     "This connection uses an operator access token, so it is not a person in \
-                     the roster. Signing in with GitHub would only attribute its actions to an \
-                     account.",
+                     the roster. Signing in with GitHub links an account for attribution.",
                 ));
+                if self.login_enabled && self.offers_github_sign_in() {
+                    let node_id = self.active_node_id().to_owned();
+                    body = body.child(
+                        Button::new("roster-sign-in-github")
+                            .label("Sign in with GitHub")
+                            .outline()
+                            .xsmall()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.begin_identity_sign_in(node_id.clone(), cx);
+                            })),
+                    );
+                }
             } else if self.offers_github_sign_in() {
                 body = body
                     .child(empty_note(
@@ -343,6 +354,21 @@ impl LoomView {
                             .text_xs()
                             .text_color(rgb(0x8f98a6))
                             .child(format!("Signed in as {}", identity.display_name)),
+                    )
+                    .when(
+                        self.login_enabled && self.offers_github_sign_in(),
+                        |element| {
+                            let node_id = self.active_node_id().to_owned();
+                            element.child(
+                                Button::new("reauth-github")
+                                    .label("Re-authenticate")
+                                    .ghost()
+                                    .xsmall()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.reauthenticate_github(node_id.clone(), cx);
+                                    })),
+                            )
+                        },
                     )
                     .child(
                         Button::new("sign-out-github")

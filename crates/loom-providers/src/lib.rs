@@ -1172,6 +1172,42 @@ mod tests {
     }
 
     #[test]
+    fn removing_an_api_key_drops_the_secret_and_leaves_the_provider_available() {
+        let credentials = Arc::new(InMemoryCredentialStore::default());
+        let registry = ProviderRegistry::with_credentials(credentials.clone());
+        registry
+            .register(ProviderConfig::openai(OPENAI_DEFAULT_MODEL))
+            .unwrap();
+        let provider_id = ProviderId::new(OPENAI_PROVIDER_ID);
+        registry
+            .configure_api_key_provider(&provider_id, "first-key".to_owned())
+            .unwrap();
+        let first = registry.list_providers().unwrap().remove(0);
+        let first_reference = CredentialRef::new(first.credential_id.clone().unwrap());
+        assert_eq!(credentials.resolve(&first_reference).unwrap(), "first-key");
+
+        // Rotating the key drops the installation-scoped secret it replaced.
+        registry
+            .configure_api_key_provider(&provider_id, "second-key".to_owned())
+            .unwrap();
+        assert!(credentials.resolve(&first_reference).is_err());
+        let second = registry.list_providers().unwrap().remove(0);
+        let second_reference = CredentialRef::new(second.credential_id.clone().unwrap());
+        assert_eq!(
+            credentials.resolve(&second_reference).unwrap(),
+            "second-key"
+        );
+
+        assert!(registry.remove_api_key_provider(&provider_id).unwrap());
+        assert!(credentials.resolve(&second_reference).is_err());
+        let removed = registry.list_providers().unwrap().remove(0);
+        assert_eq!(removed.id, provider_id);
+        assert!(removed.credential_id.is_none());
+        assert!(!removed.is_usable());
+        assert!(!registry.remove_api_key_provider(&provider_id).unwrap());
+    }
+
+    #[test]
     fn openai_model_discovery_uses_official_models_shape_and_filters_unsupported_models() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();

@@ -287,6 +287,12 @@ impl ProviderRegistry {
                 "provider API key must not be empty",
             ));
         }
+        let credentials = self.instance_credentials()?;
+        let reference = CredentialRef::new(format!(
+            "api-key:{}:{}",
+            provider_id.as_str(),
+            loom_core::RequestId::new()
+        ));
         let mut configurations = self
             .configurations
             .lock()
@@ -302,20 +308,65 @@ impl ProviderRegistry {
                 "API keys can only be configured for API-key providers",
             ));
         }
-        let reference = CredentialRef::new(format!(
-            "api-key:{}:{}",
-            provider_id.as_str(),
-            loom_core::RequestId::new()
-        ));
-        let credentials = self
-            .api_key_credentials
-            .lock()
-            .map_err(|_| internal_lock_error("API-key credential store"))?
-            .clone()
-            .unwrap_or_else(|| Arc::clone(&self.credentials));
         credentials.store(&reference, api_key)?;
-        config.credential = Some(reference);
+        let previous = config.credential.replace(reference);
+        drop(configurations);
+        // A replaced installation-scoped key is dead weight; drop it so
+        // rotating a key does not leave the old secret behind.
+        if let Some(previous) = previous
+            && previous.as_str().starts_with("api-key:")
+            && let Err(error) = credentials.remove(&previous)
+        {
+            // The new key is stored and selected; a leftover old secret is not
+            // worth failing the rotation the user asked for.
+            log::warn!(
+                "[loom-providers] rotated API key for '{}' but could not remove the previous \
+                 credential: {}",
+                provider_id.as_str(),
+                error.message
+            );
+        }
         Ok(())
+    }
+
+    /// Drops the API key configured for `provider_id`, leaving the provider in
+    /// the catalog so it can be configured again. Returns whether a key was
+    /// present. Only API-key providers may be cleared.
+    pub fn remove_api_key_provider(&self, provider_id: &ProviderId) -> Result<bool> {
+        let reference = {
+            let configurations = self
+                .configurations
+                .lock()
+                .map_err(|_| internal_lock_error("provider configuration"))?;
+            let config = configurations
+                .get(provider_id)
+                .ok_or_else(|| LoomError::not_found("provider", provider_id.as_str()))?;
+            if !matches!(
+                config.kind,
+                ProviderKind::OpenAi | ProviderKind::OpenAiCompatible | ProviderKind::DeepSeek
+            ) {
+                return Err(LoomError::invalid_request(
+                    "API keys can only be removed from API-key providers",
+                ));
+            }
+            config.credential.clone()
+        };
+        let Some(reference) = reference else {
+            return Ok(false);
+        };
+        // Only installation-scoped keys are safe to erase: a legacy reference
+        // may be shared by another backend that has not migrated it yet.
+        if reference.as_str().starts_with("api-key:") {
+            self.instance_credentials()?.remove(&reference)?;
+        }
+        let mut configurations = self
+            .configurations
+            .lock()
+            .map_err(|_| internal_lock_error("provider configuration"))?;
+        if let Some(config) = configurations.get_mut(provider_id) {
+            config.credential = None;
+        }
+        Ok(true)
     }
 
     /// Resolves the GitHub token used for repository operations (clone, browse,

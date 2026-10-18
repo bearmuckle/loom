@@ -449,6 +449,118 @@ fn github_repository_access_row_renders_when_disconnected(cx: &mut TestAppContex
 }
 
 #[gpui_kit::test]
+fn a_signed_in_worker_offers_reauthentication_and_sign_out(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.login_enabled = true;
+        view.github_sign_in_available = true;
+        view.collaboration.identity = Some(loom_core::ParticipantIdentity {
+            id: loom_core::ParticipantId::new(),
+            display_name: "octocat".to_owned(),
+        });
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Workers));
+        view
+    });
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("worker-reauth-github").is_some());
+        assert!(window.try_find("worker-sign-out-github").is_some());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn an_operator_without_an_identity_can_link_one(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.login_enabled = true;
+        view.github_sign_in_available = true;
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Workers));
+        view
+    });
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("worker-sign-in-github").is_some());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn an_api_key_can_be_removed_from_its_provider_card(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        crate::connection::negotiate(&view.connection).unwrap();
+        let provider_id = loom_model::ProviderId::new("openai-compatible");
+        let configured = view
+            .connection
+            .request(RequestEnvelope::new(ClientRequest::Provider(
+                ProviderRequest::ConfigureApiKeyProvider {
+                    provider_id: provider_id.clone(),
+                    api_key: "key-to-drop".to_owned(),
+                },
+            )));
+        assert!(configured.result.is_ok(), "{:?}", configured.result);
+        view.open_providers_for_node(view.default_backend_node_id.clone(), cx);
+        view
+    });
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window
+                .try_find("remove-api-key-openai-compatible")
+                .is_some()
+        );
+    })
+    .unwrap();
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window
+            .root::<LoomView>()
+            .unwrap()
+            .unwrap()
+            .update(cx, |view, cx| {
+                view.remove_api_key_provider(loom_model::ProviderId::new("openai-compatible"), cx);
+            });
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window
+                .try_find("remove-api-key-openai-compatible")
+                .is_none()
+        );
+        let view = window.root::<LoomView>().unwrap().unwrap();
+        view.update(cx, |view, _| {
+            let providers = view
+                .connection
+                .request(RequestEnvelope::new(ClientRequest::Provider(
+                    ProviderRequest::ListProviders,
+                )));
+            let Ok(ServerResponse::Provider(ProviderResponse::Providers { providers })) =
+                providers.result
+            else {
+                panic!("unexpected provider response");
+            };
+            let provider = providers
+                .into_iter()
+                .find(|provider| provider.id.as_str() == "openai-compatible")
+                .unwrap();
+            assert!(provider.credential_id.is_none());
+        });
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn github_copilot_login_finishes_by_registering_the_provider(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {

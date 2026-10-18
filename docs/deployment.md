@@ -112,6 +112,9 @@ credential left.
 5. Select Sign out to end the binding. The person leaves the roster of every
    session they could see, and a connection accepted without a credential
    returns to the sign-in prompt. An operator connection keeps its authority.
+   Select Re-authenticate to replace the bound account: the client signs out,
+   then starts a fresh device flow, because the worker refuses a second sign-in
+   while an identity is bound.
 
 An operator token still behaves exactly as it did: enter it after the URL, and
 the connection has unrestricted authority with no person bound. It may also

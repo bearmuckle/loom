@@ -22,11 +22,6 @@ impl LoomView {
             .unwrap_or(&self.default_backend_node_id)
     }
 
-    /// The backend that serves the active session's node.
-    pub(crate) fn active_node_backend(&self) -> Option<BackendWorker> {
-        self.node_backends.get(self.active_node_id()).cloned()
-    }
-
     /// Whether `node_id` is a connection opened without a credential that has
     /// not signed in yet.
     pub(crate) fn node_awaits_sign_in(&self, node_id: &str) -> bool {
@@ -1153,7 +1148,12 @@ impl LoomView {
     /// Signs the active connection out of GitHub.
     pub(crate) fn sign_out_github(&mut self, cx: &mut Context<Self>) {
         let node_id = self.active_node_id().to_owned();
-        let Some(backend) = self.active_node_backend() else {
+        self.sign_out_github_for_node(node_id, cx);
+    }
+
+    /// Signs `node_id` out of GitHub without changing which worker is active.
+    pub(crate) fn sign_out_github_for_node(&mut self, node_id: String, cx: &mut Context<Self>) {
+        let Some(backend) = self.node_backends.get(&node_id).cloned() else {
             self.record_status("The selected worker is not connected.");
             cx.notify();
             return;
@@ -1164,7 +1164,7 @@ impl LoomView {
         cx.spawn(async move |view, cx| {
             let response = pending.wait().await;
             view.update(cx, |view, cx| {
-                view.finish_sign_out_github(&node_id, response, cx)
+                view.finish_sign_out_github(&node_id, response, cx);
             })
             .ok();
         })
@@ -1172,14 +1172,47 @@ impl LoomView {
         cx.notify();
     }
 
-    /// Applies the answer to `Access/SignOutGitHub`.
+    /// Signs out and starts a fresh GitHub sign-in, so an expired or wrong
+    /// identity can be replaced without leaving the worker settings first.
+    ///
+    /// The worker refuses a second sign-in while an identity is bound, so
+    /// re-authentication is an explicit sign-out followed by a new device
+    /// flow. A connection with no identity starts the flow immediately.
+    pub(crate) fn reauthenticate_github(&mut self, node_id: String, cx: &mut Context<Self>) {
+        if self.collaboration.identity.is_none() {
+            self.begin_identity_sign_in(node_id, cx);
+            return;
+        }
+        let Some(backend) = self.node_backends.get(&node_id).cloned() else {
+            self.record_status("The selected worker is not connected.");
+            cx.notify();
+            return;
+        };
+        let pending = backend.submit(RequestEnvelope::new(ClientRequest::Access(
+            AccessRequest::SignOutGitHub,
+        )));
+        cx.spawn(async move |view, cx| {
+            let response = pending.wait().await;
+            view.update(cx, |view, cx| {
+                if view.finish_sign_out_github(&node_id, response, cx) {
+                    view.begin_identity_sign_in(node_id.clone(), cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Applies the answer to `Access/SignOutGitHub`, reporting whether the
+    /// connection is now signed out.
     pub(crate) fn finish_sign_out_github(
         &mut self,
         node_id: &str,
         response: ResponseEnvelope,
         cx: &mut Context<Self>,
-    ) {
-        match response.result {
+    ) -> bool {
+        let signed_out = match response.result {
             Ok(ServerResponse::Access(AccessResponse::SignedOutGitHub)) => {
                 self.collaboration.reset_after_sign_out();
                 if self.unsigned_nodes.contains(node_id) {
@@ -1192,14 +1225,22 @@ impl LoomView {
                 if !self.awaits_sign_in() {
                     self.refresh_people(cx);
                 }
+                true
             }
-            Err(error) => self.record_backend_error("sign out of GitHub", error),
-            Ok(response) => self.record_backend_error(
-                "sign out of GitHub",
-                unexpected_response("sign out of GitHub", response),
-            ),
-        }
+            Err(error) => {
+                self.record_backend_error("sign out of GitHub", error);
+                false
+            }
+            Ok(response) => {
+                self.record_backend_error(
+                    "sign out of GitHub",
+                    unexpected_response("sign out of GitHub", response),
+                );
+                false
+            }
+        };
         cx.notify();
+        signed_out
     }
 }
 

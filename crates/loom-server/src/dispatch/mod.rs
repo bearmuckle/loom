@@ -279,6 +279,9 @@ impl InProcessConnection {
             ClientRequest::Provider(ProviderRequest::ConfigureApiKeyProvider { .. }) => {
                 self.provider_dispatch(request, request_id)
             }
+            ClientRequest::Provider(ProviderRequest::RemoveApiKeyProvider { .. }) => {
+                self.provider_dispatch(request, request_id)
+            }
             ClientRequest::Provider(ProviderRequest::StartGitHubCopilotLogin) => {
                 self.provider_dispatch(request, request_id)
             }
