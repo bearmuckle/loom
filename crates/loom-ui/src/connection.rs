@@ -368,6 +368,14 @@ const SHARED_NEGOTIATION_CAPABILITIES: &[Capability] = &[
     Capability::ReadProjectChildReview,
     Capability::IntegrateProjectChild,
     Capability::CleanupProjectChildWorktree,
+    // Access and collaboration writes are capability-checked before dispatch
+    // (`authorize_request_access` in the worker), so a client that omits them
+    // cannot grant roles, request or approve access, or send peer messages:
+    // those retryable mutations fail with `CapabilityDenied` instead.
+    Capability::ReadSessionRoster,
+    Capability::ManageSessionAccess,
+    Capability::RequestSessionAccess,
+    Capability::SendPeerMessage,
     Capability::JsonProtocol,
 ];
 
@@ -1071,11 +1079,14 @@ mod tests {
         worker_node_status, workspace_config,
     };
     use loom_core::{
-        Capability, CapabilitySet, ErrorCode, LoomError as CoreLoomError, Timestamp, WorkspaceId,
-        WorkspaceRecord,
+        AgentSessionId, Capability, CapabilitySet, ErrorCode, LoomError as CoreLoomError,
+        Timestamp, WorkspaceId, WorkspaceRecord,
     };
     use loom_model::ModelId;
-    use loom_protocol::{ProviderResponse, RepositoryResponse, ServerResponse, WorkspaceConfig};
+    use loom_protocol::{
+        AccessRequest, AccessRequestId, CollaborationRequest, ParticipantId, ProviderResponse,
+        RepositoryResponse, ServerResponse, SessionRole, WorkspaceConfig,
+    };
     use loom_server::{AuthTokenStore, AuthorizationScope, RemoteServer, RemoteServerConfig};
     use std::sync::Arc;
 
@@ -1103,6 +1114,94 @@ mod tests {
         ));
         let negotiation = negotiate(&connection).unwrap();
         assert!(negotiation.capabilities.contains(Capability::GitHubSignIn));
+    }
+
+    /// Every request the UI constructs must be able to negotiate the capability
+    /// the worker gates it on. A request whose capability the client never asks
+    /// for works only while it is not checked before dispatch; once it is, the
+    /// worker answers `CapabilityDenied` and the action is impossible. This
+    /// covers the access, collaboration and sign-in requests that regressed
+    /// that way.
+    ///
+    /// `ProjectRequest::SendProjectAgentMessage` is deliberately absent: the UI
+    /// never constructs it (the worker's project tool sends it in-process), so
+    /// the client does not negotiate `SendProjectAgentMessage`.
+    #[test]
+    fn every_request_the_ui_sends_negotiates_its_required_capability() {
+        let session_id = AgentSessionId::new();
+        let participant_id = ParticipantId::new();
+        let access_request_id = AccessRequestId::new();
+        let requests = [
+            ClientRequest::Access(AccessRequest::GetSessionRoster { session_id }),
+            ClientRequest::Access(AccessRequest::ListParticipants),
+            ClientRequest::Access(AccessRequest::GrantSessionAccess {
+                session_id,
+                participant_id,
+            }),
+            ClientRequest::Access(AccessRequest::SetSessionRole {
+                session_id,
+                participant_id,
+                role: SessionRole::Participant,
+            }),
+            ClientRequest::Access(AccessRequest::RevokeSessionAccess {
+                session_id,
+                participant_id,
+            }),
+            ClientRequest::Access(AccessRequest::ListSessionAccessRequests { session_id }),
+            ClientRequest::Access(AccessRequest::ApproveSessionAccessRequest {
+                session_id,
+                request_id: access_request_id,
+                role: None,
+            }),
+            ClientRequest::Access(AccessRequest::DenySessionAccessRequest {
+                session_id,
+                request_id: access_request_id,
+                reason: None,
+            }),
+            ClientRequest::Access(AccessRequest::RequestSessionAccess {
+                session_id,
+                requested_role: SessionRole::Participant,
+                note: None,
+            }),
+            ClientRequest::Access(AccessRequest::WithdrawSessionAccessRequest {
+                session_id,
+                request_id: access_request_id,
+            }),
+            ClientRequest::Access(AccessRequest::StartGitHubSignIn),
+            ClientRequest::Collaboration(CollaborationRequest::SendPeerMessage {
+                session_id,
+                text: "hello".to_owned(),
+            }),
+        ];
+        let negotiated = negotiation_capabilities();
+        for request in requests {
+            let Some(required) = request.required_capability() else {
+                continue;
+            };
+            assert!(
+                negotiated.contains(required),
+                "the UI sends {request:?}, which the worker gates on {required:?}, but the client \
+                 does not negotiate {required:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_worker_that_offers_access_management_negotiates_it_with_the_client() {
+        let connection = ClientConnection::InProcess(Box::new(
+            crate::local_backend::OwnedBackend::new().connect(),
+        ));
+        let negotiation = negotiate(&connection).unwrap();
+        assert!(
+            negotiation
+                .capabilities
+                .contains(Capability::ReadSessionRoster)
+        );
+        assert!(
+            negotiation
+                .capabilities
+                .contains(Capability::ManageSessionAccess)
+        );
     }
 
     #[test]
