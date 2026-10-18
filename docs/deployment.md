@@ -68,7 +68,13 @@ clients such as scripts and CI.
   provider credential is still configured separately (an operator's
   `ConfigureGitHubCopilot`, or a person's own `StartGitHubCopilotLogin`).
 - A signed-in person holds no session access until an owner grants a role, so
-  sharing a worker does not share its sessions.
+  sharing a worker does not share its sessions. The exception is an operator
+  connection: when the connection that signs in also holds an unrestricted
+  operator token, the worker gives that person the owner role on every session
+  that has no owner. Such a token already reaches every session, so the
+  ownership follows it instead of granting more. A session that already has an
+  owner is unchanged, and a pre-login connection adopts nothing because it
+  holds no token to follow.
 
 ### Signing in from a client
 
@@ -91,7 +97,10 @@ credential left.
 4. The worker binds the GitHub account to the connection. The client then loads
    the workspaces, sessions, and roster it was refused while pre-login, and the
    signed-in login appears in the session header and the People tab. Signing in
-   is what puts a person in the roster; an owner still grants the role.
+   is what puts a person in the roster; an owner still grants the role. When the
+   client connected with an unrestricted operator token, the worker also makes
+   the person the owner of every session that has no owner, before it reports
+   the sign-in, so that client's refresh already shows the sessions it owns.
 5. Select Sign out to end the binding. The person leaves the roster of every
    session they could see, and a connection accepted without a credential
    returns to the sign-in prompt. An operator connection keeps its authority.
@@ -99,7 +108,10 @@ credential left.
 An operator token still behaves exactly as it did: enter it after the URL, and
 the connection has unrestricted authority with no person bound. It may also
 sign in on top of the token, and the worker refuses a second sign-in while one
-identity is bound, so sign out before switching accounts.
+identity is bound, so sign out before switching accounts. Signing in on top of
+an unrestricted operator token leaves that person the owner of every session
+that has no owner, which is how a single-operator worker keeps its sessions once
+its operator signs in.
 
 The browser client is configured with `?remote=<url>` and an optional
 `&token=<token>`; a URL alone connects unsigned, and the token no longer has to

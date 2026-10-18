@@ -480,6 +480,41 @@ fn an_operator_token_connection_stays_unbound_until_it_signs_in() {
 }
 
 #[test]
+fn only_an_unrestricted_operator_token_adopts_ownerless_sessions() {
+    let backend = InProcessBackend::new();
+    let tokens = AuthTokenStore::new();
+    let connect = |scope: AuthorizationScope| {
+        let issued = tokens.issue(scope).unwrap();
+        backend.connect_authenticated(tokens.authenticate(&issued.token).unwrap())
+    };
+
+    // An operator token reaches every session and workspace, so a sign-in on it
+    // adopts the sessions that have no owner.
+    assert!(connect(AuthorizationScope::all()).adopts_ownerless_sessions());
+
+    // A token narrowed to named workspaces or sessions reaches only those, so
+    // its sign-in adopts nothing.
+    let capability = CapabilitySet::new([Capability::GitHubSignIn]);
+    assert!(
+        !connect(AuthorizationScope::for_workspaces(
+            [WorkspaceId::new()],
+            capability.clone()
+        ))
+        .adopts_ownerless_sessions()
+    );
+    assert!(
+        !connect(AuthorizationScope::for_sessions(
+            [AgentSessionId::new()],
+            capability
+        ))
+        .adopts_ownerless_sessions()
+    );
+
+    // A pre-login connection carries no credential at all.
+    assert!(!backend.connect_pre_login().adopts_ownerless_sessions());
+}
+
+#[test]
 fn sign_in_is_refused_when_the_worker_does_not_allow_it() {
     let backend = pre_login_backend(GitHubSignInConfig::disabled());
     assert!(!backend.github_sign_in_enabled());

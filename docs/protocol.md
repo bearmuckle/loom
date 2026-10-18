@@ -538,6 +538,17 @@ New grants start as `observer`. The session creator is its owner. The last
 owner cannot be demoted or revoked. Revocation fails the person's later
 requests and closes their WebSocket connections with close code 1008.
 
+A sign-in on a connection that also holds an unrestricted operator token — a
+scope that names neither a workspace nor a session — makes the signed-in person
+the `owner` of every session that has no owner, and that is persisted before the
+sign-in is reported as `signed_in`. The token already reaches every session, so
+the ownership follows it rather than granting more. Everything else is
+unchanged: a session with any grant is left untouched, because its last owner
+can be neither demoted nor revoked; a pre-login connection holds no token and
+adopts nothing; and a token restricted to named workspaces or sessions adopts
+nothing either. Role enforcement is unchanged — the sign-in adds grants, it does
+not bypass a check.
+
 ### Access requests
 
 `ClientRequest::Access(AccessRequest)`:

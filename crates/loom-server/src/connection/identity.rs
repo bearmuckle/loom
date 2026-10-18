@@ -90,6 +90,85 @@ impl InProcessConnection {
         participant
     }
 
+    /// Whether a GitHub sign-in on this connection also adopts every session
+    /// that has no owner.
+    ///
+    /// Only an operator token whose scope reaches every session and workspace
+    /// qualifies: `None` in both fields means every one of them, and
+    /// [`AuthorizationScope::all`] is that default. Such a token already reaches
+    /// every session, so ownership follows continuity rather than adding
+    /// authority. A pre-login connection holds no credential, and a token
+    /// narrowed by [`AuthorizationScope::for_sessions`] or
+    /// [`AuthorizationScope::for_workspaces`] names what it may reach, so
+    /// neither adopts. A token bound to a person cannot sign in at all, because
+    /// the connection is already bound to that person.
+    pub(crate) fn adopts_ownerless_sessions(&self) -> bool {
+        self.auth_session().is_some_and(|auth| {
+            let scope = auth.scope();
+            scope.sessions.is_none() && scope.workspaces.is_none()
+        })
+    }
+
+    /// Makes a person who just signed in the owner of every session that has no
+    /// owner, when this connection authenticated with an unrestricted operator
+    /// token (see [`Self::adopts_ownerless_sessions`]).
+    ///
+    /// The sessions are listed here because the access service holds no session
+    /// manager. Archived sessions are included: they still exist and may be
+    /// unarchived, so a person who owns the others is not locked out of them. A
+    /// session that already has a grant is left untouched, which covers every
+    /// session that already has an owner. A failed save is logged with the
+    /// sessions it covers and does not fail the sign-in: the identity binding
+    /// was saved already, so the person stays signed in and only the grants are
+    /// not durable.
+    fn adopt_ownerless_sessions_for(&self, identity: &ParticipantIdentity) {
+        if !self.adopts_ownerless_sessions() {
+            return;
+        }
+        let sessions = match self.backend.sessions() {
+            Ok(sessions) => sessions
+                .list_in_workspace(None, true)
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                log::error!(
+                    "[loom-server] {} signed in, but the sessions to adopt could not be listed: {}",
+                    identity.display_name,
+                    error.message
+                );
+                return;
+            }
+        };
+        let adopted = self
+            .backend
+            .access
+            .adopt_ownerless_sessions(identity.id, sessions);
+        if adopted.is_empty() {
+            return;
+        }
+        log::info!(
+            "[loom-server] {} signed in on an unrestricted operator token and now owns every \
+             session that had no owner: {} session(s)",
+            identity.display_name,
+            adopted.len()
+        );
+        if let Err(error) = self.backend.persist_state() {
+            log::error!(
+                "[loom-server] {} signed in, but the ownership of {} session(s) was not saved: \
+                 {}; the sessions are {}",
+                identity.display_name,
+                adopted.len(),
+                error.message,
+                adopted
+                    .iter()
+                    .map(AgentSessionId::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+
     /// Starts a GitHub device sign-in for this connection.
     ///
     /// The sign-in requests only the `read:user` scope, reads the account once
@@ -165,6 +244,10 @@ impl InProcessConnection {
                                         identity.display_name,
                                         identity.id
                                     );
+                                    // Before the status is reported, so the
+                                    // client's post-sign-in refresh already
+                                    // sees the grants.
+                                    connection.adopt_ownerless_sessions_for(&identity);
                                     GitHubSignInStatus::SignedIn {
                                         participant: identity,
                                     }

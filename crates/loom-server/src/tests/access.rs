@@ -145,6 +145,66 @@ fn identity_is_bound_by_the_server_and_creators_own_their_sessions() {
     assert_eq!(entries[0].presence, PresenceStatus::Online);
 }
 
+/// Adoption grants an owner only where a session has no grant at all.
+#[test]
+fn adoption_makes_the_signed_in_person_owner_of_sessions_without_one() {
+    let backend = InProcessBackend::new();
+    let adopter = person("Adopter");
+    let owner = person("Owner");
+    let guest = person("Guest");
+    backend
+        .register_participants(&[adopter.clone(), owner.clone(), guest.clone()])
+        .unwrap();
+
+    let ownerless = AgentSessionId::new();
+    let owned = AgentSessionId::new();
+    let shared = AgentSessionId::new();
+    backend.access.add_owner(owned, owner.id);
+    backend.access.add_owner(shared, owner.id);
+    backend
+        .access
+        .grant(shared, guest.id, Some(owner.id))
+        .unwrap();
+
+    let adopted = backend
+        .access
+        .adopt_ownerless_sessions(adopter.id, [ownerless, owned, shared]);
+    assert_eq!(adopted, vec![ownerless]);
+    assert_eq!(
+        backend.access.role(ownerless, adopter.id),
+        Some(SessionRole::Owner)
+    );
+
+    // A session that already has an owner is untouched.
+    assert_eq!(backend.access.role(owned, adopter.id), None);
+    assert_eq!(
+        backend
+            .access
+            .roster(owned)
+            .iter()
+            .map(|entry| (entry.participant.id, entry.role))
+            .collect::<Vec<_>>(),
+        vec![(owner.id, SessionRole::Owner)]
+    );
+    // So is a session whose grants are not an ownership: the grant entry means
+    // the session already has an owner, who stays the only one.
+    assert_eq!(backend.access.role(shared, adopter.id), None);
+    assert_eq!(backend.access.roster(shared).len(), 2);
+
+    // A second adoption over the same sessions changes nothing.
+    assert!(
+        backend
+            .access
+            .adopt_ownerless_sessions(adopter.id, [ownerless, owned, shared])
+            .is_empty()
+    );
+    assert_eq!(backend.access.roster(ownerless).len(), 1);
+    assert_eq!(
+        backend.access.sessions_of(adopter.id),
+        BTreeSet::from([ownerless])
+    );
+}
+
 #[test]
 fn roles_gate_reads_actions_and_access_management() {
     let backend = InProcessBackend::new();

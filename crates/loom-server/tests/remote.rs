@@ -8,11 +8,11 @@ use loom_core::{
 };
 use loom_model::ModelId;
 use loom_protocol::{
-    ClientRequest, ControlRequest, ControlResponse, EventsRequest, EventsResponse, ProviderRequest,
-    ProviderResponse, RequestEnvelope, ResponseEnvelope, RunRequest, RunResponse, ServerEvent,
-    ServerResponse, SessionRequest, SessionResponse, TerminalRequest, TerminalResponse,
-    WorkerNodeStatus, WorkspaceRequest, WorkspaceResponse, decode_request, decode_response,
-    encode_request, encode_response,
+    AccessRequest, AccessResponse, ClientRequest, ControlRequest, ControlResponse, EventsRequest,
+    EventsResponse, ProviderRequest, ProviderResponse, RequestEnvelope, ResponseEnvelope,
+    RunRequest, RunResponse, ServerEvent, ServerResponse, SessionRequest, SessionResponse,
+    TerminalRequest, TerminalResponse, WorkerNodeStatus, WorkspaceRequest, WorkspaceResponse,
+    decode_request, decode_response, encode_request, encode_response,
 };
 use loom_server::{
     AuthTokenStore, AuthorizationScope, DEFAULT_MAX_FRAME_BYTES,
@@ -178,6 +178,10 @@ async fn invalid_websocket_url_errors_do_not_echo_credentials() {
 }
 
 async fn negotiate(connection: &mut WebSocketConnection) {
+    negotiate_with(connection, support::capabilities()).await;
+}
+
+async fn negotiate_with(connection: &mut WebSocketConnection, capabilities: CapabilitySet) {
     let response = connection
         .request(RequestEnvelope::new(ClientRequest::Control(
             ControlRequest::DiscoverCapabilities,
@@ -192,7 +196,7 @@ async fn negotiate(connection: &mut WebSocketConnection) {
         .request(RequestEnvelope::new(ClientRequest::Control(
             ControlRequest::Negotiate {
                 client_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
-                capabilities: support::capabilities(),
+                capabilities,
             },
         )))
         .await
@@ -396,6 +400,329 @@ async fn connections_waiting_to_sign_in_are_bounded() {
         upgrade_without_a_credential(&server).await.is_err(),
         "a second connection waiting to sign in must be refused"
     );
+    server.stop().await.unwrap();
+}
+
+/// A local stand-in for github.com's device flow and account API, so a
+/// sign-in test needs no network. Every round of one sign-in makes three
+/// requests: the device authorization, the token exchange, and the account
+/// read.
+struct GitHubDeviceFlowFixture {
+    base: String,
+    requests: std::sync::mpsc::Receiver<String>,
+    server: std::thread::JoinHandle<()>,
+}
+
+/// The GitHub account the fixture reports, and the allowlist that accepts it.
+const FIXTURE_GITHUB_USER_ID: u64 = 141030;
+const FIXTURE_GITHUB_LOGIN: &str = "octocat";
+
+impl GitHubDeviceFlowFixture {
+    fn start(rounds: usize) -> Self {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, requests) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            for _ in 0..rounds * 3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    if stream.read_exact(&mut byte).is_err() {
+                        return;
+                    }
+                    request.push(byte[0]);
+                }
+                let request = String::from_utf8_lossy(&request).into_owned();
+                let path = request
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_owned();
+                let body = match path.as_str() {
+                    "/login/device/code" => concat!(
+                        r#"{"device_code":"device-code","user_code":"ABCD-1234","#,
+                        r#""verification_uri":"https://github.com/login/device","#,
+                        r#""expires_in":900,"interval":1}"#
+                    )
+                    .to_owned(),
+                    "/login/oauth/access_token" => {
+                        r#"{"access_token":"identity-token","token_type":"bearer"}"#.to_owned()
+                    }
+                    "/user" => format!(
+                        r#"{{"id":{},"login":"{}"}}"#,
+                        FIXTURE_GITHUB_USER_ID, FIXTURE_GITHUB_LOGIN
+                    ),
+                    other => panic!("unexpected fixture request: {other}"),
+                };
+                let _ = sender.send(path);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        Self {
+            base: format!("http://{address}"),
+            requests,
+            server,
+        }
+    }
+
+    fn config(&self) -> GitHubSignInConfig {
+        GitHubSignInConfig::new([FIXTURE_GITHUB_LOGIN.to_owned()])
+            .with_device_code_url(format!("{}/login/device/code", self.base))
+            .with_access_token_url(format!("{}/login/oauth/access_token", self.base))
+            .with_user_api_url(format!("{}/user", self.base))
+    }
+
+    /// The paths this fixture served, in order.
+    fn served(&self) -> Vec<String> {
+        self.requests.try_iter().collect()
+    }
+
+    fn join(self) {
+        self.server.join().expect("fixture server panicked");
+    }
+}
+
+/// The capabilities a sign-in test negotiates: the standard fixture plus the
+/// identity capabilities these tests exercise, which that fixture predates.
+fn sign_in_capabilities() -> CapabilitySet {
+    support::capabilities()
+        .iter()
+        .copied()
+        .chain([Capability::GitHubSignIn, Capability::ReadSessionRoster])
+        .collect()
+}
+
+/// Starts a GitHub sign-in on `connection` and returns the id to poll.
+async fn start_github_sign_in(connection: &mut WebSocketConnection) -> String {
+    match connection
+        .request(RequestEnvelope::new(ClientRequest::Access(
+            AccessRequest::StartGitHubSignIn,
+        )))
+        .await
+        .unwrap()
+        .result
+        .unwrap()
+    {
+        ServerResponse::Access(AccessResponse::GitHubSignInStarted { login_id, .. }) => login_id,
+        response => panic!("unexpected sign-in response: {response:?}"),
+    }
+}
+
+/// Polls a sign-in until it stops being pending.
+async fn await_github_sign_in(
+    connection: &mut WebSocketConnection,
+    login_id: &str,
+) -> loom_core::GitHubSignInStatus {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = match connection
+            .request(RequestEnvelope::new(ClientRequest::Access(
+                AccessRequest::GetGitHubSignInStatus {
+                    login_id: login_id.to_owned(),
+                },
+            )))
+            .await
+            .unwrap()
+            .result
+            .unwrap()
+        {
+            ServerResponse::Access(AccessResponse::GitHubSignInStatus { status }) => status,
+            response => panic!("unexpected status response: {response:?}"),
+        };
+        if !matches!(status, loom_core::GitHubSignInStatus::Pending) {
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sign-in did not settle"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn session_roster(
+    connection: &mut WebSocketConnection,
+    session_id: AgentSessionId,
+) -> Vec<loom_core::RosterEntry> {
+    match connection
+        .request(RequestEnvelope::new(ClientRequest::Access(
+            AccessRequest::GetSessionRoster { session_id },
+        )))
+        .await
+        .unwrap()
+        .result
+        .unwrap()
+    {
+        ServerResponse::Access(AccessResponse::SessionRoster { entries, .. }) => entries,
+        response => panic!("unexpected roster response: {response:?}"),
+    }
+}
+
+/// A listener that lets GitHub sign-in through against `fixture`, over
+/// `backend`, with `auth` for its tokens.
+async fn sign_in_server(
+    backend: Arc<InProcessBackend>,
+    auth: Arc<AuthTokenStore>,
+    fixture: &GitHubDeviceFlowFixture,
+) -> loom_server::RunningRemoteServer {
+    RemoteServer::new(
+        backend,
+        auth,
+        RemoteServerConfig {
+            heartbeat_interval: Duration::from_millis(25),
+            request_timeout: Duration::from_secs(5),
+            github_sign_in: fixture.config(),
+            ..RemoteServerConfig::local_ephemeral()
+        },
+    )
+    .bind()
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unrestricted_operator_sign_in_adopts_every_ownerless_session() {
+    let fixture = GitHubDeviceFlowFixture::start(1);
+    let auth = Arc::new(AuthTokenStore::new());
+    let operator = auth
+        .insert("operator-token", AuthorizationScope::all())
+        .unwrap();
+    let server = sign_in_server(InProcessBackend::new(), Arc::clone(&auth), &fixture).await;
+    let mut connection = WebSocketTransport::new(server.websocket_url(), operator.token.clone())
+        .connect()
+        .await
+        .unwrap();
+    negotiate_with(&mut connection, sign_in_capabilities()).await;
+
+    // An operator connection creates a workspace and a session without an
+    // owner, so nothing needs to be revoked or demoted for the sign-in.
+    let workspace_id = create_workspace(&mut connection).await;
+    let session = session(&mut connection, workspace_id).await;
+    assert!(session_roster(&mut connection, session.id).await.is_empty());
+
+    let login_id = start_github_sign_in(&mut connection).await;
+    let loom_core::GitHubSignInStatus::SignedIn { participant } =
+        await_github_sign_in(&mut connection, &login_id).await
+    else {
+        panic!("the sign-in should bind the person");
+    };
+    assert_eq!(
+        participant.id,
+        loom_core::github_participant_id(FIXTURE_GITHUB_USER_ID)
+    );
+
+    // The person is the owner of the session that had no owner, not merely a
+    // person with some access to it. The connection is held to roles after the
+    // sign-in, so this roster read also shows the grant arrived before the
+    // status was reported.
+    let entries = session_roster(&mut connection, session.id).await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].participant, participant);
+    assert_eq!(entries[0].role, loom_core::SessionRole::Owner);
+
+    // The grant is real authority: an owner-only request now succeeds, where
+    // the same connection was held to the role it had before the sign-in.
+    let renamed = connection
+        .request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::RenameAgentSession {
+                session_id: session.id,
+                name: "adopted".to_owned(),
+            },
+        )))
+        .await
+        .unwrap();
+    assert!(renamed.result.is_ok(), "{:?}", renamed.result);
+
+    assert_eq!(
+        fixture.served(),
+        vec!["/login/device/code", "/login/oauth/access_token", "/user"]
+    );
+    fixture.join();
+    drop(connection);
+    server.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restricted_operator_sign_in_adopts_nothing() {
+    let fixture = GitHubDeviceFlowFixture::start(1);
+    let auth = Arc::new(AuthTokenStore::new());
+    let operator = auth
+        .insert("operator-token", AuthorizationScope::all())
+        .unwrap();
+    let server = sign_in_server(InProcessBackend::new(), Arc::clone(&auth), &fixture).await;
+    let mut operator_connection =
+        WebSocketTransport::new(server.websocket_url(), operator.token.clone())
+            .connect()
+            .await
+            .unwrap();
+    negotiate_with(&mut operator_connection, sign_in_capabilities()).await;
+    let workspace_id = create_workspace(&mut operator_connection).await;
+    let session = session(&mut operator_connection, workspace_id).await;
+
+    // A workspace-scoped token reaches only the workspace it names, so a
+    // sign-in on it adopts nothing even though it may sign in.
+    let scoped = auth
+        .insert(
+            "workspace-token",
+            AuthorizationScope::for_workspaces(
+                [workspace_id],
+                CapabilitySet::new([Capability::GitHubSignIn]),
+            ),
+        )
+        .unwrap();
+    let mut scoped_connection = WebSocketTransport::new(server.websocket_url(), scoped.token)
+        .connect()
+        .await
+        .unwrap();
+    negotiate_with(&mut scoped_connection, sign_in_capabilities()).await;
+    let login_id = start_github_sign_in(&mut scoped_connection).await;
+    let loom_core::GitHubSignInStatus::SignedIn { participant } =
+        await_github_sign_in(&mut scoped_connection, &login_id).await
+    else {
+        panic!("a workspace-scoped token may still sign in");
+    };
+    assert_eq!(
+        participant.id,
+        loom_core::github_participant_id(FIXTURE_GITHUB_USER_ID)
+    );
+
+    // The session still has no grant, which is what the unrestricted operator
+    // connection reads back.
+    assert!(
+        session_roster(&mut operator_connection, session.id)
+            .await
+            .is_empty()
+    );
+    // The signed-in person is held to roles on their own connection: a session
+    // the scoped token did not adopt is not readable.
+    assert_eq!(
+        scoped_connection
+            .request(RequestEnvelope::new(ClientRequest::Access(
+                AccessRequest::GetSessionRoster {
+                    session_id: session.id
+                },
+            )))
+            .await
+            .unwrap()
+            .result
+            .unwrap_err()
+            .code,
+        ErrorCode::AuthorizationDenied
+    );
+
+    fixture.join();
+    drop((operator_connection, scoped_connection));
     server.stop().await.unwrap();
 }
 

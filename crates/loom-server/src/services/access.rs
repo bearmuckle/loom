@@ -264,6 +264,47 @@ impl AccessService {
         );
     }
 
+    /// Makes `participant` the owner of every candidate session that has no
+    /// grant at all, and returns the sessions it adopted.
+    ///
+    /// The caller passes the sessions because this service holds no session
+    /// manager: it owns grants, not the catalog those grants hang off. A
+    /// session with any grant already has an owner, because the last owner of a
+    /// session can neither be demoted nor revoked (see [`Self::set_role`] and
+    /// [`Self::revoke`]), so only a session with no grant entry adopts a first
+    /// owner here.
+    pub(crate) fn adopt_ownerless_sessions(
+        &self,
+        participant: ParticipantId,
+        sessions: impl IntoIterator<Item = AgentSessionId>,
+    ) -> Vec<AgentSessionId> {
+        let now = Timestamp::now();
+        let mut state = self.state();
+        let mut adopted = Vec::new();
+        for session_id in sessions {
+            if state
+                .grants
+                .get(&session_id)
+                .is_some_and(|grants| !grants.is_empty())
+            {
+                continue;
+            }
+            state.grants.entry(session_id).or_default().insert(
+                participant,
+                SessionGrant {
+                    session_id,
+                    participant_id: participant,
+                    role: SessionRole::Owner,
+                    granted_by: None,
+                    granted_at: now,
+                    updated_at: now,
+                },
+            );
+            adopted.push(session_id);
+        }
+        adopted
+    }
+
     /// Grants a known person access. A new grant starts as an observer; an
     /// existing grant is returned unchanged.
     pub(crate) fn grant(
