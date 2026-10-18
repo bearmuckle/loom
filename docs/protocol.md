@@ -571,7 +571,13 @@ connections may omit it.
 
 - `SendPeerMessage { session_id, text }` → `PeerMessageSent { entry }`. Peer
   chat is stored in the session history, is never added to model context, and
-  never starts or continues a run.
+  never starts or continues a run. The protocol has no per-person delivery:
+  every peer message goes to the session's people. Clients pick the recipient
+  from a leading mention, so no modal state can misroute a message: `@agent`
+  sends the rest of the text to the agent, `@people` sends peer chat, and
+  `@<name>` sends peer chat addressed to the roster person whose name matches.
+  Any other leading `@` word is a file reference and leaves the text on the
+  agent path.
 - `DirectAgent { run_id, expected, text }`,
   `AnswerAgentQuestion { run_id, expected, text }`, and
   `ControlRun { run_id, expected, action }` → `RunAction(RunActionOutcome)`.
