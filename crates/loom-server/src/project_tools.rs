@@ -705,9 +705,9 @@ impl ProjectAgentTools {
         self.backend.upgrade().map(|backend| InProcessConnection {
             backend,
             negotiated_capabilities: Arc::new(Mutex::new(None)),
-            auth: None,
+            identity: Arc::new(Mutex::new(ConnectionIdentity::default())),
+            pre_login: false,
             max_response_bytes: None,
-            presence: None,
         })
     }
 
@@ -755,9 +755,9 @@ impl ProjectAgentTools {
         let connection = InProcessConnection {
             backend,
             negotiated_capabilities: Arc::new(Mutex::new(None)),
-            auth: None,
+            identity: Arc::new(Mutex::new(ConnectionIdentity::default())),
+            pre_login: false,
             max_response_bytes: None,
-            presence: None,
         };
         match connection.load_project_snapshot(self.project_id) {
             Ok(project)

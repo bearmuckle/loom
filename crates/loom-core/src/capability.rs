@@ -72,6 +72,11 @@ pub enum Capability {
     /// Allows a person to request access to a session, or a higher role in
     /// it, and to withdraw that request. Needs only a bound identity.
     RequestSessionAccess,
+    /// Allows a connection to start a GitHub sign-in and poll its status. A
+    /// connection accepted without a credential may negotiate this capability
+    /// before it is bound to a person; see the pre-login state described in
+    /// `docs/protocol.md`.
+    GitHubSignIn,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -140,6 +145,20 @@ mod tests {
                 .copied()
                 .collect::<Vec<_>>(),
             vec![Capability::ReadAgentSession]
+        );
+    }
+
+    #[test]
+    fn github_sign_in_is_a_negotiable_capability() {
+        let set = CapabilitySet::new([Capability::GitHubSignIn]);
+        assert!(set.contains(Capability::GitHubSignIn));
+        assert_eq!(
+            serde_json::to_string(&Capability::GitHubSignIn).unwrap(),
+            "\"git_hub_sign_in\""
+        );
+        assert_eq!(
+            serde_json::from_str::<CapabilitySet>("[\"git_hub_sign_in\"]").unwrap(),
+            set
         );
     }
 }

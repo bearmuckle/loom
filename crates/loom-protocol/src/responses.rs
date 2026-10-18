@@ -549,4 +549,24 @@ pub enum AccessResponse {
         decision: AccessRequestDecision,
         grant: Option<SessionGrant>,
     },
+
+    /// A GitHub device sign-in was started. `user_code` and `verification_uri`
+    /// are shown to the person; `login_id` polls the state, and `expires_in`
+    /// and `interval` bound how long and how often to poll.
+    GitHubSignInStarted {
+        login_id: String,
+        user_code: String,
+        verification_uri: String,
+        expires_in: u64,
+        interval: u64,
+    },
+
+    /// The state of a GitHub sign-in; `signed_in` carries the person this
+    /// connection is now bound to.
+    GitHubSignInStatus {
+        status: GitHubSignInStatus,
+    },
+
+    /// The connection signed out of GitHub and holds no participant identity.
+    SignedOutGitHub,
 }

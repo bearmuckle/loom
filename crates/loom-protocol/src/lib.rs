@@ -12,9 +12,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use loom_core::{
-    AccessRequestDecision, AccessRequestId, CredentialId, MAX_ACCESS_REQUEST_NOTE_BYTES,
-    ParticipantId, ParticipantIdentity, PresenceStatus, ProviderCredentialMetadata, RosterEntry,
-    RunCredentialPin, SessionAccessRequest, SessionCredentialSelection, SessionGrant, SessionRole,
+    AccessRequestDecision, AccessRequestId, CredentialId, GitHubSignInStatus,
+    MAX_ACCESS_REQUEST_NOTE_BYTES, ParticipantId, ParticipantIdentity, PresenceStatus,
+    ProviderCredentialMetadata, RosterEntry, RunCredentialPin, SessionAccessRequest,
+    SessionCredentialSelection, SessionGrant, SessionRole,
 };
 pub use loom_core::{
     Author, CollaborationEntry, CollaborationEntryKind, MAX_COLLABORATION_TEXT_BYTES, Recipient,
@@ -589,6 +590,9 @@ impl ClientRequest {
             | Self::Access(AccessRequest::DenySessionAccessRequest { .. }) => {
                 Some(Capability::ManageSessionAccess)
             }
+            Self::Access(AccessRequest::StartGitHubSignIn) => Some(Capability::GitHubSignIn),
+            Self::Access(AccessRequest::GetGitHubSignInStatus { .. })
+            | Self::Access(AccessRequest::SignOutGitHub) => None,
         }
     }
 
@@ -619,6 +623,11 @@ impl ClientRequest {
             // limited to the requester by the backend.
             | Self::Access(AccessRequest::RequestSessionAccess { .. })
             | Self::Access(AccessRequest::WithdrawSessionAccessRequest { .. }) => None,
+            // Signing in, polling a sign-in, and signing out need no grant: a
+            // pre-login connection has no identity to hold one yet.
+            Self::Access(AccessRequest::StartGitHubSignIn)
+            | Self::Access(AccessRequest::GetGitHubSignInStatus { .. })
+            | Self::Access(AccessRequest::SignOutGitHub) => None,
             Self::Events(EventsRequest::GetSessionEvents { session_id, .. }) => {
                 if session_id.is_some() {
                     Some(Observer)
@@ -1110,6 +1119,71 @@ mod run_message_protocol_tests {
     }
 
     #[test]
+    fn github_sign_in_requests_need_no_session_and_round_trip() {
+        let start = ClientRequest::Access(AccessRequest::StartGitHubSignIn);
+        assert_eq!(start.required_capability(), Some(Capability::GitHubSignIn));
+        assert_eq!(start.required_session_role(), None);
+        assert_eq!(start.access_target(), None);
+
+        let status = ClientRequest::Access(AccessRequest::GetGitHubSignInStatus {
+            login_id: "login-1".to_owned(),
+        });
+        assert_eq!(status.required_capability(), None);
+        assert_eq!(status.required_session_role(), None);
+        assert_eq!(status.access_target(), None);
+
+        let sign_out = ClientRequest::Access(AccessRequest::SignOutGitHub);
+        assert_eq!(sign_out.required_capability(), None);
+        assert_eq!(sign_out.required_session_role(), None);
+
+        let participant = ParticipantIdentity {
+            id: loom_core::github_participant_id(141030),
+            display_name: "bjornharrtell".to_owned(),
+        };
+        let responses = [
+            ServerResponse::Access(AccessResponse::GitHubSignInStarted {
+                login_id: "login-1".to_owned(),
+                user_code: "ABCD-1234".to_owned(),
+                verification_uri: "https://github.com/login/device".to_owned(),
+                expires_in: 900,
+                interval: 5,
+            }),
+            ServerResponse::Access(AccessResponse::GitHubSignInStatus {
+                status: GitHubSignInStatus::Pending,
+            }),
+            ServerResponse::Access(AccessResponse::GitHubSignInStatus {
+                status: GitHubSignInStatus::SignedIn {
+                    participant: participant.clone(),
+                },
+            }),
+            ServerResponse::Access(AccessResponse::GitHubSignInStatus {
+                status: GitHubSignInStatus::Failed {
+                    message: "expired".to_owned(),
+                },
+            }),
+            ServerResponse::Access(AccessResponse::SignedOutGitHub),
+        ];
+        for request in [start, status, sign_out] {
+            let encoded = serde_json::to_value(&request).unwrap();
+            assert_eq!(
+                serde_json::from_value::<ClientRequest>(encoded).unwrap(),
+                request
+            );
+        }
+        for response in responses {
+            let encoded = serde_json::to_value(&response).unwrap();
+            assert_eq!(
+                serde_json::from_value::<ServerResponse>(encoded).unwrap(),
+                response
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(ClientRequest::Access(AccessRequest::SignOutGitHub)).unwrap(),
+            serde_json::json!({"type": "access", "data": {"type": "sign_out_git_hub"}})
+        );
+    }
+
+    #[test]
     fn collaboration_requests_need_participants_and_round_trip() {
         let session_id = AgentSessionId::new();
         let run_id = RunId::new();
@@ -1192,7 +1266,7 @@ mod run_message_protocol_tests {
 
     #[test]
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 5));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 6));
         let project_id = ProjectId::new();
         let request = ClientRequest::Project(ProjectRequest::GetProjectSnapshot { project_id });
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));

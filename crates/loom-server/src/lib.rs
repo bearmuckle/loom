@@ -108,6 +108,8 @@ use services::idempotency::{
     IDEMPOTENCY_RETENTION, LEGACY_IDEMPOTENCY_RETENTION, trim_idempotency_cache,
 };
 use services::idempotency::{IdempotencyRecord, IdempotencyStore};
+use services::identity::IdentityService;
+pub use services::identity::{GITHUB_USER_API_URL, GitHubSignInConfig};
 use services::provider_credentials::{PinnedCredentialProvider, ProviderCredentialService};
 
 const FEED_PRUNE_AFTER_NEW_SEQUENCES: u64 = 64;
@@ -131,8 +133,7 @@ struct GitHubApiUser {
 }
 
 pub use auth::{
-    AuthSession, AuthTokenStore, AuthorizationScope, IssuedToken, ParticipantTokenEntry,
-    parse_participant_tokens, participant_id_for_token, validate_display_name,
+    AuthSession, AuthTokenStore, AuthorizationScope, IssuedToken, validate_display_name,
 };
 pub use deployment::{
     DEFAULT_DEPLOYMENT_ROLE, DEPLOYMENT_ROLE_ENV, DiagnosticsSettings, EGRESS_POLICY,
@@ -160,7 +161,7 @@ pub use retention::{
 };
 pub use serve::{
     ServingBackend, bind_exposure_warning, ensure_state_database, ensure_state_database_with,
-    open_backend, start_remote_server, start_remote_server_with_participants,
+    open_backend, report_github_sign_in, start_remote_server,
 };
 
 const DEFAULT_EVENT_RETENTION: usize = 4096;
@@ -375,6 +376,8 @@ pub struct InProcessBackend {
     admissions: AdmissionService,
     /// Participant directory, session grants, and connection presence.
     access: Arc<AccessService>,
+    /// GitHub sign-in policy and pending sign-ins for people.
+    identity: IdentityService,
     /// Per-run ordering of people's directions and control actions.
     collaboration: CollaborationService,
     self_reference: Mutex<Weak<InProcessBackend>>,
@@ -519,7 +522,18 @@ struct ResourceMonitor {
 pub struct InProcessConnection {
     backend: Arc<InProcessBackend>,
     negotiated_capabilities: Arc<Mutex<Option<CapabilitySet>>>,
-    auth: Option<AuthSession>,
+    /// What the connection authenticated with, and the person it is bound to
+    /// now.
+    ///
+    /// Identity is mutable because a GitHub sign-in binds a person to a
+    /// connection that was accepted without a credential, and a sign-out
+    /// releases that person again. Every clone of a connection shares it.
+    identity: Arc<Mutex<ConnectionIdentity>>,
+    /// Whether the connection was accepted without a credential because GitHub
+    /// sign-in is enabled on this worker. Such a connection may only negotiate,
+    /// discover capabilities, read worker status and the current participant,
+    /// and sign in or out until a person signs in on it.
+    pre_login: bool,
     /// Most bytes one response this connection sends may carry.
     ///
     /// The events batch is the one response that grows with journal size, so it
@@ -529,9 +543,18 @@ pub struct InProcessConnection {
     /// [`RemoteServerConfig::max_frame_bytes`], because the server must not send
     /// a frame larger than the limit it advertises to its clients.
     max_response_bytes: Option<usize>,
-    /// The live presence of the person this connection authenticated as.
-    /// Present only for connections bound to a participant; dropping the last
-    /// clone of the connection removes it from the roster.
+}
+
+/// The mutable identity of one connection.
+#[derive(Default)]
+struct ConnectionIdentity {
+    /// The operator token the connection authenticated with, if any.
+    auth: Option<AuthSession>,
+    /// The person this connection is bound to, whether the token named them or
+    /// a GitHub sign-in did.
+    participant: Option<loom_core::ParticipantIdentity>,
+    /// The live presence of that person. Dropping the last clone of the
+    /// connection removes it from the roster.
     presence: Option<Arc<ConnectionPresence>>,
 }
 
@@ -540,21 +563,27 @@ impl InProcessConnection {
         Self {
             backend,
             negotiated_capabilities: Arc::new(Mutex::new(None)),
-            auth: None,
+            identity: Arc::new(Mutex::new(ConnectionIdentity::default())),
+            pre_login: false,
             max_response_bytes: None,
-            presence: None,
         }
     }
 
     /// The person this connection is bound to, if any.
-    pub fn participant(&self) -> Option<&loom_core::ParticipantIdentity> {
-        self.auth.as_ref().and_then(AuthSession::participant)
+    pub fn participant(&self) -> Option<loom_core::ParticipantIdentity> {
+        self.identity_state().ok()?.participant.clone()
     }
 
     /// Presence handle of this connection, so a transport can refresh
     /// liveness and observe revocation.
-    pub fn presence(&self) -> Option<&Arc<ConnectionPresence>> {
-        self.presence.as_ref()
+    pub fn presence(&self) -> Option<Arc<ConnectionPresence>> {
+        self.identity_state().ok()?.presence.clone()
+    }
+
+    /// Whether the connection is waiting for a person to sign in before it may
+    /// do anything else.
+    pub fn awaits_sign_in(&self) -> bool {
+        self.pre_login && self.participant().is_none()
     }
 
     /// Bounds every response this connection sends to `max_response_bytes`.
@@ -566,9 +595,23 @@ impl InProcessConnection {
         self
     }
 
+    fn identity_state(&self) -> Result<MutexGuard<'_, ConnectionIdentity>> {
+        self.identity.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "connection identity lock was poisoned",
+                true,
+            )
+        })
+    }
+
+    /// The operator credential this connection authenticated with, if any.
+    fn auth_session(&self) -> Option<AuthSession> {
+        self.identity_state().ok()?.auth.clone()
+    }
+
     fn authorized_capabilities(&self) -> CapabilitySet {
-        self.auth
-            .as_ref()
+        self.auth_session()
             .and_then(|auth| auth.scope().capabilities.clone())
             .unwrap_or_else(|| self.backend.supported_capabilities.clone())
     }

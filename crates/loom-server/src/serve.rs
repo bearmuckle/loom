@@ -19,8 +19,8 @@ use loom_core::{ErrorCode, LoomError};
 use loom_persistence::SchemaStatus;
 
 use crate::{
-    AuthTokenStore, AuthorizationScope, InProcessBackend, RemoteServer, RemoteServerConfig,
-    RunningRemoteServer,
+    AuthTokenStore, AuthorizationScope, GitHubSignInConfig, InProcessBackend, RemoteServer,
+    RemoteServerConfig, RunningRemoteServer,
 };
 
 /// Ensures the state database at `path` can be opened by this build. An
@@ -127,25 +127,14 @@ impl ServingBackend {
 /// Binds `backend` as a remote WebSocket server that accepts only `token`, warns
 /// when `config` publishes it beyond the local machine without TLS, and logs the
 /// URLs clients use.
+///
+/// `config.github_sign_in` decides whether a WebSocket upgrade without a
+/// credential is accepted as a pre-login connection that may only sign in with
+/// GitHub. Operator bearer tokens keep working either way; they are not bound to
+/// a person unless the connection signs in.
 pub async fn start_remote_server(
     backend: Arc<InProcessBackend>,
     token: &str,
-    config: RemoteServerConfig,
-) -> Result<ServingBackend, LoomError> {
-    start_remote_server_with_participants(backend, token, &[], config).await
-}
-
-/// [`start_remote_server`] that also accepts one bearer token per person.
-///
-/// `token` stays the operator token: it is not bound to a person and is not
-/// subject to session roles. Each entry of `participants` authenticates as
-/// that person, whose identity is derived on the server from the token; the
-/// people are added to the participant directory so owners can grant them
-/// access before their first connection.
-pub async fn start_remote_server_with_participants(
-    backend: Arc<InProcessBackend>,
-    token: &str,
-    participants: &[crate::ParticipantTokenEntry],
     config: RemoteServerConfig,
 ) -> Result<ServingBackend, LoomError> {
     let tls_configured = config.tls.is_some();
@@ -153,14 +142,7 @@ pub async fn start_remote_server_with_participants(
     let bind_addr = config.bind_addr;
     let auth = Arc::new(AuthTokenStore::new());
     let _issued = auth.insert(token, AuthorizationScope::all())?;
-    let identities = auth.insert_participant_tokens(participants)?;
-    if !identities.is_empty() {
-        backend.register_participants(&identities)?;
-        log::info!(
-            "accepting {} participant token(s) for multi-user sessions",
-            identities.len()
-        );
-    }
+    report_github_sign_in(&config.github_sign_in);
     if let Some(warning) = bind_exposure_warning(bind_addr, tls_configured, allow_insecure_remote) {
         log::warn!("{warning}");
     }
@@ -174,6 +156,34 @@ pub async fn start_remote_server_with_participants(
     );
     log::info!("Health endpoint: {}", server.health_url());
     Ok(server)
+}
+
+/// Reports how people sign in, so an operator can tell whether a token-less
+/// upgrade will be accepted, how many logins are allowed, and which OAuth app
+/// the device flow uses.
+pub fn report_github_sign_in(config: &GitHubSignInConfig) {
+    if !config.is_enabled() {
+        log::info!(
+            "GitHub sign-in is disabled; a WebSocket upgrade must carry an operator bearer token"
+        );
+        return;
+    }
+    let client_id_source = if config.client_id.is_some() {
+        "--github-oauth-client-id"
+    } else {
+        "the embedded GitHub CLI OAuth app"
+    };
+    log::info!(
+        "GitHub sign-in is enabled for {} allowlisted login(s); the device flow uses the OAuth \
+         client id from {client_id_source}",
+        config.allowlist_size()
+    );
+    if config.client_id.is_none() {
+        log::warn!(
+            "using the embedded GitHub CLI public OAuth client id for sign-in; pass \
+             --github-oauth-client-id to use your own GitHub OAuth app instead"
+        );
+    }
 }
 
 /// A warning when the bind address publishes the backend beyond the local

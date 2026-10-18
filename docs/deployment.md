@@ -38,6 +38,46 @@ A download reaches `api.github.com` and GitHub's release asset hosts. A client
 installed from an archive, AppImage, or `.deb` already has `loom-server` next
 to it and does not download.
 
+## Shared sessions and GitHub sign-in
+
+A worker can be shared by more than one person. People sign in with their own
+GitHub account instead of receiving a bearer token of their own; per-person
+tokens are retired. Operator bearer tokens remain, but only for headless
+clients such as scripts and CI.
+
+- Sign-in is enabled by listing the GitHub logins that may use the worker:
+  `loom-server --allow-github-login <login>`, repeatable, matched
+  case-insensitively. With no `--allow-github-login`, the worker refuses a
+  WebSocket upgrade that carries no credential and behaves exactly as before.
+- The startup log names whether sign-in is enabled, how many logins are
+  allowed, and where the OAuth client id came from. Using the embedded client id
+  logs a warning as well.
+- `--github-oauth-client-id <id>` selects the OAuth app the device flow uses.
+  Without it the worker uses the public GitHub CLI client id compiled into
+  `loom-providers`, which works without registering anything but is shared by
+  every deployment.
+- The driver of a sign-in is a GitHub OAuth app with the device flow enabled. To
+  use your own, create one under *Settings → Developer settings → OAuth Apps*,
+  enable device flow, and pass its client id; no client secret is needed or
+  stored. The flow asks only for the `read:user` scope.
+- The resulting GitHub token is read once to obtain the account's numeric id and
+  login, and is then dropped. It is never stored as a provider credential, and a
+  provider credential is still configured separately (an operator's
+  `ConfigureGitHubCopilot`, or a person's own `StartGitHubCopilotLogin`).
+- A signed-in person holds no session access until an owner grants a role, so
+  sharing a worker does not share its sessions.
+
+Egress required for sign-in, from the backend itself:
+
+- `github.com` — the device authorization (`/login/device/code`) and token
+  exchange (`/login/oauth/access_token`).
+- `api.github.com` — reading the signed-in account (`/user`).
+
+Both are already part of the intended egress for GitHub remote operations, so a
+worker that clones or pushes to GitHub needs no new exception. A deployment that
+blocks either endpoint keeps working for operator bearer tokens; only interactive
+sign-in fails, with the reason surfaced as a failed sign-in status.
+
 ## Where agent commands execute
 
 Loom has no separate command sandbox. An agent command runs as a child process

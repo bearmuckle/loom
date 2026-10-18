@@ -82,6 +82,9 @@ subprotocol for browser clients that cannot set handshake headers, then
 creates an authenticated view of the existing in-process connection. Each request re-checks the token so revocation takes effect
 without restarting the service. Capability negotiation is intersected with the token grant, and every
 workspace/session/run request is checked against the token's explicit scope.
+A worker that allows GitHub sign-in also accepts an upgrade with no credential
+at all; that connection is pre-login and may only sign in, as described under
+[multi-user sessions](#multi-user-sessions).
 
 The backend should journal enough event metadata to replay the current
 projection after reconnecting, while avoiding unbounded memory growth. A
@@ -264,6 +267,13 @@ when sending the credential. Browser clients instead use
 the device-code exchange and stores the resulting credential itself, so no
 OAuth access token is sent through or persisted by the browser.
 
+A device flow is also how a person signs in (`Access/StartGitHubSignIn`, see
+[multi-user sessions](#multi-user-sessions)). That sign-in is not provider
+configuration: it asks only for `read:user`, uses the token to read the GitHub
+account once, and never stores it. Worker-wide provider configuration, including
+`ConfigureGitHubCopilot`, stays with operator connections, while a person's
+`StartGitHubCopilotLogin` adds a version of their own credential.
+
 Important event families include `AgentMessageDelta`,
 `AgentPlanProposed`, `AgentStepStarted`, `ToolCallRequested`,
 `ToolApprovalRequired`, `ToolCallStarted`, `ToolOutputChunk`,
@@ -424,16 +434,61 @@ transcript may lag the event stream by one in-flight model call.
 
 Protocol 11.3 adds identity, roles, and presence; 11.4 adds attributed chat
 and ordered run actions. Provider credential selection uses the same 11.4
-version. 11.5 adds access requests. Every addition is a new enum variant or
-capability, so clients of an older 11.x minor keep working; they simply never
-send the new requests or negotiate the new capability.
+version. 11.5 adds access requests. 11.6 adds GitHub sign-in. Every addition is
+a new enum variant or capability, so clients of an older 11.x minor keep
+working; they simply never send the new requests or negotiate the new
+capability.
+
+### Signing in with GitHub
+
+An interactive client is not expected to hold a per-person bearer token. When
+the worker operator allows GitHub sign-in (`loom-server --allow-github-login
+<login>`, repeatable), a WebSocket upgrade that carries **no** credential at all
+is accepted and the connection starts *pre-login*: it has no participant
+identity and no session grants. A pre-login connection may only:
+
+- `Negotiate` and `DiscoverCapabilities` (capability `git_hub_sign_in`);
+- `GetWorkerNodeStatus`, so a client can show which worker it reached;
+- `Access/GetCurrentParticipant`, which reports `participant: null`;
+- `Access/StartGitHubSignIn`, `Access/GetGitHubSignInStatus`, and
+  `Access/SignOutGitHub`.
+
+Every other request fails with `authentication_required`. When sign-in is not
+enabled (no `--allow-github-login`), or when a credential is presented, the
+upgrade behaves exactly as before: an operator bearer token is required. The
+listener bounds how many connections may wait to sign in at once and closes one
+that is still unsigned after its sign-in window.
+
+A sign-in is a GitHub device flow:
+
+1. `StartGitHubSignIn` → `GitHubSignInStarted { login_id, user_code,
+   verification_uri, expires_in, interval }`. The client shows the user code and
+   verification URI. The worker asks GitHub only for the `read:user` scope and
+   never stores the resulting GitHub token as a provider credential.
+2. The client polls `GetGitHubSignInStatus { login_id }` →
+   `GitHubSignInStatus { status }`, where `status` is `pending`,
+   `signed_in { participant }`, or `failed { message }`. The person's identity is
+   derived from the immutable numeric GitHub account id, so it survives a login
+   rename and a second sign-in; the display name is the GitHub login. Only the
+   connection that started a sign-in reads it.
+3. `signed_in` means this connection is now bound to a person. If the GitHub
+   login is not on the worker's allowlist, the sign-in fails and the connection
+   stays pre-login.
+4. `SignOutGitHub` → `SignedOutGitHub` ends the binding: the person's presence
+   is dropped from every roster they appear in, and a connection that was
+   accepted without a credential returns to the pre-login state.
+
+Anyone with a GitHub account *may* complete the device flow, but a signed-in
+person holds no session grants until an owner grants one (see access requests).
+An operator bearer token stays what it was: an unrestricted, unbound client for
+headless use. It may sign in too, and is then both an operator and a person.
 
 ### Identity and roles
 
-A bearer token loaded from `loom-server --participants-file` is bound to a
-person. The server derives the participant id and display name from the
-token; no request names its own author. Operator tokens are not bound to a
-person and are governed by token scope only.
+The worker binds a participant identity to a connection; no request names its
+own author. A participant id derived from a GitHub account id is stable across
+renames and re-authentication, and an operator token is not bound to a person
+and is governed by token scope only.
 
 Each session grants every person one role:
 
@@ -493,6 +548,11 @@ requests and closes their WebSocket connections with close code 1008.
 
 Pending requests persist (table `session_access_requests`, schema v11) and are
 removed when decided or withdrawn.
+
+The same `Access` domain carries the GitHub sign-in requests described under
+[signing in with GitHub](#signing-in-with-github): `StartGitHubSignIn`,
+`GetGitHubSignInStatus { login_id }`, and `SignOutGitHub`. They need no session
+and no grant.
 
 A missing, revoked, or mismatched credential fails with
 `provider_authentication` and a recovery hint (the owner signs in again or

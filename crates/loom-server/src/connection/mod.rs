@@ -5,6 +5,7 @@ use super::*;
 mod collaboration;
 mod events;
 mod filesystem;
+mod identity;
 mod project;
 mod protocol;
 mod repository;

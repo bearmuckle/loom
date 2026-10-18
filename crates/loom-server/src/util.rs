@@ -191,6 +191,40 @@ pub(crate) fn github_account_identity_at(
     token: &str,
     endpoint: &str,
 ) -> Result<GitHubAccountIdentity> {
+    let account = fetch_github_account_at(token, endpoint)?;
+    Ok(GitHubAccountIdentity {
+        name: account
+            .name
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| account.login.clone()),
+        email: format!("{}+{}@users.noreply.github.com", account.id, account.login),
+    })
+}
+
+/// The immutable account facts a GitHub sign-in needs.
+///
+/// The numeric id is what identifies a person across a rename and a
+/// re-authentication; the login is only the display name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GitHubAccountRef {
+    pub(crate) id: u64,
+    pub(crate) login: String,
+}
+
+/// Reads the account a GitHub token belongs to from an explicit endpoint.
+///
+/// The sign-in path calls this instead of [`github_account_identity_at`] so
+/// the commit identity keeps its own extraction rules; the HTTP call and its
+/// error handling are shared.
+pub(crate) fn github_account_ref_at(token: &str, endpoint: &str) -> Result<GitHubAccountRef> {
+    let account = fetch_github_account_at(token, endpoint)?;
+    Ok(GitHubAccountRef {
+        id: account.id,
+        login: account.login,
+    })
+}
+
+fn fetch_github_account_at(token: &str, endpoint: &str) -> Result<GitHubApiUser> {
     run_github_async(async {
         let client = loom_providers::shared_http_client()?;
         let response = client
@@ -220,20 +254,12 @@ pub(crate) fn github_account_identity_at(
                 true,
             ));
         }
-        let account: GitHubApiUser = response.json().await.map_err(|error| {
+        response.json().await.map_err(|error| {
             LoomError::new(
                 ErrorCode::ProviderInvalidResponse,
                 format!("GitHub returned an invalid account: {error}"),
                 false,
             )
-        })?;
-        let name = account
-            .name
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| account.login.clone());
-        Ok(GitHubAccountIdentity {
-            name,
-            email: format!("{}+{}@users.noreply.github.com", account.id, account.login),
         })
     })
 }

@@ -39,7 +39,7 @@ use tokio_tungstenite::{
     tungstenite::{Error as TungsteniteError, Message as ClientMessage, client::IntoClientRequest},
 };
 
-use super::{AuthSession, AuthTokenStore, InProcessBackend, InProcessConnection};
+use super::{AuthTokenStore, GitHubSignInConfig, InProcessBackend, InProcessConnection};
 
 const DEFAULT_WS_PATH: &str = "/ws";
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(15);
@@ -105,6 +105,19 @@ const CLIENT_FRAME_DEADLINE: Duration = Duration::from_secs(30);
 /// event stream, so the buffer is capped instead of growing with a session that
 /// streams faster than the caller drains it.
 const CLIENT_EVENT_BUFFER_CAPACITY: usize = 1024;
+/// Most connections one listener accepts without a credential at once.
+///
+/// Such a connection is waiting for a person to sign in with GitHub. It holds a
+/// blocking slot and an open socket, so the listener bounds how many can wait
+/// at the same time instead of letting an unauthenticated client exhaust them.
+/// Set the bound with [`RemoteServerConfig::max_anonymous_connections`].
+pub const DEFAULT_MAX_ANONYMOUS_CONNECTIONS: usize = 32;
+/// How long a connection accepted without a credential may wait to sign in.
+///
+/// The device flow itself expires after 15 minutes, so a connection still
+/// unsigned after this window is closed instead of holding a slot. Set the
+/// bound with [`RemoteServerConfig::sign_in_timeout`].
+pub const DEFAULT_SIGN_IN_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Whether this build's WebSocket transport can negotiate TLS (`wss://`).
 ///
@@ -324,6 +337,20 @@ pub struct RemoteServerConfig {
     /// [`DEFAULT_MAX_IN_FLIGHT_CONTROL_REQUESTS`].
     pub max_in_flight_control_requests: usize,
     pub outgoing_capacity: usize,
+    /// Who may sign in to this listener with a GitHub account, and where the
+    /// device flow and account verification call go.
+    ///
+    /// An empty allowlist disables sign-in: a WebSocket upgrade without a
+    /// credential is then refused, exactly as it was before sign-in existed.
+    /// When it is enabled, such an upgrade is accepted as a pre-login
+    /// connection, which may only sign in until a person is bound to it.
+    pub github_sign_in: GitHubSignInConfig,
+    /// Most connections may be accepted without a credential, waiting to sign
+    /// in, at once. It defaults to [`DEFAULT_MAX_ANONYMOUS_CONNECTIONS`].
+    pub max_anonymous_connections: usize,
+    /// How long such a connection may wait to sign in before the listener
+    /// closes it. It defaults to [`DEFAULT_SIGN_IN_TIMEOUT`].
+    pub sign_in_timeout: Duration,
     /// TLS material for the listener. `Some` serves `wss://` and `/health` over
     /// TLS; `None` serves plain `ws://` and is only allowed on loopback unless
     /// [`RemoteServerConfig::allow_insecure_remote`] is set.
@@ -344,6 +371,9 @@ impl Default for RemoteServerConfig {
             max_in_flight_requests: DEFAULT_MAX_IN_FLIGHT_REQUESTS,
             max_in_flight_control_requests: DEFAULT_MAX_IN_FLIGHT_CONTROL_REQUESTS,
             outgoing_capacity: DEFAULT_OUTGOING_CAPACITY,
+            github_sign_in: GitHubSignInConfig::default(),
+            max_anonymous_connections: DEFAULT_MAX_ANONYMOUS_CONNECTIONS,
+            sign_in_timeout: DEFAULT_SIGN_IN_TIMEOUT,
             tls: None,
             allow_insecure_remote: false,
         }
@@ -421,11 +451,17 @@ impl RemoteServer {
             || self.config.max_in_flight_requests == 0
             || self.config.max_in_flight_control_requests == 0
             || self.config.outgoing_capacity == 0
+            || self.config.max_anonymous_connections == 0
         {
             return Err(LoomError::invalid_request(
                 "remote server limits must be greater than zero",
             ));
         }
+        // The sign-in policy lives on the backend a connection serves, so the
+        // listener installs the one it was started with before accepting
+        // anything.
+        self.backend
+            .set_github_sign_in_config(self.config.github_sign_in.clone());
         self.check_exposure()?;
         let tls_config = match &self.config.tls {
             Some(tls) => Some(tls.server_config()?),
@@ -451,6 +487,7 @@ impl RemoteServer {
             backend: self.backend,
             auth: self.auth,
             config: self.config.clone(),
+            anonymous: Arc::new(Semaphore::new(self.config.max_anonymous_connections)),
         };
         let app = Router::new()
             .route(&self.config.path, get(websocket_handler))
@@ -611,6 +648,8 @@ struct RemoteState {
     backend: Arc<InProcessBackend>,
     auth: Arc<AuthTokenStore>,
     config: RemoteServerConfig,
+    /// Bounds how many connections may be waiting to sign in at once.
+    anonymous: Arc<Semaphore>,
 }
 
 /// Reports whether the backend can still serve durable requests.
@@ -636,20 +675,48 @@ async fn websocket_handler(
     headers: HeaderMap,
     State(state): State<RemoteState>,
 ) -> Response {
-    let (token, subprotocol) = match request_auth(&headers) {
-        Ok(auth) => auth,
-        Err(error) => return auth_error_response(error),
-    };
-    let auth = match state.auth.authenticate(token) {
-        Ok(auth) => auth,
+    let sign_in_enabled = state.backend.github_sign_in_enabled();
+    let (auth, subprotocol) = match request_auth(&headers) {
+        Ok((token, subprotocol)) => match state.auth.authenticate(token) {
+            Ok(auth) => (Some(auth), subprotocol),
+            Err(error) => return auth_error_response(error),
+        },
+        // An upgrade carrying no credential at all is accepted only when this
+        // worker lets people sign in with GitHub, and then only as a pre-login
+        // connection that can do nothing but sign in.
+        Err(error) if sign_in_enabled && error.code == ErrorCode::AuthenticationRequired => {
+            (None, None)
+        }
         Err(error) => return auth_error_response(error),
     };
     if let Some(protocol) = subprotocol {
         // Echo the selected subprotocol so the browser accepts the upgrade.
         upgrade = upgrade.protocols([protocol.to_owned()]);
     }
+    let anonymous = match &auth {
+        Some(_) => None,
+        None => match Arc::clone(&state.anonymous).try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                log::warn!(
+                    "refused a WebSocket upgrade without a credential: this listener already \
+                     has {} connections waiting to sign in",
+                    state.config.max_anonymous_connections
+                );
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "too many connections are waiting to sign in",
+                )
+                    .into_response();
+            }
+        },
+    };
+    let connection = match auth {
+        Some(auth) => state.backend.connect_authenticated(auth),
+        None => state.backend.connect_pre_login(),
+    };
     upgrade
-        .on_upgrade(move |socket| handle_socket(socket, state, auth))
+        .on_upgrade(move |socket| handle_socket(socket, state, connection, anonymous))
         .into_response()
 }
 
@@ -884,14 +951,18 @@ fn abandoned_request_error(
     )
 }
 
-async fn handle_socket(socket: WebSocket, state: RemoteState, auth: AuthSession) {
+async fn handle_socket(
+    socket: WebSocket,
+    state: RemoteState,
+    connection: InProcessConnection,
+    // Held for the lifetime of the connection: the slot a listener reserves for
+    // a connection that has no credential yet.
+    _anonymous: Option<OwnedSemaphorePermit>,
+) {
     // The connection carries the listener's frame limit, so an events batch it
     // answers with is bounded to a frame its clients accept instead of reaching
     // them as an over-limit frame that their own rule drains.
-    let connection = state
-        .backend
-        .connect_authenticated(auth)
-        .with_max_response_bytes(state.config.max_frame_bytes);
+    let connection = connection.with_max_response_bytes(state.config.max_frame_bytes);
     let (mut sender, mut receiver) = socket.split();
     let (control_sender, mut control_receiver) = mpsc::channel::<ConnectionControl>(1);
     let (message_sender, mut message_receiver) =
@@ -916,22 +987,31 @@ async fn handle_socket(socket: WebSocket, state: RemoteState, auth: AuthSession)
     // A person losing access ends this connection, and with it every live
     // event subscription it carries. The client reconnects and is then held to
     // its remaining grants. Operator connections are never signalled.
-    let presence = connection.presence().cloned();
-    let revoked = presence.as_ref().map(|presence| presence.revoked());
-    let revoked_wait = async {
-        match &revoked {
-            Some(revoked) => revoked.notified().await,
-            None => std::future::pending().await,
-        }
-    };
-    tokio::pin!(revoked_wait);
+    //
+    // Identity is mutable: a GitHub sign-in binds a person to a connection that
+    // was accepted without a credential, and a sign-out releases them again. The
+    // presence and its revocation signal are therefore re-read on every wait
+    // instead of captured once.
+    let sign_in_deadline = connection
+        .awaits_sign_in()
+        .then(|| Instant::now() + state.config.sign_in_timeout);
     let touch = || {
-        if let Some(presence) = &presence {
+        if let Some(presence) = connection.presence() {
             presence.touch();
         }
     };
 
     loop {
+        let presence = connection.presence();
+        let revoked = presence.as_ref().map(|presence| presence.revoked());
+        let revoked_wait = async {
+            match &revoked {
+                Some(revoked) => revoked.notified().await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(revoked_wait);
+
         tokio::select! {
             () = &mut revoked_wait => {
                 let _ = message_sender
@@ -949,6 +1029,20 @@ async fn handle_socket(socket: WebSocket, state: RemoteState, auth: AuthSession)
             }
             _ = heartbeat.tick() => {
                 if last_activity.elapsed() > heartbeat_timeout {
+                    break;
+                }
+                // A connection that was accepted without a credential must sign
+                // in within its window instead of holding its slot forever.
+                if let Some(deadline) = sign_in_deadline
+                    && connection.awaits_sign_in()
+                    && Instant::now() >= deadline
+                {
+                    let _ = message_sender
+                        .send(Message::Close(Some(CloseFrame {
+                            code: CLOSE_POLICY_VIOLATION,
+                            reason: "sign-in timed out".into(),
+                        })))
+                        .await;
                     break;
                 }
                 if message_sender.try_send(Message::Ping(Vec::new().into())).is_err() {
@@ -1774,7 +1868,8 @@ fn tls_failure_detail(error: &TungsteniteError) -> Option<String> {
 #[cfg(test)]
 mod unit_tests {
     use super::{
-        CLOSE_MESSAGE_TOO_BIG, ConnectionControl, ConnectionLimits, DEFAULT_MAX_FRAME_BYTES,
+        CLOSE_MESSAGE_TOO_BIG, ConnectionControl, ConnectionLimits,
+        DEFAULT_MAX_ANONYMOUS_CONNECTIONS, DEFAULT_MAX_FRAME_BYTES,
         DEFAULT_MAX_IN_FLIGHT_CONTROL_REQUESTS, DEFAULT_MAX_IN_FLIGHT_REQUESTS, InFlightLimits,
         MAX_FRAME_BYTES_ENV, MAX_FRAME_BYTES_FLAG, OversizedFrameAction, RemoteServer,
         RemoteServerConfig, RemoteState, RequestClass, ServerTlsConfig, WEBSOCKET_TLS_SUPPORTED,
@@ -1809,6 +1904,7 @@ mod unit_tests {
         },
         time::Duration,
     };
+    use tokio::sync::Semaphore;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpStream,
@@ -2964,6 +3060,7 @@ mod unit_tests {
             backend: Arc::clone(&backend),
             auth: Arc::new(AuthTokenStore::new()),
             config: RemoteServerConfig::local_ephemeral(),
+            anonymous: Arc::new(Semaphore::new(DEFAULT_MAX_ANONYMOUS_CONNECTIONS)),
         };
         let healthy = health_handler(State(state.clone())).await.into_response();
         assert_eq!(healthy.status(), StatusCode::OK);

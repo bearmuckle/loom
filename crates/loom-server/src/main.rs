@@ -21,12 +21,13 @@ use loom_protocol::ArchiveRetentionPolicy;
 use loom_server::{
     ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FORCE_DISCARD_ENV, ARCHIVE_RETENTION_SUB_AGENT_ENV,
     ARCHIVE_RETENTION_SWEEP_INTERVAL, DEFAULT_MAX_FRAME_BYTES, DiagnosticsSettings,
-    InProcessBackend, Instance, InstanceLayout, InstanceOptions, MAX_FRAME_BYTES_ENV,
-    ProcessContext, RemoteServerConfig, ReopenBackoff, ServerTlsConfig, ServingBackend, TlsState,
-    apply_startup_archive_retention, diagnostics_lines, fail_stop_record_path, open_backend,
-    parse_participant_tokens, reopen_after_fail_stop, resolve_archive_retention_with_sub_agent,
-    resolve_max_frame_bytes, run_archive_retention_sweeps, start_remote_server_with_participants,
-    startup_summary, sweep_archive_retention_at_startup,
+    GitHubSignInConfig, InProcessBackend, Instance, InstanceLayout, InstanceOptions,
+    MAX_FRAME_BYTES_ENV, ProcessContext, RemoteServerConfig, ReopenBackoff, ServerTlsConfig,
+    ServingBackend, TlsState, apply_startup_archive_retention, diagnostics_lines,
+    fail_stop_record_path, open_backend, reopen_after_fail_stop,
+    resolve_archive_retention_with_sub_agent, resolve_max_frame_bytes,
+    run_archive_retention_sweeps, start_remote_server, startup_summary,
+    sweep_archive_retention_at_startup,
 };
 
 /// The bind address used when `--bind` is not supplied.
@@ -92,9 +93,12 @@ struct ServerOptions {
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     allow_insecure_remote: bool,
-    /// JSON file of per-person bearer tokens; see
-    /// [`loom_server::ParticipantTokenEntry`].
-    participants_file: Option<PathBuf>,
+    /// GitHub logins allowed to sign in to this worker. Empty leaves sign-in
+    /// disabled and refuses a token-less WebSocket upgrade.
+    allow_github_login: Vec<String>,
+    /// OAuth app client id for the sign-in device flow; `None` uses the
+    /// embedded GitHub CLI public client.
+    github_oauth_client_id: Option<String>,
 }
 
 impl Default for ServerOptions {
@@ -113,7 +117,8 @@ impl Default for ServerOptions {
             tls_cert: None,
             tls_key: None,
             allow_insecure_remote: false,
-            participants_file: None,
+            allow_github_login: Vec::new(),
+            github_oauth_client_id: None,
         }
     }
 }
@@ -144,6 +149,25 @@ impl ServerOptions {
             self.max_frame_bytes.as_deref(),
             env::var(MAX_FRAME_BYTES_ENV).ok().as_deref(),
         )
+    }
+
+    /// The GitHub sign-in policy these flags ask for.
+    ///
+    /// An empty `--allow-github-login` set leaves sign-in disabled, so a
+    /// token-less WebSocket upgrade is refused as before. The client id is
+    /// reported separately at startup, so an operator can see which OAuth app
+    /// the device flow uses.
+    fn github_sign_in_config(&self) -> GitHubSignInConfig {
+        let config = GitHubSignInConfig::new(
+            self.allow_github_login
+                .iter()
+                .map(|login| login.trim().to_owned())
+                .filter(|login| !login.is_empty()),
+        );
+        match &self.github_oauth_client_id {
+            Some(client_id) => config.with_client_id(client_id.trim()),
+            None => config,
+        }
     }
 
     /// The settings [`Instance`] applies its defaults to. The archive-retention
@@ -227,15 +251,12 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
                 options.tls_key = Some(PathBuf::from(required_value(&mut args, "--tls-key")?));
             }
             "--allow-insecure-remote" => options.allow_insecure_remote = true,
-            "--participants-file" => {
-                options.participants_file = Some(PathBuf::from(required_value(
-                    &mut args,
-                    "--participants-file",
-                )?));
-            }
-            value if value.starts_with("--participants-file=") => {
-                options.participants_file =
-                    Some(PathBuf::from(&value["--participants-file=".len()..]));
+            "--allow-github-login" => options
+                .allow_github_login
+                .push(required_value(&mut args, "--allow-github-login")?),
+            "--github-oauth-client-id" => {
+                options.github_oauth_client_id =
+                    Some(required_value(&mut args, "--github-oauth-client-id")?);
             }
             "--help" | "-h" => return Ok(ParsedArgs::Help),
             "--version" | "-V" => return Ok(ParsedArgs::Version),
@@ -273,6 +294,15 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
             }
             value if value.starts_with("--tls-key=") => {
                 options.tls_key = Some(PathBuf::from(&value["--tls-key=".len()..]));
+            }
+            value if value.starts_with("--allow-github-login=") => {
+                options
+                    .allow_github_login
+                    .push(value["--allow-github-login=".len()..].to_owned());
+            }
+            value if value.starts_with("--github-oauth-client-id=") => {
+                options.github_oauth_client_id =
+                    Some(value["--github-oauth-client-id=".len()..].to_owned());
             }
             unknown => {
                 return Err(LoomError::invalid_request(format!(
@@ -328,7 +358,8 @@ fn help_text() -> String {
          [--archive-retention-force-discard <bool>] \
          [--max-frame-bytes <bytes>] \
          [--tls-cert <pem> --tls-key <pem>] \
-         [--allow-insecure-remote] [--participants-file <path>] [--diagnostics]\n\
+         [--allow-insecure-remote] [--diagnostics] \
+         [--allow-github-login <login> ...] [--github-oauth-client-id <id>]\n\
          \n\
          A standalone Loom backend that serves the remote WebSocket protocol.\n\
          \n\
@@ -358,9 +389,12 @@ fn help_text() -> String {
          \x20 --tls-key <pem>       PEM private key matching --tls-cert\n\
          \x20 --allow-insecure-remote\n\
          \x20                        allow a plaintext ws:// bind beyond loopback\n\
-         \x20 --participants-file <path>\n\
-         \x20                        JSON array of {{\"token\", \"display_name\", optional \
-         \"participant_id\"}} entries, one bearer token per person for shared sessions\n\
+         \x20 --allow-github-login <login>\n\
+         \x20                        let this GitHub login sign in to a shared session; \
+         repeat for each person (sign-in stays off when no login is allowed)\n\
+         \x20 --github-oauth-client-id <id>\n\
+         \x20                        OAuth app client id for the sign-in device flow \
+         (default: the embedded GitHub CLI public client id)\n\
          \x20 --diagnostics         print the resolved deployment context and exit\n\
          \x20 -h, --help            print this help and exit\n\
          \x20 -V, --version         print the version and exit\n\
@@ -484,22 +518,10 @@ async fn start(
         max_frame_bytes: options.max_frame_bytes()?,
         tls,
         allow_insecure_remote: options.allow_insecure_remote,
+        github_sign_in: options.github_sign_in_config(),
         ..RemoteServerConfig::default()
     };
-    let participants = match &options.participants_file {
-        Some(path) => {
-            let contents = std::fs::read_to_string(path).map_err(|error| {
-                LoomError::invalid_request(format!(
-                    "could not read --participants-file '{}': {error}",
-                    path.display()
-                ))
-            })?;
-            parse_participant_tokens(&contents)?
-        }
-        None => Vec::new(),
-    };
-    start_remote_server_with_participants(backend, instance.token().token(), &participants, config)
-        .await
+    start_remote_server(backend, instance.token().token(), config).await
 }
 
 fn serve_blocking(options: ServerOptions) -> Result<(), LoomError> {
@@ -733,6 +755,11 @@ mod tests {
         assert!(!defaults.allow_insecure_remote);
         assert_eq!(defaults.archive_retention, None);
         assert_eq!(defaults.archive_retention_force_discard, None);
+        // GitHub sign-in stays off until a login is allowed, and the embedded
+        // GitHub CLI client id is the default OAuth app.
+        assert!(defaults.allow_github_login.is_empty());
+        assert_eq!(defaults.github_oauth_client_id, None);
+        assert!(!defaults.github_sign_in_config().is_enabled());
 
         let spaced = serve_options(&[
             "--bind",
@@ -753,6 +780,12 @@ mod tests {
             "--tls-key",
             "/tmp/key.pem",
             "--allow-insecure-remote",
+            "--allow-github-login",
+            "bjornharrtell",
+            "--allow-github-login",
+            "octocat",
+            "--github-oauth-client-id",
+            "own-client-id",
         ]);
         assert_eq!(spaced.bind.to_string(), "127.0.0.1:9000");
         assert_eq!(spaced.instance_name.as_deref(), Some("worker"));
@@ -770,6 +803,10 @@ mod tests {
         assert_eq!(spaced.tls_cert.as_deref(), Some(Path::new("/tmp/cert.pem")));
         assert_eq!(spaced.tls_key.as_deref(), Some(Path::new("/tmp/key.pem")));
         assert!(spaced.allow_insecure_remote);
+        let sign_in = spaced.github_sign_in_config();
+        assert!(sign_in.is_enabled());
+        assert_eq!(sign_in.allowlist_size(), 2);
+        assert_eq!(sign_in.client_id.as_deref(), Some("own-client-id"));
 
         let equals = serve_options(&[
             "--bind=0.0.0.0:9",
@@ -780,6 +817,8 @@ mod tests {
             "--archive-retention-force-discard=0",
             "--tls-cert=/tmp/other-cert.pem",
             "--tls-key=/tmp/other-key.pem",
+            "--allow-github-login=bjornharrtell",
+            "--github-oauth-client-id=other-client-id",
         ]);
         assert_eq!(equals.bind.to_string(), "0.0.0.0:9");
         assert_eq!(equals.instance_name.as_deref(), Some("pinned"));
@@ -800,6 +839,11 @@ mod tests {
             Some(Path::new("/tmp/other-key.pem"))
         );
         assert!(!equals.allow_insecure_remote);
+        assert_eq!(equals.allow_github_login, vec!["bjornharrtell".to_owned()]);
+        assert_eq!(
+            equals.github_sign_in_config().client_id.as_deref(),
+            Some("other-client-id")
+        );
     }
 
     #[test]
@@ -814,6 +858,8 @@ mod tests {
             "--archive-retention-force-discard",
             "--tls-cert",
             "--tls-key",
+            "--allow-github-login",
+            "--github-oauth-client-id",
         ] {
             let error = parse_error(&[flag]);
             assert!(
@@ -977,6 +1023,12 @@ mod tests {
         assert!(help.contains("LOOM_ARCHIVE_RETENTION_FORCE_DISCARD"));
         assert!(help.contains("--max-frame-bytes <bytes>"));
         assert!(help.contains("LOOM_MAX_FRAME_BYTES"));
+        assert!(help.contains("--allow-github-login <login>"));
+        assert!(help.contains("--github-oauth-client-id <id>"));
+        assert!(
+            !help.contains("--participants-file"),
+            "per-person bearer tokens are retired"
+        );
         assert!(help.contains("4194304"));
         assert!(help.contains("127.0.0.1:8765"));
         assert!(version_text().starts_with("loom-server "));

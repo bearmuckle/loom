@@ -16,8 +16,8 @@ use loom_protocol::{
 };
 use loom_server::{
     AuthTokenStore, AuthorizationScope, DEFAULT_MAX_FRAME_BYTES,
-    DEFAULT_MAX_IN_FLIGHT_CONTROL_REQUESTS, DEFAULT_MAX_IN_FLIGHT_REQUESTS, InProcessBackend,
-    RemoteServer, RemoteServerConfig, ServerTlsConfig, WEBSOCKET_TLS_SUPPORTED,
+    DEFAULT_MAX_IN_FLIGHT_CONTROL_REQUESTS, DEFAULT_MAX_IN_FLIGHT_REQUESTS, GitHubSignInConfig,
+    InProcessBackend, RemoteServer, RemoteServerConfig, ServerTlsConfig, WEBSOCKET_TLS_SUPPORTED,
     WebSocketConnection, WebSocketTransport,
 };
 use tokio::net::{TcpListener, TcpStream};
@@ -292,6 +292,99 @@ async fn rejects_unauthenticated_websocket_clients_before_capability_discovery()
         Err(error) => error,
     };
     assert_eq!(error.code, ErrorCode::AuthenticationFailed);
+    server.stop().await.unwrap();
+}
+
+/// A listener that accepts GitHub sign-ins with `allowlist`, and at most
+/// `max_anonymous_connections` upgrades that carry no credential.
+async fn server_with_sign_in(
+    allowlist: &[&str],
+    max_anonymous_connections: usize,
+) -> loom_server::RunningRemoteServer {
+    RemoteServer::new(
+        InProcessBackend::new(),
+        Arc::new(AuthTokenStore::new()),
+        RemoteServerConfig {
+            heartbeat_interval: Duration::from_millis(25),
+            request_timeout: Duration::from_secs(5),
+            github_sign_in: GitHubSignInConfig::new(
+                allowlist.iter().map(|login| (*login).to_owned()),
+            ),
+            max_anonymous_connections,
+            ..RemoteServerConfig::local_ephemeral()
+        },
+    )
+    .bind()
+    .await
+    .unwrap()
+}
+
+/// Opens a WebSocket to the test listener without any credential.
+async fn upgrade_without_a_credential(
+    server: &loom_server::RunningRemoteServer,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, tokio_tungstenite::tungstenite::Error> {
+    let request = server.websocket_url().into_client_request().unwrap();
+    connect_async(request).await.map(|(socket, _)| socket)
+}
+
+#[tokio::test]
+async fn an_upgrade_without_a_credential_is_refused_unless_sign_in_is_enabled() {
+    let (_backend, _auth, _token, server) = server().await;
+    assert!(
+        upgrade_without_a_credential(&server).await.is_err(),
+        "a worker without GitHub sign-in must refuse a token-less upgrade"
+    );
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_upgrade_without_a_credential_is_a_pre_login_connection_when_sign_in_is_enabled() {
+    let server = server_with_sign_in(&["octocat"], 4).await;
+    let mut socket = upgrade_without_a_credential(&server)
+        .await
+        .expect("a worker that allows GitHub sign-in accepts a token-less upgrade");
+
+    // The pre-login connection may discover capabilities and read the worker.
+    let discover = encode_request(&RequestEnvelope::new(ClientRequest::Control(
+        ControlRequest::DiscoverCapabilities,
+    )))
+    .unwrap();
+    socket
+        .send(Message::Text(String::from_utf8(discover).unwrap().into()))
+        .await
+        .unwrap();
+    let response = decode_response(&next_text_frame(&mut socket).await).unwrap();
+    assert!(matches!(
+        response.result,
+        Ok(ServerResponse::Control(ControlResponse::Capabilities(_)))
+    ));
+
+    // Anything else is refused with the reason, over the same connection.
+    let request = encode_request(&RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::ListWorkspaces,
+    )))
+    .unwrap();
+    socket
+        .send(Message::Text(String::from_utf8(request).unwrap().into()))
+        .await
+        .unwrap();
+    let response = decode_response(&next_text_frame(&mut socket).await).unwrap();
+    let error = response.result.unwrap_err();
+    assert_eq!(error.code, ErrorCode::AuthenticationRequired);
+    assert!(error.message.contains("not signed in"), "{error}");
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn connections_waiting_to_sign_in_are_bounded() {
+    let server = server_with_sign_in(&["octocat"], 1).await;
+    let _only_slot = upgrade_without_a_credential(&server)
+        .await
+        .expect("the first connection waiting to sign in is accepted");
+    assert!(
+        upgrade_without_a_credential(&server).await.is_err(),
+        "a second connection waiting to sign in must be refused"
+    );
     server.stop().await.unwrap();
 }
 

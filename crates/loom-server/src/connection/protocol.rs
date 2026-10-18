@@ -47,12 +47,12 @@ impl InProcessConnection {
                 );
             }
         };
-        if let Some(auth) = &self.auth
+        if let Some(auth) = self.auth_session()
             && let Err(error) = auth.verify()
         {
             return ResponseEnvelope::failure(request_id, error);
         }
-        if let Some(presence) = &self.presence {
+        if let Some(presence) = self.presence() {
             presence.touch_request();
         }
         if !request
@@ -331,7 +331,7 @@ impl InProcessConnection {
 
         let now = Instant::now();
         let login_id = uuid::Uuid::new_v4().to_string();
-        let initiator = self.participant().cloned();
+        let initiator = self.participant();
         self.backend.credentials.begin_pending_for(
             login_id.clone(),
             now,
@@ -461,7 +461,7 @@ impl InProcessConnection {
     /// sampled into the scope when the token is issued. A session-scoped token
     /// whose sessions are gone reaches no workspace.
     pub(crate) fn authorized_workspaces(&self) -> Result<Option<BTreeSet<WorkspaceId>>> {
-        let Some(auth) = &self.auth else {
+        let Some(auth) = self.auth_session() else {
             return Ok(None);
         };
         let scope = auth.scope();
@@ -491,7 +491,10 @@ impl InProcessConnection {
     }
 
     pub(crate) fn authorize_request(&self, request: &ClientRequest) -> Result<()> {
-        let Some(auth) = &self.auth else {
+        // A connection accepted without a credential because GitHub sign-in is
+        // enabled may do nothing but sign in until a person is bound to it.
+        self.require_sign_in_for(request)?;
+        let Some(auth) = self.auth_session() else {
             return Ok(());
         };
         if let Some(capability) = request.required_capability()
@@ -532,7 +535,7 @@ impl InProcessConnection {
                     ));
                 }
                 let snapshot = self.load_project_snapshot(*project_id)?;
-                self.authorize_project_snapshot(auth, &snapshot)?;
+                self.authorize_project_snapshot(&auth, &snapshot)?;
             }
             ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession { session_id }) => {
                 if !auth.scope().allows_session(*session_id) {
@@ -547,7 +550,7 @@ impl InProcessConnection {
                     ));
                 }
                 let snapshot = self.load_project_snapshot_for_session(*session_id)?;
-                self.authorize_project_snapshot(auth, &snapshot)?;
+                self.authorize_project_snapshot(&auth, &snapshot)?;
             }
             ClientRequest::Workspace(WorkspaceRequest::RegisterWorkspace { workspace }) => {
                 if auth.scope().sessions.is_some() {
@@ -913,7 +916,12 @@ impl InProcessConnection {
             | ClientRequest::Access(loom_protocol::AccessRequest::ListProviderCredentials)
             | ClientRequest::Access(loom_protocol::AccessRequest::RevokeProviderCredential {
                 ..
-            }) => {}
+            })
+            // Signing in needs no scope: a connection without an identity has to
+            // be able to reach GitHub before it holds one.
+            | ClientRequest::Access(loom_protocol::AccessRequest::StartGitHubSignIn)
+            | ClientRequest::Access(loom_protocol::AccessRequest::GetGitHubSignInStatus { .. })
+            | ClientRequest::Access(loom_protocol::AccessRequest::SignOutGitHub) => {}
             ClientRequest::Access(loom_protocol::AccessRequest::GetRunCredential {
                 run_id: requested_run,
             }) => run_id = Some(*requested_run),

@@ -272,6 +272,10 @@ impl InProcessBackend {
             Capability::ManageSessionAccess,
             Capability::SendPeerMessage,
             Capability::RequestSessionAccess,
+            // Sign-in is negotiated by a connection that has no identity yet,
+            // so it is supported whether or not a worker enables it; a worker
+            // that does not reports the refusal when a sign-in is started.
+            Capability::GitHubSignIn,
         ];
         if persistence.is_some() {
             supported_capabilities.extend([
@@ -316,6 +320,7 @@ impl InProcessBackend {
             idempotency_store: IdempotencyStore::new(),
             admissions: AdmissionService::new(),
             access: Arc::new(AccessService::new()),
+            identity: IdentityService::new(),
             collaboration: CollaborationService::new(),
             self_reference: Mutex::new(Weak::new()),
             request_lifecycle: RwLock::new(0),

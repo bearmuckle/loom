@@ -148,7 +148,7 @@ impl InProcessConnection {
                 false,
             ));
         }
-        if let Some(auth) = &self.auth {
+        if let Some(auth) = self.auth_session() {
             if !auth.scope().allows_session(parent_session_id) {
                 return Err(unauthorized_session(parent_session_id));
             }

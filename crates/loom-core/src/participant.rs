@@ -70,6 +70,46 @@ pub struct ParticipantIdentity {
     pub display_name: String,
 }
 
+/// First bytes of every participant id derived from a GitHub account.
+///
+/// They keep a GitHub-derived id from colliding with a randomly generated one
+/// and make the origin of an id visible in a dump.
+const GITHUB_PARTICIPANT_ID_NAMESPACE: [u8; 8] = *b"loomgit1";
+
+/// The stable participant id of one GitHub account.
+///
+/// The id comes from the immutable numeric account id, so it survives a login
+/// rename, a re-authentication, and a restart of the worker. The login is a
+/// display name only and never identifies the person; see
+/// [`GitHubSignInStatus::SignedIn`].
+pub fn github_participant_id(github_user_id: u64) -> ParticipantId {
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&GITHUB_PARTICIPANT_ID_NAMESPACE);
+    bytes[8..].copy_from_slice(&github_user_id.to_be_bytes());
+    // Shape the derived bytes as an RFC 9562 version 4 identifier so tooling
+    // that inspects the version and variant bits keeps working.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    ParticipantId::from_uuid(uuid::Uuid::from_bytes(bytes))
+}
+
+/// Progress of one GitHub sign-in attempt on a worker.
+///
+/// A sign-in starts `Pending` and ends either `SignedIn`, carrying the identity
+/// the worker derived from the GitHub account, or `Failed` with the reason. The
+/// worker keeps the GitHub token only long enough to read the account and never
+/// stores it as a provider credential.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", content = "data", rename_all = "snake_case")]
+pub enum GitHubSignInStatus {
+    /// Waiting for the person to authorize the device code on GitHub.
+    Pending,
+    /// The connection is bound to this person.
+    SignedIn { participant: ParticipantIdentity },
+    /// The sign-in ended without binding a person.
+    Failed { message: String },
+}
+
 /// One person's access to one session.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionGrant {
@@ -194,6 +234,72 @@ mod tests {
             );
         }
         assert_eq!(SessionRole::parse("admin"), None);
+    }
+
+    #[test]
+    fn github_participant_ids_are_stable_per_account_and_distinct_across_accounts() {
+        let first = github_participant_id(141030);
+        // Derived from the immutable numeric id only, so it is the same in any
+        // process and after a login rename or a re-authentication.
+        assert_eq!(first, github_participant_id(141030));
+        assert_ne!(first, github_participant_id(141031));
+        assert_ne!(first, ParticipantId::new());
+        assert_eq!(first.as_uuid().get_version_num(), 4);
+        let bytes = first.as_uuid().as_bytes();
+        // The namespace survives except where the version and variant bits are
+        // shaped; the numeric account id is carried verbatim.
+        assert_eq!(&bytes[..6], &b"loomgi"[..]);
+        assert_eq!(bytes[7], b'1');
+        assert_eq!(&bytes[9..], &141030_u64.to_be_bytes()[1..]);
+        // Distinct accounts that share a display name stay distinct people.
+        assert_ne!(
+            ParticipantIdentity {
+                id: github_participant_id(1),
+                display_name: "same".to_owned(),
+            },
+            ParticipantIdentity {
+                id: github_participant_id(2),
+                display_name: "same".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn sign_in_status_reports_progress_and_the_bound_person() {
+        let participant = ParticipantIdentity {
+            id: github_participant_id(7),
+            display_name: "octocat".to_owned(),
+        };
+        let statuses = [
+            GitHubSignInStatus::Pending,
+            GitHubSignInStatus::SignedIn {
+                participant: participant.clone(),
+            },
+            GitHubSignInStatus::Failed {
+                message: "expired".to_owned(),
+            },
+        ];
+        for status in statuses {
+            let encoded = serde_json::to_string(&status).unwrap();
+            assert_eq!(
+                serde_json::from_str::<GitHubSignInStatus>(&encoded).unwrap(),
+                status
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&GitHubSignInStatus::Pending).unwrap(),
+            r#"{"status":"pending"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&GitHubSignInStatus::SignedIn {
+                participant: participant.clone()
+            })
+            .unwrap(),
+            format!(
+                r#"{{"status":"signed_in","data":{{"participant":{}}}}}"#,
+                serde_json::to_string(&participant).unwrap()
+            )
+        );
     }
 
     #[test]

@@ -48,9 +48,9 @@ pub use id::{
 };
 pub use limits::{LimitKind, LimitStatus, SessionLimits, UsageSnapshot};
 pub use participant::{
-    AccessRequestDecision, MAX_ACCESS_REQUEST_NOTE_BYTES, MAX_PARTICIPANT_DISPLAY_NAME_BYTES,
-    ParticipantIdentity, PresenceStatus, RosterEntry, SessionAccessRequest, SessionGrant,
-    SessionRole,
+    AccessRequestDecision, GitHubSignInStatus, MAX_ACCESS_REQUEST_NOTE_BYTES,
+    MAX_PARTICIPANT_DISPLAY_NAME_BYTES, ParticipantIdentity, PresenceStatus, RosterEntry,
+    SessionAccessRequest, SessionGrant, SessionRole, github_participant_id,
 };
 #[cfg(not(target_family = "wasm"))]
 pub use paths::{

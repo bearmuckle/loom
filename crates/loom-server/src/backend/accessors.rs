@@ -5,23 +5,63 @@ impl InProcessBackend {
         InProcessConnection {
             backend: Arc::clone(self),
             negotiated_capabilities: Arc::new(Mutex::new(None)),
-            auth: None,
+            identity: Arc::new(Mutex::new(ConnectionIdentity::default())),
+            pre_login: false,
             max_response_bytes: None,
-            presence: None,
         }
     }
 
     pub fn connect_authenticated(self: &Arc<Self>, auth: AuthSession) -> InProcessConnection {
-        let presence = auth
-            .participant()
+        let participant = auth.participant().cloned();
+        let presence = participant
+            .as_ref()
             .map(|participant| Arc::new(self.access.connect(participant)));
         InProcessConnection {
             backend: Arc::clone(self),
             negotiated_capabilities: Arc::new(Mutex::new(None)),
-            auth: Some(auth),
+            identity: Arc::new(Mutex::new(ConnectionIdentity {
+                auth: Some(auth),
+                participant,
+                presence,
+            })),
+            pre_login: false,
             max_response_bytes: None,
-            presence,
         }
+    }
+
+    /// A connection accepted without any credential, because GitHub sign-in is
+    /// enabled on this worker.
+    ///
+    /// It may negotiate, discover capabilities, read worker status and the
+    /// current participant, and sign in or out; every other request is refused
+    /// with [`ErrorCode::AuthenticationRequired`] until a person signs in on it.
+    pub fn connect_pre_login(self: &Arc<Self>) -> InProcessConnection {
+        InProcessConnection {
+            backend: Arc::clone(self),
+            negotiated_capabilities: Arc::new(Mutex::new(None)),
+            identity: Arc::new(Mutex::new(ConnectionIdentity::default())),
+            pre_login: true,
+            max_response_bytes: None,
+        }
+    }
+
+    /// Whether this worker accepts GitHub sign-ins.
+    pub fn github_sign_in_enabled(&self) -> bool {
+        self.identity.is_enabled()
+    }
+
+    /// The policy a connection's sign-in follows.
+    pub fn github_sign_in_config(&self) -> GitHubSignInConfig {
+        self.identity.config()
+    }
+
+    /// Replaces the worker's GitHub sign-in policy.
+    ///
+    /// A listener sets the policy it was started with here, and an in-process
+    /// caller can do the same before it connects. An empty allowlist leaves
+    /// sign-in disabled.
+    pub fn set_github_sign_in_config(&self, config: GitHubSignInConfig) {
+        self.identity.configure(config);
     }
 
     /// Adds people to the participant directory, so an owner can grant them

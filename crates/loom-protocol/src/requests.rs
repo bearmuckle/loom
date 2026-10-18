@@ -726,4 +726,22 @@ pub enum AccessRequest {
         session_id: AgentSessionId,
         request_id: AccessRequestId,
     },
+
+    /// Starts a GitHub device sign-in for this connection. Needs no grant and
+    /// no identity: a connection accepted without a credential may call it
+    /// while it is still pre-login. The worker requests only the `read:user`
+    /// scope, reads the account once the person authorizes the device code,
+    /// and binds this connection to the participant derived from the account's
+    /// immutable numeric id. Protocol 11.6.
+    StartGitHubSignIn,
+
+    /// The state of a sign-in started on this connection, polled by the login
+    /// id [`AccessResponse::GitHubSignInStarted`] returned. A person, or an
+    /// operator connection, reads only a sign-in it started.
+    GetGitHubSignInStatus { login_id: String },
+
+    /// Ends the connection's GitHub sign-in: the person leaves the roster of
+    /// every session they had access to, and a connection that was accepted
+    /// without a credential returns to its pre-login state.
+    SignOutGitHub,
 }

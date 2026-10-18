@@ -55,7 +55,10 @@ const GITHUB_COPILOT_OAUTH_SCOPE: &str = "read:user repo";
 /// The GitHub CLI OAuth app's public client id. A device flow against it
 /// yields a repository-scoped user token for clone, push, and pull requests,
 /// unlike the Copilot app token, which is limited to Copilot model access.
-const GITHUB_REPOSITORY_OAUTH_CLIENT_ID: &str = "178c6fc778ccc68e1d6a";
+///
+/// It is also the default client id of a worker's GitHub sign-in, which asks
+/// only for `read:user`, so a deployment without its own OAuth app works.
+pub const GITHUB_REPOSITORY_OAUTH_CLIENT_ID: &str = "178c6fc778ccc68e1d6a";
 /// `workflow` is a separate grant from `repo`: GitHub refuses to create or
 /// update anything under `.github/workflows/` unless the pushed credential
 /// carries it, so a credential without it can push every other file in a
@@ -65,6 +68,9 @@ const GITHUB_REPOSITORY_OAUTH_CLIENT_ID: &str = "178c6fc778ccc68e1d6a";
 const GITHUB_REPOSITORY_OAUTH_SCOPE: &str = "read:user repo workflow";
 const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
+/// The only scope an identity sign-in asks for: enough to read the numeric
+/// account id and login, and nothing that could touch a repository.
+pub const GITHUB_IDENTITY_OAUTH_SCOPE: &str = "read:user";
 const GITHUB_COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
 const GITHUB_COPILOT_EDITOR_VERSION: &str = "vscode/1.96.2";
 const GITHUB_COPILOT_PLUGIN_VERSION: &str = "copilot-chat/0.26.7";
@@ -1656,6 +1662,89 @@ mod tests {
         assert_eq!(
             GitHubCopilotAuthenticator::default().scope,
             GITHUB_COPILOT_OAUTH_SCOPE
+        );
+    }
+
+    /// Serves one GitHub token exchange against a local fixture and returns the
+    /// endpoint plus a handle yielding the received request body.
+    fn serve_token_exchange() -> (
+        String,
+        thread::JoinHandle<std::result::Result<String, String>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let request = read_request_with_body(&mut stream)?;
+            write_response(
+                &mut stream,
+                "application/json",
+                r#"{"access_token":"identity-token","token_type":"bearer"}"#,
+            )?;
+            Ok(request)
+        });
+        (format!("http://{address}/login/oauth/access_token"), server)
+    }
+
+    #[test]
+    fn github_identity_login_asks_only_for_the_read_user_scope() {
+        let identity = GitHubCopilotAuthenticator::identity();
+        assert_eq!(identity.client_id, GITHUB_REPOSITORY_OAUTH_CLIENT_ID);
+        assert_eq!(identity.scope, "read:user");
+        assert_eq!(identity.scope, GITHUB_IDENTITY_OAUTH_SCOPE);
+        assert_eq!(
+            identity.access_token_url,
+            "https://github.com/login/oauth/access_token"
+        );
+        // A deployment may point the flow at its own OAuth app.
+        assert_eq!(
+            GitHubCopilotAuthenticator::identity()
+                .with_client_id("own-client-id")
+                .client_id,
+            "own-client-id"
+        );
+
+        let (endpoint, server) = serve_device_authorization();
+        let device = GitHubCopilotAuthenticator::identity()
+            .with_device_code_url(endpoint)
+            .begin()
+            .unwrap();
+        assert_eq!(device.user_code, "ABCD-1234");
+        let request = server.join().unwrap().unwrap();
+        assert!(
+            request.contains(r#""scope":"read:user""#),
+            "identity login must ask only for read:user, got: {request}"
+        );
+        assert!(
+            !request.contains("repo") && !request.contains("workflow"),
+            "identity login must not ask for repository access, got: {request}"
+        );
+    }
+
+    #[test]
+    fn github_identity_login_polls_a_token_exchange_endpoint_override() {
+        let (endpoint, server) = serve_token_exchange();
+        let authenticator = GitHubCopilotAuthenticator::identity()
+            .with_device_code_url("http://127.0.0.1:1/unused")
+            .with_access_token_url(endpoint);
+        let token = authenticator
+            .poll(&GitHubDeviceCode {
+                user_code: "ABCD-1234".to_owned(),
+                verification_uri: "https://github.com/login/device".to_owned(),
+                expires_in: 60,
+                interval: 5,
+                device_code: "device-code".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(token, "identity-token");
+        let request = server.join().unwrap().unwrap();
+        assert!(
+            request.contains(r#""device_code":"device-code""#),
+            "{request}"
+        );
+        assert!(
+            request.contains(r#""client_id":"178c6fc778ccc68e1d6a""#),
+            "{request}"
         );
     }
 

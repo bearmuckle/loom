@@ -54,8 +54,7 @@ impl InProcessConnection {
                         .list_in_workspace(Some(workspace_id), include_archived)
                         .into_iter()
                         .filter(|session| {
-                            self.auth
-                                .as_ref()
+                            self.auth_session()
                                 .is_none_or(|auth| auth.scope().allows_session(session.id))
                                 && readable
                                     .as_ref()

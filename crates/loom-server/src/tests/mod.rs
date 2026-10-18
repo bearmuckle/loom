@@ -42,6 +42,7 @@ mod event_pages;
 mod feed;
 mod filesystem;
 mod idempotency;
+mod identity;
 mod project_child;
 mod project_child_reliability;
 mod project_integration;

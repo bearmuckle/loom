@@ -35,12 +35,12 @@ impl InProcessConnection {
                 "session is not a project member",
             ));
         }
-        if let Some(auth) = &self.auth
+        if let Some(auth) = self.auth_session()
             && !auth.scope().allows_session(session_id)
         {
             return Err(unauthorized_session(session_id));
         }
-        if let Some(auth) = &self.auth
+        if let Some(auth) = self.auth_session()
             && !auth
                 .scope()
                 .allows_workspace(self.backend.sessions()?.get(session_id)?.workspace_id)
@@ -216,7 +216,7 @@ impl InProcessConnection {
         {
             return Ok(false);
         }
-        if let Some(auth) = &self.auth {
+        if let Some(auth) = self.auth_session() {
             let session = self.backend.sessions()?.get(session_id)?;
             if !auth.scope().allows_session(session_id)
                 || !auth.scope().allows_workspace(session.workspace_id)

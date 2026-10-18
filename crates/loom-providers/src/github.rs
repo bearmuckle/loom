@@ -23,6 +23,9 @@ pub struct GitHubCopilotAuthenticator {
     /// Device-authorization endpoint, overridable so tests can observe the
     /// request body against a local fixture.
     pub device_code_url: String,
+    /// Token-exchange endpoint, overridable so tests can point the exchange at
+    /// a local fixture instead of github.com.
+    pub access_token_url: String,
 }
 
 impl Default for GitHubCopilotAuthenticator {
@@ -31,6 +34,7 @@ impl Default for GitHubCopilotAuthenticator {
             client_id: GITHUB_OAUTH_CLIENT_ID.to_owned(),
             scope: GITHUB_COPILOT_OAUTH_SCOPE,
             device_code_url: GITHUB_DEVICE_CODE_URL.to_owned(),
+            access_token_url: GITHUB_ACCESS_TOKEN_URL.to_owned(),
         }
     }
 }
@@ -48,12 +52,40 @@ impl GitHubCopilotAuthenticator {
             client_id: GITHUB_REPOSITORY_OAUTH_CLIENT_ID.to_owned(),
             scope: GITHUB_REPOSITORY_OAUTH_SCOPE,
             device_code_url: GITHUB_DEVICE_CODE_URL.to_owned(),
+            access_token_url: GITHUB_ACCESS_TOKEN_URL.to_owned(),
         }
+    }
+
+    /// Device authorization for a person's identity: the GitHub CLI OAuth app
+    /// by default, asking only for `read:user`.
+    ///
+    /// The resulting token is only used to read the account's numeric id and
+    /// login and is never stored as a provider credential, so no scope that
+    /// could reach a repository is requested.
+    pub fn identity() -> Self {
+        Self {
+            client_id: GITHUB_REPOSITORY_OAUTH_CLIENT_ID.to_owned(),
+            scope: GITHUB_IDENTITY_OAUTH_SCOPE,
+            device_code_url: GITHUB_DEVICE_CODE_URL.to_owned(),
+            access_token_url: GITHUB_ACCESS_TOKEN_URL.to_owned(),
+        }
+    }
+
+    /// Uses a different OAuth app for the device authorization.
+    pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
+        self.client_id = client_id.into();
+        self
     }
 
     /// Points the device authorization at a different endpoint.
     pub fn with_device_code_url(mut self, endpoint: impl Into<String>) -> Self {
         self.device_code_url = endpoint.into();
+        self
+    }
+
+    /// Points the token exchange at a different endpoint.
+    pub fn with_access_token_url(mut self, endpoint: impl Into<String>) -> Self {
+        self.access_token_url = endpoint.into();
         self
     }
 
@@ -99,7 +131,7 @@ impl GitHubCopilotAuthenticator {
             }
             let (status, body) = run_async(request_json(
                 reqwest::Method::POST,
-                GITHUB_ACCESS_TOKEN_URL,
+                &self.access_token_url,
                 &[],
                 Some(serde_json::json!({
                     "client_id": self.client_id.as_str(),

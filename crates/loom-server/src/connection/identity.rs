@@ -1,0 +1,234 @@
+//! GitHub sign-in: binding a person to a connection after it was accepted.
+//!
+//! A connection accepted without a credential is pre-login: it may negotiate,
+//! discover capabilities, read worker status and the current participant, and
+//! sign in or out. Every other request is refused until a person signs in, and
+//! that gate lives here beside the binding it waits for.
+
+use loom_core::{ErrorCode, GitHubSignInStatus, LoomError, ParticipantIdentity, Result};
+use loom_protocol::{AccessRequest, AccessResponse, ClientRequest, ControlRequest};
+
+use super::*;
+use crate::services::identity::MAX_SIGN_IN_LIFETIME;
+
+impl InProcessConnection {
+    /// Requests a connection may make before it is bound to a person.
+    fn is_available_before_sign_in(request: &ClientRequest) -> bool {
+        matches!(
+            request,
+            ClientRequest::Control(
+                ControlRequest::Negotiate { .. }
+                    | ControlRequest::DiscoverCapabilities
+                    | ControlRequest::GetWorkerNodeStatus
+            ) | ClientRequest::Access(
+                AccessRequest::GetCurrentParticipant
+                    | AccessRequest::StartGitHubSignIn
+                    | AccessRequest::GetGitHubSignInStatus { .. }
+                    | AccessRequest::SignOutGitHub
+            )
+        )
+    }
+
+    /// Refuses every request a pre-login connection may not make yet.
+    pub(crate) fn require_sign_in_for(&self, request: &ClientRequest) -> Result<()> {
+        if !self.awaits_sign_in() || Self::is_available_before_sign_in(request) {
+            return Ok(());
+        }
+        Err(LoomError::new(
+            ErrorCode::AuthenticationRequired,
+            "this connection is not signed in to GitHub; negotiate, discover capabilities, read \
+             worker status or the current participant, or sign in first",
+            false,
+        ))
+    }
+
+    /// Binds this connection to `identity`.
+    ///
+    /// The person is added to the participant directory, a presence is
+    /// registered for them (which pushes the new roster to every session they
+    /// hold access to), and the directory is saved so an owner can grant them
+    /// access after a restart. An operator token on the connection is kept:
+    /// the connection is then both an operator client and a person.
+    pub(crate) fn bind_participant(
+        &self,
+        identity: ParticipantIdentity,
+    ) -> Result<ParticipantIdentity> {
+        let identity = ParticipantIdentity {
+            id: identity.id,
+            display_name: validate_display_name(&identity.display_name)?,
+        };
+        // Registered before the lock is taken: `connect` pushes the roster and
+        // must never run under the connection's identity lock.
+        let presence = Arc::new(self.backend.access.connect(&identity));
+        {
+            let mut state = self.identity_state()?;
+            state.participant = Some(identity.clone());
+            state.presence = Some(presence);
+        }
+        if let Err(error) = self.backend.persist_state() {
+            self.unbind_participant();
+            return Err(error);
+        }
+        Ok(identity)
+    }
+
+    /// Releases the person this connection is bound to, if any.
+    ///
+    /// The presence handle is dropped outside the identity lock, which removes
+    /// the person's connection from the roster. An operator token the
+    /// connection authenticated with is left in place, so the connection
+    /// returns to an unbound operator (or, when it was accepted without a
+    /// credential, to the pre-login state).
+    pub(crate) fn unbind_participant(&self) -> Option<ParticipantIdentity> {
+        let (participant, presence) = {
+            let Ok(mut state) = self.identity_state() else {
+                return None;
+            };
+            (state.participant.take(), state.presence.take())
+        };
+        drop(presence);
+        participant
+    }
+
+    /// Starts a GitHub device sign-in for this connection.
+    ///
+    /// The sign-in requests only the `read:user` scope, reads the account once
+    /// the person authorizes the device code, checks the login against the
+    /// worker's allowlist, and binds this connection to the participant derived
+    /// from the account's numeric id. The GitHub token is dropped afterwards and
+    /// is never stored as a provider credential.
+    pub(crate) fn start_github_sign_in(&self) -> Result<ServerResponse> {
+        let config = self.backend.identity.config();
+        if !config.is_enabled() {
+            return Err(LoomError::new(
+                ErrorCode::UnsupportedCapability,
+                "GitHub sign-in is not enabled on this worker; start it with \
+                 --allow-github-login <login> to accept sign-ins",
+                false,
+            ));
+        }
+        if let Some(participant) = self.participant() {
+            return Err(LoomError::new(
+                ErrorCode::Conflict,
+                format!(
+                    "this connection is already signed in as {}; sign out first to sign in as \
+                     someone else",
+                    participant.display_name
+                ),
+                false,
+            ));
+        }
+
+        let now = Instant::now();
+        let login_id = uuid::Uuid::new_v4().to_string();
+        self.backend.identity.begin_pending(
+            login_id.clone(),
+            now,
+            now + MAX_SIGN_IN_LIFETIME,
+            None,
+        )?;
+        let device = match config.authenticator().begin() {
+            Ok(device) => device,
+            Err(error) => {
+                self.backend.identity.remove(&login_id);
+                return Err(error);
+            }
+        };
+        self.backend.identity.set_expires_at(
+            &login_id,
+            now + Duration::from_secs(device.expires_in).min(MAX_SIGN_IN_LIFETIME),
+        );
+
+        let connection = self.clone();
+        let worker_login_id = login_id.clone();
+        let account_endpoint = config.user_api_url().to_owned();
+        let device_for_poll = device.clone();
+        let spawn_result = thread::Builder::new()
+            .name("github-sign-in".to_owned())
+            .spawn(move || {
+                let status = match config.authenticator().poll(&device_for_poll) {
+                    Ok(token) => match github_account_ref_at(&token, &account_endpoint) {
+                        Ok(account) if !config.allows_login(&account.login) => {
+                            GitHubSignInStatus::Failed {
+                                message: format!(
+                                    "GitHub account '{}' is not allowed to sign in to this worker",
+                                    account.login
+                                ),
+                            }
+                        }
+                        Ok(account) => {
+                            let identity = config.identity_for(&account);
+                            match connection.bind_participant(identity) {
+                                Ok(identity) => {
+                                    log::info!(
+                                        "[loom-server] {} signed in with GitHub; participant {}",
+                                        identity.display_name,
+                                        identity.id
+                                    );
+                                    GitHubSignInStatus::SignedIn {
+                                        participant: identity,
+                                    }
+                                }
+                                Err(error) => GitHubSignInStatus::Failed {
+                                    message: error.message,
+                                },
+                            }
+                        }
+                        Err(error) => GitHubSignInStatus::Failed {
+                            message: error.message,
+                        },
+                    },
+                    Err(error) => GitHubSignInStatus::Failed {
+                        message: error.message,
+                    },
+                };
+                connection.backend.identity.finish(&worker_login_id, status);
+            });
+        if let Err(error) = spawn_result {
+            self.backend.identity.remove(&login_id);
+            return Err(LoomError::new(
+                ErrorCode::Internal,
+                format!("could not start GitHub sign-in: {error}"),
+                false,
+            ));
+        }
+
+        Ok(ServerResponse::Access(
+            AccessResponse::GitHubSignInStarted {
+                login_id,
+                user_code: device.user_code,
+                verification_uri: device.verification_uri,
+                expires_in: device.expires_in,
+                interval: device.interval,
+            },
+        ))
+    }
+
+    /// The state of a sign-in this connection started.
+    pub(crate) fn github_sign_in_status(&self, login_id: &str) -> Result<ServerResponse> {
+        let status = self.backend.identity.status_for(
+            login_id,
+            Instant::now(),
+            self.participant().map(|participant| participant.id),
+        )?;
+        Ok(ServerResponse::Access(AccessResponse::GitHubSignInStatus {
+            status,
+        }))
+    }
+
+    /// Signs this connection out of GitHub, dropping its presence from every
+    /// session roster a person can see.
+    pub(crate) fn sign_out_github(&self) -> Result<ServerResponse> {
+        let Some(participant) = self.unbind_participant() else {
+            return Err(LoomError::invalid_request(
+                "this connection is not signed in to GitHub",
+            ));
+        };
+        log::info!(
+            "[loom-server] {} signed out of GitHub; participant {}",
+            participant.display_name,
+            participant.id
+        );
+        Ok(ServerResponse::Access(AccessResponse::SignedOutGitHub))
+    }
+}

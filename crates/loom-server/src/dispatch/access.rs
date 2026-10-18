@@ -15,7 +15,7 @@ impl InProcessConnection {
         };
         let response = match request {
             AccessRequest::GetCurrentParticipant => AccessResponse::CurrentParticipant {
-                participant: self.participant().cloned(),
+                participant: self.participant(),
             },
             AccessRequest::ListParticipants => AccessResponse::Participants {
                 participants: self.backend.access.participants(),
@@ -145,7 +145,7 @@ impl InProcessConnection {
                 requested_role,
                 note,
             } => {
-                let requester = self.participant().cloned().ok_or_else(|| {
+                let requester = self.participant().ok_or_else(|| {
                     LoomError::invalid_request(
                         "requesting access needs a connection bound to a person",
                     )
@@ -241,7 +241,7 @@ impl InProcessConnection {
                 session_id,
                 request_id,
             } => {
-                let requester = self.participant().cloned().ok_or_else(|| {
+                let requester = self.participant().ok_or_else(|| {
                     LoomError::invalid_request(
                         "withdrawing a request needs a connection bound to a person",
                     )
@@ -260,6 +260,11 @@ impl InProcessConnection {
                     grant: None,
                 }
             }
+            AccessRequest::StartGitHubSignIn => return self.start_github_sign_in(),
+            AccessRequest::GetGitHubSignInStatus { login_id } => {
+                return self.github_sign_in_status(&login_id);
+            }
+            AccessRequest::SignOutGitHub => return self.sign_out_github(),
         };
         Ok(ServerResponse::Access(response))
     }
