@@ -19,12 +19,9 @@ pub(crate) fn card_value_font() -> gpui_kit::Rems {
     gpui_kit::rems(CARD_VALUE_FONT_SIZE / BASE_FONT_SIZE)
 }
 
-mod agent;
 mod changes;
-mod context;
-mod files;
 mod people;
-mod plan;
+mod run;
 
 impl LoomView {
     pub(crate) fn render_inspector(
@@ -41,8 +38,8 @@ impl LoomView {
         };
         let header = div()
             .w_full()
-            .px_2()
-            .pt_2()
+            .px_3()
+            .pt_3()
             .flex()
             .flex_col()
             .gap_2()
@@ -53,59 +50,54 @@ impl LoomView {
                     .w_full()
                     .flex()
                     .items_center()
-                    .justify_between()
                     .gap_2()
+                    .when(layout.phone, |element| {
+                        element.child(
+                            Button::new("back-inspector")
+                                .icon(Icon::new(IconName::ChevronLeft))
+                                .ghost()
+                                .large()
+                                .h(layout.control_size())
+                                .w(layout.control_size())
+                                .accessibility_label("Back")
+                                .on_click(cx.listener(Self::close_review)),
+                        )
+                    })
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(0.))
                             .flex()
-                            .items_center()
-                            .gap_1()
-                            .when(layout.phone, |element| {
-                                element.child(
-                                    Button::new("close-inspector")
-                                        .icon(Icon::new(IconName::ChevronLeft))
-                                        .ghost()
-                                        .large()
-                                        .h(layout.control_size())
-                                        .w(layout.control_size())
-                                        .accessibility_label("Back")
-                                        .on_click(cx.listener(Self::close_review)),
-                                )
-                            })
-                            .child(div().text_xs().text_color(rgb(0x93c5fd)).child(title)),
+                            .flex_col()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_sm()
+                                    .text_color(rgb(0xe5e7eb))
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(rgb(0x8f98a6))
+                                    .child(self.inspector_status_summary()),
+                            ),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .when(!layout.phone, |element| {
-                                element.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(0x8f98a6))
-                                        .child(self.inspector_status_summary()),
-                                )
-                            })
-                            .when(!layout.phone, |element| {
-                                element.child(
-                                    Button::new("close-inspector")
-                                        .label("Close")
-                                        .ghost()
-                                        .small()
-                                        .accessibility_label("Close")
-                                        .on_click(cx.listener(Self::close_review)),
-                                )
-                            }),
+                        Button::new("close-inspector")
+                            .icon(Icon::new(IconName::Close))
+                            .ghost()
+                            .small()
+                            .tooltip("Close")
+                            .accessibility_label("Close")
+                            .on_click(cx.listener(Self::close_review)),
                     ),
             )
             .child(self.render_inspector_tabs(cx));
         let content = match self.review.tab {
             InspectorTab::Changes => self.render_inspector_changes(window, cx).into_any_element(),
-            InspectorTab::Plan => self.render_inspector_plan(window, cx).into_any_element(),
-            InspectorTab::Agent => self.render_inspector_agent(window, cx).into_any_element(),
-            InspectorTab::Context => self.render_inspector_context(window, cx).into_any_element(),
-            InspectorTab::Files => self.render_inspector_files(window, cx).into_any_element(),
+            InspectorTab::Run => self.render_inspector_run(window, cx).into_any_element(),
             InspectorTab::People => self.render_inspector_people(window, cx).into_any_element(),
         };
         div()
@@ -139,12 +131,10 @@ impl LoomView {
     fn render_inspector_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
         let changed_files = self.github_changed_file_count();
-        let pending_attention =
-            usize::from(self.pending_approval.is_some() || self.pending_input.is_some());
+        let pending_attention = self.pending_approval.is_some() || self.pending_input.is_some();
         div().w_full().child(
             TabBar::new("inspector-tabs")
                 .underline()
-                .menu(true)
                 .selected_index(self.review.tab.index())
                 .on_click(move |index, _window, cx| {
                     if let Some(tab) = InspectorTab::ALL.get(*index).copied() {
@@ -157,27 +147,26 @@ impl LoomView {
                         InspectorTab::Changes if changed_files > 0 => {
                             Some(changed_files.to_string())
                         }
-                        InspectorTab::Agent if pending_attention > 0 => Some("•".to_owned()),
-                        InspectorTab::People if !self.collaboration.roster.is_empty() => {
-                            Some(self.collaboration.roster.len().to_string())
-                        }
-                        InspectorTab::Plan => self
+                        InspectorTab::Run => self
                             .plan
                             .as_ref()
                             .filter(|plan| !plan.is_empty())
                             .map(|plan| format!("{}/{}", plan.done_count(), plan.total())),
+                        InspectorTab::People if !self.collaboration.roster.is_empty() => {
+                            Some(self.collaboration.roster.len().to_string())
+                        }
                         _ => None,
                     };
                     let unread = match tab {
                         InspectorTab::Changes => self.review.unread.changes,
-                        InspectorTab::Plan => self.review.unread.plan,
-                        InspectorTab::Agent
-                        | InspectorTab::Context
-                        | InspectorTab::Files
-                        | InspectorTab::People => false,
+                        InspectorTab::Run => self.review.unread.plan,
+                        InspectorTab::People => false,
                     };
+                    // A run blocked on the user is the one figure the tab dot
+                    // should carry: it is the only state that needs an answer.
+                    let attention = tab == InspectorTab::Run && pending_attention;
                     let mut item = Tab::new().label(tab.label());
-                    if count.is_some() || unread {
+                    if count.is_some() || unread || attention {
                         let mut suffix = div().flex().items_center().gap_1();
                         if let Some(count) = count {
                             suffix = suffix.child(
@@ -188,6 +177,17 @@ impl LoomView {
                                     .text_xs()
                                     .text_color(rgb(0x93c5fd))
                                     .child(count),
+                            );
+                        }
+                        if attention {
+                            suffix = suffix.child(
+                                div()
+                                    .id("tab-attention")
+                                    .test_support()
+                                    .flex_shrink_0()
+                                    .w(px(6.))
+                                    .h(px(6.))
+                                    .child(Badge::new().dot().color(rgb(0xfcd34d))),
                             );
                         }
                         if unread {
@@ -208,57 +208,7 @@ impl LoomView {
         )
     }
 
-    /// The shared token/cost card shown by the Agent and Context tabs.
-    pub(crate) fn render_usage_card(&self) -> impl IntoElement {
-        let mut body = div().flex().flex_col().gap_2();
-        match self.review.usage.total() {
-            Some(usage) => {
-                body = body
-                    .child(info_row(
-                        "Tokens",
-                        format!(
-                            "{} in · {} out · {} cached",
-                            format_tokens(usage.input_tokens),
-                            format_tokens(usage.output_tokens),
-                            format_tokens(usage.cached_input_tokens)
-                        ),
-                    ))
-                    .child(info_row("Tool calls", usage.tool_calls.to_string()));
-                if let Some(provider) = self.review.usage.provider() {
-                    body = body.child(info_row(
-                        "Cost",
-                        format!(
-                            "{} · {} requests",
-                            format_cost_micros(provider.cost_micros),
-                            provider.requests
-                        ),
-                    ));
-                } else if usage.cost_micros > 0 {
-                    body = body.child(info_row("Cost", format_cost_micros(usage.cost_micros)));
-                }
-                if usage.elapsed_ms > 0 {
-                    body = body.child(info_row("Duration", format_elapsed_ms(usage.elapsed_ms)));
-                }
-            }
-            None if self.review.usage.loading => {
-                body = body.child(empty_note("Loading usage…"));
-            }
-            None => {
-                body = body.child(empty_note("No usage recorded for this session."));
-            }
-        }
-        if let Some(error) = &self.review.usage.error {
-            body = body.child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0xfca5a5))
-                    .child(error.clone()),
-            );
-        }
-        card("Usage", body)
-    }
-
-    /// A compact status line shown at the trailing edge of the inspector header.
+    /// A compact status line under the inspector title.
     fn inspector_status_summary(&self) -> String {
         match self.review.tab {
             InspectorTab::Changes => self
@@ -273,21 +223,13 @@ impl LoomView {
                     )
                 })
                 .unwrap_or_else(|| "VCS unavailable".to_owned()),
-            InspectorTab::Plan => match self.plan.as_ref().filter(|plan| !plan.is_empty()) {
-                Some(plan) => format!("{} / {} steps", plan.done_count(), plan.total()),
-                None => "No plan".to_owned(),
-            },
-            InspectorTab::Agent => session_status_label(self.session_state).to_owned(),
-            InspectorTab::Context => self
-                .context_inspection
-                .as_ref()
-                .map(|inspection| format!("~ {} tokens", format_tokens(inspection.included_tokens)))
-                .unwrap_or_else(|| "No inspection yet".to_owned()),
-            InspectorTab::Files => {
-                if self.review.files.loaded {
-                    format!("{} files", self.workspace_file_count())
-                } else {
-                    "Not loaded".to_owned()
+            InspectorTab::Run => {
+                let state = session_status_label(self.session_state);
+                match self.plan.as_ref().filter(|plan| !plan.is_empty()) {
+                    Some(plan) => {
+                        format!("{state}  ·  {}/{} steps", plan.done_count(), plan.total())
+                    }
+                    None => state.to_owned(),
                 }
             }
             InspectorTab::People => match self.collaboration.roster.len() {
@@ -303,15 +245,6 @@ impl LoomView {
             .as_ref()
             .map(|status| status.files.len())
             .unwrap_or(0)
-    }
-
-    fn workspace_file_count(&self) -> usize {
-        self.review
-            .files
-            .entries
-            .iter()
-            .filter(|entry| entry.kind == WorkspaceEntryKind::File)
-            .count()
     }
 }
 
@@ -375,28 +308,87 @@ pub(crate) fn empty_note(text: &str) -> impl IntoElement {
         .child(text.to_owned())
 }
 
-/// A bordered card with a heading, used by the Agent, Context, and Files tabs.
+/// A bordered card with a heading, used by every inspector tab.
 pub(crate) fn card(title: &str, body: impl IntoElement) -> impl IntoElement {
+    card_with_action(title, div().into_any_element(), body)
+}
+
+/// The same card with a trailing control in its heading row, such as a
+/// disclosure toggle or a refresh button.
+pub(crate) fn card_with_action(
+    title: &str,
+    action: impl IntoElement,
+    body: impl IntoElement,
+) -> impl IntoElement {
     div()
         .w_full()
-        .rounded_lg()
+        .rounded_md()
         .bg(rgb(0x1b1d24))
         .border_1()
         .border_color(rgb(0x293244))
+        .p_3()
         .flex()
         .flex_col()
-        .overflow_hidden()
+        .gap_3()
         .child(
             div()
-                .px_3()
-                .py_2()
-                .border_b_1()
-                .border_color(rgb(0x293244))
-                .text_size(card_title_font())
-                .text_color(rgb(0x93c5fd))
-                .child(title.to_owned()),
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(section_heading(title))
+                .child(div().flex_shrink_0().child(action)),
         )
-        .child(div().p_3().flex().flex_col().gap_2().child(body))
+        .child(body)
+}
+
+/// A labelled figure inside a card, used instead of a label/value list so the
+/// run figures line up in one row.
+pub(crate) fn metric(label: &str, value: impl IntoElement) -> impl IntoElement {
+    div()
+        .flex_1()
+        .min_w(px(0.))
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .truncate()
+                .text_size(card_label_font())
+                .text_color(rgb(0x8f98a6))
+                .child(label.to_owned()),
+        )
+        .child(
+            div()
+                .truncate()
+                .text_size(card_value_font())
+                .text_color(rgb(0xe5e7eb))
+                .child(value),
+        )
+}
+
+/// A row of [`metric`] figures.
+pub(crate) fn metric_row() -> gpui_kit::Div {
+    div().w_full().flex().items_start().gap_3()
+}
+
+/// A muted line under a card's figures, for counts that do not deserve a row.
+pub(crate) fn metric_caption(text: impl Into<String>) -> impl IntoElement {
+    div()
+        .w_full()
+        .text_size(card_label_font())
+        .text_color(rgb(0x8f98a6))
+        .child(text.into())
+}
+
+/// A monospaced muted value, used for counts and identifiers in headings.
+pub(crate) fn mono_note(text: impl Into<String>) -> impl IntoElement {
+    div()
+        .font_family(mono_font())
+        .text_size(card_label_font())
+        .text_color(rgb(0x8f98a6))
+        .child(text.into())
 }
 
 /// A label/value row used inside cards.

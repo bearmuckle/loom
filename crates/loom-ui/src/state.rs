@@ -16,7 +16,7 @@ use loom_core::{
 use loom_model::ProviderUsageSummary;
 use loom_protocol::{
     AgentPlanProgress, AgentRunState, GitDiff, GitRepositoryStatus, SessionFilesystemChange,
-    SessionFilesystemFile, WorkspaceEntry,
+    SessionFilesystemFile,
 };
 use serde::{Deserialize, Serialize};
 
@@ -26,31 +26,19 @@ use crate::MAX_TIMELINE_OUTPUT;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InspectorTab {
     Changes,
-    Plan,
-    Agent,
-    Context,
-    Files,
+    /// The active run: status, plan progress, token usage, and context budget.
+    Run,
     /// The session roster, access, run credential, and repository access.
     People,
 }
 
 impl InspectorTab {
-    pub(crate) const ALL: [Self; 6] = [
-        Self::Changes,
-        Self::Plan,
-        Self::Agent,
-        Self::Context,
-        Self::Files,
-        Self::People,
-    ];
+    pub(crate) const ALL: [Self; 3] = [Self::Changes, Self::Run, Self::People];
 
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Changes => "Changes",
-            Self::Plan => "Plan",
-            Self::Agent => "Agent",
-            Self::Context => "Context",
-            Self::Files => "Files",
+            Self::Run => "Run",
             Self::People => "People",
         }
     }
@@ -63,8 +51,8 @@ impl InspectorTab {
     }
 }
 
-/// Token and cost accounting surfaced by the Context and Agent tabs. Session
-/// and run figures are kept separately because only one may be current.
+/// Token and cost accounting surfaced by the Run tab. Session and run figures
+/// are kept separately because only one may be current.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct UsageState {
     pub(crate) session: Option<UsageSnapshot>,
@@ -86,19 +74,6 @@ impl UsageState {
             .as_ref()
             .or(self.session_provider.as_ref())
     }
-}
-
-/// The read-only file browser shown in the Files tab.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct FilesState {
-    pub(crate) entries: Vec<WorkspaceEntry>,
-    pub(crate) loading: bool,
-    pub(crate) loaded: bool,
-    pub(crate) error: Option<String>,
-    pub(crate) selected_path: Option<String>,
-    pub(crate) selected_file: Option<SessionFilesystemFile>,
-    pub(crate) file_loading: bool,
-    pub(crate) file_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -180,8 +155,8 @@ impl OutputDetail {
 /// own indicator until that tab is viewed. The two markers track different
 /// kinds of content:
 ///
-/// * Plan is a live view fed by agent events, so viewing the tab counts as
-///   viewing everything that has arrived.
+/// * Plan is a live view fed by agent events and shown on the Run tab, so
+///   viewing that tab counts as viewing everything that has arrived.
 /// * Changes is a fetched snapshot. A fetch is only new content when it differs
 ///   from the snapshot the user last looked at, and a change event newer than
 ///   the fetched snapshot stays unviewed until the user refreshes the tab.
@@ -221,7 +196,6 @@ pub(crate) struct ReviewState {
     /// Whether diff and file previews soft-wrap instead of scrolling sideways.
     pub(crate) wrap_lines: bool,
     pub(crate) usage: UsageState,
-    pub(crate) files: FilesState,
 }
 impl ReviewState {
     /// Shows `diff` in the diff surface, replacing any previous selection.
@@ -360,9 +334,9 @@ impl ReviewState {
         self.changes_seen_key = None;
     }
 
-    /// Marks the Plan tab unread unless it is already being viewed.
+    /// Marks the Run tab unread unless it is already being viewed.
     pub(crate) fn mark_plan_unread(&mut self) {
-        if !self.is_viewing(InspectorTab::Plan) {
+        if !self.is_viewing(InspectorTab::Run) {
             self.unread.plan = true;
         }
     }
@@ -377,11 +351,8 @@ impl ReviewState {
                 self.unread.changes = false;
                 self.changes_seen_key = Some(self.changes_content_key());
             }
-            InspectorTab::Plan => self.unread.plan = false,
-            InspectorTab::Agent
-            | InspectorTab::Context
-            | InspectorTab::Files
-            | InspectorTab::People => {}
+            InspectorTab::Run => self.unread.plan = false,
+            InspectorTab::People => {}
         }
     }
 
@@ -478,7 +449,6 @@ impl Default for ReviewState {
             loading_diff: false,
             wrap_lines: false,
             usage: UsageState::default(),
-            files: FilesState::default(),
         }
     }
 }
@@ -501,8 +471,7 @@ pub(crate) enum TimelineItem {
 /// Live progress for the active run's plan.
 ///
 /// A plan is run-scoped status rather than a conversation message, so it is
-/// kept out of the timeline and rendered in full in the inspector's Plan tab,
-/// with a compact summary in the Agent tab's Run card.
+/// kept out of the timeline and rendered in the inspector's Run tab.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct PlanState {
     pub(crate) steps: Vec<String>,
@@ -944,7 +913,7 @@ mod tests {
     fn inspector_tabs_report_stable_labels_and_indexes() {
         assert_eq!(
             InspectorTab::ALL.map(InspectorTab::label),
-            ["Changes", "Plan", "Agent", "Context", "Files", "People"]
+            ["Changes", "Run", "People"]
         );
         for (index, tab) in InspectorTab::ALL.into_iter().enumerate() {
             assert_eq!(tab.index(), index);
@@ -973,8 +942,8 @@ mod tests {
         // Content that arrives while its tab is already displayed counts as
         // viewed, so it does not re-mark the tab unread.
         review.open = true;
-        review.tab = InspectorTab::Plan;
-        review.clear_unread(InspectorTab::Plan);
+        review.tab = InspectorTab::Run;
+        review.clear_unread(InspectorTab::Run);
         review.mark_plan_unread();
         assert!(!review.unread.plan);
 
@@ -985,7 +954,7 @@ mod tests {
         assert!(review.unread.changes);
 
         // Clearing an unrelated tab leaves the remaining markers alone.
-        review.clear_unread(InspectorTab::Files);
+        review.clear_unread(InspectorTab::People);
         assert!(review.unread.changes);
     }
 
@@ -1003,9 +972,9 @@ mod tests {
         review.mark_changes_unread();
         assert!(!review.unread.changes);
 
-        // The pane moves to the Plan tab and the same snapshot is fetched
+        // The pane moves to the Run tab and the same snapshot is fetched
         // again; identical content is not new.
-        review.tab = InspectorTab::Plan;
+        review.tab = InspectorTab::Run;
         review.mark_changes_unread();
         assert!(!review.unread.changes);
 
@@ -1033,7 +1002,7 @@ mod tests {
         assert!(!review.unread.changes);
 
         // `captured_at` changes on every fetch, so it is excluded from the key.
-        review.tab = InspectorTab::Plan;
+        review.tab = InspectorTab::Run;
         review.vcs = Some(vcs_status(2));
         review.mark_changes_unread();
         assert!(!review.unread.changes);
@@ -1055,7 +1024,7 @@ mod tests {
 
         // A stale marker is dropped even when the tab is not displayed.
         review.open = true;
-        review.tab = InspectorTab::Plan;
+        review.tab = InspectorTab::Run;
         review.unread.changes = true;
         review.mark_changes_unread();
         assert!(!review.unread.changes);

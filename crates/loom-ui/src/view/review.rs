@@ -170,43 +170,23 @@ impl LoomView {
 
     /// Switches the inspector tab, loading the tab's data on first view.
     pub(crate) fn select_inspector_tab(&mut self, tab: InspectorTab, cx: &mut Context<Self>) {
-        if self.review.tab == tab {
-            // Selecting the displayed tab refreshes it. That is the only way
-            // the Changes snapshot picks up content that arrived after it was
-            // fetched, and it clears the marker for content now shown here.
-            self.review.clear_unread(tab);
-            match tab {
-                InspectorTab::Changes => self.refresh_review_changes(cx),
-                InspectorTab::Agent | InspectorTab::Context => self.refresh_usage(cx),
-                InspectorTab::Files => {
-                    if !self.review.files.loaded {
-                        self.load_inspector_files(cx);
-                    }
-                }
-                InspectorTab::Plan => {}
-                InspectorTab::People => self.refresh_people(cx),
-            }
-            if tab == InspectorTab::Context {
-                self.refresh_context(cx);
-            }
-            cx.notify();
-            return;
-        }
+        let reselected = self.review.tab == tab;
         self.review.tab = tab;
-        // Viewing a tab clears its unread marker.
+        // Viewing a tab clears its unread marker. Selecting the displayed tab
+        // refreshes it: that is the only way the Changes snapshot picks up
+        // content that arrived after it was fetched.
         self.review.clear_unread(tab);
         match tab {
-            InspectorTab::Changes | InspectorTab::Plan => {}
-            InspectorTab::People => self.refresh_people(cx),
-            InspectorTab::Agent | InspectorTab::Context => self.refresh_usage(cx),
-            InspectorTab::Files => {
-                if !self.review.files.loaded {
-                    self.load_inspector_files(cx);
+            InspectorTab::Changes => {
+                if reselected {
+                    self.refresh_review_changes(cx);
                 }
             }
-        }
-        if tab == InspectorTab::Context {
-            self.refresh_context(cx);
+            InspectorTab::Run => {
+                self.refresh_usage(cx);
+                self.refresh_context(cx);
+            }
+            InspectorTab::People => self.refresh_people(cx),
         }
         cx.notify();
     }
@@ -283,74 +263,6 @@ impl LoomView {
                 ),
             },
         );
-    }
-
-    /// Loads the session filesystem listing for the Files tab.
-    pub(crate) fn load_inspector_files(&mut self, cx: &mut Context<Self>) {
-        let session_id = self.active_session.id;
-        self.review.files.loading = true;
-        self.review.files.error = None;
-        self.dispatch(
-            cx,
-            ClientRequest::Filesystem(FilesystemRequest::GetSessionFilesystemSnapshot {
-                session_id,
-            }),
-            move |view, response, _| {
-                if view.active_session.id != session_id {
-                    return;
-                }
-                view.review.files.loading = false;
-                match response.result {
-                    Ok(ServerResponse::Filesystem(
-                        FilesystemResponse::SessionFilesystemSnapshot(snapshot),
-                    )) => {
-                        view.review.files.loaded = true;
-                        view.review.files.entries = snapshot.entries;
-                    }
-                    Err(error) => view.review.files.error = Some(error.to_string()),
-                    Ok(response) => {
-                        view.review.files.error =
-                            Some(unexpected_response("filesystem snapshot", response).to_string());
-                    }
-                }
-            },
-        );
-    }
-
-    /// Opens a workspace file in the Files tab viewer.
-    pub(crate) fn open_inspector_file(&mut self, path: String, cx: &mut Context<Self>) {
-        self.review.files.selected_path = Some(path.clone());
-        self.review.files.selected_file = None;
-        self.review.files.file_loading = true;
-        self.review.files.file_error = None;
-        let session_id = self.active_session.id;
-        let requested_path = path.clone();
-        self.dispatch(
-            cx,
-            ClientRequest::Filesystem(FilesystemRequest::ReadSessionFile { session_id, path }),
-            move |view, response, _| {
-                if view.active_session.id != session_id
-                    || view.review.files.selected_path.as_deref() != Some(&requested_path)
-                {
-                    return;
-                }
-                view.review.files.file_loading = false;
-                match response.result {
-                    Ok(ServerResponse::Filesystem(FilesystemResponse::SessionFilesystemFile(
-                        mut file,
-                    ))) => {
-                        file.content = bounded_to(&file.content, MAX_REVIEW_DIFF);
-                        view.review.files.selected_file = Some(file);
-                    }
-                    Err(error) => view.review.files.file_error = Some(error.to_string()),
-                    Ok(response) => {
-                        view.review.files.file_error =
-                            Some(unexpected_response("workspace file", response).to_string());
-                    }
-                }
-            },
-        );
-        cx.notify();
     }
 
     pub(crate) fn toggle_review_wrap(&mut self, cx: &mut Context<Self>) {

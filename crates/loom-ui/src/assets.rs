@@ -41,6 +41,7 @@ gpui_kit::assets::icon_assets!(
         Pencil,
         Play,
         Plus,
+        RefreshCw,
         Settings,
         Sparkles,
         SquareTerminal,

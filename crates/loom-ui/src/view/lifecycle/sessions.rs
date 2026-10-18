@@ -142,7 +142,7 @@ impl LoomView {
         // A different session's review content must not count as already
         // viewed, so the Changes marker and its recorded snapshot both go.
         self.review.reset_changes_unread();
-        self.review.clear_unread(InspectorTab::Plan);
+        self.review.clear_unread(InspectorTab::Run);
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
         self.transcript_before_ordinal = None;
         self.transcript_loaded_ordinals.clear();

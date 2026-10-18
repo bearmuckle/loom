@@ -60,7 +60,7 @@ use loom_protocol::{
     ResponseEnvelope, RunRequest, RunResponse, ServerEvent, ServerResponse, SessionDirectory,
     SessionRepository, SessionRequest, SessionResponse, TaskRequest, TerminalRequest, UsageRequest,
     UsageResponse, WorkerNodeConfig, WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig,
-    WorkspaceEntryKind, WorkspaceFeedEvent, WorkspaceRequest, WorkspaceResponse,
+    WorkspaceFeedEvent, WorkspaceRequest, WorkspaceResponse,
 };
 #[cfg(not(target_family = "wasm"))]
 #[cfg(not(target_family = "wasm"))]
@@ -72,7 +72,7 @@ use crate::{
     connection::{BackendWorker, ClientConnection, ConnectionCleanupGuard},
     preferences::UiPreferences,
     state::{
-        AssistantPart, AssistantTurn, EvidenceText, FilesState, GitHubLoginKind, GitHubLoginState,
+        AssistantPart, AssistantTurn, EvidenceText, GitHubLoginKind, GitHubLoginState,
         InspectorTab, OutputDetail, PlanState, PlanStepStatus, ProjectDeleteDialogState,
         RenameDialogState, ReviewState, SystemNote, SystemTone, ThemeChoice, TimelineItem,
         ToolPart, ToolPartStatus, UsageState, bounded, bounded_to, finish_assistant_turn,
@@ -645,10 +645,10 @@ pub(crate) struct LoomView {
     /// virtual list so it can prepend them without jumping the scroll anchor.
     transcript_prepend_count: usize,
     timeline_view: Option<Entity<TimelineView>>,
-    /// The active run's plan progress. Rendered in full in the inspector's Plan
-    /// tab and summarised in the Agent tab, never as a timeline row.
+    /// The active run's plan progress. Rendered in the inspector's Run tab,
+    /// never as a timeline row.
     pub(crate) plan: Option<PlanState>,
-    /// Whether the Plan tab's checklist is collapsed to its header.
+    /// Whether the Run tab's plan checklist is collapsed to its heading.
     pub(crate) plan_collapsed: bool,
     pub(crate) activity_records: BTreeMap<ActivityId, AgentActivityRecord>,
     /// The user's expansion choice per transcript disclosure, where `true` is

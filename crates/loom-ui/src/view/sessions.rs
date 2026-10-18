@@ -41,7 +41,6 @@ impl LoomView {
         self.review.vcs = None;
         self.review.repositories_loaded = false;
         self.review.usage = UsageState::default();
-        self.review.files = FilesState::default();
         self.collaboration.reset_session();
     }
 

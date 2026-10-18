@@ -30,13 +30,12 @@ use loom_model::{
 use loom_protocol::ToolResult;
 use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, ClientRequest,
-    ClonedRepository, ContextBudget, ContextInspection, ContextItem, ContextItemKind,
-    ContextSummary, EventsResponse, FileActivityOperation, FilesystemRequest, FilesystemResponse,
-    GitDiff, GitFileStatus, GitFileStatusKind, GitHubRepository, GitRepositoryStatus,
-    ProviderRequest, RequestEnvelope, RunRequest, RunResponse, ServerResponse,
-    SessionFilesystemChange, SessionFilesystemFile, SessionRepository, SessionRequest,
-    SessionResponse, WorkerNodeResources, WorkerNodeStatus, WorkspaceChangeKind, WorkspaceEntry,
-    WorkspaceEntryKind, WorkspaceRequest,
+    ClonedRepository, ContextBudget, ContextInspection, EventsResponse, FileActivityOperation,
+    FilesystemRequest, FilesystemResponse, GitDiff, GitFileStatus, GitFileStatusKind,
+    GitHubRepository, GitRepositoryStatus, ProviderRequest, RequestEnvelope, RunRequest,
+    RunResponse, ServerResponse, SessionFilesystemChange, SessionFilesystemFile, SessionRepository,
+    SessionRequest, SessionResponse, WorkerNodeResources, WorkerNodeStatus, WorkspaceChangeKind,
+    WorkspaceRequest,
 };
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -4217,12 +4216,14 @@ fn review_panel_renders_loading_file_and_binary_diff_states(cx: &mut TestAppCont
 }
 
 #[gpui_kit::test]
-fn inspector_renders_agent_context_and_files_tabs(cx: &mut TestAppContext) {
+fn inspector_renders_the_consolidated_run_tab(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    render_scenario(cx, |view| {
-        view.review.open = true;
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
         view.sessions = vec![view.active_session.clone()];
-        view.review.tab = InspectorTab::Agent;
+        view.review.open = true;
+        view.review.tab = InspectorTab::Run;
+        view.active_run_id = Some(RunId::new());
         view.active_run = Some(loom_protocol::AgentRunSnapshot {
             id: RunId::new(),
             attempt_id: loom_core::RunAttemptId::new(),
@@ -4259,90 +4260,155 @@ fn inspector_renders_agent_context_and_files_tabs(cx: &mut TestAppContext) {
             completed: BTreeSet::from([0]),
             active: Some(1),
         });
-        view.timeline = vec![TimelineItem::Assistant(AssistantTurn {
-            parts: vec![AssistantPart::Tool(Box::new(ToolPart {
-                id: ToolCallId::new(),
-                name: "read_file".to_owned(),
-                title: "Read src/lib.rs".to_owned(),
-                status: ToolPartStatus::Completed,
-                detail: Some("src/lib.rs".to_owned()),
-                output: Some("contents".to_owned()),
-                elapsed_ms: Some(12),
-                approval_pending: false,
-                policy: None,
-            }))],
-            streaming: false,
-        })];
-    });
-    render_scenario(cx, |view| {
-        view.review.open = true;
-        view.sessions = vec![view.active_session.clone()];
-        view.review.tab = InspectorTab::Context;
         view.context_inspection = Some(ContextInspection {
-            items: vec![
-                ContextItem {
-                    kind: ContextItemKind::Task,
-                    label: "Task".to_owned(),
-                    estimated_tokens: 10,
-                    included: true,
-                    omission_reason: None,
-                },
-                ContextItem {
-                    kind: ContextItemKind::Conversation,
-                    label: "Conversation".to_owned(),
-                    estimated_tokens: 90,
-                    included: false,
-                    omission_reason: Some("over budget".to_owned()),
-                },
-            ],
-            total_tokens: 100,
+            items: Vec::new(),
+            total_tokens: 210,
             included_tokens: 120,
             omitted_tokens: 90,
             budget: ContextBudget::new(Some(100), None, 50).unwrap(),
-            compacted: true,
-            summary: Some(ContextSummary {
-                text: "Earlier turns were summarised.".to_owned(),
-                source_message_count: 4,
-                projection_version: 1,
-                source_digest: "digest".to_owned(),
-                created_at: Timestamp::from_unix_millis(3),
-            }),
+            compacted: false,
+            summary: None,
         });
-        view.review.usage.run = Some(UsageSnapshot {
-            input_tokens: 30,
-            output_tokens: 10,
-            ..UsageSnapshot::default()
-        });
+        view
     });
-    render_scenario(cx, |view| {
-        view.review.open = true;
+    cx.update_window(handle.into(), |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        window.render_frame(cx);
+        // The plan, usage, and context figures share one tab instead of three.
+        assert!(window.find("run-status").visible());
+        assert!(window.find("plan-checklist").visible());
+        assert!(window.find(("plan-step", 0usize)).visible());
+        assert!(window.find(("plan-step", 1usize)).visible());
+        assert!(window.find("run-usage").visible());
+        assert!(window.find("run-context").visible());
+        // The context card owns the refresh control.
+        assert!(window.find("refresh-context").visible());
+
+        // The cards stack in one column without overlapping.
+        let status = window.find("run-status").bounds();
+        let usage = window.find("run-usage").bounds();
+        let context = window.find("run-context").bounds();
+        assert!(
+            status.bottom() <= usage.top(),
+            "the status and usage cards overlap"
+        );
+        assert!(
+            usage.bottom() <= context.top(),
+            "the usage and context cards overlap"
+        );
+
+        // The checklist collapses behind the plan heading; the figures stay.
+        window.click("toggle-plan", cx);
+        window.render_frame(cx);
+        view.update(cx, |view, _| assert!(view.plan_collapsed));
+        assert!(window.try_find(("plan-step", 0usize)).is_none());
+        assert!(window.find("run-usage").visible());
+    })
+    .unwrap();
+}
+
+/// A phone pane is the narrowest place the Run tab renders, so its figures must
+/// stay inside the viewport there.
+#[gpui_kit::test]
+fn run_tab_figures_fit_a_phone_pane(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(390.), px(844.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
         view.sessions = vec![view.active_session.clone()];
-        view.review.tab = InspectorTab::Files;
-        view.review.files.loaded = true;
-        view.review.files.entries = vec![
-            WorkspaceEntry {
-                path: "src".to_owned(),
-                kind: WorkspaceEntryKind::Directory,
-                size: 0,
-                modified_at: None,
-                revision: "dir".to_owned(),
-            },
-            WorkspaceEntry {
-                path: "src/main.rs".to_owned(),
-                kind: WorkspaceEntryKind::File,
-                size: 42,
-                modified_at: None,
-                revision: "rev".to_owned(),
-            },
-        ];
-        view.review.files.selected_path = Some("src/main.rs".to_owned());
-        view.review.files.selected_file = Some(SessionFilesystemFile {
-            session_id: view.active_session.id,
-            path: "src/main.rs".to_owned(),
-            content: "fn main() {}\n".to_owned(),
-            revision: "rev".to_owned(),
+        view.review.open = true;
+        view.review.tab = InspectorTab::Run;
+        view.review.usage.session = Some(UsageSnapshot {
+            input_tokens: 1_200_000,
+            output_tokens: 400_000,
+            cached_input_tokens: 1_000_000,
+            tool_calls: 1_200,
+            cost_micros: 12_500_000,
+            elapsed_ms: 3_725_000,
         });
+        view.plan = Some(crate::state::PlanState {
+            steps: vec![
+                "Inspect the repository layout".to_owned(),
+                "Edit".to_owned(),
+            ],
+            completed: BTreeSet::from([0]),
+            active: Some(1),
+        });
+        view.context_inspection = Some(ContextInspection {
+            items: Vec::new(),
+            total_tokens: 210_000,
+            included_tokens: 120_000,
+            omitted_tokens: 90_000,
+            budget: ContextBudget::new(Some(100_000), None, 50_000).unwrap(),
+            compacted: false,
+            summary: None,
+        });
+        view
     });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let viewport = window.viewport_size();
+        for id in ["run-status", "run-usage", "run-context", "plan-checklist"] {
+            let bounds = window.find(id).bounds();
+            assert!(
+                bounds.right() <= viewport.width,
+                "{id} ran off the right edge: {bounds:?}"
+            );
+            assert!(
+                bounds.left() >= px(0.),
+                "{id} started off the left edge: {bounds:?}"
+            );
+        }
+    })
+    .unwrap();
+}
+
+/// Everything on the Run tab is optional, so a session without a run must show
+/// its status and then stop, not render empty shells for the missing figures.
+#[gpui_kit::test]
+fn run_tab_omits_the_figures_a_session_without_a_run_cannot_have(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.review.open = true;
+        view.review.tab = InspectorTab::Run;
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("run-status").visible());
+        assert!(window.try_find("plan-checklist").is_none());
+        assert!(window.try_find("run-usage").is_none());
+        assert!(window.try_find("run-context").is_none());
+    })
+    .unwrap();
+}
+
+/// A run blocked on the user keeps an attention dot on the Run tab, so a
+/// collapsed checklist cannot hide a request for an answer.
+#[gpui_kit::test]
+fn run_tab_marks_a_run_blocked_on_the_user(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.review.open = true;
+        view.review.tab = InspectorTab::Changes;
+        view.pending_input = Some("Which branch should I use?".to_owned());
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("tab-attention").visible());
+    })
+    .unwrap();
+}
+
+/// The Changes tab previews the selected file, so the removed Files tab left no
+/// gap in the review flow.
+#[gpui_kit::test]
+fn changes_tab_previews_a_file_with_wrapping(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
     render_scenario(cx, |view| {
         view.review.open = true;
         view.sessions = vec![view.active_session.clone()];
@@ -4456,13 +4522,13 @@ fn plan_progress_tracks_steps_and_resets_with_a_new_run(cx: &mut TestAppContext)
 }
 
 #[gpui_kit::test]
-fn plan_renders_in_inspector_tab_and_agent_summary(cx: &mut TestAppContext) {
+fn plan_renders_in_the_run_tab(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
         let mut view = LoomView::new_for_test(cx.focus_handle());
         view.sessions = vec![view.active_session.clone()];
         view.review.open = true;
-        view.review.tab = InspectorTab::Plan;
+        view.review.tab = InspectorTab::Run;
         view.active_run_id = Some(RunId::new());
         view.plan = Some(crate::state::PlanState {
             steps: vec!["Inspect".to_owned(), "Edit".to_owned()],
@@ -4487,30 +4553,9 @@ fn plan_renders_in_inspector_tab_and_agent_summary(cx: &mut TestAppContext) {
         window.click("toggle-plan", cx);
         window.render_frame(cx);
         view.update(cx, |view, _| assert!(view.plan_collapsed));
-        // The collapsed header stays; only the step list is hidden.
+        // The collapsed heading stays; only the step list is hidden.
         assert!(window.find("toggle-plan").visible());
         assert!(window.try_find(("plan-step", 0usize)).is_none());
-    })
-    .unwrap();
-
-    // The Agent tab keeps the compact Run-card summary.
-    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
-        let mut view = LoomView::new_for_test(cx.focus_handle());
-        view.sessions = vec![view.active_session.clone()];
-        view.review.open = true;
-        view.review.tab = InspectorTab::Agent;
-        view.active_run_id = Some(RunId::new());
-        view.plan = Some(crate::state::PlanState {
-            steps: vec!["Inspect".to_owned(), "Edit".to_owned()],
-            completed: BTreeSet::from([0]),
-            active: Some(1),
-        });
-        view.timeline = vec![TimelineItem::User("do the work".to_owned())];
-        view
-    });
-    cx.update_window(handle.into(), |_, window, cx| {
-        window.render_frame(cx);
-        assert!(window.find("run-plan-summary").visible());
     })
     .unwrap();
 }
@@ -4548,8 +4593,8 @@ fn unread_markers_follow_changes_and_plan_events(cx: &mut TestAppContext) {
         // Content that arrives while its tab is already displayed is viewed,
         // so it does not re-mark that tab.
         view.review.open = true;
-        view.review.tab = InspectorTab::Plan;
-        view.review.clear_unread(InspectorTab::Plan);
+        view.review.tab = InspectorTab::Run;
+        view.review.clear_unread(InspectorTab::Run);
         view.consume_agent_event(&loom_protocol::AgentEvent::StepStarted {
             run_id,
             step_id: loom_core::StepId::new(),
@@ -4730,9 +4775,9 @@ fn unread_indicators_mark_and_clear_when_viewed(cx: &mut TestAppContext) {
         assert!(window.try_find(("tab-unread", 0usize)).is_none());
         assert!(window.find(("tab-unread", 1usize)).visible());
 
-        // Selecting the Plan tab clears the plan marker and the pane dot.
+        // Selecting the Run tab clears the plan marker and the pane dot.
         view.update(cx, |view, cx| {
-            view.select_inspector_tab(InspectorTab::Plan, cx);
+            view.select_inspector_tab(InspectorTab::Run, cx);
         });
         window.render_frame(cx);
         view.update(cx, |view, _| assert!(!view.review.has_unread()));

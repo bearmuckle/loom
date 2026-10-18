@@ -287,7 +287,7 @@ impl LoomView {
                     // A plan belongs to one run, so a new run starts without one.
                     self.plan = None;
                     self.plan_collapsed = false;
-                    self.review.clear_unread(InspectorTab::Plan);
+                    self.review.clear_unread(InspectorTab::Run);
                 }
                 self.context_inspection = None;
                 self.active_run = Some(snapshot.clone());
