@@ -14,21 +14,124 @@ use loom_core::{
 };
 use loom_protocol::{AgentRunSnapshot, AgentRunState, CollaborationRequest, RunRequest};
 
-/// Whom the composer sends to. The choice is explicit so peer chat never
-/// reaches the agent by accident.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum ComposerRecipient {
-    #[default]
-    Agent,
-    People,
+/// Where a composer draft goes, decided from a leading `@` mention instead of
+/// a mode the user has to remember to set.
+///
+/// `@agent` addresses the agent explicitly, `@people` addresses everyone in
+/// the session, and `@<name>` addresses the person whose roster name matches.
+/// Every other draft keeps the agent path, so a file reference such as
+/// `@crates/loom-ui/src/main.rs` is never mistaken for a person.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ComposerAddressing {
+    /// The mention as written, for example `@sam`, when one was recognized.
+    pub(crate) mention: Option<String>,
+    /// The person a mention names, when it names one.
+    pub(crate) person: Option<ParticipantIdentity>,
+    /// Whether the draft goes to the people in the session.
+    pub(crate) to_people: bool,
+    /// The text to send. A leading `@agent` mention is dropped; a people
+    /// mention stays, because it addresses the message.
+    pub(crate) text: String,
 }
 
-impl ComposerRecipient {
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::Agent => "Agent",
-            Self::People => "People",
+impl ComposerAddressing {
+    /// The recipient as the composer hint names it.
+    pub(crate) fn hint(&self) -> String {
+        match (&self.person, self.to_people) {
+            (Some(person), _) => format!("To {} · not sent to the agent", person.display_name),
+            (None, true) => "To people · not sent to the agent".to_owned(),
+            (None, false) => "To the agent".to_owned(),
         }
+    }
+}
+
+/// Reads the leading mention of `text` against the session roster.
+///
+/// Only the first word is a mention, and only when it names the agent, the
+/// people as a group, or a person on the roster. Anything else leaves the
+/// draft on the agent path unchanged.
+pub(crate) fn addressing_for(text: &str, roster: &[RosterEntry]) -> ComposerAddressing {
+    let Some(rest) = text.trim_start().strip_prefix('@') else {
+        return ComposerAddressing {
+            text: text.to_owned(),
+            ..ComposerAddressing::default()
+        };
+    };
+    let (word, after) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, ""), |(word, rest)| (word, rest.trim_start()));
+    let mention = format!("@{word}");
+    let name = word.to_lowercase();
+    match name.as_str() {
+        "agent" => ComposerAddressing {
+            text: after.to_owned(),
+            ..ComposerAddressing::default()
+        },
+        "people" | "everyone" => ComposerAddressing {
+            mention: Some(mention),
+            to_people: true,
+            text: text.to_owned(),
+            person: None,
+        },
+        _ => match mentioned_person(&name, roster) {
+            Some(person) => ComposerAddressing {
+                mention: Some(mention),
+                person: Some(person),
+                to_people: true,
+                text: text.to_owned(),
+            },
+            None => ComposerAddressing {
+                text: text.to_owned(),
+                ..ComposerAddressing::default()
+            },
+        },
+    }
+}
+
+/// The roster entry `name` addresses: a full display name wins, otherwise a
+/// first word that belongs to exactly one person. A name two different people
+/// answer to is ambiguous, so it addresses nobody.
+fn mentioned_person(name: &str, roster: &[RosterEntry]) -> Option<ParticipantIdentity> {
+    match addressed(
+        roster
+            .iter()
+            .filter(|entry| entry.participant.display_name.to_lowercase() == name),
+    ) {
+        AddressMatch::None => {}
+        AddressMatch::One(person) => return Some(person),
+        AddressMatch::Ambiguous => return None,
+    }
+    match addressed(roster.iter().filter(|entry| {
+        entry
+            .participant
+            .display_name
+            .split_whitespace()
+            .next()
+            .is_some_and(|first| first.to_lowercase() == name)
+    })) {
+        AddressMatch::One(person) => Some(person),
+        AddressMatch::None | AddressMatch::Ambiguous => None,
+    }
+}
+
+/// How many distinct people a set of roster entries names.
+enum AddressMatch {
+    None,
+    One(ParticipantIdentity),
+    Ambiguous,
+}
+
+fn addressed<'a>(entries: impl Iterator<Item = &'a RosterEntry>) -> AddressMatch {
+    let mut distinct: Vec<ParticipantIdentity> = Vec::new();
+    for person in entries.map(|entry| &entry.participant) {
+        if distinct.iter().all(|seen| seen.id != person.id) {
+            distinct.push(person.clone());
+        }
+    }
+    match distinct.len() {
+        0 => AddressMatch::None,
+        1 => AddressMatch::One(distinct.remove(0)),
+        _ => AddressMatch::Ambiguous,
     }
 }
 
@@ -88,7 +191,7 @@ pub(crate) enum ComposerRoute {
 /// than silently applying the text to a run that moved on.
 pub(crate) fn route_composer(
     permissions: SessionPermissions,
-    recipient: ComposerRecipient,
+    to_people: bool,
     run: Option<&AgentRunSnapshot>,
     awaiting_input: bool,
     revision: Option<RunRevision>,
@@ -96,7 +199,7 @@ pub(crate) fn route_composer(
     if !permissions.can_act {
         return ComposerRoute::ReadOnly;
     }
-    if recipient == ComposerRecipient::People {
+    if to_people {
         return ComposerRoute::PeerMessage;
     }
     let Some(run) = run.filter(|run| !run_is_finished(run.state)) else {
@@ -288,7 +391,6 @@ pub(crate) struct CollaborationState {
     pub(crate) roster: Vec<RosterEntry>,
     /// People an owner can grant access to.
     pub(crate) directory: Vec<ParticipantIdentity>,
-    pub(crate) recipient: ComposerRecipient,
     /// The last revision seen for the active run.
     pub(crate) revision: Option<(RunId, RunRevision)>,
     pub(crate) conflict: Option<ConflictNotice>,
@@ -438,7 +540,6 @@ impl CollaborationState {
         self.run_pin = None;
         self.message_authors.clear();
         self.seen_entries.clear();
-        self.recipient = ComposerRecipient::Agent;
         self.request_in_flight = false;
         self.access = AccessRequestsState::default();
     }
@@ -903,33 +1004,27 @@ mod tests {
     }
 
     #[test]
-    fn routing_follows_recipient_role_and_run_state() {
+    fn routing_follows_mention_role_and_run_state() {
         let all = SessionPermissions::UNRESTRICTED;
         let observer = SessionPermissions::for_role(Some(SessionRole::Observer));
         let active = run(AgentRunState::Executing);
         let current = revision(&active, 4);
         assert_eq!(
-            route_composer(
-                observer,
-                ComposerRecipient::People,
-                Some(&active),
-                false,
-                None
-            ),
+            route_composer(observer, true, Some(&active), false, None),
             ComposerRoute::ReadOnly
         );
         assert_eq!(
-            route_composer(all, ComposerRecipient::People, Some(&active), false, None),
+            route_composer(all, true, Some(&active), false, None),
             ComposerRoute::PeerMessage
         );
         assert_eq!(
-            route_composer(all, ComposerRecipient::Agent, None, false, None),
+            route_composer(all, false, None, false, None),
             ComposerRoute::StartRun
         );
         assert_eq!(
             route_composer(
                 all,
-                ComposerRecipient::Agent,
+                false,
                 Some(&run(AgentRunState::Completed)),
                 false,
                 None
@@ -937,30 +1032,18 @@ mod tests {
             ComposerRoute::StartRun
         );
         assert_eq!(
-            route_composer(all, ComposerRecipient::Agent, Some(&active), false, None),
+            route_composer(all, false, Some(&active), false, None),
             ComposerRoute::NeedRevision { run_id: active.id }
         );
         assert_eq!(
-            route_composer(
-                all,
-                ComposerRecipient::Agent,
-                Some(&active),
-                false,
-                Some(current)
-            ),
+            route_composer(all, false, Some(&active), false, Some(current)),
             ComposerRoute::DirectAgent {
                 run_id: active.id,
                 expected: current
             }
         );
         assert_eq!(
-            route_composer(
-                all,
-                ComposerRecipient::Agent,
-                Some(&active),
-                true,
-                Some(current)
-            ),
+            route_composer(all, false, Some(&active), true, Some(current)),
             ComposerRoute::AnswerAgentQuestion {
                 run_id: active.id,
                 expected: current
@@ -972,15 +1055,73 @@ mod tests {
             ..current
         };
         assert_eq!(
-            route_composer(
-                all,
-                ComposerRecipient::Agent,
-                Some(&active),
-                false,
-                Some(stale)
-            ),
+            route_composer(all, false, Some(&active), false, Some(stale)),
             ComposerRoute::NeedRevision { run_id: active.id }
         );
+    }
+
+    #[test]
+    fn a_leading_mention_selects_the_people_channel() {
+        let sam = person("sam");
+        let nadia = person("Nadia Petrova");
+        let roster = vec![
+            entry(&sam, SessionRole::Participant),
+            entry(&nadia, SessionRole::Observer),
+        ];
+
+        let plain = addressing_for("fix the reconnect test", &roster);
+        assert!(!plain.to_people);
+        assert_eq!(plain.text, "fix the reconnect test");
+        assert_eq!(plain.hint(), "To the agent");
+
+        let group = addressing_for("@people standup in five", &roster);
+        assert!(group.to_people);
+        assert!(group.person.is_none());
+        assert_eq!(group.text, "@people standup in five");
+        assert_eq!(group.hint(), "To people · not sent to the agent");
+
+        let named = addressing_for("@sam can you take the reconnect test?", &roster);
+        assert!(named.to_people);
+        assert_eq!(named.person.as_ref().map(|person| person.id), Some(sam.id));
+        assert_eq!(named.mention.as_deref(), Some("@sam"));
+        assert_eq!(
+            named.text, "@sam can you take the reconnect test?",
+            "a people mention stays in the stored message"
+        );
+        assert_eq!(named.hint(), "To sam · not sent to the agent");
+
+        // A multi-word roster name is addressable by its unique first word;
+        // the rest of the name stays in the message body.
+        assert_eq!(
+            addressing_for("@nadia please review", &roster)
+                .person
+                .map(|person| person.id),
+            Some(nadia.id)
+        );
+        assert_eq!(
+            addressing_for("@nadia petrova please review", &roster).text,
+            "@nadia petrova please review",
+            "only the first word is the mention; the rest is message text"
+        );
+
+        // `@agent` is explicit and is not part of the agent's text.
+        let agent = addressing_for("@agent rerun the failed step", &roster);
+        assert!(!agent.to_people);
+        assert_eq!(agent.mention, None);
+        assert_eq!(agent.text, "rerun the failed step");
+
+        // File references keep working: an unknown word is not a mention.
+        let file = addressing_for("@crates/loom-ui/src/main.rs add a test", &roster);
+        assert!(!file.to_people);
+        assert_eq!(file.text, "@crates/loom-ui/src/main.rs add a test");
+
+        // A name shared by two people is ambiguous, so it stays on the agent
+        // path rather than guessing a recipient.
+        let duplicate = vec![
+            entry(&person("sam"), SessionRole::Participant),
+            entry(&person("sam"), SessionRole::Observer),
+        ];
+        assert!(!addressing_for("@sam look", &duplicate).to_people);
     }
 
     #[test]

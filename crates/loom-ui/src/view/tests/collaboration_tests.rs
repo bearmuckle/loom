@@ -752,3 +752,45 @@ fn each_pending_request_has_its_own_deny_reason(cx: &mut TestAppContext) {
         })
         .unwrap();
 }
+
+#[gpui_kit::test]
+fn an_at_token_offers_roster_people_while_typing(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let _handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        let sam = person("sam");
+        let me = person("nadia");
+        view.collaboration.identity = Some(me.clone());
+        view.collaboration.replace_roster(
+            view.active_session.id,
+            vec![
+                roster(&sam, SessionRole::Participant),
+                roster(&me, SessionRole::Owner),
+            ],
+        );
+        assert_eq!(
+            view.people_completion_candidates(""),
+            vec![("sam".to_owned(), "Participant · messages people".to_owned())],
+            "the caller is not offered to themselves"
+        );
+        assert!(view.people_completion_candidates("zz").is_empty());
+
+        // `@sa` completes to the person and not to a file path, so Enter
+        // keeps a mention a mention.
+        let input = cx.new(|cx| TextareaState::new(window, cx));
+        input.update(cx, |state, cx| state.set_value("@sa", window, cx));
+        view.composer_input = Some(input);
+        view.refresh_composer_completion(cx);
+        view.accept_composer_completion(window, cx);
+        assert_eq!(
+            view.composer_input
+                .as_ref()
+                .expect("composer input")
+                .read(cx)
+                .value()
+                .as_ref(),
+            "@sam "
+        );
+        view
+    });
+}

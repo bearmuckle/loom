@@ -1,3 +1,5 @@
+use crate::collaboration::{ComposerAddressing, addressing_for};
+
 use super::*;
 
 impl LoomView {
@@ -8,25 +10,27 @@ impl LoomView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let permissions = self.collaboration.permissions();
-        let to_people =
-            self.collaboration.recipient == crate::collaboration::ComposerRecipient::People;
+        let composer = self
+            .composer_input
+            .as_ref()
+            .expect("composer input initialized before rendering");
+        let value = composer.read(cx).value().to_string();
+        // A leading `@` mention decides the recipient, so the draft itself is
+        // the control and no mode can be left set from an earlier message.
+        let addressing = addressing_for(&value, &self.collaboration.roster);
         let placeholder = if !permissions.can_act {
             "Observers can read this session but not send messages"
-        } else if to_people {
+        } else if addressing.to_people {
             "Message the people in this session (not sent to the agent)..."
         } else if self.pending_input.is_some() {
             "Answer the agent question..."
         } else if self.sending_message {
             "Sending direction..."
         } else if self.active_run_id.is_some() {
-            "Send follow-up direction..."
+            "Send follow-up direction, or @name to message people..."
         } else {
-            "Describe a task, or type / for commands"
+            "Describe a task, @name to message people, or type / for commands"
         };
-        let composer = self
-            .composer_input
-            .as_ref()
-            .expect("composer input initialized before rendering");
         if self.composer_placeholder.as_deref() != Some(placeholder) {
             composer.update(cx, |state, cx| {
                 state.set_placeholder(placeholder, window, cx)
@@ -36,7 +40,6 @@ impl LoomView {
             // does not keep invalidating the view on every render.
             // This is presentation state only; the text stays in InputState.
         }
-        let value = composer.read(cx).value().to_string();
         let height = composer_height(&value, layout.phone);
         let view = cx.entity();
         let completion_rows = match &self.composer_completion {
@@ -52,6 +55,11 @@ impl LoomView {
                     })
                     .collect::<Vec<_>>()
             }
+            Some(completion) if completion.kind == CompletionKind::Person => self
+                .people_completion_candidates(&completion.query)
+                .into_iter()
+                .map(|(name, detail)| (format!("@{name}"), name, detail))
+                .collect::<Vec<_>>(),
             Some(completion) => self
                 .file_completion_candidates()
                 .into_iter()
@@ -227,7 +235,8 @@ impl LoomView {
                                     // second row.
                                     .when(layout.phone, |element| element.flex_1())
                                     .when(permissions.can_act, |element| {
-                                        element.child(self.render_recipient_toggle(cx))
+                                        element
+                                            .child(self.render_recipient_hint(addressing.clone()))
                                     })
                                     .child(self.render_model_picker(layout.phone, cx))
                                     .child(
@@ -288,7 +297,7 @@ impl LoomView {
                                                     .w(layout.control_size())
                                             })
                                             .when(!layout.phone, |button| button.small())
-                                            .tooltip(if to_people {
+                                            .tooltip(if addressing.to_people {
                                                 "Send to people (Enter)"
                                             } else {
                                                 "Send to agent (Enter)"
@@ -351,33 +360,19 @@ impl LoomView {
         buttons
     }
 
-    /// The explicit Agent / People recipient switch. People sends peer chat,
-    /// which is never added to model context.
-    fn render_recipient_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        use crate::collaboration::ComposerRecipient;
-        use gpui_kit::component::button::ButtonGroup;
-        let recipient = self.collaboration.recipient;
-        ButtonGroup::new("composer-recipient")
-            .outline()
-            .xsmall()
-            .child(
-                Button::new("recipient-agent")
-                    .label(ComposerRecipient::Agent.label())
-                    .selected(recipient == ComposerRecipient::Agent),
-            )
-            .child(
-                Button::new("recipient-people")
-                    .label(ComposerRecipient::People.label())
-                    .selected(recipient == ComposerRecipient::People),
-            )
-            .on_click(cx.listener(|this, clicked: &Vec<usize>, _, cx| {
-                let recipient = if clicked.contains(&1) {
-                    ComposerRecipient::People
-                } else {
-                    ComposerRecipient::Agent
-                };
-                this.set_composer_recipient(recipient, cx);
+    /// The recipient the draft's leading mention selects, shown as a passive
+    /// hint so peer chat is never a hidden mode: the text decides.
+    fn render_recipient_hint(&self, addressing: ComposerAddressing) -> impl IntoElement {
+        div()
+            .id("composer-recipient-hint")
+            .test_support()
+            .text_xs()
+            .text_color(rgb(if addressing.to_people {
+                0xc4b5fd
+            } else {
+                0x64748b
             }))
+            .child(addressing.hint())
     }
 
     /// A dismissible banner for the latest operational status or backend error.

@@ -128,6 +128,9 @@ pub(crate) struct ResponsiveLayout {
 enum CompletionKind {
     Command,
     File,
+    /// A person in the session roster, so `@name` reaches people and is
+    /// discoverable while typing.
+    Person,
 }
 
 /// The active pane in the settings dialog's section navigation.

@@ -142,6 +142,10 @@ impl LoomView {
     }
 
     /// Recomputes the composer's inline completion from the current text.
+    ///
+    /// An `@` token offers the session's people before file paths: a mention
+    /// the roster answers to is what the user means, and offering files there
+    /// would let Enter replace a name with a path.
     pub(crate) fn refresh_composer_completion(&mut self, cx: &mut Context<Self>) {
         if self.suppress_completion_once {
             self.suppress_completion_once = false;
@@ -153,8 +157,57 @@ impl LoomView {
             .as_ref()
             .map(|input| input.read(cx).value().to_string())
             .unwrap_or_default();
-        self.composer_completion = completion_for_value(&value);
+        self.composer_completion = completion_for_value(&value).map(|completion| {
+            if completion.kind == CompletionKind::File
+                && !self
+                    .people_completion_candidates(&completion.query)
+                    .is_empty()
+            {
+                ComposerCompletion {
+                    kind: CompletionKind::Person,
+                    ..completion
+                }
+            } else {
+                completion
+            }
+        });
         cx.notify();
+    }
+
+    /// Roster people offered for `@` completion, as (mention name, detail).
+    /// The caller is left out because mentioning yourself addresses nobody
+    /// else.
+    pub(crate) fn people_completion_candidates(&self, query: &str) -> Vec<(String, String)> {
+        let query = query.to_lowercase();
+        let me = self
+            .collaboration
+            .identity
+            .as_ref()
+            .map(|identity| identity.id);
+        self.collaboration
+            .roster
+            .iter()
+            .filter(|entry| Some(entry.participant.id) != me)
+            .filter_map(|entry| {
+                let name = entry.participant.display_name.split_whitespace().next()?;
+                let matches = query.is_empty()
+                    || entry
+                        .participant
+                        .display_name
+                        .to_lowercase()
+                        .starts_with(&query)
+                    || name.to_lowercase().starts_with(&query);
+                matches.then(|| {
+                    (
+                        name.to_owned(),
+                        format!(
+                            "{} · messages people",
+                            crate::collaboration::role_label(entry.role)
+                        ),
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Applies the highlighted completion to the composer text.
@@ -177,6 +230,13 @@ impl LoomView {
                     return;
                 };
                 replace_command_token(&value, command.name)
+            }
+            CompletionKind::Person => {
+                let candidates = self.people_completion_candidates(&completion.query);
+                let Some((name, _)) = candidates.get(completion.selected) else {
+                    return;
+                };
+                replace_last_token(&value, &format!("@{name} "))
             }
             CompletionKind::File => {
                 let matches = self.file_completion_candidates();

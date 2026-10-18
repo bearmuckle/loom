@@ -8,7 +8,7 @@ use loom_protocol::{
 
 use super::*;
 use crate::collaboration::{
-    CollaborationSupport, ComposerRecipient, ComposerRoute, ControlRoute, is_unsupported_error,
+    CollaborationSupport, ComposerRoute, ControlRoute, addressing_for, is_unsupported_error,
     route_composer, route_control,
 };
 use loom_core::RunControlAction;
@@ -261,20 +261,12 @@ impl LoomView {
         );
     }
 
-    pub(crate) fn set_composer_recipient(
-        &mut self,
-        recipient: ComposerRecipient,
-        cx: &mut Context<Self>,
-    ) {
-        self.collaboration.recipient = recipient;
-        cx.notify();
-    }
-
-    /// Sends composer text along the route the recipient, role, and run state
-    /// select. Returns `false` when nothing was sent, so the caller keeps the
-    /// draft.
+    /// Sends composer text along the route its leading mention, role, and run
+    /// state select. Returns `false` when nothing was sent, so the caller keeps
+    /// the draft.
     pub(crate) fn send_composer_text(&mut self, text: String, cx: &mut Context<Self>) -> bool {
         let permissions = self.collaboration.permissions();
+        let addressing = addressing_for(&text, &self.collaboration.roster);
         let run = self
             .active_run
             .as_ref()
@@ -282,11 +274,15 @@ impl LoomView {
         let revision = run.and_then(|run| self.collaboration.revision_for(run));
         let route = route_composer(
             permissions,
-            self.collaboration.recipient,
+            addressing.to_people,
             run,
             self.pending_input.is_some(),
             revision,
         );
+        // The mention itself is not part of an agent direction: only the text
+        // after `@agent` is sent, while a people mention stays in the stored
+        // peer message because it addresses it.
+        let text = addressing.text;
         // Every connection that can act takes the ordered path when the worker
         // supports it, so operators are ordered against people too. Older
         // workers keep the existing run requests.
