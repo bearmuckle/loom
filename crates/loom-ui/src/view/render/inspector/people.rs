@@ -295,7 +295,13 @@ impl LoomView {
                 );
             }
         } else if !state.is_participant_bound() && state.roster.is_empty() {
-            if self.offers_github_sign_in() {
+            if self.node_uses_operator_token(self.active_node_id()) {
+                body = body.child(empty_note(
+                    "This connection uses an operator access token, so it is not a person in \
+                     the roster. Signing in with GitHub would only attribute its actions to an \
+                     account.",
+                ));
+            } else if self.offers_github_sign_in() {
                 body = body
                     .child(empty_note(
                         "This connection reports no person, so the session has no roster. \

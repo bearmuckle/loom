@@ -254,7 +254,21 @@ impl LoomView {
                 .get(&node_id)
                 .map_or(node_id.as_str(), String::as_str)
         ));
+        self.refresh_identity_after_provider_login(&node_id, cx);
         cx.notify();
+    }
+
+    /// Reads the identity a successful provider login may have bound.
+    ///
+    /// A worker binds the account behind an operator's provider login, so the
+    /// existing GitHub sign-in in Providers also joins the connection to the
+    /// roster. The status response carries no participant, so the client asks.
+    fn refresh_identity_after_provider_login(&mut self, node_id: &str, cx: &mut Context<Self>) {
+        if self.active_node_id() != node_id {
+            return;
+        }
+        self.collaboration.identity_loaded = false;
+        self.refresh_collaboration(cx);
     }
 
     pub(crate) fn handle_github_provider_configured(
@@ -280,6 +294,7 @@ impl LoomView {
                 .get(&node_id)
                 .map_or(node_id.as_str(), String::as_str)
         ));
+        self.refresh_identity_after_provider_login(&node_id, cx);
         self.dispatch_to_node(
             cx,
             node_id.clone(),

@@ -317,6 +317,63 @@ impl InProcessConnection {
         })
     }
 
+    /// Binds the GitHub account behind a provider login to this connection,
+    /// when the worker allows sign-in and the account passes its allowlist.
+    ///
+    /// A provider login already asks for `read:user`, so the token can name the
+    /// person who authorized it. Binding here is what lets an operator reuse
+    /// the existing provider sign-in instead of starting a second identity
+    /// flow. A failure only costs the attribution: the provider credential is
+    /// already configured, so it is logged and the login still succeeds.
+    pub(crate) fn bind_provider_identity(
+        &self,
+        config: &GitHubSignInConfig,
+        token: &str,
+    ) -> Option<loom_core::ParticipantIdentity> {
+        if !config.is_enabled() || self.participant().is_some() {
+            return None;
+        }
+        let account = match github_account_ref_at(token, config.user_api_url()) {
+            Ok(account) => account,
+            Err(error) => {
+                log::warn!(
+                    "[loom-server] a provider sign-in completed but its GitHub account could not \
+                     be read, so the connection stays unbound: {}",
+                    error.message
+                );
+                return None;
+            }
+        };
+        if !config.allows_login(&account.login) {
+            log::info!(
+                "[loom-server] GitHub account '{}' is not allowed to sign in to this worker; the \
+                 provider credential was stored but the connection stays unbound",
+                account.login
+            );
+            return None;
+        }
+        let identity = config.identity_for(&account);
+        match self.bind_participant(identity) {
+            Ok(identity) => {
+                self.adopt_ownerless_sessions_for(&identity);
+                log::info!(
+                    "[loom-server] {} signed in with a provider GitHub login; participant {}",
+                    identity.display_name,
+                    identity.id
+                );
+                Some(identity)
+            }
+            Err(error) => {
+                log::error!(
+                    "[loom-server] a provider sign-in stored its credential but the GitHub \
+                     identity could not be bound: {}",
+                    error.message
+                );
+                None
+            }
+        }
+    }
+
     pub(crate) fn start_github_copilot_login(&self) -> Result<ServerResponse> {
         self.start_github_device_login(GitHubLoginKind::Copilot)
     }
@@ -353,6 +410,9 @@ impl InProcessConnection {
         );
 
         let backend = self.backend.clone();
+        let connection = self.clone();
+        let identity_config = self.backend.identity.config();
+        let bind_identity = initiator.is_none();
         let device_for_poll = device.clone();
         let worker_login_id = login_id.clone();
         let spawn_result = thread::Builder::new()
@@ -371,7 +431,7 @@ impl InProcessConnection {
                                     backend.providers.instance_credentials()?.as_ref(),
                                     loom_providers::GITHUB_COPILOT_PROVIDER_ID,
                                     participant,
-                                    token,
+                                    token.clone(),
                                 )?;
                                 log::info!(
                                     "[loom-server] participant {} signed in to GitHub Copilot; \
@@ -382,11 +442,20 @@ impl InProcessConnection {
                                 );
                             }
                             (GitHubLoginKind::Copilot, None) => {
-                                backend.providers.configure_github_copilot(token)?;
+                                backend.providers.configure_github_copilot(token.clone())?;
                             }
                             (GitHubLoginKind::Repository, _) => {
-                                backend.providers.configure_github_repository(token)?;
+                                backend
+                                    .providers
+                                    .configure_github_repository(token.clone())?;
                             }
+                        }
+                        // A connection that has no person yet (an operator token
+                        // or an in-process client) gets one from the account it
+                        // just authorized, so the provider sign-in is also the
+                        // worker sign-in instead of a second GitHub flow.
+                        if bind_identity {
+                            connection.bind_provider_identity(&identity_config, &token);
                         }
                         backend.persist_state()
                     }) {
@@ -1095,12 +1164,15 @@ impl InProcessConnection {
     /// Holds a connection bound to a person to their role in the session the
     /// request reads or acts on.
     ///
-    /// Operator connections (unauthenticated in-process callers and tokens not
-    /// bound to a person) are governed by their token scope alone. A person
-    /// without any grant in the session is told the session is not authorized,
-    /// exactly as if it did not belong to their scope, so neither content nor
-    /// presence leaks.
+    /// Operator connections (unauthenticated in-process callers, tokens not
+    /// bound to a person, and unrestricted operator tokens that signed in) are
+    /// governed by their token scope alone. A person without any grant in the
+    /// session is told the session is not authorized, exactly as if it did not
+    /// belong to their scope, so neither content nor presence leaks.
     pub(crate) fn authorize_session_role(&self, request: &ClientRequest) -> Result<()> {
+        if self.retains_operator_authority() {
+            return Ok(());
+        }
         let Some(participant) = self.participant() else {
             return Ok(());
         };
@@ -1206,8 +1278,12 @@ impl InProcessConnection {
     }
 
     /// Sessions this connection may read, or `None` when it is not limited by
-    /// session grants (an operator connection).
+    /// session grants (an operator connection, including an unrestricted
+    /// operator token that signed in).
     pub(crate) fn readable_sessions(&self) -> Result<Option<BTreeSet<AgentSessionId>>> {
+        if self.retains_operator_authority() {
+            return Ok(None);
+        }
         let Some(participant) = self.participant() else {
             return Ok(None);
         };

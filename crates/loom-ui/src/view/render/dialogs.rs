@@ -923,6 +923,7 @@ impl LoomView {
     fn render_worker_sign_in_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let node_id = self.default_backend_node_id.clone();
         let awaiting_sign_in = self.node_awaits_sign_in(&node_id);
+        let operator = self.node_uses_operator_token(&node_id);
         let identity = self
             .collaboration
             .identity
@@ -955,10 +956,20 @@ impl LoomView {
                 );
             return row;
         }
+        if operator {
+            // The operator token is the credential: signing in would only add
+            // attribution, and asking for a second GitHub account here makes a
+            // working connection look incomplete.
+            return row.child(
+                div()
+                    .flex_1()
+                    .child("Connected with an access token; no GitHub account is linked."),
+            );
+        }
         let message = if awaiting_sign_in {
             "This worker is waiting for a GitHub sign-in."
         } else {
-            "Sign in with GitHub to join this worker's roster, or connect with its access token."
+            "Sign in with GitHub to join this worker's roster."
         };
         row = row.child(div().flex_1().child(message));
         if self.offers_github_sign_in() {

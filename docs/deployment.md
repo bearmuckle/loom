@@ -66,15 +66,20 @@ clients such as scripts and CI.
 - The resulting GitHub token is read once to obtain the account's numeric id and
   login, and is then dropped. It is never stored as a provider credential, and a
   provider credential is still configured separately (an operator's
-  `ConfigureGitHubCopilot`, or a person's own `StartGitHubCopilotLogin`).
+  `ConfigureGitHubCopilot`, or a person's own `StartGitHubCopilotLogin`). A
+  provider device login asks for `read:user` as well, so when it completes on a
+  connection that has no person, the worker binds that account too: the existing
+  GitHub sign-in in Providers is also the worker sign-in for a token connection.
 - A signed-in person holds no session access until an owner grants a role, so
   sharing a worker does not share its sessions. The exception is an operator
   connection: when the connection that signs in also holds an unrestricted
-  operator token, the worker gives that person the owner role on every session
-  that has no owner. Such a token already reaches every session, so the
-  ownership follows it instead of granting more. A session that already has an
-  owner is unchanged, and a pre-login connection adopts nothing because it
-  holds no token to follow.
+  operator token, the token keeps deciding what the connection may do, and the
+  GitHub identity is attribution on top of it. The worker also gives that
+  person the owner role on every session that has no owner, so a later personal
+  connection continues to reach them. Such a token already reaches every
+  session, so the ownership follows it instead of granting more. A session that
+  already has an owner is unchanged, and a pre-login connection adopts nothing
+  because it holds no token to follow.
 
 ### Signing in from a client
 
@@ -90,10 +95,13 @@ credential left.
    which may only negotiate, read worker status and its own identity, and sign
    in. The client shows a sign-in prompt where the composer would be, and the
    roster, credential, and run controls stay disabled.
-3. Select Sign in with GitHub, either from the Sign in row or from the People
-   tab, and complete the device flow. The pane shows the user code and the
+3. Select Sign in with GitHub from the composer prompt (or from the People
+   tab) and complete the device flow. The pane shows the user code and the
    verification URL and polls the worker until the account is bound. A refused
-   or expired sign-in is reported in the pane with the worker's reason.
+   or expired sign-in is reported in the pane with the worker's reason. A
+   connection that already holds an access token is not asked to sign in: its
+   token is the credential, and it keeps operator authority even if it signs in
+   for attribution.
 4. The worker binds the GitHub account to the connection. The client then loads
    the workspaces, sessions, and roster it was refused while pre-login, and the
    signed-in login appears in the session header and the People tab. Signing in
@@ -109,9 +117,11 @@ An operator token still behaves exactly as it did: enter it after the URL, and
 the connection has unrestricted authority with no person bound. It may also
 sign in on top of the token, and the worker refuses a second sign-in while one
 identity is bound, so sign out before switching accounts. Signing in on top of
-an unrestricted operator token leaves that person the owner of every session
-that has no owner, which is how a single-operator worker keeps its sessions once
-its operator signs in.
+an unrestricted operator token does not narrow the token: the connection keeps
+worker-wide access, repository browsing, and provider administration, and the
+person is attributed as the author of what it does. The worker also makes that
+person the owner of every session that has no owner, so a later personal
+connection continues to reach them.
 
 The browser client is configured with `?remote=<url>` and an optional
 `&token=<token>`; a URL alone connects unsigned, and the token no longer has to

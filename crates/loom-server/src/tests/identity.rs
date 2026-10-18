@@ -95,6 +95,38 @@ impl GitHubFixture {
     }
 }
 
+/// Serves one GitHub account read and returns its endpoint plus a handle that
+/// yields the request line.
+fn serve_github_user(body: &'static str) -> (String, thread::JoinHandle<String>) {
+    use std::io::{Read, Write};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            if stream.read_exact(&mut byte).is_err() {
+                break;
+            }
+            request.push(byte[0]);
+        }
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+        String::from_utf8_lossy(&request)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    });
+    (format!("http://{address}/user"), server)
+}
+
 fn send(connection: &InProcessConnection, request: ClientRequest) -> Result<ServerResponse> {
     connection.request(RequestEnvelope::new(request)).result
 }
@@ -480,6 +512,44 @@ fn an_operator_token_connection_stays_unbound_until_it_signs_in() {
 }
 
 #[test]
+fn a_provider_login_binds_the_account_it_authorized() {
+    let (endpoint, server) = serve_github_user(r#"{"id":141030,"login":"octocat"}"#);
+    let config = GitHubSignInConfig::new(["octocat".to_owned()]).with_user_api_url(endpoint);
+    let backend = InProcessBackend::new();
+    let connection = backend.connect();
+    negotiate(&connection);
+
+    let identity = connection
+        .bind_provider_identity(&config, "provider-token")
+        .expect("the allowed account binds the connection");
+
+    assert_eq!(participant_of(&connection), Some(identity.clone()));
+    assert_eq!(identity.id, github_participant_id(141030));
+    assert_eq!(identity.display_name, "octocat");
+    assert!(
+        server.join().unwrap().starts_with("GET /user "),
+        "the provider login reads the account over the configured endpoint"
+    );
+}
+
+#[test]
+fn a_provider_login_does_not_bind_a_disallowed_account() {
+    let (endpoint, server) = serve_github_user(r#"{"id":141030,"login":"mallory"}"#);
+    let config = GitHubSignInConfig::new(["octocat".to_owned()]).with_user_api_url(endpoint);
+    let backend = InProcessBackend::new();
+    let connection = backend.connect();
+    negotiate(&connection);
+
+    assert!(
+        connection
+            .bind_provider_identity(&config, "provider-token")
+            .is_none()
+    );
+    assert_eq!(participant_of(&connection), None);
+    server.join().unwrap();
+}
+
+#[test]
 fn only_an_unrestricted_operator_token_adopts_ownerless_sessions() {
     let backend = InProcessBackend::new();
     let tokens = AuthTokenStore::new();
@@ -508,6 +578,23 @@ fn only_an_unrestricted_operator_token_adopts_ownerless_sessions() {
             capability
         ))
         .adopts_ownerless_sessions()
+    );
+
+    // A token already bound to a person cannot sign in again and must never be
+    // treated as an operator, even when its scope reaches everything.
+    let bound = tokens
+        .issue_for_participant(
+            AuthorizationScope::all(),
+            ParticipantIdentity {
+                id: github_participant_id(141030),
+                display_name: "octocat".to_owned(),
+            },
+        )
+        .unwrap();
+    assert!(
+        !backend
+            .connect_authenticated(tokens.authenticate(&bound.token).unwrap())
+            .adopts_ownerless_sessions()
     );
 
     // A pre-login connection carries no credential at all.

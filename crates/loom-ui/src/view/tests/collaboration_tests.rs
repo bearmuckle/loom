@@ -35,6 +35,13 @@ fn person(name: &str) -> ParticipantIdentity {
     }
 }
 
+/// Makes the test view a connection opened without an operator token, so the
+/// identity it is given is subject to session roles.
+fn mark_unsigned(view: &mut LoomView) {
+    let node_id = view.default_backend_node_id.clone();
+    view.unsigned_nodes.insert(node_id);
+}
+
 fn roster(person: &ParticipantIdentity, role: SessionRole) -> RosterEntry {
     RosterEntry {
         participant: person.clone(),
@@ -111,6 +118,7 @@ fn observers_cannot_send_or_act(cx: &mut TestAppContext) {
         view.sessions = vec![view.active_session.clone()];
         let me = person("Nadia");
         view.collaboration.identity = Some(me.clone());
+        mark_unsigned(&mut view);
         view.collaboration.replace_roster(
             view.active_session.id,
             vec![roster(&me, SessionRole::Observer)],
@@ -135,6 +143,7 @@ fn participants_search_only_for_sessions_they_own(cx: &mut TestAppContext) {
         let mut view = LoomView::new_for_test(cx.focus_handle());
         let me = person("Sam");
         view.collaboration.identity = Some(me.clone());
+        mark_unsigned(&mut view);
         view.collaboration.replace_roster(
             view.active_session.id,
             vec![roster(&me, SessionRole::Owner)],
@@ -147,6 +156,23 @@ fn participants_search_only_for_sessions_they_own(cx: &mut TestAppContext) {
         view.begin_source_dialog(SessionSourceDialogPurpose::StartSession, cx);
         assert_eq!(view.repository_search_session(), None);
         view.collaboration.identity = None;
+        assert_eq!(view.repository_search_session(), Some(None));
+        view
+    });
+}
+
+#[gpui_kit::test]
+fn an_operator_token_keeps_repository_search_after_signing_in(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        // The token binds no person's role; a sign-in only adds attribution.
+        view.collaboration.identity = Some(person("Sam"));
+        view.collaboration.identity_loaded = true;
+        assert!(view.node_uses_operator_token(&view.default_backend_node_id));
+        assert!(view.session_permissions().can_act);
+        assert!(view.session_permissions().can_manage);
+        view.begin_source_dialog(SessionSourceDialogPurpose::StartSession, cx);
         assert_eq!(view.repository_search_session(), Some(None));
         view
     });
@@ -447,6 +473,7 @@ fn observer_request_shows_pending_then_the_outcome(cx: &mut TestAppContext) {
         view.sessions = vec![view.active_session.clone()];
         let me = person("Nadia");
         view.collaboration.identity = Some(me.clone());
+        mark_unsigned(&mut view);
         view.collaboration.support = crate::collaboration::CollaborationSupport::Supported;
         view.collaboration.replace_roster(
             view.active_session.id,
@@ -505,6 +532,7 @@ fn owner_sees_pending_requests_until_resolved(cx: &mut TestAppContext) {
         let owner = person("Björn");
         let nadia = person("Nadia");
         view.collaboration.identity = Some(owner.clone());
+        mark_unsigned(&mut view);
         view.collaboration.support = crate::collaboration::CollaborationSupport::Supported;
         view.collaboration.replace_roster(
             view.active_session.id,
@@ -562,6 +590,7 @@ fn run_control_view(
     view.sessions = vec![view.active_session.clone()];
     let me = person("Nadia");
     view.collaboration.identity = Some(me.clone());
+    mark_unsigned(&mut view);
     view.collaboration.support = crate::collaboration::CollaborationSupport::Supported;
     view.collaboration
         .replace_roster(view.active_session.id, vec![roster(&me, role)]);
@@ -695,6 +724,7 @@ fn each_pending_request_has_its_own_deny_reason(cx: &mut TestAppContext) {
         view.sessions = vec![view.active_session.clone()];
         let owner = person("Owner");
         view.collaboration.identity = Some(owner.clone());
+        mark_unsigned(&mut view);
         view.collaboration.support = crate::collaboration::CollaborationSupport::Supported;
         view.collaboration.replace_roster(
             view.active_session.id,
@@ -780,6 +810,7 @@ fn an_at_token_offers_roster_people_while_typing(cx: &mut TestAppContext) {
         let sam = person("sam");
         let me = person("nadia");
         view.collaboration.identity = Some(me.clone());
+        mark_unsigned(&mut view);
         view.collaboration.replace_roster(
             view.active_session.id,
             vec![

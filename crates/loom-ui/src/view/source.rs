@@ -165,13 +165,14 @@ impl LoomView {
     /// operator connection may do that, but a connection bound to a person
     /// must name a session it owns, so it cannot search before one exists.
     pub(crate) fn repository_search_session(&self) -> Option<Option<AgentSessionId>> {
-        let purpose = self.source_dialog.as_ref()?.purpose;
-        match purpose {
+        let dialog = self.source_dialog.as_ref()?;
+        match dialog.purpose {
             SessionSourceDialogPurpose::AddToSession => self
                 .can_manage_sources()
                 .then_some(Some(self.active_session.id)),
             SessionSourceDialogPurpose::StartSession => {
-                (!self.collaboration.is_participant_bound()).then_some(None)
+                let operator = self.node_uses_operator_token(&dialog.target_node_id);
+                (!self.collaboration.is_participant_bound() || operator).then_some(None)
             }
         }
     }

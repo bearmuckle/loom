@@ -9,10 +9,10 @@ use loom_core::{
 use loom_model::ModelId;
 use loom_protocol::{
     AccessRequest, AccessResponse, ClientRequest, ControlRequest, ControlResponse, EventsRequest,
-    EventsResponse, ProviderRequest, ProviderResponse, RequestEnvelope, ResponseEnvelope,
-    RunRequest, RunResponse, ServerEvent, ServerResponse, SessionRequest, SessionResponse,
-    TerminalRequest, TerminalResponse, WorkerNodeStatus, WorkspaceRequest, WorkspaceResponse,
-    decode_request, decode_response, encode_request, encode_response,
+    EventsResponse, ProviderRequest, ProviderResponse, RepositoryRequest, RequestEnvelope,
+    ResponseEnvelope, RunRequest, RunResponse, ServerEvent, ServerResponse, SessionRequest,
+    SessionResponse, TerminalRequest, TerminalResponse, WorkerNodeStatus, WorkspaceRequest,
+    WorkspaceResponse, decode_request, decode_response, encode_request, encode_response,
 };
 use loom_server::{
     AuthTokenStore, AuthorizationScope, DEFAULT_MAX_FRAME_BYTES,
@@ -702,6 +702,17 @@ async fn an_unrestricted_operator_sign_in_adopts_every_ownerless_session() {
         .await
         .unwrap();
     assert!(renamed.result.is_ok(), "{:?}", renamed.result);
+
+    // The operator token still decides what the connection may do: binding a
+    // GitHub person must not take away worker-wide repository browsing, which
+    // a role-bound participant may not use.
+    let cloned = connection
+        .request(RequestEnvelope::new(ClientRequest::Repository(
+            RepositoryRequest::ListClonedRepositories,
+        )))
+        .await
+        .unwrap();
+    assert!(cloned.result.is_ok(), "{:?}", cloned.result);
 
     assert_eq!(
         fixture.served(),

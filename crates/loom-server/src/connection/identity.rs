@@ -107,8 +107,27 @@ impl InProcessConnection {
     pub(crate) fn adopts_ownerless_sessions(&self) -> bool {
         self.auth_session().is_some_and(|auth| {
             let scope = auth.scope();
-            scope.sessions.is_none() && scope.workspaces.is_none()
+            auth.participant().is_none() && scope.sessions.is_none() && scope.workspaces.is_none()
         })
+    }
+
+    /// Whether this connection still holds operator authority after a sign-in.
+    ///
+    /// An unrestricted operator token reaches everything already, so binding a
+    /// GitHub identity on top of it cannot narrow what the token may do. The
+    /// person is then an operator with an attributed identity: session roles are
+    /// not consulted, and worker-wide GitHub browsing stays available. The same
+    /// applies to an in-process connection, which is an operator without any
+    /// credential. A pre-login connection that signed in, a credential-bound
+    /// person, and a token narrowed by scope are governed by their roles instead.
+    pub(crate) fn retains_operator_authority(&self) -> bool {
+        if self.pre_login {
+            return false;
+        }
+        match self.auth_session() {
+            Some(_) => self.adopts_ownerless_sessions(),
+            None => true,
+        }
     }
 
     /// Makes a person who just signed in the owner of every session that has no
@@ -128,7 +147,7 @@ impl InProcessConnection {
     /// id and does not stop the others or fail the sign-in: the identity
     /// binding was saved already, so the person stays signed in and only that
     /// session's entry and save are missing.
-    fn adopt_ownerless_sessions_for(&self, identity: &ParticipantIdentity) {
+    pub(crate) fn adopt_ownerless_sessions_for(&self, identity: &ParticipantIdentity) {
         if !self.adopts_ownerless_sessions() {
             return;
         }

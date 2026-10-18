@@ -33,6 +33,16 @@ impl LoomView {
         self.awaiting_sign_in_nodes.contains(node_id)
     }
 
+    /// Whether the connection to `node_id` was opened with an access token.
+    ///
+    /// A token connection is an operator: it is not subject to session roles,
+    /// and a GitHub sign-in on top of it only attributes actions to a person.
+    /// Only connections opened without a credential are governed by the roles
+    /// the worker reports.
+    pub(crate) fn node_uses_operator_token(&self, node_id: &str) -> bool {
+        !self.unsigned_nodes.contains(node_id)
+    }
+
     /// Whether the active connection waits for a GitHub sign-in.
     ///
     /// A pre-login connection is neither an operator nor a person: it holds no
@@ -44,10 +54,13 @@ impl LoomView {
 
     /// What the active connection may do. A connection waiting for sign-in is
     /// locked rather than unrestricted, because `UNRESTRICTED` is what an
-    /// operator token earns.
+    /// operator token earns. A token connection keeps that authority even after
+    /// signing in, so its identity never narrows the token.
     pub(crate) fn session_permissions(&self) -> SessionPermissions {
         if self.awaits_sign_in() {
             SessionPermissions::LOCKED
+        } else if self.node_uses_operator_token(self.active_node_id()) {
+            SessionPermissions::UNRESTRICTED
         } else {
             self.collaboration.permissions()
         }

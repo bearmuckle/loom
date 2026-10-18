@@ -175,6 +175,11 @@ fn an_operator_connection_keeps_its_authority(cx: &mut TestAppContext) {
         );
         assert_eq!(view.collaboration.identity.as_ref(), Some(&octocat));
         assert!(!view.awaits_sign_in());
+        // The token still decides what the connection may do; the identity is
+        // attribution, not a narrower role.
+        assert!(view.session_permissions().can_act);
+        assert!(view.session_permissions().can_manage);
+        assert!(view.node_uses_operator_token(&node_id));
         // Signing out keeps the operator's unrestricted authority.
         view.finish_sign_out_github(&node_id, signed_out(), cx);
         assert!(view.collaboration.identity.is_none());
