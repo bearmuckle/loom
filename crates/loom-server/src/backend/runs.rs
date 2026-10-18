@@ -83,6 +83,44 @@ impl InProcessBackend {
         })
     }
 
+    /// Settles a run whose admission deadline elapsed before it got a slot.
+    /// Records the real admission error as a failed run instead of a user
+    /// cancellation, so the transcript and session state say why.
+    pub(crate) fn settle_rejected_run(self: &Arc<Self>, handle: &Arc<RunHandle>, error: LoomError) {
+        log::warn!("could not admit run {}: {}", handle.run_id, error.message);
+        handle.record_failure(error.clone());
+        if let Ok(mut runtime) = handle.try_runtime() {
+            if let Err(publish_error) = runtime.fail(error.message.clone()) {
+                handle.record_failure(publish_error);
+            }
+            handle.refresh(&runtime);
+        }
+        if let Err(persist_error) = self.persist_worker_state() {
+            handle.record_failure(persist_error);
+        }
+        handle.set_running(false);
+    }
+
+    /// Resolves how long a fresh run for this session may wait for a free
+    /// concurrency slot, using the workspace's configured queue timeout.
+    pub(crate) fn run_admission_timeout(&self, session_id: AgentSessionId) -> std::time::Duration {
+        let workspace_id = self
+            .sessions()
+            .ok()
+            .and_then(|sessions| sessions.get(session_id).ok())
+            .map(|session| session.workspace_id);
+        let seconds = workspace_id
+            .and_then(|workspace_id| {
+                self.workspace_configs().ok().and_then(|configs| {
+                    configs
+                        .get(&workspace_id)
+                        .map(|config| config.run_admission_timeout_secs)
+                })
+            })
+            .unwrap_or(loom_protocol::DEFAULT_RUN_ADMISSION_TIMEOUT_SECS);
+        std::time::Duration::from_secs(u64::from(seconds.max(1)))
+    }
+
     /// Drives a registered run on the bounded run executor so the request
     /// handler returns as soon as the run is registered. A run no longer owns a
     /// dedicated OS thread: at most `DEFAULT_MAX_CONCURRENT_RUNS` runs execute
@@ -91,11 +129,14 @@ impl InProcessBackend {
         handle.join_worker()?;
         handle.set_running(true);
         let backend = Arc::clone(self);
+        let reject_backend = Arc::clone(self);
         let task_handle = Arc::clone(&handle);
         let reject_handle = Arc::clone(&handle);
         let run_id = handle.run_id;
+        let admission_timeout = self.run_admission_timeout(handle.session_id);
         let worker = self.run_executor.spawn_bounded(
             format!("loom-run-{run_id}"),
+            admission_timeout,
             move || {
                 let fragment_flusher = backend.persistence.clone().map(|persistence| {
                     let handle = Arc::downgrade(&task_handle);
@@ -238,17 +279,7 @@ impl InProcessBackend {
                     }
                 }
             },
-            move |error| {
-                log::warn!("could not admit run {run_id}: {}", error.message);
-                reject_handle.record_failure(error);
-                // No worker owns the runtime yet, so settle the run here rather
-                // than leaving it running with no driver.
-                if let Ok(mut runtime) = reject_handle.try_runtime() {
-                    let _ = runtime.interrupt();
-                    reject_handle.refresh(&runtime);
-                }
-                reject_handle.set_running(false);
-            },
+            move |error| reject_backend.settle_rejected_run(&reject_handle, error),
         );
         *handle.worker.lock().unwrap_or_else(PoisonError::into_inner) = Some(worker);
         Ok(())

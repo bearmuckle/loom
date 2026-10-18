@@ -1248,6 +1248,40 @@ impl LoomView {
                             phone,
                         ))
                         .child(settings_row(
+                            "Run queue timeout",
+                            "How long a run may wait for a free agent slot before it is rejected",
+                            settings_stepper(
+                                Button::new("run-admission-timeout-decrease")
+                                    .label("-")
+                                    .small()
+                                    .disabled(
+                                        !self.is_connected()
+                                            || self.workspace_config.run_admission_timeout_secs
+                                                <= loom_protocol::MIN_RUN_ADMISSION_TIMEOUT_SECS,
+                                    )
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.adjust_run_admission_timeout(-5, cx);
+                                    })),
+                                format!(
+                                    "{} min",
+                                    self.workspace_config.run_admission_timeout_secs / 60
+                                ),
+                                Button::new("run-admission-timeout-increase")
+                                    .label("+")
+                                    .small()
+                                    .disabled(
+                                        !self.is_connected()
+                                            || self.workspace_config.run_admission_timeout_secs
+                                                >= loom_protocol::MAX_RUN_ADMISSION_TIMEOUT_SECS,
+                                    )
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.adjust_run_admission_timeout(5, cx);
+                                    })),
+                            ),
+                            false,
+                            phone,
+                        ))
+                        .child(settings_row(
                             "Auto-archive completed sub agents",
                             "Archive a delegated agent once its task is done and any code change is integrated",
                             Switch::new("auto-archive-completed-agents-toggle")

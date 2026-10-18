@@ -11,10 +11,6 @@ use tokio::{
 
 /// Default number of agent runs that may execute concurrently on the runtime.
 pub(crate) const DEFAULT_MAX_CONCURRENT_RUNS: usize = 4;
-/// Default time a fresh run may wait for a concurrency slot before it is
-/// rejected. This is the backpressure bound: without it an unbounded queue of
-/// runs would wait forever during an outage or overload.
-pub(crate) const DEFAULT_RUN_ADMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The runtime worker entry point. Building the runtime on a dedicated,
 /// non-async thread means the executor can be created from any context,
@@ -129,19 +125,17 @@ impl RunTask {
 pub(crate) struct RunExecutor {
     handle: Handle,
     permits: std::sync::Arc<Semaphore>,
-    admission_timeout: Duration,
 }
 
 impl RunExecutor {
     pub(crate) fn with_defaults() -> Self {
-        Self::new(DEFAULT_MAX_CONCURRENT_RUNS, DEFAULT_RUN_ADMISSION_TIMEOUT)
+        Self::new(DEFAULT_MAX_CONCURRENT_RUNS)
     }
 
-    pub(crate) fn new(max_concurrent_runs: usize, admission_timeout: Duration) -> Self {
+    pub(crate) fn new(max_concurrent_runs: usize) -> Self {
         Self {
             handle: runtime_handle(),
             permits: std::sync::Arc::new(Semaphore::new(max_concurrent_runs.max(1))),
-            admission_timeout,
         }
     }
 
@@ -153,6 +147,7 @@ impl RunExecutor {
     pub(crate) fn spawn_bounded<T, R>(
         &self,
         name: impl Into<String>,
+        admission_timeout: Duration,
         task: T,
         on_reject: R,
     ) -> RunTask
@@ -161,7 +156,6 @@ impl RunExecutor {
         R: FnOnce(LoomError) + Send + 'static,
     {
         let permits = std::sync::Arc::clone(&self.permits);
-        let admission_timeout = self.admission_timeout;
         let completion = std::sync::Arc::new(RunCompletion::default());
         let task_completion = std::sync::Arc::clone(&completion);
         let name = name.into();
@@ -180,11 +174,19 @@ impl RunExecutor {
                 }
                 Ok(Err(_closed)) => {
                     task_completion.panic("run executor was closed");
-                    reject(on_reject, run_admission_error(&task_name, true)).await;
+                    reject(
+                        on_reject,
+                        run_admission_error(&task_name, admission_timeout, true),
+                    )
+                    .await;
                 }
                 Err(_elapsed) => {
                     task_completion.panic("run admission timed out");
-                    reject(on_reject, run_admission_error(&task_name, false)).await;
+                    reject(
+                        on_reject,
+                        run_admission_error(&task_name, admission_timeout, false),
+                    )
+                    .await;
                 }
             }
             task_completion.finish();
@@ -223,11 +225,14 @@ async fn reject<R: FnOnce(LoomError) + Send + 'static>(on_reject: R, error: Loom
     let _ = tokio::task::spawn_blocking(move || on_reject(error)).await;
 }
 
-fn run_admission_error(name: &str, closed: bool) -> LoomError {
+fn run_admission_error(name: &str, admission_timeout: Duration, closed: bool) -> LoomError {
     let message = if closed {
         format!("{name} could not start because the run executor was closed")
     } else {
-        format!("{name} waited too long for a run concurrency slot")
+        format!(
+            "{name} waited {} minutes for a free run slot and was rejected; raise the run queue timeout or let another run finish",
+            admission_timeout.as_secs() / 60
+        )
     };
     LoomError::new(ErrorCode::DeadlineExceeded, message, true)
 }
@@ -247,7 +252,7 @@ mod tests {
 
     #[test]
     fn runs_overlap_without_exceeding_the_concurrency_limit() {
-        let executor = RunExecutor::new(2, Duration::from_secs(30));
+        let executor = RunExecutor::new(2);
         let current = Arc::new(AtomicUsize::new(0));
         let max = Arc::new(AtomicUsize::new(0));
         let mut tasks = Vec::new();
@@ -256,6 +261,7 @@ mod tests {
             let max = Arc::clone(&max);
             tasks.push(executor.spawn_bounded(
                 "test-run",
+                Duration::from_secs(30),
                 move || {
                     let active = current.fetch_add(1, Ordering::SeqCst) + 1;
                     max.fetch_max(active, Ordering::SeqCst);
@@ -278,7 +284,8 @@ mod tests {
 
     #[test]
     fn a_run_that_waits_past_the_admission_timeout_is_rejected() {
-        let executor = RunExecutor::new(1, Duration::from_millis(40));
+        let executor = RunExecutor::new(1);
+        let admission_timeout = Duration::from_millis(40);
         let (release_sender, release_receiver) = mpsc::channel::<()>();
         let (rejected_sender, rejected_receiver) = mpsc::channel::<LoomError>();
         let started = Arc::new(AtomicUsize::new(0));
@@ -286,6 +293,7 @@ mod tests {
         let blocking_started = Arc::clone(&started);
         let first = executor.spawn_bounded(
             "blocking-run",
+            admission_timeout,
             move || {
                 blocking_started.fetch_add(1, Ordering::SeqCst);
                 let _ = release_receiver.recv();
@@ -300,6 +308,7 @@ mod tests {
         let rejected_flag = Arc::clone(&rejected_started);
         let second = executor.spawn_bounded(
             "waiting-run",
+            admission_timeout,
             move || {
                 *rejected_flag.lock().unwrap() = true;
             },

@@ -24,14 +24,15 @@ pub use loom_core::{
 pub use loom_core::{
     CURRENT_PROTOCOL_VERSION, Checkpoint, CheckpointFile, ClonedRepository, ContextAssemblyOptions,
     ContextBudget, ContextFileKind, ContextFileReference, ContextInspection, ContextItem,
-    ContextItemKind, ContextSummary, GITHUB_REPOSITORY_QUERY_MIN_CHARS, GitHubRepository,
-    MAX_PROJECT_AGENT_CONCURRENCY, MIN_PROJECT_AGENT_CONCURRENCY, RevertResult, SessionDirectory,
-    SessionFilesystemChange, SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository,
-    TaskArtifact, TaskEvent, TaskEventRecord, TaskEvidenceLink, TaskKind, TaskSnapshot, TaskSpec,
-    TaskStatus, TerminalEvent, TerminalEventRecord, TerminalSnapshot, TerminalStatus,
-    TerminalStream, UndoResult, WorkerNodeConfig, WorkspaceChangeKind, WorkspaceConfig,
-    WorkspaceControl, WorkspaceEdit, WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind,
-    WorkspaceRecord,
+    ContextItemKind, ContextSummary, DEFAULT_RUN_ADMISSION_TIMEOUT_SECS,
+    GITHUB_REPOSITORY_QUERY_MIN_CHARS, GitHubRepository, MAX_PROJECT_AGENT_CONCURRENCY,
+    MAX_RUN_ADMISSION_TIMEOUT_SECS, MIN_PROJECT_AGENT_CONCURRENCY, MIN_RUN_ADMISSION_TIMEOUT_SECS,
+    RevertResult, SessionDirectory, SessionFilesystemChange, SessionFilesystemFile,
+    SessionFilesystemSnapshot, SessionRepository, TaskArtifact, TaskEvent, TaskEventRecord,
+    TaskEvidenceLink, TaskKind, TaskSnapshot, TaskSpec, TaskStatus, TerminalEvent,
+    TerminalEventRecord, TerminalSnapshot, TerminalStatus, TerminalStream, UndoResult,
+    WorkerNodeConfig, WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl, WorkspaceEdit,
+    WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind, WorkspaceRecord,
 };
 pub use loom_core::{
     GitBranch, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,

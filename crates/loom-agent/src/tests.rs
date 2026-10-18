@@ -1705,6 +1705,35 @@ fn interrupt_preserves_a_cancelled_run() {
 }
 
 #[test]
+fn fail_reports_the_admission_reason_as_a_failure() {
+    let root = workspace();
+    let tools = ToolExecutor::new(&root).unwrap();
+    let task = AgentTask::new("inspect", ModelId::new("deterministic/demo")).unwrap();
+    let mut runtime = AgentRuntime::new(
+        AgentSessionId::new(),
+        task,
+        Box::new(DeterministicProvider::demo()),
+        tools,
+    );
+    runtime.start().unwrap();
+
+    let events = runtime
+        .fail("waited 30 minutes for a free run slot")
+        .unwrap();
+
+    assert_eq!(runtime.run.state, AgentRunState::Failed);
+    let summary = runtime.run.summary.expect("a failed run carries a summary");
+    assert!(summary.starts_with(loom_model::AGENT_RUN_FAILURE_SUMMARY_PREFIX));
+    assert!(summary.contains("waited 30 minutes for a free run slot"));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RunCompleted { snapshot }
+            if snapshot.state == AgentRunState::Failed
+    )));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn refreshing_github_access_updates_the_advertised_tools() {
     let root = workspace();
     let tools = ToolExecutor::new(&root).unwrap();

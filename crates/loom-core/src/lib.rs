@@ -35,8 +35,9 @@ pub use credential::{ProviderCredentialMetadata, RunCredentialPin, SessionCreden
 pub use error::{ErrorCode, LoomError, Result};
 pub use filesystem::{
     Checkpoint, CheckpointFile, ClonedRepository, ContextFileKind, ContextFileReference,
-    GITHUB_REPOSITORY_QUERY_MIN_CHARS, GitHubRepository, MAX_PROJECT_AGENT_CONCURRENCY,
-    MIN_PROJECT_AGENT_CONCURRENCY, RevertResult, SessionDirectory, SessionFilesystemChange,
+    DEFAULT_RUN_ADMISSION_TIMEOUT_SECS, GITHUB_REPOSITORY_QUERY_MIN_CHARS, GitHubRepository,
+    MAX_PROJECT_AGENT_CONCURRENCY, MAX_RUN_ADMISSION_TIMEOUT_SECS, MIN_PROJECT_AGENT_CONCURRENCY,
+    MIN_RUN_ADMISSION_TIMEOUT_SECS, RevertResult, SessionDirectory, SessionFilesystemChange,
     SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository, UndoResult,
     WorkerNodeConfig, WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl, WorkspaceEdit,
     WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind,

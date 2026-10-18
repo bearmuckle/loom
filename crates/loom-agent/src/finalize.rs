@@ -118,6 +118,14 @@ impl AgentRuntime {
         events
     }
 
+    /// Fails a run before it starts executing, reporting the real reason in the
+    /// transcript and session state instead of a cancellation. The server uses
+    /// this when a queued run is rejected before admission.
+    pub fn fail(&mut self, reason: impl Into<String>) -> Result<Vec<AgentEvent>> {
+        let events = self.finish_failed(reason);
+        self.publish(Ok(events))
+    }
+
     pub(crate) fn finish_failed(&mut self, reason: impl Into<String>) -> Vec<AgentEvent> {
         let reason = reason.into();
         // Every producer of a failed run routes through here, so this one line

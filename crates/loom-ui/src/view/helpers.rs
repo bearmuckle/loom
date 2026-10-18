@@ -427,6 +427,16 @@ pub(crate) fn adjusted_project_agent_concurrency(current: u8, delta: i8) -> u8 {
     ) as u8
 }
 
+/// Applies a minute delta to the queued-run timeout, clamped to the range the
+/// worker accepts.
+pub(crate) fn adjusted_run_admission_timeout_secs(current: u32, delta_minutes: i8) -> u32 {
+    let next = i64::from(current) + i64::from(delta_minutes) * 60;
+    next.clamp(
+        i64::from(loom_protocol::MIN_RUN_ADMISSION_TIMEOUT_SECS),
+        i64::from(loom_protocol::MAX_RUN_ADMISSION_TIMEOUT_SECS),
+    ) as u32
+}
+
 /// Order worker nodes for a "Run on" picker, keeping the default/home worker
 /// first and preserving the caller's order for the rest.
 pub(crate) fn order_session_nodes(
@@ -3175,6 +3185,20 @@ mod tests {
         assert_eq!(change_kind_label(WorkspaceChangeKind::Modified), "Updated");
         assert_eq!(adjusted_cpu_pulse_threshold(50, 100), 100);
         assert_eq!(adjusted_cpu_pulse_threshold(10, -100), 0);
+    }
+
+    #[test]
+    fn run_queue_timeout_steps_in_minutes_and_clamps() {
+        assert_eq!(adjusted_run_admission_timeout_secs(1800, 5), 2100);
+        assert_eq!(adjusted_run_admission_timeout_secs(1800, -5), 1500);
+        assert_eq!(
+            adjusted_run_admission_timeout_secs(loom_protocol::MAX_RUN_ADMISSION_TIMEOUT_SECS, 5),
+            loom_protocol::MAX_RUN_ADMISSION_TIMEOUT_SECS
+        );
+        assert_eq!(
+            adjusted_run_admission_timeout_secs(loom_protocol::MIN_RUN_ADMISSION_TIMEOUT_SECS, -5),
+            loom_protocol::MIN_RUN_ADMISSION_TIMEOUT_SECS
+        );
     }
 
     #[test]

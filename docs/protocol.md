@@ -317,9 +317,10 @@ ListSessionTasks / GetSessionTask / GetSessionTaskEvidence
 Worker-node management adds workspace-scoped
 `GetWorkspaceConfigForWorkspace` and `SetWorkspaceConfigForWorkspace`
 requests. The persisted config contains a revision,
-worker WebSocket URLs, and a CPU pulse threshold for session-card node
-indicators (default 5%); credentials, workspace files, and session state are
-not included. Connected peers receive the updated config when nodes join or
+worker WebSocket URLs, a CPU pulse threshold for session-card node indicators
+(default 5%), the parallel project-agent limit, the auto-archive-completed-agents
+switch, and the run queue timeout (default 30 minutes); credentials, workspace
+files, and session state are not included. Connected peers receive the updated config when nodes join or
 are removed. Sessions remain owned by the node that created them; config
 distribution does not migrate sessions.
 Provider settings are maintained independently by each worker. The client can

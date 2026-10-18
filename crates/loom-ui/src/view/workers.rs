@@ -251,6 +251,24 @@ impl LoomView {
         cx.notify();
     }
 
+    pub(crate) fn adjust_run_admission_timeout(
+        &mut self,
+        delta_minutes: i8,
+        cx: &mut Context<Self>,
+    ) {
+        let next = adjusted_run_admission_timeout_secs(
+            self.workspace_config.run_admission_timeout_secs,
+            delta_minutes,
+        );
+        if next == self.workspace_config.run_admission_timeout_secs {
+            return;
+        }
+        self.workspace_config.run_admission_timeout_secs = next;
+        self.workspace_config.revision = self.workspace_config.revision.saturating_add(1);
+        self.persist_and_distribute_workspace_config(None, cx);
+        cx.notify();
+    }
+
     /// Turns automatic archiving of completed, integrated sub agents on or off
     /// for this workspace.
     pub(crate) fn set_auto_archive_completed_agents(

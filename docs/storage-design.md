@@ -44,10 +44,12 @@ Large immutable values—including message bodies, tool output, checkpoint file 
 Runtime objects, locks, provider clients, filesystem watchers, and UI caches are reconstructed and are not persisted.
 
 The workspace-config JSON stores `project_agent_concurrency` with a serde
-default of four (valid values are one through sixteen). Existing config blobs
-without the field remain readable, and the setting needs no separate SQLite
-schema change; the delegated-task table already persists queued work. A
-project may have at most fifty queued or active delegated tasks.
+default of four (valid values are one through sixteen) and
+`run_admission_timeout_secs` with a serde default of 1800 (valid values are 60
+through 7200). Existing config blobs without either field remain readable, and
+the settings need no separate SQLite schema change; the delegated-task table
+already persists queued work. A project may have at most fifty queued or active
+delegated tasks.
 
 ## Operational storage
 

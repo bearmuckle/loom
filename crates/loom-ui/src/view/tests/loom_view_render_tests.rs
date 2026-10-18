@@ -888,6 +888,12 @@ fn settings_dialog_close_control_handles_a_real_click(cx: &mut TestAppContext) {
             .click("project-agent-concurrency-increase", cx);
         window
             .within("settings-dialog")
+            .click("run-admission-timeout-decrease", cx);
+        window
+            .within("settings-dialog")
+            .click("run-admission-timeout-increase", cx);
+        window
+            .within("settings-dialog")
             .click("session-auto-approve-toggle", cx);
         window.within("settings-dialog").click("close-settings", cx);
         window.render_frame(cx);

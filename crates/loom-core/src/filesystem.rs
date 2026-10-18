@@ -23,10 +23,23 @@ pub struct WorkspaceConfig {
     /// visible for inspection until the workspace opts in.
     #[serde(default)]
     pub auto_archive_completed_agents: bool,
+    /// Seconds a fresh run may wait for a free concurrency slot before it is
+    /// rejected. This is the backpressure bound that keeps an overloaded
+    /// worker from queueing runs forever.
+    #[serde(default = "default_run_admission_timeout_secs")]
+    pub run_admission_timeout_secs: u32,
 }
 
 pub const MIN_PROJECT_AGENT_CONCURRENCY: u8 = 1;
 pub const MAX_PROJECT_AGENT_CONCURRENCY: u8 = 16;
+
+/// Default time a queued run may wait for a free concurrency slot. Generous
+/// because a running agent routinely holds its slot for many minutes; a queued
+/// run is not doing work, so the bound only exists to keep an overloaded worker
+/// from accepting runs it cannot start.
+pub const DEFAULT_RUN_ADMISSION_TIMEOUT_SECS: u32 = 1800;
+pub const MIN_RUN_ADMISSION_TIMEOUT_SECS: u32 = 60;
+pub const MAX_RUN_ADMISSION_TIMEOUT_SECS: u32 = 7200;
 
 const fn default_project_agent_concurrency() -> u8 {
     4
@@ -34,6 +47,10 @@ const fn default_project_agent_concurrency() -> u8 {
 
 const fn default_cpu_pulse_threshold_percent() -> u8 {
     5
+}
+
+const fn default_run_admission_timeout_secs() -> u32 {
+    DEFAULT_RUN_ADMISSION_TIMEOUT_SECS
 }
 
 impl Default for WorkspaceConfig {
@@ -44,6 +61,7 @@ impl Default for WorkspaceConfig {
             cpu_pulse_threshold_percent: default_cpu_pulse_threshold_percent(),
             project_agent_concurrency: default_project_agent_concurrency(),
             auto_archive_completed_agents: false,
+            run_admission_timeout_secs: default_run_admission_timeout_secs(),
         }
     }
 }
@@ -217,7 +235,7 @@ pub struct ContextFileReference {
 
 #[cfg(test)]
 mod tests {
-    use super::WorkspaceConfig;
+    use super::{DEFAULT_RUN_ADMISSION_TIMEOUT_SECS, WorkspaceConfig};
 
     #[test]
     fn older_workspace_config_defaults_project_agent_concurrency() {
@@ -230,5 +248,9 @@ mod tests {
         assert_eq!(config.cpu_pulse_threshold_percent, 15);
         assert_eq!(config.project_agent_concurrency, 4);
         assert!(!config.auto_archive_completed_agents);
+        assert_eq!(
+            config.run_admission_timeout_secs,
+            DEFAULT_RUN_ADMISSION_TIMEOUT_SECS
+        );
     }
 }

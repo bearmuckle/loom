@@ -3,6 +3,10 @@
 #[allow(unused_imports)]
 use super::support::*;
 use super::*;
+use loom_agent::{AgentRuntime, AgentTask};
+use loom_core::{AgentSessionState, LoomError};
+use loom_model::AgentRunState;
+use loom_tools::ToolExecutor;
 
 #[test]
 fn workspace_config_is_persisted_and_excludes_access_tokens() {
@@ -14,6 +18,7 @@ fn workspace_config_is_persisted_and_excludes_access_tokens() {
         cpu_pulse_threshold_percent: 37,
         project_agent_concurrency: 2,
         auto_archive_completed_agents: false,
+        run_admission_timeout_secs: 900,
         worker_nodes: vec![WorkerNodeConfig {
             url: "wss://worker.example/ws".to_owned(),
         }],
@@ -67,6 +72,7 @@ fn workspace_config_is_persisted_and_excludes_access_tokens() {
                     cpu_pulse_threshold_percent: 5,
                     project_agent_concurrency: 4,
                     auto_archive_completed_agents: false,
+                    run_admission_timeout_secs: 1800,
                     worker_nodes: vec![WorkerNodeConfig {
                         url: "wss://stale.example/ws".to_owned(),
                     }],
@@ -98,6 +104,7 @@ fn workspace_config_is_persisted_and_excludes_access_tokens() {
                         cpu_pulse_threshold_percent: 5,
                         project_agent_concurrency: 4,
                         auto_archive_completed_agents: false,
+                        run_admission_timeout_secs: 1800,
                         worker_nodes: vec![WorkerNodeConfig {
                             url: url.to_owned(),
                         }],
@@ -120,9 +127,99 @@ fn workspace_config_is_persisted_and_excludes_access_tokens() {
             invalid_concurrency.result,
             Err(error) if error.code == ErrorCode::InvalidRequest
         ));
+        for run_admission_timeout_secs in [
+            loom_protocol::MIN_RUN_ADMISSION_TIMEOUT_SECS - 1,
+            loom_protocol::MAX_RUN_ADMISSION_TIMEOUT_SECS + 1,
+        ] {
+            let invalid_timeout = connection.request(RequestEnvelope::new(
+                ClientRequest::Workspace(WorkspaceRequest::SetWorkspaceConfigForWorkspace {
+                    workspace_id,
+                    config: WorkspaceConfig {
+                        revision: 2,
+                        run_admission_timeout_secs,
+                        ..WorkspaceConfig::default()
+                    },
+                }),
+            ));
+            assert!(matches!(
+                invalid_timeout.result,
+                Err(error) if error.code == ErrorCode::InvalidRequest
+            ));
+        }
         backend.shutdown().unwrap();
     }
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn run_queue_timeout_uses_the_workspace_config() {
+    let backend = InProcessBackend::new();
+    let workspace_id = WorkspaceId::new();
+    let session = {
+        let mut sessions = backend.sessions().unwrap();
+        sessions
+            .create_in_workspace(workspace_id, "timeout")
+            .unwrap()
+            .0
+    };
+    assert_eq!(
+        backend.run_admission_timeout(session.id),
+        Duration::from_secs(u64::from(loom_protocol::DEFAULT_RUN_ADMISSION_TIMEOUT_SECS))
+    );
+    backend
+        .set_workspace_config(
+            workspace_id,
+            WorkspaceConfig {
+                revision: 1,
+                run_admission_timeout_secs: 600,
+                ..WorkspaceConfig::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        backend.run_admission_timeout(session.id),
+        Duration::from_secs(600)
+    );
+}
+
+#[test]
+fn rejected_run_is_recorded_as_failed_with_its_reason() {
+    let backend = InProcessBackend::new();
+    let workspace_id = WorkspaceId::new();
+    let session = {
+        let mut sessions = backend.sessions().unwrap();
+        sessions
+            .create_in_workspace(workspace_id, "rejected")
+            .unwrap()
+            .0
+    };
+    let root = std::env::temp_dir().join(format!("loom-rejected-run-{}", WorkspaceId::new()));
+    fs::create_dir_all(&root).unwrap();
+    let runtime = AgentRuntime::new(
+        session.id,
+        AgentTask::new("wait for a slot", ModelId::new("deterministic/demo")).unwrap(),
+        Box::new(loom_providers::DeterministicProvider::demo()),
+        ToolExecutor::new(&root).unwrap(),
+    );
+    let handle = backend.register_runtime(runtime);
+    backend.settle_rejected_run(
+        &handle,
+        LoomError::new(
+            ErrorCode::DeadlineExceeded,
+            "loom-run waited 30 minutes for a free run slot and was rejected",
+            true,
+        ),
+    );
+
+    let snapshot = handle.snapshot();
+    assert_eq!(snapshot.state, AgentRunState::Failed);
+    let summary = snapshot.summary.expect("a failed run carries a summary");
+    assert!(summary.contains("waited 30 minutes for a free run slot"));
+    assert_eq!(
+        backend.sessions().unwrap().get(session.id).unwrap().state,
+        AgentSessionState::Failed
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

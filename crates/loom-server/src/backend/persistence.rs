@@ -20,10 +20,17 @@ impl InProcessBackend {
             || !(loom_protocol::MIN_PROJECT_AGENT_CONCURRENCY
                 ..=loom_protocol::MAX_PROJECT_AGENT_CONCURRENCY)
                 .contains(&config.project_agent_concurrency)
+            || !(loom_protocol::MIN_RUN_ADMISSION_TIMEOUT_SECS
+                ..=loom_protocol::MAX_RUN_ADMISSION_TIMEOUT_SECS)
+                .contains(&config.run_admission_timeout_secs)
         {
-            return Err(LoomError::invalid_request(
-                "workspace configuration must contain at most 64 safe worker-node URLs and project agent concurrency between 1 and 16",
-            ));
+            return Err(LoomError::invalid_request(format!(
+                "workspace configuration must contain at most 64 safe worker-node URLs, project agent concurrency between {} and {}, and a run queue timeout between {} and {} seconds",
+                loom_protocol::MIN_PROJECT_AGENT_CONCURRENCY,
+                loom_protocol::MAX_PROJECT_AGENT_CONCURRENCY,
+                loom_protocol::MIN_RUN_ADMISSION_TIMEOUT_SECS,
+                loom_protocol::MAX_RUN_ADMISSION_TIMEOUT_SECS,
+            )));
         }
         let current_revision = self
             .workspace_configs()?

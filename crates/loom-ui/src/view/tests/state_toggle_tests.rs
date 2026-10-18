@@ -35,6 +35,7 @@ fn review_composer_and_worker_controls_toggle(cx: &mut TestAppContext) {
 
         view.adjust_cpu_pulse_threshold(5, cx);
         view.adjust_project_agent_concurrency(1, cx);
+        view.adjust_run_admission_timeout(5, cx);
         view.adjust_font_scale(1, window, cx);
         view.set_font_scale_percent(120, window, cx);
         view
