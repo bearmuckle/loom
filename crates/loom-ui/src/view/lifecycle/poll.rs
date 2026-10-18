@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(not(target_family = "wasm"))]
+use crate::connection::resume_github_identity;
 
 impl LoomView {
     /// Delays a poll while the worker is unreachable.
@@ -445,6 +447,20 @@ impl LoomView {
                             && current_participant(&connection)
                                 .map(|participant| participant.is_none())
                                 .unwrap_or(false);
+                        if !unsigned
+                            && let Some(saved) = crate::identity_store::load(&status.node_id)
+                        {
+                            match resume_github_identity(&connection, saved.id) {
+                                Ok(Some(_)) => {}
+                                Ok(None) => crate::identity_store::clear(&status.node_id),
+                                Err(error) => log::debug!(
+                                    "[loom-ui] could not resume the GitHub identity for worker \
+                                     '{}': {}",
+                                    status.node_id,
+                                    error.message
+                                ),
+                            }
+                        }
                         Ok::<_, (WorkerConnectionStage, LoomError, bool)>((
                             connection,
                             status,

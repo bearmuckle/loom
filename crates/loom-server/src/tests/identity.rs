@@ -512,6 +512,86 @@ fn an_operator_token_connection_stays_unbound_until_it_signs_in() {
 }
 
 #[test]
+fn an_operator_token_resumes_a_remembered_identity() {
+    let backend = InProcessBackend::new();
+    let octocat = ParticipantIdentity {
+        id: github_participant_id(141030),
+        display_name: "octocat".to_owned(),
+    };
+    backend
+        .register_participants(std::slice::from_ref(&octocat))
+        .unwrap();
+    let tokens = AuthTokenStore::new();
+    let operator = tokens.issue(AuthorizationScope::all()).unwrap();
+    let connection = backend.connect_authenticated(tokens.authenticate(&operator.token).unwrap());
+    negotiate(&connection);
+
+    // An id the worker has never seen is not resumed.
+    let unknown = ParticipantIdentity {
+        id: github_participant_id(7),
+        display_name: "mallory".to_owned(),
+    };
+    assert_eq!(
+        access(
+            &connection,
+            AccessRequest::ResumeGitHubIdentity {
+                participant_id: unknown.id,
+            },
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::NotFound
+    );
+
+    let resumed = access(
+        &connection,
+        AccessRequest::ResumeGitHubIdentity {
+            participant_id: octocat.id,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        resumed,
+        AccessResponse::GitHubIdentityResumed { participant } if participant == octocat
+    ));
+    assert_eq!(participant_of(&connection), Some(octocat.clone()));
+
+    // A connection with no operator token cannot claim a remembered person.
+    let pre_login = backend.connect_pre_login();
+    negotiate(&pre_login);
+    assert_eq!(
+        access(
+            &pre_login,
+            AccessRequest::ResumeGitHubIdentity {
+                participant_id: octocat.id,
+            },
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::AuthenticationRequired
+    );
+
+    // A token already bound to a person is not an operator connection.
+    let bound = tokens
+        .issue_for_participant(AuthorizationScope::all(), octocat.clone())
+        .unwrap();
+    let bound_connection =
+        backend.connect_authenticated(tokens.authenticate(&bound.token).unwrap());
+    negotiate(&bound_connection);
+    assert_eq!(
+        access(
+            &bound_connection,
+            AccessRequest::ResumeGitHubIdentity {
+                participant_id: octocat.id,
+            },
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::Conflict
+    );
+}
+
+#[test]
 fn a_provider_login_binds_the_account_it_authorized() {
     let (endpoint, server) = serve_github_user(r#"{"id":141030,"login":"octocat"}"#);
     let config = GitHubSignInConfig::new(["octocat".to_owned()]).with_user_api_url(endpoint);

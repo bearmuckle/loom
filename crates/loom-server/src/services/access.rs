@@ -163,6 +163,19 @@ impl AccessService {
         }
     }
 
+    /// The directory entry for a person, when the worker has seen them before.
+    /// A resumed identity must name a real participant, not an arbitrary id.
+    pub(crate) fn known_identity(&self, participant: ParticipantId) -> Option<ParticipantIdentity> {
+        self.state()
+            .participants
+            .get(&participant)
+            .cloned()
+            .map(|display_name| ParticipantIdentity {
+                id: participant,
+                display_name,
+            })
+    }
+
     fn state(&self) -> MutexGuard<'_, AccessState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }

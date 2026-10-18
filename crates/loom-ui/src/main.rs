@@ -13,6 +13,7 @@ mod backend_host;
 mod browser;
 mod collaboration;
 mod connection;
+mod identity_store;
 #[cfg(not(target_family = "wasm"))]
 mod local_backend;
 mod preferences;

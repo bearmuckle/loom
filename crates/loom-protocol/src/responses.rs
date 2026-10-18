@@ -495,6 +495,12 @@ pub enum AccessResponse {
         participant: Option<ParticipantIdentity>,
     },
 
+    /// The person a connection resumed as. The worker bound their presence, so
+    /// a reconnect can show them online without a new GitHub device flow.
+    GitHubIdentityResumed {
+        participant: ParticipantIdentity,
+    },
+
     Participants {
         participants: Vec<ParticipantIdentity>,
     },

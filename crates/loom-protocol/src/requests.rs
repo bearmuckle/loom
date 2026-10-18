@@ -676,6 +676,12 @@ pub enum AccessRequest {
     /// The identity bound to this connection.
     GetCurrentParticipant,
 
+    /// Binds a connection back to a person it signed in as before. Only an
+    /// unrestricted operator token may resume an identity: the client
+    /// remembers the participant id locally, and the worker keeps the person
+    /// in its directory. Protocol 11.9.
+    ResumeGitHubIdentity { participant_id: ParticipantId },
+
     /// People the backend knows, so an owner can pick whom to grant access to.
     ListParticipants,
 

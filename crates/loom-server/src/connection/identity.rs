@@ -323,6 +323,50 @@ impl InProcessConnection {
         }))
     }
 
+    /// Binds this connection back to a person it signed in as before.
+    ///
+    /// The client remembers the participant id for a worker, so a reload can
+    /// show the person online without another device flow. Only an
+    /// unrestricted operator token may resume an identity: it already reaches
+    /// every session, and the worker only accepts an id that is in its
+    /// participant directory. A credential-bound connection and a pre-login
+    /// connection may not resume.
+    pub(crate) fn resume_github_identity(
+        &self,
+        participant_id: loom_core::ParticipantId,
+    ) -> Result<ServerResponse> {
+        if self.participant().is_some() {
+            return Err(LoomError::new(
+                ErrorCode::Conflict,
+                "this connection is already bound to a person",
+                false,
+            ));
+        }
+        if !self.retains_operator_authority() {
+            return Err(LoomError::new(
+                ErrorCode::AuthorizationDenied,
+                "resuming a GitHub identity needs an unrestricted operator token",
+                false,
+            ));
+        }
+        let identity = self
+            .backend
+            .access
+            .known_identity(participant_id)
+            .ok_or_else(|| LoomError::not_found("participant", participant_id.to_string()))?;
+        let identity = self.bind_participant(identity)?;
+        log::info!(
+            "[loom-server] {} resumed their GitHub identity; participant {}",
+            identity.display_name,
+            identity.id
+        );
+        Ok(ServerResponse::Access(
+            AccessResponse::GitHubIdentityResumed {
+                participant: identity,
+            },
+        ))
+    }
+
     /// Signs this connection out of GitHub, dropping its presence from every
     /// session roster a person can see.
     pub(crate) fn sign_out_github(&self) -> Result<ServerResponse> {

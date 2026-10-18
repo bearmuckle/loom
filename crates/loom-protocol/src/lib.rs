@@ -592,7 +592,10 @@ impl ClientRequest {
             | Self::Access(AccessRequest::DenySessionAccessRequest { .. }) => {
                 Some(Capability::ManageSessionAccess)
             }
-            Self::Access(AccessRequest::StartGitHubSignIn) => Some(Capability::GitHubSignIn),
+            Self::Access(AccessRequest::StartGitHubSignIn)
+            | Self::Access(AccessRequest::ResumeGitHubIdentity { .. }) => {
+                Some(Capability::GitHubSignIn)
+            }
             Self::Access(AccessRequest::GetGitHubSignInStatus { .. })
             | Self::Access(AccessRequest::SignOutGitHub) => None,
         }
@@ -618,6 +621,7 @@ impl ClientRequest {
             })
             | Self::Repository(RepositoryRequest::ListClonedRepositories)
             | Self::Access(AccessRequest::GetCurrentParticipant)
+            | Self::Access(AccessRequest::ResumeGitHubIdentity { .. })
             | Self::Access(AccessRequest::ListParticipants)
             | Self::Access(AccessRequest::ListProviderCredentials)
             | Self::Access(AccessRequest::RevokeProviderCredential { .. })
@@ -1270,7 +1274,7 @@ mod run_message_protocol_tests {
 
     #[test]
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 8));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 9));
         let project_id = ProjectId::new();
         let request = ClientRequest::Project(ProjectRequest::GetProjectSnapshot { project_id });
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));

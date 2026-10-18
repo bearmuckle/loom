@@ -91,6 +91,9 @@ impl LoomView {
                         Ok(ServerResponse::Access(AccessResponse::CurrentParticipant {
                             participant,
                         })) => {
+                            if let Some(participant) = &participant {
+                                crate::identity_store::save(view.active_node_id(), participant);
+                            }
                             view.collaboration.identity_loaded = true;
                             view.collaboration.identity = participant;
                             view.collaboration.support = CollaborationSupport::Supported;
@@ -1120,6 +1123,9 @@ impl LoomView {
         participant: ParticipantIdentity,
         cx: &mut Context<Self>,
     ) {
+        // Remember the person per worker so a reload can resume them on the
+        // operator connection instead of leaving them offline.
+        crate::identity_store::save(&node_id, &participant);
         self.awaiting_sign_in_nodes.remove(&node_id);
         let signed_in_the_active_node = self.active_node_id() == node_id;
         if signed_in_the_active_node {
@@ -1214,6 +1220,7 @@ impl LoomView {
     ) -> bool {
         let signed_out = match response.result {
             Ok(ServerResponse::Access(AccessResponse::SignedOutGitHub)) => {
+                crate::identity_store::clear(node_id);
                 self.collaboration.reset_after_sign_out();
                 if self.unsigned_nodes.contains(node_id) {
                     // The connection was accepted without a credential, so

@@ -994,6 +994,7 @@ impl InProcessConnection {
             // Signing in needs no scope: a connection without an identity has to
             // be able to reach GitHub before it holds one.
             | ClientRequest::Access(loom_protocol::AccessRequest::StartGitHubSignIn)
+            | ClientRequest::Access(loom_protocol::AccessRequest::ResumeGitHubIdentity { .. })
             | ClientRequest::Access(loom_protocol::AccessRequest::GetGitHubSignInStatus { .. })
             | ClientRequest::Access(loom_protocol::AccessRequest::SignOutGitHub) => {}
             ClientRequest::Access(loom_protocol::AccessRequest::GetRunCredential {

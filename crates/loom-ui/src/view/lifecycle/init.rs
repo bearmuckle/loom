@@ -1,4 +1,8 @@
 use super::*;
+#[cfg(not(target_family = "wasm"))]
+use crate::connection::resume_github_identity;
+#[cfg(target_family = "wasm")]
+use crate::connection::resume_github_identity_async;
 use crate::preferences::UiPreferences;
 
 /// Resolves and starts the managed `loom-server` worker that replaces the
@@ -80,7 +84,25 @@ impl LoomView {
         let server_protocol_version = Some(negotiation.protocol_version);
         let backend_endpoint = options.remote.clone();
         let remote_options = remote_connection_options(options);
-        let pre_login = unsigned && current_participant(&connection)?.is_none();
+        let node_status = worker_node_status(&connection)?;
+        let participant = current_participant(&connection)?;
+        if !unsigned
+            && participant.is_none()
+            && let Some(saved) = crate::identity_store::load(&node_status.node_id)
+        {
+            match resume_github_identity(&connection, saved.id) {
+                Ok(Some(_)) => {}
+                // The worker no longer knows this person; ask again on the
+                // next explicit sign-in instead of retrying forever.
+                Ok(None) => crate::identity_store::clear(&node_status.node_id),
+                Err(error) => log::debug!(
+                    "[loom-ui] could not resume the GitHub identity for worker '{}': {}",
+                    node_status.node_id,
+                    error.message
+                ),
+            }
+        }
+        let pre_login = unsigned && participant.is_none();
         let mut view = if pre_login {
             info!(
                 "worker accepted the connection without a credential; waiting for a GitHub \
@@ -88,7 +110,7 @@ impl LoomView {
             );
             Self::new_pre_login(
                 connection.clone(),
-                worker_node_status(&connection)?,
+                node_status,
                 WorkspaceConfig::default(),
                 server_protocol_version,
                 backend_endpoint,
@@ -933,7 +955,21 @@ impl LoomView {
         // accepts it as pre-login, so there is no workspace to load until the
         // person signs in.
         let unsigned = options.token().trim().is_empty();
-        let pre_login = unsigned && current_participant_async(&connection).await?.is_none();
+        let participant = current_participant_async(&connection).await?;
+        if !unsigned && participant.is_none() {
+            if let Some(saved) = crate::identity_store::load(&node_status.node_id) {
+                match resume_github_identity_async(&connection, saved.id).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => crate::identity_store::clear(&node_status.node_id),
+                    Err(error) => log::debug!(
+                        "[loom-ui] could not resume the GitHub identity for worker '{}': {}",
+                        node_status.node_id,
+                        error.message
+                    ),
+                }
+            }
+        }
+        let pre_login = unsigned && participant.is_none();
         if pre_login {
             if let Err(error) = options.persist_connection() {
                 log::warn!("[loom-ui] could not save the bootstrap worker config: {error}");
@@ -1424,6 +1460,20 @@ impl LoomView {
                         && current_participant(&connection)
                             .map(|participant| participant.is_none())
                             .unwrap_or(false);
+                    if !unsigned
+                        && let Some(saved) = crate::identity_store::load(&status.node_id)
+                    {
+                        match resume_github_identity(&connection, saved.id) {
+                            Ok(Some(_)) => {}
+                            Ok(None) => crate::identity_store::clear(&status.node_id),
+                            Err(error) => log::debug!(
+                                "[loom-ui] could not resume the GitHub identity for worker '{}': \
+                                 {}",
+                                status.node_id,
+                                error.message
+                            ),
+                        }
+                    }
                     let credentials = PeerCredentialStore::new();
                     let credential_result = if token.is_empty() {
                         credentials.delete(workspace_id, &node_url)
@@ -1599,6 +1649,19 @@ impl LoomView {
                         .await
                         .map(|participant| participant.is_none())
                         .unwrap_or(false);
+                if !unsigned
+                    && let Some(saved) = crate::identity_store::load(&status.node_id)
+                {
+                    match resume_github_identity_async(&connection, saved.id).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => crate::identity_store::clear(&status.node_id),
+                        Err(error) => log::debug!(
+                            "[loom-ui] could not resume the GitHub identity for worker '{}': {}",
+                            status.node_id,
+                            error.message
+                        ),
+                    }
+                }
                 Ok::<_, (WorkerConnectionStage, LoomError, bool)>((
                     connection,
                     status,

@@ -15,8 +15,8 @@ use std::time::Duration;
 #[cfg(target_family = "wasm")]
 use futures_channel::oneshot;
 use loom_core::{
-    AgentSessionSnapshot, Capability, CapabilitySet, ErrorCode, LoomError, ParticipantIdentity,
-    WorkspaceId, WorkspaceRecord,
+    AgentSessionSnapshot, Capability, CapabilitySet, ErrorCode, LoomError, ParticipantId,
+    ParticipantIdentity, WorkspaceId, WorkspaceRecord,
 };
 use loom_model::{ModelId, ProviderId, ProviderSummary};
 #[cfg(not(target_family = "wasm"))]
@@ -448,6 +448,56 @@ pub(crate) async fn current_participant_async(
             Ok(participant)
         }
         response => Err(unexpected_response("current participant", response)),
+    }
+}
+
+/// Asks the worker to bind this connection back to a remembered participant.
+///
+/// `Ok(None)` means the worker no longer knows that person, so the caller can
+/// forget the saved id. Other errors are left to the caller: a connection that
+/// is already bound or a transient failure should keep the saved identity for
+/// the next reconnect.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn resume_github_identity(
+    connection: &ClientConnection,
+    participant_id: ParticipantId,
+) -> Result<Option<ParticipantIdentity>, LoomError> {
+    let response = connection.request_with_timeout(
+        RequestEnvelope::new(ClientRequest::Access(AccessRequest::ResumeGitHubIdentity {
+            participant_id,
+        })),
+        Duration::from_secs(15),
+    );
+    match response.result {
+        Ok(ServerResponse::Access(AccessResponse::GitHubIdentityResumed { participant })) => {
+            Ok(Some(participant))
+        }
+        Err(error) if error.code == ErrorCode::NotFound => Ok(None),
+        Err(error) => Err(error),
+        Ok(response) => Err(unexpected_response("resume GitHub identity", response)),
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) async fn resume_github_identity_async(
+    connection: &ClientConnection,
+    participant_id: ParticipantId,
+) -> Result<Option<ParticipantIdentity>, LoomError> {
+    let response = request_with_timeout(
+        connection,
+        RequestEnvelope::new(ClientRequest::Access(AccessRequest::ResumeGitHubIdentity {
+            participant_id,
+        })),
+        BROWSER_REQUEST_TIMEOUT_MILLIS,
+    )
+    .await?;
+    match response.result {
+        Ok(ServerResponse::Access(AccessResponse::GitHubIdentityResumed { participant })) => {
+            Ok(Some(participant))
+        }
+        Err(error) if error.code == ErrorCode::NotFound => Ok(None),
+        Err(error) => Err(error),
+        Ok(response) => Err(unexpected_response("resume GitHub identity", response)),
     }
 }
 
@@ -1075,8 +1125,8 @@ mod tests {
         create_session_in_workspace, create_workspace, describe_startup_connection_error,
         include_discovered_models, list_models, list_workspace_sessions, list_workspaces,
         negotiate, negotiation_capabilities, provider_name_for_id, redact_secret,
-        remote_url_is_secure_for_secrets, set_workspace_config, unexpected_response,
-        worker_node_status, workspace_config,
+        remote_url_is_secure_for_secrets, resume_github_identity, set_workspace_config,
+        unexpected_response, worker_node_status, workspace_config,
     };
     use loom_core::{
         AgentSessionId, Capability, CapabilitySet, ErrorCode, LoomError as CoreLoomError,
@@ -1084,8 +1134,8 @@ mod tests {
     };
     use loom_model::ModelId;
     use loom_protocol::{
-        AccessRequest, AccessRequestId, CollaborationRequest, ParticipantId, ProviderResponse,
-        RepositoryResponse, ServerResponse, SessionRole, WorkspaceConfig,
+        AccessRequest, AccessRequestId, CollaborationRequest, ParticipantId, ParticipantIdentity,
+        ProviderResponse, RepositoryResponse, ServerResponse, SessionRole, WorkspaceConfig,
     };
     use loom_server::{AuthTokenStore, AuthorizationScope, RemoteServer, RemoteServerConfig};
     use std::sync::Arc;
@@ -1168,6 +1218,7 @@ mod tests {
                 request_id: access_request_id,
             }),
             ClientRequest::Access(AccessRequest::StartGitHubSignIn),
+            ClientRequest::Access(AccessRequest::ResumeGitHubIdentity { participant_id }),
             ClientRequest::Collaboration(CollaborationRequest::SendPeerMessage {
                 session_id,
                 text: "hello".to_owned(),
@@ -1201,6 +1252,32 @@ mod tests {
             negotiation
                 .capabilities
                 .contains(Capability::ManageSessionAccess)
+        );
+    }
+
+    #[test]
+    fn a_remembered_identity_resumes_on_an_operator_connection() {
+        let backend = loom_server::InProcessBackend::new();
+        let octocat = ParticipantIdentity {
+            id: ParticipantId::new(),
+            display_name: "octocat".to_owned(),
+        };
+        backend
+            .register_participants(std::slice::from_ref(&octocat))
+            .unwrap();
+        let connection = ClientConnection::InProcess(Box::new(backend.connect()));
+        negotiate(&connection).unwrap();
+
+        assert_eq!(
+            resume_github_identity(&connection, octocat.id).unwrap(),
+            Some(octocat)
+        );
+        assert_eq!(
+            resume_github_identity(&connection, ParticipantId::new())
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict,
+            "a connection already bound to the remembered person cannot resume again"
         );
     }
 

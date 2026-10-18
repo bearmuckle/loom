@@ -109,6 +109,10 @@ credential left.
    client connected with an unrestricted operator token, the worker also makes
    the person the owner of every session that has no owner, before it reports
    the sign-in, so that client's refresh already shows the sessions it owns.
+   The client remembers the person per worker and resumes them on a later
+   connection with the same operator token, so a client restart shows them
+   online without another device flow. A connection accepted without a token
+   cannot resume an identity and asks for sign-in again.
 5. Select Sign out to end the binding. The person leaves the roster of every
    session they could see, and a connection accepted without a credential
    returns to the sign-in prompt. An operator connection keeps its authority.

@@ -260,6 +260,9 @@ impl InProcessConnection {
                     grant: None,
                 }
             }
+            AccessRequest::ResumeGitHubIdentity { participant_id } => {
+                return self.resume_github_identity(participant_id);
+            }
             AccessRequest::StartGitHubSignIn => return self.start_github_sign_in(),
             AccessRequest::GetGitHubSignInStatus { login_id } => {
                 return self.github_sign_in_status(&login_id);

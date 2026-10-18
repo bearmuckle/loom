@@ -471,11 +471,12 @@ Levels that need the same projection change only the display.
 Protocol 11.3 adds identity, roles, and presence; 11.4 adds attributed chat
 and ordered run actions. Provider credential selection uses the same 11.4
 version. 11.5 adds access requests. 11.6 adds GitHub sign-in. 11.7 adds the
-activity-detail projection. 11.8 adds provider API-key removal. Every addition
-is a new enum variant, a capability, or a field with a compatible default (an
-omitted field keeps the older behavior), so clients of an older 11.x minor keep
-working; they simply never send the new requests, negotiate the new capability,
-or ask for the new behavior.
+activity-detail projection. 11.8 adds provider API-key removal. 11.9 adds
+resuming a remembered GitHub identity. Every addition is a new enum variant, a
+capability, or a field with a compatible default (an omitted field keeps the
+older behavior), so clients of an older 11.x minor keep working; they simply
+never send the new requests, negotiate the new capability, or ask for the new
+behavior.
 
 ### Signing in with GitHub
 
@@ -518,6 +519,12 @@ A sign-in is a GitHub device flow:
 4. `SignOutGitHub` → `SignedOutGitHub` ends the binding: the person's presence
    is dropped from every roster they appear in, and a connection that was
    accepted without a credential returns to the pre-login state.
+5. A client remembers the participant id per worker. A later connection with an
+   unrestricted operator token may send `ResumeGitHubIdentity { participant_id }`
+   → `GitHubIdentityResumed { participant }`, which binds presence again without
+   a new device flow. The worker resumes only a person already in its directory
+   and only on an operator token; a connection accepted without a credential
+   still has to sign in.
 
 Anyone with a GitHub account *may* complete the device flow, but a signed-in
 person holds no session grants until an owner grants one (see access requests).
@@ -603,8 +610,9 @@ removed when decided or withdrawn.
 
 The same `Access` domain carries the GitHub sign-in requests described under
 [signing in with GitHub](#signing-in-with-github): `StartGitHubSignIn`,
-`GetGitHubSignInStatus { login_id }`, and `SignOutGitHub`. They need no session
-and no grant.
+`GetGitHubSignInStatus { login_id }`, `SignOutGitHub`, and
+`ResumeGitHubIdentity { participant_id }`. They need no session and no grant;
+resuming additionally needs an unrestricted operator token.
 
 A missing, revoked, or mismatched credential fails with
 `provider_authentication` and a recovery hint (the owner signs in again or

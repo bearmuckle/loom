@@ -198,6 +198,7 @@ impl LoomView {
             self.node_backends.remove(&node.status.node_id);
             self.node_workspaces.remove(&node.status.node_id);
             self.node_session_load_errors.remove(&node.status.node_id);
+            crate::identity_store::clear(&node.status.node_id);
         }
         if let Some(url) = &node.url {
             let count = self.workspace_config.worker_nodes.len();
