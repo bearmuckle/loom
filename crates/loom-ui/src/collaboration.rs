@@ -35,12 +35,20 @@ pub(crate) struct ComposerAddressing {
 }
 
 impl ComposerAddressing {
-    /// The recipient as the composer hint names it.
-    pub(crate) fn hint(&self) -> String {
+    /// The recipient as the composer hint names it, when the route is worth
+    /// announcing.
+    ///
+    /// A draft to the agent is the default route, so it has no hint: the chip
+    /// would only restate the norm. Only a people route is announced, because
+    /// peer chat is not sent to the agent.
+    pub(crate) fn hint(&self) -> Option<String> {
         match (&self.person, self.to_people) {
-            (Some(person), _) => format!("To {} · not sent to the agent", person.display_name),
-            (None, true) => "To people · not sent to the agent".to_owned(),
-            (None, false) => "To the agent".to_owned(),
+            (Some(person), _) => Some(format!(
+                "To {} · not sent to the agent",
+                person.display_name
+            )),
+            (None, true) => Some("To people · not sent to the agent".to_owned()),
+            (None, false) => None,
         }
     }
 }
@@ -1096,13 +1104,19 @@ mod tests {
         let plain = addressing_for("fix the reconnect test", &roster);
         assert!(!plain.to_people);
         assert_eq!(plain.text, "fix the reconnect test");
-        assert_eq!(plain.hint(), "To the agent");
+        assert!(
+            plain.hint().is_none(),
+            "the agent route is the default, so it shows no chip"
+        );
 
         let group = addressing_for("@people standup in five", &roster);
         assert!(group.to_people);
         assert!(group.person.is_none());
         assert_eq!(group.text, "@people standup in five");
-        assert_eq!(group.hint(), "To people · not sent to the agent");
+        assert_eq!(
+            group.hint().as_deref(),
+            Some("To people · not sent to the agent")
+        );
 
         let named = addressing_for("@sam can you take the reconnect test?", &roster);
         assert!(named.to_people);
@@ -1112,7 +1126,10 @@ mod tests {
             named.text, "@sam can you take the reconnect test?",
             "a people mention stays in the stored message"
         );
-        assert_eq!(named.hint(), "To sam · not sent to the agent");
+        assert_eq!(
+            named.hint().as_deref(),
+            Some("To sam · not sent to the agent")
+        );
 
         // A multi-word roster name is addressable by its unique first word;
         // the rest of the name stays in the message body.

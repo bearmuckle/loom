@@ -1,4 +1,4 @@
-use crate::collaboration::{ComposerAddressing, addressing_for};
+use crate::collaboration::addressing_for;
 
 use super::*;
 
@@ -238,8 +238,9 @@ impl LoomView {
                                     // second row.
                                     .when(layout.phone, |element| element.flex_1())
                                     .when(permissions.can_act, |element| {
-                                        element
-                                            .child(self.render_recipient_hint(addressing.clone()))
+                                        element.when_some(addressing.hint(), |element, hint| {
+                                            element.child(self.render_recipient_hint(hint))
+                                        })
                                     })
                                     .child(self.render_model_picker(layout.phone, cx))
                                     .child(
@@ -411,17 +412,17 @@ impl LoomView {
 
     /// The recipient the draft's leading mention selects, shown as a passive
     /// hint so peer chat is never a hidden mode: the text decides.
-    fn render_recipient_hint(&self, addressing: ComposerAddressing) -> impl IntoElement {
+    ///
+    /// Only a people route reaches this, because a draft to the agent is the
+    /// default and announces nothing, so the hint always reads as the people
+    /// colour.
+    fn render_recipient_hint(&self, hint: String) -> impl IntoElement {
         div()
             .id("composer-recipient-hint")
             .test_support()
             .text_xs()
-            .text_color(rgb(if addressing.to_people {
-                0xc4b5fd
-            } else {
-                0x64748b
-            }))
-            .child(addressing.hint())
+            .text_color(rgb(0xc4b5fd))
+            .child(hint)
     }
 
     /// A dismissible banner for the latest operational status or backend error.

@@ -3243,6 +3243,23 @@ fn phone_composer_and_settings_render_at_mobile_width(cx: &mut TestAppContext) {
         // Phone composer controls use finger-sized targets.
         assert_eq!(send.size.height, px(44.));
         assert_eq!(palette.size.height, px(44.));
+        // The agent is the default route, so a plain draft shows no recipient
+        // chip; a people draft announces that it is not sent to the agent.
+        assert!(window.try_find("composer-recipient-hint").is_none());
+        window
+            .root::<LoomView>()
+            .unwrap()
+            .unwrap()
+            .update(cx, |view, cx| {
+                if let Some(input) = view.composer_input.clone() {
+                    input.update(cx, |state, cx| {
+                        state.set_value("@people standup in five", window, cx)
+                    });
+                }
+                cx.notify();
+            });
+        window.render_frame(cx);
+        assert!(window.try_find("composer-recipient-hint").is_some());
         window
             .root::<LoomView>()
             .unwrap()
