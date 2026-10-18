@@ -172,8 +172,11 @@ impl RunExecutor {
                         task_completion.panic(error.to_string());
                     }
                 }
+                // A rejected admission is not a panic: `on_reject` settles the
+                // run as failed with the real reason. Marking it as a panic made
+                // `join_worker` report an internal "worker panicked" error at
+                // shutdown or when the run was joined again.
                 Ok(Err(_closed)) => {
-                    task_completion.panic("run executor was closed");
                     reject(
                         on_reject,
                         run_admission_error(&task_name, admission_timeout, true),
@@ -181,7 +184,6 @@ impl RunExecutor {
                     .await;
                 }
                 Err(_elapsed) => {
-                    task_completion.panic("run admission timed out");
                     reject(
                         on_reject,
                         run_admission_error(&task_name, admission_timeout, false),
@@ -325,6 +327,10 @@ mod tests {
         assert!(
             !*rejected_started.lock().unwrap(),
             "a rejected run must not execute"
+        );
+        assert!(
+            second.failure().is_none(),
+            "a rejected run is not a worker panic"
         );
 
         release_sender.send(()).unwrap();
