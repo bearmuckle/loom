@@ -1474,6 +1474,24 @@ impl LoomView {
                             false,
                             phone,
                         ))
+                        .child(settings_row(
+                            "Automatic project titles",
+                            "Name a project from the work its agent plans, or from its goal; a manual rename stops it",
+                            Switch::new("auto-title-projects-toggle")
+                                .checked(self.workspace_config.auto_title_projects)
+                                .disabled(!self.is_connected())
+                                .accessibility_label("Automatic project titles")
+                                .on_change({
+                                    let view = cx.entity();
+                                    move |checked, _window, cx| {
+                                        view.update(cx, |view, cx| {
+                                            view.set_auto_title_projects(*checked, cx);
+                                        });
+                                    }
+                                }),
+                            false,
+                            phone,
+                        ))
                         // How much of the agent's own output the transcript
                         // shows belongs with the agent settings, not with the
                         // window appearance ones.

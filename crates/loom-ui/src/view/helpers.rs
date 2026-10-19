@@ -1030,6 +1030,9 @@ pub(crate) fn session_id_for_request(
         | ClientRequest::Task(TaskRequest::CancelSessionTask { session_id, .. })
         | ClientRequest::Task(TaskRequest::GetSessionTaskEvidence { session_id, .. })
         | ClientRequest::Session(SessionRequest::SetSessionApprovalPolicy { session_id, .. })
+        | ClientRequest::Session(SessionRequest::SetAgentSessionTitleSource {
+            session_id, ..
+        })
         | ClientRequest::Session(SessionRequest::ForkAgentSession { session_id, .. })
         | ClientRequest::Usage(UsageRequest::GetSessionUsage { session_id }) => Some(*session_id),
         ClientRequest::Project(ProjectRequest::ControlProjectChild {

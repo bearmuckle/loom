@@ -331,6 +331,55 @@ impl LoomView {
         );
     }
 
+    /// Pins a project's title to the name it has now, or hands it back to the
+    /// backend, without renaming it.
+    ///
+    /// Only the title source changes: the backend keeps the current name and
+    /// records who chooses the next one.
+    pub(crate) fn set_session_title_source(
+        &mut self,
+        session_id: AgentSessionId,
+        source: loom_core::SessionTitleSource,
+        cx: &mut Context<Self>,
+    ) {
+        let resumed = source == loom_core::SessionTitleSource::Auto;
+        self.dispatch(
+            cx,
+            ClientRequest::Session(SessionRequest::SetAgentSessionTitleSource {
+                session_id,
+                source,
+            }),
+            move |view, response, cx| match response.result {
+                Ok(ServerResponse::Session(SessionResponse::AgentSession(snapshot))) => {
+                    // The menu was opened from a cached row, so the answer is
+                    // written back there as well as to the active session.
+                    if let Some(session) = view
+                        .sessions
+                        .iter_mut()
+                        .find(|session| session.id == snapshot.id)
+                    {
+                        *session = snapshot.clone();
+                    }
+                    if view.active_session.id == snapshot.id {
+                        view.active_session = snapshot;
+                    }
+                    view.record_status(if resumed {
+                        "Automatic titles resumed"
+                    } else {
+                        "Automatic titles stopped"
+                    });
+                    view.update_session_list();
+                    cx.notify();
+                }
+                Err(error) => view.record_backend_error("set session title source", error),
+                Ok(response) => view.record_backend_error(
+                    "set session title source",
+                    unexpected_response("session title source", response),
+                ),
+            },
+        );
+    }
+
     /// Forgets an archived session and, when a whole project was archived, every
     /// descendant the backend cascaded. Returns whether the active session was
     /// among the removed sessions.

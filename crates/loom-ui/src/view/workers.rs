@@ -298,6 +298,17 @@ impl LoomView {
         cx.notify();
     }
 
+    /// Turns automatic project titles on or off for this workspace.
+    pub(crate) fn set_auto_title_projects(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.workspace_config.auto_title_projects == enabled {
+            return;
+        }
+        self.workspace_config.auto_title_projects = enabled;
+        self.workspace_config.revision = self.workspace_config.revision.saturating_add(1);
+        self.persist_and_distribute_workspace_config(None, cx);
+        cx.notify();
+    }
+
     pub(crate) fn set_font_scale_percent(
         &mut self,
         font_scale_percent: u16,

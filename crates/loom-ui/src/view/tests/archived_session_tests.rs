@@ -2279,8 +2279,9 @@ fn the_project_context_menu_offers_delete_project_only_for_a_project_root(cx: &m
         let mut menu = window.within("popup-menu");
         assert_eq!(menu.find(0usize).label(), Some("Rename"));
         assert_eq!(menu.find(1usize).label(), Some("Archive project"));
-        assert_eq!(menu.find(2usize).label(), Some("Delete project"));
-        menu.click(2usize, cx);
+        assert_eq!(menu.find(2usize).label(), Some("Stop automatic titles"));
+        assert_eq!(menu.find(3usize).label(), Some("Delete project"));
+        menu.click(3usize, cx);
     })
     .unwrap();
     cx.run_until_parked();

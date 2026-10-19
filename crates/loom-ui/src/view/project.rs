@@ -487,6 +487,28 @@ impl LoomView {
                 }),
             );
         }
+        // A project root can pin its title (or hand it back to the backend)
+        // without renaming: the label follows who chose the current name. A
+        // delegated sub agent has no title of its own, so it offers neither.
+        if is_project_root {
+            let (title_label, title_source) = match session.title_source {
+                loom_core::SessionTitleSource::Auto => (
+                    "Stop automatic titles",
+                    loom_core::SessionTitleSource::Manual,
+                ),
+                loom_core::SessionTitleSource::Manual => (
+                    "Resume automatic titles",
+                    loom_core::SessionTitleSource::Auto,
+                ),
+            };
+            let title_view = menu_view.clone();
+            let title_session_id = session.id;
+            menu = menu.item(PopupMenuItem::new(title_label).on_click(move |_, _, cx| {
+                title_view.update(cx, |view, cx| {
+                    view.set_session_title_source(title_session_id, title_source, cx);
+                });
+            }));
+        }
         if let Some(project) = menu_project.as_ref()
             && let Some(child) = project.agents.iter().find(|agent| {
                 agent.session_id == session.id

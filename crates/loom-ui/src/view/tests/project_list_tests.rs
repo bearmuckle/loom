@@ -902,6 +902,403 @@ fn the_filter_moves_the_highlight_with_the_selected_project(cx: &mut TestAppCont
     .unwrap();
 }
 
+/// Automatic project titles: the project row's pin/resume action, the cached
+/// title source a menu reflects, the event that updates it, and the workspace
+/// setting that gates the backend behaviour.
+#[cfg(not(target_family = "wasm"))]
+mod automatic_title_tests {
+    use super::*;
+    use crate::backend_host::{BackendWorker, Job};
+    use loom_core::SessionTitleSource;
+    use loom_protocol::ServerEvent;
+
+    /// The shared session fixture with an explicit title source.
+    fn titled(
+        id: AgentSessionId,
+        name: &str,
+        title_source: SessionTitleSource,
+    ) -> AgentSessionSnapshot {
+        let mut snapshot = session(id, name, AgentSessionState::Idle, 1);
+        snapshot.title_source = title_source;
+        snapshot
+    }
+
+    /// Opens `build_project_session_context_menu` for `snapshot` in a window of
+    /// its own, over a backend whose requests stay pending so a clicked item's
+    /// request can be read.
+    fn open_row_menu(
+        cx: &mut TestAppContext,
+        snapshot: AgentSessionSnapshot,
+        project: Option<ProjectSnapshot>,
+    ) -> (
+        gpui_kit::AnyWindowHandle,
+        Entity<LoomView>,
+        std::sync::mpsc::Receiver<Job>,
+    ) {
+        let rendered = Rc::new(RefCell::new(None));
+        let rendered_for_window = rendered.clone();
+        let pending = Rc::new(RefCell::new(None));
+        let pending_for_window = pending.clone();
+        let handle = cx.open_window(size(px(1280.), px(800.)), move |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = LoomView::new_for_test(cx.focus_handle());
+                let (backend, requests) = BackendWorker::deferred_for_test();
+                *pending_for_window.borrow_mut() = Some(requests);
+                let node_id = view.default_backend_node_id.clone();
+                view.node_backends.insert(node_id.clone(), backend);
+                view.session_node_ids.insert(snapshot.id, node_id);
+                view.sessions = vec![snapshot.clone()];
+                view.active_session = snapshot.clone();
+                view.project_tree_snapshots = project.iter().cloned().collect();
+                view
+            });
+            let menu_view = view.clone();
+            let menu_session = snapshot.clone();
+            let menu =
+                gpui_kit::component::menu::PopupMenu::build(window, cx, move |menu, _, _| {
+                    LoomView::build_project_session_context_menu(
+                        menu,
+                        menu_session.clone(),
+                        project.clone(),
+                        menu_view.clone(),
+                    )
+                });
+            *rendered_for_window.borrow_mut() = Some(view);
+            gpui_kit::component::Root::new(menu, window, cx)
+        });
+        let view = rendered
+            .borrow_mut()
+            .take()
+            .expect("the window built the view");
+        let requests = pending
+            .borrow_mut()
+            .take()
+            .expect("the view was given a deferred backend");
+        (handle.into(), view, requests)
+    }
+
+    /// A project root titled automatically offers to stop, and a pinned title
+    /// offers to resume. Each click sends the opposite source.
+    #[gpui_kit::test]
+    fn a_project_root_toggles_automatic_titles(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let root = AgentSessionId::new();
+        let snapshot = project(
+            root,
+            vec![agent(
+                root,
+                ProjectId::from_uuid(*root.as_uuid()),
+                None,
+                AgentSessionState::Idle,
+            )],
+        );
+
+        let (handle, _view, requests) = open_row_menu(
+            cx,
+            titled(root, "Checkout flow", SessionTitleSource::Auto),
+            Some(snapshot.clone()),
+        );
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let mut menu = window.within("popup-menu");
+            assert_eq!(menu.find(2usize).label(), Some("Stop automatic titles"));
+            menu.click(2usize, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let job = requests.try_recv().expect("the menu item sent a request");
+        assert!(
+            matches!(
+                job.request.request,
+                ClientRequest::Session(SessionRequest::SetAgentSessionTitleSource {
+                    session_id,
+                    source,
+                }) if session_id == root && source == SessionTitleSource::Manual
+            ),
+            "unexpected request: {:?}",
+            job.request.request
+        );
+        job.reply
+            .send(ResponseEnvelope::success(
+                job.request.request_id,
+                ServerResponse::Session(SessionResponse::AgentSession(titled(
+                    root,
+                    "Checkout flow",
+                    SessionTitleSource::Manual,
+                ))),
+            ))
+            .unwrap();
+        cx.run_until_parked();
+
+        let (handle, _view, requests) = open_row_menu(
+            cx,
+            titled(root, "Checkout flow", SessionTitleSource::Manual),
+            Some(snapshot),
+        );
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let mut menu = window.within("popup-menu");
+            assert_eq!(menu.find(2usize).label(), Some("Resume automatic titles"));
+            menu.click(2usize, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let job = requests.try_recv().expect("the menu item sent a request");
+        assert!(
+            matches!(
+                job.request.request,
+                ClientRequest::Session(SessionRequest::SetAgentSessionTitleSource {
+                    session_id,
+                    source,
+                }) if session_id == root && source == SessionTitleSource::Auto
+            ),
+            "unexpected request: {:?}",
+            job.request.request
+        );
+        job.reply
+            .send(ResponseEnvelope::success(
+                job.request.request_id,
+                ServerResponse::Session(SessionResponse::AgentSession(titled(
+                    root,
+                    "Checkout flow",
+                    SessionTitleSource::Auto,
+                ))),
+            ))
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    /// A delegated agent is titled by its manager, so its row offers neither
+    /// action.
+    #[gpui_kit::test]
+    fn a_delegated_agent_offers_no_automatic_title_action(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let root = AgentSessionId::new();
+        let child = AgentSessionId::new();
+        let project_id = ProjectId::from_uuid(*root.as_uuid());
+        let snapshot = project(
+            root,
+            vec![
+                agent(root, project_id, None, AgentSessionState::Idle),
+                agent(child, project_id, Some(root), AgentSessionState::Executing),
+            ],
+        );
+
+        for title_source in [SessionTitleSource::Auto, SessionTitleSource::Manual] {
+            let (handle, _view, requests) = open_row_menu(
+                cx,
+                titled(child, "Researcher", title_source),
+                Some(snapshot.clone()),
+            );
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                let menu = window.within("popup-menu");
+                assert_eq!(menu.find(0usize).label(), Some("Open transcript"));
+                assert!(
+                    menu.try_find(1usize).is_none(),
+                    "a delegated agent has no title of its own"
+                );
+            })
+            .unwrap();
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    /// The answer is written back to the cached row so the next menu reads the
+    /// new source; a refusal keeps the row and names the operation.
+    #[gpui_kit::test]
+    fn a_title_source_answer_updates_the_cached_session(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let root = AgentSessionId::new();
+        let snapshot = project(
+            root,
+            vec![agent(
+                root,
+                ProjectId::from_uuid(*root.as_uuid()),
+                None,
+                AgentSessionState::Idle,
+            )],
+        );
+        let (handle, view, requests) = open_row_menu(
+            cx,
+            titled(root, "Checkout flow", SessionTitleSource::Auto),
+            Some(snapshot),
+        );
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            window.within("popup-menu").click(2usize, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let job = requests.try_recv().expect("the menu item sent a request");
+        job.reply
+            .send(ResponseEnvelope::success(
+                job.request.request_id,
+                ServerResponse::Session(SessionResponse::AgentSession(titled(
+                    root,
+                    "Checkout flow",
+                    SessionTitleSource::Manual,
+                ))),
+            ))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert_eq!(view.sessions[0].title_source, SessionTitleSource::Manual);
+            assert_eq!(view.active_session.title_source, SessionTitleSource::Manual);
+            assert_eq!(
+                view.status_banner.as_ref().map(|note| note.text.as_str()),
+                Some("Automatic titles stopped")
+            );
+        });
+
+        view.update(cx, |view, cx| {
+            view.set_session_title_source(root, SessionTitleSource::Auto, cx)
+        });
+        let job = requests.try_recv().expect("the helper sent a request");
+        job.reply
+            .send(ResponseEnvelope::failure(
+                job.request.request_id,
+                LoomError::new(ErrorCode::Internal, "no title", false),
+            ))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert_eq!(
+                view.sessions[0].title_source,
+                SessionTitleSource::Manual,
+                "a refusal leaves the cached title alone"
+            );
+            assert!(
+                view.status_banner.as_ref().is_some_and(|note| {
+                    note.heading
+                        .as_deref()
+                        .is_some_and(|heading| heading.starts_with("set session title source"))
+                }),
+                "a refusal names the operation"
+            );
+        });
+    }
+
+    /// The backend's title-source event updates the cached row, which is what a
+    /// menu built afterwards reads.
+    #[gpui_kit::test]
+    fn a_title_source_event_updates_the_row_menu(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let root = AgentSessionId::new();
+        let snapshot = project(
+            root,
+            vec![agent(
+                root,
+                ProjectId::from_uuid(*root.as_uuid()),
+                None,
+                AgentSessionState::Idle,
+            )],
+        );
+        let (handle, view, _requests) = open_row_menu(
+            cx,
+            titled(root, "Checkout flow", SessionTitleSource::Auto),
+            Some(snapshot.clone()),
+        );
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.within("popup-menu").find(2usize).label(),
+                Some("Stop automatic titles")
+            );
+        })
+        .unwrap();
+
+        view.update(cx, |view, _| {
+            view.consume_event(&ServerEvent::AgentSessionTitleSourceChanged {
+                session_id: root,
+                source: SessionTitleSource::Manual,
+            });
+        });
+
+        let cached = view.read_with(cx, |view, _| view.sessions[0].clone());
+        assert_eq!(cached.title_source, SessionTitleSource::Manual);
+        let (handle, _view, _requests) = open_row_menu(cx, cached, Some(snapshot));
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window.within("popup-menu").find(2usize).label(),
+                Some("Resume automatic titles")
+            );
+        })
+        .unwrap();
+    }
+
+    /// The Settings › Agents row follows the workspace config and saves the
+    /// toggle through the workspace config request the other rows use.
+    #[gpui_kit::test]
+    fn the_automatic_project_titles_setting_follows_the_workspace_config(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let rendered = Rc::new(RefCell::new(None));
+        let rendered_for_window = rendered.clone();
+        let handle = cx.open_window(size(px(1280.), px(800.)), move |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = LoomView::new_for_test(cx.focus_handle());
+                crate::connection::negotiate(&view.connection).unwrap();
+                let workspace =
+                    crate::connection::create_workspace(&view.connection, "title settings")
+                        .unwrap();
+                view.workspace_id = workspace.id;
+                view.workspaces = vec![workspace];
+                view.sessions = vec![view.active_session.clone()];
+                view.show_surface(CoveringSurface::Settings(SettingsSection::Agents));
+                view
+            });
+            *rendered_for_window.borrow_mut() = Some(view.clone());
+            gpui_kit::component::Root::new(view, window, cx)
+        });
+        let view = rendered
+            .borrow_mut()
+            .take()
+            .expect("the window built the view");
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window
+                    .within("settings-dialog")
+                    .find("auto-title-projects-toggle")
+                    .checked(),
+                Some(true),
+                "the row follows the workspace config"
+            );
+            window
+                .within("settings-dialog")
+                .click("auto-title-projects-toggle", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let view = view.read(cx);
+            assert!(!view.workspace_config.auto_title_projects);
+            let stored = crate::connection::workspace_config(&view.connection, view.workspace_id)
+                .expect("the saved workspace config is readable");
+            assert!(
+                !stored.auto_title_projects,
+                "the toggle is saved through the workspace config request"
+            );
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                window
+                    .within("settings-dialog")
+                    .find("auto-title-projects-toggle")
+                    .checked(),
+                Some(false)
+            );
+        })
+        .unwrap();
+    }
+}
+
 /// The pane says so when it has no projects to list.
 #[gpui_kit::test]
 fn an_empty_pane_says_how_to_start_the_list(cx: &mut TestAppContext) {
