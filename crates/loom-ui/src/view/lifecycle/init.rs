@@ -1838,9 +1838,13 @@ impl LoomView {
     /// Detects a closed browser transport and swaps the live workspace for a
     /// reconnect screen. Safe to call after any request and on each poll, so a
     /// dropped socket is never mistaken for a working connection.
+    ///
+    /// The demo page has no transport at all: its connection is the canned
+    /// state it starts with, so there is no socket whose close could be
+    /// reported and nothing to reconnect to.
     #[cfg(target_family = "wasm")]
     pub(crate) fn detect_browser_connection_loss(&mut self, cx: &mut Context<Self>) {
-        if !self.connected {
+        if !self.connected || self.browser_demo_mode {
             return;
         }
         if let Some(reason) = self.backend.connection_closed_reason() {
