@@ -627,7 +627,14 @@ impl Render for LoomView {
                                             });
                                             let name = Path::new(&repository.source)
                                                 .file_name()
-                                                .map(|name| name.to_string_lossy().into_owned())
+                                                .map(|name| {
+                                                    // The recorded source is the
+                                                    // clone URL or path, so drop
+                                                    // its `.git` suffix.
+                                                    name.to_string_lossy()
+                                                        .trim_end_matches(".git")
+                                                        .to_owned()
+                                                })
                                                 .unwrap_or_else(|| repository.source.clone());
                                             menu = menu.item(PopupMenuItem::submenu(name, source_menu));
                                         }

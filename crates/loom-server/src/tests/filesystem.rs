@@ -448,7 +448,9 @@ fn attach_can_reuse_a_cached_github_clone_without_the_network() {
     else {
         panic!("expected cached attachment: {:?}", attached.result.err());
     };
-    assert_eq!(repository.source, "cached");
+    // The recorded source must be the one that can be attached again, not the
+    // display name derived from it.
+    assert_eq!(repository.source, url);
 
     // A checkout cloned from the node mirror still points `origin` at GitHub.
     let filesystem = backend.restore_session_filesystem(session.id).unwrap();
@@ -457,6 +459,188 @@ fn attach_can_reuse_a_cached_github_clone_without_the_network() {
     assert!(
         config.contains(url),
         "cached checkout origin should be the GitHub URL: {config}"
+    );
+
+    let _ = fs::remove_dir_all(&source);
+}
+
+#[test]
+fn a_listed_session_repository_source_can_be_attached_to_another_session() {
+    let source = git_repository();
+    let backend = InProcessBackend::new();
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Inherit".to_owned(),
+        },
+    )));
+    let Ok(ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace))) =
+        created.result
+    else {
+        panic!("expected workspace creation");
+    };
+    let create_session = |name: &str| {
+        let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: name.to_owned(),
+            },
+        )));
+        let Ok(ServerResponse::Session(SessionResponse::AgentSessionCreated(session))) =
+            created.result
+        else {
+            panic!("expected session creation");
+        };
+        session
+    };
+    let attach = |session_id: AgentSessionId, source: &str, path: &str| {
+        connection.request(RequestEnvelope::new(ClientRequest::Repository(
+            RepositoryRequest::AttachSessionRepository {
+                session_id,
+                source: source.to_owned(),
+                path: path.to_owned(),
+                revision: None,
+                reuse_local: false,
+            },
+        )))
+    };
+    let parent = create_session("Parent");
+    let branch = create_session("Branch");
+
+    let repository_source = source.display().to_string();
+    let attached = attach(parent.id, &repository_source, "repo");
+    let Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(repository))) =
+        attached.result
+    else {
+        panic!(
+            "expected repository attachment: {:?}",
+            attached.result.err()
+        );
+    };
+    assert_eq!(repository.source, repository_source);
+
+    // The listed source is the one that can be attached again, so a sub project
+    // inheriting the parent's repository gets a source the server accepts.
+    let listed = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+        RepositoryRequest::ListSessionRepositories {
+            session_id: parent.id,
+        },
+    )));
+    let Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositories { repositories })) =
+        listed.result
+    else {
+        panic!("expected a session repository listing");
+    };
+    let listed = repositories
+        .into_iter()
+        .find(|listed| listed.id == repository.id)
+        .expect("the attached repository is listed");
+
+    let reattached = attach(branch.id, &listed.source, &listed.path);
+    let Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(checkout))) =
+        reattached.result
+    else {
+        panic!(
+            "expected the listed source to attach to another session: {:?}",
+            reattached.result.err()
+        );
+    };
+    let filesystem = backend.restore_session_filesystem(branch.id).unwrap();
+    assert!(
+        filesystem.directory_path(&checkout.path).unwrap().exists(),
+        "the second session has its own checkout"
+    );
+
+    let _ = fs::remove_dir_all(&source);
+}
+
+#[test]
+fn a_session_repository_recorded_with_a_display_name_is_reported_with_its_origin() {
+    let source = git_repository();
+    let backend = InProcessBackend::new();
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+
+    // Seed the node cache with a mirror of a GitHub-shaped repository, so the
+    // attach records that URL and the checkout keeps it as `origin`.
+    let url = "https://github.com/owner/cached.git";
+    let mirror = backend.repository_mirror_path(url).unwrap();
+    GitService::create_mirror(&source, &mirror, url).unwrap();
+    backend
+        .register_cloned_repository(&ClonedRepository {
+            full_name: "owner/cached".to_owned(),
+            clone_url: url.to_owned(),
+            branch: Some("main".to_owned()),
+            last_used_at: Timestamp::from_unix_millis(1),
+        })
+        .unwrap();
+
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Legacy source".to_owned(),
+        },
+    )));
+    let Ok(ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace))) =
+        created.result
+    else {
+        panic!("expected workspace creation");
+    };
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
+            workspace_id: workspace.id,
+            name: "Legacy source".to_owned(),
+        },
+    )));
+    let Ok(ServerResponse::Session(SessionResponse::AgentSessionCreated(session))) = created.result
+    else {
+        panic!("expected session creation");
+    };
+    let attached = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+        RepositoryRequest::AttachSessionRepository {
+            session_id: session.id,
+            source: url.to_owned(),
+            path: "repo".to_owned(),
+            revision: None,
+            reuse_local: true,
+        },
+    )));
+    let Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(repository))) =
+        attached.result
+    else {
+        panic!("expected cached attachment: {:?}", attached.result.err());
+    };
+    assert_eq!(repository.source, url);
+
+    // A record persisted before the attach source was recorded keeps the derived
+    // display name, which is not a source that can be attached again.
+    {
+        let mut records = backend.session_repositories().unwrap();
+        records
+            .get_mut(&session.id)
+            .and_then(|repositories| repositories.get_mut(&repository.id))
+            .expect("the attached repository is recorded")
+            .source = "cached".to_owned();
+    }
+
+    let listed = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+        RepositoryRequest::ListSessionRepositories {
+            session_id: session.id,
+        },
+    )));
+    let Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositories { repositories })) =
+        listed.result
+    else {
+        panic!("expected a session repository listing");
+    };
+    let listed = repositories
+        .into_iter()
+        .find(|listed| listed.id == repository.id)
+        .expect("the recorded repository is listed");
+    assert_eq!(
+        listed.source, url,
+        "the listing reports the checkout's origin so the record can be attached again"
     );
 
     let _ = fs::remove_dir_all(&source);

@@ -16,7 +16,10 @@
 >   **New sub project** shortcut in the project header (or the same action's
 >   dialog); the client attaches the parent's sources to the new session so the
 >   branch starts where the project is, and the sidebar lists the branch directly
->   beneath its parent with a branch mark. See *A sub project is its own project*
+>   beneath its parent with a branch mark. A session repository records the
+>   source it was attached from (clone URL or absolute path), so it can be
+>   attached again; a record written before that is reported from its checkout's
+>   `origin`. See *A sub project is its own project*
 >   below for how this differs from the nested-membership sketch.
 > - **Archive from the header (implemented).** The project header offers
 >   **Archive project**, which archives the root session of the project on

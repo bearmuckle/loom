@@ -1003,7 +1003,9 @@ fn deleting_a_session_keeps_the_node_clone_cache() {
     else {
         panic!("expected a cached attachment");
     };
-    assert_eq!(repository.source, "cached");
+    // The recorded source must be the one that can be attached again, not the
+    // display name derived from it.
+    assert_eq!(repository.source, url);
 
     archive(&connection, session.id);
     assert_deleted(delete(&connection, session.id, false).unwrap(), session.id);

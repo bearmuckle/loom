@@ -506,13 +506,15 @@ fn counts(additions: u32, deletions: u32) -> impl IntoElement {
 }
 
 fn repository_display_name(source: &str) -> String {
-    source
+    let name = source
         .trim_end_matches('/')
         .rsplit('/')
         .next()
         .filter(|name| !name.is_empty())
-        .unwrap_or("Repository")
-        .to_owned()
+        .unwrap_or("Repository");
+    // A recorded source is the clone URL or path the repository was attached
+    // from, so a GitHub checkout would otherwise read `loom.git`.
+    name.strip_suffix(".git").unwrap_or(name).to_owned()
 }
 
 fn git_status_totals(status: &GitRepositoryStatus) -> (usize, u64, u64) {
@@ -597,4 +599,26 @@ fn render_code_block_wrapped(
         offset = line_end + 1;
     }
     column.into_any()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repository_labels_read_a_clone_url_as_its_repository_name() {
+        // A recorded source is the clone URL or path it was attached from.
+        assert_eq!(
+            repository_display_name("https://github.com/bearmuckle/loom.git"),
+            "loom"
+        );
+        assert_eq!(
+            repository_display_name("ssh://git@github.com/bearmuckle/loom.git"),
+            "loom"
+        );
+        assert_eq!(repository_display_name("/home/bjorn/src/loom"), "loom");
+        // A legacy display name still renders as it did.
+        assert_eq!(repository_display_name("repositories/parent"), "parent");
+        assert_eq!(repository_display_name(""), "Repository");
+    }
 }

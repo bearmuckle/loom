@@ -219,7 +219,10 @@ impl InProcessConnection {
         );
         let repository = SessionRepository {
             id: repository_id,
-            source: source_name.clone(),
+            // Record the source the caller attached, not its display name: a
+            // listed repository is attached again by a sub project, and only an
+            // absolute path or URL is a source that can be attached.
+            source,
             path: relative_path,
             revision: status.head,
             attached_at: Timestamp::now(),
@@ -237,6 +240,42 @@ impl InProcessConnection {
         filesystem.mark_state_dirty()?;
         log::info!("repository {source_name} attached to session {session_id}");
         Ok(repository)
+    }
+
+    /// The source to report for one attached session repository.
+    ///
+    /// A record written before the attach source was stored as sent carries the
+    /// derived display name instead, which cannot be attached again. Such a
+    /// record is completed from the checkout's own `origin`, so a sub project
+    /// that inherits it starts from the repository the checkout came from. A
+    /// checkout whose origin cannot be read reports the stored source, because
+    /// listing repositories must not fail over one unreadable record.
+    pub(crate) fn reported_repository_source(
+        &self,
+        session_id: AgentSessionId,
+        repository: &SessionRepository,
+    ) -> String {
+        if Path::new(&repository.source).is_absolute()
+            || url::Url::parse(&repository.source).is_ok()
+        {
+            return repository.source.clone();
+        }
+        let origin = self
+            .session_git(session_id, repository.id)
+            .and_then(|git| git.remote_url("origin"))
+            .ok()
+            .flatten()
+            .filter(|origin| !origin.trim().is_empty());
+        match origin {
+            Some(origin) => origin,
+            None => {
+                log::warn!(
+                    "[loom-server] could not complete the source of repository {} in session {session_id} from its checkout origin",
+                    repository.id
+                );
+                repository.source.clone()
+            }
+        }
     }
 
     /// Resolves the node mirror to clone a session checkout from, refreshing it

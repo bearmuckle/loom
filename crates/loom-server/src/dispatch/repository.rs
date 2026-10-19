@@ -38,7 +38,7 @@ impl InProcessConnection {
                     .session_repositories()?
                     .get(&session_id)
                     .map(|repositories| repositories.values().cloned().collect());
-                let repositories = match repositories {
+                let repositories: Vec<SessionRepository> = match repositories {
                     Some(repositories) => repositories,
                     None => self
                         .backend
@@ -46,6 +46,16 @@ impl InProcessConnection {
                         .map(|persisted| persisted.repositories.into_values().collect())
                         .unwrap_or_default(),
                 };
+                // Every listed record carries a source that can be attached
+                // again, which a record persisted with a display name does not.
+                let repositories = repositories
+                    .into_iter()
+                    .map(|mut repository| {
+                        repository.source =
+                            self.reported_repository_source(session_id, &repository);
+                        repository
+                    })
+                    .collect();
                 Ok(ServerResponse::Repository(
                     RepositoryResponse::SessionRepositories { repositories },
                 ))

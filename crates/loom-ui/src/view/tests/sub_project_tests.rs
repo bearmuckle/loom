@@ -198,7 +198,9 @@ mod header_shortcuts {
         };
         let repository = SessionRepository {
             id: RepositoryId::new(),
-            source: "repositories/parent".to_owned(),
+            // A listed record carries the source it was attached from, not its
+            // display name, so the branch can attach it again.
+            source: "https://github.com/owner/parent.git".to_owned(),
             path: "repositories/parent".to_owned(),
             revision: None,
             attached_at: Timestamp::from_unix_millis(1),
