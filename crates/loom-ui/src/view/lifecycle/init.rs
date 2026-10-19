@@ -464,6 +464,136 @@ impl LoomView {
         Ok(view)
     }
 
+    /// The canned multi-user state the browser demo shows without a worker.
+    ///
+    /// A demo page has no backend, so nothing answers the roster request and
+    /// nothing records a shared history. This builds the projection a shared
+    /// session would have: the person viewing the demo as its owner, one other
+    /// person on the roster, a direction the other person gave the agent, and
+    /// peer chat between the two of them.
+    #[cfg(target_family = "wasm")]
+    fn demo_multi_user_state(
+        session_id: AgentSessionId,
+        timestamp: loom_core::Timestamp,
+    ) -> (crate::collaboration::CollaborationState, Vec<TimelineItem>) {
+        use loom_core::{
+            Author, CollaborationEntry, CollaborationEntryKind, ParticipantIdentity, Recipient,
+            RosterEntry, SessionRole, github_participant_id,
+        };
+
+        let me = ParticipantIdentity {
+            id: github_participant_id(141_030),
+            display_name: "mara-voss".to_owned(),
+        };
+        let sam = ParticipantIdentity {
+            id: github_participant_id(141_031),
+            display_name: "sam-rivera".to_owned(),
+        };
+        let direction = "Add cursor pagination to the sessions list.";
+        let collaboration = crate::collaboration::CollaborationState {
+            identity_loaded: true,
+            identity: Some(me.clone()),
+            support: crate::collaboration::CollaborationSupport::Supported,
+            roster_session: Some(session_id),
+            roster: vec![
+                RosterEntry {
+                    participant: me.clone(),
+                    role: SessionRole::Owner,
+                    presence: loom_protocol::PresenceStatus::Online,
+                    connections: 2,
+                    last_active_at: None,
+                },
+                RosterEntry {
+                    participant: sam.clone(),
+                    role: SessionRole::Participant,
+                    presence: loom_protocol::PresenceStatus::Online,
+                    connections: 1,
+                    last_active_at: None,
+                },
+            ],
+            // The agent-directed direction below is a `User` row; the author
+            // is what names its sender instead of "You".
+            message_authors: vec![(
+                direction.to_owned(),
+                Author::Participant {
+                    participant: me.clone(),
+                    role: SessionRole::Owner,
+                },
+            )],
+            ..Default::default()
+        };
+        let timeline = vec![
+            TimelineItem::User(direction.to_owned()),
+            TimelineItem::Assistant(AssistantTurn::text(
+                "Added cursor pagination to the sessions list. The list keeps its place while a \
+                 run streams.",
+            )),
+            TimelineItem::Collaboration(Box::new(CollaborationEntry {
+                session_id,
+                run_id: None,
+                author: Author::Participant {
+                    participant: me,
+                    role: SessionRole::Owner,
+                },
+                recipient: Recipient::People,
+                kind: CollaborationEntryKind::PeerMessage {
+                    text: "@sam-rivera can you take the reconnect test?".to_owned(),
+                },
+                revision: None,
+                created_at: timestamp,
+            })),
+            TimelineItem::Collaboration(Box::new(CollaborationEntry {
+                session_id,
+                run_id: None,
+                author: Author::Participant {
+                    participant: sam,
+                    role: SessionRole::Participant,
+                },
+                recipient: Recipient::People,
+                kind: CollaborationEntryKind::PeerMessage {
+                    text: "@mara-voss sure, running it on the cursor branch now.".to_owned(),
+                },
+                revision: None,
+                created_at: timestamp,
+            })),
+        ];
+        (collaboration, timeline)
+    }
+
+    /// The worker section the browser demo shows in the sidebar.
+    ///
+    /// A session with no worker reads as one whose worker was removed, which is
+    /// what a demo page would otherwise look like. This gives the canned
+    /// session a worker to belong to, named for what it is. It carries no
+    /// connection, so nothing polls it and nothing can fail on it.
+    #[cfg(target_family = "wasm")]
+    fn demo_worker_node() -> WorkerNodeEntry {
+        WorkerNodeEntry {
+            id: 0,
+            status: loom_protocol::WorkerNodeStatus {
+                node_id: String::new(),
+                name: "loom-demo".to_owned(),
+                online: true,
+                capabilities: loom_core::CapabilitySet::default(),
+                resources: loom_protocol::WorkerNodeResources {
+                    cpu_count: 12,
+                    cpu_usage_percent: Some(23),
+                    memory_usage_percent: Some(41),
+                    memory_total_bytes: Some(32 * 1024 * 1024 * 1024),
+                    memory_available_bytes: Some(19 * 1024 * 1024 * 1024),
+                    disk_total_bytes: Some(512 * 1024 * 1024 * 1024),
+                    disk_available_bytes: Some(128 * 1024 * 1024 * 1024),
+                },
+            },
+            is_local: false,
+            url: None,
+            connection: None,
+            connection_state: WorkerConnectionState::Connected,
+            connection_detail: None,
+            severe_load_streak: 0,
+        }
+    }
+
     #[cfg(target_family = "wasm")]
     pub(crate) fn new_browser_disconnected(
         options: &BrowserOptions,
@@ -475,6 +605,16 @@ impl LoomView {
         let workspace_id = WorkspaceId::new();
         let timestamp = loom_core::Timestamp::from_unix_millis(0);
         let demo_mode = options.demo();
+        // A demo session is not a worker's session, so it has no history to age
+        // from. These ages read as a session that was opened a few minutes ago
+        // and touched since, instead of the epoch a placeholder carries.
+        let demo_age = |millis: u64| {
+            loom_core::Timestamp::from_unix_millis(
+                loom_core::Timestamp::now()
+                    .as_unix_millis()
+                    .saturating_sub(millis),
+            )
+        };
         let active_session = AgentSessionSnapshot {
             id: AgentSessionId::new(),
             workspace_id,
@@ -485,8 +625,16 @@ impl LoomView {
             }
             .to_owned(),
             state: AgentSessionState::Idle,
-            created_at: timestamp,
-            updated_at: timestamp,
+            created_at: if demo_mode {
+                demo_age(9 * 60_000)
+            } else {
+                timestamp
+            },
+            updated_at: if demo_mode {
+                demo_age(2 * 60_000)
+            } else {
+                timestamp
+            },
             // The placeholder is not a worker's session, so nothing chose its
             // name; it reads like any session written before titles existed.
             title_source: loom_core::SessionTitleSource::Auto,
@@ -495,8 +643,14 @@ impl LoomView {
             .trim()
             .to_owned();
         let preferences = UiPreferences::load();
+        let demo_session =
+            demo_mode.then(|| Self::demo_multi_user_state(active_session.id, timestamp));
+        // The demo's timeline is set below with the session fields; its
+        // collaboration state is assigned after the literal so the shared
+        // defaults stay in one place.
+        let (demo_collaboration, demo_timeline) = demo_session.unzip();
 
-        Self {
+        let mut view = Self {
             connected: demo_mode,
             unsigned_nodes: BTreeSet::new(),
             awaiting_sign_in_nodes: BTreeSet::new(),
@@ -510,7 +664,9 @@ impl LoomView {
             browser_client: true,
             default_backend_node_id: String::new(),
             node_backends: BTreeMap::new(),
-            node_names: BTreeMap::new(),
+            node_names: demo_mode
+                .then(|| BTreeMap::from([(String::new(), "loom-demo".to_owned())]))
+                .unwrap_or_default(),
             session_node_ids: BTreeMap::new(),
             workspace_id,
             workspaces: Vec::new(),
@@ -609,16 +765,7 @@ impl LoomView {
             shortcut_interceptor: None,
             after_sequence: None,
             event_stream_epoch: None,
-            timeline: if demo_mode {
-                vec![
-                    TimelineItem::User("What can Loom do?".to_owned()),
-                    TimelineItem::Assistant(AssistantTurn::text(
-                        "Loom gives you a workspace for steering coding agents. Connect a backend to work with a real repository, run tools, and keep sessions available across clients. This browser demo is a static preview.",
-                    )),
-                ]
-            } else {
-                Vec::new()
-            },
+            timeline: demo_timeline.unwrap_or_default(),
             transcript_before_ordinal: None,
             transcript_loaded_ordinals: BTreeSet::new(),
             transcript_messages: BTreeMap::new(),
@@ -689,7 +836,7 @@ impl LoomView {
             github_login: None,
             github_login_kind: GitHubLoginKind::Copilot,
             next_worker_node_id: 0,
-            worker_nodes: Vec::new(),
+            worker_nodes: demo_mode.then(Self::demo_worker_node).into_iter().collect(),
             worker_node_polls_scheduled: BTreeSet::new(),
             workspace_config: WorkspaceConfig::default(),
             node_input_initial,
@@ -703,7 +850,9 @@ impl LoomView {
             browser_startup_error: startup_error,
             browser_starting: options.is_configured() && !options.demo(),
             browser_connection_lost: None,
-        }
+        };
+        view.collaboration = demo_collaboration.unwrap_or_default();
+        view
     }
 
     /// Builds the view for a worker that accepted the connection without a
