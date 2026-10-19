@@ -205,6 +205,19 @@ impl Render for LoomView {
             ));
             self.rename_input_state = Some(input);
         }
+        if self.sub_project_dialog.is_some() && self.sub_project_input_state.is_none() {
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder("Sub project name"));
+            input.update(cx, |state, cx| state.focus(window, cx));
+            self.input_subscriptions.push(cx.subscribe(
+                &input,
+                |view, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        view.confirm_sub_project(cx);
+                    }
+                },
+            ));
+            self.sub_project_input_state = Some(input);
+        }
         if self.settings_section() == Some(SettingsSection::Providers) {
             for provider in self
                 .providers
@@ -454,6 +467,50 @@ impl Render for LoomView {
                     )
                     .child(
                         session_header_actions()
+                            // A project on screen offers the two shortcuts that
+                            // turn it into a branch: a sub project of it, or its
+                            // archive. Nothing is offered for an empty session.
+                            .when(self.has_header_project(), |actions| {
+                                actions
+                                    .when(self.can_manage_sources(), |actions| {
+                                        actions.child(header_tooltip(
+                                            "new-sub-project-tooltip",
+                                            "New sub project",
+                                            Button::new("new-sub-project")
+                                                .icon(Icon::new(AssetIconName::Plus))
+                                                .ghost()
+                                                .when(layout.phone, |button| {
+                                                    button
+                                                        .large()
+                                                        .h(layout.control_size())
+                                                        .w(layout.control_size())
+                                                })
+                                                .when(!layout.phone, |button| button.small())
+                                                .accessibility_label("New sub project")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.begin_sub_project_dialog(cx);
+                                                })),
+                                        ))
+                                    })
+                                    .child(header_tooltip(
+                                        "archive-project-tooltip",
+                                        "Archive project",
+                                        Button::new("archive-project")
+                                            .icon(Icon::new(AssetIconName::Archive))
+                                            .ghost()
+                                            .when(layout.phone, |button| {
+                                                button
+                                                    .large()
+                                                    .h(layout.control_size())
+                                                    .w(layout.control_size())
+                                            })
+                                            .when(!layout.phone, |button| button.small())
+                                            .accessibility_label("Archive project")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.archive_header_project(cx);
+                                            })),
+                                    ))
+                            })
                             .child(header_tooltip("session-sources-tooltip", "Session sources",
                         Button::new("session-sources")
                             .icon(Icon::new(AssetIconName::ListTree))
@@ -870,6 +927,9 @@ impl LoomView {
                 self.render_github_login_dialog(cx).into_any_element()
             }
             Some(CoveringSurface::Rename) => self.render_rename_dialog(cx).into_any_element(),
+            Some(CoveringSurface::SubProject) => {
+                self.render_sub_project_dialog(cx).into_any_element()
+            }
         }
     }
 }

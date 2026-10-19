@@ -189,6 +189,9 @@ impl InProcessConnection {
             ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession { .. }) => {
                 self.project_dispatch(request, request_id)
             }
+            ClientRequest::Project(ProjectRequest::CreateSubProject { .. }) => {
+                self.project_dispatch(request, request_id)
+            }
             ClientRequest::Project(ProjectRequest::SendProjectAgentMessage { .. }) => {
                 self.project_dispatch(request, request_id)
             }

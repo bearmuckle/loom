@@ -472,7 +472,8 @@ Protocol 11.3 adds identity, roles, and presence; 11.4 adds attributed chat
 and ordered run actions. Provider credential selection uses the same 11.4
 version. 11.5 adds access requests. 11.6 adds GitHub sign-in. 11.7 adds the
 activity-detail projection. 11.8 adds provider API-key removal. 11.9 adds
-resuming a remembered GitHub identity. Every addition is a new enum variant, a
+resuming a remembered GitHub identity. 11.10 adds creating a sub project from
+the project it branches out of. Every addition is a new enum variant, a
 capability, or a field with a compatible default (an omitted field keeps the
 older behavior), so clients of an older 11.x minor keep working; they simply
 never send the new requests, negotiate the new capability, or ask for the new

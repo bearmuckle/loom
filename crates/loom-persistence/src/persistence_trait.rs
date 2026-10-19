@@ -695,6 +695,12 @@ pub trait ProjectRepository: Send + Sync {
         task: &DelegatedTaskRecord,
         worktree: &ProjectWorktreeRecord,
     ) -> Result<DelegatedTaskRecord>;
+    fn create_sub_project(
+        &self,
+        session: &AgentSessionSnapshot,
+        parent_project_id: ProjectId,
+        session_next_sequence: EventSequence,
+    ) -> Result<()>;
     fn has_pending_project_cancellation_cascade(&self, project_id: ProjectId) -> Result<bool>;
     fn list_agent_messages(
         &self,
@@ -838,6 +844,14 @@ impl ProjectRepository for FilePersistence {
             task,
             worktree,
         )
+    }
+    fn create_sub_project(
+        &self,
+        session: &AgentSessionSnapshot,
+        parent_project_id: ProjectId,
+        session_next_sequence: EventSequence,
+    ) -> Result<()> {
+        FilePersistence::create_sub_project(self, session, parent_project_id, session_next_sequence)
     }
     fn has_pending_project_cancellation_cascade(&self, project_id: ProjectId) -> Result<bool> {
         FilePersistence::has_pending_project_cancellation_cascade(self, project_id)
@@ -1024,6 +1038,14 @@ impl<T: ProjectRepository + ?Sized> ProjectRepository for Arc<T> {
             task,
             worktree,
         )
+    }
+    fn create_sub_project(
+        &self,
+        session: &AgentSessionSnapshot,
+        parent_project_id: ProjectId,
+        session_next_sequence: EventSequence,
+    ) -> Result<()> {
+        (**self).create_sub_project(session, parent_project_id, session_next_sequence)
     }
     fn has_pending_project_cancellation_cascade(&self, project_id: ProjectId) -> Result<bool> {
         (**self).has_pending_project_cancellation_cascade(project_id)

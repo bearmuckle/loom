@@ -18,6 +18,7 @@ fn event_page_continuations_keep_poll_ownership(cx: &mut TestAppContext) {
             view.project_snapshot = Some(loom_core::ProjectSnapshot {
                 project_id,
                 root_session_id: root,
+                parent_project_id: None,
                 agents: vec![loom_core::ProjectAgentRecord {
                     session_id: AgentSessionId::new(),
                     project_id,
@@ -993,6 +994,7 @@ fn a_project_poll_answers_a_feed_page_without_rewinding_the_cursor(cx: &mut Test
         view.project_snapshot = Some(loom_core::ProjectSnapshot {
             project_id,
             root_session_id: root,
+            parent_project_id: None,
             agents: vec![loom_core::ProjectAgentRecord {
                 session_id: root,
                 project_id,

@@ -108,6 +108,10 @@ impl LoomView {
                 self.rename_dialog = None;
                 self.rename_input_state = None;
             }
+            CoveringSurface::SubProject => {
+                self.sub_project_dialog = None;
+                self.sub_project_input_state = None;
+            }
         }
     }
 }

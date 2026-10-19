@@ -54,6 +54,7 @@ fn project(root_session_id: AgentSessionId, agents: Vec<ProjectAgentRecord>) -> 
     ProjectSnapshot {
         project_id: ProjectId::from_uuid(*root_session_id.as_uuid()),
         root_session_id,
+        parent_project_id: None,
         agents,
         tasks: Vec::new(),
         worktrees: Vec::new(),
@@ -168,6 +169,97 @@ fn uncovered_sessions_keep_their_own_row() {
         .map(|row| row.name.as_str())
         .collect::<Vec<_>>();
     assert_eq!(names, ["Loose session", "Project"]);
+}
+
+/// A sub project is a project of its own, so it keeps its own row; it is listed
+/// directly beneath the project it was branched out of and marked as a branch.
+#[test]
+fn sub_projects_are_listed_under_the_project_they_branched_from() {
+    let parent = AgentSessionId::new();
+    let branch_new = AgentSessionId::new();
+    let branch_old = AgentSessionId::new();
+    let unrelated = AgentSessionId::new();
+    // Both branches are newer than their parent, so only nesting puts their rows
+    // beneath it.
+    let sessions = vec![
+        session(parent, "Parent", AgentSessionState::Idle, 1),
+        session(branch_old, "Branch old", AgentSessionState::Idle, 2),
+        session(branch_new, "Branch new", AgentSessionState::Idle, 3),
+        session(unrelated, "Unrelated", AgentSessionState::Idle, 4),
+    ];
+    let parent_snapshot = project(
+        parent,
+        vec![agent(
+            parent,
+            ProjectId::from_uuid(*parent.as_uuid()),
+            None,
+            AgentSessionState::Idle,
+        )],
+    );
+    let branch = |root: AgentSessionId| ProjectSnapshot {
+        project_id: ProjectId::from_uuid(*root.as_uuid()),
+        root_session_id: root,
+        parent_project_id: Some(ProjectId::from_uuid(*parent.as_uuid())),
+        agents: vec![agent(
+            root,
+            ProjectId::from_uuid(*root.as_uuid()),
+            None,
+            AgentSessionState::Idle,
+        )],
+        tasks: Vec::new(),
+        worktrees: Vec::new(),
+    };
+    let branch_old_snapshot = branch(branch_old);
+    let branch_new_snapshot = branch(branch_new);
+
+    let model = list(
+        &sessions,
+        &[&parent_snapshot, &branch_old_snapshot, &branch_new_snapshot],
+        branch_new,
+    );
+
+    let listed = rows(&model);
+    assert_eq!(
+        listed
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Unrelated", "Parent", "Branch new", "Branch old"]
+    );
+    assert_eq!(
+        listed.iter().map(|row| row.sub_project).collect::<Vec<_>>(),
+        [false, false, true, true]
+    );
+    // Selecting a branch highlights its own row, not the project it came from.
+    assert_eq!(model.selected, Some(branch_new));
+}
+
+/// A branch whose parent project is not in the list is a project of its own, so
+/// it is neither indented nor dropped.
+#[test]
+fn a_branch_without_its_parent_is_listed_as_a_project() {
+    let orphan = AgentSessionId::new();
+    let sessions = vec![session(orphan, "Orphan", AgentSessionState::Idle, 1)];
+    let snapshot = ProjectSnapshot {
+        project_id: ProjectId::from_uuid(*orphan.as_uuid()),
+        root_session_id: orphan,
+        parent_project_id: Some(ProjectId::new()),
+        agents: vec![agent(
+            orphan,
+            ProjectId::from_uuid(*orphan.as_uuid()),
+            None,
+            AgentSessionState::Idle,
+        )],
+        tasks: Vec::new(),
+        worktrees: Vec::new(),
+    };
+
+    let model = list(&sessions, &[&snapshot], orphan);
+
+    let listed = rows(&model);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "Orphan");
+    assert!(!listed[0].sub_project);
 }
 
 /// Rows are listed newest-created first, not in the activity order the backend

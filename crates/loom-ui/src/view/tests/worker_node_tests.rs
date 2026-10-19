@@ -361,6 +361,7 @@ fn project_snapshot_has_unloaded_agent_sessions_detects_missing_agent_sessions()
     let project = loom_core::ProjectSnapshot {
         project_id,
         root_session_id: root_id,
+        parent_project_id: None,
         agents: vec![
             loom_core::ProjectAgentRecord {
                 session_id: root_id,
@@ -465,6 +466,7 @@ fn uncovered_session_ids_skip_sessions_captured_by_a_known_project() {
     let project = loom_core::ProjectSnapshot {
         project_id,
         root_session_id: root,
+        parent_project_id: None,
         agents: vec![agent(root, None), agent(child, Some(root))],
         tasks: Vec::new(),
         worktrees: Vec::new(),

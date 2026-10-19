@@ -335,6 +335,17 @@ fn render_project_row(
         .gap_2()
         .w_full()
         .min_w(px(0.))
+        .when(row.sub_project, |line| {
+            // A branch sits under the project it was branched out of, so its
+            // row is indented and carries the branch mark instead of a second
+            // heading level.
+            line.pl(px(12.)).child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(rgb(0x64748b))
+                    .child(Icon::new(AssetIconName::GitBranch).size_3()),
+            )
+        })
         .child(
             div()
                 .id(("project-name", row_index))

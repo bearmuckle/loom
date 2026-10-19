@@ -385,6 +385,19 @@ pub(crate) struct RenameDialogState {
     pub(crate) is_project: bool,
 }
 
+/// The sub project being branched out of the project on screen.
+///
+/// A sub project inherits the parent project's sources and model and is a
+/// project of its own once created, so the dialog has one field: the name of
+/// the branch.
+#[derive(Clone, Debug)]
+pub(crate) struct SubProjectDialogState {
+    /// The root session of the project the branch is created from.
+    pub(crate) parent_session_id: AgentSessionId,
+    /// The parent project's name, so the dialog says what it branches from.
+    pub(crate) parent_name: String,
+}
+
 /// The confirmation a project deletion goes through before it is submitted.
 ///
 /// A project deletion cascades to every session in the tree, so it is never

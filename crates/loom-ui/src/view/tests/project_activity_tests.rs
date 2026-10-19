@@ -65,6 +65,7 @@ fn project_agent_states_update_covered_sessions_only() {
     let project = ProjectSnapshot {
         project_id,
         root_session_id: active_id,
+        parent_project_id: None,
         agents: vec![
             // The active session's state is owned by its own event stream, so a
             // snapshot that is older must not regress it.
@@ -124,6 +125,7 @@ fn project_agent_states_skip_only_the_named_session() {
     let project = ProjectSnapshot {
         project_id,
         root_session_id: root_id,
+        parent_project_id: None,
         agents: vec![
             agent(root_id, project_id, 1, AgentSessionState::Completed),
             agent(child_id, project_id, 2, AgentSessionState::Completed),

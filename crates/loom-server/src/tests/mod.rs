@@ -48,6 +48,7 @@ mod project_child_reliability;
 mod project_integration;
 mod project_manager;
 mod project_misc;
+mod project_sub_project;
 mod providers;
 mod resources;
 mod retention;

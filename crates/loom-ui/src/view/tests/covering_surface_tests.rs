@@ -60,6 +60,7 @@ fn open_surface(
                 let session = view.active_session.clone();
                 view.begin_session_rename(session, false, window, cx);
             }
+            CoveringSurface::SubProject => view.begin_sub_project_dialog(cx),
         });
     })
     .unwrap();
@@ -235,6 +236,11 @@ fn each_surface_closes_from_its_own_control(cx: &mut TestAppContext) {
         ),
         (CoveringSurface::Rename, "cancel-rename", "rename-dialog"),
         (
+            CoveringSurface::SubProject,
+            "cancel-sub-project",
+            "sub-project-dialog",
+        ),
+        (
             CoveringSurface::NewProject,
             "close-source-dialog",
             "source-dialog-pane",
@@ -279,6 +285,7 @@ fn a_stale_close_control_does_not_close_the_surface_on_screen(cx: &mut TestAppCo
         view.close_rename_dialog(cx);
         view.close_github_login(cx);
         view.close_source_dialog(cx);
+        view.close_sub_project_dialog(cx);
     });
     assert_on_screen(cx, handle, &view, Some(CoveringSurface::ArchivedSessions));
 }

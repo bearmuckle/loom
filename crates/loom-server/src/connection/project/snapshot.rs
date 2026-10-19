@@ -99,6 +99,7 @@ impl InProcessConnection {
         Ok(ProjectSnapshot {
             project_id,
             root_session_id,
+            parent_project_id: None,
             agents: vec![ProjectAgentRecord {
                 session_id: root.id,
                 project_id,
@@ -138,6 +139,7 @@ impl InProcessConnection {
         Ok(ProjectSnapshot {
             project_id,
             root_session_id: root.id,
+            parent_project_id: None,
             agents: vec![ProjectAgentRecord {
                 session_id: root.id,
                 project_id,

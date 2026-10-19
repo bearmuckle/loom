@@ -58,6 +58,7 @@ mod refresh_tests {
         ProjectSnapshot {
             project_id: loom_core::ProjectId::from_uuid(*session_id.as_uuid()),
             root_session_id: session_id,
+            parent_project_id: None,
             agents: Vec::new(),
             tasks: Vec::new(),
             worktrees: Vec::new(),

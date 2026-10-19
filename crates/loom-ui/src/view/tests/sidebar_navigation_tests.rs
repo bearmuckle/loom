@@ -322,6 +322,7 @@ fn source_lookups_skip_delegated_agents_and_stay_bounded(cx: &mut TestAppContext
             view.project_tree_snapshots = vec![loom_core::ProjectSnapshot {
                 project_id,
                 root_session_id: root_id,
+                parent_project_id: None,
                 agents: vec![
                     agent_record(root_id, project_id, None, 1),
                     agent_record(child_id, project_id, Some(root_id), 2),
@@ -392,6 +393,7 @@ fn source_discovery_is_single_flight_and_drains_all_rows(cx: &mut TestAppContext
         view.project_tree_snapshots = vec![loom_core::ProjectSnapshot {
             project_id,
             root_session_id: root_id,
+            parent_project_id: None,
             agents: vec![agent_record(child_id, project_id, Some(root_id), 2)],
             tasks: Vec::new(),
             worktrees: Vec::new(),

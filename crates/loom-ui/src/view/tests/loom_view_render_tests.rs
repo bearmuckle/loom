@@ -202,6 +202,7 @@ pub(super) fn nested_project_view(focus_handle: gpui_kit::FocusHandle) -> LoomVi
     view.project_snapshot = Some(ProjectSnapshot {
         project_id,
         root_session_id: root_id,
+        parent_project_id: None,
         agents,
         tasks: vec![manager_task, worker_task],
         worktrees: vec![worker_worktree],

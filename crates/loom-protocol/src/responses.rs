@@ -395,6 +395,13 @@ pub enum TaskResponse {
 pub enum ProjectResponse {
     ProjectSnapshot(ProjectSnapshot),
 
+    /// The sub project created from a parent project: its own project ID, which
+    /// is also its root session ID, and that root session.
+    SubProjectCreated {
+        project_id: ProjectId,
+        session: Box<AgentSessionSnapshot>,
+    },
+
     ProjectChildCreated {
         task: Box<DelegatedTaskRecord>,
         child: ProjectAgentRecord,

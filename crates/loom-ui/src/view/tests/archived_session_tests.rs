@@ -58,6 +58,7 @@ fn project_snapshot(
     loom_core::ProjectSnapshot {
         project_id,
         root_session_id: root,
+        parent_project_id: None,
         agents: std::iter::once(agent(root, 1, None))
             .chain(children.iter().map(|child| agent(*child, 2, Some(root))))
             .collect(),

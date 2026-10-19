@@ -75,9 +75,9 @@ use crate::{
         ASK_USER_TOOL, AgentQuestion, AssistantPart, AssistantTurn, EvidenceText, GitHubLoginKind,
         GitHubLoginState, InspectorTab, MAX_QUESTION_CHOICE_BYTES, MAX_QUESTION_CHOICES,
         OutputDetail, PlanState, PlanStepStatus, ProjectDeleteDialogState, RenameDialogState,
-        ReviewState, SystemNote, SystemTone, ThemeChoice, TimelineItem, ToolPart, ToolPartStatus,
-        UsageState, bounded, bounded_to, finish_assistant_turn, has_tool_part,
-        push_assistant_evidence, push_assistant_reasoning, push_assistant_text,
+        ReviewState, SubProjectDialogState, SystemNote, SystemTone, ThemeChoice, TimelineItem,
+        ToolPart, ToolPartStatus, UsageState, bounded, bounded_to, finish_assistant_turn,
+        has_tool_part, push_assistant_evidence, push_assistant_reasoning, push_assistant_text,
         session_state_for_run, upsert_tool_part,
     },
     syntax::{self, Language},
@@ -174,6 +174,8 @@ pub(crate) enum CoveringSurface {
     GitHubLogin,
     /// The rename dialog.
     Rename,
+    /// The dialog that names a new sub project of the project on screen.
+    SubProject,
 }
 
 impl CoveringSurface {
@@ -181,12 +183,13 @@ impl CoveringSurface {
     /// `id` match beside it is exhaustive, so a new variant has to be named
     /// there and here, and has to satisfy the exclusivity test.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::Settings(SettingsSection::Agents),
         Self::ArchivedSessions,
         Self::NewProject,
         Self::GitHubLogin,
         Self::Rename,
+        Self::SubProject,
     ];
 
     /// The id of the surface's own root element, which is what a render test
@@ -199,6 +202,7 @@ impl CoveringSurface {
             Self::NewProject => "source-dialog-pane",
             Self::GitHubLogin => "github-login-dialog",
             Self::Rename => "rename-dialog",
+            Self::SubProject => "sub-project-dialog",
         }
     }
 
@@ -730,6 +734,9 @@ pub(crate) struct LoomView {
     selected_repository_id: Option<RepositoryId>,
     session_drawer_open: bool,
     pub(crate) rename_dialog: Option<RenameDialogState>,
+    /// The sub project dialog: its parent project, while the branch is named.
+    pub(crate) sub_project_dialog: Option<SubProjectDialogState>,
+    sub_project_input_state: Option<Entity<InputState>>,
     /// The confirmation an archived project deletion goes through. A whole tree
     /// is never removed without it.
     pub(crate) project_delete_dialog: Option<ProjectDeleteDialogState>,
@@ -809,6 +816,9 @@ pub(crate) struct ProjectListRow {
     /// The session the row selects: the project's root, or the session itself
     /// when no known project snapshot covers it.
     pub(crate) session_id: AgentSessionId,
+    /// Whether this project was branched out of another project on screen, so
+    /// the row is listed under it and marked as a branch.
+    pub(crate) sub_project: bool,
     pub(crate) name: String,
     /// The project's main source when known, otherwise `updated <when>`.
     pub(crate) detail: String,
@@ -898,6 +908,10 @@ pub(crate) fn project_list_model(input: ProjectListInput<'_>) -> ProjectListMode
     }
 
     let mut sections = Vec::new();
+    // The project each project root was branched out of, when that parent is a
+    // project the client knows. A sub project is a project of its own, so this
+    // only decides where its row is listed.
+    let sub_project_parents = sub_project_parents(input.projects, &sessions_by_id);
     for (node_id, group) in group_sessions_by_worker(
         input.sessions,
         input.owners,
@@ -965,6 +979,7 @@ pub(crate) fn project_list_model(input: ProjectListInput<'_>) -> ProjectListMode
                     .unwrap_or(usize::MAX),
             )
         });
+        let rows = nest_sub_projects(rows, &sub_project_parents);
         sections.push(ProjectListSection { node_id, rows });
     }
 
@@ -1004,6 +1019,7 @@ fn project_list_row(
             .any(|agent| active_sessions.contains(&agent.session_id));
     ProjectListRow {
         session_id: session.id,
+        sub_project: false,
         name: session.name.clone(),
         detail: source_labels.get(&session.id).cloned().unwrap_or_else(|| {
             format!(
@@ -1046,6 +1062,83 @@ fn agent_summary_line(agents: &[ProjectAgentRow]) -> String {
         parts.push(format!("{done} done"));
     }
     parts.join(" · ")
+}
+
+/// The project each listed project was branched out of.
+///
+/// A branch is only nested when its parent is a project the client lists: a row
+/// whose parent is not on screen is listed as a project of its own instead of
+/// disappearing under a row that is not there.
+fn sub_project_parents(
+    projects: &[&loom_core::ProjectSnapshot],
+    sessions_by_id: &BTreeMap<AgentSessionId, &AgentSessionSnapshot>,
+) -> BTreeMap<AgentSessionId, AgentSessionId> {
+    let mut parents = BTreeMap::new();
+    for project in projects {
+        let Some(parent_project_id) = project.parent_project_id else {
+            continue;
+        };
+        let parent_session_id = AgentSessionId::from_uuid(*parent_project_id.as_uuid());
+        if parent_session_id == project.root_session_id
+            || !sessions_by_id.contains_key(&parent_session_id)
+        {
+            continue;
+        }
+        parents.insert(project.root_session_id, parent_session_id);
+    }
+    parents
+}
+
+/// Lists each project directly beneath the project it was branched out of.
+///
+/// The incoming order is kept as far as nesting allows: a parent is followed by
+/// its own branches, which keep their order among themselves, and every other
+/// row keeps its place. A row whose parent is missing, or whose chain would
+/// loop, is listed as a project rather than being dropped.
+fn nest_sub_projects(
+    rows: Vec<ProjectListRow>,
+    parents: &BTreeMap<AgentSessionId, AgentSessionId>,
+) -> Vec<ProjectListRow> {
+    let mut ordered = Vec::with_capacity(rows.len());
+    let mut pending = rows;
+    let mut listed = BTreeSet::new();
+    loop {
+        let mut progressed = false;
+        let mut index = 0;
+        while index < pending.len() {
+            let ready = match parents.get(&pending[index].session_id) {
+                None => true,
+                Some(parent) => {
+                    listed.contains(parent)
+                        || !pending.iter().any(|other| other.session_id == *parent)
+                }
+            };
+            if ready {
+                let row = pending.remove(index);
+                listed.insert(row.session_id);
+                ordered.push(row);
+                progressed = true;
+            } else {
+                index += 1;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    ordered.extend(pending);
+    // A branch is only indented when the project it was branched out of is
+    // listed above it.
+    let listed_ids = ordered
+        .iter()
+        .map(|row| row.session_id)
+        .collect::<BTreeSet<_>>();
+    for row in &mut ordered {
+        row.sub_project = parents
+            .get(&row.session_id)
+            .is_some_and(|parent| listed_ids.contains(parent));
+    }
+    ordered
 }
 
 /// A compact status label with theme-resolved foreground and background colors
@@ -1948,6 +2041,8 @@ impl LoomView {
             clear_access_note: false,
             clear_access_deny_reason: None,
             rename_input_state: None,
+            sub_project_dialog: None,
+            sub_project_input_state: None,
             source_path_input: None,
             repository_filter_input: None,
             cloned_repositories: Vec::new(),
@@ -2078,6 +2173,7 @@ mod review;
 mod runs;
 mod sessions;
 mod source;
+mod sub_project;
 mod surfaces;
 mod timeline;
 mod workers;

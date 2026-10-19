@@ -1,6 +1,131 @@
 use super::*;
 
 impl FilePersistence {
+    /// Atomically records a sub project: its root session, the project root
+    /// membership that session is, and the link to the project it was branched
+    /// out of.
+    ///
+    /// A sub project is a project of its own, so the row this writes is the
+    /// same one `save_session_rows` would write for a top-level project; the
+    /// only extra state is the [`project_parents`](super::schema) link. The
+    /// parent must be an existing project root in the same workspace, so a
+    /// client can group the sub project under it.
+    pub fn create_sub_project(
+        &self,
+        session: &AgentSessionSnapshot,
+        parent_project_id: ProjectId,
+        session_next_sequence: EventSequence,
+    ) -> Result<()> {
+        if session.name.trim().is_empty() {
+            return Err(LoomError::invalid_request(
+                "sub project name must not be empty",
+            ));
+        }
+        let project_id = ProjectId::from_uuid(*session.id.as_uuid());
+        if project_id == parent_project_id {
+            return Err(LoomError::invalid_request(
+                "a project cannot be its own parent project",
+            ));
+        }
+        let connection = self.connection_for_write()?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin sub project transaction: {error}"),
+                true,
+            )
+        })?;
+        // The parent is a project root, which the hierarchy records as a
+        // depth-one membership whose project is the session itself.
+        let parent_is_root: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sessions_hierarchy AS hierarchy
+                    JOIN sessions AS parent ON parent.id=hierarchy.session_id
+                    WHERE hierarchy.project_id=?1 AND hierarchy.session_id=?1
+                      AND hierarchy.parent_session_id IS NULL AND hierarchy.depth=1
+                      AND parent.workspace_id=?2
+                 )",
+                params![
+                    parent_project_id.as_uuid().as_bytes().as_slice(),
+                    session.workspace_id.as_uuid().as_bytes().as_slice(),
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not inspect the parent project: {error}"),
+                    true,
+                )
+            })?;
+        if !parent_is_root {
+            return Err(LoomError::invalid_request(
+                "the parent of a sub project must be a project root in the same workspace",
+            ));
+        }
+        transaction
+            .execute(
+                "INSERT INTO sessions(id, workspace_id, name, state, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    session.id.as_uuid().as_bytes().as_slice(),
+                    session.workspace_id.as_uuid().as_bytes().as_slice(),
+                    session.name,
+                    session_state_name(session.state),
+                    encode_timestamp(session.created_at)?,
+                    encode_timestamp(session.updated_at)?,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not create sub project: {error}"), true)
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO sessions_hierarchy(project_id, session_id, parent_session_id, depth)
+                 VALUES (?1, ?1, NULL, 1)",
+                [session.id.as_uuid().as_bytes().as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not create the sub project hierarchy: {error}"),
+                    true,
+                )
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO project_parents(project_id, parent_project_id, created_at)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    project_id.as_uuid().as_bytes().as_slice(),
+                    parent_project_id.as_uuid().as_bytes().as_slice(),
+                    encode_timestamp(session.created_at)?,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not link the sub project to its parent: {error}"),
+                    true,
+                )
+            })?;
+        let next_sequence = i64::try_from(session_next_sequence.value()).map_err(|_| {
+            LoomError::invalid_request("session sequence exceeds SQLite's integer range")
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO session_store_meta(singleton, next_sequence) VALUES (1, ?1)
+                 ON CONFLICT(singleton) DO UPDATE SET next_sequence=MAX(next_sequence, excluded.next_sequence)",
+                [next_sequence],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not update session sequence: {error}"), true)
+            })?;
+        transaction.commit().map_err(|error| {
+            persistence_error(
+                format!("could not commit sub project transaction: {error}"),
+                true,
+            )
+        })
+    }
+
     /// Atomically creates a child session, its hierarchy edge, and its delegated task.
     /// Reusing a request ID returns the durable task only when its semantic request
     /// fields match, which makes the request key safe across a crash before generic
@@ -1533,6 +1658,24 @@ impl FilePersistence {
                 false,
             ));
         }
+        // A sub project records the project it was branched out of. The link
+        // is optional state: a project without a row was not branched out.
+        let parent_project_id = transaction
+            .query_row(
+                "SELECT parent_project_id FROM project_parents WHERE project_id=?1",
+                [project_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read the project's sub project link: {error}"),
+                    true,
+                )
+            })?
+            .as_deref()
+            .map(|bytes| decode_uuid(bytes, "parent project id").map(ProjectId::from_uuid))
+            .transpose()?;
         transaction.commit().map_err(|error| {
             persistence_error(
                 format!("could not finish project snapshot read: {error}"),
@@ -1543,6 +1686,7 @@ impl FilePersistence {
         Ok(Some(ProjectSnapshot {
             project_id,
             root_session_id,
+            parent_project_id,
             agents,
             tasks,
             worktrees,

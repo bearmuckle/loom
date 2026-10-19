@@ -17,6 +17,10 @@ impl InProcessConnection {
                     self.load_project_snapshot_for_session(session_id)?,
                 )))
             }
+            ClientRequest::Project(ProjectRequest::CreateSubProject {
+                parent_session_id,
+                name,
+            }) => self.create_sub_project(parent_session_id, name),
             ClientRequest::Project(ProjectRequest::SendProjectAgentMessage { message }) => {
                 self.send_project_agent_message(request_id, message)
             }

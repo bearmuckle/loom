@@ -2,13 +2,25 @@
 
 > Status: design investigation for
 > [GitHub issue #257](https://github.com/bearmuckle/loom/issues/257),
-> “Project sub agent / project strategies.” The **sub-agent de-emphasis** and
-> **auto-archive** parts are implemented; **nested sub projects** remain a
-> design only. This document frames the decisions; the companion mockup is
+> “Project sub agent / project strategies.” The **sub-agent de-emphasis**,
+> **auto-archive**, and **sub projects** parts are implemented. This document
+> frames the decisions; the companion mockup is
 > [`project-subprojects-mockup.html`](project-subprojects-mockup.html).
 >
 > ## Implementation status
 >
+> - **Sub projects (implemented).** A sub project is a project of its own — its
+>   own root session, agents, model choice, and checkouts in the parent's
+>   workspace — plus one durable link, `project_parents`, to the project it was
+>   branched out of. Creating one is a single name field, opened from the
+>   **New sub project** shortcut in the project header (or the same action's
+>   dialog); the client attaches the parent's sources to the new session so the
+>   branch starts where the project is, and the sidebar lists the branch directly
+>   beneath its parent with a branch mark. See *A sub project is its own project*
+>   below for how this differs from the nested-membership sketch.
+> - **Archive from the header (implemented).** The project header offers
+>   **Archive project**, which archives the root session of the project on
+>   screen, so selecting an agent of a project still archives the whole tree.
 > - **Sub agents de-emphasized (implemented).** The sidebar nests each project's
 >   delegated agents under one collapsed summary row (`N agents · x running ·
 >   y done`) that expands for inspection. A sub agent's context menu opens its
@@ -18,9 +30,30 @@
 >   gates it, off by default and toggled from Settings → Agents. When on, a
 >   delegated agent is archived once its task is `Completed` and any code result
 >   is integrated; failures and un-integrated code stay visible.
-> - **Nested sub projects (design only).** The nested project model below needs
->   a schema migration and a rework of the one-project-per-session invariant, so
->   it is not implemented here.
+
+## A sub project is its own project
+
+The original sketch below made a sub project a *nested membership* of its parent
+project. Implementation showed that rework buys nothing the tree needs: a
+session belongs to one project, and every project-level invariant (depth,
+concurrency, retention, integration) is expressed per project. A sub project is
+therefore a separate project that records its parent:
+
+- `project_parents(project_id, parent_project_id)` holds the link, and
+  `ProjectSnapshot.parent_project_id` reports it. Deleting either project drops
+  the link alone.
+- The parent must be a project root in the same workspace; a delegated agent is
+  managed by its project and cannot own one.
+- The branch is created by `ProjectRequest::CreateSubProject`, which writes the
+  session row, its project root row, and the link in one transaction. Owner role
+  and `create_agent_session` are required.
+- Sources and the model are **not** copied by the worker: the client attaches the
+  parent's repositories (reusing the worker's clone) and directories to the new
+  session, so a project that was branched out and a project created on its own
+  share one attach path.
+- The link only groups the row in a client. A branch whose parent is not listed
+  (archived, on another worker, not yet fetched) is listed as a project of its
+  own rather than disappearing.
 
 ## Problem
 
@@ -44,6 +77,10 @@ Three changes are wanted:
 3. Let the **task delegation flow auto-archive completed sub agents**.
 
 ## Proposed model
+
+> Superseded: sub projects are implemented as their own project plus a parent
+> link (see *A sub project is its own project*). The nested-membership model
+> below is kept as the record of what was investigated.
 
 ### A sub project is a nested project with its own manager
 

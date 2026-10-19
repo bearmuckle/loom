@@ -455,6 +455,11 @@ impl ClientRequest {
             | Self::Project(ProjectRequest::GetProjectSnapshotForSession { .. }) => {
                 Some(Capability::ReadProject)
             }
+            // A sub project is an agent session of its own, so creating one
+            // needs the capability that creates sessions.
+            Self::Project(ProjectRequest::CreateSubProject { .. }) => {
+                Some(Capability::CreateAgentSession)
+            }
             Self::Project(ProjectRequest::SendProjectAgentMessage { .. }) => {
                 Some(Capability::SendProjectAgentMessage)
             }
@@ -729,6 +734,10 @@ impl ClientRequest {
             | Self::Access(AccessRequest::ApproveSessionAccessRequest { .. })
             | Self::Access(AccessRequest::DenySessionAccessRequest { .. })
             | Self::Access(AccessRequest::RevokeSessionAccess { .. }) => Some(Owner),
+            // Creating a sub project adds a project next to the one it is
+            // branched out of, so it needs the role that may change that
+            // project.
+            Self::Project(ProjectRequest::CreateSubProject { .. }) => Some(Owner),
         }
     }
 
@@ -831,6 +840,10 @@ impl ClientRequest {
                 session_id,
                 ..
             }) => Some(Session(*session_id)),
+            // Creating a sub project acts on the project it branches out of.
+            Self::Project(ProjectRequest::CreateSubProject {
+                parent_session_id, ..
+            }) => Some(Session(*parent_session_id)),
             Self::Access(AccessRequest::GetRunCredential { run_id })
             | Self::Run(RunRequest::GetAgentRun { run_id })
             | Self::Run(RunRequest::GetAgentRunMessagePage { run_id, .. })
@@ -870,6 +883,7 @@ impl ClientRequest {
                 | Self::Workspace(WorkspaceRequest::RegisterWorkspace { .. })
                 | Self::Workspace(WorkspaceRequest::RenameWorkspace { .. })
                 | Self::Workspace(WorkspaceRequest::CreateAgentSessionInWorkspace { .. })
+                | Self::Project(ProjectRequest::CreateSubProject { .. })
                 | Self::Project(ProjectRequest::ControlProjectChild { .. })
                 | Self::Project(ProjectRequest::IntegrateProjectChild { .. })
                 | Self::Project(ProjectRequest::CleanupProjectChildWorktree { .. })
@@ -1274,7 +1288,7 @@ mod run_message_protocol_tests {
 
     #[test]
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 9));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 10));
         let project_id = ProjectId::new();
         let request = ClientRequest::Project(ProjectRequest::GetProjectSnapshot { project_id });
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));
@@ -1310,6 +1324,7 @@ mod run_message_protocol_tests {
         let snapshot = ProjectSnapshot {
             project_id,
             root_session_id,
+            parent_project_id: None,
             agents: vec![ProjectAgentRecord {
                 session_id: root_session_id,
                 project_id,
@@ -1324,6 +1339,54 @@ mod run_message_protocol_tests {
             worktrees: vec![],
         };
         let response = ServerResponse::Project(ProjectResponse::ProjectSnapshot(snapshot));
+        let encoded = encode_response(&ResponseEnvelope::success(
+            RequestId::new(),
+            response.clone(),
+        ))
+        .unwrap();
+        assert_eq!(decode_response(&encoded).unwrap().result.unwrap(), response);
+    }
+
+    #[test]
+    fn create_sub_project_requires_session_creation_and_the_parent_owner_role() {
+        let parent_session_id = AgentSessionId::new();
+        let request = ClientRequest::Project(ProjectRequest::CreateSubProject {
+            parent_session_id,
+            name: "Branch out".into(),
+        });
+        // A sub project is a session of its own, so creating one draws on the
+        // capability that creates sessions.
+        assert_eq!(
+            request.required_capability(),
+            Some(Capability::CreateAgentSession)
+        );
+        // It changes the project it branches out of, so it needs the role that
+        // may change that project.
+        assert_eq!(request.required_session_role(), Some(SessionRole::Owner));
+        assert_eq!(
+            request.access_target(),
+            Some(AccessTarget::Session(parent_session_id))
+        );
+        assert!(request.is_retryable_mutation());
+        assert_eq!(
+            decode_request(&encode_request(&RequestEnvelope::new(request.clone())).unwrap())
+                .unwrap()
+                .request,
+            request
+        );
+
+        let sub_project_id = ProjectId::new();
+        let response = ServerResponse::Project(ProjectResponse::SubProjectCreated {
+            project_id: sub_project_id,
+            session: Box::new(loom_core::AgentSessionSnapshot {
+                id: AgentSessionId::from_uuid(*sub_project_id.as_uuid()),
+                workspace_id: loom_core::WorkspaceId::new(),
+                name: "Branch out".into(),
+                state: loom_core::AgentSessionState::Idle,
+                created_at: loom_core::Timestamp::from_unix_millis(1),
+                updated_at: loom_core::Timestamp::from_unix_millis(1),
+            }),
+        });
         let encoded = encode_response(&ResponseEnvelope::success(
             RequestId::new(),
             response.clone(),

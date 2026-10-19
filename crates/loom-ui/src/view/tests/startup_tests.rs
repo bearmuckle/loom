@@ -39,6 +39,7 @@ fn project(root: AgentSessionId, children: &[AgentSessionId]) -> ProjectSnapshot
     ProjectSnapshot {
         project_id,
         root_session_id: root,
+        parent_project_id: None,
         agents: std::iter::once(agent(root, None))
             .chain(children.iter().map(|child| agent(*child, Some(root))))
             .collect(),

@@ -545,6 +545,19 @@ pub enum ProjectRequest {
         session_id: AgentSessionId,
     },
 
+    /// Creates a project branched out of `parent_session_id`, which must be a
+    /// project root in the caller's workspace.
+    ///
+    /// The new project is a project of its own: it gets a root session, its own
+    /// agents, and its own checkouts. Only the link back to the project it was
+    /// branched out of is recorded, so a client can group it under that
+    /// project. A client inherits the parent's sources and model by attaching
+    /// them to the new session; the worker does not copy them.
+    CreateSubProject {
+        parent_session_id: AgentSessionId,
+        name: String,
+    },
+
     SendProjectAgentMessage {
         message: AgentMessageDraft,
     },

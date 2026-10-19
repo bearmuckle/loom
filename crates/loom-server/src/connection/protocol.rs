@@ -272,7 +272,8 @@ impl InProcessConnection {
         if self.backend.persistence.is_none()
             && matches!(
                 &request,
-                ClientRequest::Project(ProjectRequest::SendProjectAgentMessage { .. })
+                ClientRequest::Project(ProjectRequest::CreateSubProject { .. })
+                    | ClientRequest::Project(ProjectRequest::SendProjectAgentMessage { .. })
                     | ClientRequest::Project(ProjectRequest::ListProjectAgentMessages { .. })
                     | ClientRequest::Project(ProjectRequest::ControlProjectChild { .. })
                     | ClientRequest::Project(ProjectRequest::GetProjectChildReview { .. })
@@ -282,7 +283,7 @@ impl InProcessConnection {
         {
             return Err(LoomError::new(
                 ErrorCode::UnsupportedCapability,
-                "project agents and messages require durable storage",
+                "project agents, messages, and sub projects require durable storage",
                 false,
             ));
         }
@@ -769,6 +770,11 @@ impl InProcessConnection {
                     return Err(unauthorized_session(message.target_session_id));
                 }
             }
+            // A sub project is created beside the project it branches out of, so
+            // its parent session is the one that has to fit the token's scope.
+            ClientRequest::Project(ProjectRequest::CreateSubProject {
+                parent_session_id, ..
+            }) => session_id = Some(*parent_session_id),
             ClientRequest::Run(RunRequest::StartSessionAgentRun {
                 session_id: requested_session,
                 ..

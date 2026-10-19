@@ -28,6 +28,13 @@ pub struct ProjectAgentRecord {
 pub struct ProjectSnapshot {
     pub project_id: ProjectId,
     pub root_session_id: AgentSessionId,
+    /// The project this one was branched out of, when it is a sub project.
+    ///
+    /// A sub project is a project of its own: it owns a root session, its
+    /// agents, and its checkouts. The link only records where it came from, so
+    /// a client can group it under its parent.
+    #[serde(default)]
+    pub parent_project_id: Option<ProjectId>,
     pub agents: Vec<ProjectAgentRecord>,
     /// Durable task intent and lifecycle state for delegated project agents.
     #[serde(default)]
@@ -341,6 +348,7 @@ mod tests {
         let snapshot = ProjectSnapshot {
             project_id,
             root_session_id: root,
+            parent_project_id: None,
             agents: vec![
                 ProjectAgentRecord {
                     session_id: root,
@@ -372,6 +380,13 @@ mod tests {
         assert_eq!(decoded.agents[0].depth, 1);
         assert_eq!(decoded.agents[1].depth, 2);
         assert_eq!(decoded.agents[1].parent_session_id, Some(root));
+        assert_eq!(decoded.parent_project_id, None);
+        // A snapshot written before sub projects existed decodes as a project
+        // that was not branched out of another one.
+        let mut legacy = serde_json::to_value(&snapshot).unwrap();
+        legacy.as_object_mut().unwrap().remove("parent_project_id");
+        let legacy: ProjectSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.parent_project_id, None);
     }
 
     #[test]

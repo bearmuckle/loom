@@ -170,6 +170,110 @@ fn project_hierarchy_constraints_reject_invalid_depth_and_cross_project_parent()
 }
 
 #[test]
+fn sub_projects_record_their_parent_project_and_refuse_other_parents() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+    let persistence = FilePersistence::open(&path).unwrap();
+    let mut manager = SessionManager::default();
+    let (parent, _) = manager
+        .create_in_workspace(WorkspaceId::new(), "Parent project")
+        .unwrap();
+    persistence
+        .save_state_with_sessions(&manager.export_state())
+        .unwrap();
+    let parent_project_id = ProjectId::from_uuid(*parent.id.as_uuid());
+
+    let sub_project = AgentSessionSnapshot {
+        id: AgentSessionId::new(),
+        workspace_id: parent.workspace_id,
+        name: "Branch out".to_owned(),
+        state: AgentSessionState::Idle,
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
+    };
+    persistence
+        .create_sub_project(&sub_project, parent_project_id, EventSequence::new(2))
+        .unwrap();
+
+    // The sub project is a project of its own whose snapshot names the project
+    // it branched out of, while the parent keeps no link of its own.
+    let snapshot = persistence
+        .load_project_snapshot(ProjectId::from_uuid(*sub_project.id.as_uuid()))
+        .unwrap()
+        .expect("the sub project is durable");
+    assert_eq!(snapshot.root_session_id, sub_project.id);
+    assert_eq!(snapshot.parent_project_id, Some(parent_project_id));
+    assert_eq!(snapshot.agents.len(), 1);
+    assert_eq!(snapshot.agents[0].depth, 1);
+    let parent_snapshot = persistence
+        .load_project_snapshot(parent_project_id)
+        .unwrap()
+        .expect("the parent project is durable");
+    assert_eq!(parent_snapshot.parent_project_id, None);
+    // Looking the branch up by its session finds the same project.
+    assert_eq!(
+        persistence
+            .load_project_snapshot_for_session(sub_project.id)
+            .unwrap()
+            .expect("the sub project is reachable by session"),
+        snapshot
+    );
+
+    // An existing session that is not a project root of the same workspace
+    // cannot be a parent, and a project cannot be its own parent.
+    let unrelated = AgentSessionId::new();
+    let error = persistence
+        .create_sub_project(
+            &AgentSessionSnapshot {
+                id: unrelated,
+                workspace_id: parent.workspace_id,
+                name: "Unrelated".to_owned(),
+                ..sub_project.clone()
+            },
+            ProjectId::new(),
+            EventSequence::new(3),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidRequest);
+    let error = persistence
+        .create_sub_project(
+            &AgentSessionSnapshot {
+                id: sub_project.id,
+                ..sub_project.clone()
+            },
+            ProjectId::from_uuid(*sub_project.id.as_uuid()),
+            EventSequence::new(3),
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidRequest);
+
+    // A sub project is a project of its own, so it can be the parent of a
+    // further sub project.
+    let nested = AgentSessionSnapshot {
+        id: AgentSessionId::new(),
+        name: "Branch out again".to_owned(),
+        ..sub_project.clone()
+    };
+    persistence
+        .create_sub_project(
+            &nested,
+            ProjectId::from_uuid(*sub_project.id.as_uuid()),
+            EventSequence::new(3),
+        )
+        .unwrap();
+    assert_eq!(
+        persistence
+            .load_project_snapshot(ProjectId::from_uuid(*nested.id.as_uuid()))
+            .unwrap()
+            .expect("the nested sub project is durable")
+            .parent_project_id,
+        Some(ProjectId::from_uuid(*sub_project.id.as_uuid()))
+    );
+
+    drop(persistence);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn project_child_and_agent_messages_are_atomic_ordered_and_request_idempotent() {
     let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
     let persistence = FilePersistence::open(&path).unwrap();

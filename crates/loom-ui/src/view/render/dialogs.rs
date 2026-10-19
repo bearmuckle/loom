@@ -229,6 +229,98 @@ impl LoomView {
             .into_any()
     }
 
+    /// Renders the sub project dialog: the one field that names a branch of the
+    /// project on screen. Everything else the branch needs is inherited, so
+    /// there is nothing else to choose.
+    pub(crate) fn render_sub_project_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(dialog) = &self.sub_project_dialog else {
+            return div().into_any();
+        };
+        div()
+            .id("sub-project-dialog")
+            .test_support()
+            .occlude()
+            .absolute()
+            .top(px(120.))
+            .left(px(280.))
+            .w(px(420.))
+            .p_3()
+            .rounded_lg()
+            .bg(rgb(0x1b1d24))
+            .border_1()
+            .border_color(rgb(0x3b4555))
+            .shadow_lg()
+            .text_color(rgb(0xe5e7eb))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0xf3f4f6))
+                    .child("New sub project"),
+            )
+            .child(
+                div()
+                    .mt_1()
+                    .text_xs()
+                    .text_color(rgb(0x8f98a6))
+                    .child(format!(
+                        "Branches from {}. It gets its own session, sources, and checkouts.",
+                        dialog.parent_name
+                    )),
+            )
+            .child(
+                div().mt_3().child(
+                    KitInput::new(
+                        self.sub_project_input_state
+                            .as_ref()
+                            .expect("sub project input initialized before rendering"),
+                    )
+                    .id("sub-project-name-input")
+                    .small(),
+                ),
+            )
+            .child(
+                div()
+                    .mt_3()
+                    .flex()
+                    .justify_end()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("cancel-sub-project")
+                            .test_support()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(0x242833))
+                            .hover(|style| style.bg(rgb(0x293244)))
+                            .text_sm()
+                            .cursor_pointer()
+                            .child("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_sub_project_dialog(cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("confirm-sub-project")
+                            .test_support()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(0x2563eb))
+                            .text_sm()
+                            .text_color(rgb(0xffffff))
+                            .cursor_pointer()
+                            .child("Create")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_sub_project(cx);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any()
+    }
+
     pub(crate) fn render_source_dialog(
         &self,
         layout: ResponsiveLayout,

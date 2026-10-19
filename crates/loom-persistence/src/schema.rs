@@ -39,6 +39,19 @@ CREATE INDEX IF NOT EXISTS sessions_hierarchy_by_project
 CREATE INDEX IF NOT EXISTS sessions_hierarchy_by_parent
     ON sessions_hierarchy(parent_session_id, session_id)
     WHERE parent_session_id IS NOT NULL;
+-- A sub project is a project of its own that was branched out of another one.
+-- The link only groups it in a client: every project, membership, and checkout
+-- stays independent, and removing either project drops the link alone.
+CREATE TABLE IF NOT EXISTS project_parents (
+    project_id BLOB PRIMARY KEY NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+        CHECK(length(project_id) = 16),
+    parent_project_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+        CHECK(length(parent_project_id) = 16),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    CHECK(project_id != parent_project_id)
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS project_parents_by_parent
+    ON project_parents(parent_project_id, project_id);
 CREATE TRIGGER IF NOT EXISTS sessions_hierarchy_parent_depth_insert
 BEFORE INSERT ON sessions_hierarchy
 WHEN NEW.parent_session_id IS NOT NULL AND NOT EXISTS (
@@ -1207,6 +1220,11 @@ fn migrate_schema_transaction(connection: &Connection, from_version: u32) -> Res
             // new baseline tables.
             10 => {
                 version = 11;
+            }
+            // v12 adds the link that groups a sub project under the project it
+            // was branched out of, a new baseline table.
+            11 => {
+                version = 12;
             }
             other => return Err(unsupported_database_error(other)),
         }
