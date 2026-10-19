@@ -625,6 +625,7 @@ impl LoomView {
             projects: &projects,
             active_session_id: self.active_session.id,
             source_labels: &self.session_sources,
+            pending: &self.session_pending_work,
             filter: &filter,
             now_millis: Timestamp::now().as_unix_millis(),
         });

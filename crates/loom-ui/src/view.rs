@@ -569,6 +569,11 @@ pub(crate) struct LoomView {
     session_source_lookups: BTreeMap<AgentSessionId, (Option<String>, Option<String>)>,
     /// Serializes background source discovery across render-triggered refreshes.
     session_source_request_in_flight: bool,
+    /// Work the client started on a project and the worker has not confirmed
+    /// yet, keyed by the project's root session. The row reports it in place of
+    /// its source, so a project is listed the moment the worker creates it and
+    /// an archive reports progress from the click instead of from the answer.
+    session_pending_work: BTreeMap<AgentSessionId, ProjectPendingWork>,
     /// Last session-list error per worker node, so a worker that failed to load
     /// is distinguishable from one that simply has no projects.
     node_session_load_errors: BTreeMap<String, String>,
@@ -823,7 +828,8 @@ pub(crate) struct ProjectListRow {
     /// the row is listed under it and marked as a branch.
     pub(crate) sub_project: bool,
     pub(crate) name: String,
-    /// The project's main source when known, otherwise `updated <when>`.
+    /// The project's main source when known, otherwise `updated <when>`. Work
+    /// in flight replaces it, because it is what the row is doing right now.
     pub(crate) detail: String,
     /// The one-line agent summary, omitted when the project has no agents.
     pub(crate) summary: Option<String>,
@@ -834,6 +840,41 @@ pub(crate) struct ProjectListRow {
     pub(crate) status: SessionStatusPill,
     /// The pill shown beside the name, for attention states only.
     pub(crate) attention: Option<SessionStatusPill>,
+    /// Work the client started for this project and the worker has not
+    /// confirmed yet. It keeps the row animating and names the step on the
+    /// second line, so the pane reports the wait instead of staying silent.
+    pub(crate) pending: Option<ProjectPendingWork>,
+}
+
+/// The step a project row reports while the client waits for the worker to
+/// finish work the client started.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectPendingWorkKind {
+    /// The project exists, but its source is still being cloned or attached.
+    SettingUp,
+    /// The archive request is in flight.
+    Archiving,
+}
+
+/// One project's work in flight: the pill beside its name and the second line
+/// that names the step.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProjectPendingWork {
+    pub(crate) kind: ProjectPendingWorkKind,
+    /// The row's second line while the work runs.
+    pub(crate) detail: String,
+}
+
+impl ProjectPendingWork {
+    /// The pill shown beside the project name while the work runs.
+    pub(crate) fn pill(&self) -> SessionStatusPill {
+        let label = match self.kind {
+            ProjectPendingWorkKind::SettingUp => "Setting up",
+            ProjectPendingWorkKind::Archiving => "Archiving",
+        };
+        // Calm blue: the row is working, nothing is waiting on the user.
+        SessionStatusPill::new(label, 0x93c5fd, 0x263b58)
+    }
 }
 
 /// The projects owned by one worker, in list order.
@@ -865,6 +906,9 @@ pub(crate) struct ProjectListInput<'a> {
     pub(crate) active_session_id: AgentSessionId,
     /// The main source of each project, shown as the row's second line.
     pub(crate) source_labels: &'a BTreeMap<AgentSessionId, String>,
+    /// Work the client started on a project and the worker has not confirmed
+    /// yet. It wins over the source label, because the row is doing it now.
+    pub(crate) pending: &'a BTreeMap<AgentSessionId, ProjectPendingWork>,
     /// The lowercased filter text. It matches project names only.
     pub(crate) filter: &'a str,
     pub(crate) now_millis: u64,
@@ -965,6 +1009,7 @@ pub(crate) fn project_list_model(input: ProjectListInput<'_>) -> ProjectListMode
                 agents,
                 &active_sessions,
                 input.source_labels,
+                input.pending.get(&session_id),
                 input.now_millis,
             ));
         }
@@ -1010,13 +1055,17 @@ fn project_list_row(
     agents: Vec<ProjectAgentRow>,
     active_sessions: &BTreeSet<AgentSessionId>,
     source_labels: &BTreeMap<AgentSessionId, String>,
+    pending: Option<&ProjectPendingWork>,
     now_millis: u64,
 ) -> ProjectListRow {
     // A project shows activity for its delegated agents too, so a sub agent
     // that is working keeps its project's row alive. Session state is
     // authoritative; persisted task records can lag behind and would keep a
-    // finished project animating.
-    let active = active_sessions.contains(&session.id)
+    // finished project animating. Work the client just started counts as well:
+    // a clone or an archive in flight is activity, even while the session it
+    // belongs to is idle.
+    let active = pending.is_some()
+        || active_sessions.contains(&session.id)
         || agents
             .iter()
             .any(|agent| active_sessions.contains(&agent.session_id));
@@ -1024,17 +1073,27 @@ fn project_list_row(
         session_id: session.id,
         sub_project: false,
         name: session.name.clone(),
-        detail: source_labels.get(&session.id).cloned().unwrap_or_else(|| {
-            format!(
-                "updated {}",
-                relative_time(session.updated_at.as_unix_millis(), now_millis)
-            )
-        }),
+        detail: pending
+            .map(|pending| pending.detail.clone())
+            .or_else(|| source_labels.get(&session.id).cloned())
+            .unwrap_or_else(|| {
+                format!(
+                    "updated {}",
+                    relative_time(session.updated_at.as_unix_millis(), now_millis)
+                )
+            }),
         summary: (!agents.is_empty()).then(|| agent_summary_line(&agents)),
         agents,
         active,
-        status: session_status_pill(session.state, None),
-        attention: project_attention_pill(session.state),
+        // The dots take the colour of what the row is doing: work the client
+        // started reads like work in flight instead of like an idle project.
+        status: pending
+            .map(ProjectPendingWork::pill)
+            .unwrap_or_else(|| session_status_pill(session.state, None)),
+        attention: pending
+            .map(ProjectPendingWork::pill)
+            .or_else(|| project_attention_pill(session.state)),
+        pending: pending.cloned(),
     }
 }
 
@@ -1950,6 +2009,7 @@ impl LoomView {
             session_sources: BTreeMap::new(),
             session_source_lookups: BTreeMap::new(),
             session_source_request_in_flight: false,
+            session_pending_work: BTreeMap::new(),
             node_session_load_errors: BTreeMap::new(),
             active_session: active_session.clone(),
             active_run: None,

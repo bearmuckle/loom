@@ -283,12 +283,25 @@ impl LoomView {
             return;
         }
         self.archive_request_in_flight = true;
+        // The row reports the request from the click, not from the answer: an
+        // archive that has to reach a remote worker would otherwise leave the
+        // pane looking unchanged until it returned.
+        self.begin_pending_work(
+            session_id,
+            ProjectPendingWorkKind::Archiving,
+            "Archiving…".to_owned(),
+        );
         self.record_status("Archiving session...");
+        cx.notify();
         self.dispatch(
             cx,
             ClientRequest::Session(SessionRequest::ArchiveAgentSession { session_id }),
             move |view, response, cx| {
                 view.archive_request_in_flight = false;
+                // The answer ends the row's reported work either way: success
+                // removes the row, a refusal puts it back to how it was.
+                view.finish_pending_work(session_id);
+                cx.notify();
                 match response.result {
                     Ok(ServerResponse::Session(SessionResponse::AgentSessionArchived(
                         snapshot,
@@ -407,6 +420,7 @@ impl LoomView {
             self.session_auto_approve_actions.remove(session_id);
             self.session_ask_before_destructive_actions
                 .remove(session_id);
+            self.session_pending_work.remove(session_id);
         }
         // Drop the archived sessions from every cached project snapshot so the
         // tree view stops rendering them without waiting for a refresh.
@@ -915,12 +929,16 @@ impl LoomView {
 
     /// Projects whose main source is still unknown, in list order and bounded
     /// per refresh. A delegated agent is skipped: it appears under its
-    /// project's own row, which carries the project's source.
+    /// project's own row, which carries the project's source. A project the
+    /// client just created is skipped too: its source is still being attached,
+    /// and an answer recorded before that finishes would cache "no source" for
+    /// good instead of being asked again once the clone lands.
     pub(crate) fn session_source_lookup_candidates(&self) -> Vec<AgentSessionId> {
         self.sessions
             .iter()
             .filter(|session| !self.session_sources.contains_key(&session.id))
             .filter(|session| !self.session_source_lookups.contains_key(&session.id))
+            .filter(|session| !self.session_pending_work.contains_key(&session.id))
             .filter(|session| !self.session_is_project_child(session.id))
             .take(Self::SESSION_SOURCE_LOOKUPS_PER_REFRESH)
             .map(|session| session.id)
@@ -966,6 +984,20 @@ impl LoomView {
             }
             None => "Creating project…".to_owned(),
         };
+        // The row names the step its source is on until the clone or the attach
+        // lands, so the wait reads as work on that project.
+        let setup_detail = match source.as_ref() {
+            Some(SessionCreationSource::GitHub(source)) => {
+                if source.reuse_local {
+                    format!("Reusing the clone of {}…", source.full_name)
+                } else {
+                    format!("Cloning {}…", source.full_name)
+                }
+            }
+            Some(SessionCreationSource::LocalDirectory(_)) => "Attaching the directory…".to_owned(),
+            None => "Preparing the project…".to_owned(),
+        };
+        let source_label = source.as_ref().map(session_source_context_label);
         self.record_status(creation_status);
         let Some(backend) = self.node_backends.get(&node_id).cloned() else {
             self.record_backend_error(
@@ -1033,7 +1065,9 @@ impl LoomView {
                 .ok();
                 return;
             }
-            let result = async {
+            // Create only. The source is attached below, once the project is
+            // already on screen.
+            let created = async {
                 // A worker keeps its own workspace; the client never shares a
                 // home workspace across the fleet. Create one on demand when the
                 // worker has none yet.
@@ -1048,84 +1082,155 @@ impl LoomView {
                     ))
                     .wait()
                     .await;
-                let snapshot = match response.result? {
-                    ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => snapshot,
-                    response => return Err(unexpected_response("session creation", response)),
-                };
-                log::info!("created session {}; attaching source", snapshot.id);
-                let setup = match source {
-                    None => Ok(()),
-                    Some(SessionCreationSource::LocalDirectory(source)) => {
-                        let path = source_mount_path("sources", &source, &[]);
-                        let response = backend
-                            .submit(RequestEnvelope::new(ClientRequest::Filesystem(FilesystemRequest::AttachSessionDirectory{
-                                session_id: snapshot.id,
-                                source,
-                                path,
-                            })))
-                            .wait()
-                            .await;
-                        match response.result? {
-                            ServerResponse::Filesystem(FilesystemResponse::SessionDirectoryAttached{ .. }) => Ok(()),
-                            response => Err(unexpected_response("directory attachment", response)),
-                        }
+                match response.result? {
+                    ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => {
+                        Ok(snapshot)
                     }
-                    Some(SessionCreationSource::GitHub(source)) => {
-                        log::info!(
-                            "preparing GitHub repository {} for session {} (reuse_local={})",
-                            source.full_name,
-                            snapshot.id,
-                            source.reuse_local
-                        );
-                        let path = source_mount_path("repositories", &source.full_name, &[]);
-                        let response = backend
-                            .submit(RequestEnvelope::new(ClientRequest::Repository(RepositoryRequest::AttachSessionRepository{
-                                session_id: snapshot.id,
-                                source: source.clone_url,
-                                path,
-                                revision: None,
-                                reuse_local: source.reuse_local,
-                            })))
-                            .wait()
-                            .await;
-                        match response.result? {
-                            ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(_)) => Ok(()),
-                            response => Err(unexpected_response("repository attachment", response)),
-                        }
-                    }
-                };
-                if let Err(error) = setup {
-                    log::error!("session source setup failed: {}", error.message);
-                    let _ = backend
-                        .submit(RequestEnvelope::new(ClientRequest::Session(SessionRequest::ArchiveAgentSession{
-                            session_id: snapshot.id,
-                        })))
-                        .wait()
-                        .await;
-                    return Err(error);
+                    response => Err(unexpected_response("session creation", response)),
                 }
-                Ok(snapshot)
             }
             .await;
-            view.update(cx, |view, cx| match result {
-                Ok(snapshot) => {
-                    view.record_status("Project created successfully");
-                    view.node_model_catalogs
-                        .insert(node_id.clone(), models);
-                    view.session_models.insert(snapshot.id, model);
-                    view.session_node_ids
-                        .insert(snapshot.id, node_id.clone());
-                    view.sessions.push(snapshot.clone());
-                    view.select_session(snapshot, cx);
-                }
+            let snapshot = match created {
+                Ok(snapshot) => snapshot,
                 Err(error) => {
                     log::error!("session creation failed: {}", error.message);
-                    view.record_backend_error("create session", error)
-                },
+                    view.update(cx, |view, cx| {
+                        view.record_backend_error("create session", error);
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            log::info!(
+                "created session {}; listing it while its source is attached",
+                snapshot.id
+            );
+            view.update(cx, |view, cx| {
+                view.publish_created_session(
+                    snapshot.clone(),
+                    node_id.clone(),
+                    model.clone(),
+                    setup_detail.clone(),
+                    cx,
+                );
+                cx.notify();
+            })
+            .ok();
+            let setup = attach_creation_source(&backend, snapshot.id, source).await;
+            if let Err(error) = setup {
+                log::error!("session source setup failed: {}", error.message);
+                let _ = backend
+                    .submit(RequestEnvelope::new(ClientRequest::Session(
+                        SessionRequest::ArchiveAgentSession {
+                            session_id: snapshot.id,
+                        },
+                    )))
+                    .wait()
+                    .await;
+                view.update(cx, |view, cx| {
+                    view.abandon_created_project(snapshot.id, cx);
+                    view.record_backend_error("create session", error);
+                    cx.notify();
+                })
+                .ok();
+                return;
+            }
+            view.update(cx, |view, cx| {
+                view.finish_project_setup(snapshot, source_label, cx);
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Lists a project the worker has just created, before its source is
+    /// attached, and opens it.
+    ///
+    /// Creation is immediate: the worker answers with the session long before a
+    /// clone finishes, so the row appears at once and reports the setup step
+    /// until [`Self::finish_project_setup`] ends it.
+    fn publish_created_session(
+        &mut self,
+        session: AgentSessionSnapshot,
+        node_id: String,
+        model: ModelId,
+        setup_detail: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.session_node_ids.insert(session.id, node_id);
+        self.session_models.insert(session.id, model);
+        match self
+            .sessions
+            .iter_mut()
+            .find(|known| known.id == session.id)
+        {
+            Some(known) => *known = session.clone(),
+            None => self.sessions.push(session.clone()),
+        }
+        self.begin_pending_work(session.id, ProjectPendingWorkKind::SettingUp, setup_detail);
+        self.select_session(session, cx);
+    }
+
+    /// Ends a created project's setup: the row shows the source it was created
+    /// from, and the project is asked about again so its row stops reporting
+    /// the setup step.
+    fn finish_project_setup(
+        &mut self,
+        session: AgentSessionSnapshot,
+        source_label: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_pending_work(session.id);
+        // A project archived or deleted while its clone ran has no row left to
+        // update.
+        if !self.sessions.iter().any(|known| known.id == session.id) {
+            cx.notify();
+            return;
+        }
+        if let Some(label) = source_label {
+            self.session_sources.insert(session.id, label);
+        }
+        // Discovery ran while the clone was in flight and found no source, so
+        // the project is asked about again now that it has one.
+        self.session_source_lookups.remove(&session.id);
+        self.record_status("Project created successfully");
+        self.refresh_session_source_labels(cx);
+        self.refresh_missing_project_snapshots(cx);
+        cx.notify();
+    }
+
+    /// Drops a project whose source could not be attached. The caller archives
+    /// the session the project was created for, so nothing is left behind.
+    fn abandon_created_project(&mut self, session_id: AgentSessionId, cx: &mut Context<Self>) {
+        self.finish_pending_work(session_id);
+        let was_active = self.forget_archived_session(session_id);
+        if was_active {
+            if let Some(session) = self.sessions.first().cloned() {
+                self.select_session(session, cx);
+            } else {
+                self.activate_session(empty_session_snapshot(self.workspace_id));
+                self.review.open = false;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Records work the client started on a project, so its row reports the
+    /// step until the worker confirms it.
+    fn begin_pending_work(
+        &mut self,
+        session_id: AgentSessionId,
+        kind: ProjectPendingWorkKind,
+        detail: String,
+    ) {
+        self.session_pending_work
+            .insert(session_id, ProjectPendingWork { kind, detail });
+    }
+
+    /// Clears a project's reported work, so its row shows its source again.
+    fn finish_pending_work(&mut self, session_id: AgentSessionId) {
+        self.session_pending_work.remove(&session_id);
     }
 
     pub(crate) fn begin_session_rename(
@@ -1298,5 +1403,74 @@ async fn resolve_or_create_workspace(
     match created.result? {
         ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => Ok(workspace),
         response => Err(unexpected_response("workspace creation", response)),
+    }
+}
+
+/// The second line a project row shows for the source it was created from.
+fn session_source_context_label(source: &SessionCreationSource) -> String {
+    match source {
+        SessionCreationSource::LocalDirectory(path) => source_context_label(path),
+        SessionCreationSource::GitHub(source) => source_context_label(&source.clone_url),
+    }
+}
+
+/// Attaches a created project's source on the worker that owns it.
+///
+/// This is the step that takes time: a clone of a large repository, or a mount
+/// of a large folder. The caller lists the project before it starts, so the row
+/// reports the step instead of the pane waiting without any trace of it.
+async fn attach_creation_source(
+    backend: &BackendWorker,
+    session_id: AgentSessionId,
+    source: Option<SessionCreationSource>,
+) -> Result<(), LoomError> {
+    match source {
+        None => Ok(()),
+        Some(SessionCreationSource::LocalDirectory(source)) => {
+            let path = source_mount_path("sources", &source, &[]);
+            let response = backend
+                .submit(RequestEnvelope::new(ClientRequest::Filesystem(
+                    FilesystemRequest::AttachSessionDirectory {
+                        session_id,
+                        source,
+                        path,
+                    },
+                )))
+                .wait()
+                .await;
+            match response.result? {
+                ServerResponse::Filesystem(FilesystemResponse::SessionDirectoryAttached {
+                    ..
+                }) => Ok(()),
+                response => Err(unexpected_response("directory attachment", response)),
+            }
+        }
+        Some(SessionCreationSource::GitHub(source)) => {
+            log::info!(
+                "preparing GitHub repository {} for session {} (reuse_local={})",
+                source.full_name,
+                session_id,
+                source.reuse_local
+            );
+            let path = source_mount_path("repositories", &source.full_name, &[]);
+            let response = backend
+                .submit(RequestEnvelope::new(ClientRequest::Repository(
+                    RepositoryRequest::AttachSessionRepository {
+                        session_id,
+                        source: source.clone_url,
+                        path,
+                        revision: None,
+                        reuse_local: source.reuse_local,
+                    },
+                )))
+                .wait()
+                .await;
+            match response.result? {
+                ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(_)) => {
+                    Ok(())
+                }
+                response => Err(unexpected_response("repository attachment", response)),
+            }
+        }
     }
 }

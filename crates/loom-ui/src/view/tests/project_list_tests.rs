@@ -79,6 +79,7 @@ fn list_filtered(
 ) -> ProjectListModel {
     let owners = BTreeMap::new();
     let source_labels = BTreeMap::new();
+    let pending = BTreeMap::new();
     let node_order = Vec::new();
     project_list_model(ProjectListInput {
         sessions,
@@ -88,6 +89,7 @@ fn list_filtered(
         projects,
         active_session_id: active,
         source_labels: &source_labels,
+        pending: &pending,
         filter,
         now_millis: 10_000,
     })
@@ -465,6 +467,7 @@ fn the_detail_line_prefers_the_source_and_falls_back_to_the_update_time() {
     let owners = BTreeMap::new();
     let node_order = Vec::new();
     let no_labels = BTreeMap::new();
+    let no_pending = BTreeMap::new();
 
     let unknown = project_list_model(ProjectListInput {
         sessions: &sessions,
@@ -474,6 +477,7 @@ fn the_detail_line_prefers_the_source_and_falls_back_to_the_update_time() {
         projects: &[],
         active_session_id: id,
         source_labels: &no_labels,
+        pending: &no_pending,
         filter: "",
         now_millis: 10_000,
     });
@@ -488,10 +492,103 @@ fn the_detail_line_prefers_the_source_and_falls_back_to_the_update_time() {
         projects: &[],
         active_session_id: id,
         source_labels: &source_labels,
+        pending: &no_pending,
         filter: "",
         now_millis: 10_000,
     });
     assert_eq!(rows(&known)[0].detail, "bearmuckle/loom");
+}
+
+/// A project the client created, whose source is still being cloned, is listed
+/// at once: its row names the step and stays active, so creating a project shows
+/// work instead of waiting for the clone.
+#[test]
+fn a_project_being_set_up_reports_the_step_and_stays_active() {
+    let id = AgentSessionId::new();
+    let sessions = vec![session(id, "loom", AgentSessionState::Idle, 1)];
+    let owners = BTreeMap::new();
+    let node_order = Vec::new();
+    // The source label is already known: it comes from the source the project
+    // was created with, not from reading the worker back.
+    let source_labels = BTreeMap::from([(id, "bearmuckle/loom".to_owned())]);
+    let pending = BTreeMap::from([(
+        id,
+        ProjectPendingWork {
+            kind: ProjectPendingWorkKind::SettingUp,
+            detail: "Cloning bearmuckle/loom…".to_owned(),
+        },
+    )]);
+
+    let model = project_list_model(ProjectListInput {
+        sessions: &sessions,
+        owners: &owners,
+        node_order: &node_order,
+        default_node_id: "node",
+        projects: &[],
+        active_session_id: id,
+        source_labels: &source_labels,
+        pending: &pending,
+        filter: "",
+        now_millis: 10_000,
+    });
+
+    let row = &rows(&model)[0];
+    assert_eq!(row.session_id, id, "the new project has its row already");
+    assert_eq!(
+        row.detail, "Cloning bearmuckle/loom…",
+        "the row names the step instead of the source it does not have yet"
+    );
+    assert!(row.active, "a clone in flight is activity on the project");
+    assert_eq!(
+        row.attention.map(|pill| pill.label),
+        Some("Setting up"),
+        "the row reports the setup beside the project name"
+    );
+
+    // Once the clone lands the row shows the source it came from and stops
+    // reporting the setup.
+    let settled = list(&sessions, &[], id);
+    let row = &rows(&settled)[0];
+    assert_eq!(row.detail, "updated just now");
+    assert!(!row.active, "nothing is in flight any more");
+    assert_eq!(row.attention, None);
+    assert_eq!(row.pending, None);
+}
+
+/// An archive the client has submitted is reported on its row from the click,
+/// before the worker answers.
+#[test]
+fn a_project_being_archived_reports_the_request() {
+    let id = AgentSessionId::new();
+    let sessions = vec![session(id, "Project", AgentSessionState::Idle, 1)];
+    let owners = BTreeMap::new();
+    let node_order = Vec::new();
+    let source_labels = BTreeMap::from([(id, "bearmuckle/loom".to_owned())]);
+    let pending = BTreeMap::from([(
+        id,
+        ProjectPendingWork {
+            kind: ProjectPendingWorkKind::Archiving,
+            detail: "Archiving…".to_owned(),
+        },
+    )]);
+
+    let model = project_list_model(ProjectListInput {
+        sessions: &sessions,
+        owners: &owners,
+        node_order: &node_order,
+        default_node_id: "node",
+        projects: &[],
+        active_session_id: id,
+        source_labels: &source_labels,
+        pending: &pending,
+        filter: "",
+        now_millis: 10_000,
+    });
+
+    let row = &rows(&model)[0];
+    assert_eq!(row.detail, "Archiving…");
+    assert!(row.active);
+    assert_eq!(row.attention.map(|pill| pill.label), Some("Archiving"));
 }
 
 /// Opens a 1280x800 window over the nested project scenario, which has one
