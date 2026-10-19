@@ -646,6 +646,91 @@ fn a_session_repository_recorded_with_a_display_name_is_reported_with_its_origin
     let _ = fs::remove_dir_all(&source);
 }
 
+/// A record whose checkout cannot be read keeps the source it stored: listing
+/// repositories reports what it has instead of failing over one record.
+#[test]
+fn a_listed_repository_keeps_its_stored_source_when_its_checkout_is_unreadable() {
+    let source = git_repository();
+    let backend = InProcessBackend::new();
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Unreadable checkout".to_owned(),
+        },
+    )));
+    let Ok(ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace))) =
+        created.result
+    else {
+        panic!("expected workspace creation");
+    };
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
+            workspace_id: workspace.id,
+            name: "Unreadable checkout".to_owned(),
+        },
+    )));
+    let Ok(ServerResponse::Session(SessionResponse::AgentSessionCreated(session))) = created.result
+    else {
+        panic!("expected session creation");
+    };
+    let attached = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+        RepositoryRequest::AttachSessionRepository {
+            session_id: session.id,
+            source: source.display().to_string(),
+            path: "repo".to_owned(),
+            revision: None,
+            reuse_local: false,
+        },
+    )));
+    let Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(repository))) =
+        attached.result
+    else {
+        panic!(
+            "expected repository attachment: {:?}",
+            attached.result.err()
+        );
+    };
+
+    // The record carries the old display name and points at a checkout that is
+    // gone, and no cached Git service can answer for its origin.
+    {
+        let mut records = backend.session_repositories().unwrap();
+        let record = records
+            .get_mut(&session.id)
+            .and_then(|repositories| repositories.get_mut(&repository.id))
+            .expect("the attached repository is recorded");
+        record.source = "vanished".to_owned();
+        record.path = "vanished".to_owned();
+    }
+    backend
+        .session_vcs()
+        .unwrap()
+        .remove(&(session.id, repository.id));
+
+    let listed = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+        RepositoryRequest::ListSessionRepositories {
+            session_id: session.id,
+        },
+    )));
+    let Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositories { repositories })) =
+        listed.result
+    else {
+        panic!("expected a session repository listing");
+    };
+    let listed = repositories
+        .into_iter()
+        .find(|listed| listed.id == repository.id)
+        .expect("the recorded repository is still listed");
+    assert_eq!(
+        listed.source, "vanished",
+        "an unreadable checkout leaves the recorded source as it is"
+    );
+
+    let _ = fs::remove_dir_all(&source);
+}
+
 #[test]
 fn github_repository_search_reports_transport_failures() {
     let error =
