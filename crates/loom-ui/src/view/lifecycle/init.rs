@@ -485,6 +485,9 @@ impl LoomView {
             state: AgentSessionState::Idle,
             created_at: timestamp,
             updated_at: timestamp,
+            // The placeholder is not a worker's session, so nothing chose its
+            // name; it reads like any session written before titles existed.
+            title_source: loom_core::SessionTitleSource::Auto,
         };
         let node_input_initial = format!("{} {}", options.remote(), options.token())
             .trim()
