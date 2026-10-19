@@ -81,9 +81,22 @@ fn confirm_state_wipe(path: &Path, status: SchemaStatus) -> Result<bool, LoomErr
 /// `persistence`, or the in-memory backend when this instance has no durable
 /// database. Both binaries serve the backend this returns.
 pub fn open_backend(persistence: Option<&Path>) -> Result<Arc<InProcessBackend>, LoomError> {
+    open_backend_named(persistence, None)
+}
+
+/// [`open_backend`] with the operator-set node name clients should show.
+///
+/// `node_name` is a value [`crate::resolve_node_name`] accepted; `None` keeps the
+/// derived `hostname · short-id` display name. The name is display-only, so it
+/// changes no persisted state and no protocol field besides
+/// `WorkerNodeStatus.name`.
+pub fn open_backend_named(
+    persistence: Option<&Path>,
+    node_name: Option<&str>,
+) -> Result<Arc<InProcessBackend>, LoomError> {
     match persistence {
-        Some(path) => InProcessBackend::new_persistent_with_github_copilot(path),
-        None => InProcessBackend::new_with_github_copilot(),
+        Some(path) => InProcessBackend::new_persistent_with_github_copilot_named(path, node_name),
+        None => InProcessBackend::new_with_github_copilot_named(node_name),
     }
 }
 
@@ -151,7 +164,8 @@ pub async fn start_remote_server(
         .await?;
     let server = ServingBackend { remote, backend };
     log::info!(
-        "Loom remote backend listening at {}",
+        "Loom remote backend '{}' listening at {}",
+        server.backend.node_name(),
         server.websocket_url()
     );
     log::info!("Health endpoint: {}", server.health_url());

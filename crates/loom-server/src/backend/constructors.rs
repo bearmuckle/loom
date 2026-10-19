@@ -6,10 +6,19 @@ impl InProcessBackend {
     }
 
     pub fn new_with_github_copilot() -> Result<Arc<Self>> {
+        Self::new_with_github_copilot_named(None)
+    }
+
+    /// [`InProcessBackend::new_with_github_copilot`] with an operator-set node
+    /// name, which replaces the derived `hostname · short-id` display name that
+    /// clients show. Validation belongs to
+    /// [`crate::resolve_node_name`], so `node_name` is used as given.
+    pub fn new_with_github_copilot_named(node_name: Option<&str>) -> Result<Arc<Self>> {
         let credentials = github_copilot_credentials()?;
-        Self::with_provider_registry_persistent_credentials(
+        Self::with_provider_registry_persistent_credentials_named(
             ProviderRegistry::configured(credentials)?,
             None,
+            node_name,
         )
     }
 
@@ -160,10 +169,21 @@ impl InProcessBackend {
     }
 
     pub fn new_persistent_with_github_copilot(path: impl Into<PathBuf>) -> Result<Arc<Self>> {
+        Self::new_persistent_with_github_copilot_named(path, None)
+    }
+
+    /// [`InProcessBackend::new_persistent_with_github_copilot`] with an
+    /// operator-set node name; see
+    /// [`InProcessBackend::new_with_github_copilot_named`].
+    pub fn new_persistent_with_github_copilot_named(
+        path: impl Into<PathBuf>,
+        node_name: Option<&str>,
+    ) -> Result<Arc<Self>> {
         let credentials = github_copilot_credentials()?;
-        Self::with_provider_registry_persistent_credentials(
+        Self::with_provider_registry_persistent_credentials_named(
             ProviderRegistry::configured(credentials)?,
             Some(path.into()),
+            node_name,
         )
     }
 
@@ -192,13 +212,22 @@ impl InProcessBackend {
         providers: ProviderRegistry,
         path: Option<PathBuf>,
     ) -> Result<Arc<Self>> {
-        Self::with_provider_registry_and_persistence(
+        Self::with_provider_registry_persistent_credentials_named(providers, path, None)
+    }
+
+    pub(crate) fn with_provider_registry_persistent_credentials_named(
+        providers: ProviderRegistry,
+        path: Option<PathBuf>,
+        node_name: Option<&str>,
+    ) -> Result<Arc<Self>> {
+        Self::with_provider_registry_and_persistence_named(
             providers,
             path.map(|path| {
                 FilePersistence::open_exclusive_writer(path)
                     .map(|store| Arc::new(store) as Arc<dyn Persistence>)
             })
             .transpose()?,
+            node_name,
         )
     }
 
@@ -206,12 +235,20 @@ impl InProcessBackend {
         providers: ProviderRegistry,
         persistence: Option<Arc<dyn Persistence>>,
     ) -> Result<Arc<Self>> {
+        Self::with_provider_registry_and_persistence_named(providers, persistence, None)
+    }
+
+    pub(crate) fn with_provider_registry_and_persistence_named(
+        providers: ProviderRegistry,
+        persistence: Option<Arc<dyn Persistence>>,
+        node_name: Option<&str>,
+    ) -> Result<Arc<Self>> {
         if let Some(persistence) = &persistence {
             let credential_path = persistence.path().with_extension("credentials.json");
             providers
                 .scope_api_key_credentials(Arc::new(FileCredentialStore::open(credential_path)?))?;
         }
-        let (node_id, node_name) = worker_node_identity();
+        let (node_id, node_name) = worker_node_identity(node_name);
         let session_root_base = persistence.as_ref().map_or_else(
             || {
                 std::env::temp_dir().join(format!(

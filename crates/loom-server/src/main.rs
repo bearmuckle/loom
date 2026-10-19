@@ -22,10 +22,10 @@ use loom_server::{
     ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FORCE_DISCARD_ENV, ARCHIVE_RETENTION_SUB_AGENT_ENV,
     ARCHIVE_RETENTION_SWEEP_INTERVAL, DEFAULT_MAX_FRAME_BYTES, DiagnosticsSettings,
     GitHubSignInConfig, InProcessBackend, Instance, InstanceLayout, InstanceOptions,
-    MAX_FRAME_BYTES_ENV, ProcessContext, RemoteServerConfig, ReopenBackoff, ServerTlsConfig,
-    ServingBackend, TlsState, apply_startup_archive_retention, diagnostics_lines,
-    fail_stop_record_path, open_backend, reopen_after_fail_stop,
-    resolve_archive_retention_with_sub_agent, resolve_max_frame_bytes,
+    MAX_FRAME_BYTES_ENV, NODE_NAME_ENV, ProcessContext, RemoteServerConfig, ReopenBackoff,
+    ServerTlsConfig, ServingBackend, TlsState, apply_startup_archive_retention, diagnostics_lines,
+    fail_stop_record_path, open_backend_named, reopen_after_fail_stop,
+    resolve_archive_retention_with_sub_agent, resolve_max_frame_bytes, resolve_node_name,
     run_archive_retention_sweeps, start_remote_server, startup_summary,
     sweep_archive_retention_at_startup,
 };
@@ -78,6 +78,8 @@ enum ParsedArgs {
 struct ServerOptions {
     bind: SocketAddr,
     instance_name: Option<String>,
+    /// Raw `--node-name` value, before it is resolved against the environment.
+    node_name: Option<String>,
     token: Option<String>,
     token_file: Option<PathBuf>,
     persistence: Option<PathBuf>,
@@ -109,6 +111,7 @@ impl Default for ServerOptions {
         Self {
             bind: DEFAULT_BIND.parse().expect("valid default bind address"),
             instance_name: None,
+            node_name: None,
             token: None,
             token_file: None,
             persistence: None,
@@ -152,6 +155,17 @@ impl ServerOptions {
         resolve_max_frame_bytes(
             self.max_frame_bytes.as_deref(),
             env::var(MAX_FRAME_BYTES_ENV).ok().as_deref(),
+        )
+    }
+
+    /// The name this worker reports to clients: `--node-name`,
+    /// `LOOM_NODE_NAME`, or the derived `hostname · short-id` display name when
+    /// neither is given. An unusable value fails the start and names the input
+    /// to fix.
+    fn node_name(&self) -> Result<Option<String>, LoomError> {
+        resolve_node_name(
+            self.node_name.as_deref(),
+            env::var(NODE_NAME_ENV).ok().as_deref(),
         )
     }
 
@@ -225,6 +239,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
             "--instance-name" => {
                 options.instance_name = Some(required_value(&mut args, "--instance-name")?);
             }
+            "--node-name" => {
+                options.node_name = Some(required_value(&mut args, "--node-name")?);
+            }
             "--token-file" => {
                 options.token_file =
                     Some(PathBuf::from(required_value(&mut args, "--token-file")?));
@@ -273,6 +290,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
             }
             value if value.starts_with("--instance-name=") => {
                 options.instance_name = Some(value["--instance-name=".len()..].to_owned());
+            }
+            value if value.starts_with("--node-name=") => {
+                options.node_name = Some(value["--node-name=".len()..].to_owned());
             }
             value if value.starts_with("--token-file=") => {
                 options.token_file = Some(PathBuf::from(&value["--token-file=".len()..]));
@@ -361,6 +381,7 @@ fn resolve_tls(options: &ServerOptions) -> Result<Option<ServerTlsConfig>, LoomE
 fn help_text() -> String {
     format!(
         "Usage: loom-server [--bind <addr>] [--instance-name <name>] \
+         [--node-name <name>] \
          [--token <token> | --token-file <path>] [--persistence <path>] \
          [--reset-state] [--archive-retention <duration>] \
          [--archive-retention-force-discard <bool>] \
@@ -377,6 +398,8 @@ fn help_text() -> String {
          \x20 --instance-name <name>\n\
          \x20                        pin this instance's directory instead of naming it \
          after --bind\n\
+         \x20 --node-name <name>   name this worker in client status lines instead of \
+         the derived hostname and node id (LOOM_NODE_NAME is the fallback)\n\
          \x20 --token <token>       bearer token clients must present\n\
          \x20 --token-file <path>   file whose trimmed contents are the bearer token\n\
          \x20 --persistence <path>  keep state in the database at this path\n\
@@ -591,7 +614,10 @@ async fn serve_in(
         state_directory,
     );
     log::info!("{}", startup_summary(&ProcessContext::detect(), &settings));
-    let backend = open_backend(instance.state_db())?;
+    // The node name is validated before any state is opened, so a bad value
+    // fails the start instead of serving under an unintended name.
+    let node_name = options.node_name()?;
+    let backend = open_backend_named(instance.state_db(), node_name.as_deref())?;
     // An explicit flag or variable wins over the persisted policy and is
     // persisted in turn; otherwise the policy loaded when the durable state was
     // opened applies; otherwise retention stays disabled. Either way the
@@ -757,6 +783,7 @@ mod tests {
         let defaults = serve_options(&[]);
         assert_eq!(defaults.bind.to_string(), "127.0.0.1:8765");
         assert_eq!(defaults.instance_name, None);
+        assert_eq!(defaults.node_name, None);
         assert_eq!(defaults.token, None);
         assert_eq!(defaults.token_file, None);
         assert_eq!(defaults.persistence, None);
@@ -788,6 +815,8 @@ mod tests {
             "127.0.0.1:9000",
             "--instance-name",
             "worker",
+            "--node-name",
+            "prod-builder",
             "--token",
             "spaced-token",
             "--persistence",
@@ -811,6 +840,7 @@ mod tests {
         ]);
         assert_eq!(spaced.bind.to_string(), "127.0.0.1:9000");
         assert_eq!(spaced.instance_name.as_deref(), Some("worker"));
+        assert_eq!(spaced.node_name.as_deref(), Some("prod-builder"));
         assert!(spaced.reset_state);
         assert_eq!(spaced.token.as_deref(), Some("spaced-token"));
         assert_eq!(
@@ -833,6 +863,7 @@ mod tests {
         let equals = serve_options(&[
             "--bind=0.0.0.0:9",
             "--instance-name=pinned",
+            "--node-name=prod-builder",
             "--token-file=/tmp/token",
             "--persistence=/tmp/other.db",
             "--archive-retention=30m",
@@ -844,6 +875,7 @@ mod tests {
         ]);
         assert_eq!(equals.bind.to_string(), "0.0.0.0:9");
         assert_eq!(equals.instance_name.as_deref(), Some("pinned"));
+        assert_eq!(equals.node_name.as_deref(), Some("prod-builder"));
         assert_eq!(equals.token, None);
         assert_eq!(equals.token_file.as_deref(), Some(Path::new("/tmp/token")));
         assert_eq!(
@@ -873,6 +905,7 @@ mod tests {
         for flag in [
             "--bind",
             "--instance-name",
+            "--node-name",
             "--token",
             "--token-file",
             "--persistence",
@@ -1020,6 +1053,28 @@ mod tests {
     }
 
     #[test]
+    fn the_node_name_resolves_from_the_flag_then_the_environment() {
+        // Neither input keeps the derived `hostname · short-id` display name.
+        if std::env::var(loom_server::NODE_NAME_ENV).is_err() {
+            assert_eq!(ServerOptions::default().node_name().unwrap(), None);
+        }
+
+        // Both the spaced and the `=` form reach the resolver, which trims the
+        // value it is given.
+        let spaced = serve_options(&["--node-name", "  prod-builder  "]);
+        assert_eq!(spaced.node_name.as_deref(), Some("  prod-builder  "));
+        assert_eq!(spaced.node_name().unwrap().as_deref(), Some("prod-builder"));
+        let equals = serve_options(&["--node-name=prod-builder"]);
+        assert_eq!(equals.node_name().unwrap().as_deref(), Some("prod-builder"));
+
+        // A rejected value names the flag it came from.
+        let empty = serve_options(&["--node-name", "   "]);
+        let error = empty.node_name().unwrap_err();
+        assert_eq!(error.code, loom_core::ErrorCode::InvalidRequest);
+        assert!(error.message.contains("--node-name"), "{error}");
+    }
+
+    #[test]
     fn help_and_version_short_circuit_the_remaining_arguments() {
         assert_eq!(parse(&["--help"]).unwrap(), ParsedArgs::Help);
         assert_eq!(parse(&["-h", "--mystery"]).unwrap(), ParsedArgs::Help);
@@ -1033,6 +1088,8 @@ mod tests {
         run(arguments(&["-V"])).unwrap();
         let help = help_text();
         assert!(help.contains("--instance-name <name>"));
+        assert!(help.contains("--node-name <name>"));
+        assert!(help.contains("LOOM_NODE_NAME"));
         assert!(help.contains("--reset-state"));
         assert!(help.contains("--token-file <path>"));
         assert!(help.contains("--tls-cert <pem>"));

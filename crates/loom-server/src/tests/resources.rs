@@ -70,11 +70,77 @@ fn worker_node_status_reports_capabilities_and_resources() {
     assert_eq!(refreshed.resources.cpu_count, status.resources.cpu_count);
     assert_eq!(refreshed.node_id, status.node_id);
     assert_eq!(refreshed.name, status.name);
+    assert_eq!(status.name, backend.node_name());
     assert_eq!(
         refreshed.resources.memory_total_bytes,
         status.resources.memory_total_bytes
     );
     assert!(status.capabilities.contains(Capability::ReadAgentSession));
+}
+
+#[test]
+fn worker_node_status_reports_an_operator_set_node_name() {
+    let backend = InProcessBackend::with_provider_registry_and_persistence_named(
+        loom_providers::ProviderRegistry::demo(),
+        None,
+        Some("prod-builder"),
+    )
+    .unwrap();
+    assert_eq!(backend.node_name(), "prod-builder");
+
+    let connection = backend.connect();
+    negotiate_m5(&connection);
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Control(
+        ControlRequest::GetWorkerNodeStatus,
+    )));
+    let ServerResponse::Control(ControlResponse::WorkerNodeStatus(status)) =
+        response.result.unwrap()
+    else {
+        panic!("expected worker node status");
+    };
+    assert_eq!(status.name, "prod-builder");
+    // The name is display-only, so the node id is unaffected.
+    assert!(!status.node_id.is_empty());
+    assert_ne!(status.node_id, status.name);
+
+    // A backend without a configured name keeps the derived shape, and the
+    // status reports exactly what the backend says.
+    let derived = InProcessBackend::new();
+    let name = derived.node_name().to_owned();
+    assert!(
+        name.rsplit_once(" · ")
+            .is_some_and(|(hostname, short_id)| !hostname.is_empty() && short_id.len() == 8),
+        "{name:?} should be `hostname · short-id`"
+    );
+}
+
+#[test]
+fn a_named_durable_backend_reports_the_configured_name() {
+    let path = std::env::temp_dir().join(format!("loom-node-name-{}.db", loom_core::RunId::new()));
+    let backend = InProcessBackend::with_provider_registry_persistent_credentials_named(
+        loom_providers::ProviderRegistry::demo(),
+        Some(path.clone()),
+        Some("prod-builder"),
+    )
+    .unwrap();
+    assert_eq!(backend.node_name(), "prod-builder");
+    backend.shutdown().unwrap();
+
+    // The name is display-only, so reopening the same database without one
+    // derives the display name again instead of replaying the old one.
+    let reopened = InProcessBackend::with_provider_registry_persistent_credentials_named(
+        loom_providers::ProviderRegistry::demo(),
+        Some(path.clone()),
+        None,
+    )
+    .unwrap();
+    assert_ne!(reopened.node_name(), "prod-builder");
+    reopened.shutdown().unwrap();
+
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(path.with_extension("credentials.json")).ok();
+    std::fs::remove_dir_all(path.with_extension("session-roots")).ok();
+    std::fs::remove_dir_all(path.with_extension("clone-cache")).ok();
 }
 
 #[test]
