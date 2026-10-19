@@ -5,6 +5,7 @@ impl LoomView {
         &self,
         turn: &AssistantTurn,
         index: usize,
+        layout: ResponsiveLayout,
         parent: &Entity<LoomView>,
     ) -> gpui_kit::AnyElement {
         let role = div()
@@ -79,6 +80,13 @@ impl LoomView {
                     }
                     part_index += 1;
                 }
+                // An `ask_user` call is a question for the user to answer, not
+                // tool activity, so it renders as its own component.
+                AssistantPart::Tool(part) if part.name == ASK_USER_TOOL => {
+                    body = body
+                        .child(self.render_agent_question(part, index, part_index, layout, parent));
+                    part_index += 1;
+                }
                 AssistantPart::Tool(_) => {
                     // All tool calls in a response collapse behind one usage
                     // summary line; expanding it reveals the existing per-tool
@@ -87,14 +95,18 @@ impl LoomView {
                     let mut end = part_index + 1;
                     while end < turn.parts.len() {
                         match &turn.parts[end] {
+                            // A question is presented on its own, so it neither
+                            // joins the run nor counts as one of its tools.
+                            AssistantPart::Tool(part) if part.name == ASK_USER_TOOL => break,
                             AssistantPart::Tool(_) | AssistantPart::Reasoning(_) => end += 1,
                             _ => break,
                         }
                     }
                     let parts = &turn.parts[part_index..end];
                     // Low hides the agent's work, except for a run blocked on the
-                    // user: its usage block holds the approval and input
-                    // controls, so it stays reachable at every level.
+                    // user: its usage block holds the approval control, so it
+                    // stays reachable at every level. A question is not part of
+                    // this block, so it never hides with the work.
                     if self.output_detail.shows_activity()
                         || tool_needs_attention(&run_tool_parts(parts))
                     {
@@ -790,23 +802,17 @@ impl LoomView {
                     )
                     .into_any()
             }
-            TimelineItem::Assistant(turn) => self.render_assistant_turn(turn, index, parent),
+            TimelineItem::Assistant(turn) => {
+                self.render_assistant_turn(turn, index, layout, parent)
+            }
             TimelineItem::Collaboration(entry) => render_collaboration_entry(entry, index),
             TimelineItem::System(note) => {
-                // A clarification request is a question for the user to answer,
-                // not a status line, so it gets its own component instead of the
-                // generic note card.
-                if note.tone == SystemTone::Input {
-                    return Self::render_agent_question(note, layout, parent);
-                }
                 let (surface, accent) = match note.tone {
                     SystemTone::Error => (rgb(ERROR_CARD_SURFACE), rgb(ERROR_CARD_ACCENT)),
-                    SystemTone::Input => (rgb(0x241f3b), rgb(0xc4b5fd)),
                     SystemTone::Neutral => (rgb(0x191c22), rgb(0x64748b)),
                 };
                 let text_color = match note.tone {
                     SystemTone::Error => ERROR_CARD_FOREGROUND,
-                    SystemTone::Input => 0xe9d5ff,
                     SystemTone::Neutral => 0x94a3b8,
                 };
                 let mut card = div()
@@ -842,23 +848,34 @@ impl LoomView {
         }
     }
 
-    /// The agent's clarification request, rendered as its own component instead
-    /// of the generic note card.
+    /// The agent's clarification question, rendered as its own component instead
+    /// of a row of tool activity.
     ///
     /// The question is the point of the entry, so it is never behind a
     /// disclosure: the whole text wraps to the available width and stays
-    /// readable at phone sizes. The answer action is the next step and hands the
-    /// user to the composer, where `pending_input` expects the reply. The
-    /// lifecycle heading is replaced by the question framing, which says the
-    /// same thing to the reader.
+    /// readable at phone sizes. A question that offers choices answers with one
+    /// click, and an open question keeps the free-text route through the
+    /// composer, which is where a typed answer is written. The question comes
+    /// from the call that asked it, so the prompt and its choices read the same
+    /// when the run asks them, after a reload, and in history.
     fn render_agent_question(
-        note: &SystemNote,
+        &self,
+        part: &ToolPart,
+        index: usize,
+        part_index: usize,
         layout: ResponsiveLayout,
         parent: &Entity<LoomView>,
     ) -> gpui_kit::AnyElement {
-        let parent_for_answer = parent.clone();
+        let Some(question) = self.question_for(part) else {
+            return div().into_any();
+        };
+        let key = tool_element_id(index, part_index);
+        // Only the question the run is still waiting on can be answered: the
+        // choices of an answered question stay as a record of what it offered,
+        // so they are shut instead of silently sending a stale answer.
+        let open = self.pending_input.is_some() && self.session_permissions().can_act;
         let mut card = div()
-            .id("agent-question")
+            .id(("agent-question", key))
             .test_support()
             .w_full()
             .min_w(px(0.))
@@ -871,7 +888,7 @@ impl LoomView {
             .gap_2()
             .child(
                 div()
-                    .id("agent-question-heading")
+                    .id(("agent-question-heading", key))
                     .test_support()
                     .w_full()
                     .flex()
@@ -885,27 +902,63 @@ impl LoomView {
                 // One wrapping text element, so the question reads in full
                 // instead of being clipped at a fixed width.
                 div()
-                    .id("agent-question-text")
+                    .id(("agent-question-text", key))
                     .test_support()
                     .w_full()
                     .min_w(px(0.))
-                    .aria_label(note.text.clone())
+                    .aria_label(question.prompt.clone())
                     .text_sm()
                     .text_color(rgb(0xe9d5ff))
-                    .child(note.text.clone()),
+                    .child(question.prompt.clone()),
             );
-        card = card.child(
-            Button::new("agent-question-answer")
-                .label("Answer")
-                .small()
-                .accessibility_label("Answer the agent question")
-                .when(layout.phone, |button| {
-                    button.h(layout.control_size()).w_full()
-                })
-                .on_click(move |_, window, cx| {
-                    parent_for_answer.update(cx, |view, cx| view.focus_composer(window, cx));
-                }),
-        );
+        if !question.choices.is_empty() {
+            let mut list = div().w_full().flex().flex_col().gap_1();
+            for (choice_index, choice) in question.choices.iter().enumerate() {
+                let answer = choice.clone();
+                let parent_for_choice = parent.clone();
+                list = list.child(
+                    Button::new((
+                        "agent-question-choice",
+                        question_choice_id(index, part_index, choice_index),
+                    ))
+                    .label(choice.clone())
+                    .outline()
+                    .small()
+                    .w_full()
+                    .when(layout.phone, |button| button.h(layout.control_size()))
+                    .disabled(!open)
+                    .accessibility_label(format!("Answer the agent question with {answer}"))
+                    .on_click(move |_, _, cx| {
+                        // The chosen text is the answer, so it is sent as one
+                        // instead of being typed into the composer first.
+                        let answer = answer.clone();
+                        parent_for_choice.update(cx, |view, cx| {
+                            view.answer_question(answer, cx);
+                        });
+                    }),
+                );
+            }
+            card = card.child(list);
+        }
+        if open {
+            let parent_for_answer = parent.clone();
+            card = card.child(
+                Button::new(("agent-question-answer", key))
+                    .label(if question.choices.is_empty() {
+                        "Answer"
+                    } else {
+                        "Answer in your own words"
+                    })
+                    .small()
+                    .accessibility_label("Answer the agent question")
+                    .when(layout.phone, |button| {
+                        button.h(layout.control_size()).w_full()
+                    })
+                    .on_click(move |_, window, cx| {
+                        parent_for_answer.update(cx, |view, cx| view.focus_composer(window, cx));
+                    }),
+            );
+        }
         card.into_any()
     }
 

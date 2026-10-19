@@ -680,14 +680,38 @@ impl ToolPartStatus {
     }
 }
 
+/// The tool that asks the user a question, and therefore renders as a question
+/// instead of as tool activity.
+pub(crate) const ASK_USER_TOOL: &str = "ask_user";
+
+/// How many choices a question keeps. A model that offers more would flood the
+/// question, so the surplus is dropped.
+pub(crate) const MAX_QUESTION_CHOICES: usize = 6;
+
+/// The longest choice a question keeps. A choice is the answer text one click
+/// sends, so a choice over this bound is dropped rather than truncated: a
+/// shortened choice would send a different answer than the one asked about.
+pub(crate) const MAX_QUESTION_CHOICE_BYTES: usize = 200;
+
+/// The clarification question an `ask_user` call asks.
+///
+/// The question comes from the call's own arguments, so the transcript renders
+/// it from the call that asked it rather than from a second copy in a note. It
+/// therefore reads the same when it arrives, after a reload, and in history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AgentQuestion {
+    pub(crate) prompt: String,
+    /// The answers one click can send, in the order the call offered them.
+    pub(crate) choices: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SystemTone {
     Neutral,
     Error,
-    Input,
 }
 
-/// A non-conversational note: status, an error, or a request for input.
+/// A non-conversational note: status or an error.
 #[derive(Clone, Debug)]
 pub(crate) struct SystemNote {
     pub(crate) tone: SystemTone,

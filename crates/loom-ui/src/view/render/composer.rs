@@ -439,7 +439,6 @@ impl LoomView {
     ) -> gpui_kit::AnyElement {
         let (surface, accent, text_color) = match note.tone {
             SystemTone::Error => (ERROR_CARD_SURFACE, ERROR_CARD_ACCENT, ERROR_CARD_FOREGROUND),
-            SystemTone::Input => (0x241f3b, 0xc4b5fd, 0xe9d5ff),
             SystemTone::Neutral => (0x191c22, 0x64748b, 0x94a3b8),
         };
         let details = note.details.clone();

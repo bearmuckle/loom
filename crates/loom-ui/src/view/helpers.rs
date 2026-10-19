@@ -1508,6 +1508,12 @@ pub(crate) fn tool_element_id(index: usize, part_index: usize) -> u64 {
     ((index as u64) << 32) | part_index as u64
 }
 
+/// The element id of one choice of a question, kept clear of the id the question
+/// itself and its other parts carry so each choice is its own target.
+pub(crate) fn question_choice_id(index: usize, part_index: usize, choice_index: usize) -> u64 {
+    ((index as u64) << 48) | ((part_index as u64) << 16) | choice_index as u64
+}
+
 pub(crate) fn reasoning_preview(text: &str) -> String {
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut preview = normalized.chars().take(96).collect::<String>();
@@ -2190,6 +2196,81 @@ pub(crate) fn tool_detail(call: &loom_model::ToolCall) -> Option<String> {
     }
 }
 
+/// The question an `ask_user` call asks, or `None` for any other call. The
+/// prompt and its choices are read from the call's own arguments, so the
+/// transcript can render the question from the call that asked it.
+pub(crate) fn agent_question(call: &loom_model::ToolCall) -> Option<AgentQuestion> {
+    if call.name != ASK_USER_TOOL {
+        return None;
+    }
+    let prompt = string_argument(&call.arguments, "prompt")?
+        .trim()
+        .to_owned();
+    if prompt.is_empty() {
+        return None;
+    }
+    Some(AgentQuestion {
+        prompt,
+        choices: question_choices(&call.arguments),
+    })
+}
+
+/// The choices a question offers, in the order the call listed them. Blank
+/// repeats and choices over the length bound are dropped, and the list stops at
+/// the count bound, so a model cannot flood the question with answers no reader
+/// could take in.
+fn question_choices(arguments: &serde_json::Value) -> Vec<String> {
+    let Some(offered) = arguments
+        .get("options")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut choices: Vec<String> = Vec::new();
+    for offered in offered {
+        let Some(choice) = offered
+            .as_str()
+            .map(str::trim)
+            .filter(|choice| !choice.is_empty() && choice.len() <= MAX_QUESTION_CHOICE_BYTES)
+        else {
+            continue;
+        };
+        if choices.iter().any(|existing| existing == choice) {
+            continue;
+        }
+        if choices.len() == MAX_QUESTION_CHOICES {
+            break;
+        }
+        choices.push(choice.to_owned());
+    }
+    choices
+}
+
+impl LoomView {
+    /// The call an activity recorded for `id`, when the activity is known. A
+    /// tool part keeps only what it presents, so the arguments the call ran with
+    /// are read back from the activity that recorded them.
+    pub(crate) fn recorded_call(&self, id: loom_core::ToolCallId) -> Option<&loom_model::ToolCall> {
+        self.activity_records
+            .values()
+            .find_map(|activity| activity_call(activity).filter(|call| call.id == id))
+    }
+
+    /// The question a tool part asks. The call's own arguments are the source,
+    /// so the prompt and its choices survive a reload; the part's detail stands
+    /// in for the prompt when no activity records the call, which is all a
+    /// transcript message rebuilt without its arguments can offer.
+    pub(crate) fn question_for(&self, part: &ToolPart) -> Option<AgentQuestion> {
+        if let Some(question) = self.recorded_call(part.id).and_then(agent_question) {
+            return Some(question);
+        }
+        Some(AgentQuestion {
+            prompt: part.detail.clone()?,
+            choices: Vec::new(),
+        })
+    }
+}
+
 /// Rewrites a project-agent tool's JSON result into a short human-readable
 /// summary. Other tools keep their raw output.
 pub(crate) fn humanize_tool_output(name: &str, output: &str) -> String {
@@ -2751,14 +2832,21 @@ pub(crate) fn tool_failure_reason(part: &ToolPart) -> Option<String> {
     Some(reason.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
-pub(crate) fn tool_part_from_activity(activity: &AgentActivityRecord) -> Option<ToolPart> {
-    let call = match &activity.data {
-        AgentActivityData::ModelTurn { .. } => return None,
+/// The call an activity records, or `None` for a model turn. Every tool activity
+/// shape carries the call it ran, which is what keeps the call's arguments
+/// available after a reload.
+pub(crate) fn activity_call(activity: &AgentActivityRecord) -> Option<&loom_model::ToolCall> {
+    match &activity.data {
+        AgentActivityData::ModelTurn { .. } => None,
         AgentActivityData::ToolCall { call, .. }
         | AgentActivityData::File { call, .. }
         | AgentActivityData::Search { call, .. }
-        | AgentActivityData::Command { call, .. } => call,
-    };
+        | AgentActivityData::Command { call, .. } => Some(call),
+    }
+}
+
+pub(crate) fn tool_part_from_activity(activity: &AgentActivityRecord) -> Option<ToolPart> {
+    let call = activity_call(activity)?;
     let detail = match &activity.data {
         // These activity shapes carry the call, which already summarizes the
         // arguments; the title names the target, so the detail adds whatever the

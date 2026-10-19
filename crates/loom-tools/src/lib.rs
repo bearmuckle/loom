@@ -3428,11 +3428,19 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolKind::AskUser.name().to_owned(),
-            description: "Pause the run and ask the user for information needed to continue."
-                .to_owned(),
+            description: "Pause the run and ask the user for information needed to continue. Offer `options` when the answer is a choice among a few answers, so the user can pick one instead of typing.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "properties": {"prompt": {"type": "string"}},
+                "properties": {
+                    "prompt": {"type": "string", "description": "The question to ask."},
+                    "options": {
+                        "type": "array",
+                        "description": "The answers the user can pick from. Omit when the answer is free text.",
+                        "items": {"type": "string"},
+                        "minItems": 2,
+                        "maxItems": 6
+                    }
+                },
                 "required": ["prompt"],
                 "additionalProperties": false
             }),
@@ -3780,7 +3788,7 @@ pub fn tool_guidance(definitions: &[ToolDefinition]) -> Option<String> {
     }
     if present(ToolKind::AskUser) {
         guidance.push(
-            "Call ask_user when you need information only the user can provide instead of guessing.".to_owned(),
+            "Call ask_user when you need information only the user can provide instead of guessing; pass `options` when the answer is a choice among a few answers, so the user can pick one instead of typing.".to_owned(),
         );
     }
     if present(ToolKind::WebSearch) {
@@ -4718,6 +4726,29 @@ mod tests {
                 .any(|name| name == "github_push_branch")
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The question tool offers the answers a user can pick from, so a client
+    /// presents them as choices instead of only a free-text prompt.
+    #[test]
+    fn ask_user_advertises_the_answers_it_can_offer() {
+        let definition = tool_definitions()
+            .into_iter()
+            .find(|definition| definition.name == "ask_user")
+            .expect("the question tool is advertised");
+        let properties = &definition.input_schema["properties"];
+        assert_eq!(properties["prompt"]["type"], "string");
+        let options = &properties["options"];
+        assert_eq!(options["type"], "array");
+        assert_eq!(options["items"]["type"], "string");
+        // One answer is not a choice, and a handful is all a reader can weigh.
+        assert_eq!(options["minItems"], 2);
+        assert_eq!(options["maxItems"], 6);
+        // The question itself stays required; the choices are optional.
+        assert_eq!(
+            definition.input_schema["required"],
+            serde_json::json!(["prompt"])
+        );
     }
 
     #[test]

@@ -4897,14 +4897,6 @@ fn transcript_renders_all_message_and_activity_variants(cx: &mut TestAppContext)
                 progress: None,
                 retryable: true,
             }),
-            TimelineItem::System(SystemNote {
-                tone: SystemTone::Input,
-                heading: Some("Agent needs input".to_owned()),
-                text: "Which branch should I use?".to_owned(),
-                details: None,
-                progress: None,
-                retryable: false,
-            }),
         ];
         view.pending_input = Some("Which branch should I use?".to_owned());
         view.pending_approval = Some(call);

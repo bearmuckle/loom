@@ -111,6 +111,24 @@ impl LoomView {
         .detach();
     }
 
+    /// Answers the question the active run is waiting on with the text a choice
+    /// stands for.
+    ///
+    /// The answer travels the same route as a typed one, so permissions, the
+    /// run revision, and a conflicting direction are handled once: a choice is
+    /// a shortcut for writing the answer, not a second way to send it. The
+    /// guards keep a stale card, a double click, or a read-only connection from
+    /// sending anything.
+    pub(crate) fn answer_question(&mut self, answer: String, cx: &mut Context<Self>) {
+        if self.pending_input.is_none() || self.sending_message {
+            return;
+        }
+        if !self.session_permissions().can_act {
+            return;
+        }
+        self.send_composer_text(answer, cx);
+    }
+
     pub(crate) fn finish_send_response(
         &mut self,
         response: ResponseEnvelope,

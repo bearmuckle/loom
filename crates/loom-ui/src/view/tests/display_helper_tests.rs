@@ -3,15 +3,15 @@ use super::{
     CONNECTION_LOST_COPY, CompletionKind, FileActivityOperation, LOOM_REPOSITORY_URL,
     MAX_RUN_FAILURE_REASON_CHARS, ToolPart, ToolPartStatus, about_backend, about_backend_label,
     about_build_version, about_git_revision, about_links, about_platform_label, about_protocol,
-    about_version_label, action_kind_label, activity_output, approval_policy_status_text,
-    change_kind_label, command_line, command_purpose, commands_matching, completion_for_value,
-    disconnected_screen, endpoint_host, endpoint_label, has_block_markdown, humanize_tool_output,
-    is_redundant_completion_summary, rgb, run_failure_reason, run_state_color, run_state_label,
-    session_is_active, session_status_pill, source_mount_path, tool_denial_count, tool_detail,
-    tool_failure_count, tool_failure_reason, tool_group_label, tool_group_status, tool_icon,
-    tool_needs_attention, tool_outcome_notes, tool_part_from_activity, tool_part_from_policy,
-    tool_policy_note, tool_shows_output, tool_status, tool_title, tool_title_for_activity,
-    tool_usage_label, tool_usage_summary,
+    about_version_label, action_kind_label, activity_output, agent_question,
+    approval_policy_status_text, change_kind_label, command_line, command_purpose,
+    commands_matching, completion_for_value, disconnected_screen, endpoint_host, endpoint_label,
+    has_block_markdown, humanize_tool_output, is_redundant_completion_summary, rgb,
+    run_failure_reason, run_state_color, run_state_label, session_is_active, session_status_pill,
+    source_mount_path, tool_denial_count, tool_detail, tool_failure_count, tool_failure_reason,
+    tool_group_label, tool_group_status, tool_icon, tool_needs_attention, tool_outcome_notes,
+    tool_part_from_activity, tool_part_from_policy, tool_policy_note, tool_shows_output,
+    tool_status, tool_title, tool_title_for_activity, tool_usage_label, tool_usage_summary,
 };
 use gpui_kit::assets::IconName as AssetIconName;
 use loom_core::{
@@ -21,6 +21,8 @@ use loom_core::{
 use loom_model::{ModelId, ToolCall};
 use loom_protocol::{AgentActivityKind, AgentRunState, ApprovalPolicyApplyScope, ToolResult};
 use serde_json::json;
+
+use crate::state::{MAX_QUESTION_CHOICE_BYTES, MAX_QUESTION_CHOICES};
 
 fn activity(data: AgentActivityData) -> AgentActivityRecord {
     AgentActivityRecord {
@@ -328,6 +330,57 @@ fn core_tools_get_readable_details_instead_of_json() {
     assert_eq!(
         tool_detail(&call).as_deref(),
         Some("cargo test\nDirectory: repo")
+    );
+}
+
+#[test]
+fn ask_user_options_become_the_question_choices() {
+    let mut call = call("ask_user");
+    call.arguments = json!({
+        "prompt": "  Which branch?  ",
+        "options": ["main", " release", "", "main", "   "],
+    });
+    let question = agent_question(&call).expect("a question");
+    assert_eq!(question.prompt, "Which branch?");
+    // Blank and repeated options are dropped, so every choice sends exactly one
+    // answer.
+    assert_eq!(
+        question.choices,
+        vec!["main".to_owned(), "release".to_owned()]
+    );
+
+    // A question without options keeps the free-text route, and a call that is
+    // not a question has no question to show.
+    call.arguments = json!({"prompt": "Which branch?"});
+    assert_eq!(
+        agent_question(&call).expect("a question").choices,
+        Vec::<String>::new()
+    );
+    call.arguments = json!({"prompt": "   "});
+    assert!(agent_question(&call).is_none());
+    call.name = "read_file".to_owned();
+    call.arguments = json!({"prompt": "Which branch?"});
+    assert!(agent_question(&call).is_none());
+
+    // The bounds keep a model from flooding the question or offering an answer
+    // too long to send back.
+    call.name = "ask_user".to_owned();
+    let over_long = "x".repeat(MAX_QUESTION_CHOICE_BYTES + 1);
+    call.arguments = json!({"prompt": "Which branch?", "options": [over_long, "main"]});
+    assert_eq!(
+        agent_question(&call).expect("a question").choices,
+        vec!["main".to_owned()]
+    );
+    let offered = (0..MAX_QUESTION_CHOICES + 3)
+        .map(|index| format!("branch {index}"))
+        .collect::<Vec<_>>();
+    call.arguments = json!({"prompt": "Which branch?", "options": offered});
+    let question = agent_question(&call).expect("a question");
+    assert_eq!(question.choices.len(), MAX_QUESTION_CHOICES);
+    assert_eq!(question.choices[0], "branch 0");
+    assert_eq!(
+        question.choices[MAX_QUESTION_CHOICES - 1],
+        format!("branch {}", MAX_QUESTION_CHOICES - 1)
     );
 }
 

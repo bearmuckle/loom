@@ -485,15 +485,11 @@ impl LoomView {
                 ..
             } => {
                 self.update_active_run_control(*run_id, *attempt_id, *control_revision);
+                // The question itself renders from the `ask_user` call that asked
+                // it, so the event only marks the run as waiting on the user.
+                // Nothing is added to the transcript here, or the same question
+                // would be presented twice.
                 self.pending_input = Some(prompt.clone());
-                self.timeline.push(TimelineItem::System(SystemNote {
-                    tone: SystemTone::Input,
-                    heading: Some("Agent needs input".to_owned()),
-                    text: prompt.clone(),
-                    details: None,
-                    progress: None,
-                    retryable: false,
-                }));
             }
             AgentEvent::RunUsage { usage, .. } => {
                 let run = self
