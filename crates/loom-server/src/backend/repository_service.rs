@@ -84,6 +84,10 @@ pub(crate) enum MirrorFreshness {
 
 impl MirrorFreshness {
     /// Whether this reuse could not establish how current the mirror is.
+    ///
+    /// Reuse no longer depends on freshness alone, so this reports what a test
+    /// asserts rather than gating a decision.
+    #[cfg(test)]
     pub(crate) fn is_unknown(&self) -> bool {
         matches!(self, Self::Unknown { .. })
     }

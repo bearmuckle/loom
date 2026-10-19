@@ -48,9 +48,14 @@ therefore a separate project that records its parent:
   session row, its project root row, and the link in one transaction. Owner role
   and `create_agent_session` are required.
 - Sources and the model are **not** copied by the worker: the client attaches the
-  parent's repositories (reusing the worker's clone) and directories to the new
-  session, so a project that was branched out and a project created on its own
-  share one attach path.
+  parent's directories (folders) and repositories to the new session, so a
+  project that was branched out and a project created on its own share one
+  attach path. Folders go first, because a mounted folder carries the checkouts
+  inside it: a checkout and a mount cannot share a session path, so a repository
+  is cloned into the branch only when no mounted folder covers its path. A
+  repository is cloned from its own source rather than from the parent's head,
+  because that head can be a commit which exists only in the parent's checkout
+  and which no clone of the source can resolve.
 - The link only groups the row in a client. A branch whose parent is not listed
   (archived, on another worker, not yet fetched) is listed as a project of its
   own rather than disappearing.

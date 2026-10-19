@@ -143,10 +143,17 @@ impl LoomView {
                         view.sessions.push(session.clone());
                     }
                     // The snapshot carries the parent link, so the sidebar nests
-                    // the new project under the one it branched from.
-                    view.project_tree_snapshots
-                        .retain(|known| known.project_id != created.snapshot.project_id);
-                    view.project_tree_snapshots.push(created.snapshot);
+                    // the new project under the one it branched from. A branch
+                    // whose snapshot could not be read stays listed and is asked
+                    // for again, so it never becomes a top-level project row.
+                    match created.snapshot {
+                        Some(snapshot) => {
+                            view.project_tree_snapshots
+                                .retain(|known| known.project_id != snapshot.project_id);
+                            view.project_tree_snapshots.push(snapshot);
+                        }
+                        None => view.refresh_missing_project_snapshots(cx),
+                    }
                     view.select_session(session, cx);
                     match created.source_warnings.first() {
                         Some(warning) => view.record_status(format!(
@@ -168,7 +175,10 @@ impl LoomView {
 /// parent and any sources that could not be attached.
 struct CreatedSubProject {
     session: AgentSessionSnapshot,
-    snapshot: loom_core::ProjectSnapshot,
+    /// The new project's snapshot, or `None` when the worker created the
+    /// project but its snapshot could not be read. The branch is listed either
+    /// way, and a missing snapshot is fetched again by the sidebar's own scan.
+    snapshot: Option<loom_core::ProjectSnapshot>,
     source_warnings: Vec<String>,
 }
 
@@ -194,50 +204,60 @@ async fn create_sub_project_from_project(
         response => return Err(unexpected_response("sub project creation", response)),
     };
     log::info!("[loom-ui] created sub project {project_id} from {parent_session_id}");
-    let mut source_warnings = Vec::new();
-    let repositories = backend
-        .submit(RequestEnvelope::new(ClientRequest::Repository(
-            RepositoryRequest::ListSessionRepositories {
-                session_id: parent_session_id,
+    let source_warnings = inherit_parent_sources(&backend, parent_session_id, session.id).await;
+    let snapshot = backend
+        .submit(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::GetProjectSnapshotForSession {
+                session_id: session.id,
             },
         )))
         .wait()
         .await;
-    match repositories.result {
-        Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositories {
-            repositories,
-        })) => {
-            for repository in repositories {
-                let source = repository.source.clone();
-                let attached = backend
-                    .submit(RequestEnvelope::new(ClientRequest::Repository(
-                        RepositoryRequest::AttachSessionRepository {
-                            session_id: session.id,
-                            source: repository.source,
-                            path: repository.path,
-                            revision: repository.revision,
-                            // The worker already holds the parent's clone, so the
-                            // branch starts from it instead of downloading again.
-                            reuse_local: true,
-                        },
-                    )))
-                    .wait()
-                    .await;
-                if let Err(error) = attached.result {
-                    log::warn!(
-                        "[loom-ui] could not attach {source} to sub project {}: {}",
-                        session.id,
-                        error.message
-                    );
-                    source_warnings.push(error.message);
-                }
-            }
-        }
+    let snapshot = match snapshot.result {
+        Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(snapshot))) => Some(snapshot),
         Ok(response) => {
-            source_warnings.push(unexpected_response("repository listing", response).message)
+            log::warn!("[loom-ui] unexpected sub project snapshot: {response:?}");
+            None
         }
-        Err(error) => source_warnings.push(error.message),
-    }
+        Err(error) => {
+            log::warn!(
+                "[loom-ui] could not read the snapshot of sub project {}: {}",
+                session.id,
+                error.message
+            );
+            None
+        }
+    };
+    Ok(CreatedSubProject {
+        session,
+        snapshot,
+        source_warnings,
+    })
+}
+
+/// Attaches the sources of the project a branch came from to that branch.
+///
+/// The parent's mounted directories go first: a mount already carries the
+/// checkouts inside it, so cloning those repositories a second time would put a
+/// checkout where the mount has to go, and mounting over a checkout fails the
+/// same way in the other order. A repository is therefore inherited on its own
+/// only when no mount covers its path; the directory attach discovers and
+/// registers the checkouts of the folder it mounts.
+///
+/// A repository is attached from its own source instead of the parent's
+/// revision: the parent's head may be a commit that exists only in the parent's
+/// checkout, which no clone of the source can resolve, and a branch that cannot
+/// be cloned is worse than one that starts from the source's own head.
+///
+/// A source that cannot be attached is reported and does not discard the new
+/// project, which the user can still work in and add a source to.
+async fn inherit_parent_sources(
+    backend: &BackendWorker,
+    parent_session_id: AgentSessionId,
+    session_id: AgentSessionId,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut mounted_paths = Vec::new();
     let directories = backend
         .submit(RequestEnvelope::new(ClientRequest::Filesystem(
             FilesystemRequest::ListSessionDirectories {
@@ -253,43 +273,94 @@ async fn create_sub_project_from_project(
                 let attached = backend
                     .submit(RequestEnvelope::new(ClientRequest::Filesystem(
                         FilesystemRequest::AttachSessionDirectory {
-                            session_id: session.id,
+                            session_id,
                             source: directory.source,
-                            path: directory.path,
+                            path: directory.path.clone(),
                         },
                     )))
                     .wait()
                     .await;
-                if let Err(error) = attached.result {
-                    log::warn!(
-                        "[loom-ui] could not attach {source} to sub project {}: {}",
-                        session.id,
-                        error.message
-                    );
-                    source_warnings.push(error.message);
+                match attached.result {
+                    Ok(ServerResponse::Filesystem(
+                        FilesystemResponse::SessionDirectoryAttached { .. },
+                    )) => mounted_paths.push(directory.path),
+                    Ok(response) => {
+                        warnings.push(unexpected_response("directory attachment", response).message)
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "[loom-ui] could not attach {source} to sub project {session_id}: {}",
+                            error.message
+                        );
+                        warnings.push(error.message);
+                    }
                 }
             }
         }
-        Ok(response) => {
-            source_warnings.push(unexpected_response("directory listing", response).message)
-        }
-        Err(error) => source_warnings.push(error.message),
+        Ok(response) => warnings.push(unexpected_response("directory listing", response).message),
+        Err(error) => warnings.push(error.message),
     }
-    let snapshot = backend
-        .submit(RequestEnvelope::new(ClientRequest::Project(
-            ProjectRequest::GetProjectSnapshotForSession {
-                session_id: session.id,
+    let repositories = backend
+        .submit(RequestEnvelope::new(ClientRequest::Repository(
+            RepositoryRequest::ListSessionRepositories {
+                session_id: parent_session_id,
             },
         )))
         .wait()
         .await;
-    let snapshot = match snapshot.result? {
-        ServerResponse::Project(ProjectResponse::ProjectSnapshot(snapshot)) => snapshot,
-        response => return Err(unexpected_response("sub project snapshot", response)),
-    };
-    Ok(CreatedSubProject {
-        session,
-        snapshot,
-        source_warnings,
-    })
+    match repositories.result {
+        Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositories {
+            repositories,
+        })) => {
+            for repository in repositories {
+                if mounted_paths
+                    .iter()
+                    .any(|mount| path_is_within(&repository.path, mount))
+                {
+                    log::info!(
+                        "[loom-ui] sub project {session_id} inherits {} through a mounted directory",
+                        repository.path
+                    );
+                    continue;
+                }
+                let source = repository.source.clone();
+                let attached = backend
+                    .submit(RequestEnvelope::new(ClientRequest::Repository(
+                        RepositoryRequest::AttachSessionRepository {
+                            session_id,
+                            source: repository.source,
+                            path: repository.path,
+                            revision: None,
+                            // The worker already holds the parent's clone, so the
+                            // branch starts from it instead of downloading again.
+                            reuse_local: true,
+                        },
+                    )))
+                    .wait()
+                    .await;
+                match attached.result {
+                    Ok(ServerResponse::Repository(
+                        RepositoryResponse::SessionRepositoryAttached(_),
+                    )) => {}
+                    Ok(response) => warnings
+                        .push(unexpected_response("repository attachment", response).message),
+                    Err(error) => {
+                        log::warn!(
+                            "[loom-ui] could not attach {source} to sub project {session_id}: {}",
+                            error.message
+                        );
+                        warnings.push(error.message);
+                    }
+                }
+            }
+        }
+        Ok(response) => warnings.push(unexpected_response("repository listing", response).message),
+        Err(error) => warnings.push(error.message),
+    }
+    warnings
+}
+
+/// Whether a session path is a mounted directory or lies inside one.
+fn path_is_within(path: &str, mount: &str) -> bool {
+    path == mount || path.starts_with(&format!("{mount}/"))
 }

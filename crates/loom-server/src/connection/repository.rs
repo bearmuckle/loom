@@ -32,6 +32,16 @@ fn mirror_contains_revision(mirror: &Path, revision: &str) -> bool {
     GitService::open(mirror).is_ok_and(|git| git.resolves_revision(revision))
 }
 
+/// Whether a mirror can serve a request for `revision`.
+///
+/// A request without a revision is satisfied by any mirror, and a request with
+/// one only by a mirror that resolves it. A checkout cloned from a mirror takes
+/// the mirror's own refs, so a mirror that lacks the requested revision cannot
+/// produce it however current the mirror is.
+fn mirror_satisfies_revision(mirror: &Path, revision: Option<&str>) -> bool {
+    revision.is_none_or(|revision| mirror_contains_revision(mirror, revision))
+}
+
 impl InProcessConnection {
     pub(crate) fn search_github_repositories(&self, query: &str) -> Result<ServerResponse> {
         let token = self.backend.providers.github_account_token()?;
@@ -242,8 +252,10 @@ impl InProcessConnection {
     /// A mirror whose recorded refresh is older than [`MIRROR_REUSE_MAX_AGE`] is
     /// not reused at all: the checkout comes from the network instead. That mirror
     /// is still refreshed, so a mirror that went unused past the limit becomes
-    /// reusable again for the session after this one. A mirror whose bounded
-    /// refresh failed is not reused for a request it cannot resolve.
+    /// reusable again for the session after this one. A mirror that cannot
+    /// resolve the requested revision is not reused either, whether or not the
+    /// bounded refresh ran: a request that pins a revision only the remote has
+    /// would otherwise fail the clone instead of cloning from the network.
     pub(crate) fn resolve_reusable_mirror(
         &self,
         source: &str,
@@ -269,14 +281,12 @@ impl InProcessConnection {
             return Ok(None);
         }
         let freshness = self.refresh_cached_mirror(source, &mirror, recorded);
-        let unsatisfied = revision.filter(|revision| {
-            freshness.is_unknown() && !mirror_contains_revision(&mirror, revision)
-        });
-        if let Some(revision) = unsatisfied {
+        if !mirror_satisfies_revision(&mirror, revision) {
             log::warn!(
-                "[loom-server] not reusing the cached clone of {source_name} at {}: {} and its cached tip does not contain the requested revision '{revision}'; cloning from the network instead",
+                "[loom-server] not reusing the cached clone of {source_name} at {}: {} and it does not contain the requested revision '{}'; cloning from the network instead",
                 mirror.display(),
-                freshness.summary(now)
+                freshness.summary(now),
+                revision.unwrap_or_default()
             );
             return Ok(None);
         }
@@ -541,5 +551,15 @@ mod tests {
     fn an_unreadable_mirror_contains_no_revision() {
         let missing = std::env::temp_dir().join(format!("loom-missing-{}", AgentSessionId::new()));
         assert!(!mirror_contains_revision(&missing, "main"));
+    }
+
+    #[test]
+    fn a_mirror_only_serves_a_request_without_a_revision_or_with_one_it_resolves() {
+        let missing = std::env::temp_dir().join(format!("loom-missing-{}", AgentSessionId::new()));
+        // A request that pins nothing is served by any mirror.
+        assert!(mirror_satisfies_revision(&missing, None));
+        // A request that pins a revision the mirror cannot resolve is not served
+        // by it, so the attach clones from the network instead of failing.
+        assert!(!mirror_satisfies_revision(&missing, Some("main")));
     }
 }
