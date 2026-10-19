@@ -2314,13 +2314,18 @@ fn the_project_context_menu_offers_delete_project_only_for_a_project_root(cx: &m
         assert!(child_view.read(cx).project_delete_dialog.is_none());
     });
 
-    // Neither does a session that belongs to no project at all.
+    // Neither does a session that belongs to no project at all, though the
+    // backend titles such a session as its own project, so it offers the pin.
     let (plain_window, plain_view) = open_project_menu(cx, session(child, "Standalone"), None);
     cx.update_window(plain_window, |_, window, cx| {
         window.render_frame(cx);
         let menu = window.within("popup-menu");
         assert_eq!(menu.find(1usize).label(), Some("Archive"));
-        assert!(menu.try_find(2usize).is_none());
+        assert_eq!(menu.find(2usize).label(), Some("Stop automatic titles"));
+        assert!(
+            menu.try_find(3usize).is_none(),
+            "a session without a project record has no project to delete"
+        );
     })
     .unwrap();
     cx.update(|cx| {

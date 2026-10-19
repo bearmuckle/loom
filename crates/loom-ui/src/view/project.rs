@@ -487,10 +487,12 @@ impl LoomView {
                 }),
             );
         }
-        // A project root can pin its title (or hand it back to the backend)
-        // without renaming: the label follows who chose the current name. A
+        // A project can pin its title (or hand it back to the backend) without
+        // renaming: the label follows who chose the current name. The condition
+        // matches `is_project`, not the root-only case, because the backend
+        // titles a session with no project record as its own project. A
         // delegated sub agent has no title of its own, so it offers neither.
-        if is_project_root {
+        if is_project {
             let (title_label, title_source) = match session.title_source {
                 loom_core::SessionTitleSource::Auto => (
                     "Stop automatic titles",

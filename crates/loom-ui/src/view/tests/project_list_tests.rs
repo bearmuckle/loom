@@ -1104,6 +1104,41 @@ mod automatic_title_tests {
         }
     }
 
+    /// A session with no project record is its own project, which is the case
+    /// the backend titles too, so its row offers the same pin action.
+    #[gpui_kit::test]
+    fn a_session_without_a_project_record_offers_the_same_action(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let session_id = AgentSessionId::new();
+        let (handle, _view, requests) = open_row_menu(
+            cx,
+            titled(session_id, "Checkout flow", SessionTitleSource::Auto),
+            None,
+        );
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let mut menu = window.within("popup-menu");
+            assert_eq!(menu.find(0usize).label(), Some("Rename"));
+            assert_eq!(menu.find(1usize).label(), Some("Archive"));
+            assert_eq!(menu.find(2usize).label(), Some("Stop automatic titles"));
+            menu.click(2usize, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let job = requests.try_recv().expect("the menu item sent a request");
+        assert!(
+            matches!(
+                job.request.request,
+                ClientRequest::Session(SessionRequest::SetAgentSessionTitleSource {
+                    session_id: requested,
+                    source: SessionTitleSource::Manual,
+                }) if requested == session_id
+            ),
+            "unexpected request: {:?}",
+            job.request.request
+        );
+    }
+
     /// The answer is written back to the cached row so the next menu reads the
     /// new source; a refusal keeps the row and names the operation.
     #[gpui_kit::test]
