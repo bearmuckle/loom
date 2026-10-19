@@ -5,6 +5,30 @@ use super::support::*;
 use super::*;
 
 #[test]
+fn a_session_title_source_round_trips_through_the_catalog() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+    let persistence = FilePersistence::open(&path).unwrap();
+    let mut manager = SessionManager::default();
+    let (session, _) = manager
+        .create_in_workspace(WorkspaceId::new(), "Titled session")
+        .unwrap();
+    let (renamed, _) = manager.rename(session.id, "Pinned title").unwrap();
+    assert_eq!(renamed.title_source, SessionTitleSource::Manual);
+
+    persistence
+        .save_state_with_sessions(&manager.export_state())
+        .unwrap();
+    let restored = persistence.load_sessions().unwrap().unwrap();
+
+    assert_eq!(restored, manager.export_state());
+    assert_eq!(
+        restored.sessions[&renamed.id].title_source,
+        SessionTitleSource::Manual
+    );
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn typed_session_catalog_round_trips_and_uses_the_picker_index() {
     let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
     let persistence = FilePersistence::open(&path).unwrap();
@@ -372,6 +396,9 @@ fn session_and_workspace_settings_are_bounded_indexed_and_atomic() {
                 id: "inspect".to_owned(),
                 description: "Inspect the relevant source and build output".to_owned(),
             }],
+            // A plan title is a naming hint for the proposal moment, so it is
+            // not part of what a plan persists.
+            title: Some("Inspect the source".to_owned()),
         },
     )]);
     let activity_call = loom_model::ToolCall {
@@ -656,10 +683,11 @@ fn session_and_workspace_settings_are_bounded_indexed_and_atomic() {
     );
     assert_eq!(loaded_record.response, serde_json::json!({"sessions": []}));
     assert_eq!(persistence.load_run_summaries().unwrap(), run_summaries);
-    assert_eq!(
-        persistence.load_run_plan(run_id).unwrap(),
-        run_plans[&run_id]
-    );
+    // A restored plan carries no title: the title is a naming hint for the
+    // proposal moment and the project keeps the title it already has.
+    let restored_plan = persistence.load_run_plan(run_id).unwrap();
+    assert_eq!(restored_plan.steps, run_plans[&run_id].steps);
+    assert_eq!(restored_plan.title, None);
     assert_eq!(
         persistence
             .load_session_usage(session.id, &BTreeSet::new())
@@ -914,8 +942,13 @@ fn session_and_workspace_settings_are_bounded_indexed_and_atomic() {
             .is_err()
     );
     assert_eq!(
-        persistence.load_run_plan(run_id).unwrap(),
-        run_plans[&run_id]
+        persistence.load_run_plan(run_id).unwrap().steps,
+        run_plans[&run_id].steps
+    );
+    assert_eq!(
+        persistence.load_run_plan(run_id).unwrap().title,
+        None,
+        "a plan title is a naming hint for the proposal moment, not persisted state"
     );
     assert_eq!(
         persistence.load_run_summary(run_id).unwrap(),
@@ -1252,6 +1285,7 @@ fn child_snapshot(
         state: AgentSessionState::Idle,
         created_at: Timestamp::now(),
         updated_at: Timestamp::now(),
+        title_source: loom_core::SessionTitleSource::Auto,
     }
 }
 
@@ -1605,6 +1639,7 @@ fn deleted_sessions_lose_their_rows_and_unused_content_in_one_transaction() {
                 event: loom_model::ServerEvent::AgentSessionRenamed {
                     session_id: survivor_id,
                     name: "Surviving child".to_owned(),
+                    source: loom_core::SessionTitleSource::Auto,
                 },
             },
         ],

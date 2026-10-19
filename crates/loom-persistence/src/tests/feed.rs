@@ -144,7 +144,10 @@ fn run_checkpoint_is_scoped_and_rolls_back_session_and_run_with_feed_failure() {
         }],
         workspace_events: Vec::new(),
     };
-    let plan = loom_model::AgentPlan { steps: Vec::new() };
+    let plan = loom_model::AgentPlan {
+        steps: Vec::new(),
+        title: None,
+    };
     let mut updated_activity = initial_activity.clone();
     updated_activity.status = AgentActivityStatus::Completed;
     updated_activity.completed_at = Some(Timestamp::from_unix_millis(3));
@@ -753,6 +756,7 @@ fn reconnect_feed_is_indexed_bounded_and_atomic_with_catalog_writes() {
         state: AgentSessionState::Idle,
         created_at: Timestamp::from_unix_millis(10),
         updated_at: Timestamp::from_unix_millis(10),
+        title_source: loom_core::SessionTitleSource::Auto,
     };
     let mut manager = SessionManager::default();
     manager
@@ -769,6 +773,7 @@ fn reconnect_feed_is_indexed_bounded_and_atomic_with_catalog_writes() {
         state: AgentSessionState::Idle,
         created_at: Timestamp::from_unix_millis(11),
         updated_at: Timestamp::from_unix_millis(11),
+        title_source: loom_core::SessionTitleSource::Auto,
     };
     let sessions = manager.export_state();
     let feed = DurableFeedState {
@@ -863,6 +868,7 @@ fn reconnect_feed_is_indexed_bounded_and_atomic_with_catalog_writes() {
                         state: AgentSessionState::Idle,
                         created_at: Timestamp::from_unix_millis(11),
                         updated_at: Timestamp::from_unix_millis(11),
+                        title_source: loom_core::SessionTitleSource::Auto,
                     },
                 },
             },
@@ -937,6 +943,7 @@ fn workspace_reconnect_feed_is_isolated_indexed_and_tracks_pruning() {
         state: AgentSessionState::Idle,
         created_at: Timestamp::from_unix_millis(1),
         updated_at: Timestamp::from_unix_millis(1),
+        title_source: loom_core::SessionTitleSource::Auto,
     };
     let event = |sequence, id, workspace_id| ServerEventEnvelope {
         protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
@@ -1171,6 +1178,7 @@ fn incremental_feed_rows_resolve_each_session_workspace_and_reject_unknown_sessi
                     state: AgentSessionState::Idle,
                     created_at: Timestamp::from_unix_millis(1),
                     updated_at: Timestamp::from_unix_millis(1),
+                    title_source: loom_core::SessionTitleSource::Auto,
                 },
             },
         }

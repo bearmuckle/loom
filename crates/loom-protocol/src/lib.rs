@@ -479,6 +479,7 @@ impl ClientRequest {
                 Some(Capability::CleanupProjectChildWorktree)
             }
             Self::Session(SessionRequest::RenameAgentSession { .. })
+            | Self::Session(SessionRequest::SetAgentSessionTitleSource { .. })
             | Self::Session(SessionRequest::ArchiveAgentSession { .. }) => {
                 Some(Capability::ControlAgentSession)
             }
@@ -715,6 +716,7 @@ impl ClientRequest {
             | Self::Collaboration(CollaborationRequest::AnswerAgentQuestion { .. })
             | Self::Collaboration(CollaborationRequest::ControlRun { .. }) => Some(Participant),
             Self::Session(SessionRequest::RenameAgentSession { .. })
+            | Self::Session(SessionRequest::SetAgentSessionTitleSource { .. })
             | Self::Session(SessionRequest::ArchiveAgentSession { .. })
             | Self::Session(SessionRequest::DeleteAgentSession { .. })
             | Self::Session(SessionRequest::SetSessionApprovalPolicy { .. })
@@ -759,6 +761,7 @@ impl ClientRequest {
             })
             | Self::Session(SessionRequest::GetAgentSessionInitialState { session_id, .. })
             | Self::Session(SessionRequest::RenameAgentSession { session_id, .. })
+            | Self::Session(SessionRequest::SetAgentSessionTitleSource { session_id, .. })
             | Self::Session(SessionRequest::ArchiveAgentSession { session_id })
             | Self::Session(SessionRequest::DeleteAgentSession { session_id, .. })
             | Self::Session(SessionRequest::ForkAgentSession { session_id, .. })
@@ -907,6 +910,7 @@ impl ClientRequest {
                 | Self::Task(TaskRequest::CancelSessionTask { .. })
                 | Self::Session(SessionRequest::SetSessionApprovalPolicy { .. })
                 | Self::Session(SessionRequest::RenameAgentSession { .. })
+                | Self::Session(SessionRequest::SetAgentSessionTitleSource { .. })
                 | Self::Session(SessionRequest::ArchiveAgentSession { .. })
                 | Self::Session(SessionRequest::DeleteAgentSession { .. })
                 | Self::Control(ControlRequest::SetArchiveRetentionPolicy { .. })
@@ -1288,7 +1292,7 @@ mod run_message_protocol_tests {
 
     #[test]
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 10));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 11));
         let project_id = ProjectId::new();
         let request = ClientRequest::Project(ProjectRequest::GetProjectSnapshot { project_id });
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));
@@ -1662,6 +1666,34 @@ mod run_message_protocol_tests {
             }
         });
         assert!(decode_request(raw_request.to_string().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn setting_a_session_title_source_round_trips_with_its_capability_and_role() {
+        let session_id = AgentSessionId::new();
+        let request = ClientRequest::Session(SessionRequest::SetAgentSessionTitleSource {
+            session_id,
+            source: loom_core::SessionTitleSource::Manual,
+        });
+        assert_eq!(
+            request.required_capability(),
+            Some(Capability::ControlAgentSession)
+        );
+        assert_eq!(
+            request.required_session_role(),
+            Some(loom_core::SessionRole::Owner)
+        );
+        assert_eq!(
+            request.access_target(),
+            Some(AccessTarget::Session(session_id))
+        );
+        assert!(request.is_retryable_mutation());
+        assert_eq!(
+            decode_request(&encode_request(&RequestEnvelope::new(request.clone())).unwrap())
+                .unwrap()
+                .request,
+            request
+        );
     }
 
     #[test]

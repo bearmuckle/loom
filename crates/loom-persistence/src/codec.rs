@@ -330,6 +330,28 @@ pub(crate) fn parse_session_state(state: &str) -> Result<AgentSessionState> {
     }
 }
 
+/// The stored form of a session's title source.
+pub(crate) fn session_title_source_name(source: SessionTitleSource) -> &'static str {
+    match source {
+        SessionTitleSource::Auto => "auto",
+        SessionTitleSource::Manual => "manual",
+    }
+}
+
+/// Parses the stored title source, which the column constrains to the two
+/// known values.
+pub(crate) fn parse_session_title_source(source: &str) -> Result<SessionTitleSource> {
+    match source {
+        "auto" => Ok(SessionTitleSource::Auto),
+        "manual" => Ok(SessionTitleSource::Manual),
+        _ => Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("persisted session has an unknown title source '{source}'"),
+            false,
+        )),
+    }
+}
+
 pub(crate) fn encode_timestamp(timestamp: Timestamp) -> Result<i64> {
     i64::try_from(timestamp.as_unix_millis()).map_err(|_| {
         LoomError::new(

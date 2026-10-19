@@ -688,6 +688,10 @@ impl InProcessConnection {
                 session_id: requested_session,
                 ..
             })
+            | ClientRequest::Session(SessionRequest::SetAgentSessionTitleSource {
+                session_id: requested_session,
+                ..
+            })
             | ClientRequest::Session(SessionRequest::ArchiveAgentSession {
                 session_id: requested_session,
             })

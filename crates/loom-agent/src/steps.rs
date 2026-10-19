@@ -625,8 +625,19 @@ impl AgentRuntime {
                         });
                         return Ok(StreamFlow::Stop);
                     }
+                    // The title is a naming hint the server validates, so it
+                    // is passed through as the model wrote it: trimmed, and an
+                    // empty string is no hint at all.
+                    let title = call
+                        .arguments
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|title| !title.is_empty())
+                        .map(str::to_owned);
                     self.plan = AgentPlan {
                         steps: steps.clone(),
+                        title: title.clone(),
                     };
                     ctx.events.push(AgentEvent::PlanProposed {
                         run_id: self.run.id,

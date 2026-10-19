@@ -11,6 +11,9 @@ CREATE TABLE IF NOT EXISTS sessions (
         'idle', 'queued', 'planning', 'awaiting_approval', 'paused', 'executing',
         'evaluating', 'needs_input', 'completed', 'failed', 'cancelled', 'archived'
     )),
+    -- Who chose the name: the backend from the work, or a person. A manual
+    -- rename pins the title and stops automatic re-titling.
+    title_source TEXT NOT NULL DEFAULT 'auto' CHECK(title_source IN ('auto', 'manual')),
     created_at INTEGER NOT NULL CHECK(created_at >= 0),
     updated_at INTEGER NOT NULL CHECK(updated_at >= created_at)
 ) WITHOUT ROWID, STRICT;
@@ -1225,6 +1228,27 @@ fn migrate_schema_transaction(connection: &Connection, from_version: u32) -> Res
             // was branched out of, a new baseline table.
             11 => {
                 version = 12;
+            }
+            // v13 records who chose a session's name, so a manual rename pins
+            // the title. A database written before the column exists keeps the
+            // `auto` default for every session.
+            12 => {
+                if migration_table_exists(&transaction, "sessions")?
+                    && !migration_column_exists(&transaction, "sessions", "title_source")?
+                {
+                    transaction
+                        .execute_batch(
+                            "ALTER TABLE sessions ADD COLUMN title_source TEXT NOT NULL
+                                 DEFAULT 'auto' CHECK(title_source IN ('auto', 'manual'));",
+                        )
+                        .map_err(|error| {
+                            persistence_error(
+                                format!("could not migrate persistence schema to v13: {error}"),
+                                true,
+                            )
+                        })?;
+                }
+                version = 13;
             }
             other => return Err(unsupported_database_error(other)),
         }

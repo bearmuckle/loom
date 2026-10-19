@@ -203,7 +203,10 @@ impl FilePersistence {
     /// Loads a run's ordered plan steps without decoding its runtime snapshot.
     pub fn load_run_plan(&self, run_id: RunId) -> Result<AgentPlan> {
         if !self.path.exists() {
-            return Ok(AgentPlan { steps: Vec::new() });
+            return Ok(AgentPlan {
+                steps: Vec::new(),
+                title: None,
+            });
         }
         let connection = self.connection()?;
         Self::load_run_plan_on(&connection, run_id)
@@ -233,7 +236,10 @@ impl FilePersistence {
                 persistence_error(format!("could not read run plan: {error}"), true)
             })?);
         }
-        Ok(AgentPlan { steps })
+        // Only the steps are stored. A plan's title is a naming hint for the
+        // moment it is proposed, not plan content, so a restored plan has none
+        // and the project keeps the title it already has.
+        Ok(AgentPlan { steps, title: None })
     }
 
     pub fn load_run_runtime_config(

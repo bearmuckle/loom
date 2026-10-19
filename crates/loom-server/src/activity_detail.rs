@@ -406,6 +406,7 @@ mod tests {
         let renamed = ServerEvent::AgentSessionRenamed {
             session_id,
             name: "renamed".to_owned(),
+            source: loom_core::SessionTitleSource::Auto,
         };
         let mut projected = renamed.clone();
         project_server_event(&mut projected, ActivityDetail::Replies);

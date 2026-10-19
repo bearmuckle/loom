@@ -222,7 +222,10 @@ fn fixture(
         run_id,
         summary,
         runtime_config,
-        AgentPlan { steps: Vec::new() },
+        AgentPlan {
+            steps: Vec::new(),
+            title: None,
+        },
         messages,
         activities,
     )

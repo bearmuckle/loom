@@ -342,6 +342,7 @@ fn session(id: AgentSessionId, name: &str) -> AgentSessionSnapshot {
         state: AgentSessionState::Idle,
         created_at: Timestamp::from_unix_millis(1),
         updated_at: Timestamp::from_unix_millis(1),
+        title_source: loom_core::SessionTitleSource::Auto,
     }
 }
 

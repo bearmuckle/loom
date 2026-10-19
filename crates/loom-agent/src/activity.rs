@@ -151,7 +151,7 @@ pub(crate) fn initial_messages(task: &AgentTask) -> Vec<ModelMessage> {
     // never sent on its own; keep its shape stable for persisted runs.
     messages.push(ModelMessage::new(
         MessageRole::System,
-        "Use propose_plan for an ordered plan before workspace changes, and use ask_user when information from the user is required to continue.",
+        "Use propose_plan for an ordered plan before workspace changes, and name the planned work in its title field with 3 to 6 words. Use ask_user when information from the user is required to continue.",
     ));
     if let Some(system) = &task.system_instructions {
         messages.push(ModelMessage::new(MessageRole::System, system));

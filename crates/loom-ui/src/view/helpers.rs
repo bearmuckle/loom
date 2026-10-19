@@ -335,6 +335,7 @@ pub(crate) fn empty_session_snapshot(workspace_id: WorkspaceId) -> AgentSessionS
         state: AgentSessionState::Idle,
         created_at: now,
         updated_at: now,
+        title_source: loom_core::SessionTitleSource::Auto,
     }
 }
 

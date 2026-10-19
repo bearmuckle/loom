@@ -690,6 +690,7 @@ mod retention_eligibility_tests {
             state: AgentSessionState::Archived,
             created_at: Timestamp::from_unix_millis(archived_at),
             updated_at: Timestamp::from_unix_millis(archived_at),
+            title_source: SessionTitleSource::Auto,
         }
     }
 

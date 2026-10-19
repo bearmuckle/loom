@@ -25,6 +25,7 @@ this checkout and cites the file that implements it.
 | [0002](0002-bearer-token-websocket-auth.md) | Accepted | WebSocket authentication uses a bearer token with scoped capabilities |
 | [0003](0003-protocol-version-negotiation.md) | Accepted | Protocol version 11.1 with major-version negotiation |
 | [0004](0004-gpui-kit-client.md) | Accepted | One GPUI client on the published `gpui-kit` crate for native and wasm |
+| [0005](0005-auto-project-titles.md) | Accepted | A project title is chosen from the work automatically and pinned by a manual rename |
 
 ## Open
 

@@ -191,6 +191,97 @@ impl InProcessBackend {
         Ok(())
     }
 
+    /// Titles a project automatically from the work its root agent is doing.
+    ///
+    /// The candidate is the plan title the model proposed, or a title derived
+    /// from the run's goal when it proposed no title. A project is only
+    /// re-titled silently: a manual rename pins the title, its title source
+    /// stops being `auto`, and automation never touches it again. Only a project
+    /// root is titled, so a delegated sub agent keeps the name its manager gave
+    /// it. Nothing here may fail a run, so every problem is logged and dropped.
+    ///
+    /// The caller runs this from the run observer, which already holds no
+    /// session, config, or project lock: each guard is taken and released here
+    /// before the rename, and the runtime lock is never touched.
+    pub(crate) fn maybe_auto_title(
+        self: &Arc<Self>,
+        session_id: AgentSessionId,
+        plan_title: Option<&str>,
+        goal: &str,
+    ) {
+        if let Err(error) = self.try_auto_title(session_id, plan_title, goal) {
+            log::debug!(
+                "could not auto-title agent session {session_id}: {}",
+                error.message
+            );
+        }
+    }
+
+    fn try_auto_title(
+        self: &Arc<Self>,
+        session_id: AgentSessionId,
+        plan_title: Option<&str>,
+        goal: &str,
+    ) -> Result<()> {
+        let session = self.sessions()?.get(session_id)?;
+        if session.state == AgentSessionState::Archived {
+            return Ok(());
+        }
+        if session.title_source != SessionTitleSource::Auto {
+            return Ok(());
+        }
+        let enabled = self
+            .workspace_configs()?
+            .get(&session.workspace_id)
+            .map(|config| config.auto_title_projects)
+            .unwrap_or_else(|| WorkspaceConfig::default().auto_title_projects);
+        if !enabled {
+            return Ok(());
+        }
+        // A session with no project record counts as a root: a plain session is
+        // its own project.
+        let project = match &self.persistence {
+            Some(persistence) => persistence.load_project_snapshot_for_session(session_id)?,
+            None => None,
+        };
+        if let Some(project) = &project {
+            let member = project
+                .agents
+                .iter()
+                .find(|agent| agent.session_id == session_id);
+            if member.is_some_and(|agent| agent.depth != 1 || agent.parent_session_id.is_some()) {
+                return Ok(());
+            }
+        }
+
+        let candidate =
+            sanitize_title(plan_title.unwrap_or_default()).or_else(|| title_from_goal(goal));
+        let Some(candidate) = candidate else {
+            return Ok(());
+        };
+        if candidate == session.name || !titles_diverge(&session.name, &candidate) {
+            return Ok(());
+        }
+        let (renamed, record) =
+            self.sessions()?
+                .rename_with_source(session_id, candidate, SessionTitleSource::Auto)?;
+        match self.journal() {
+            Ok(mut journal) => journal.append_session(record),
+            Err(error) => {
+                log::warn!(
+                    "auto-title renamed agent session {session_id} to '{}' but its event was not journaled: {}",
+                    renamed.name,
+                    error.message
+                );
+            }
+        }
+        log::debug!(
+            "auto-titled agent session {session_id} as '{}'",
+            renamed.name
+        );
+        Ok(())
+    }
+
     /// Notifies a child task's parent that the child has produced something.
     ///
     /// Any durable inbox messages are delivered first. When a child finishes

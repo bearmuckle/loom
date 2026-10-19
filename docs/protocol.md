@@ -325,7 +325,8 @@ Worker-node management adds workspace-scoped
 requests. The persisted config contains a revision,
 worker WebSocket URLs, a CPU pulse threshold for session-card node indicators
 (default 5%), the parallel project-agent limit, the auto-archive-completed-agents
-switch, and the run queue timeout (default 30 minutes); credentials, workspace
+switch, the automatic-project-titles switch (default on), and the run queue
+timeout (default 30 minutes); credentials, workspace
 files, and session state are not included. Connected peers receive the updated config when nodes join or
 are removed. Sessions remain owned by the node that created them; config
 distribution does not migrate sessions.
@@ -384,11 +385,34 @@ The existing M1-M4 mutations remain the control surface:
 
 ```text
 CreateAgentSession / RenameAgentSession / ArchiveAgentSession
+SetAgentSessionTitleSource
 DeleteAgentSession
 StartAgentRun / SendAgentMessage
 PauseAgentRun / ResumeAgentRun / InterruptAgentRun
 ApproveAgentAction / RejectAgentAction / RetryAgentStep
 ```
+
+A project is titled automatically. A project's row in the sidebar is rendered
+from its root agent session's `name`, so the backend chooses that name from the
+work: the `title` the agent passes to `propose_plan` (3-6 words, no paths and no
+quotes), or a title derived from the run's goal when the run never proposes
+one. The title is sanitised (no paths or URLs, at most six words and 48
+characters, first letter upper-case) and is only replaced when it diverges
+enough from the current name. Only a project root is titled; a delegated sub
+agent keeps the name its manager gave it.
+
+`AgentSessionSnapshot.title_source` says who chose the current name: `auto`
+when the backend chose it, `manual` after a person renamed the session. A
+manual rename pins the title, so automation stops for that project.
+`SetAgentSessionTitleSource { session_id, source }` changes the source without
+renaming, returning `agent_session(snapshot)`, and requires the same
+`control_agent_session` capability and owner role as `RenameAgentSession`. A
+rename reports its source in `AgentSessionRenamed { session_id, name, source }`
+(absent in older payloads, which read as `auto`), and a source change is
+journaled as `AgentSessionTitleSourceChanged { session_id, source }`, so a
+client can render the state from the event stream. A workspace turns the
+behaviour off with `auto_title_projects: false`; the default is on, so an
+upgraded workspace titles new projects without an operator action.
 
 `ArchiveAgentSession` interrupts a non-terminal run for the session before
 archiving it, so clients do not need to issue a separate interrupt request.
@@ -473,7 +497,9 @@ and ordered run actions. Provider credential selection uses the same 11.4
 version. 11.5 adds access requests. 11.6 adds GitHub sign-in. 11.7 adds the
 activity-detail projection. 11.8 adds provider API-key removal. 11.9 adds
 resuming a remembered GitHub identity. 11.10 adds creating a sub project from
-the project it branches out of. Every addition is a new enum variant, a
+the project it branches out of. 11.11 adds automatic project titles,
+`SetAgentSessionTitleSource`, and the title source a rename reports. Every
+addition is a new enum variant, a
 capability, or a field with a compatible default (an omitted field keeps the
 older behavior), so clients of an older 11.x minor keep working; they simply
 never send the new requests, negotiate the new capability, or ask for the new

@@ -134,6 +134,14 @@ pub struct AgentToolAttemptRecord {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentPlan {
     pub steps: Vec<AgentPlanStep>,
+    /// A naming hint for the proposal moment: a short name for the work being
+    /// planned, so a project's title can be chosen from it.
+    ///
+    /// It is not persisted across restore, because it is not the plan's
+    /// content: a restored plan carries `None` and the project keeps the title
+    /// it already has.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -1113,7 +1113,10 @@ pub(crate) fn runtime_state_from_durable_config(
             repository_instructions: config.repository_instructions,
         },
         run,
-        plan: loom_agent::AgentPlan { steps: Vec::new() },
+        plan: loom_agent::AgentPlan {
+            steps: Vec::new(),
+            title: None,
+        },
         messages: Vec::new(),
         message_timeline_ordinals: Vec::new(),
         last_project_message_sequence: 0,

@@ -189,6 +189,7 @@ pub(super) fn nested_project_view(focus_handle: gpui_kit::FocusHandle) -> LoomVi
             state: *state,
             created_at: timestamp,
             updated_at: timestamp,
+            title_source: loom_core::SessionTitleSource::Auto,
         })
         .collect::<Vec<_>>();
     let mut view = LoomView::new_for_test(focus_handle);
@@ -713,6 +714,7 @@ fn session_activation_resets_projection_and_resolves_backend_ownership(cx: &mut 
             state: loom_core::AgentSessionState::Idle,
             created_at: Timestamp::from_unix_millis(1),
             updated_at: Timestamp::from_unix_millis(1),
+            title_source: loom_core::SessionTitleSource::Auto,
         });
 
         assert_eq!(view.model, model);
@@ -2591,6 +2593,7 @@ fn agent_event_projection_handles_the_run_lifecycle_and_tool_fallback(cx: &mut T
                             id: "edit".to_owned(),
                             description: "Edit the app".to_owned(),
                         }],
+                        title: Some("Edit the app".to_owned()),
                     },
                 },
                 loom_protocol::AgentEvent::StepStarted {
@@ -2992,6 +2995,7 @@ fn server_event_projection_updates_session_and_ignores_service_streams(cx: &mut 
         view.consume_event(&loom_protocol::ServerEvent::AgentSessionRenamed {
             session_id,
             name: "Renamed from event".to_owned(),
+            source: loom_core::SessionTitleSource::Auto,
         });
         view.consume_event(&loom_protocol::ServerEvent::AgentSessionArchived { session_id });
         view.consume_event(&loom_protocol::ServerEvent::SessionFilesystemChanged {
@@ -4520,6 +4524,7 @@ fn plan_progress_tracks_steps_and_resets_with_a_new_run(cx: &mut TestAppContext)
                         description: "Second".to_owned(),
                     },
                 ],
+                title: None,
             },
         });
         let plan = view.plan.as_ref().unwrap();
@@ -4618,6 +4623,7 @@ fn unread_markers_follow_changes_and_plan_events(cx: &mut TestAppContext) {
                     id: "one".to_owned(),
                     description: "First".to_owned(),
                 }],
+                title: None,
             },
         });
         assert!(view.review.unread.plan);

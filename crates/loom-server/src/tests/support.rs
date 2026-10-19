@@ -331,6 +331,7 @@ pub(super) fn pending_project_code_child_fixture() -> ProjectCodeChildFixture {
         state: AgentSessionState::Idle,
         created_at,
         updated_at: created_at,
+        title_source: loom_core::SessionTitleSource::Auto,
     };
     let task = loom_core::DelegatedTaskRecord {
         task_id,

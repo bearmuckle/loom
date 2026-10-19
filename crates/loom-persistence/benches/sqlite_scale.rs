@@ -283,6 +283,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         state: AgentSessionState::Idle,
                         created_at: now,
                         updated_at: now,
+                        title_source: loom_core::SessionTitleSource::Auto,
                     };
                     Ok(ServerEventEnvelope {
                         protocol_version: CURRENT_PROTOCOL_VERSION,

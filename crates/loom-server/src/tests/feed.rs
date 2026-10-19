@@ -51,6 +51,7 @@ fn event_journal_retention_is_independent_per_session() {
             event: loom_core::SessionEvent::AgentSessionRenamed {
                 session_id,
                 name: name.to_owned(),
+                source: loom_core::SessionTitleSource::Auto,
             },
         });
     }
@@ -315,6 +316,7 @@ fn renamed_session_record(session_id: AgentSessionId, name: &str) -> SessionEven
         event: loom_core::SessionEvent::AgentSessionRenamed {
             session_id,
             name: name.to_owned(),
+            source: loom_core::SessionTitleSource::Auto,
         },
     }
 }
@@ -326,6 +328,7 @@ fn envelope(sequence: u64, session_id: AgentSessionId, name: &str) -> ServerEven
         loom_core::SessionEvent::AgentSessionRenamed {
             session_id,
             name: name.to_owned(),
+            source: loom_core::SessionTitleSource::Auto,
         },
     )
 }
@@ -458,6 +461,7 @@ fn worker_feed_capture_and_acknowledgement_are_session_scoped() {
             event: loom_core::SessionEvent::AgentSessionRenamed {
                 session_id,
                 name: name.to_owned(),
+                source: loom_core::SessionTitleSource::Auto,
             },
         });
     }

@@ -2,7 +2,7 @@ use std::{cmp::Reverse, collections::BTreeMap};
 
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, EventSequence, LoomError, Result,
-    SessionEvent, SessionEventRecord, Timestamp, WorkspaceId,
+    SessionEvent, SessionEventRecord, SessionTitleSource, Timestamp, WorkspaceId,
 };
 mod project;
 mod workspace;
@@ -88,6 +88,7 @@ impl SessionManager {
             state: AgentSessionState::Idle,
             created_at: now,
             updated_at: now,
+            title_source: SessionTitleSource::Auto,
         };
         self.sessions.insert(snapshot.id, snapshot.clone());
         let record = self.record(
@@ -131,10 +132,27 @@ impl SessionManager {
         sessions
     }
 
+    /// Renames a session and pins its title, so automatic titling stops.
+    ///
+    /// This is the manual entry point; see [`Self::rename_with_source`] for the
+    /// automatic one.
     pub fn rename(
         &mut self,
         session_id: AgentSessionId,
         name: impl Into<String>,
+    ) -> Result<(AgentSessionSnapshot, SessionEventRecord)> {
+        self.rename_with_source(session_id, name, SessionTitleSource::Manual)
+    }
+
+    /// Renames a session and records who chose the name.
+    ///
+    /// A `Manual` rename pins the title; an `Auto` rename is the backend
+    /// choosing a project's title from the work being done.
+    pub fn rename_with_source(
+        &mut self,
+        session_id: AgentSessionId,
+        name: impl Into<String>,
+        source: SessionTitleSource,
     ) -> Result<(AgentSessionSnapshot, SessionEventRecord)> {
         let name = name.into();
         if name.trim().is_empty() {
@@ -157,12 +175,47 @@ impl SessionManager {
             ));
         }
         snapshot.name = name.clone();
+        snapshot.title_source = source;
         snapshot.updated_at = Timestamp::now();
         let snapshot = snapshot.clone();
         let record = self.record(
             session_id,
             snapshot.updated_at,
-            SessionEvent::AgentSessionRenamed { session_id, name },
+            SessionEvent::AgentSessionRenamed {
+                session_id,
+                name,
+                source,
+            },
+        );
+        Ok((snapshot, record))
+    }
+
+    /// Records who chose a session's current title without renaming it.
+    ///
+    /// Pinning a title (`Manual`) makes a project's name the person's, so later
+    /// automatic candidates are not applied; unpinning (`Auto`) lets automation
+    /// resume.
+    pub fn set_title_source(
+        &mut self,
+        session_id: AgentSessionId,
+        source: SessionTitleSource,
+    ) -> Result<(AgentSessionSnapshot, SessionEventRecord)> {
+        let snapshot = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| LoomError::not_found("agent session", session_id))?;
+        if snapshot.state == AgentSessionState::Archived {
+            return Err(LoomError::invalid_state(
+                "archived agent sessions cannot change their title source",
+            ));
+        }
+        snapshot.title_source = source;
+        snapshot.updated_at = Timestamp::now();
+        let snapshot = snapshot.clone();
+        let record = self.record(
+            session_id,
+            snapshot.updated_at,
+            SessionEvent::AgentSessionTitleSourceChanged { session_id, source },
         );
         Ok((snapshot, record))
     }
@@ -285,6 +338,7 @@ impl SessionManager {
             state: AgentSessionState::Idle,
             created_at: now,
             updated_at: now,
+            title_source: SessionTitleSource::Auto,
         };
         self.sessions.insert(snapshot.id, snapshot.clone());
         let record = self.record(
@@ -419,6 +473,74 @@ mod tests {
             SessionEvent::AgentSessionArchived { session_id } if session_id == archived.id
         ));
         assert_eq!(manager.get(archived.id).unwrap(), archived);
+    }
+
+    #[test]
+    fn renames_record_who_chose_the_name_and_pin_it() {
+        let mut manager = SessionManager::default();
+        let (snapshot, _) = manager
+            .create_in_workspace(WorkspaceId::new(), "Initial")
+            .unwrap();
+        assert_eq!(snapshot.title_source, SessionTitleSource::Auto);
+
+        let (automatic, automatic_event) = manager
+            .rename_with_source(snapshot.id, "Implement titles", SessionTitleSource::Auto)
+            .unwrap();
+        assert_eq!(automatic.title_source, SessionTitleSource::Auto);
+        assert!(matches!(
+            automatic_event.event,
+            SessionEvent::AgentSessionRenamed {
+                source: SessionTitleSource::Auto,
+                ..
+            }
+        ));
+
+        let (manual, manual_event) = manager.rename(snapshot.id, "Pinned name").unwrap();
+        assert_eq!(manual.name, "Pinned name");
+        assert_eq!(manual.title_source, SessionTitleSource::Manual);
+        assert!(matches!(
+            manual_event.event,
+            SessionEvent::AgentSessionRenamed {
+                source: SessionTitleSource::Manual,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn title_source_changes_are_journaled_and_refuse_archived_sessions() {
+        let mut manager = SessionManager::default();
+        let (snapshot, _) = manager
+            .create_in_workspace(WorkspaceId::new(), "Title source")
+            .unwrap();
+
+        let (pinned, event) = manager
+            .set_title_source(snapshot.id, SessionTitleSource::Manual)
+            .unwrap();
+        assert_eq!(pinned.title_source, SessionTitleSource::Manual);
+        assert!(matches!(
+            event.event,
+            SessionEvent::AgentSessionTitleSourceChanged {
+                source: SessionTitleSource::Manual,
+                ..
+            }
+        ));
+        assert_eq!(
+            manager
+                .set_title_source(AgentSessionId::new(), SessionTitleSource::Auto)
+                .unwrap_err()
+                .code,
+            loom_core::ErrorCode::NotFound
+        );
+
+        manager.archive(snapshot.id).unwrap();
+        assert_eq!(
+            manager
+                .set_title_source(snapshot.id, SessionTitleSource::Auto)
+                .unwrap_err()
+                .code,
+            loom_core::ErrorCode::InvalidState
+        );
     }
 
     #[test]

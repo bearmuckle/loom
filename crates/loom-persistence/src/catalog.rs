@@ -22,7 +22,7 @@ impl FilePersistence {
         };
         let mut statement = connection
             .prepare(
-                "SELECT id, workspace_id, name, state, created_at, updated_at
+                "SELECT id, workspace_id, name, state, title_source, created_at, updated_at
                  FROM sessions ORDER BY id",
             )
             .map_err(|error| {
@@ -35,8 +35,9 @@ impl FilePersistence {
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
                 ))
             })
             .map_err(|error| {
@@ -44,9 +45,10 @@ impl FilePersistence {
             })?;
         let mut sessions = BTreeMap::new();
         for row in rows {
-            let (id, workspace_id, name, state, created_at, updated_at) = row.map_err(|error| {
-                persistence_error(format!("could not read session catalog: {error}"), true)
-            })?;
+            let (id, workspace_id, name, state, title_source, created_at, updated_at) = row
+                .map_err(|error| {
+                    persistence_error(format!("could not read session catalog: {error}"), true)
+                })?;
             let id = AgentSessionId::from_uuid(decode_uuid(&id, "session id")?);
             let workspace_id = WorkspaceId::from_uuid(decode_uuid(&workspace_id, "workspace id")?);
             let snapshot = AgentSessionSnapshot {
@@ -56,6 +58,7 @@ impl FilePersistence {
                 state: parse_session_state(&state)?,
                 created_at: decode_timestamp(created_at)?,
                 updated_at: decode_timestamp(updated_at)?,
+                title_source: parse_session_title_source(&title_source)?,
             };
             sessions.insert(id, snapshot);
         }
@@ -750,17 +753,21 @@ pub(crate) fn save_session_rows(
             })?;
         transaction
             .execute(
-                "INSERT INTO sessions(id, workspace_id, name, state, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO sessions(
+                     id, workspace_id, name, state, title_source, created_at, updated_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(id) DO UPDATE SET
                     workspace_id=excluded.workspace_id,
                     name=excluded.name,
                     state=excluded.state,
+                    title_source=excluded.title_source,
                     created_at=excluded.created_at,
                     updated_at=excluded.updated_at
                  WHERE sessions.workspace_id IS NOT excluded.workspace_id
                     OR sessions.name IS NOT excluded.name
                     OR sessions.state IS NOT excluded.state
+                    OR sessions.title_source IS NOT excluded.title_source
                     OR sessions.created_at IS NOT excluded.created_at
                     OR sessions.updated_at IS NOT excluded.updated_at",
                 params![
@@ -768,6 +775,7 @@ pub(crate) fn save_session_rows(
                     workspace_id.as_slice(),
                     session.name,
                     session_state_name(session.state),
+                    session_title_source_name(session.title_source),
                     encode_timestamp(session.created_at)?,
                     encode_timestamp(session.updated_at)?,
                 ],
@@ -1156,17 +1164,21 @@ pub(crate) fn save_session_checkpoint_row(
         })?;
     transaction
         .execute(
-            "INSERT INTO sessions(id, workspace_id, name, state, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO sessions(
+                 id, workspace_id, name, state, title_source, created_at, updated_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET
                 workspace_id=excluded.workspace_id,
                 name=excluded.name,
                 state=excluded.state,
+                title_source=excluded.title_source,
                 created_at=excluded.created_at,
                 updated_at=excluded.updated_at
              WHERE sessions.workspace_id IS NOT excluded.workspace_id
                 OR sessions.name IS NOT excluded.name
                 OR sessions.state IS NOT excluded.state
+                OR sessions.title_source IS NOT excluded.title_source
                 OR sessions.created_at IS NOT excluded.created_at
                 OR sessions.updated_at IS NOT excluded.updated_at",
             params![
@@ -1174,6 +1186,7 @@ pub(crate) fn save_session_checkpoint_row(
                 session.workspace_id.as_uuid().as_bytes().as_slice(),
                 session.name,
                 session_state_name(session.state),
+                session_title_source_name(session.title_source),
                 encode_timestamp(session.created_at)?,
                 encode_timestamp(session.updated_at)?,
             ],

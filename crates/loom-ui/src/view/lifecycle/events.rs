@@ -213,16 +213,34 @@ impl LoomView {
                 self.update_session_list();
             }
             ServerEvent::AgentSessionForked { .. } => {}
-            ServerEvent::AgentSessionRenamed { session_id, name } => {
+            ServerEvent::AgentSessionTitleSourceChanged { session_id, source } => {
+                if let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == *session_id)
+                {
+                    session.title_source = *source;
+                }
+                if self.active_session.id == *session_id {
+                    self.active_session.title_source = *source;
+                }
+            }
+            ServerEvent::AgentSessionRenamed {
+                session_id,
+                name,
+                source,
+            } => {
                 if let Some(session) = self
                     .sessions
                     .iter_mut()
                     .find(|session| session.id == *session_id)
                 {
                     session.name = name.clone();
+                    session.title_source = *source;
                 }
                 if self.active_session.id == *session_id {
                     self.active_session.name = name.clone();
+                    self.active_session.title_source = *source;
                     self.update_session_list();
                 }
             }

@@ -104,6 +104,7 @@ fn reconnect_event_decoder_accepts_compressed_rows_and_rejects_corruption() {
                 state: AgentSessionState::Idle,
                 created_at: Timestamp::from_unix_millis(1),
                 updated_at: Timestamp::from_unix_millis(1),
+                title_source: loom_core::SessionTitleSource::Auto,
             },
         },
     };
@@ -454,7 +455,10 @@ fn run_checkpoint_collects_content_orphaned_by_its_own_transcript_reset() {
         project_integration_enabled: false,
         project_branch_messaging_enabled: false,
     };
-    let plan = loom_model::AgentPlan { steps: Vec::new() };
+    let plan = loom_model::AgentPlan {
+        steps: Vec::new(),
+        title: None,
+    };
     let feed = DurableFeedState {
         next_sequence: EventSequence::new(1),
         retention_limit: 250,

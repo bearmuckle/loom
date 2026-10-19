@@ -3413,14 +3413,15 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolKind::ProposePlan.name().to_owned(),
-            description: "Propose an ordered plan before changing the workspace.".to_owned(),
+            description: "Propose an ordered plan before changing the workspace. Pass a 3-6 word title naming the work being planned (no paths, no quotes).".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "steps": {
                         "type": "array",
                         "items": {"type": "string"}
-                    }
+                    },
+                    "title": {"type": "string"}
                 },
                 "required": ["steps"],
                 "additionalProperties": false
@@ -3782,7 +3783,7 @@ pub fn tool_guidance(definitions: &[ToolDefinition]) -> Option<String> {
     }
     if present(ToolKind::ProposePlan) {
         guidance.push(
-            "Call propose_plan with an ordered plan before making non-trivial workspace changes."
+            "Call propose_plan with an ordered plan before making non-trivial workspace changes, and name the work in its 3-6 word title."
                 .to_owned(),
         );
     }

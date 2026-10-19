@@ -19,6 +19,7 @@ fn workspace_config_is_persisted_and_excludes_access_tokens() {
         project_agent_concurrency: 2,
         auto_archive_completed_agents: false,
         run_admission_timeout_secs: 900,
+        auto_title_projects: true,
         worker_nodes: vec![WorkerNodeConfig {
             url: "wss://worker.example/ws".to_owned(),
         }],
@@ -73,6 +74,7 @@ fn workspace_config_is_persisted_and_excludes_access_tokens() {
                     project_agent_concurrency: 4,
                     auto_archive_completed_agents: false,
                     run_admission_timeout_secs: 1800,
+                    auto_title_projects: true,
                     worker_nodes: vec![WorkerNodeConfig {
                         url: "wss://stale.example/ws".to_owned(),
                     }],
@@ -105,6 +107,7 @@ fn workspace_config_is_persisted_and_excludes_access_tokens() {
                         project_agent_concurrency: 4,
                         auto_archive_completed_agents: false,
                         run_admission_timeout_secs: 1800,
+                        auto_title_projects: true,
                         worker_nodes: vec![WorkerNodeConfig {
                             url: url.to_owned(),
                         }],

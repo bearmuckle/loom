@@ -58,4 +58,5 @@ mod session_deletion;
 mod session_workspace;
 mod shutdown;
 mod support;
+mod title;
 mod util;

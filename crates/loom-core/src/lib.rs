@@ -15,6 +15,7 @@ mod process;
 mod project;
 mod session;
 mod time;
+mod title;
 mod vcs;
 mod version;
 mod workspace;
@@ -74,6 +75,10 @@ pub use session::{
     AgentSessionSnapshot, AgentSessionState, SessionEvent, SessionEventRecord, SessionManagerState,
 };
 pub use time::Timestamp;
+pub use title::{
+    MAX_SESSION_TITLE_CHARS, MAX_SESSION_TITLE_WORDS, SessionTitleSource, is_placeholder_title,
+    sanitize_title, title_from_goal, titles_diverge,
+};
 pub use vcs::{
     GitBranch, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,
     GitFileStatusKind, GitRepositoryStatus,

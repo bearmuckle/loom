@@ -28,6 +28,12 @@ pub struct WorkspaceConfig {
     /// worker from queueing runs forever.
     #[serde(default = "default_run_admission_timeout_secs")]
     pub run_admission_timeout_secs: u32,
+    /// Choose a project's title automatically from the work its root agent
+    /// plans, or from its goal when it never proposes a plan. A manual rename
+    /// pins the title and stops automation for that project. Enabled by
+    /// default, so an upgraded workspace titles itself.
+    #[serde(default = "default_auto_title_projects")]
+    pub auto_title_projects: bool,
 }
 
 pub const MIN_PROJECT_AGENT_CONCURRENCY: u8 = 1;
@@ -53,6 +59,11 @@ const fn default_run_admission_timeout_secs() -> u32 {
     DEFAULT_RUN_ADMISSION_TIMEOUT_SECS
 }
 
+/// Automatic project titles are on unless a workspace turns them off.
+const fn default_auto_title_projects() -> bool {
+    true
+}
+
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
@@ -62,6 +73,7 @@ impl Default for WorkspaceConfig {
             project_agent_concurrency: default_project_agent_concurrency(),
             auto_archive_completed_agents: false,
             run_admission_timeout_secs: default_run_admission_timeout_secs(),
+            auto_title_projects: default_auto_title_projects(),
         }
     }
 }
@@ -252,5 +264,8 @@ mod tests {
             config.run_admission_timeout_secs,
             DEFAULT_RUN_ADMISSION_TIMEOUT_SECS
         );
+        // A workspace that predates automatic titles gets them, so an upgraded
+        // workspace titles new projects without an operator action.
+        assert!(config.auto_title_projects);
     }
 }

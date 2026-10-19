@@ -229,6 +229,7 @@ fn event_json_round_trip_preserves_sequence_and_session() {
         state: AgentSessionState::Idle,
         created_at: Timestamp::from_unix_millis(1),
         updated_at: Timestamp::from_unix_millis(1),
+        title_source: loom_core::SessionTitleSource::Auto,
     };
     let event = ServerEventEnvelope {
         protocol_version: ProtocolVersion::new(1, 0),

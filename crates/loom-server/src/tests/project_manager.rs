@@ -532,6 +532,7 @@ fn project_manager_tool_creates_an_idempotent_non_code_child() {
         state: AgentSessionState::Idle,
         created_at,
         updated_at: created_at,
+        title_source: loom_core::SessionTitleSource::Auto,
     };
     let idle_task = loom_core::DelegatedTaskRecord {
         task_id: loom_core::TaskId::new(),
@@ -833,6 +834,7 @@ fn a_finished_child_result_stays_readable_with_its_delivery_state() {
             state: AgentSessionState::Idle,
             created_at,
             updated_at: created_at,
+            title_source: loom_core::SessionTitleSource::Auto,
         };
         let task = loom_core::DelegatedTaskRecord {
             task_id: loom_core::TaskId::new(),
@@ -1064,6 +1066,7 @@ fn a_child_report_reaches_a_completed_project_manager() {
         state: AgentSessionState::Idle,
         created_at,
         updated_at: created_at,
+        title_source: loom_core::SessionTitleSource::Auto,
     };
     let task = loom_core::DelegatedTaskRecord {
         task_id: loom_core::TaskId::new(),
@@ -1633,6 +1636,7 @@ fn an_action_request_to_a_completed_code_child_is_refused() {
             state: AgentSessionState::Idle,
             created_at,
             updated_at: created_at,
+            title_source: loom_core::SessionTitleSource::Auto,
         };
         let task = loom_core::DelegatedTaskRecord {
             task_id: loom_core::TaskId::new(),

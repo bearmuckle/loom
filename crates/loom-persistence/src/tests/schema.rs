@@ -16,7 +16,7 @@ fn migrates_populated_v7_model_storage_without_cascading_dependents() {
     connection.execute_batch(
         "PRAGMA foreign_keys=ON;
          PRAGMA user_version=7;
-         INSERT INTO sessions VALUES (zeroblob(16), zeroblob(16), 'session', 'idle', 1, 1);
+         INSERT INTO sessions VALUES (zeroblob(16), zeroblob(16), 'session', 'idle', 'auto', 1, 1);
          INSERT INTO run_summaries VALUES (
              zeroblob(16), zeroblob(16), zeroblob(16), 0, 'executing', 1, 1, NULL,
              'task', 'legacy-model', NULL, 0, 0, 0, 0, 0, 0);
@@ -577,6 +577,78 @@ fn opens_and_migrates_an_older_schema_in_place() {
         fs::remove_file(path).unwrap();
     }
     fs::remove_file(fresh_path).unwrap();
+}
+
+#[test]
+fn migrates_a_v11_database_by_adding_the_session_title_source_column() {
+    let path = std::env::temp_dir().join(format!(
+        "loom-persistence-migrate-v11-{}.db",
+        Uuid::new_v4()
+    ));
+    let session_id = AgentSessionId::new();
+    let workspace_id = WorkspaceId::new();
+    {
+        let connection = Connection::open(&path).unwrap();
+        // A v11 database predates the title source column. The fixture is the
+        // current baseline without that one column, so the v13 step is what
+        // adds it back.
+        connection
+            .execute_batch(&super::super::schema::DATABASE_SCHEMA.replace(
+                "    title_source TEXT NOT NULL DEFAULT 'auto' \
+                     CHECK(title_source IN ('auto', 'manual')),\n",
+                "",
+            ))
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_store_meta(singleton, next_sequence) VALUES (1, 3)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(id, workspace_id, name, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'An older project', 'idle', 1, 1)",
+                params![
+                    session_id.as_uuid().as_bytes().as_slice(),
+                    workspace_id.as_uuid().as_bytes().as_slice(),
+                ],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", 11u32)
+            .unwrap();
+    }
+
+    let store = FilePersistence::open(&path).unwrap();
+    let restored = store.load_sessions().unwrap().unwrap();
+    assert_eq!(
+        restored.sessions[&session_id].name, "An older project",
+        "a migration keeps the stored name"
+    );
+    assert_eq!(
+        restored.sessions[&session_id].title_source,
+        SessionTitleSource::Auto,
+        "a session written before the column is not pinned"
+    );
+    drop(store);
+
+    let connection = Connection::open(&path).unwrap();
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, DATABASE_SCHEMA_VERSION);
+    let has_column: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions')
+             WHERE name='title_source')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(has_column, "the v13 migration adds the title source column");
+    drop(connection);
+    fs::remove_file(path).unwrap();
 }
 
 #[test]

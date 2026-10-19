@@ -355,6 +355,7 @@ fn archiving_project_requires_terminal_children_then_archives_the_tree() {
         state: AgentSessionState::Idle,
         created_at,
         updated_at: created_at,
+        title_source: loom_core::SessionTitleSource::Auto,
     };
     let task = loom_core::DelegatedTaskRecord {
         task_id: loom_core::TaskId::new(),
@@ -610,6 +611,7 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
         state: AgentSessionState::Idle,
         created_at,
         updated_at: created_at,
+        title_source: loom_core::SessionTitleSource::Auto,
     };
     let task = loom_core::DelegatedTaskRecord {
         task_id,
@@ -718,6 +720,7 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
         state: AgentSessionState::Idle,
         created_at,
         updated_at: created_at,
+        title_source: loom_core::SessionTitleSource::Auto,
     };
     persistence
         .create_project_child(
@@ -971,6 +974,7 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
         state: AgentSessionState::Idle,
         created_at,
         updated_at: created_at,
+        title_source: loom_core::SessionTitleSource::Auto,
     };
     persistence
         .create_project_child(
@@ -1642,6 +1646,7 @@ fn auto_archive_policy_archives_a_completed_child_agent() {
             state: AgentSessionState::Idle,
             created_at,
             updated_at: created_at,
+            title_source: loom_core::SessionTitleSource::Auto,
         };
         let task = loom_core::DelegatedTaskRecord {
             task_id: loom_core::TaskId::new(),
@@ -1801,6 +1806,7 @@ fn auto_archive_waits_for_code_integration() {
         state: AgentSessionState::Idle,
         created_at,
         updated_at: created_at,
+        title_source: loom_core::SessionTitleSource::Auto,
     };
     let task = loom_core::DelegatedTaskRecord {
         task_id: loom_core::TaskId::new(),

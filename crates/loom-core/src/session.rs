@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::{AgentSessionId, EventSequence, Timestamp, WorkspaceId};
+use crate::{AgentSessionId, EventSequence, SessionTitleSource, Timestamp, WorkspaceId};
 use serde::{Deserialize, Serialize};
 
 /// Serializable snapshot of the session manager, owned by the neutral domain
@@ -32,10 +32,17 @@ pub enum AgentSessionState {
 pub struct AgentSessionSnapshot {
     pub id: AgentSessionId,
     pub workspace_id: WorkspaceId,
+    /// The session's name. A project's row in the sidebar is rendered from its
+    /// root session's name, so this doubles as the project title.
     pub name: String,
     pub state: AgentSessionState,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
+    /// Who chose the current name. A manual rename pins it and stops automatic
+    /// re-titling. A snapshot written before this field existed reads as
+    /// `auto`.
+    #[serde(default)]
+    pub title_source: SessionTitleSource,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -56,6 +63,16 @@ pub enum SessionEvent {
     AgentSessionRenamed {
         session_id: AgentSessionId,
         name: String,
+        /// Who chose the new name. The field is additive, so a record written
+        /// before it existed reads as `auto`.
+        #[serde(default)]
+        source: SessionTitleSource,
+    },
+    /// The session's title source changed without renaming it, so automation
+    /// starts or stops for that session.
+    AgentSessionTitleSourceChanged {
+        session_id: AgentSessionId,
+        source: SessionTitleSource,
     },
     AgentSessionArchived {
         session_id: AgentSessionId,

@@ -70,6 +70,27 @@ impl InProcessBackend {
                 if let Err(error) = recorded {
                     handle.record_failure(error);
                 }
+                // Then choose a project title for the work that was just
+                // recorded. This runs after the event was applied so the plan
+                // and goal the run holds are the ones the event produced, and
+                // it reads them from the cached state instead of the runtime,
+                // whose lock the run loop already holds.
+                match event {
+                    AgentEvent::PlanProposed { plan, .. } => {
+                        let goal = handle.state().run.task;
+                        backend.maybe_auto_title(session_id, plan.title.as_deref(), &goal);
+                    }
+                    AgentEvent::RunCompleted { .. } => {
+                        // A run that proposed a title already named its project,
+                        // so the heuristic only covers runs that never proposed
+                        // a plan and never overwrites a model title.
+                        let state = handle.state();
+                        if state.plan.title.is_none() {
+                            backend.maybe_auto_title(session_id, None, &state.run.task);
+                        }
+                    }
+                    _ => {}
+                }
             }
         })
     }

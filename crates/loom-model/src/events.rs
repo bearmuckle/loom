@@ -86,6 +86,14 @@ pub enum ServerEvent {
     AgentSessionRenamed {
         session_id: AgentSessionId,
         name: String,
+        /// Who chose the new name. Absent in older payloads, which read as
+        /// `auto`.
+        #[serde(default)]
+        source: loom_core::SessionTitleSource,
+    },
+    AgentSessionTitleSourceChanged {
+        session_id: AgentSessionId,
+        source: loom_core::SessionTitleSource,
     },
     AgentSessionArchived {
         session_id: AgentSessionId,
@@ -157,8 +165,17 @@ impl ServerEventEnvelope {
                 source_session_id,
                 snapshot,
             },
-            SessionEvent::AgentSessionRenamed { session_id, name } => {
-                ServerEvent::AgentSessionRenamed { session_id, name }
+            SessionEvent::AgentSessionRenamed {
+                session_id,
+                name,
+                source,
+            } => ServerEvent::AgentSessionRenamed {
+                session_id,
+                name,
+                source,
+            },
+            SessionEvent::AgentSessionTitleSourceChanged { session_id, source } => {
+                ServerEvent::AgentSessionTitleSourceChanged { session_id, source }
             }
             SessionEvent::AgentSessionArchived { session_id } => {
                 ServerEvent::AgentSessionArchived { session_id }

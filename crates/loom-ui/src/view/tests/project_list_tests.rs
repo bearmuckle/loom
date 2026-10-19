@@ -29,6 +29,7 @@ fn session(
         state,
         created_at: Timestamp::from_unix_millis(created_at),
         updated_at: Timestamp::from_unix_millis(created_at),
+        title_source: loom_core::SessionTitleSource::Auto,
     }
 }
 

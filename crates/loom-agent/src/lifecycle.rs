@@ -51,7 +51,10 @@ impl AgentRuntime {
             started_at: now,
             completed_at: None,
         }];
-        let plan = AgentPlan { steps: Vec::new() };
+        let plan = AgentPlan {
+            steps: Vec::new(),
+            title: None,
+        };
         let messages = initial_messages(&task);
         let message_timeline_ordinals = (0..messages.len())
             .map(|ordinal| u64::try_from(ordinal).expect("initial message count fits in u64"))

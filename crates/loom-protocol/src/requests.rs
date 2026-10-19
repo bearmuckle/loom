@@ -247,6 +247,13 @@ pub enum SessionRequest {
         name: String,
     },
 
+    /// Records who chose a session's current title, so a person can pin a
+    /// project's name (or hand it back to automation) without renaming it.
+    SetAgentSessionTitleSource {
+        session_id: AgentSessionId,
+        source: loom_core::SessionTitleSource,
+    },
+
     ArchiveAgentSession {
         session_id: AgentSessionId,
     },

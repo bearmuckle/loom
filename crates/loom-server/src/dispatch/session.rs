@@ -48,6 +48,19 @@ impl InProcessConnection {
                     SessionResponse::AgentSessionRenamed(snapshot),
                 ))
             }
+            ClientRequest::Session(SessionRequest::SetAgentSessionTitleSource {
+                session_id,
+                source,
+            }) => {
+                let (snapshot, record) = self
+                    .backend
+                    .sessions()?
+                    .set_title_source(session_id, source)?;
+                self.backend.journal()?.append_session(record);
+                Ok(ServerResponse::Session(SessionResponse::AgentSession(
+                    snapshot,
+                )))
+            }
             ClientRequest::Session(SessionRequest::ArchiveAgentSession { session_id }) => {
                 self.archive_session(session_id)
             }

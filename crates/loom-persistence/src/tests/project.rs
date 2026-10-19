@@ -293,6 +293,7 @@ fn project_child_and_agent_messages_are_atomic_ordered_and_request_idempotent() 
         state: AgentSessionState::Idle,
         created_at: Timestamp::now(),
         updated_at: Timestamp::now(),
+        title_source: loom_core::SessionTitleSource::Auto,
     };
     let task = DelegatedTaskRecord {
         task_id: TaskId::new(),
@@ -547,6 +548,7 @@ fn project_cancellation_cascade_intent_is_ordered_idempotent_and_removable() {
         state: AgentSessionState::Idle,
         created_at: Timestamp::now(),
         updated_at: Timestamp::now(),
+        title_source: loom_core::SessionTitleSource::Auto,
     };
     let task = DelegatedTaskRecord {
         task_id: TaskId::new(),
@@ -657,6 +659,7 @@ fn project_task_queries_and_cancellation_cover_lifecycle_paths() {
         state: AgentSessionState::Idle,
         created_at: now,
         updated_at: now,
+        title_source: loom_core::SessionTitleSource::Auto,
     };
     let task = DelegatedTaskRecord {
         task_id: TaskId::new(),

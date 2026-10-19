@@ -25,8 +25,8 @@ use loom_core::{
     MAX_PROJECT_AGENT_DEPTH, ProjectAgentRecord, ProjectId, ProjectSnapshot,
     ProjectWorktreeBaseRefresh, ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord,
     ProjectWorktreeStatus, ProtocolVersion, RepositoryId, RequestId, Result, RunAttemptId,
-    SessionEventRecord, TaskContextReference, Timestamp, UsageSnapshot, WorkspaceId,
-    WorkspaceRecord,
+    SessionEventRecord, SessionTitleSource, TaskContextReference, Timestamp, UsageSnapshot,
+    WorkspaceId, WorkspaceRecord, sanitize_title, title_from_goal, titles_diverge,
 };
 use loom_model::{
     ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId, ToolCall, ToolDefinition,
