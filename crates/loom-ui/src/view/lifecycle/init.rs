@@ -590,11 +590,11 @@ impl LoomView {
             default_model_select_value: None,
             model_select_choices: BTreeMap::new(),
             default_model_select_choices: BTreeMap::new(),
-            // An unconfigured client opens on the settings dialog, which is the
-            // covering surface on screen until the user closes it.
-            covering_surface: options
-                .is_configured()
-                .then_some(CoveringSurface::Settings(SettingsSection::Agents)),
+            // A configured page bootstraps at once and shows only the startup
+            // screen; an unconfigured page is onboarded by the welcome dialog,
+            // whose button opens Settings. Neither first frame starts on the
+            // settings dialog, which would cover the startup screen.
+            covering_surface: browser_startup_covering_surface(),
             archived_sessions: ArchivedSessionsState::default(),
             providers: Vec::new(),
             providers_node_id: None,

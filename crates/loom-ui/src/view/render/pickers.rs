@@ -263,11 +263,17 @@ impl LoomView {
                                             .child(screen.empty),
                                     ),
                             )
-                            .when(self.settings_open(), |element| {
-                                let section =
-                                    self.settings_section().unwrap_or(SettingsSection::Agents);
-                                element.child(self.render_settings_dialog(section, layout, cx))
-                            }),
+                            .when(
+                                startup_screen_shows_settings(
+                                    self.settings_open(),
+                                    self.browser_starting,
+                                ),
+                                |element| {
+                                    let section =
+                                        self.settings_section().unwrap_or(SettingsSection::Agents);
+                                    element.child(self.render_settings_dialog(section, layout, cx))
+                                },
+                            ),
                     ),
             )
             .child(disconnected_footer(layout).child(screen.footer))

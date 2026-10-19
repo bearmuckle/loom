@@ -1406,6 +1406,29 @@ pub(crate) fn startup_screen(connected: bool) -> DisconnectedScreen {
     }
 }
 
+/// The covering surface the browser client's first view starts with: none.
+///
+/// A page that has a worker URL bootstraps at once and shows only the startup
+/// screen, so it must not start with the settings dialog covering that screen.
+/// A page without one is onboarded by the welcome dialog, whose button opens
+/// Settings. Neither first frame has a covering surface, so the saved settings
+/// decide nothing here.
+#[cfg(any(target_family = "wasm", test))]
+pub(crate) fn browser_startup_covering_surface() -> Option<CoveringSurface> {
+    None
+}
+
+/// Whether the startup screen paints the settings dialog over itself.
+///
+/// A bootstrap in flight owns the whole screen: it shows only its own progress,
+/// and a settings dialog the view still holds would cover that progress. Once
+/// the bootstrap ends the screen is the disconnected screen, which keeps its
+/// settings affordances, including the surface the view still holds.
+#[cfg(any(target_family = "wasm", test))]
+pub(crate) fn startup_screen_shows_settings(settings_open: bool, browser_starting: bool) -> bool {
+    settings_open && !browser_starting
+}
+
 /// What the browser client should do once the page becomes visible again.
 ///
 /// Kept as a pure decision so the table below can be tested on native builds,

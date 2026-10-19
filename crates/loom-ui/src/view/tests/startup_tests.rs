@@ -151,3 +151,37 @@ fn the_startup_screen_offers_progress_instead_of_a_settings_prompt() {
         disconnected_screen(Some("the connection closed (code 1006)")).heading
     );
 }
+
+/// The first browser frame has no covering surface. A page with a worker URL
+/// bootstraps at once, so the startup screen must not have the settings dialog
+/// on top of it; a page without one is onboarded by the welcome dialog, whose
+/// button opens Settings.
+#[test]
+fn the_browser_client_starts_without_a_covering_surface() {
+    assert!(
+        browser_startup_covering_surface().is_none(),
+        "the first browser view covers itself with the settings dialog"
+    );
+}
+
+/// The startup screen paints the settings dialog only once no bootstrap is in
+/// flight: an automatic startup that reaches Settings holds the whole screen
+/// with its own progress, and a settings dialog the view still holds waits
+/// until the disconnected screen that offers it is on screen.
+#[test]
+fn the_startup_screen_hides_the_settings_dialog_while_a_bootstrap_runs() {
+    let cases = [
+        // settings open, bootstrap in flight, settings dialog painted
+        (true, true, false),
+        (true, false, true),
+        (false, true, false),
+        (false, false, false),
+    ];
+    for (settings_open, browser_starting, painted) in cases {
+        assert_eq!(
+            startup_screen_shows_settings(settings_open, browser_starting),
+            painted,
+            "settings open {settings_open}, bootstrap in flight {browser_starting}"
+        );
+    }
+}
