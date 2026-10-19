@@ -5,7 +5,7 @@ use super::support::*;
 use super::*;
 use loom_agent::{AgentRuntime, AgentTask};
 use loom_core::{AgentSessionState, LoomError};
-use loom_model::AgentRunState;
+use loom_model::{AgentRunState, MessageRole, ModelMessage};
 use loom_tools::ToolExecutor;
 
 #[test]
@@ -223,6 +223,72 @@ fn rejected_run_is_recorded_as_failed_with_its_reason() {
         AgentSessionState::Failed
     );
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_checkpoint_that_consolidates_fragments_resets_the_fragment_cursor() {
+    let path = std::env::temp_dir().join(format!(
+        "loom-fragment-consolidation-{}.db",
+        WorkspaceId::new()
+    ));
+    let backend = InProcessBackend::new_persistent(&path).unwrap();
+    let workspace_id = WorkspaceId::new();
+    let session = {
+        let mut sessions = backend.sessions().unwrap();
+        sessions
+            .create_in_workspace(workspace_id, "fragments")
+            .unwrap()
+            .0
+    };
+    let root = std::env::temp_dir().join(format!("loom-fragments-{}", WorkspaceId::new()));
+    fs::create_dir_all(&root).unwrap();
+    let runtime = AgentRuntime::new(
+        session.id,
+        AgentTask::new("fragments", ModelId::new("deterministic/demo")).unwrap(),
+        Box::new(loom_providers::DeterministicProvider::demo()),
+        ToolExecutor::new(&root).unwrap(),
+    );
+    let handle = backend.register_runtime(runtime);
+    let persistence = backend.persistence.as_ref().unwrap().clone();
+
+    // Create the run summary without a transcript row.
+    backend.persist_run_checkpoint(&handle).unwrap();
+
+    // Stream "first" as a fragment: the message row starts with no base
+    // content and holds only the fragment descriptor.
+    handle.append_message_delta(&*persistence, "first").unwrap();
+    handle.flush_message_fragments(&*persistence).unwrap();
+
+    // Cache the completed message text, as `refresh` does after a step.
+    {
+        let mut state = handle.locked_state();
+        state
+            .messages
+            .push(ModelMessage::new(MessageRole::Assistant, "first"));
+        state.message_timeline_ordinals.push(0);
+    }
+
+    // The checkpoint consolidates the matching fragment into the message
+    // content and deletes the fragment descriptor.
+    backend.persist_run_checkpoint(&handle).unwrap();
+
+    // The same assistant message continues. The append must re-read the
+    // committed position instead of reusing the deleted fragment's cursor.
+    handle
+        .append_message_delta(&*persistence, "second")
+        .unwrap();
+    handle.flush_message_fragments(&*persistence).unwrap();
+
+    let messages = persistence.load_run_messages(handle.run_id).unwrap();
+    let assistant = messages
+        .iter()
+        .find(|message| message.role == MessageRole::Assistant)
+        .expect("the streamed assistant message");
+    assert_eq!(assistant.content, "firstsecond");
+
+    backend.shutdown().unwrap();
+    std::fs::remove_file(path).ok();
+    fs::remove_dir_all(root).ok();
 }
 
 #[test]

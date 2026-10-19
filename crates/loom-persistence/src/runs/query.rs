@@ -1697,20 +1697,29 @@ impl FilePersistence {
                 "message fragment retry conflicts with the committed fragment",
             ));
         }
-        let contiguous = match fragments
+        let (expected_fragment_ordinal, expected_byte_offset) = fragments
             .iter()
             .max_by_key(|fragment| fragment.fragment_ordinal)
+            .map(|tail| {
+                (
+                    tail.fragment_ordinal.checked_add(1),
+                    tail.byte_offset.checked_add(tail.byte_length),
+                )
+            })
+            .unwrap_or((Some(0), Some(base_offset)));
+        if expected_fragment_ordinal != Some(fragment_ordinal)
+            || expected_byte_offset != Some(byte_offset)
         {
-            Some(tail) => {
-                tail.fragment_ordinal.checked_add(1) == Some(fragment_ordinal)
-                    && tail.byte_offset.checked_add(tail.byte_length) == Some(byte_offset)
-            }
-            None => fragment_ordinal == 0 && byte_offset == base_offset,
-        };
-        if !contiguous {
-            return Err(LoomError::invalid_request(
-                "message fragments must be appended contiguously in order",
-            ));
+            let expected = format!(
+                "fragment {} at byte offset {}",
+                expected_fragment_ordinal
+                    .map_or_else(|| "overflow".to_owned(), |value| value.to_string()),
+                expected_byte_offset
+                    .map_or_else(|| "overflow".to_owned(), |value| value.to_string()),
+            );
+            return Err(LoomError::invalid_request(format!(
+                "run {run_id} message {message_ordinal} message fragments must be appended contiguously in order (expected {expected}, got fragment {fragment_ordinal} at byte offset {byte_offset})"
+            )));
         }
         fragments.push(StoredFragment {
             fragment_ordinal,

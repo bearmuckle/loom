@@ -358,6 +358,10 @@ impl InProcessBackend {
             self.persistence_failed.store(true, Ordering::SeqCst);
             return Err(error);
         }
+        // The save may have consolidated this message's streamed fragments into
+        // its content, deleting the fragment descriptors. Re-read the cursor
+        // before appending more text to the same message.
+        handle.clear_message_fragment_positions();
         if let Some((filesystem, generation)) = filesystem_ack {
             filesystem.acknowledge_persisted_generation(generation)?;
         }
@@ -432,7 +436,7 @@ impl InProcessBackend {
             )
         })?;
         let handles = self.runs()?.values().cloned().collect::<Vec<_>>();
-        for handle in handles {
+        for handle in &handles {
             handle.flush_message_fragments(persistence)?;
         }
         let mut runs: BTreeMap<loom_core::RunId, AgentRuntimeState> = self
@@ -674,6 +678,11 @@ impl InProcessBackend {
             self.persistence_failed.store(true, Ordering::SeqCst);
         }
         if result.is_ok() {
+            // A full save consolidates streamed fragments too; drop the cached
+            // cursors so a later delta re-reads the committed position.
+            for handle in &handles {
+                handle.clear_message_fragment_positions();
+            }
             for (filesystem, generation) in filesystem_generations {
                 filesystem.acknowledge_persisted_generation(generation)?;
             }

@@ -147,6 +147,23 @@ impl RunHandle {
         self.flush_message_fragments_locked(persistence, &mut fragments)
     }
 
+    /// Drops the cached fragment cursors so the next append re-reads the
+    /// committed position.
+    ///
+    /// A checkpoint consolidates a message whose stored fragments match its
+    /// content: it writes the content and deletes the fragment descriptors. If
+    /// the same assistant message continues afterwards, the cached ordinal and
+    /// byte offset describe deleted fragments and the append would be rejected
+    /// as non-contiguous. Checkpoints call this after a successful save.
+    pub(crate) fn clear_message_fragment_positions(&self) {
+        let mut fragments = self
+            .message_fragments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        fragments.active_message_ordinal = None;
+        fragments.positions.clear();
+    }
+
     pub(crate) fn flush_message_fragments_locked(
         &self,
         persistence: &dyn Persistence,

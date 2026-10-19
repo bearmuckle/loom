@@ -275,6 +275,26 @@ fn streamed_messages_are_append_only_and_paged_by_keyset() {
             .code,
         ErrorCode::InvalidRequest
     );
+    let gap = persistence
+        .append_run_message_fragment(run_id, session.id, 1, 3, 15, b"gap")
+        .unwrap_err();
+    assert_eq!(gap.code, ErrorCode::InvalidRequest);
+    assert!(
+        gap.message.contains(&format!("run {run_id} message 1")),
+        "the error must name the run and message: {}",
+        gap.message
+    );
+    assert!(
+        gap.message
+            .contains("expected fragment 2 at byte offset 15"),
+        "the error must name the expected fragment: {}",
+        gap.message
+    );
+    assert!(
+        gap.message.contains("got fragment 3 at byte offset 15"),
+        "the error must name the appended fragment: {}",
+        gap.message
+    );
     assert_eq!(
         persistence
             .load_run_message_content_range(run_id, 999, 0, 1)
