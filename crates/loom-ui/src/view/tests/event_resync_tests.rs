@@ -106,7 +106,7 @@ use super::*;
 use gpui_kit::{TestAppContext, px, size};
 
 /// Builds one journaled agent event envelope for the given sequence.
-fn agent_envelope(
+pub(super) fn agent_envelope(
     sequence: u64,
     session_id: AgentSessionId,
     event: AgentEvent,

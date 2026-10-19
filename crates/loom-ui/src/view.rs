@@ -658,6 +658,16 @@ pub(crate) struct LoomView {
     transcript_messages: BTreeMap<u64, (u64, ModelMessage)>,
     transcript_has_older: bool,
     transcript_loading: bool,
+    /// Whether the open session's conversation is not on screen yet.
+    ///
+    /// Opening a session repaints the conversation several times: the durable
+    /// projection paints first, then each transcript page the reopen backfill
+    /// follows, then one reordering rebuild. Every one of those frames is a
+    /// different partial transcript, so the timeline holds one neutral
+    /// placeholder while this is set. Only opening a session for display sets
+    /// it; the poll-driven resync rebuilds a conversation that is already on
+    /// screen and must never blank it.
+    conversation_opening: bool,
     transcript_generation: u64,
     /// Rows added at the head by an older-page load, consumed by the timeline's
     /// virtual list so it can prepend them without jumping the scroll anchor.
@@ -2088,6 +2098,7 @@ impl LoomView {
             transcript_messages: BTreeMap::new(),
             transcript_has_older: false,
             transcript_loading: false,
+            conversation_opening: false,
             transcript_generation: 0,
             transcript_prepend_count: 0,
             timeline_view: None,

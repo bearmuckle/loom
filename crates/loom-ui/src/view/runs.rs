@@ -338,6 +338,9 @@ impl LoomView {
             Ok(backend) => backend,
             Err(error) => {
                 self.finish_browser_startup();
+                // Nothing was requested, so nothing will end the ladder and
+                // clear the hold later.
+                self.conversation_opening = false;
                 self.record_backend_error("load conversation history", error);
                 cx.notify();
                 return;
@@ -366,7 +369,8 @@ impl LoomView {
                     if view.active_run_id != Some(run_id)
                         || view.transcript_generation != transcript_generation
                     {
-                        // A newer load owns transcript_loading.
+                        // A newer load owns transcript_loading, and it owns the
+                        // hold that goes with it.
                         return None;
                     }
                     match result {
@@ -410,6 +414,10 @@ impl LoomView {
                                     // The next reopen reorders.
                                 }
                                 view.transcript_loading = false;
+                                // Every page the ladder followed is applied, so
+                                // the whole conversation is on screen and the
+                                // placeholder can go.
+                                view.conversation_opening = false;
                             }
                             cx.notify();
                             next
@@ -418,6 +426,9 @@ impl LoomView {
                             view.finish_browser_startup();
                             view.record_backend_error("load conversation history", error);
                             view.transcript_loading = false;
+                            // The ladder ends here with whatever pages it already
+                            // applied, which is all that will ever arrive.
+                            view.conversation_opening = false;
                             cx.notify();
                             None
                         }

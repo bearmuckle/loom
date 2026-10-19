@@ -52,7 +52,7 @@ impl Render for TimelineView {
             self.scroller_subscription = Some(cx.observe(&scroller, |_, _, cx| cx.notify()));
         }
 
-        let (item_count, session_changed, timeline_revision, prepend_count) = {
+        let (item_count, session_changed, timeline_revision, prepend_count, conversation_opening) = {
             let parent_state = self.parent.read(cx);
             let item_count = parent_state.timeline.len();
             let session_id = parent_state.active_session.id;
@@ -79,6 +79,7 @@ impl Render for TimelineView {
                 session_changed,
                 timeline_revision,
                 parent_state.transcript_prepend_count,
+                parent_state.conversation_opening,
             )
         };
         self.sync_list(
@@ -92,7 +93,7 @@ impl Render for TimelineView {
             self.parent
                 .update(cx, |view, _| view.transcript_prepend_count = 0);
         }
-        if item_count == 0 {
+        if item_count == 0 && !conversation_opening {
             div()
                 .size_full()
                 .p_6()
@@ -138,6 +139,48 @@ impl Render for TimelineView {
                                             "{} palette",
                                             command_palette_shortcut_label()
                                         )),
+                                ),
+                        ),
+                )
+                .into_any_element()
+        } else if conversation_opening {
+            // The open session's conversation is still being rebuilt, so this
+            // paints one neutral frame instead of each partial transcript the
+            // reopen ladder applies. The list above is still synced, so the
+            // final frame lands on the scroller state the whole roster implies.
+            div()
+                .size_full()
+                .p_6()
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .id("timeline-opening")
+                                .test_support()
+                                .w_full()
+                                .max_w(TIMELINE_CONTENT_MAX_WIDTH)
+                                .p_5()
+                                .rounded_lg()
+                                .bg(rgb(0x171c25))
+                                .border_1()
+                                .border_color(rgb(0x293244))
+                                .text_size(gpui_kit::rems(13. / BASE_FONT_SIZE))
+                                .text_color(rgb(0xb7c0d0))
+                                .child(
+                                    div()
+                                        .text_size(gpui_kit::rems(15. / BASE_FONT_SIZE))
+                                        .text_color(rgb(0xf3f4f6))
+                                        .child("Opening the conversation"),
+                                )
+                                .child(
+                                    div()
+                                        .mt_1()
+                                        .text_size(gpui_kit::rems(13. / BASE_FONT_SIZE))
+                                        .text_color(rgb(0x8f98a6))
+                                        .child("Reading the transcript. Loom shows it once the whole conversation is loaded."),
                                 ),
                         ),
                 )

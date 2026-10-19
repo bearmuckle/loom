@@ -316,6 +316,11 @@ impl LoomView {
                 self.active_run = Some(snapshot.clone());
                 self.active_run_id = Some(snapshot.id);
                 self.set_run_state(snapshot.state);
+                // A new run streams its own conversation into the open session,
+                // so the transcript below owns the timeline from here; holding
+                // it behind the opening placeholder would only blank the live
+                // frames.
+                self.conversation_opening = false;
             }
             AgentEvent::PlanProposed { plan, .. } => {
                 let steps = plan

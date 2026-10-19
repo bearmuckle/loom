@@ -15,6 +15,7 @@ mod agent_question_tests;
 mod archived_session_tests;
 mod collaboration_tests;
 mod connectivity_tests;
+mod conversation_open_tests;
 mod covering_surface_tests;
 mod destructive_approval_tests;
 mod disconnected_screen_render_tests;

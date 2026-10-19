@@ -367,7 +367,7 @@ fn reopening_from_a_snapshot_that_carries_messages_keeps_the_conversation(cx: &m
 /// view on that backend is initialized with. The rebuild tests below differ
 /// only in the response pair they feed the view.
 #[cfg(not(target_family = "wasm"))]
-fn completed_demo_session(
+pub(super) fn completed_demo_session(
     task: &str,
 ) -> (
     crate::local_backend::OwnedBackend,
@@ -410,7 +410,7 @@ fn completed_demo_session(
 /// rebuild tests start from. The live worker's delayed status poll is cleared so
 /// the test stays synchronous.
 #[cfg(not(target_family = "wasm"))]
-fn open_selected_session_view(
+pub(super) fn open_selected_session_view(
     cx: &mut TestAppContext,
     backend: crate::local_backend::OwnedBackend,
     connection: ClientConnection,

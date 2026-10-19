@@ -503,6 +503,9 @@ impl LoomView {
             self.select_session(session, cx);
             return;
         }
+        // The landing session's conversation is not on screen yet either, so it
+        // is held exactly like an interactive selection.
+        self.conversation_opening = true;
         self.begin_session_data_load(session.id, cx);
         cx.notify();
     }
@@ -512,6 +515,9 @@ impl LoomView {
             // Nothing will load for this session, so the browser startup screen
             // must not wait on it; the error banner explains the empty workspace.
             self.finish_browser_startup();
+            // No ladder will run for this session, so a hold from an earlier
+            // open must not stay set in front of the empty workspace.
+            self.conversation_opening = false;
             self.record_backend_error("select session", error);
             cx.notify();
             return;
@@ -534,6 +540,10 @@ impl LoomView {
             self.refresh_models_for_node_async(node_id, cx);
         }
         self.ensure_session_task_message(session.id);
+        // The conversation is about to be rebuilt by the reopen ladder, which
+        // paints several partial transcripts, so it is held until that ladder
+        // ends instead of flashing each one.
+        self.conversation_opening = true;
         self.begin_session_data_load(session.id, cx);
         self.refresh_collaboration(cx);
         cx.notify();
@@ -555,6 +565,8 @@ impl LoomView {
             Ok(backend) => backend,
             Err(error) => {
                 self.finish_browser_startup();
+                // Nothing was requested, so nothing will clear the hold later.
+                self.conversation_opening = false;
                 self.record_backend_error("load session", error);
                 cx.notify();
                 return;
@@ -801,8 +813,11 @@ impl LoomView {
             self.begin_transcript_page(None, cx);
         } else {
             // The conversation is on screen, so a browser startup that waited
-            // for it can reveal the workspace.
+            // for it can reveal the workspace. The same holds for the reveal:
+            // this is the ladder's last step, and every failed half above ends
+            // here too, so a refused load can never strand the placeholder.
             self.finish_browser_startup();
+            self.conversation_opening = false;
         }
         // Peer chat and attribution are not part of the run transcript, and the
         // event window above can be a partial tail, so read them from history.
