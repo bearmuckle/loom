@@ -1389,6 +1389,7 @@ mod run_message_protocol_tests {
                 state: loom_core::AgentSessionState::Idle,
                 created_at: loom_core::Timestamp::from_unix_millis(1),
                 updated_at: loom_core::Timestamp::from_unix_millis(1),
+                title_source: loom_core::SessionTitleSource::Auto,
             }),
         });
         let encoded = encode_response(&ResponseEnvelope::success(

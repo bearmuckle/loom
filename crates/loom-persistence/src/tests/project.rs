@@ -189,6 +189,7 @@ fn sub_projects_record_their_parent_project_and_refuse_other_parents() {
         state: AgentSessionState::Idle,
         created_at: Timestamp::now(),
         updated_at: Timestamp::now(),
+        title_source: loom_core::SessionTitleSource::Auto,
     };
     persistence
         .create_sub_project(&sub_project, parent_project_id, EventSequence::new(2))
