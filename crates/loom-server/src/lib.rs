@@ -163,8 +163,9 @@ pub use retention::{
 };
 pub use serve::{
     ServingBackend, bind_exposure_warning, ensure_state_database, ensure_state_database_with,
-    open_backend, report_github_sign_in, start_remote_server,
+    open_backend, open_backend_named, report_github_sign_in, start_remote_server,
 };
+pub use util::{MAX_NODE_NAME_BYTES, NODE_NAME_ENV, NODE_NAME_FLAG, resolve_node_name};
 
 const DEFAULT_EVENT_RETENTION: usize = 4096;
 /// Most events one `SessionEvents` response carries, whatever its byte budget.

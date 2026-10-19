@@ -1235,17 +1235,72 @@ pub(crate) fn memory_usage_percent(total: Option<u64>, available: Option<u64>) -
     Some(usage.round() as u8)
 }
 
-pub(crate) fn worker_node_identity() -> (String, String) {
+/// The flag that names this worker in client status lines.
+pub const NODE_NAME_FLAG: &str = "--node-name";
+/// The environment variable that names this worker when the flag is absent.
+pub const NODE_NAME_ENV: &str = "LOOM_NODE_NAME";
+/// Longest accepted node name, in bytes.
+pub const MAX_NODE_NAME_BYTES: usize = 64;
+
+/// Resolves the operator-set node name from an explicit flag and its
+/// environment fallback.
+///
+/// An explicit flag always wins over the variable it falls back to. `None`
+/// means neither was given, so the backend keeps deriving its display name from
+/// the hostname and the node id. A supplied value is trimmed and must be a
+/// non-empty name of at most [`MAX_NODE_NAME_BYTES`] bytes without control
+/// characters; a rejected value fails the start and names the input to fix.
+pub fn resolve_node_name(flag: Option<&str>, env: Option<&str>) -> Result<Option<String>> {
+    match (flag, env) {
+        (Some(value), _) => parse_node_name(value, NODE_NAME_FLAG).map(Some),
+        (None, Some(value)) => parse_node_name(value, NODE_NAME_ENV).map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Validates one node-name input. `source` names the flag or environment
+/// variable the value came from, so the error names the input to fix.
+fn parse_node_name(value: &str, source: &str) -> Result<String> {
+    let name = value.trim();
+    if name.is_empty() {
+        return Err(LoomError::invalid_request(format!(
+            "{source} must not be empty"
+        )));
+    }
+    if name.len() > MAX_NODE_NAME_BYTES {
+        return Err(LoomError::invalid_request(format!(
+            "{source} must be at most {MAX_NODE_NAME_BYTES} bytes; got {} bytes",
+            name.len()
+        )));
+    }
+    if name.chars().any(char::is_control) {
+        return Err(LoomError::invalid_request(format!(
+            "{source} must not contain control characters"
+        )));
+    }
+    Ok(name.to_owned())
+}
+
+/// The node id of this backend and the name it reports to clients.
+///
+/// An operator-set name replaces the derived display name; the id is always
+/// generated the same way, so it is unaffected by the name.
+pub(crate) fn worker_node_identity(configured_name: Option<&str>) -> (String, String) {
     let node_id = uuid::Uuid::new_v4().to_string();
-    let hostname = ["HOSTNAME", "COMPUTERNAME"]
-        .iter()
-        .find_map(|key| {
-            std::env::var(key)
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .unwrap_or_else(|| "Loom backend".to_owned());
-    let node_name = format!("{hostname} · {}", &node_id[..8]);
+    let node_name = match configured_name {
+        Some(name) => name.to_owned(),
+        None => {
+            let hostname = ["HOSTNAME", "COMPUTERNAME"]
+                .iter()
+                .find_map(|key| {
+                    std::env::var(key)
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                })
+                .unwrap_or_else(|| "Loom backend".to_owned());
+            format!("{hostname} · {}", &node_id[..8])
+        }
+    };
     (node_id, node_name)
 }
 
@@ -1618,6 +1673,82 @@ pub(crate) fn unauthorized_session(session_id: AgentSessionId) -> LoomError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_name_resolution_prefers_the_flag_and_validates_the_value() {
+        // Neither input keeps the derived display name.
+        assert_eq!(resolve_node_name(None, None).unwrap(), None);
+        // Either input alone is used as given.
+        assert_eq!(
+            resolve_node_name(Some("prod-builder"), None).unwrap(),
+            Some("prod-builder".to_owned())
+        );
+        assert_eq!(
+            resolve_node_name(None, Some("env-builder")).unwrap(),
+            Some("env-builder".to_owned())
+        );
+        // An explicit flag wins over the variable it falls back to.
+        assert_eq!(
+            resolve_node_name(Some(" flag "), Some("env")).unwrap(),
+            Some("flag".to_owned())
+        );
+        // Surrounding whitespace is trimmed.
+        assert_eq!(
+            resolve_node_name(None, Some("  spaced name  ")).unwrap(),
+            Some("spaced name".to_owned())
+        );
+
+        // Empty and whitespace-only values are rejected, naming the input.
+        for (flag, env, source) in [
+            (Some(""), None, NODE_NAME_FLAG),
+            (Some("   "), None, NODE_NAME_FLAG),
+            (None, Some(""), NODE_NAME_ENV),
+            (None, Some("\t\n"), NODE_NAME_ENV),
+        ] {
+            let error = resolve_node_name(flag, env).unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+            assert!(error.message.contains(source), "{source}: {error}");
+            assert!(error.message.contains("empty"), "{source}: {error}");
+        }
+
+        // The byte limit is inclusive and trimmed before it applies.
+        let longest = "y".repeat(MAX_NODE_NAME_BYTES);
+        assert_eq!(
+            resolve_node_name(Some(&format!("  {longest}  ")), None).unwrap(),
+            Some(longest.clone())
+        );
+        let too_long = "x".repeat(MAX_NODE_NAME_BYTES + 1);
+        let error = resolve_node_name(Some(&too_long), None).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains(NODE_NAME_FLAG), "{error}");
+        assert!(error.message.contains("64"), "{error}");
+        let error = resolve_node_name(None, Some(&too_long)).unwrap_err();
+        assert!(error.message.contains(NODE_NAME_ENV), "{error}");
+
+        // Control characters are rejected wherever they appear.
+        let error = resolve_node_name(None, Some("prod\nbuilder")).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains(NODE_NAME_ENV), "{error}");
+        assert!(error.message.contains("control"), "{error}");
+        let error = resolve_node_name(Some("prod\u{7}builder"), None).unwrap_err();
+        assert!(error.message.contains(NODE_NAME_FLAG), "{error}");
+    }
+
+    #[test]
+    fn worker_node_identity_uses_a_configured_name_and_keeps_the_derived_shape() {
+        let (node_id, node_name) = worker_node_identity(Some("prod-builder"));
+        assert_eq!(node_name, "prod-builder");
+        assert!(uuid::Uuid::parse_str(&node_id).is_ok());
+
+        // Without a configured name the hostname and the first eight id
+        // characters are still combined, whatever this machine is called.
+        let (node_id, derived) = worker_node_identity(None);
+        assert!(uuid::Uuid::parse_str(&node_id).is_ok());
+        let (_, short_id) = derived
+            .rsplit_once(" · ")
+            .unwrap_or_else(|| panic!("{derived:?} should carry the ` · short-id` suffix"));
+        assert_eq!(short_id, &node_id[..8]);
+    }
 
     #[test]
     fn worker_urls_reject_credentials_and_secure_only_where_expected() {

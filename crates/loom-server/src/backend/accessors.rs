@@ -45,6 +45,15 @@ impl InProcessBackend {
         }
     }
 
+    /// The human-readable name this worker reports in `WorkerNodeStatus` and
+    /// every client shows in its worker picker, sidebar, and status lines.
+    ///
+    /// It is either the operator-set `--node-name` or, without one, the derived
+    /// `hostname · short-id` display name. The node id is unaffected.
+    pub fn node_name(&self) -> &str {
+        &self.node_name
+    }
+
     /// Whether this worker accepts GitHub sign-ins.
     pub fn github_sign_in_enabled(&self) -> bool {
         self.identity.is_enabled()

@@ -27,10 +27,11 @@ use loom_providers::{
 use loom_server::{
     ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FORCE_DISCARD_ENV, ARCHIVE_RETENTION_SUB_AGENT_ENV,
     ARCHIVE_RETENTION_SWEEP_INTERVAL, AuthTokenStore, AuthorizationScope, InProcessBackend,
-    InProcessConnection, Instance, InstanceOptions, MAX_FRAME_BYTES_ENV, RemoteServer,
-    RemoteServerConfig, WebSocketConnection, WebSocketTransport, apply_startup_archive_retention,
-    resolve_archive_retention_with_sub_agent, resolve_max_frame_bytes,
-    run_archive_retention_sweeps, sweep_archive_retention_at_startup,
+    InProcessConnection, Instance, InstanceOptions, MAX_FRAME_BYTES_ENV, NODE_NAME_ENV,
+    RemoteServer, RemoteServerConfig, WebSocketConnection, WebSocketTransport,
+    apply_startup_archive_retention, resolve_archive_retention_with_sub_agent,
+    resolve_max_frame_bytes, resolve_node_name, run_archive_retention_sweeps,
+    sweep_archive_retention_at_startup,
 };
 
 /// How long the shell waits between event polls while a run is executing.
@@ -145,6 +146,8 @@ struct CliOptions {
     m4_demo: bool,
     bind: SocketAddr,
     instance_name: Option<String>,
+    /// Raw `--node-name` value, before it is resolved against the environment.
+    node_name: Option<String>,
     token: Option<String>,
     token_file: Option<PathBuf>,
     login_provider: Option<String>,
@@ -188,6 +191,17 @@ impl CliOptions {
         )
     }
 
+    /// The name the `--serve` backend reports to clients: `--node-name`,
+    /// `LOOM_NODE_NAME`, or the derived `hostname · short-id` display name when
+    /// neither is given. An unusable value fails the start and names the input
+    /// to fix.
+    fn node_name(&self) -> Result<Option<String>, LoomError> {
+        resolve_node_name(
+            self.node_name.as_deref(),
+            env::var(NODE_NAME_ENV).ok().as_deref(),
+        )
+    }
+
     /// The settings [`Instance`] applies its defaults to when `--serve` runs, so
     /// the standalone shell mode resolves its state directory and token exactly
     /// like the `loom-server` binary does.
@@ -209,7 +223,7 @@ fn help_text() -> String {
     [
         "Usage: loom [--name <name>] [--task <task>] [--model <id>] [--root <path>] \
          [--manual-approval] [--m3-demo] [--persistence <path>] [--reset-state] \
-         [--serve --bind <addr> --instance-name <name> \
+         [--serve --bind <addr> --instance-name <name> --node-name <name> \
          [--token <token> | --token-file <path>] [--archive-retention <duration>] \
          [--archive-retention-force-discard <bool>]] [--m4-demo] [--login github-copilot] \
          [--allow-insecure-remote] [--max-frame-bytes <bytes>]",
@@ -218,6 +232,8 @@ fn help_text() -> String {
          backend.",
         "The default workspace is an isolated directory in the system temp folder.",
         "Use --serve with an explicit bearer --token to expose the standalone WebSocket backend.",
+        "--node-name <name> (or LOOM_NODE_NAME) names the --serve worker in client status \
+         lines instead of the derived hostname and node id; the flag wins over the variable.",
         "Without --persistence, --serve keeps its state in \
          <state-dir>/<instance-name or bind-key>/state.db and reads or generates \
          <instance-dir>/token, exactly like the loom-server binary.",
@@ -258,6 +274,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
             .parse()
             .expect("valid default bind address"),
         instance_name: None,
+        node_name: None,
         token: None,
         token_file: None,
         login_provider: None,
@@ -314,6 +331,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
             "--instance-name" => {
                 options.instance_name = Some(required_value(&mut args, "--instance-name")?);
             }
+            "--node-name" => {
+                options.node_name = Some(required_value(&mut args, "--node-name")?);
+            }
             "--login" => {
                 options.login_provider = Some(required_value(&mut args, "--login")?);
             }
@@ -354,6 +374,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
             }
             value if value.starts_with("--instance-name=") => {
                 options.instance_name = Some(value["--instance-name=".len()..].to_owned());
+            }
+            value if value.starts_with("--node-name=") => {
+                options.node_name = Some(value["--node-name=".len()..].to_owned());
             }
             value if value.starts_with("--archive-retention=") => {
                 options.archive_retention = Some(value["--archive-retention=".len()..].to_owned());
@@ -427,7 +450,10 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
     let instance = Instance::prepare(&instance_options, &loom_core::state_dir())?;
     instance.token().log_source();
     instance.token().print_generated();
-    let backend = loom_server::open_backend(instance.state_db())?;
+    // The node name is validated before any state is opened, so a bad value
+    // fails the start instead of serving under an unintended name.
+    let node_name = options.node_name()?;
+    let backend = loom_server::open_backend_named(instance.state_db(), node_name.as_deref())?;
     // An explicit flag or variable wins over the persisted policy and is
     // persisted in turn; otherwise the policy loaded when the durable state was
     // opened applies; otherwise retention stays disabled. The startup sweep runs
@@ -453,10 +479,12 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
         })?;
     runtime.block_on(async move {
         let sweep_backend = Arc::clone(&backend);
+        let node_name = backend.node_name().to_owned();
         let server =
             loom_server::start_remote_server(backend, instance.token().token(), config).await?;
         println!(
-            "Loom remote backend listening at {}",
+            "Loom remote backend '{}' listening at {}",
+            node_name,
             server.websocket_url()
         );
         println!("Health endpoint: {}", server.health_url());
@@ -1907,6 +1935,7 @@ mod tests {
             m4_demo: false,
             bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
             instance_name: None,
+            node_name: None,
             token: None,
             token_file: None,
             login_provider: None,
@@ -1941,6 +1970,7 @@ mod tests {
             m4_demo: true,
             bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
             instance_name: None,
+            node_name: None,
             token: None,
             token_file: None,
             login_provider: None,
@@ -1978,6 +2008,7 @@ mod tests {
             m4_demo: false,
             bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
             instance_name: None,
+            node_name: None,
             token: None,
             token_file: None,
             login_provider: None,
@@ -2048,6 +2079,8 @@ mod tests {
                 "--allow-insecure-remote",
                 "--bind",
                 "127.0.0.1:9000",
+                "--node-name",
+                "prod-builder",
                 "--token",
                 "tok",
                 "--login",
@@ -2069,6 +2102,7 @@ mod tests {
             assert!(options.reset_state);
             assert!(options.allow_insecure_remote);
             assert_eq!(options.bind.to_string(), "127.0.0.1:9000");
+            assert_eq!(options.node_name.as_deref(), Some("prod-builder"));
             assert_eq!(options.token.as_deref(), Some("tok"));
             assert_eq!(options.login_provider.as_deref(), Some("github-copilot"));
             assert_eq!(
@@ -2084,6 +2118,7 @@ mod tests {
                 "--bind=127.0.0.1:9002",
                 "--instance-name",
                 "worker",
+                "--node-name=prod-builder",
                 "--token-file",
                 "/etc/loom/token",
                 "--reset-state",
@@ -2091,6 +2126,7 @@ mod tests {
             .unwrap()
             .unwrap();
             assert_eq!(options.instance_name.as_deref(), Some("worker"));
+            assert_eq!(options.node_name.as_deref(), Some("prod-builder"));
             assert_eq!(
                 options.token_file.as_deref(),
                 Some(std::path::Path::new("/etc/loom/token"))
@@ -2117,6 +2153,33 @@ mod tests {
             assert_eq!(defaults.bind.to_string(), "127.0.0.1:8765");
             assert_eq!(defaults.instance_name, None);
             assert_eq!(defaults.token_file, None);
+        }
+
+        #[test]
+        fn parse_args_resolves_the_node_name_and_rejects_a_bad_one() {
+            let defaults = parse(&["--serve"]).unwrap().unwrap();
+            assert_eq!(defaults.node_name, None);
+            if std::env::var(loom_server::NODE_NAME_ENV).is_err() {
+                assert_eq!(defaults.node_name().unwrap(), None);
+            }
+
+            let spaced = parse(&["--serve", "--node-name", "  prod-builder  "])
+                .unwrap()
+                .unwrap();
+            assert_eq!(spaced.node_name().unwrap().as_deref(), Some("prod-builder"));
+
+            let equals = parse(&["--node-name=prod-builder"]).unwrap().unwrap();
+            assert_eq!(equals.node_name().unwrap().as_deref(), Some("prod-builder"));
+
+            // A rejected value names the flag that carried it.
+            let error = parse(&["--node-name="])
+                .unwrap()
+                .unwrap()
+                .node_name()
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+            assert!(error.message.contains("--node-name"), "{error}");
+            assert!(parse(&["--node-name"]).is_err());
         }
 
         #[test]
