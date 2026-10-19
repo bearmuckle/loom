@@ -446,13 +446,14 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
             "--root is only available for one-shot sessions; server sessions manage their own repositories",
         ));
     }
+    // The node name is validated before preparation, which can wipe an
+    // incompatible database under `--reset-state` and generate a token file, so
+    // a bad value fails the start without changing state.
+    let node_name = options.node_name()?;
     let instance_options = options.instance_options()?;
     let instance = Instance::prepare(&instance_options, &loom_core::state_dir())?;
     instance.token().log_source();
     instance.token().print_generated();
-    // The node name is validated before any state is opened, so a bad value
-    // fails the start instead of serving under an unintended name.
-    let node_name = options.node_name()?;
     let backend = loom_server::open_backend_named(instance.state_db(), node_name.as_deref())?;
     // An explicit flag or variable wins over the persisted policy and is
     // persisted in turn; otherwise the policy loaded when the durable state was
