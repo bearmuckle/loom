@@ -25,6 +25,17 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --workspace --locked
 ```
 
+### Toolchain discovery on a worker node
+
+A worker node often has Rust installed below `$CARGO_HOME/bin` or
+`$HOME/.cargo/bin` without a `PATH` entry, so `cargo` fails to start even though
+the toolchain is present. `./scripts/agent-toolchain.sh` finds it, links the
+rustup proxies into a directory that is already on `PATH`, and reports the
+version, the default toolchain, and the components and targets it needs.
+`./scripts/agent-toolchain.sh --install` installs Rust 1.99 with rustfmt and
+clippy first when the node has none. The script is idempotent, so it is safe to
+run on every node and after any toolchain change.
+
 Full workspace coverage is an optional local diagnostic:
 
 ```sh
