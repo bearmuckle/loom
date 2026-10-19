@@ -546,12 +546,15 @@ A sign-in is a GitHub device flow:
 4. `SignOutGitHub` → `SignedOutGitHub` ends the binding: the person's presence
    is dropped from every roster they appear in, and a connection that was
    accepted without a credential returns to the pre-login state.
-5. A client remembers the participant id per worker. A later connection with an
-   unrestricted operator token may send `ResumeGitHubIdentity { participant_id }`
-   → `GitHubIdentityResumed { participant }`, which binds presence again without
-   a new device flow. The worker resumes only a person already in its directory
-   and only on an operator token; a connection accepted without a credential
-   still has to sign in.
+5. A client remembers the participant id per worker, keyed by a durable worker
+   identity — a remote worker's address, or the state database the managed local
+   worker keeps — and never by `WorkerNodeStatus::node_id`, which names one
+   worker process and is regenerated whenever that process starts. A later
+   connection with an unrestricted operator token may send
+   `ResumeGitHubIdentity { participant_id }` → `GitHubIdentityResumed {
+   participant }`, which binds presence again without a new device flow. The
+   worker resumes only a person already in its directory and only on an operator
+   token; a connection accepted without a credential still has to sign in.
 
 Anyone with a GitHub account *may* complete the device flow, but a signed-in
 person holds no session grants until an owner grants one (see access requests).

@@ -13,6 +13,22 @@ impl LoomView {
         self.awaiting_sign_in_nodes.insert(node_id);
     }
 
+    /// The durable key of the worker behind `node_id`.
+    ///
+    /// The remembered GitHub identity has to outlive the worker, and a worker's
+    /// `node_id` does not: the server generates a new one every time it starts.
+    /// An unknown node keeps its own id, so it can never read another worker's
+    /// person.
+    pub(crate) fn identity_key_for_node(&self, node_id: &str) -> String {
+        self.worker_nodes
+            .iter()
+            .find(|node| node.status.node_id == node_id)
+            .map_or_else(
+                || node_id.to_owned(),
+                |node| worker_entry_identity_key(self.backend_endpoint.as_deref(), node),
+            )
+    }
+
     pub(crate) fn add_worker_node(
         &mut self,
         connection: ClientConnection,
@@ -198,7 +214,8 @@ impl LoomView {
             self.node_backends.remove(&node.status.node_id);
             self.node_workspaces.remove(&node.status.node_id);
             self.node_session_load_errors.remove(&node.status.node_id);
-            crate::identity_store::clear(&node.status.node_id);
+            let identity_key = worker_entry_identity_key(self.backend_endpoint.as_deref(), &node);
+            crate::identity_store::clear(&identity_key);
         }
         if let Some(url) = &node.url {
             let count = self.workspace_config.worker_nodes.len();

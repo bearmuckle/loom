@@ -844,3 +844,106 @@ fn an_at_token_offers_roster_people_while_typing(cx: &mut TestAppContext) {
         view
     });
 }
+
+#[gpui_kit::test]
+fn a_remembered_identity_is_keyed_by_the_worker_not_by_its_instance_id(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let _handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        let startup_node_id = view.default_backend_node_id.clone();
+        // The startup connection stands for the managed local worker, which has
+        // no endpoint of its own.
+        let mut startup = connection_placeholder(
+            0,
+            "ws://unused".to_owned(),
+            WorkerConnectionState::Connected,
+            None,
+        );
+        startup.is_local = true;
+        startup.url = None;
+        startup.status.node_id = startup_node_id.clone();
+        // A connected worker is named by the address it was reached at.
+        let mut remote = connection_placeholder(
+            1,
+            "ws://worker.example:8765".to_owned(),
+            WorkerConnectionState::Connected,
+            None,
+        );
+        remote.status.node_id = "first-instance".to_owned();
+        view.worker_nodes = vec![startup, remote];
+
+        let startup_key = view.identity_key_for_node(&startup_node_id);
+        assert_eq!(startup_key, crate::identity_store::worker_key(None));
+        assert_ne!(
+            startup_key, startup_node_id,
+            "a node id names one worker process and cannot key a remembered person"
+        );
+
+        let remembered = view.identity_key_for_node("first-instance");
+        assert_eq!(
+            remembered,
+            crate::identity_store::worker_key(Some("ws://worker.example:8765"))
+        );
+        // The same worker after a restart reports a new node id and keeps the
+        // key the client remembered, which is what makes the person resumable.
+        view.worker_nodes[1].status.node_id = "second-instance".to_owned();
+        assert_eq!(view.identity_key_for_node("second-instance"), remembered);
+        // A node the view no longer holds keeps its own id, so it can never read
+        // another worker's person.
+        assert_eq!(view.identity_key_for_node("gone"), "gone");
+        view
+    });
+}
+
+#[gpui_kit::test]
+fn the_active_sessions_worker_answers_who_the_client_is(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+
+    // Two workers: the startup connection binds no person, while the second one
+    // is signed in as Bob.
+    let other = loom_server::InProcessBackend::new();
+    let bob = person("bob");
+    other
+        .register_participants(std::slice::from_ref(&bob))
+        .unwrap();
+    let other_connection = ClientConnection::InProcess(Box::new(other.connect()));
+    crate::connection::negotiate(&other_connection).unwrap();
+    assert_eq!(
+        crate::connection::resume_github_identity(&other_connection, bob.id).unwrap(),
+        Some(bob.clone())
+    );
+
+    let view = cx.new(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        let node_id = "other-node".to_owned();
+        view.node_backends.insert(
+            node_id.clone(),
+            BackendWorker::spawn(other_connection.clone()),
+        );
+        let mut entry = connection_placeholder(
+            1,
+            "ws://other.example:8765".to_owned(),
+            WorkerConnectionState::Connected,
+            None,
+        );
+        entry.status.node_id = node_id.clone();
+        entry.connection = Some(other_connection);
+        view.worker_nodes.push(entry);
+        view.session_node_ids
+            .insert(view.active_session.id, node_id);
+        view.collaboration.identity_loaded = false;
+        view.refresh_collaboration(cx);
+        view
+    });
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(
+            view.collaboration.identity.as_ref(),
+            Some(&bob),
+            "the identity must come from the worker the active session lives on"
+        );
+        assert!(view.collaboration.identity_loaded);
+    });
+}

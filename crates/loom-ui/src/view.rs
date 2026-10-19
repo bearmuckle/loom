@@ -515,7 +515,10 @@ pub(crate) struct LoomView {
     pub(crate) backend: BackendWorker,
     /// The startup backend remains the default for workspace requests and new sessions.
     default_backend_node_id: String,
-    /// Connections are keyed by the backend's stable node identity.
+    /// Connections are keyed by the backend's node identity, which is stable for
+    /// one worker process only; anything that has to outlive a restart is keyed
+    /// by the worker's durable identity instead (see
+    /// [`crate::identity_store::worker_key`]).
     node_backends: BTreeMap<String, BackendWorker>,
     /// Last known display names remain available for sessions after node removal.
     node_names: BTreeMap<String, String>,

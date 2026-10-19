@@ -3205,6 +3205,25 @@ pub(crate) fn update_worker_node_status(
     message
 }
 
+/// The durable key a worker's remembered GitHub identity is stored under.
+///
+/// The startup connection is named by the endpoint the client was started with,
+/// which is `None` for the managed local worker; every other worker node is named
+/// by its address. A node with neither falls back to its instance id, so it can
+/// never alias another worker.
+pub(crate) fn worker_entry_identity_key(
+    startup_endpoint: Option<&str>,
+    node: &WorkerNodeEntry,
+) -> String {
+    if node.is_local {
+        return crate::identity_store::worker_key(startup_endpoint);
+    }
+    node.url.as_deref().map_or_else(
+        || node.status.node_id.clone(),
+        |url| crate::identity_store::worker_key(Some(url)),
+    )
+}
+
 pub(crate) fn initial_worker_nodes(
     local_status: WorkerNodeStatus,
     local_connection: ClientConnection,

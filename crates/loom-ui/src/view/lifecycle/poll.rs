@@ -447,16 +447,21 @@ impl LoomView {
                             && current_participant(&connection)
                                 .map(|participant| participant.is_none())
                                 .unwrap_or(false);
+                        // The remembered identity is stored under the address
+                        // this worker is reached at, so it survives the worker
+                        // restarting under a new instance id.
+                        let identity_key =
+                            crate::identity_store::worker_key(Some(candidate_url.as_str()));
                         if !unsigned
-                            && let Some(saved) = crate::identity_store::load(&status.node_id)
+                            && let Some(saved) = crate::identity_store::load(&identity_key)
                         {
                             match resume_github_identity(&connection, saved.id) {
                                 Ok(Some(_)) => {}
-                                Ok(None) => crate::identity_store::clear(&status.node_id),
+                                Ok(None) => crate::identity_store::clear(&identity_key),
                                 Err(error) => log::debug!(
                                     "[loom-ui] could not resume the GitHub identity for worker \
                                      '{}': {}",
-                                    status.node_id,
+                                    identity_key,
                                     error.message
                                 ),
                             }

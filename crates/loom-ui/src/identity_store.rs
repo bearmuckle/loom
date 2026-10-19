@@ -6,8 +6,41 @@
 //! online instead of leaving them behind as an offline grant. The id is not a
 //! secret: the worker only resumes it for an operator token and only when the
 //! person is still in the worker's directory.
+//!
+//! Entries are keyed by [`worker_key`], never by a worker's reported node id:
+//! that id names one worker process and the server generates a new one on every
+//! start, so a store keyed by it could not be read again after a restart.
 
 use loom_core::ParticipantIdentity;
+
+/// The durable key of the worker a client reached at `endpoint`.
+///
+/// [`loom_protocol::WorkerNodeStatus::node_id`] names one worker *process*, so
+/// it cannot key anything that has to outlive a restart. A worker is instead
+/// remembered by what a restart keeps: the address a remote worker is reached at
+/// (`Some`), or the state database the one managed local worker owns (`None`).
+/// The address has to stay the same across restarts for the worker to keep its
+/// identity, which the stored access token already assumes.
+pub(crate) fn worker_key(endpoint: Option<&str>) -> String {
+    endpoint.map_or_else(local_worker_key, |url| {
+        // A trailing slash or surrounding whitespace is the same endpoint.
+        format!("remote:{}", url.trim().trim_end_matches('/'))
+    })
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn local_worker_key() -> String {
+    // Every managed worker a client starts keeps its state in this database, so
+    // the file names that worker across any number of process restarts.
+    format!("local:{}", loom_local::backend_persistence_path().display())
+}
+
+#[cfg(target_family = "wasm")]
+fn local_worker_key() -> String {
+    // The browser client reaches only remote workers; the fallback keeps the key
+    // function total for a caller that has no endpoint.
+    "local".to_owned()
+}
 
 /// Reads, saves, and clears can arrive from the UI thread and a reconnect
 /// thread at once; one lock keeps the read-modify-write whole.
@@ -22,11 +55,11 @@ fn lock_store() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[cfg(all(not(target_family = "wasm"), not(test)))]
-pub(crate) fn load(node_id: &str) -> Option<ParticipantIdentity> {
+pub(crate) fn load(worker_key: &str) -> Option<ParticipantIdentity> {
     let _guard = lock_store();
     let path = native_path();
     match read_identities(&path) {
-        Ok(identities) => identities.get(node_id).cloned(),
+        Ok(identities) => identities.get(worker_key).cloned(),
         Err(error) => {
             log::warn!(
                 "[loom-ui] could not read remembered worker identities from '{}': {}",
@@ -39,35 +72,35 @@ pub(crate) fn load(node_id: &str) -> Option<ParticipantIdentity> {
 }
 
 #[cfg(all(not(target_family = "wasm"), not(test)))]
-pub(crate) fn save(node_id: &str, identity: &ParticipantIdentity) {
+pub(crate) fn save(worker_key: &str, identity: &ParticipantIdentity) {
     let _guard = lock_store();
     let path = native_path();
     let mut identities = read_identities(&path).unwrap_or_default();
-    if identities.get(node_id) == Some(identity) {
+    if identities.get(worker_key) == Some(identity) {
         return;
     }
-    identities.insert(node_id.to_owned(), identity.clone());
+    identities.insert(worker_key.to_owned(), identity.clone());
     if let Err(error) = write_identities(&path, &identities) {
         log::warn!(
             "[loom-ui] could not remember the GitHub identity for worker '{}': {}",
-            node_id,
+            worker_key,
             error
         );
     }
 }
 
 #[cfg(all(not(target_family = "wasm"), not(test)))]
-pub(crate) fn clear(node_id: &str) {
+pub(crate) fn clear(worker_key: &str) {
     let _guard = lock_store();
     let path = native_path();
     let mut identities = read_identities(&path).unwrap_or_default();
-    if identities.remove(node_id).is_none() {
+    if identities.remove(worker_key).is_none() {
         return;
     }
     if let Err(error) = write_identities(&path, &identities) {
         log::warn!(
             "[loom-ui] could not forget the GitHub identity for worker '{}': {}",
-            node_id,
+            worker_key,
             error
         );
     }
@@ -106,49 +139,49 @@ fn write_identities(
 }
 
 #[cfg(target_family = "wasm")]
-fn storage_key(node_id: &str) -> String {
-    format!("loom.worker_identity.{node_id}")
+fn storage_key(worker_key: &str) -> String {
+    format!("loom.worker_identity.{worker_key}")
 }
 
 #[cfg(target_family = "wasm")]
-pub(crate) fn load(node_id: &str) -> Option<ParticipantIdentity> {
+pub(crate) fn load(worker_key: &str) -> Option<ParticipantIdentity> {
     let storage = crate::browser::browser_storage().ok()?;
-    let stored = storage.get_item(&storage_key(node_id)).ok().flatten()?;
+    let stored = storage.get_item(&storage_key(worker_key)).ok().flatten()?;
     serde_json::from_str(&stored).ok()
 }
 
 #[cfg(target_family = "wasm")]
-pub(crate) fn save(node_id: &str, identity: &ParticipantIdentity) {
+pub(crate) fn save(worker_key: &str, identity: &ParticipantIdentity) {
     let Ok(storage) = crate::browser::browser_storage() else {
         return;
     };
     match serde_json::to_string(identity) {
         Ok(serialized) => {
-            if let Err(error) = storage.set_item(&storage_key(node_id), &serialized) {
+            if let Err(error) = storage.set_item(&storage_key(worker_key), &serialized) {
                 log::warn!(
                     "[loom-ui] could not remember the GitHub identity for worker '{}': {:?}",
-                    node_id,
+                    worker_key,
                     error
                 );
             }
         }
         Err(error) => log::warn!(
             "[loom-ui] could not encode the GitHub identity for worker '{}': {}",
-            node_id,
+            worker_key,
             error
         ),
     }
 }
 
 #[cfg(target_family = "wasm")]
-pub(crate) fn clear(node_id: &str) {
+pub(crate) fn clear(worker_key: &str) {
     let Ok(storage) = crate::browser::browser_storage() else {
         return;
     };
-    if let Err(error) = storage.remove_item(&storage_key(node_id)) {
+    if let Err(error) = storage.remove_item(&storage_key(worker_key)) {
         log::warn!(
             "[loom-ui] could not forget the GitHub identity for worker '{}': {:?}",
-            node_id,
+            worker_key,
             error
         );
     }
@@ -157,15 +190,15 @@ pub(crate) fn clear(node_id: &str) {
 /// Tests never touch the developer's real config directory. The file helpers
 /// above are exercised with temporary paths instead.
 #[cfg(test)]
-pub(crate) fn load(_node_id: &str) -> Option<ParticipantIdentity> {
+pub(crate) fn load(_worker_key: &str) -> Option<ParticipantIdentity> {
     None
 }
 
 #[cfg(test)]
-pub(crate) fn save(_node_id: &str, _identity: &ParticipantIdentity) {}
+pub(crate) fn save(_worker_key: &str, _identity: &ParticipantIdentity) {}
 
 #[cfg(test)]
-pub(crate) fn clear(_node_id: &str) {}
+pub(crate) fn clear(_worker_key: &str) {}
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
@@ -203,5 +236,30 @@ mod tests {
         assert!(!loaded.contains_key("worker-a"));
         assert_eq!(loaded.get("worker-b"), Some(&second));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_worker_key_outlives_a_restart_and_never_aliases_another_worker() {
+        // A remote worker is named by its address, so the entry a restart reads
+        // is the one the previous process wrote even though its node id changed.
+        let address = "ws://127.0.0.1:8765/";
+        assert_eq!(
+            worker_key(Some(address)),
+            worker_key(Some(" ws://127.0.0.1:8765 "))
+        );
+        assert_eq!(
+            worker_key(Some(address)),
+            "remote:ws://127.0.0.1:8765".to_owned()
+        );
+        assert_ne!(
+            worker_key(Some(address)),
+            worker_key(Some("ws://127.0.0.1:8766"))
+        );
+
+        // The managed local worker is named by the state database it owns, which
+        // is never one of the remote workers' keys.
+        let local = worker_key(None);
+        assert!(local.starts_with("local:"), "{local}");
+        assert_ne!(local, worker_key(Some(address)));
     }
 }
