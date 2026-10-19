@@ -605,6 +605,10 @@ async fn serve_in(
     shutdown: impl Future<Output = Result<(), LoomError>>,
     reopen: impl FnOnce(Arc<InProcessBackend>, Option<PathBuf>) -> FailStopReopen,
 ) -> Result<(), LoomError> {
+    // The node name is validated before preparation, which can wipe an
+    // incompatible database under `--reset-state` and generate a token file, so
+    // a bad value fails the start without changing state.
+    let node_name = options.node_name()?;
     let instance = prepare_instance(&options, state_directory)?;
     let instance_options = options.instance_options()?;
     let settings = diagnostics_settings(
@@ -614,9 +618,6 @@ async fn serve_in(
         state_directory,
     );
     log::info!("{}", startup_summary(&ProcessContext::detect(), &settings));
-    // The node name is validated before any state is opened, so a bad value
-    // fails the start instead of serving under an unintended name.
-    let node_name = options.node_name()?;
     let backend = open_backend_named(instance.state_db(), node_name.as_deref())?;
     // An explicit flag or variable wins over the persisted policy and is
     // persisted in turn; otherwise the policy loaded when the durable state was
@@ -1587,6 +1588,41 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.message.contains("--reset-state"), "{error}");
+        std::fs::remove_dir_all(&state).ok();
+    }
+
+    #[tokio::test]
+    async fn an_invalid_node_name_is_rejected_before_state_is_prepared() {
+        let state = temporary_directory("invalid-node-name");
+        let database = state.join("127.0.0.1_8765").join("state.db");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+        std::fs::write(
+            &database,
+            br#"{"schema_version":1,"state":{"broken":true}}"#,
+        )
+        .unwrap();
+
+        // Preparation would wipe this incompatible database under
+        // `--reset-state` and generate the token file, so a rejected node name
+        // must fail before either side effect.
+        let error = serve_in(
+            serve_options(&["--bind", "127.0.0.1:8765", "--reset-state", "--node-name="]),
+            &state,
+            async { Ok(()) },
+            never_reopen,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.message.contains("--node-name"), "{error}");
+        assert!(
+            database.exists(),
+            "an invalid node name must not reset the database"
+        );
+        assert!(
+            !state.join("token").exists(),
+            "an invalid node name must not generate a token"
+        );
         std::fs::remove_dir_all(&state).ok();
     }
 
