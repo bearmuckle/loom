@@ -519,6 +519,13 @@ jobs:
     permissions:
       contents: write
     steps:
+      # The release notes are generated from the full commit history between
+      # the previous tag and this one, so the checkout needs every commit and
+      # tag. Keep this before `download-artifact`: checkout cleans the
+      # workspace, which would remove the downloaded assets.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: release-*
@@ -534,188 +541,11 @@ jobs:
           mv "$RUNNER_TEMP/SHA256SUMS" .
           cat SHA256SUMS
       - name: Compose the release notes
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          # The generated changelog is appended to the installation and
-          # verification instructions rather than replacing them.
-          cat > release-notes.md <<'NOTES'
-          Native Loom releases contain the `loom-ui` desktop client and the
-          standalone `loom-server` backend for Linux (x86_64 and aarch64), macOS
-          (one universal binary) and Windows (x86_64), plus Linux AppImages and
-          `.deb` packages of the client and a server container image. The client
-          archives, AppImages and `.deb` packages include `loom-server`, which the
-          client starts as its local worker process; a client without one
-          downloads the matching `loom-server` archive from this release and
-          checks it against `SHA256SUMS` first.
-
-          ## Verify what you downloaded
-
-          `SHA256SUMS` covers every file attached to this release, and every
-          artifact also carries signed SLSA build provenance from the workflow
-          run that produced it:
-
-          ```sh
-          # Check the artifacts against the manifest.
-          sha256sum -c SHA256SUMS
-
-          # Check provenance (needs the GitHub CLI, authenticated).
-          gh attestation verify loom-ui-${{ github.ref_name }}-linux-x86_64.tar.gz \
-            --repo ${{ github.repository }}
-          ```
-
-          `loom-${{ github.ref_name }}.cdx.json` is a CycloneDX SBOM of the
-          workspace dependencies at the tagged revision.
-
-          ## Linux client
-
-          Unpack the tarball, mark the binary executable, and run it:
-
-          ```sh
-          tar -xzf loom-ui-${{ github.ref_name }}-linux-x86_64.tar.gz
-          chmod +x loom-ui
-          ./loom-ui --version
-          ./loom-ui
-          ```
-
-          The `.deb` installs the binary, a desktop entry and the icon:
-
-          ```sh
-          sudo apt install ./loom-ui_*.deb
-          loom-ui
-          ```
-
-          The AppImage is self-contained, needs no installation, and does need
-          the executable bit:
-
-          ```sh
-          chmod +x loom-ui-${{ github.ref_name }}-x86_64.AppImage
-          ./loom-ui-${{ github.ref_name }}-x86_64.AppImage
-          ```
-
-          Running an AppImage normally needs FUSE (the `libfuse2` package on
-          Debian and Ubuntu). Without it, use the image's extract-and-run path:
-          `./loom-ui-${{ github.ref_name }}-x86_64.AppImage --appimage-extract-and-run`.
-
-          ## macOS client
-
-          The macOS archive holds one universal binary that runs natively on
-          Apple silicon and on Intel. It is not notarized, so macOS quarantines a
-          downloaded archive; clear the attribute after unpacking:
-
-          ```sh
-          tar -xzf loom-ui-${{ github.ref_name }}-macos-universal.tar.gz
-          xattr -d com.apple.quarantine loom-ui
-          ./loom-ui --version
-          ```
-
-          ## Windows client
-
-          Unpack `loom-ui-${{ github.ref_name }}-windows-x86_64.zip` and run
-          `loom-ui.exe`. The executable is not code signed, so SmartScreen warns
-          about it on first run.
-
-          ## Standalone server
-
-          `loom-server` is the backend the client runs as its local worker
-          process, and can also be deployed on its own.
-          Its archives unpack the same way as the client's:
-
-          ```sh
-          tar -xzf loom-server-${{ github.ref_name }}-linux-x86_64.tar.gz
-          chmod +x loom-server
-          ./loom-server --version
-          ```
-
-          Neither `--persistence` nor a token is required:
-
-          ```sh
-          ./loom-server --bind 127.0.0.1:8765
-          ```
-
-          Without `--persistence`, a bind address with a stable port keeps durable
-          state in `<state-dir>/<instance-name or bind-key>/state.db`; `<state-dir>`
-          is `LOOM_STATE_DIR`, else `$XDG_STATE_HOME`, else `$HOME/.local/state`,
-          else a directory in the system temp folder, with a `loom` subdirectory
-          appended. The bind key replaces `:` with `_`, so `127.0.0.1:8765` becomes
-          `127.0.0.1_8765`. The instance directory is created with mode `0700` and
-          holds the database, the token, and the files derived from the database
-          path. `--instance-name` pins one directory for a host-aliased bind, and a
-          bind port of 0 keeps state in memory.
-
-          Without `--token` or `--token-file` the server reads
-          `<instance-dir>/token` and, when that file is missing or empty, generates
-          a `loom-<uuid>` token there, written atomically with mode `0600`. The
-          path is always logged, generation is logged as a warning, and the value
-          is printed only when stdout is a terminal, so it does not land in
-          `journald` or `docker logs`. `--token` and `--token-file` remain
-          explicit, mutually exclusive overrides, and `--reset-state` wipes an
-          incompatible database instead of refusing to start.
-
-          The server refuses a bind that is not loopback unless it serves TLS or
-          the operator opts in to plaintext, and its unauthenticated `GET /health`
-          endpoint answers `ok`. To serve `wss://`, pass a certificate chain and
-          its key:
-
-          ```sh
-          ./loom-server --bind 0.0.0.0:8765 \
-            --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
-          ```
-
-          A plaintext listener beyond loopback needs an explicit opt-in, which
-          logs what it accepts:
-
-          ```sh
-          ./loom-server --bind 0.0.0.0:8765 --allow-insecure-remote \
-            --instance-name loom-server
-          ```
-
-          A client connecting to a worker with a private or self-signed CA adds
-          that CA to its OS trust roots with `--ca /path/to/ca.pem` (or
-          `LOOM_TLS_CA`). Verification is never disabled.
-
-          A container image is published for the same tag:
-
-          ```sh
-          docker pull ghcr.io/${{ github.repository_owner }}/loom-server:${{ github.ref_name }}
-          docker run --rm -p 127.0.0.1:8765:8765 \
-            ghcr.io/${{ github.repository_owner }}/loom-server:${{ github.ref_name }}
-          ```
-
-          The image's default command binds `0.0.0.0:8765` inside the container
-          with `--allow-insecure-remote` and pins `--instance-name loom-server`
-          below `LOOM_STATE_DIR=/var/lib/loom`, because that is what makes a
-          published port reachable. The first start generates the token in that
-          instance directory, so
-          `docker exec <container> cat /var/lib/loom/loom/loom-server/token` reads
-          it, or set a fixed value with `--token` or `--token-file` instead.
-          Publish the port only to trusted peers, or pass your own TLS material:
-          `-v "$PWD/tls:/tls:ro"` and a `CMD` override of
-          `--tls-cert /tls/cert.pem --tls-key /tls/key.pem` without the opt-in.
-          The image's `HEALTHCHECK` derives host, port and scheme from the
-          server's own command line, so an overridden `--bind` and a TLS override
-          are followed automatically. Mount a volume at `LOOM_STATE_DIR` for the
-          state root to outlive the container; without that mount the state lives
-          in the container's own writable layer. `loom-server --diagnostics`
-          reports the execution context, the persistence boundary and the
-          intended egress policy without printing the token value.
-
-          ## Known gaps
-
-          - `packaging/loom.desktop` sets `StartupWMClass=loom-ui`, which has not
-            been confirmed against a real desktop session. If a taskbar or dock
-            shows a second entry for the client, that value is the one to correct.
-          - No macOS notarization, no Windows code signing, and no `.rpm`
-            packages.
-          - The Linux client needs a working Vulkan or OpenGL driver; installing
-            a package such as `mesa-vulkan-drivers` covers Mesa-based systems.
-
-          ## What changed
-          NOTES
-          gh api "repos/${{ github.repository }}/releases/generate-notes" \
-            -f "tag_name=$GITHUB_REF_NAME" --jq .body >> release-notes.md
+        # The release page is the changelog, not the installation manual: the
+        # README and docs/deployment.md already carry those instructions. The
+        # script walks the commits between tags, so direct pushes to main and
+        # not only merged pull requests appear in the notes.
+        run: ./scripts/release-notes.sh "$GITHUB_REF_NAME" > release-notes.md
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
