@@ -1167,48 +1167,90 @@ fn sub_project_parents(
 /// its own branches, which keep their order among themselves, and every other
 /// row keeps its place. A row whose parent is missing, or whose chain would
 /// loop, is listed as a project rather than being dropped.
+///
+/// A project lists its branches from its own step. Collecting the branches that
+/// are not ready yet and appending them after the scan put every branch after
+/// the last project of the list, so a branch could sit under a project it was
+/// not branched out of.
 fn nest_sub_projects(
     rows: Vec<ProjectListRow>,
     parents: &BTreeMap<AgentSessionId, AgentSessionId>,
 ) -> Vec<ProjectListRow> {
-    let mut ordered = Vec::with_capacity(rows.len());
-    let mut pending = rows;
-    let mut listed = BTreeSet::new();
-    loop {
-        let mut progressed = false;
-        let mut index = 0;
-        while index < pending.len() {
-            let ready = match parents.get(&pending[index].session_id) {
-                None => true,
-                Some(parent) => {
-                    listed.contains(parent)
-                        || !pending.iter().any(|other| other.session_id == *parent)
-                }
-            };
-            if ready {
-                let row = pending.remove(index);
-                listed.insert(row.session_id);
-                ordered.push(row);
-                progressed = true;
-            } else {
-                index += 1;
-            }
+    /// Lists one row, then the branches it owns, which keep their order.
+    fn nest(
+        index: usize,
+        rows: &mut [Option<ProjectListRow>],
+        branches: &BTreeMap<AgentSessionId, Vec<usize>>,
+        listed: &mut [bool],
+        ordered: &mut Vec<ProjectListRow>,
+        is_branch: bool,
+    ) {
+        if listed[index] {
+            return;
         }
-        if !progressed {
-            break;
+        listed[index] = true;
+        let Some(mut row) = rows[index].take() else {
+            return;
+        };
+        // A branch is only indented when the project it was branched out of is
+        // listed directly above it.
+        row.sub_project = is_branch;
+        let root = row.session_id;
+        ordered.push(row);
+        for branch in branches.get(&root).into_iter().flatten() {
+            nest(*branch, rows, branches, listed, ordered, true);
         }
     }
-    ordered.extend(pending);
-    // A branch is only indented when the project it was branched out of is
-    // listed above it.
-    let listed_ids = ordered
+
+    let positions = rows
         .iter()
-        .map(|row| row.session_id)
-        .collect::<BTreeSet<_>>();
-    for row in &mut ordered {
-        row.sub_project = parents
+        .enumerate()
+        .map(|(index, row)| (row.session_id, index))
+        .collect::<BTreeMap<_, _>>();
+    // The branches of each listed project, in the incoming order, so a project
+    // lists its own branches as soon as it is listed itself.
+    let mut branches = BTreeMap::<AgentSessionId, Vec<usize>>::new();
+    for (index, row) in rows.iter().enumerate() {
+        if let Some(parent) = parents
             .get(&row.session_id)
-            .is_some_and(|parent| listed_ids.contains(parent));
+            .filter(|parent| positions.contains_key(*parent))
+        {
+            branches.entry(*parent).or_default().push(index);
+        }
+    }
+    let mut slots = rows.into_iter().map(Some).collect::<Vec<_>>();
+    let mut listed = vec![false; slots.len()];
+    let mut ordered = Vec::with_capacity(slots.len());
+    for index in 0..slots.len() {
+        // A branch waits for the project it was branched out of, which lists it.
+        let waiting = slots[index]
+            .as_ref()
+            .and_then(|row| parents.get(&row.session_id))
+            .and_then(|parent| positions.get(parent))
+            .is_some_and(|parent| !listed[*parent]);
+        if waiting {
+            continue;
+        }
+        nest(
+            index,
+            &mut slots,
+            &branches,
+            &mut listed,
+            &mut ordered,
+            false,
+        );
+    }
+    // A chain that loops is reached from no listed project: list the rows that
+    // are left as projects of their own instead of dropping them.
+    for index in 0..slots.len() {
+        nest(
+            index,
+            &mut slots,
+            &branches,
+            &mut listed,
+            &mut ordered,
+            false,
+        );
     }
     ordered
 }

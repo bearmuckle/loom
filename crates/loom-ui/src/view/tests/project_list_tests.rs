@@ -237,6 +237,23 @@ fn sub_projects_are_listed_under_the_project_they_branched_from() {
     assert_eq!(model.selected, Some(branch_new));
 }
 
+/// A project snapshot that records the project it was branched out of.
+fn branch(root_session_id: AgentSessionId, parent: AgentSessionId) -> ProjectSnapshot {
+    ProjectSnapshot {
+        project_id: ProjectId::from_uuid(*root_session_id.as_uuid()),
+        root_session_id,
+        parent_project_id: Some(ProjectId::from_uuid(*parent.as_uuid())),
+        agents: vec![agent(
+            root_session_id,
+            ProjectId::from_uuid(*root_session_id.as_uuid()),
+            None,
+            AgentSessionState::Idle,
+        )],
+        tasks: Vec::new(),
+        worktrees: Vec::new(),
+    }
+}
+
 /// A branch whose parent project is not in the list is a project of its own, so
 /// it is neither indented nor dropped.
 #[test]
@@ -263,6 +280,152 @@ fn a_branch_without_its_parent_is_listed_as_a_project() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].name, "Orphan");
     assert!(!listed[0].sub_project);
+}
+
+/// Every branch stays directly beneath the project it was branched out of, even
+/// when another project was created after that project and before the branch.
+/// Listing every branch after the last parent put one project's branch under
+/// another project.
+#[test]
+fn branches_stay_beneath_their_own_project_with_several_projects() {
+    let first = AgentSessionId::new();
+    let first_branch = AgentSessionId::new();
+    let second = AgentSessionId::new();
+    let second_branch = AgentSessionId::new();
+    // Both branches are newer than the others, so only nesting puts them under
+    // the project they were branched out of.
+    let sessions = vec![
+        session(first, "First", AgentSessionState::Idle, 1),
+        session(first_branch, "First branch", AgentSessionState::Idle, 2),
+        session(second, "Second", AgentSessionState::Idle, 3),
+        session(second_branch, "Second branch", AgentSessionState::Idle, 4),
+    ];
+    let first_project = project(
+        first,
+        vec![agent(
+            first,
+            ProjectId::from_uuid(*first.as_uuid()),
+            None,
+            AgentSessionState::Idle,
+        )],
+    );
+    let second_project = project(
+        second,
+        vec![agent(
+            second,
+            ProjectId::from_uuid(*second.as_uuid()),
+            None,
+            AgentSessionState::Idle,
+        )],
+    );
+    let first_branch_snapshot = branch(first_branch, first);
+    let second_branch_snapshot = branch(second_branch, second);
+
+    let model = list(
+        &sessions,
+        &[
+            &first_project,
+            &second_project,
+            &first_branch_snapshot,
+            &second_branch_snapshot,
+        ],
+        second_branch,
+    );
+
+    let listed = rows(&model);
+    assert_eq!(
+        listed
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Second", "Second branch", "First", "First branch"]
+    );
+    assert_eq!(
+        listed.iter().map(|row| row.sub_project).collect::<Vec<_>>(),
+        [false, true, false, true]
+    );
+}
+
+/// A branch of a branch keeps the whole chain beneath the project it grew from,
+/// in the order the projects were created.
+#[test]
+fn a_branch_chain_stays_beneath_its_own_project() {
+    let first = AgentSessionId::new();
+    let first_branch = AgentSessionId::new();
+    let deep_branch = AgentSessionId::new();
+    let second = AgentSessionId::new();
+    let sessions = vec![
+        session(first, "First", AgentSessionState::Idle, 1),
+        session(first_branch, "First branch", AgentSessionState::Idle, 2),
+        session(deep_branch, "Deep branch", AgentSessionState::Idle, 3),
+        session(second, "Second", AgentSessionState::Idle, 4),
+    ];
+    let first_project = project(
+        first,
+        vec![agent(
+            first,
+            ProjectId::from_uuid(*first.as_uuid()),
+            None,
+            AgentSessionState::Idle,
+        )],
+    );
+    let second_project = project(
+        second,
+        vec![agent(
+            second,
+            ProjectId::from_uuid(*second.as_uuid()),
+            None,
+            AgentSessionState::Idle,
+        )],
+    );
+    let first_branch_snapshot = branch(first_branch, first);
+    let deep_branch_snapshot = branch(deep_branch, first_branch);
+
+    let model = list(
+        &sessions,
+        &[
+            &first_project,
+            &second_project,
+            &first_branch_snapshot,
+            &deep_branch_snapshot,
+        ],
+        deep_branch,
+    );
+
+    let listed = rows(&model);
+    assert_eq!(
+        listed
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Second", "First", "First branch", "Deep branch"]
+    );
+    assert_eq!(
+        listed.iter().map(|row| row.sub_project).collect::<Vec<_>>(),
+        [false, false, true, true]
+    );
+}
+
+/// A chain that loops is reached from no project, so every row of it is still
+/// listed exactly once instead of being dropped.
+#[test]
+fn a_looping_branch_chain_is_listed_rather_than_dropped() {
+    let one = AgentSessionId::new();
+    let two = AgentSessionId::new();
+    let sessions = vec![
+        session(one, "One", AgentSessionState::Idle, 2),
+        session(two, "Two", AgentSessionState::Idle, 1),
+    ];
+    let one_branch = branch(one, two);
+    let two_branch = branch(two, one);
+
+    let model = list(&sessions, &[&one_branch, &two_branch], one);
+
+    let names = rows(&model)
+        .iter()
+        .map(|row| row.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["One", "Two"]);
 }
 
 /// Rows are listed newest-created first, not in the activity order the backend
