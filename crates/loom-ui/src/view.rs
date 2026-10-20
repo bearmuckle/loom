@@ -613,8 +613,10 @@ pub(crate) struct LoomView {
     node_model_provider_names: BTreeMap<String, BTreeMap<ModelId, String>>,
     model_catalog_node_id: Option<String>,
     model_refreshes_in_flight: BTreeSet<String>,
-    /// Wall-clock time of the last model-catalog refresh per node. Used to
-    /// throttle on-demand provider discovery from the model selection.
+    /// Wall-clock time of the last model-catalog refresh per node that
+    /// delivered a catalog. Used to throttle on-demand provider discovery from
+    /// the model selection; a failed refresh records nothing, so the next one
+    /// retries instead of hiding behind a stale catalog.
     model_catalog_refreshed_at: BTreeMap<String, Timestamp>,
     model_select: Option<Entity<ModelSelectState>>,
     default_model_select: Option<Entity<ModelSelectState>>,

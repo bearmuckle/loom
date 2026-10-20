@@ -3162,6 +3162,70 @@ fn settings_and_provider_dialogs_render_configured_entries(cx: &mut TestAppConte
     });
 }
 
+/// GitHub Copilot carries no API key, but its model catalog is discovered and
+/// the worker drops it on a restart. Without a refresh action the only way to
+/// restore a non-default model is to reconnect the worker, so its card offers
+/// the same action an API-key provider has.
+#[gpui_kit::test]
+fn provider_cards_refresh_the_catalog_of_every_configured_provider(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Providers));
+        view.providers = vec![
+            ProviderSummary {
+                id: loom_model::ProviderId::new("github-copilot"),
+                kind: ProviderKind::GitHubCopilot,
+                display_name: "GitHub Copilot".to_owned(),
+                models: vec![ModelDescriptor {
+                    id: ModelId::new("gpt-6-luna"),
+                    provider: loom_model::ProviderId::new("github-copilot"),
+                    display_name: "gpt-6-luna".to_owned(),
+                    context_window: Some(128_000),
+                    max_input_tokens: None,
+                    max_output_tokens: None,
+                    capabilities: ModelCapabilities::default(),
+                }],
+                credential_id: Some("github-copilot".to_owned()),
+                api_key_configurable: false,
+                health: ProviderHealth::default(),
+            },
+            ProviderSummary {
+                id: loom_model::ProviderId::new("company-gateway"),
+                kind: ProviderKind::OpenAiCompatible,
+                display_name: "Company gateway".to_owned(),
+                models: Vec::new(),
+                credential_id: Some("gateway-key".to_owned()),
+                api_key_configurable: true,
+                health: ProviderHealth::default(),
+            },
+        ];
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window
+                .find("refresh-provider-models-github-copilot")
+                .visible(),
+            "a configured Copilot provider needs a catalog refresh action"
+        );
+        assert!(
+            window
+                .find("refresh-provider-models-company-gateway")
+                .visible()
+        );
+        // Copilot still carries no API key, so it must not offer key controls.
+        assert!(
+            window
+                .try_find("configure-api-key-github-copilot")
+                .is_none()
+        );
+        assert!(window.find("configure-api-key-company-gateway").visible());
+    })
+    .unwrap();
+}
+
 #[gpui_kit::test]
 fn github_login_states_and_phone_session_drawer_render(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);

@@ -75,8 +75,6 @@ impl LoomView {
         if !self.model_refreshes_in_flight.insert(node_id.clone()) {
             return;
         }
-        self.model_catalog_refreshed_at
-            .insert(node_id.clone(), Timestamp::now());
         let active_node_id = self
             .session_node_ids
             .get(&self.active_session.id)
@@ -110,6 +108,12 @@ impl LoomView {
                 }
                 match result {
                     Ok(catalog) => {
+                        // Only a delivered catalog is fresh. Recording the
+                        // attempt instead would let one failed discovery
+                        // suppress the next on-demand retry for the staleness
+                        // window while the stale catalog stays authoritative.
+                        view.model_catalog_refreshed_at
+                            .insert(node_id.clone(), Timestamp::now());
                         view.record_model_discovery_errors(catalog.discovery_errors);
                         view.node_model_provider_names
                             .insert(node_id.clone(), catalog.provider_names);

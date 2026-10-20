@@ -1682,7 +1682,7 @@ impl LoomView {
                         phone,
                     )),
                 )
-                .child(self.render_api_key_providers(cx))
+                .child(self.render_providers(cx))
                 .into_any_element()
             }
             SettingsSection::Workers => {
@@ -2095,14 +2095,14 @@ impl LoomView {
             .into_any()
     }
 
-    fn render_api_key_providers(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        let local_providers = self
-            .providers
-            .iter()
-            .filter(|provider| provider.kind != ProviderKind::GitHubCopilot)
-            .collect::<Vec<_>>();
+    /// Every provider configured on the shown worker. GitHub Copilot is
+    /// included: it carries no API key, but it does carry a discovered model
+    /// catalog that the worker drops on a restart, so it needs the same
+    /// refresh action as an API-key provider.
+    fn render_providers(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let providers = self.providers.iter().collect::<Vec<_>>();
         let mut body = div().w_full().flex().flex_col().gap_2();
-        if local_providers.is_empty() {
+        if providers.is_empty() {
             body = body.child(
                 settings_card().child(
                     div()
@@ -2110,11 +2110,11 @@ impl LoomView {
                         .py_3()
                         .text_xs()
                         .text_color(rgb(0x8f98a6))
-                        .child("No other providers are configured."),
+                        .child("No providers are configured."),
                 ),
             );
         } else {
-            for provider in local_providers {
+            for provider in providers {
                 let api_key_configurable = provider.api_key_configurable;
                 let configured = provider.credential_id.is_some();
                 let provider_id = provider.id.clone();
@@ -2208,28 +2208,28 @@ impl LoomView {
                                 .child(status.clone()),
                         );
                     }
-                    if configured {
-                        let node_id = self
-                            .providers_node_id
-                            .clone()
-                            .unwrap_or_else(|| self.default_backend_node_id.clone());
-                        card = card.child(
-                            div().px_4().pb_3().child(
-                                Button::new(format!(
-                                    "refresh-provider-models-{}",
-                                    provider.id.as_str()
-                                ))
-                                .label("Refresh models")
-                                .ghost()
-                                .xsmall()
-                                .on_click(cx.listener(
-                                    move |view, _, _, cx| {
-                                        view.refresh_models_for_node_async(node_id.clone(), cx);
-                                    },
-                                )),
-                            ),
-                        );
-                    }
+                }
+                if configured {
+                    let node_id = self
+                        .providers_node_id
+                        .clone()
+                        .unwrap_or_else(|| self.default_backend_node_id.clone());
+                    card = card.child(
+                        div().px_4().pb_3().child(
+                            Button::new(format!(
+                                "refresh-provider-models-{}",
+                                provider.id.as_str()
+                            ))
+                            .label("Refresh models")
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(
+                                move |view, _, _, cx| {
+                                    view.refresh_models_for_node_async(node_id.clone(), cx);
+                                },
+                            )),
+                        ),
+                    );
                 }
                 body = body.child(card);
             }
