@@ -589,3 +589,115 @@ mod header_shortcuts {
         });
     }
 }
+
+/// The dialog card fits the viewport it is drawn in: a phone insets it inside
+/// the viewport instead of floating it at the offset its wider layout uses,
+/// where the card's right side ran past the edge of the screen.
+mod dialog_layout_tests {
+    use super::super::loom_view_render_tests::render_scenario_at;
+    use super::*;
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{Pixels, Size, TestAppContext, px, size};
+
+    /// Renders the sub project dialog in the shared scenario harness and returns
+    /// the window it was rendered into.
+    fn render_sub_project_dialog(
+        cx: &mut TestAppContext,
+        window_size: Size<Pixels>,
+    ) -> gpui_kit::AnyWindowHandle {
+        cx.update(gpui_kit::init);
+        render_scenario_at(cx, window_size, |view| {
+            view.show_surface(CoveringSurface::SubProject);
+            view.sub_project_dialog = Some(SubProjectDialogState {
+                parent_session_id: view.active_session.id,
+                parent_name: "loom".to_owned(),
+            });
+        });
+        let windows = cx.windows();
+        assert_eq!(windows.len(), 1, "the scenario renders in a single window");
+        windows[0]
+    }
+
+    /// Asserts that the card, its field, and its actions all stay inside a
+    /// phone's viewport, and that the actions are finger-sized targets.
+    fn assert_dialog_fits_phone(cx: &mut TestAppContext, window_size: Size<Pixels>) {
+        let handle = render_sub_project_dialog(cx, window_size);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let viewport = window.viewport_size();
+            let card = window.find("sub-project-card");
+            assert!(card.visible(), "the dialog card is not on screen");
+            let bounds = card.bounds();
+            assert!(
+                bounds.size.width > px(0.),
+                "the card has no width: {bounds:?}"
+            );
+            assert!(
+                bounds.left() >= px(0.),
+                "the card runs off the left edge: {bounds:?}"
+            );
+            assert!(
+                bounds.right() <= viewport.width,
+                "the card runs off the right edge: {bounds:?} in {viewport:?}"
+            );
+            assert!(
+                bounds.bottom() <= viewport.height,
+                "the card runs off the bottom: {bounds:?} in {viewport:?}"
+            );
+            assert!(window.find("sub-project-name-input").visible());
+            for id in ["cancel-sub-project", "confirm-sub-project"] {
+                let button = window.find(id);
+                assert!(button.visible(), "{id} is not on screen");
+                let bounds = button.bounds();
+                assert!(
+                    bounds.size.height >= px(44.),
+                    "{id} is not a finger-sized target: {bounds:?}"
+                );
+                assert!(
+                    bounds.right() <= viewport.width,
+                    "{id} runs off the right edge: {bounds:?} in {viewport:?}"
+                );
+            }
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn a_phone_insets_the_dialog_inside_the_viewport(cx: &mut TestAppContext) {
+        assert_dialog_fits_phone(cx, size(px(390.), px(520.)));
+    }
+
+    /// A narrow phone is the tightest case: the card gets less room than the
+    /// fixed desktop width it used to demand.
+    #[gpui_kit::test]
+    fn a_narrow_phone_insets_the_dialog_inside_the_viewport(cx: &mut TestAppContext) {
+        assert_dialog_fits_phone(cx, size(px(320.), px(480.)));
+    }
+
+    /// A layout wider than a phone keeps the floating card at the width and
+    /// offset it has always had, instead of insetting it in a full-window
+    /// overlay the way a phone has to.
+    #[gpui_kit::test]
+    fn a_wider_layout_floats_the_card_at_its_offset(cx: &mut TestAppContext) {
+        let handle = render_sub_project_dialog(cx, size(px(1280.), px(800.)));
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            let viewport = window.viewport_size();
+            let dialog = window.find("sub-project-dialog").bounds();
+            let card = window.find("sub-project-card").bounds();
+            assert_eq!(card.size.width, px(420.), "card {card:?}");
+            assert_eq!(
+                card.left(),
+                dialog.left(),
+                "the wider layout adds no overlay around the card: {dialog:?}"
+            );
+            assert_eq!(
+                card.top(),
+                dialog.top(),
+                "the wider layout adds no overlay around the card: {dialog:?}"
+            );
+            assert!(card.right() <= viewport.width, "card {card:?}");
+        })
+        .unwrap();
+    }
+}
