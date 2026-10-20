@@ -99,11 +99,12 @@ needs the explicit `--allow-insecure-remote` opt-in.
 | `whoami` | The participant bound to the token. |
 | `ls [--workspace <id>]` | Workspaces, or the sessions of one workspace. |
 | `get <session-id> [--metadata]` | One session snapshot, or only its metadata. |
-| `events --session <id> [--after <seq>] [--cursor-file <path>] [--follow] [--format text\|jsonl] [--max-bytes <n>]` | Session events, optionally followed until interrupted. |
-| `peek --session <id> [--lines <n>]` | The tail of the session's current output; 200 lines by default. |
+| `events --session <id> [--after <seq>] [--cursor-file <path>] [--follow] [--format text\|jsonl] [--max-bytes <n>]` | Session events, followed until the run completes or the caller interrupts. |
+| `peek --session <id> [--lines <n>] [--format text\|jsonl] [--max-bytes <n>]` | The tail of the session's current output; 200 lines by default. |
+| `run --workspace <id> (--task <text> \| --task-file <path>) [--name <name>] [--model <id>] [--repo <source> [--revision <rev>] [--path <path>]] [--as-directory <path>] [--approval-policy default\|auto] [--request-id <uuid>]` | Reuse or create the session named `--name`, attach the inputs, set the approval policy, and start one run. |
 
-`events` renders at most 4096 bytes of each event body by default; `--max-bytes`
-changes that cap.
+`events` and `peek` bound the tool payload of each rendered event to 4096 bytes
+by default; `--max-bytes` changes that cap.
 
 `--format text` is the default and is the documented, byte-stable `loom-text/1`
 projection: one line per event as `<seq> <kind> <body>`, with the body escaped
@@ -130,6 +131,14 @@ the request id the call used.
 `ls`, `get`, `events`, and `peek` are read-only and work with a
 read-only-scoped token. `run` starts a run and prints its ids; no verb in this
 slice waits for a run to finish.
+
+`run` is the one mutation. It reuses the workspace session whose name matches
+`--name` (or a name derived from the task) and otherwise creates it, attaches
+`--repo` or `--as-directory` only when it created the session, and pins
+`--approval-policy` before the run starts. `--request-id` is the idempotency key
+of the run start, so repeating the same command returns the same run. A worker
+accepts a run only in an idle session, so reusing a session that already ran
+reports `invalid_state` (exit `5`) and creates nothing.
 
 ## Providers
 
