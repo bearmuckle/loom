@@ -500,6 +500,9 @@ pub struct ToolExecutor {
     web_search_provider: Option<Arc<dyn WebSearchProvider>>,
     github_token: Option<String>,
     github_write_enabled: bool,
+    /// Whether the connected account holds the repository-scoped credential a
+    /// private repository needs. `None` means the server did not report it.
+    github_repository_access: Option<bool>,
     github_api_base: String,
     extension: Option<Arc<dyn ToolExtension>>,
     /// Per-session Cargo target directory, when the server owns a build cache.
@@ -521,6 +524,7 @@ impl ToolExecutor {
             web_search_provider: None,
             github_token: None,
             github_write_enabled: false,
+            github_repository_access: None,
             github_api_base: DEFAULT_GITHUB_API_BASE.to_owned(),
             extension: None,
             build_cache: None,
@@ -552,11 +556,26 @@ impl ToolExecutor {
         self
     }
 
-    /// Refreshes the GitHub token and write grant on an already-built executor
-    /// so a settings change takes effect for the next agent step.
-    pub fn set_github_access(&mut self, token: Option<String>, write_access: bool) {
+    /// States whether the connected account is authorized for repository
+    /// access, which is what a private repository needs and is a separate fact
+    /// from the write grant.
+    pub fn with_github_repository_access(mut self, enabled: bool) -> Self {
+        self.github_repository_access = Some(enabled);
+        self
+    }
+
+    /// Refreshes the GitHub token, write grant, and repository-access fact on an
+    /// already-built executor so a settings change takes effect for the next
+    /// agent step.
+    pub fn set_github_access(
+        &mut self,
+        token: Option<String>,
+        write_access: bool,
+        repository_access: bool,
+    ) {
         self.github_token = token.filter(|token| !token.trim().is_empty());
         self.github_write_enabled = write_access;
+        self.github_repository_access = Some(repository_access);
     }
 
     pub fn with_extension(mut self, extension: Arc<dyn ToolExtension>) -> Self {
@@ -2106,14 +2125,15 @@ impl ToolExecutor {
                 )),
             ),
             // The caller asked for this refresh, so the VCS failure is the
-            // answer rather than a note. The cause cannot be observed from
-            // here, so the failure states what a private repository needs
-            // without claiming that is what went wrong.
+            // answer rather than a note. Missing repository access is the one
+            // cause the server observed, so only that case names it; otherwise
+            // the wording stays generic and claims no cause.
             Err(error) => ToolResult::failure(
                 call,
                 format!(
-                    "{}\nrefs/remotes/origin/* was left unchanged. A private repository needs a connected account with access to it, and the checkout itself carries no git credentials.",
-                    error.message
+                    "{}\nrefs/remotes/origin/* was left unchanged. {}",
+                    error.message,
+                    github_fetch_failure_guidance(self.github_repository_access)
                 ),
             ),
         }
@@ -3404,6 +3424,20 @@ fn github_fetch_result(
         ));
     }
     result
+}
+
+/// Explains what a failed explicit `origin` refresh leaves the caller with.
+///
+/// Only a missing repository grant is a cause the server observed, and only
+/// that case names one: the generic sentence states what a private repository
+/// needs without claiming it is what went wrong. The token is never part of
+/// the answer.
+fn github_fetch_failure_guidance(repository_access: Option<bool>) -> &'static str {
+    if repository_access == Some(false) {
+        "The connected GitHub account is not authorized for repository access, which a private repository needs; authorize repository access in Loom settings and retry. The checkout itself carries no git credentials."
+    } else {
+        "A private repository needs a connected account with access to it, and the checkout itself carries no git credentials."
+    }
 }
 
 /// `1 commit` or `N commits`, so a tracking line reads naturally.
@@ -4992,7 +5026,7 @@ mod tests {
         assert!(!refused.success);
         assert!(refused.output.contains("write access is disabled"));
 
-        executor.set_github_access(Some("test-token".to_owned()), true);
+        executor.set_github_access(Some("test-token".to_owned()), true, true);
         assert!(advertised(&executor));
         let refreshed = executor.execute(&call(
             "github_push_branch",
@@ -5527,6 +5561,119 @@ mod tests {
 
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(bare).unwrap();
+    }
+
+    /// The server knows the connected account has no repository-scoped
+    /// credential, which is what a private repository needs, so the failure
+    /// names that fix instead of leaving the raw VCS error as the only answer.
+    #[test]
+    fn github_fetch_names_missing_repository_access() {
+        let root = std::env::temp_dir().join(format!("loom-fetch-{}", AgentSessionId::new()));
+        let branch = init_git_repository(&root);
+        let bare = origin_remote(&root, &branch);
+        // Without the bare origin the fetch cannot resolve, which fails the call
+        // without touching the network.
+        fs::remove_dir_all(&bare).unwrap();
+        let executor = ToolExecutor::new(&root)
+            .unwrap()
+            .with_github_token(Some("test-token".to_owned()))
+            .with_github_repository_access(false);
+
+        let failed = executor.execute(&call(
+            "github_fetch",
+            serde_json::json!({"repository": "owner/name"}),
+        ));
+
+        assert!(!failed.success, "{}", failed.output);
+        // The VCS error and the state the caller is left with are kept.
+        assert!(
+            failed
+                .output
+                .contains("could not fetch the 'origin' remote"),
+            "{}",
+            failed.output
+        );
+        assert!(
+            failed
+                .output
+                .contains("refs/remotes/origin/* was left unchanged."),
+            "{}",
+            failed.output
+        );
+        assert!(
+            failed
+                .output
+                .contains("not authorized for repository access"),
+            "{}",
+            failed.output
+        );
+        assert!(
+            failed.output.contains("which a private repository needs"),
+            "{}",
+            failed.output
+        );
+        assert!(
+            failed
+                .output
+                .contains("authorize repository access in Loom settings and retry"),
+            "{}",
+            failed.output
+        );
+        assert!(!failed.output.contains("test-token"), "{}", failed.output);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An authorized account leaves the generic sentence in place: the failure
+    /// must not claim a cause the server did not observe.
+    #[test]
+    fn github_fetch_does_not_name_repository_access_when_authorized() {
+        let root = std::env::temp_dir().join(format!("loom-fetch-{}", AgentSessionId::new()));
+        let branch = init_git_repository(&root);
+        let bare = origin_remote(&root, &branch);
+        fs::remove_dir_all(&bare).unwrap();
+        let executor = ToolExecutor::new(&root)
+            .unwrap()
+            .with_github_token(Some("test-token".to_owned()))
+            .with_github_repository_access(true);
+
+        let failed = executor.execute(&call(
+            "github_fetch",
+            serde_json::json!({"repository": "owner/name"}),
+        ));
+
+        assert!(!failed.success, "{}", failed.output);
+        assert!(
+            failed
+                .output
+                .contains("refs/remotes/origin/* was left unchanged."),
+            "{}",
+            failed.output
+        );
+        assert!(
+            !failed
+                .output
+                .contains("not authorized for repository access"),
+            "{}",
+            failed.output
+        );
+        assert!(
+            !failed
+                .output
+                .contains("authorize repository access in Loom settings"),
+            "{}",
+            failed.output
+        );
+        assert!(
+            failed.output.contains(
+                "A private repository needs a connected account with access to it, and the checkout itself carries no git credentials."
+            ),
+            "{}",
+            failed.output
+        );
+        assert!(!failed.output.contains("test-token"), "{}", failed.output);
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// A caller that only wants one ref namespace does not have to read every

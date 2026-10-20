@@ -206,13 +206,15 @@ impl InProcessBackend {
                             .runtime
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner);
-                        // Re-read the GitHub credentials and write grant each step
-                        // so settings toggled while a run is registered (for
-                        // example while it waits for user input) take effect
-                        // instead of keeping the values captured at run start.
+                        // Re-read the GitHub credentials, write grant, and
+                        // repository-access fact each step so settings toggled
+                        // while a run is registered (for example while it waits
+                        // for user input) take effect instead of keeping the
+                        // values captured at run start.
                         runtime.set_github_access(
                             backend.providers.github_account_token().ok(),
                             backend.providers.github_write_access(),
+                            backend.providers.github_repository_token().is_ok(),
                         );
                         let progress = runtime.run_step();
                         task_handle.refresh(&runtime);

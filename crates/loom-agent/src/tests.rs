@@ -1755,7 +1755,7 @@ fn refreshing_github_access_updates_the_advertised_tools() {
     };
     assert!(!advertises_push(&runtime));
 
-    runtime.set_github_access(Some("test-token".to_owned()), true);
+    runtime.set_github_access(Some("test-token".to_owned()), true, true);
     assert!(advertises_push(&runtime));
     fs::remove_dir_all(root).unwrap();
 }

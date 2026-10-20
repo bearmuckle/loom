@@ -75,7 +75,10 @@ impl InProcessConnection {
         let tools = ToolExecutor::new_with_workspace(workspace)
             .with_build_cache_root(self.backend.build_cache_root())
             .with_github_token(self.backend.providers.github_account_token().ok())
-            .with_github_write_access(self.backend.providers.github_write_access());
+            .with_github_write_access(self.backend.providers.github_write_access())
+            .with_github_repository_access(
+                self.backend.providers.github_repository_token().is_ok(),
+            );
         let tools = self.backend.with_project_agent_tools(
             tools,
             state.session_id,
@@ -658,7 +661,10 @@ impl InProcessConnection {
         let tools = ToolExecutor::new_with_workspace(workspace)
             .with_build_cache_root(self.backend.build_cache_root())
             .with_github_token(self.backend.providers.github_account_token().ok())
-            .with_github_write_access(self.backend.providers.github_write_access());
+            .with_github_write_access(self.backend.providers.github_write_access())
+            .with_github_repository_access(
+                self.backend.providers.github_repository_token().is_ok(),
+            );
         let tools = self.backend.with_project_agent_tools(
             tools,
             session.id,
