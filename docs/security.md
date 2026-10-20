@@ -178,6 +178,19 @@ remote-tracking refs: nothing is published to the remote, and a private
 repository needs a connected account with access to it. `github_push_branch` is
 the tool that publishes commits, under its own write grant.
 
+That refresh does not need a tool call to start. A run start fetches every head
+of the `origin` remote of the session's single attached checkout with the
+connected account token, under a bounded deadline, and appends how far that
+checkout's base has drifted from the fetched default branch to the run's
+repository instructions. The measurement is advisory: a fetch that fails or
+exceeds the deadline is recorded as unknown drift and never blocks the run, and
+the cached `origin/*` refs are not used as a stand-in for it. A session that
+runs long enough to drift again, or whose run-start refresh failed, refreshes
+explicitly with `github_fetch`. `github_push_branch` measures the same drift
+before a branch push, and a force-with-lease rewrite of a base that is behind
+`origin` is refused while the remote is still untouched, naming `github_fetch`
+and the rebase that resolves it.
+
 The backend owns and canonicalizes each session filesystem root, rejecting
 traversal and outside-root symlinks. Workspace authorization governs access to
 workspace metadata and session membership; session authorization governs
