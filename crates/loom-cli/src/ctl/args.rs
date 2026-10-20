@@ -241,6 +241,11 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
         }
     }
 
+    // `--connect` wins over the environment, which is only consulted when the
+    // flag is absent. Resolving it here, rather than in `main`, keeps the URL a
+    // cursor file is scoped to identical in both code paths.
+    globals.connect = resolve_connect(globals.connect.take(), std::env::var("LOOM_URL").ok());
+
     let Some(name) = positionals.first() else {
         return Err("missing verb; try --help".to_owned());
     };
@@ -399,6 +404,13 @@ fn no_positionals(verb: &str, rest: &[String]) -> Result<(), String> {
         )),
         None => Ok(()),
     }
+}
+
+/// The worker URL, with the flag winning over the environment. An empty or
+/// whitespace-only environment value is treated as unset, so it fails the
+/// "a worker URL is required" check instead of producing an unusable link.
+pub(crate) fn resolve_connect(flag: Option<String>, environment: Option<String>) -> Option<String> {
+    flag.or_else(|| environment.filter(|url| !url.trim().is_empty()))
 }
 
 fn parse_format(value: Option<String>) -> Result<Format, String> {
