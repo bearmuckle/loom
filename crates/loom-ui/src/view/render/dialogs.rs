@@ -140,103 +140,102 @@ impl LoomView {
             .into_any()
     }
 
-    pub(crate) fn render_rename_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Renders the dialog that renames the session or project on screen.
+    pub(crate) fn render_rename_dialog(
+        &self,
+        layout: ResponsiveLayout,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let Some(dialog) = &self.rename_dialog else {
             return div().into_any();
         };
-        div()
-            .id("rename-dialog")
-            .test_support()
-            .occlude()
-            .absolute()
-            .top(px(120.))
-            .left(px(280.))
-            .w(px(420.))
-            .p_3()
-            .rounded_lg()
-            .bg(rgb(0x1b1d24))
-            .border_1()
-            .border_color(rgb(0x3b4555))
-            .shadow_lg()
-            .text_color(rgb(0xe5e7eb))
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(0xf3f4f6))
-                    .child(if dialog.is_project {
-                        "Rename project"
-                    } else {
-                        "Rename session"
-                    }),
-            )
-            .child(
-                div()
-                    .mt_1()
-                    .text_xs()
-                    .text_color(rgb(0x8f98a6))
-                    .child(format!("Current name: {}", dialog.session.name)),
-            )
-            .child(
-                div().mt_3().child(
-                    KitInput::new(
-                        self.rename_input_state
-                            .as_ref()
-                            .expect("rename input initialized before rendering"),
-                    )
-                    .id("rename-session-input")
-                    .small(),
-                ),
-            )
-            .child(
-                div()
-                    .mt_3()
-                    .flex()
-                    .justify_end()
-                    .gap_1()
-                    .child(
-                        div()
+        let phone = layout.phone;
+        dialog_surface(
+            "rename-dialog",
+            phone,
+            dialog_card(phone)
+                .id("rename-card")
+                .test_support()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0xf3f4f6))
+                        .child(if dialog.is_project {
+                            "Rename project"
+                        } else {
+                            "Rename session"
+                        }),
+                )
+                .child(
+                    div()
+                        .mt_1()
+                        .text_xs()
+                        .text_color(rgb(0x8f98a6))
+                        .child(format!("Current name: {}", dialog.session.name)),
+                )
+                .child(
+                    div().mt_3().child(
+                        KitInput::new(
+                            self.rename_input_state
+                                .as_ref()
+                                .expect("rename input initialized before rendering"),
+                        )
+                        .id("rename-session-input")
+                        .small(),
+                    ),
+                )
+                .child(
+                    div()
+                        .mt_3()
+                        .flex()
+                        .justify_end()
+                        .gap_1()
+                        .child(
+                            dialog_action(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(rgb(0x242833))
+                                    .hover(|style| style.bg(rgb(0x293244)))
+                                    .text_sm()
+                                    .cursor_pointer(),
+                                phone,
+                            )
                             .id("cancel-rename")
                             .test_support()
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(rgb(0x242833))
-                            .hover(|style| style.bg(rgb(0x293244)))
-                            .text_sm()
-                            .cursor_pointer()
                             .child("Cancel")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.close_rename_dialog(cx);
                             })),
-                    )
-                    .child(
-                        div()
+                        )
+                        .child(
+                            dialog_action(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(rgb(0x2563eb))
+                                    .text_sm()
+                                    .text_color(rgb(0xffffff))
+                                    .cursor_pointer(),
+                                phone,
+                            )
                             .id("confirm-rename")
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(rgb(0x2563eb))
-                            .text_sm()
-                            .text_color(rgb(0xffffff))
-                            .cursor_pointer()
+                            .test_support()
                             .child("Rename")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.confirm_rename(cx);
                                 cx.notify();
                             })),
-                    ),
-            )
-            .into_any()
+                        ),
+                ),
+        )
     }
 
     /// Renders the sub project dialog: the one field that names a branch of the
     /// project on screen. Everything else the branch needs is inherited, so
     /// there is nothing else to choose.
-    ///
-    /// A wider layout floats the card at a fixed offset. A phone cannot hold it
-    /// there: the card's width added to that offset puts its right side past the
-    /// viewport edge, so a phone insets the card inside the viewport instead and
-    /// gives its actions a finger-sized target.
     pub(crate) fn render_sub_project_dialog(
         &self,
         layout: ResponsiveLayout,
@@ -246,121 +245,86 @@ impl LoomView {
             return div().into_any();
         };
         let phone = layout.phone;
-        div()
-            .id("sub-project-dialog")
-            .test_support()
-            .occlude()
-            .absolute()
-            .when(phone, |element| {
-                element
-                    .top(px(0.))
-                    .left(px(0.))
-                    .size_full()
-                    .p_4()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(gpui_kit::hsla(0., 0., 0., 0.55))
-            })
-            .when(!phone, |element| element.top(px(120.)).left(px(280.)))
-            .child(
-                div()
-                    .id("sub-project-card")
-                    .test_support()
-                    .when(phone, |card| card.w_full().max_w(px(420.)))
-                    .when(!phone, |card| card.w(px(420.)))
-                    .p_3()
-                    .rounded_lg()
-                    .bg(rgb(0x1b1d24))
-                    .border_1()
-                    .border_color(rgb(0x3b4555))
-                    .shadow_lg()
-                    .text_color(rgb(0xe5e7eb))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0xf3f4f6))
-                            .child("New sub project"),
-                    )
-                    .child(
-                        div()
-                            .mt_1()
-                            .text_xs()
-                            .text_color(rgb(0x8f98a6))
-                            .child(format!(
-                                "Branches from {}. It gets its own session, sources, and checkouts.",
-                                dialog.parent_name
-                            )),
-                    )
-                    .child(
-                        div().mt_3().child(
-                            KitInput::new(
-                                self.sub_project_input_state
-                                    .as_ref()
-                                    .expect("sub project input initialized before rendering"),
-                            )
-                            .id("sub-project-name-input")
-                            .small(),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .mt_3()
-                            .flex()
-                            .justify_end()
-                            .gap_1()
-                            .child(
+        dialog_surface(
+            "sub-project-dialog",
+            phone,
+            dialog_card(phone)
+                .id("sub-project-card")
+                .test_support()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0xf3f4f6))
+                        .child("New sub project"),
+                )
+                .child(
+                    div()
+                        .mt_1()
+                        .text_xs()
+                        .text_color(rgb(0x8f98a6))
+                        .child(format!(
+                            "Branches from {}. It gets its own session, sources, and checkouts.",
+                            dialog.parent_name
+                        )),
+                )
+                .child(
+                    div().mt_3().child(
+                        KitInput::new(
+                            self.sub_project_input_state
+                                .as_ref()
+                                .expect("sub project input initialized before rendering"),
+                        )
+                        .id("sub-project-name-input")
+                        .small(),
+                    ),
+                )
+                .child(
+                    div()
+                        .mt_3()
+                        .flex()
+                        .justify_end()
+                        .gap_1()
+                        .child(
+                            dialog_action(
                                 div()
-                                    .id("cancel-sub-project")
-                                    .test_support()
                                     .px_2()
                                     .py_1()
                                     .rounded_sm()
                                     .bg(rgb(0x242833))
                                     .hover(|style| style.bg(rgb(0x293244)))
                                     .text_sm()
-                                    .cursor_pointer()
-                                    .when(phone, |button| {
-                                        button
-                                            .flex_1()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .min_h(px(44.))
-                                    })
-                                    .child("Cancel")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.close_sub_project_dialog(cx);
-                                    })),
+                                    .cursor_pointer(),
+                                phone,
                             )
-                            .child(
+                            .id("cancel-sub-project")
+                            .test_support()
+                            .child("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_sub_project_dialog(cx);
+                            })),
+                        )
+                        .child(
+                            dialog_action(
                                 div()
-                                    .id("confirm-sub-project")
-                                    .test_support()
                                     .px_2()
                                     .py_1()
                                     .rounded_sm()
                                     .bg(rgb(0x2563eb))
                                     .text_sm()
                                     .text_color(rgb(0xffffff))
-                                    .cursor_pointer()
-                                    .when(phone, |button| {
-                                        button
-                                            .flex_1()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .min_h(px(44.))
-                                    })
-                                    .child("Create")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.confirm_sub_project(cx);
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
-            )
-            .into_any()
+                                    .cursor_pointer(),
+                                phone,
+                            )
+                            .id("confirm-sub-project")
+                            .test_support()
+                            .child("Create")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_sub_project(cx);
+                                cx.notify();
+                            })),
+                        ),
+                ),
+        )
     }
 
     pub(crate) fn render_source_dialog(
@@ -2272,6 +2236,62 @@ impl LoomView {
         }
         body.into_any_element()
     }
+}
+
+/// The surface a small dialog is drawn on.
+///
+/// A wider layout floats the card at the offset these dialogs have always used.
+/// A phone cannot hold it there: the card's fixed width added to that offset
+/// puts its right side past the viewport edge, so a phone insets the card inside
+/// the viewport, over a dimmed backdrop, instead.
+fn dialog_surface(id: &'static str, phone: bool, card: impl IntoElement) -> gpui_kit::AnyElement {
+    div()
+        .id(id)
+        .test_support()
+        .occlude()
+        .absolute()
+        .when(phone, |element| {
+            element
+                .top(px(0.))
+                .left(px(0.))
+                .size_full()
+                .p_4()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui_kit::hsla(0., 0., 0., 0.55))
+        })
+        .when(!phone, |element| element.top(px(120.)).left(px(280.)))
+        .child(card)
+        .into_any()
+}
+
+/// The card a small dialog is drawn on, sized to the layout showing it. The
+/// caller names it, so both the card and its actions can be identified.
+fn dialog_card(phone: bool) -> gpui_kit::Div {
+    div()
+        .when(phone, |card| card.w_full().max_w(px(420.)))
+        .when(!phone, |card| card.w(px(420.)))
+        .p_3()
+        .rounded_lg()
+        .bg(rgb(0x1b1d24))
+        .border_1()
+        .border_color(rgb(0x3b4555))
+        .shadow_lg()
+        .text_color(rgb(0xe5e7eb))
+}
+
+/// Gives one dialog action a finger-sized target that splits the card's width,
+/// which a phone needs because there the card is as narrow as the screen.
+fn dialog_action(button: gpui_kit::Div, phone: bool) -> gpui_kit::Div {
+    button.when(phone, |button| {
+        button
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .min_h(px(44.))
+    })
 }
 
 /// Subtitle for a repository already cloned on the worker node, e.g.

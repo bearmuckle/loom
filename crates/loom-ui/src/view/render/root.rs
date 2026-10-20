@@ -933,7 +933,9 @@ impl LoomView {
             Some(CoveringSurface::GitHubLogin) => {
                 self.render_github_login_dialog(cx).into_any_element()
             }
-            Some(CoveringSurface::Rename) => self.render_rename_dialog(cx).into_any_element(),
+            Some(CoveringSurface::Rename) => {
+                self.render_rename_dialog(layout, cx).into_any_element()
+            }
             Some(CoveringSurface::SubProject) => self
                 .render_sub_project_dialog(layout, cx)
                 .into_any_element(),
