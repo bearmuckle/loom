@@ -1952,6 +1952,10 @@ impl ToolExecutor {
         // The name a branch push reports: the requested branch, or the current
         // branch when the caller left it out.
         let mut pushed_branch = branch.clone().unwrap_or_default();
+        // The base drift a branch push reports, measured before the push so it
+        // describes the base the push was made from rather than the state the
+        // push left behind.
+        let mut freshness: Option<String> = None;
         let pushed = if delete {
             let refname = if tag {
                 match branch.as_deref() {
@@ -2007,6 +2011,14 @@ impl ToolExecutor {
                 },
             };
             pushed_branch = local.clone();
+            // The refresh is advisory, so a failed or expired fetch leaves the
+            // drift unknown instead of failing the push, and an unknown drift is
+            // never a reason to refuse the rewrite on a guess.
+            let refresh = checkout_base_refresh(&service, Some(token));
+            if let Some(refusal) = stale_base_lease_refusal(&local, lease.as_deref(), &refresh) {
+                return ToolResult::failure(call, refusal);
+            }
+            freshness = Some(refresh.summary());
             service.push_branch_authenticated(
                 BranchPush {
                     branch: &local,
@@ -2020,12 +2032,9 @@ impl ToolExecutor {
         };
         match pushed {
             Ok(report) => {
-                // The push already succeeded, so the base drift is reported next
-                // to a branch update: a branch pushed from a checkout that is
-                // many commits behind its base opens a stale pull request. A tag
-                // or a delete publishes no branch, so there is no base to report.
-                let freshness = (!report.deleted && report.refname.starts_with("refs/heads/"))
-                    .then(|| checkout_base_freshness_note(&service, Some(token)));
+                // A branch push measured its base drift before pushing, so the
+                // result describes the base the push was made from. A tag or a
+                // delete publishes no branch, so there is no base to report.
                 let label = if pushed_branch.is_empty() {
                     report.refname.as_str()
                 } else {
@@ -3445,17 +3454,15 @@ fn commit_count(count: usize) -> String {
     format!("{count} commit{}", if count == 1 { "" } else { "s" })
 }
 
-/// Describes how far the checkout at `service` has drifted from the default
+/// Resolves how far the checkout at `service` has drifted from the default
 /// branch of its `origin`, as resolved by a bounded fetch performed now.
 ///
-/// The note is advisory: a failed or expired fetch reports the drift as unknown
+/// The record is advisory: a failed or expired fetch states the drift as unknown
 /// instead of failing the caller, and a cached `origin/*` ref is never used as a
-/// stand-in for the fetch that failed. The wording comes from
-/// [`ProjectWorktreeBaseRefresh::summary`], so a pinned base reads the same
-/// wherever it is reported.
-fn checkout_base_freshness_note(service: &GitService, token: Option<&str>) -> String {
+/// stand-in for the fetch that failed.
+fn checkout_base_refresh(service: &GitService, token: Option<&str>) -> ProjectWorktreeBaseRefresh {
     let head = service.status().ok().and_then(|status| status.head);
-    let refresh = match service.refresh_origin_default_branch(
+    match service.refresh_origin_default_branch(
         head.as_deref(),
         token,
         GITHUB_BASE_FRESHNESS_DEADLINE,
@@ -3475,8 +3482,51 @@ fn checkout_base_freshness_note(service: &GitService, token: Option<&str>) -> St
             attempted_at: Timestamp::now(),
             warning: error.message,
         },
+    }
+}
+
+/// Describes how far the checkout at `service` has drifted from the default
+/// branch of its `origin`, as resolved by a bounded fetch performed now.
+///
+/// The note is advisory: a failed or expired fetch reports the drift as unknown
+/// instead of failing the caller. The wording comes from
+/// [`ProjectWorktreeBaseRefresh::summary`], so a pinned base reads the same
+/// wherever it is reported.
+fn checkout_base_freshness_note(service: &GitService, token: Option<&str>) -> String {
+    checkout_base_refresh(service, token).summary()
+}
+
+/// Refuses a force-with-lease rewrite of a branch whose base is known to be
+/// behind the default branch it was pushed from.
+///
+/// A rewrite replaces the remote ref, so a base that is behind would publish a
+/// branch without the commits the default branch gained after the checkout was
+/// created. The refusal names the drift and the remedy, and it is decided before
+/// the push is sent so the remote stays untouched. A fast-forward-only push is
+/// never refused, and an unknown drift is never a reason to refuse on a guess.
+/// A dry run is refused for the same reason, because the rewrite it reports is
+/// the one a real push would perform.
+fn stale_base_lease_refusal(
+    branch: &str,
+    lease: Option<&str>,
+    refresh: &ProjectWorktreeBaseRefresh,
+) -> Option<String> {
+    let ProjectWorktreeBaseRefresh::Fetched {
+        remote,
+        default_branch,
+        behind,
+        ..
+    } = refresh
+    else {
+        return None;
     };
-    refresh.summary()
+    if lease.is_none() || *behind == 0 {
+        return None;
+    }
+    Some(format!(
+        "Refused the force-with-lease rewrite of branch '{branch}' from a stale base: {}.\nThe force push was refused, so {remote}/{default_branch} was left untouched. Refresh the base with github_fetch, rebase onto the refreshed {remote}/{default_branch}, then retry the push.",
+        refresh.summary()
+    ))
 }
 
 enum PushRemote {
@@ -3730,7 +3780,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolKind::GitHubPushBranch.name().to_owned(),
-            description: "Push a local branch in the workspace to the GitHub repository's origin remote using the connected account, so a pull request can be opened, and report the remote ref's previous revision, its new revision, and the commit range landed. `remote_branch` targets a remote branch name distinct from the local one; `tag` pushes the local tag named by `branch` to refs/tags/<branch>; `delete` removes the remote ref named by `remote_branch`, `branch`, or the current branch instead of pushing it; and `dry_run` performs the reads and reports what would change without writing to the remote. The result also states how far the checkout's base has drifted from origin. Supplying `lease` asks for a force-with-lease rewrite instead of a fast-forward-only push: a force push rewrites published history, and it is safe only because the tool refuses the push unless the remote branch still holds exactly the lease revision. This is a destructive action: it requires enabled GitHub write access and an approval policy that permits destructive actions; the default policy and automatic approvals allow it, and a user who gates destructive actions is prompted for each call.".to_owned(),
+            description: "Push a local branch in the workspace to the GitHub repository's origin remote using the connected account, so a pull request can be opened, and report the remote ref's previous revision, its new revision, and the commit range landed. `remote_branch` targets a remote branch name distinct from the local one; `tag` pushes the local tag named by `branch` to refs/tags/<branch>; `delete` removes the remote ref named by `remote_branch`, `branch`, or the current branch instead of pushing it; and `dry_run` performs the reads and reports what would change without writing to the remote. The result also states how far the checkout's base has drifted from origin. Supplying `lease` asks for a force-with-lease rewrite instead of a fast-forward-only push: a force push rewrites published history, and it is safe only because the tool refuses the push unless the remote branch still holds exactly the lease revision, and because a rewrite from a base that is behind origin is refused with the remote untouched, so refresh with `github_fetch` and rebase onto the refreshed base before retrying. This is a destructive action: it requires enabled GitHub write access and an approval policy that permits destructive actions; the default policy and automatic approvals allow it, and a user who gates destructive actions is prompted for each call.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -5407,9 +5457,16 @@ mod tests {
         let root = std::env::temp_dir().join(format!("loom-push-{}", AgentSessionId::new()));
         let branch = init_git_repository(&root);
         let bare = origin_remote(&root, &branch);
-        let previous = remote_revision(&bare, &branch);
+        // The rewrite belongs to a topic branch, so the default-branch tip stays
+        // in its history and only the topic ref needs rewriting.
+        run_git(&root, &["checkout", "-q", "-b", "loom/topic"]);
+        fs::write(root.join("topic.txt"), "topic\n").unwrap();
+        run_git(&root, &["add", "--", "topic.txt"]);
+        run_git(&root, &["commit", "-qm", "topic"]);
+        run_git(&root, &["push", "-q", "origin", "loom/topic"]);
+        let previous = remote_revision(&bare, "loom/topic");
         // Rewrite the tip, so only a lease can update the remote ref.
-        fs::write(root.join("README.md"), "rewritten\n").unwrap();
+        fs::write(root.join("topic.txt"), "rewritten\n").unwrap();
         run_git(&root, &["commit", "-q", "--amend", "-m", "rewritten"]);
         let rewritten = revision(&root, "HEAD");
 
@@ -5422,13 +5479,13 @@ mod tests {
 
         let listed = executor.execute(&call(
             "github_list_remote_refs",
-            serde_json::json!({"repository": "owner/name", "branch": branch}),
+            serde_json::json!({"repository": "owner/name", "branch": "loom/topic"}),
         ));
         assert!(listed.success, "{}", listed.output);
         assert!(
             listed
                 .output
-                .contains(&format!("refs/heads/{branch} {previous}")),
+                .contains(&format!("refs/heads/loom/topic {previous}")),
             "{}",
             listed.output
         );
@@ -5446,7 +5503,7 @@ mod tests {
             serde_json::json!({"repository": "owner/name", "lease": previous}),
         ));
         assert!(pushed.success, "{}", pushed.output);
-        assert_eq!(remote_revision(&bare, &branch), rewritten);
+        assert_eq!(remote_revision(&bare, "loom/topic"), rewritten);
 
         // A branch the remote does not advertise is reported as creatable.
         let absent = executor.execute(&call(
@@ -5789,18 +5846,26 @@ mod tests {
         fs::remove_dir_all(bare).unwrap();
     }
 
-    /// A branch whose history was linearised cannot be updated without rewriting
-    /// the remote ref, so the lease is what makes the rewrite safe: with it the
-    /// ref is rewritten and reported, without it the push stays refused.
+    /// A branch whose own history was linearised cannot be updated without
+    /// rewriting the remote ref, so the lease is what makes the rewrite safe:
+    /// with it the ref is rewritten and reported, without it the push stays
+    /// refused.
     #[test]
     fn github_push_branch_force_with_lease_rewrites_the_remote_ref() {
         let root = std::env::temp_dir().join(format!("loom-push-{}", AgentSessionId::new()));
         let branch = init_git_repository(&root);
         let bare = origin_remote(&root, &branch);
-        let previous = remote_revision(&bare, &branch);
+        // The rewrite belongs to a topic branch, so the default-branch tip stays
+        // in its history: the base is current, and only the topic ref is rewritten.
+        run_git(&root, &["checkout", "-q", "-b", "loom/topic"]);
+        fs::write(root.join("topic.txt"), "topic\n").unwrap();
+        run_git(&root, &["add", "--", "topic.txt"]);
+        run_git(&root, &["commit", "-qm", "topic"]);
+        run_git(&root, &["push", "-q", "origin", "loom/topic"]);
+        let previous = remote_revision(&bare, "loom/topic");
         // Rewrite the tip, so the update no longer descends from the revision the
         // remote holds.
-        fs::write(root.join("README.md"), "rewritten\n").unwrap();
+        fs::write(root.join("topic.txt"), "rewritten\n").unwrap();
         run_git(&root, &["commit", "-q", "--amend", "-m", "rewritten"]);
         let rewritten = revision(&root, "HEAD");
         assert_ne!(previous, rewritten);
@@ -5812,7 +5877,7 @@ mod tests {
             serde_json::json!({"repository": "owner/name"}),
         ));
         assert!(!refused.success, "{}", refused.output);
-        assert_eq!(remote_revision(&bare, &branch), previous);
+        assert_eq!(remote_revision(&bare, "loom/topic"), previous);
 
         // A leased dry run reports the rewrite it would perform and the fact that
         // the update is not a fast-forward.
@@ -5832,7 +5897,7 @@ mod tests {
             "{}",
             dry_run.output
         );
-        assert_eq!(remote_revision(&bare, &branch), previous);
+        assert_eq!(remote_revision(&bare, "loom/topic"), previous);
 
         let pushed = executor.execute(&call(
             "github_push_branch",
@@ -5842,13 +5907,13 @@ mod tests {
         assert!(
             pushed
                 .output
-                .contains(&format!("Force-pushed branch '{branch}' to ")),
+                .contains("Force-pushed branch 'loom/topic' to "),
             "{}",
             pushed.output
         );
         assert!(
             pushed.output.contains(&format!(
-                "with force-with-lease: the remote refs/heads/{branch} still held {previous}"
+                "with force-with-lease: the remote refs/heads/loom/topic still held {previous}"
             )),
             "{}",
             pushed.output
@@ -5879,7 +5944,7 @@ mod tests {
             "{}",
             pushed.output
         );
-        assert_eq!(remote_revision(&bare, &branch), rewritten);
+        assert_eq!(remote_revision(&bare, "loom/topic"), rewritten);
         // The push reads and writes the remote itself: it needs no GitHub REST
         // call, because the credentials come from the connection.
         assert!(mock.requests().is_empty());
@@ -5893,8 +5958,16 @@ mod tests {
         let root = std::env::temp_dir().join(format!("loom-push-{}", AgentSessionId::new()));
         let branch = init_git_repository(&root);
         let bare = origin_remote(&root, &branch);
-        let previous = remote_revision(&bare, &branch);
-        fs::write(root.join("README.md"), "rewritten\n").unwrap();
+        // The rewrite belongs to a topic branch, so the default-branch tip stays
+        // in its history and the base is current: only the lease is left to
+        // decide the push.
+        run_git(&root, &["checkout", "-q", "-b", "loom/topic"]);
+        fs::write(root.join("topic.txt"), "topic\n").unwrap();
+        run_git(&root, &["add", "--", "topic.txt"]);
+        run_git(&root, &["commit", "-qm", "topic"]);
+        run_git(&root, &["push", "-q", "origin", "loom/topic"]);
+        let previous = remote_revision(&bare, "loom/topic");
+        fs::write(root.join("topic.txt"), "rewritten\n").unwrap();
         run_git(&root, &["commit", "-q", "--amend", "-m", "rewritten"]);
         let rewritten = revision(&root, "HEAD");
 
@@ -5913,7 +5986,7 @@ mod tests {
             "{}",
             refused.output
         );
-        assert_eq!(remote_revision(&bare, &branch), previous);
+        assert_eq!(remote_revision(&bare, "loom/topic"), previous);
 
         // A lease cannot create a ref the remote does not advertise, and an empty
         // lease names no revision at all.
@@ -6129,6 +6202,106 @@ mod tests {
             "{}",
             pushed.output
         );
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(bare).unwrap();
+    }
+
+    /// A force-with-lease rewrite replaces the remote ref, so a base that is
+    /// behind the default branch would publish a branch without the commits the
+    /// remote gained after the checkout was created. The drift is measured before
+    /// the push, and a known drift refuses the rewrite while the remote is still
+    /// untouched, instead of reporting the staleness after the branch was
+    /// already rewritten.
+    #[test]
+    fn github_push_branch_refuses_a_lease_push_from_a_stale_base() {
+        let root = std::env::temp_dir().join(format!("loom-push-{}", AgentSessionId::new()));
+        let branch = init_git_repository(&root);
+        let bare = origin_remote(&root, &branch);
+        // The remote moves on after the checkout was cloned, and the local tip is
+        // then rewritten, so only a force-with-lease push could update the remote.
+        advance_origin(&bare, &branch);
+        let stale = remote_revision(&bare, &branch);
+        fs::write(root.join("README.md"), "rewritten\n").unwrap();
+        run_git(&root, &["commit", "-q", "--amend", "-m", "rewritten"]);
+        let rewritten = revision(&root, "HEAD");
+        assert_ne!(stale, rewritten);
+
+        let executor = github_executor(&root, &MockGitHub::start(Vec::new()));
+        let refused = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name", "lease": stale}),
+        ));
+
+        assert!(!refused.success, "{}", refused.output);
+        assert!(
+            refused
+                .output
+                .contains(&format!("rewrite of branch '{branch}'")),
+            "{}",
+            refused.output
+        );
+        assert!(
+            refused
+                .output
+                .contains(&format!("diverged from origin/{branch} at")),
+            "{}",
+            refused.output
+        );
+        assert!(
+            refused.output.contains("force push was refused"),
+            "{}",
+            refused.output
+        );
+        assert!(
+            refused.output.contains("github_fetch"),
+            "{}",
+            refused.output
+        );
+        assert!(refused.output.contains("rebase"), "{}", refused.output);
+        // The refusal was decided before the push was sent, so the remote still
+        // holds the revision the lease named.
+        assert_eq!(remote_revision(&bare, &branch), stale);
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(bare).unwrap();
+    }
+
+    /// A lease push from a base that is current with its default branch is
+    /// allowed: the drift is known and nothing is behind, so the lease is the
+    /// only check the rewrite needs. The note still describes the base the push
+    /// was made from, not the state the push left behind.
+    #[test]
+    fn github_push_branch_allows_a_lease_push_from_an_up_to_date_base() {
+        let root = std::env::temp_dir().join(format!("loom-push-{}", AgentSessionId::new()));
+        let branch = init_git_repository(&root);
+        let bare = origin_remote(&root, &branch);
+        let previous = remote_revision(&bare, &branch);
+        fs::write(root.join("README.md"), "second\n").unwrap();
+        run_git(&root, &["add", "--", "README.md"]);
+        run_git(&root, &["commit", "-qm", "second"]);
+        let landed = revision(&root, "HEAD");
+
+        let executor = github_executor(&root, &MockGitHub::start(Vec::new()));
+        let pushed = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name", "lease": previous}),
+        ));
+
+        assert!(pushed.success, "{}", pushed.output);
+        assert!(
+            pushed.output.contains("Base freshness:"),
+            "{}",
+            pushed.output
+        );
+        assert!(
+            pushed
+                .output
+                .contains(&format!("origin/{branch} is 1 commit behind the base at")),
+            "{}",
+            pushed.output
+        );
+        assert_eq!(remote_revision(&bare, &branch), landed);
 
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(bare).unwrap();
