@@ -9,7 +9,8 @@
 
 use std::{path::PathBuf, str::FromStr};
 
-use loom_core::{AgentSessionId, WorkspaceId};
+use loom_core::{AgentSessionId, RequestId, WorkspaceId};
+use loom_model::ModelId;
 
 /// The budget `--max-bytes` defaults to.
 pub(crate) const DEFAULT_MAX_BYTES: usize = 4096;
@@ -17,6 +18,14 @@ pub(crate) const DEFAULT_MAX_BYTES: usize = 4096;
 pub(crate) const MIN_MAX_BYTES: usize = 64;
 /// How many events `peek` asks for by default.
 pub(crate) const DEFAULT_LINES: u32 = 200;
+/// The model `run` starts when `--model` is absent.
+pub(crate) const DEFAULT_MODEL: &str = "deterministic/demo";
+/// How many of the task's leading words a derived session name keeps.
+const NAME_WORDS: usize = 6;
+/// The longest derived session name, in characters.
+const NAME_MAX_CHARS: usize = 48;
+/// The name `run` uses when the task has no words at all.
+const NAME_FALLBACK: &str = "loom-ctl run";
 
 pub(crate) const HELP: &str = r#"Usage: loom-ctl <verb> [flags]
 
@@ -33,6 +42,24 @@ Verbs:
                                     following for new ones
   peek --session <id> [--lines <n>] [--format text|jsonl] [--max-bytes <n>]
                                     print the newest events of a session
+  run --workspace <id> (--task <text> | --task-file <path>) [--name <name>]
+      [--model <id>] [--repo <source> [--revision <rev>] [--path <path>]]
+      [--as-directory <path> [--path <path>]]
+      [--approval-policy default|auto] [--request-id <uuid>]
+                                    reuse the workspace's session named
+                                    --name, or create it, attach the inputs
+                                    to a session this run created, and start
+                                    one agent run without waiting for it
+
+`run` never prints more than `session <id> <name>` and `run <id> <state>`: it
+returns as soon as the worker accepts the run. --repo and --as-directory are
+mutually exclusive, --revision applies to --repo only, and --path defaults to
+the source's final path component without a trailing `.git`. A session is only
+attached to when this invocation created it, so replaying a command with the
+same --request-id neither duplicates an attachment nor fails on one that
+exists. --request-id is the idempotency key of the run start alone: the same id
+is answered from the worker's durable cache with the same run, while the other
+mutations of the verb use fresh ids.
 
 Global flags, accepted anywhere as --flag value or --flag=value:
   --connect <url>             worker WebSocket URL (fallback LOOM_URL)
@@ -89,6 +116,44 @@ pub(crate) struct PeekArgs {
     pub max_bytes: usize,
 }
 
+/// The preset `--approval-policy` selects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ApprovalPreset {
+    /// The shipped policy: reads and destructive actions run, writes, commands,
+    /// and network access ask first.
+    Default,
+    /// Every action kind runs without a prompt.
+    Auto,
+}
+
+/// One input `run` attaches to a session it creates: a repository to clone or a
+/// local directory to mount, and the relative path it lands at.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Attach {
+    pub source: String,
+    pub path: String,
+    /// The revision to clone for a repository; always absent for a directory.
+    pub revision: Option<String>,
+}
+
+/// The flags of `run`.
+#[derive(Clone, Debug)]
+pub(crate) struct RunArgs {
+    pub workspace: WorkspaceId,
+    /// The task text, either `--task` or the contents of `--task-file`.
+    pub task: String,
+    /// The session to reuse or create, derived from the task when absent.
+    pub name: String,
+    pub model: ModelId,
+    /// `--repo`, attached only when this invocation creates the session.
+    pub repository: Option<Attach>,
+    /// `--as-directory`, attached only when this invocation creates the session.
+    pub directory: Option<Attach>,
+    pub approval: ApprovalPreset,
+    /// The run start's idempotency key, or `None` when the caller left it open.
+    pub request_id: Option<RequestId>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum Verb {
     Doctor,
@@ -103,6 +168,9 @@ pub(crate) enum Verb {
     },
     Events(EventsArgs),
     Peek(PeekArgs),
+    /// Boxed because the box keeps every variant small: a `Verb` is carried by
+    /// one `Invocation` for the life of a command line.
+    Run(Box<RunArgs>),
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +193,7 @@ pub(crate) fn verb_name(verb: &Verb) -> &'static str {
         Verb::Get { .. } => "get",
         Verb::Events(_) => "events",
         Verb::Peek(_) => "peek",
+        Verb::Run(_) => "run",
     }
 }
 
@@ -147,6 +216,7 @@ pub(crate) fn named_verb(arguments: &[String]) -> &'static str {
             "get" => "get",
             "events" => "events",
             "peek" => "peek",
+            "run" => "run",
             _ => "",
         })
         .unwrap_or("")
@@ -160,6 +230,8 @@ fn arity(name: &str) -> Option<bool> {
         "--workspace" | "--session" | "--after" | "--cursor-file" | "--format" | "--max-bytes"
         | "--lines" => true,
         "--archived" | "--metadata" | "--follow" => false,
+        "--task" | "--task-file" | "--name" | "--model" | "--repo" | "--revision" | "--path"
+        | "--as-directory" | "--approval-policy" | "--request-id" => true,
         _ => return None,
     })
 }
@@ -323,6 +395,10 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
                 max_bytes: parse_max_bytes(flags.value("--max-bytes"))?,
             })
         }
+        "run" => {
+            no_positionals(&flags.verb, rest)?;
+            Verb::Run(Box::new(parse_run(&mut flags)?))
+        }
         other => return Err(format!("unknown verb '{other}'; try --help")),
     };
     flags.finish()?;
@@ -388,6 +464,138 @@ fn parse_id<T: FromStr>(what: &str, value: &str) -> Result<T, String> {
     value
         .parse::<T>()
         .map_err(|_| format!("'{value}' is not a valid {what}"))
+}
+
+/// The flags of `run`, which is the one verb whose flags interact: the task and
+/// the name default feed each other, and the two attach flags share `--path`.
+fn parse_run(flags: &mut FlagSet) -> Result<RunArgs, String> {
+    let workspace = flags.required("--workspace")?;
+    let task = match (flags.value("--task"), flags.value("--task-file")) {
+        (Some(_), Some(_)) => {
+            return Err("run accepts --task or --task-file, not both".to_owned());
+        }
+        (Some(task), None) => task,
+        (None, Some(path)) => read_task_file(&path)?,
+        (None, None) => return Err("run requires --task <text> or --task-file <path>".to_owned()),
+    };
+    let name = match flags.value("--name") {
+        Some(name) => name,
+        None => derived_name(&task),
+    };
+    if name.trim().is_empty() {
+        return Err("--name must not be empty".to_owned());
+    }
+    let model = ModelId::new(
+        flags
+            .value("--model")
+            .unwrap_or_else(|| DEFAULT_MODEL.to_owned()),
+    );
+
+    let repository = flags.value("--repo");
+    let directory = flags.value("--as-directory");
+    let path = flags.value("--path");
+    let revision = flags.value("--revision");
+    if repository.is_some() && directory.is_some() {
+        return Err("run accepts --repo or --as-directory, not both".to_owned());
+    }
+    if revision.is_some() && repository.is_none() {
+        return Err("--revision only applies to --repo".to_owned());
+    }
+    if path.is_some() && repository.is_none() && directory.is_none() {
+        return Err("--path requires --repo or --as-directory".to_owned());
+    }
+    let attach = |source: String, revision: Option<String>| -> Result<Attach, String> {
+        let path = match &path {
+            Some(path) => path.clone(),
+            None => default_attach_path(&source).ok_or_else(|| {
+                format!(
+                    "'{source}' has no final path component; pass --path <path> to name the \
+                     session path it lands at"
+                )
+            })?,
+        };
+        Ok(Attach {
+            source,
+            path,
+            revision,
+        })
+    };
+    let repository = repository
+        .map(|source| attach(source, revision))
+        .transpose()?;
+    let directory = directory.map(|source| attach(source, None)).transpose()?;
+
+    let approval = match flags.value("--approval-policy").as_deref() {
+        None | Some("default") => ApprovalPreset::Default,
+        Some("auto") => ApprovalPreset::Auto,
+        Some(other) => {
+            return Err(format!(
+                "--approval-policy must be default or auto, got '{other}'"
+            ));
+        }
+    };
+    let request_id = match flags.value("--request-id") {
+        Some(value) => Some(value.parse::<RequestId>().map_err(|_| {
+            format!("'{value}' is not a valid request id; --request-id takes a UUID")
+        })?),
+        None => None,
+    };
+    Ok(RunArgs {
+        workspace: parse_id("workspace id", &workspace)?,
+        task,
+        name,
+        model,
+        repository,
+        directory,
+        approval,
+        request_id,
+    })
+}
+
+/// Reads a task file as UTF-8, dropping one trailing line ending.
+///
+/// Exactly one newline is removed, so a file that ends with `\n` and one that
+/// ends with `\r\n` produce the same task, and any further trailing whitespace
+/// the author wrote is kept as part of the task.
+fn read_task_file(path: &str) -> Result<String, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("could not read the task file '{path}': {error}"))?;
+    Ok(match text.strip_suffix('\n') {
+        Some(trimmed) => trimmed.strip_suffix('\r').unwrap_or(trimmed).to_owned(),
+        None => text,
+    })
+}
+
+/// The session name a task derives when `--name` is absent: the task's first six
+/// whitespace-separated words, at most 48 characters, without trailing
+/// whitespace, and `loom-ctl run` when the task has no words.
+pub(crate) fn derived_name(task: &str) -> String {
+    let mut name = String::new();
+    for word in task.split_whitespace().take(NAME_WORDS) {
+        if !name.is_empty() {
+            name.push(' ');
+        }
+        name.push_str(word);
+    }
+    let bounded = name.chars().take(NAME_MAX_CHARS).collect::<String>();
+    let bounded = bounded.trim_end();
+    if bounded.is_empty() {
+        NAME_FALLBACK.to_owned()
+    } else {
+        bounded.to_owned()
+    }
+}
+
+/// The session path an attach source lands at when `--path` is absent: the
+/// source's final path component, without a trailing `.git`.
+pub(crate) fn default_attach_path(source: &str) -> Option<String> {
+    let trimmed = source.trim_end_matches('/');
+    let last = trimmed.rsplit('/').next().unwrap_or_default();
+    let last = last.strip_suffix(".git").unwrap_or(last);
+    if last.is_empty() || last == "." || last == ".." {
+        return None;
+    }
+    Some(last.to_owned())
 }
 
 fn optional_id<T: FromStr>(value: Option<String>) -> Result<Option<T>, String> {

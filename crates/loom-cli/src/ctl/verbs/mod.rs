@@ -1,13 +1,13 @@
 //! The verb implementations.
 //!
-//! Every verb shares one shape: negotiate, send only the read-only requests its
-//! row in the module contract names, and either print text lines or return the
-//! payload a `--json` envelope carries. A verb therefore never writes output
-//! when `--json` is set, and never writes a line before the request it prints
-//! succeeded.
+//! Every verb shares one shape: negotiate, send only the requests its row in the
+//! module contract names, and either print text lines or return the payload a
+//! `--json` envelope carries. A verb therefore never writes output when `--json`
+//! is set, and never writes a line before the request it prints succeeded.
 
 mod events;
 mod query;
+mod run;
 
 use std::io::Write;
 
@@ -115,9 +115,16 @@ impl Failure {
     }
 }
 
-/// The capabilities this client uses, and therefore the only ones it negotiates.
-pub(crate) fn used_capabilities() -> CapabilitySet {
-    CapabilitySet::new([
+/// The capabilities a verb negotiates: the set every verb shares, plus the ones
+/// `run` adds for the mutations only it performs.
+///
+/// A verb negotiates exactly the capabilities its own requests need, so a
+/// read-only verb keeps asking for the shared set alone: its handshake stays
+/// byte-identical, and a worker that does not offer session creation can still
+/// be inspected. Only `run` mutates, so only `run` asks for what its mutations
+/// require.
+pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
+    let mut capabilities = vec![
         Capability::SubscribeSessionEvents,
         Capability::ReadAgentSession,
         Capability::ManageWorkspaces,
@@ -126,7 +133,12 @@ pub(crate) fn used_capabilities() -> CapabilitySet {
         Capability::ReadWorkerNodeStatus,
         Capability::JsonProtocol,
         Capability::StartAgentRun,
-    ])
+    ];
+    if matches!(verb, Verb::Run(_)) {
+        capabilities.push(Capability::CreateAgentSession);
+        capabilities.push(Capability::ConfigureApprovalPolicy);
+    }
+    CapabilitySet::new(capabilities)
 }
 
 /// One connection's requests, remembering the id of the first one.
@@ -147,7 +159,24 @@ impl<'a, C: Client> Caller<'a, C> {
         &mut self,
         request: ClientRequest,
     ) -> Result<(RequestId, ServerResponse), Failure> {
-        let envelope = RequestEnvelope::new(request);
+        self.call_envelope(RequestEnvelope::new(request)).await
+    }
+
+    /// Sends `request` under a caller-chosen id, which is what makes a run start
+    /// replayable: the worker answers a repeated id from its durable cache.
+    async fn call_with_id(
+        &mut self,
+        request_id: RequestId,
+        request: ClientRequest,
+    ) -> Result<(RequestId, ServerResponse), Failure> {
+        self.call_envelope(RequestEnvelope::with_request_id(request_id, request))
+            .await
+    }
+
+    async fn call_envelope(
+        &mut self,
+        envelope: RequestEnvelope,
+    ) -> Result<(RequestId, ServerResponse), Failure> {
         let request_id = envelope.request_id;
         if self.primary.is_none() {
             self.primary = Some(request_id);
@@ -168,11 +197,14 @@ impl<'a, C: Client> Caller<'a, C> {
 }
 
 /// The version handshake every verb performs before its own requests.
-async fn handshake<C: Client>(caller: &mut Caller<'_, C>) -> Result<NegotiationResult, Failure> {
+async fn handshake<C: Client>(
+    caller: &mut Caller<'_, C>,
+    verb: &Verb,
+) -> Result<NegotiationResult, Failure> {
     let (request_id, response) = caller
         .call(ClientRequest::Control(ControlRequest::Negotiate {
             client_version: CURRENT_PROTOCOL_VERSION,
-            capabilities: used_capabilities(),
+            capabilities: used_capabilities(verb),
         }))
         .await?;
     match response {
@@ -202,6 +234,7 @@ pub(crate) async fn run<C: Client>(
         }
         Verb::Events(args) => events::events(client, invocation, args, out).await,
         Verb::Peek(args) => events::peek(client, invocation, args, out).await,
+        Verb::Run(args) => run::run(client, invocation, args, out).await,
     }
 }
 

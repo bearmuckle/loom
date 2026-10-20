@@ -1,4 +1,4 @@
-//! `loom-ctl`: the read-only command-line client contract.
+//! `loom-ctl`: the command-line client contract.
 //!
 //! # Surface
 //!
@@ -14,16 +14,42 @@
 //! | `get` | `Session/GetAgentSession`, plus `Session/GetAgentSessionSnapshotMetadata` with `--metadata` |
 //! | `events` | `Events/GetSessionEvents` |
 //! | `peek` | `Events/GetRecentSessionEvents` |
+//! | `run` | `Control/Negotiate`, `Workspace/ListWorkspaceSessions`, `Workspace/CreateAgentSessionInWorkspace`, `Repository/AttachSessionRepository`, `Filesystem/AttachSessionDirectory`, `Session/SetSessionApprovalPolicy`, `Run/StartSessionAgentRunWithOptions` |
 //!
 //! Every verb first sends `Control/Negotiate` with the version this build
-//! speaks and with only the capabilities the client uses, because a worker
-//! refuses an unnegotiated connection. Nothing else is sent, so `ls`, `get`,
-//! `events`, and `peek` issue no mutation and leave the worker's journal and
-//! session snapshots untouched.
+//! speaks and with only the capabilities it uses, because a worker refuses an
+//! unnegotiated connection. `ls`, `get`, `events`, and `peek` send nothing else,
+//! so they issue no mutation and leave the worker's journal and session
+//! snapshots untouched; they also negotiate only the read-only capabilities they
+//! use, so their handshake is unchanged by the mutating verb beside them.
 //!
-//! `run`, and every other mutating verb, is out of scope here. The parser is
-//! structured so a verb with side effects can be added without touching the
-//! read-only ones.
+//! `run` is the one mutating verb, and it is the only verb whose requests change
+//! worker state:
+//!
+//! 1. `Workspace/ListWorkspaceSessions { include_archived: false }` resolves the
+//!    workspace's live sessions. The first session whose name equals the
+//!    resolved name (`--name`, or one derived from the task) is reused;
+//!    otherwise the session is created with
+//!    `Workspace/CreateAgentSessionInWorkspace`.
+//! 2. The inputs are attached **only when this invocation created the session**:
+//!    `--repo` sends `Repository/AttachSessionRepository` and `--as-directory`
+//!    sends `Filesystem/AttachSessionDirectory`. A replay of the same command
+//!    therefore neither duplicates an attachment nor fails on one that already
+//!    exists.
+//! 3. `Session/SetSessionApprovalPolicy` pins `--approval-policy` before the run
+//!    starts, because a run resolves its policy once, when it is created.
+//! 4. `Run/StartSessionAgentRunWithOptions` starts the run under the caller's
+//!    `--request-id` (or a freshly generated id), so repeating the same id is
+//!    answered from the worker's durable idempotency cache with the same run
+//!    instead of starting a second one. The idempotency key is the run start
+//!    alone; the session creation, the attachments, and the policy change use
+//!    fresh ids.
+//!
+//! The verb returns as soon as `AgentRunStarted` arrives: it never polls and
+//! never waits for the run, and `events --follow` is the verb that watches one.
+//! Its text output is exactly two lines, `session <session-id> <session-name>`
+//! and `run <run-id> <run-state>`, and it prints neither when the run did not
+//! start.
 //!
 //! # `loom-text/1`
 //!
@@ -59,7 +85,9 @@
 //! payload in `data`; failure is
 //! `{"ok":false,"verb":...,"request_id":...,"error":{"code":...,"message":...,"retryable":...,"exit_code":...}}`.
 //! `request_id` is the id of the verb's primary request (its first request, or
-//! its handshake), or `null` when no request was sent.
+//! its handshake), or `null` when no request was sent. `run` reports its run
+//! start instead, because that is the id its caller chose and the key a replay
+//! reuses.
 //!
 //! `events --format jsonl` and `peek --format jsonl` are a different shape:
 //! without `--json` they print one object per event,
