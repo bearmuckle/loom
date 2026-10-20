@@ -602,6 +602,20 @@ fn github_tools_get_readable_titles_and_no_json_detail() {
     assert_eq!(tool_usage_label("github_list_remote_refs"), "Read refs");
     assert_eq!(tool_icon("github_list_remote_refs"), AssetIconName::List);
 
+    call.arguments = json!({"repository": "owner/name"});
+    assert_eq!(
+        tool_title("github_fetch", &call.arguments),
+        "Refresh origin for owner/name"
+    );
+    assert_eq!(tool_title("github_fetch", &json!({})), "Refresh origin");
+    assert_eq!(tool_detail(&call), None);
+    assert_eq!(
+        tool_group_label("github_fetch", 2),
+        "Refreshed origin 2 times"
+    );
+    assert_eq!(tool_usage_label("github_fetch"), "Fetch");
+    assert_eq!(tool_icon("github_fetch"), AssetIconName::RefreshCw);
+
     call.arguments = json!({"repository": "owner/name", "state": "open"});
     assert_eq!(
         tool_title("github_list_issues", &call.arguments),

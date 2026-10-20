@@ -168,6 +168,16 @@ returned as bounded structured citations, and may be restricted to explicit
 hostnames by the tool request. Page retrieval and arbitrary URL fetching are
 not implied by this tool.
 
+The `github_fetch` tool is a network action too, and it is the one that keeps a
+checkout's view of its remote honest. Loom deliberately does not write the
+connected account's token into the checkout's Git configuration, so an agent's
+own `git fetch` or `git push` has no credentials and fails on a private
+repository. `github_fetch` therefore sends the connected account's token to the
+checkout's `origin` remote and writes only the local `refs/remotes/origin/*`
+remote-tracking refs: nothing is published to the remote, and a private
+repository needs a connected account with access to it. `github_push_branch` is
+the tool that publishes commits, under its own write grant.
+
 The backend owns and canonicalizes each session filesystem root, rejecting
 traversal and outside-root symlinks. Workspace authorization governs access to
 workspace metadata and session membership; session authorization governs

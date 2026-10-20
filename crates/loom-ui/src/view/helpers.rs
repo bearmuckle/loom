@@ -1744,6 +1744,7 @@ pub(crate) fn tool_icon(name: &str) -> AssetIconName {
         "github_create_pull_request" => AssetIconName::GitMerge,
         "github_push_branch" => AssetIconName::ArrowUp,
         "github_list_remote_refs" => AssetIconName::List,
+        "github_fetch" => AssetIconName::RefreshCw,
         "github_list_issues" => AssetIconName::List,
         "github_get_issue" => AssetIconName::FileText,
         "github_get_comments" => AssetIconName::MessageSquare,
@@ -1784,6 +1785,7 @@ pub(crate) fn tool_group_label(name: &str, count: usize) -> String {
         "github_create_pull_request" => format!("Opened {count} pull requests"),
         "github_push_branch" => format!("Pushed {count} branches"),
         "github_list_remote_refs" => format!("Listed remote refs {count} times"),
+        "github_fetch" => format!("Refreshed origin {count} times"),
         "github_list_issues" => format!("Listed issues {count} times"),
         "github_get_issue" => format!("Read {count} issues"),
         "github_get_comments" => format!("Read comments {count} times"),
@@ -1831,6 +1833,7 @@ pub(crate) fn tool_usage_label(name: &str) -> &str {
         "github_create_pull_request" => "Open PR",
         "github_push_branch" => "Push",
         "github_list_remote_refs" => "Read refs",
+        "github_fetch" => "Fetch",
         "github_list_issues" => "List issues",
         "github_get_issue" => "Read issue",
         "github_get_comments" => "Read comments",
@@ -2178,6 +2181,7 @@ pub(crate) fn tool_detail(call: &loom_model::ToolCall) -> Option<String> {
         | "github_create_pull_request"
         | "github_push_branch"
         | "github_list_remote_refs"
+        | "github_fetch"
         | "github_list_issues"
         | "github_get_issue"
         | "github_get_comments"
@@ -2633,6 +2637,10 @@ pub(crate) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
                 (None, None) => "Read remote refs".to_owned(),
             }
         }
+        "github_fetch" => string_argument(arguments, "repository").map_or_else(
+            || "Refresh origin".to_owned(),
+            |repository| format!("Refresh origin for {repository}"),
+        ),
         "github_list_issues" => string_argument(arguments, "repository").map_or_else(
             || "List issues".to_owned(),
             |repository| format!("List issues in {repository}"),
