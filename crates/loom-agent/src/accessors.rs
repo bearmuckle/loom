@@ -52,6 +52,38 @@ impl AgentRuntime {
         self.usage.clone()
     }
 
+    /// The session goal this run works against, or `None` when the session has
+    /// none. The server refreshes it from the durable session record before each
+    /// model turn, so a goal change reaches an active run.
+    pub fn goal(&self) -> Option<&str> {
+        self.goal.as_deref()
+    }
+
+    /// What the model stated when it claimed the goal is reached, or `None`
+    /// while the goal is still open.
+    pub fn goal_claim(&self) -> Option<&str> {
+        self.goal_claim.as_deref()
+    }
+
+    /// Replaces the goal this run works against and reopens it: a claim already
+    /// made belonged to the previous goal. Returns whether the goal changed, so
+    /// the server can journal only real changes.
+    pub fn set_goal(&mut self, goal: Option<String>) -> bool {
+        let goal = goal.and_then(|goal| loom_core::normalize_session_goal(&goal).ok());
+        if goal == self.goal {
+            return false;
+        }
+        log::info!(
+            "run {} now works against {}session goal",
+            self.run.id,
+            if goal.is_some() { "the " } else { "no " }
+        );
+        self.goal = goal;
+        self.goal_claim = None;
+        self.goal_continuations = 0;
+        true
+    }
+
     pub fn limits(&self) -> &SessionLimits {
         &self.options.limits
     }

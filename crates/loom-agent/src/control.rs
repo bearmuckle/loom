@@ -683,6 +683,8 @@ impl AgentRuntime {
         self.denied_tool_calls.clear();
         self.next_message_id = 0;
         self.active_message_id = None;
+        self.goal_continuations = 0;
+        self.goal_claim = None;
         self.usage = UsageSnapshot::default();
         self.context_inspection = None;
         self.context_checkpoint = None;

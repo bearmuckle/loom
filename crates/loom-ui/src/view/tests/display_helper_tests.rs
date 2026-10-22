@@ -318,6 +318,10 @@ fn core_tools_get_readable_details_instead_of_json() {
     call.arguments = json!({"prompt": "Which one?"});
     assert_eq!(tool_detail(&call).as_deref(), Some("Which one?"));
 
+    call.name = "claim_goal_reached".to_owned();
+    call.arguments = json!({"summary": "  The suite passes.  "});
+    assert_eq!(tool_detail(&call).as_deref(), Some("The suite passes."));
+
     call.name = "apply_patch".to_owned();
     call.arguments = json!({
         "path": "src/lib.rs",
@@ -442,7 +446,22 @@ fn tool_group_labels_describe_repeated_calls() {
         "Reviewed 2 sub-agents"
     );
     assert_eq!(tool_group_label("ask_user", 2), "Asked the user 2 times");
+    assert_eq!(
+        tool_group_label("claim_goal_reached", 1),
+        "Claimed the goal 1 times"
+    );
     assert_eq!(tool_group_label("mystery_tool", 2), "mystery_tool × 2");
+}
+
+#[test]
+fn the_goal_claim_tool_reads_as_a_goal() {
+    let arguments = json!({"summary": "The suite passes."});
+    assert_eq!(
+        tool_title("claim_goal_reached", &arguments),
+        "Claim goal reached"
+    );
+    assert_eq!(tool_usage_label("claim_goal_reached"), "Goal");
+    assert_eq!(tool_icon("claim_goal_reached"), AssetIconName::Check);
 }
 
 #[test]

@@ -68,7 +68,7 @@ pub fn tool_result_kind(name: &str) -> ToolResultKind {
     match name {
         "read_file" | "search_text" | "glob" | "list_files" => ToolResultKind::WorkspaceDerived,
         "run_command" => ToolResultKind::Command,
-        "propose_plan" | "ask_user" => ToolResultKind::Control,
+        "propose_plan" | "ask_user" | "claim_goal_reached" => ToolResultKind::Control,
         "delegate_project_task"
         | "delegate_project_code_task"
         | "wait_for_project_children"
@@ -113,7 +113,7 @@ mod tests {
             );
             assert!(tool_result_kind(name).keeps_body());
         }
-        for name in ["propose_plan", "ask_user"] {
+        for name in ["propose_plan", "ask_user", "claim_goal_reached"] {
             assert_eq!(tool_result_kind(name), ToolResultKind::Control, "{name}");
         }
         assert_eq!(

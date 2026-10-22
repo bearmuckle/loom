@@ -53,6 +53,18 @@ const MAX_OUTPUT_TRUNCATION_RETRIES: u32 = 3;
 /// costs a model turn to resend, so keep it small.
 const MAX_INVALID_TOOL_CALL_RETRIES: u32 = 3;
 
+/// How many consecutive turns that end without a goal claim are answered with a
+/// "keep working" continuation before the run completes anyway. Each
+/// continuation costs a model turn, so keep it small; real tool work between
+/// turns resets the count.
+const MAX_GOAL_CONTINUATIONS: u32 = 3;
+/// Longest goal claim summary accepted from the model, in bytes. It is a short
+/// statement of evidence, not a second transcript.
+const MAX_GOAL_CLAIM_BYTES: usize = 4096;
+/// Name of the hidden user turn that tells a goal-driven run to keep working.
+/// A transcript renders it as scaffolding rather than as a user message.
+const GOAL_CONTINUATION_MESSAGE: &str = "loom_goal_continuation";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StepOutcome {
     Continue,
@@ -68,6 +80,9 @@ struct StepContext {
     saw_tool_call: bool,
     completed: bool,
     completion_guarded: bool,
+    /// Set when an unclaimed goal was answered with a continuation, so the run
+    /// makes another model request instead of ending after the completed step.
+    continue_after_goal: bool,
     /// Set when a length-truncated turn was resumed, so the run makes another
     /// model request instead of ending after the completed step.
     continue_after_truncation: bool,
@@ -86,6 +101,7 @@ impl StepContext {
             saw_tool_call: false,
             completed: false,
             completion_guarded: false,
+            continue_after_goal: false,
             continue_after_truncation: false,
             finished: false,
             activity_id,
@@ -135,6 +151,17 @@ pub struct AgentRuntime {
     /// were answered with a tool error. Reset by a decodable tool call so the
     /// bound only applies to a run of undecodable calls.
     invalid_tool_call_retries: u32,
+    /// The session's stated goal, refreshed from the durable session record for
+    /// every model turn. A goal-driven run keeps working until it claims the
+    /// goal is reached.
+    goal: Option<String>,
+    /// What the model stated when it claimed the goal is reached, or `None`
+    /// while the goal is still open. Runtime-only: a restored run is told its
+    /// goal again and re-claims it before finishing.
+    goal_claim: Option<String>,
+    /// Consecutive turns that ended without a goal claim. A turn that performs
+    /// tool work resets it, so the bound only applies to a run of empty stops.
+    goal_continuations: u32,
     control: RunControl,
     observer: Option<AgentEventObserver>,
     flush_offset: usize,

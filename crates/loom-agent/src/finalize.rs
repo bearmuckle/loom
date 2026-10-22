@@ -108,6 +108,27 @@ impl AgentRuntime {
         events
     }
 
+    /// Completes a goal-driven run that kept ending its turns without claiming
+    /// the goal, after the continuation budget ran out. The summary says the
+    /// goal was never claimed so the result is not read as a reached goal.
+    pub(crate) fn finish_completed_after_unclaimed_goal(&mut self) -> Vec<AgentEvent> {
+        log::warn!(
+            "run {} completed without claiming its session goal after {} continuations",
+            self.run.id,
+            self.goal_continuations,
+        );
+        let mut events = self.set_state(AgentRunState::Completed);
+        self.run.completed_at = Some(Timestamp::now());
+        self.run.summary = Some(format!(
+            "Completed task: {} (the goal was not claimed reached)",
+            self.task.task
+        ));
+        events.push(AgentEvent::RunCompleted {
+            snapshot: self.run.clone(),
+        });
+        events
+    }
+
     pub(crate) fn finish_cancelled(&mut self) -> Vec<AgentEvent> {
         let mut events = self.set_state(AgentRunState::Cancelled);
         self.run.completed_at = Some(Timestamp::now());

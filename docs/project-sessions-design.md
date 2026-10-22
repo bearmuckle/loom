@@ -115,13 +115,21 @@ expectations.
 
 The goal is stored on the root session and is a first-class durable attribute,
 not only the free text of a run. A person sets or reads it with `/goal`, and the
-backend journals the change as `AgentSessionGoalChanged`. The manager's
-instructions name the current goal on every run, so it survives transcript
-compaction and a restart that resumes the run. A run that is already executing
-keeps the instructions it started with, so a goal change reaches the next run.
-A session that has no goal adopts its first run's task, so sessions created
-before goals existed gain one. A delegated child session keeps its own task
-intent; the project goal is not copied into delegated task records.
+backend journals the change as `AgentSessionGoalChanged`. A session gains a goal
+only that way; a run's task is not promoted into a goal. The goal is stated on
+every model request, so it survives transcript compaction and a restart that
+resumes the run, and the session record is re-read before each model turn so a
+goal changed during a run reaches that run's next turn.
+
+A run with a goal is goal-driven: it works against the goal and does not finish
+on a plain reply. It finishes when the agent calls `claim_goal_reached` with the
+evidence that the goal is reached, or when it blocks on the user with `ask_user`.
+A turn that ends without a claim is answered with a bounded continuation that
+tells the agent to keep working or claim the goal; after the continuation budget
+is spent the run completes with a summary that says the goal was not claimed, so
+a model that stops unproductively cannot spend the session budget in a loop.
+A delegated child session keeps its own task intent; the project goal is not
+copied into delegated task records.
 
 The manager may run independent tasks concurrently up to a configured
 workspace/backend limit. Start with a default cap of four active child agents

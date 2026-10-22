@@ -2230,40 +2230,44 @@ fn context_runtime(root: &std::path::Path) -> AgentRuntime {
 #[test]
 fn request_system_instructions_include_builtin_tool_guidance() {
     let all = loom_tools::tool_definitions();
-    let guidance_only = super::steps::system_instructions_with_builtin_guidance(None, &all);
+    let guidance_only = super::steps::system_instructions_with_builtin_guidance(None, None, &all);
     assert!(guidance_only.starts_with("General agent instructions:"));
     assert!(guidance_only.contains("Be concise and factual."));
     assert!(guidance_only.contains("search_text"));
     assert!(guidance_only.contains("propose_plan"));
     assert!(guidance_only.contains("ask_user"));
 
-    let combined =
-        super::steps::system_instructions_with_builtin_guidance(Some("Be concise."), &all);
+    let combined = super::steps::system_instructions_with_builtin_guidance(
+        Some("Be concise."),
+        Some("Ship the durable goal"),
+        &all,
+    );
     assert!(combined.starts_with("Be concise."));
+    let goal = combined.find("Goal-driven work:").expect("goal block");
     let general = combined
         .find("General agent instructions:")
         .expect("general block");
     let tools = combined.find("search_text").expect("tool guidance");
     assert!(
-        general < tools,
-        "general instructions precede tool guidance"
+        goal < general && general < tools,
+        "the goal follows the client text and precedes the general block and tool guidance"
     );
 
     // The general block is composed even without client instructions or
     // advertised tools, and the client text always comes first.
     assert_eq!(
-        super::steps::system_instructions_with_builtin_guidance(Some("Be concise."), &[]),
+        super::steps::system_instructions_with_builtin_guidance(Some("Be concise."), None, &[]),
         format!(
             "Be concise.\n\n{}",
             super::steps::GENERAL_AGENT_INSTRUCTIONS
         )
     );
     assert_eq!(
-        super::steps::system_instructions_with_builtin_guidance(None, &[]),
+        super::steps::system_instructions_with_builtin_guidance(None, None, &[]),
         super::steps::GENERAL_AGENT_INSTRUCTIONS
     );
     assert_eq!(
-        super::steps::system_instructions_with_builtin_guidance(Some("   "), &[]),
+        super::steps::system_instructions_with_builtin_guidance(Some("   "), None, &[]),
         super::steps::GENERAL_AGENT_INSTRUCTIONS
     );
 }
@@ -2297,6 +2301,197 @@ fn model_request_puts_client_instructions_before_the_general_block() {
     assert!(system.content.starts_with("Client instructions.\n\n"));
     assert!(system.content.contains("General agent instructions:"));
     assert!(system.content.contains("search_text"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// A runtime with a scripted provider and an optional goal, so a test drives
+/// the claim and continuation turns exactly.
+fn goal_runtime(
+    root: &std::path::Path,
+    goal: Option<&str>,
+    steps: Vec<Vec<ModelStreamEvent>>,
+) -> AgentRuntime {
+    let mut runtime = context_runtime(root);
+    runtime.provider = Some(Box::new(loom_providers::DeterministicProvider {
+        descriptor: loom_providers::deterministic_descriptor(),
+        steps,
+        cursor: 0,
+    }));
+    runtime.set_goal(goal.map(str::to_owned));
+    runtime
+}
+
+fn goal_claim_step(summary: &str) -> Vec<ModelStreamEvent> {
+    vec![
+        ModelStreamEvent::TextDelta {
+            text: "I can show the goal is reached.".to_owned(),
+        },
+        ModelStreamEvent::ToolCallDelta {
+            call: ToolCall {
+                id: loom_core::ToolCallId::new(),
+                name: "claim_goal_reached".to_owned(),
+                arguments: serde_json::json!({ "summary": summary }),
+            },
+        },
+        ModelStreamEvent::Completed {
+            reason: loom_model::FinishReason::ToolCall,
+        },
+    ]
+}
+
+fn reply_step(text: &str) -> Vec<ModelStreamEvent> {
+    vec![
+        ModelStreamEvent::TextDelta {
+            text: text.to_owned(),
+        },
+        ModelStreamEvent::Completed {
+            reason: loom_model::FinishReason::Stop,
+        },
+    ]
+}
+
+/// The goal steers the run: a plain reply is not accepted as the end, and the
+/// run finishes only after `claim_goal_reached` records the evidence.
+#[test]
+fn a_goal_run_continues_until_the_agent_claims_it() {
+    let root = workspace();
+    let mut runtime = goal_runtime(
+        &root,
+        Some("Ship the durable goal"),
+        vec![
+            reply_step("I inspected the workspace."),
+            goal_claim_step("The validation suite passes."),
+            reply_step("The goal is reached."),
+        ],
+    );
+
+    let events = runtime.start().unwrap();
+
+    assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+    assert_eq!(runtime.goal_claim(), Some("The validation suite passes."));
+    assert_eq!(runtime.provider_cursor, 3, "one continuation turn was made");
+    assert!(runtime.messages().iter().any(|message| {
+        message.role == MessageRole::User
+            && message.name.as_deref() == Some("loom_goal_continuation")
+            && message.content.contains("Ship the durable goal")
+    }));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolCallCompleted { result, .. }
+            if result.name == "claim_goal_reached" && result.success
+    )));
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// A claim without evidence is refused, so the run stays open instead of
+/// finishing on a claim it cannot support.
+#[test]
+fn a_goal_claim_without_evidence_is_answered_with_a_tool_error() {
+    let root = workspace();
+    let mut runtime = goal_runtime(
+        &root,
+        Some("Ship the durable goal"),
+        vec![goal_claim_step("   "), reply_step("Still working.")],
+    );
+
+    let events = runtime.start().unwrap();
+
+    assert_eq!(runtime.goal_claim(), None);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolCallCompleted { result, .. }
+            if result.name == "claim_goal_reached"
+                && !result.success
+                && result.output.contains("requires a non-empty summary")
+    )));
+    assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+    assert!(
+        runtime
+            .snapshot()
+            .summary
+            .unwrap_or_default()
+            .contains("the goal was not claimed reached"),
+        "an unclaimed goal is reported instead of being read as reached"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// A run whose model keeps ending its turns without a claim is nudged a bounded
+/// number of times and then completes, so it cannot spin forever.
+#[test]
+fn an_unclaimed_goal_stops_after_the_continuation_budget() {
+    let root = workspace();
+    let mut runtime = goal_runtime(
+        &root,
+        Some("Ship the durable goal"),
+        vec![reply_step("Done, I think.")],
+    );
+
+    runtime.start().unwrap();
+
+    assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+    assert_eq!(runtime.goal_continuations, MAX_GOAL_CONTINUATIONS);
+    assert_eq!(
+        runtime
+            .messages()
+            .iter()
+            .filter(|message| message.name.as_deref() == Some("loom_goal_continuation"))
+            .count(),
+        usize::try_from(MAX_GOAL_CONTINUATIONS).unwrap_or(usize::MAX)
+    );
+    assert!(
+        runtime
+            .snapshot()
+            .summary
+            .unwrap_or_default()
+            .contains("the goal was not claimed reached")
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// The claim tool belongs to the goal: it is advertised only for a goal-driven
+/// run, and calling it without a goal is answered as a tool error.
+#[test]
+fn the_claim_tool_is_only_offered_for_a_goal() {
+    let root = workspace();
+    let runtime = goal_runtime(&root, None, vec![goal_claim_step("No goal here.")]);
+    let (request, _) = runtime.model_request().unwrap();
+    assert!(
+        !request
+            .tools
+            .iter()
+            .any(|tool| tool.name == "claim_goal_reached")
+    );
+    assert!(!request.messages.iter().any(|message| {
+        message.role == MessageRole::System && message.content.contains("Goal-driven work:")
+    }));
+    let mut runtime = runtime;
+    let events = runtime.start().unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolCallCompleted { result, .. }
+            if result.name == "claim_goal_reached"
+                && !result.success
+                && result.output.contains("the session has no goal")
+    )));
+    assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Changing the goal reopens it: a claim made for the previous goal no longer
+/// counts, and setting the same goal again is a no-op.
+#[test]
+fn changing_the_goal_reopens_the_claim() {
+    let root = workspace();
+    let mut runtime = goal_runtime(&root, Some("Ship the durable goal"), Vec::new());
+    runtime.set_goal(Some("Ship the durable goal".to_owned()));
+    assert!(runtime.set_goal(Some("Fix the failing tests".to_owned())));
+    assert_eq!(runtime.goal(), Some("Fix the failing tests"));
+    assert!(!runtime.set_goal(Some("Fix the failing tests".to_owned())));
+    runtime.goal_claim = Some("old evidence".to_owned());
+    assert!(runtime.set_goal(None));
+    assert_eq!(runtime.goal(), None);
+    assert_eq!(runtime.goal_claim(), None);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -2595,11 +2790,11 @@ fn repeated_undecodable_calls_fail_and_stay_retryable() {
 }
 
 #[test]
-fn a_compacted_request_keeps_the_session_goal_in_system_instructions() {
+fn a_compacted_request_keeps_the_session_goal() {
     let root = workspace();
     let mut runtime = context_runtime(&root);
-    runtime.task.system_instructions =
-        Some("The project goal is: ship the durable goal".to_owned());
+    runtime.task.system_instructions = Some("Be concise.".to_owned());
+    runtime.set_goal(Some("ship the durable goal".to_owned()));
     runtime.options.context.max_input_tokens = Some(4_000);
     for i in 0..30 {
         runtime.messages.push(ModelMessage::new(
@@ -2617,12 +2812,31 @@ fn a_compacted_request_keeps_the_session_goal_in_system_instructions() {
     assert!(
         request.messages.iter().any(|message| {
             message.role == MessageRole::System
-                && message
-                    .content
-                    .contains("The project goal is: ship the durable goal")
+                && message.content.contains("Goal-driven work:")
+                && message.content.contains("ship the durable goal")
         }),
-        "compaction must not drop a goal carried by the system instructions"
+        "compaction must not drop the goal stated outside the transcript"
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_goal_is_stated_on_every_request_with_the_claim_tool() {
+    let root = workspace();
+    let runtime = goal_runtime(&root, Some("Ship the durable goal"), Vec::new());
+    let (request, _) = runtime.model_request().unwrap();
+    assert!(
+        request
+            .tools
+            .iter()
+            .any(|tool| tool.name == "claim_goal_reached")
+    );
+    assert!(request.messages.iter().any(|message| {
+        message.role == MessageRole::System
+            && message.content.contains("Goal-driven work:")
+            && message.content.contains("Ship the durable goal")
+            && message.content.contains("claim_goal_reached")
+    }));
     fs::remove_dir_all(root).unwrap();
 }
 

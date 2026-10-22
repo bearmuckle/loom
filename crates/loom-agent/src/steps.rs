@@ -14,24 +14,39 @@ pub(crate) const GENERAL_AGENT_INSTRUCTIONS: &str = r#"General agent instruction
 - When proposing code, include only the minimal code needed and explain assumptions briefly."#;
 
 /// User-supplied system instructions followed by the server-owned built-in
-/// blocks: the general agent instructions and the tool guidance derived from the
-/// tools actually advertised this step. The built-in blocks are composed in a
-/// stable order and separated by a blank line, so they stay consistent with the
-/// request without being persisted or duplicated into the stored transcript
-/// prefix. The result is never empty.
+/// blocks: the session goal, the general agent instructions, and the tool
+/// guidance derived from the tools actually advertised this step. The built-in
+/// blocks are composed in a stable order and separated by a blank line, so they
+/// stay consistent with the request without being persisted or duplicated into
+/// the stored transcript prefix. The result is never empty.
 pub(crate) fn system_instructions_with_builtin_guidance(
     system_instructions: Option<&str>,
+    goal: Option<&str>,
     tools: &[loom_model::ToolDefinition],
 ) -> String {
-    let mut blocks = Vec::with_capacity(3);
+    let mut blocks = Vec::with_capacity(4);
     if let Some(system_instructions) = system_instructions.filter(|text| !text.trim().is_empty()) {
         blocks.push(system_instructions.to_owned());
+    }
+    if let Some(goal) = goal_instructions(goal) {
+        blocks.push(goal);
     }
     blocks.push(GENERAL_AGENT_INSTRUCTIONS.to_owned());
     if let Some(guidance) = loom_tools::tool_guidance(tools) {
         blocks.push(guidance);
     }
     blocks.join("\n\n")
+}
+
+/// The standing objective a goal-driven run works against, stated on every
+/// request so it survives transcript compaction and a resumed run. The wording
+/// is what makes the goal behaviour instead of a label: keep working, finish
+/// only with a claim, and ask the user instead of stopping silently.
+pub(crate) fn goal_instructions(goal: Option<&str>) -> Option<String> {
+    let goal = goal.map(str::trim).filter(|goal| !goal.is_empty())?;
+    Some(format!(
+        "Goal-driven work:\n- The user set this goal for the session: {goal}\n- Work against the goal. Inspect, change, and verify until it is reached, and do not stop early to report progress or ask what to do next while work you can do remains.\n- The run finishes only after you call `claim_goal_reached` with the evidence that shows the goal is reached; then give the user the result.\n- If you cannot continue without a decision or information only the user can provide, call `ask_user` instead of claiming the goal."
+    ))
 }
 
 impl AgentRuntime {
@@ -199,6 +214,7 @@ impl AgentRuntime {
             saw_tool_call,
             completed,
             completion_guarded,
+            continue_after_goal,
             continue_after_truncation,
             finished,
             buffered_tools,
@@ -248,7 +264,7 @@ impl AgentRuntime {
             return Ok(StepOutcome::Blocked);
         }
         if completed && !saw_tool_call {
-            if completion_guarded || continue_after_truncation {
+            if completion_guarded || continue_after_goal || continue_after_truncation {
                 return Ok(StepOutcome::Continue);
             }
             return Ok(StepOutcome::Blocked);
@@ -432,6 +448,10 @@ impl AgentRuntime {
                     usage: self.usage.clone(),
                 });
                 ctx.saw_tool_call = true;
+                // Tool work is progress toward the goal, so a later empty stop is
+                // answered with a fresh continuation budget instead of one left
+                // over from before this turn.
+                self.goal_continuations = 0;
                 ctx.events
                     .push(self.start_tool_activity(&call, Some(ctx.activity_id)));
                 ctx.events.push(AgentEvent::ToolCallRequested {
@@ -572,6 +592,9 @@ impl AgentRuntime {
                     });
                     ctx.finished = true;
                     return Ok(StreamFlow::Stop);
+                }
+                if kind == Some(ToolKind::ClaimGoalReached) {
+                    return self.handle_goal_claim(&call, ctx);
                 }
                 if kind == Some(ToolKind::ProposePlan) {
                     let steps = call
@@ -940,6 +963,12 @@ impl AgentRuntime {
                                 reasoning_content: None,
                             });
                             ctx.completion_guarded = true;
+                        } else if self.continue_toward_goal(ctx) {
+                            // The continuation is a user turn, and the step
+                            // continues into another model request.
+                        } else if self.goal.is_some() && self.goal_claim.is_none() {
+                            ctx.events
+                                .extend(self.finish_completed_after_unclaimed_goal());
                         } else {
                             ctx.events.extend(self.finish_completed());
                         }
@@ -1005,6 +1034,118 @@ impl AgentRuntime {
             return Ok(StreamFlow::Stop);
         }
         Ok(StreamFlow::Continue)
+    }
+
+    /// Answers a `claim_goal_reached` call. A valid claim records the evidence
+    /// that lets the goal-driven run finish; an invalid one is answered as a
+    /// tool error so the model keeps working instead of ending the run on a
+    /// claim it could not support.
+    fn handle_goal_claim(&mut self, call: &ToolCall, ctx: &mut StepContext) -> Result<StreamFlow> {
+        if self.goal.is_none() {
+            self.fail_tool_call(
+                call,
+                "claim_goal_reached is not available because the session has no goal; finish with a normal reply"
+                    .to_owned(),
+                &mut ctx.events,
+            );
+            self.complete_step(ctx);
+            return Ok(StreamFlow::Stop);
+        }
+        let summary = call
+            .arguments
+            .get("summary")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|summary| !summary.is_empty() && summary.len() <= MAX_GOAL_CLAIM_BYTES)
+            .map(str::to_owned);
+        let Some(summary) = summary else {
+            self.fail_tool_call(
+                call,
+                format!(
+                    "claim_goal_reached requires a non-empty summary of at most \
+                     {MAX_GOAL_CLAIM_BYTES} bytes stating the evidence that the goal is \
+                     reached; keep working and claim again when you can show it"
+                ),
+                &mut ctx.events,
+            );
+            self.complete_step(ctx);
+            return Ok(StreamFlow::Stop);
+        };
+        self.goal_claim = Some(summary.clone());
+        self.goal_continuations = 0;
+        let result = ToolResult::success(call, format!("Goal claimed reached: {summary}"));
+        ctx.events.push(AgentEvent::ToolCallCompleted {
+            run_id: self.run.id,
+            result: result.clone(),
+        });
+        ctx.events
+            .push(self.complete_tool_activity(&result, AgentActivityStatus::Completed));
+        self.push_message(ModelMessage {
+            role: MessageRole::Tool,
+            content: result.output.clone(),
+            name: Some(result.name.clone()),
+            tool_call_id: Some(result.tool_call_id),
+            tool_calls: Vec::new(),
+            reasoning_content: None,
+        });
+        self.complete_step(ctx);
+        log::info!(
+            "run {} claimed its session goal is reached: {summary}",
+            self.run.id
+        );
+        Ok(StreamFlow::Stop)
+    }
+
+    /// Keeps a goal-driven run working when the model ended its turn without
+    /// claiming the goal. Returns whether a continuation was queued.
+    ///
+    /// The continuation is bounded so a model that keeps stopping without a
+    /// claim cannot spend the session budget on empty turns; tool work between
+    /// turns resets the budget because it is progress.
+    fn continue_toward_goal(&mut self, ctx: &mut StepContext) -> bool {
+        let Some(goal) = self.goal.clone() else {
+            return false;
+        };
+        if self.goal_claim.is_some() {
+            return false;
+        }
+        if self.goal_continuations >= MAX_GOAL_CONTINUATIONS {
+            return false;
+        }
+        self.goal_continuations = self.goal_continuations.saturating_add(1);
+        self.active_message_id = None;
+        self.push_message(ModelMessage {
+            role: MessageRole::User,
+            content: format!(
+                "You ended your turn without claiming that the session goal is reached. \
+                 Goal: {goal}\nContinue working toward it now with tools. If it is reached, \
+                 call `claim_goal_reached` with the evidence and then give the user the \
+                 result. If you need the user, call `ask_user`."
+            ),
+            name: Some(GOAL_CONTINUATION_MESSAGE.to_owned()),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+            reasoning_content: None,
+        });
+        ctx.continue_after_goal = true;
+        log::info!(
+            "run {} ended its turn without claiming its session goal; continuing ({} of {})",
+            self.run.id,
+            self.goal_continuations,
+            MAX_GOAL_CONTINUATIONS,
+        );
+        true
+    }
+
+    /// Closes the current step after the runtime answered a control tool itself.
+    fn complete_step(&mut self, ctx: &mut StepContext) {
+        self.step_id = None;
+        self.step_index = self.step_index.saturating_add(1);
+        ctx.events.push(AgentEvent::StepCompleted {
+            run_id: self.run.id,
+            step_id: ctx.step_id,
+            index: ctx.step_index,
+        });
     }
 
     pub(crate) fn validate_control_revision(
@@ -1099,13 +1240,19 @@ impl AgentRuntime {
             options.max_input_tokens,
             reserve,
         )?;
-        let tools = if provider.descriptor().capabilities.tool_calling {
+        let mut tools = if provider.descriptor().capabilities.tool_calling {
             self.tools.definitions()
         } else {
             Vec::new()
         };
+        // The claim tool is only meaningful for a session that has a goal, so a
+        // goal-less run is not asked to use it.
+        if self.goal.is_none() {
+            tools.retain(|tool| tool.name != ToolKind::ClaimGoalReached.name());
+        }
         let system_instructions = system_instructions_with_builtin_guidance(
             self.task.system_instructions.as_deref(),
+            self.goal.as_deref(),
             &tools,
         );
         let completion = CompletionOptions {

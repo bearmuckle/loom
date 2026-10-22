@@ -216,6 +216,14 @@ impl InProcessBackend {
                             backend.providers.github_write_access(),
                             backend.providers.github_repository_token().is_ok(),
                         );
+                        // The session owns the goal, so a goal set or replaced
+                        // while this run is registered reaches its next model
+                        // turn instead of waiting for a new run.
+                        if let Ok(sessions) = backend.sessions()
+                            && let Ok(session) = sessions.get(task_handle.session_id)
+                        {
+                            runtime.set_goal(session.goal.clone());
+                        }
                         let progress = runtime.run_step();
                         task_handle.refresh(&runtime);
                         progress

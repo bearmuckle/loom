@@ -82,14 +82,22 @@ request sets it and returns the updated snapshot as
 `AgentSessionGoalChanged`. Blank or over-long goals (more than 8192 bytes after
 trimming) are rejected before any state changes, and an archived session or an
 unknown session ID is rejected without a partial update. A goal change is
-journalled as `AgentSessionGoalChanged`. A run that is already executing keeps
-the instructions it started with, so the change reaches the next run rather than
-interrupting the active one. A session with no goal adopts its run's
-task when a run starts, so an existing project gains a stated goal. The root
-session's goal is the project goal: the manager's instructions name it on every
-run, which keeps it outside the compactable transcript. Protocol 11.12 adds the
-field, request, response, and event; a snapshot written before it existed still
-decodes with no goal.
+journalled as `AgentSessionGoalChanged`. A session gains a goal only through
+this request: a run's task is never promoted into a goal. The goal is stated on
+every model request, which keeps it outside the compactable transcript and
+across a restart that resumes the run, and the durable session record is re-read
+before each model turn, so a goal changed while a run executes reaches that
+run's next turn instead of waiting for a new run.
+
+A run with a goal is goal-driven. Its request advertises `claim_goal_reached`,
+a control tool answered by the runtime, and no other tool use is needed for it.
+A turn that ends without a claim is answered with a bounded continuation that
+tells the agent to continue or claim; after the continuation budget the run
+completes with a summary that says the goal was not claimed, so an unproductive
+model cannot loop. A run blocked on `ask_user` stays resumable as usual. The
+root session's goal is the project goal, and the manager is told it owns it.
+Protocol 11.12 adds the field, request, response, and event; a snapshot written
+before it existed still decodes with no goal.
 
 The WebSocket service authenticates during the HTTP upgrade using a bearer
 token supplied in the `Authorization` header, or in a `loom.bearer.<token>`

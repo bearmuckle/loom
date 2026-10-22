@@ -1,8 +1,9 @@
 //! In-process tests: the durable session goal.
 //!
-//! A session's goal is backend-owned text. `/goal` sets it, a first run adopts
-//! its task when the session has none, and the manager is told the goal it
-//! owns. The value survives a restart and reaches every session read.
+//! A session's goal is backend-owned text. `/goal` sets it, the value survives a
+//! restart and reaches every session read, and a goal-driven run works against
+//! it until the agent claims it is reached. A run's task is never promoted into
+//! a goal.
 
 #[allow(unused_imports)]
 use super::support::*;
@@ -201,7 +202,7 @@ fn invalid_goal_requests_leave_the_session_unchanged() {
 }
 
 #[test]
-fn a_manager_run_names_the_goal_after_restart_and_resume() {
+fn a_run_works_against_the_goal_and_reports_it_after_restart() {
     let path =
         std::env::temp_dir().join(format!("loom-server-goal-run-{}.db", uuid::Uuid::new_v4()));
     let run_id;
@@ -228,32 +229,144 @@ fn a_manager_run_names_the_goal_after_restart_and_resume() {
             ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
             response => panic!("unexpected run response: {response:?}"),
         };
+        // The runtime works against the session goal, which stays outside the
+        // compactable transcript.
         await_settled_run(&connection, run_id);
+        let handle = connection.run_handle(run_id).unwrap();
+        assert_eq!(
+            handle.try_runtime().unwrap().goal(),
+            Some("Ship the durable goal")
+        );
         backend.flush().unwrap();
-
-        // The assembled run configuration is what the provider request is
-        // built from, and it carries the goal outside the compactable
-        // transcript.
-        let persisted = FilePersistence::open(&path).unwrap();
-        let runtime_config = persisted.load_run_runtime_config(run_id).unwrap().unwrap();
-        let system_instructions = runtime_config.system_instructions.unwrap();
-        assert!(system_instructions.contains("The project goal is: Ship the durable goal"));
-        drop(persisted);
         backend.shutdown().unwrap();
     }
 
     let backend = InProcessBackend::new_persistent(&path).unwrap();
     let connection = backend.connect();
     negotiate_m3(&connection);
-    // Resuming the run rebuilds its task, including the instructions the goal
-    // was folded into.
-    let state = connection.run_handle(run_id).unwrap().state();
-    assert!(
-        state.task.system_instructions.as_deref().is_some_and(
-            |instructions| instructions.contains("The project goal is: Ship the durable goal")
-        ),
-        "a resumed run still names the session goal"
+    // A restored run is told the durable session goal again, so it resumes
+    // working toward the same objective instead of losing it with the process.
+    let handle = connection.run_handle(run_id).unwrap();
+    assert_eq!(
+        handle.try_runtime().unwrap().goal(),
+        Some("Ship the durable goal"),
+        "a resumed run still works against the session goal"
     );
     backend.shutdown().unwrap();
     fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_run_task_is_not_promoted_into_a_goal() {
+    let backend = InProcessBackend::new();
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+    let (_, session_id) = create_workspace_and_session(&connection);
+    let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id,
+            task: "create a demo file".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            system_instructions: Some("Be concise.".to_owned()),
+            repository_instructions: None,
+        },
+    )));
+    let run_id = match started.result.unwrap() {
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
+        response => panic!("unexpected run response: {response:?}"),
+    };
+    await_settled_run(&connection, run_id);
+
+    let snapshot = match connection
+        .request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::GetAgentSessionSnapshot {
+                session_id,
+                activity_detail: loom_protocol::ActivityDetail::Full,
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionSnapshot(snapshot)) => snapshot,
+        response => panic!("unexpected session snapshot response: {response:?}"),
+    };
+    assert_eq!(
+        snapshot.session.goal, None,
+        "a run's task is not a goal; only /goal sets one"
+    );
+    backend.shutdown().unwrap();
+}
+
+#[test]
+fn a_goal_set_while_a_run_is_registered_reaches_its_next_turn() {
+    let backend = InProcessBackend::new();
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+    let (_, session_id) = create_workspace_and_session(&connection);
+    // A prompt for every non-read action stops the run after its first write,
+    // so the goal can be changed while the run is registered.
+    connection
+        .request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::SetSessionApprovalPolicy {
+                session_id,
+                policy: loom_core::ApprovalPolicy::default(),
+                auto_approve_actions: Some(false),
+            },
+        )))
+        .result
+        .unwrap();
+    set_goal(&connection, session_id, "Ship the durable goal")
+        .result
+        .unwrap();
+    let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id,
+            task: "create a demo file".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            system_instructions: Some("Be concise.".to_owned()),
+            repository_instructions: None,
+        },
+    )));
+    let run_id = match started.result.unwrap() {
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
+        response => panic!("unexpected run response: {response:?}"),
+    };
+    let mut settled = await_settled_run(&connection, run_id);
+    assert_eq!(settled.state, AgentRunState::AwaitingApproval);
+
+    set_goal(&connection, session_id, "Fix the failing tests")
+        .result
+        .unwrap();
+
+    while !matches!(
+        settled.state,
+        AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+    ) {
+        let pending = connection
+            .run_handle(run_id)
+            .unwrap()
+            .state()
+            .pending_approval
+            .expect("a stopped run with no pending call is not resumable here");
+        connection
+            .request(RequestEnvelope::new(ClientRequest::Run(
+                RunRequest::ApproveAgentAction {
+                    run_id,
+                    attempt_id: settled.attempt_id,
+                    expected_control_revision: settled.control_revision,
+                    tool_call_id: pending.id,
+                },
+            )))
+            .result
+            .unwrap();
+        settled = await_settled_run(&connection, run_id);
+    }
+
+    let handle = connection.run_handle(run_id).unwrap();
+    assert_eq!(
+        handle.try_runtime().unwrap().goal(),
+        Some("Fix the failing tests"),
+        "a goal changed during the run reaches the next model turn"
+    );
+    backend.shutdown().unwrap();
 }

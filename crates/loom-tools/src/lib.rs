@@ -104,6 +104,7 @@ pub enum ToolKind {
     WebSearch,
     ProposePlan,
     AskUser,
+    ClaimGoalReached,
     ApplyPatch,
     RunCommand,
     GitHubListPullRequests,
@@ -137,6 +138,7 @@ impl ToolKind {
             "web_search" => Some(Self::WebSearch),
             "propose_plan" => Some(Self::ProposePlan),
             "ask_user" => Some(Self::AskUser),
+            "claim_goal_reached" => Some(Self::ClaimGoalReached),
             "apply_patch" => Some(Self::ApplyPatch),
             "run_command" => Some(Self::RunCommand),
             "github_list_pull_requests" => Some(Self::GitHubListPullRequests),
@@ -173,6 +175,7 @@ impl ToolKind {
             Self::WebSearch => "web_search",
             Self::ProposePlan => "propose_plan",
             Self::AskUser => "ask_user",
+            Self::ClaimGoalReached => "claim_goal_reached",
             Self::ApplyPatch => "apply_patch",
             Self::RunCommand => "run_command",
             Self::GitHubListPullRequests => "github_list_pull_requests",
@@ -219,7 +222,8 @@ impl ToolKind {
             | Self::SearchText
             | Self::Glob
             | Self::ProposePlan
-            | Self::AskUser => ActionKind::Read,
+            | Self::AskUser
+            | Self::ClaimGoalReached => ActionKind::Read,
             Self::WebSearch
             | Self::GitHubListPullRequests
             | Self::GitHubGetPullRequest
@@ -713,10 +717,12 @@ impl ToolExecutor {
             ToolKind::SearchText => self.search_text(call),
             ToolKind::Glob => self.glob(call),
             ToolKind::WebSearch => self.web_search(call),
-            ToolKind::ProposePlan | ToolKind::AskUser => ToolResult::failure(
-                call,
-                "control tool is handled by the agent runtime and cannot be executed directly",
-            ),
+            ToolKind::ProposePlan | ToolKind::AskUser | ToolKind::ClaimGoalReached => {
+                ToolResult::failure(
+                    call,
+                    "control tool is handled by the agent runtime and cannot be executed directly",
+                )
+            }
             ToolKind::ApplyPatch => self.apply_patch(call),
             ToolKind::RunCommand => self.run_command(call, cancel),
             ToolKind::GitHubListPullRequests => self.github_list_pull_requests(call),
@@ -3682,6 +3688,21 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: ToolKind::ClaimGoalReached.name().to_owned(),
+            description: "Claim that the session goal is reached, with the evidence that shows it. A goal-driven run finishes only after this claim, so call it when the goal is met; while work remains, keep working instead.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "What was done and the evidence that the goal is reached."
+                    }
+                },
+                "required": ["summary"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
             name: ToolKind::ApplyPatch.name().to_owned(),
             description: "Edit a workspace file with one or more exact text replacements. Provide `edits` (each an old_text/new_text pair), or the single old_text/new_text pair. Each old_text must match exactly once. Returns a unified diff. Requires approval for workspace writes.".to_owned(),
             input_schema: serde_json::json!({
@@ -4039,6 +4060,11 @@ pub fn tool_guidance(definitions: &[ToolDefinition]) -> Option<String> {
     if present(ToolKind::AskUser) {
         guidance.push(
             "Call ask_user when you need information only the user can provide instead of guessing; pass `options` when the answer is a choice among a few answers, so the user can pick one instead of typing.".to_owned(),
+        );
+    }
+    if present(ToolKind::ClaimGoalReached) {
+        guidance.push(
+            "The session has a goal, so the run does not finish on a plain reply: keep working until you can call claim_goal_reached with the evidence that shows the goal is reached, and use ask_user when you instead need the user.".to_owned(),
         );
     }
     if present(ToolKind::WebSearch) {
@@ -7997,6 +8023,7 @@ mod helper_tests {
             ToolKind::WebSearch,
             ToolKind::ProposePlan,
             ToolKind::AskUser,
+            ToolKind::ClaimGoalReached,
             ToolKind::ApplyPatch,
             ToolKind::RunCommand,
             ToolKind::GitHubListPullRequests,
@@ -8029,6 +8056,7 @@ mod helper_tests {
                 | ToolKind::WebSearch
                 | ToolKind::ProposePlan
                 | ToolKind::AskUser
+                | ToolKind::ClaimGoalReached
                 | ToolKind::ApplyPatch
                 | ToolKind::RunCommand
                 | ToolKind::GitHubListPullRequests
@@ -8102,6 +8130,7 @@ mod helper_tests {
             "glob",
             "propose_plan",
             "ask_user",
+            "claim_goal_reached",
         ];
         assert_eq!(unapproved, expected_unapproved.to_vec());
     }

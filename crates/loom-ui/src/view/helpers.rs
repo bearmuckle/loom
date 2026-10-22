@@ -752,10 +752,14 @@ pub(crate) fn timeline_items_from_messages(
                 MessageRole::User if message.name.as_deref() == Some("loom_project_message") => {
                     project_boundary = true;
                 }
-                // A completion guard is also orchestration traffic, but it
-                // starts a fresh assistant reply rather than continuing one.
+                // A completion guard or a goal continuation is orchestration
+                // traffic, but it starts a fresh assistant reply rather than
+                // continuing one: the earlier reply was not final.
                 MessageRole::User
-                    if message.name.as_deref() == Some("loom_project_completion_guard") =>
+                    if matches!(
+                        message.name.as_deref(),
+                        Some("loom_project_completion_guard" | "loom_goal_continuation")
+                    ) =>
                 {
                     project_boundary = true;
                 }
@@ -1779,6 +1783,7 @@ pub(crate) fn tool_icon(name: &str) -> AssetIconName {
         "web_search" => AssetIconName::Globe,
         "run_command" => AssetIconName::SquareTerminal,
         "propose_plan" => AssetIconName::ListChecks,
+        "claim_goal_reached" => AssetIconName::Check,
         "delegate_project_task" => AssetIconName::UserPlus,
         "delegate_project_code_task" => AssetIconName::GitBranch,
         "wait_for_project_children" => AssetIconName::Clock,
@@ -1824,6 +1829,7 @@ pub(crate) fn tool_group_label(name: &str, count: usize) -> String {
         "run_command" => format!("Ran {count} commands"),
         "web_search" => format!("Searched the web {count} times"),
         "propose_plan" => format!("Proposed {count} plans"),
+        "claim_goal_reached" => format!("Claimed the goal {count} times"),
         "ask_user" => format!("Asked the user {count} times"),
         "delegate_project_task" => format!("Delegated {count} sub-agents"),
         "delegate_project_code_task" => format!("Delegated {count} code sub-agents"),
@@ -1868,6 +1874,7 @@ pub(crate) fn tool_usage_label(name: &str) -> &str {
         "run_command" => "Run",
         "web_search" => "Web search",
         "propose_plan" => "Plan",
+        "claim_goal_reached" => "Goal",
         "ask_user" => "Ask",
         "delegate_project_task" => "Delegate",
         "delegate_project_code_task" => "Delegate code",
@@ -2167,6 +2174,9 @@ pub(crate) fn tool_detail(call: &loom_model::ToolCall) -> Option<String> {
         "ask_user" => string_argument(&call.arguments, "prompt")
             .map(|prompt| bounded_to(prompt.trim(), 600))
             .filter(|prompt| !prompt.is_empty()),
+        "claim_goal_reached" => string_argument(&call.arguments, "summary")
+            .map(|summary| bounded_to(summary.trim(), 600))
+            .filter(|summary| !summary.is_empty()),
         "apply_patch" => {
             let edits = call
                 .arguments
@@ -2536,6 +2546,7 @@ pub(crate) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
             command_purpose(&command, &args)
         }
         "propose_plan" => "Propose a plan".to_owned(),
+        "claim_goal_reached" => "Claim goal reached".to_owned(),
         "ask_user" => "Ask the user".to_owned(),
         "delegate_project_task" | "delegate_project_code_task" => {
             let code = name == "delegate_project_code_task";
