@@ -85,6 +85,7 @@ impl SessionManager {
             id: session_id,
             workspace_id,
             name,
+            goal: None,
             state: AgentSessionState::Idle,
             created_at: now,
             updated_at: now,
@@ -186,6 +187,42 @@ impl SessionManager {
                 name,
                 source,
             },
+        );
+        Ok((snapshot, record))
+    }
+
+    /// Sets the session's goal, trimming and validating it before any change.
+    ///
+    /// An archived session is immutable, as it is for a rename. Setting the
+    /// same goal again is rejected so a retried request cannot journal a
+    /// duplicate change.
+    pub fn set_goal(
+        &mut self,
+        session_id: AgentSessionId,
+        goal: impl Into<String>,
+    ) -> Result<(AgentSessionSnapshot, SessionEventRecord)> {
+        let goal = loom_core::normalize_session_goal(&goal.into())?;
+        let snapshot = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| LoomError::not_found("agent session", session_id))?;
+        if snapshot.state == AgentSessionState::Archived {
+            return Err(LoomError::invalid_state(
+                "archived agent sessions cannot change their goal",
+            ));
+        }
+        if snapshot.goal.as_deref() == Some(goal.as_str()) {
+            return Err(LoomError::invalid_request(
+                "agent session already has the requested goal",
+            ));
+        }
+        snapshot.goal = Some(goal.clone());
+        snapshot.updated_at = Timestamp::now();
+        let snapshot = snapshot.clone();
+        let record = self.record(
+            session_id,
+            snapshot.updated_at,
+            SessionEvent::AgentSessionGoalChanged { session_id, goal },
         );
         Ok((snapshot, record))
     }
@@ -335,6 +372,7 @@ impl SessionManager {
             id,
             workspace_id: source.workspace_id,
             name,
+            goal: source.goal,
             state: AgentSessionState::Idle,
             created_at: now,
             updated_at: now,
@@ -537,6 +575,55 @@ mod tests {
         assert_eq!(
             manager
                 .set_title_source(snapshot.id, SessionTitleSource::Auto)
+                .unwrap_err()
+                .code,
+            loom_core::ErrorCode::InvalidState
+        );
+    }
+
+    #[test]
+    fn sets_and_journals_the_goal_without_allowing_invalid_text() {
+        let mut manager = SessionManager::default();
+        let (snapshot, _) = manager
+            .create_in_workspace(WorkspaceId::new(), "Goal")
+            .unwrap();
+        assert_eq!(snapshot.goal, None);
+
+        let (updated, event) = manager
+            .set_goal(snapshot.id, "  Ship the goal feature  ")
+            .unwrap();
+        assert_eq!(updated.goal.as_deref(), Some("Ship the goal feature"));
+        assert!(matches!(
+            event.event,
+            SessionEvent::AgentSessionGoalChanged { ref goal, .. }
+                if goal == "Ship the goal feature"
+        ));
+
+        let (fork, _) = manager.fork(snapshot.id, "Fork").unwrap();
+        assert_eq!(
+            fork.goal, updated.goal,
+            "a fork copies the goal with the rest of the session state"
+        );
+
+        let too_long = "x".repeat(loom_core::MAX_AGENT_SESSION_GOAL_BYTES + 1);
+        assert_eq!(
+            manager.set_goal(snapshot.id, "   ").unwrap_err().code,
+            loom_core::ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            manager.set_goal(snapshot.id, too_long).unwrap_err().code,
+            loom_core::ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            manager.get(snapshot.id).unwrap().goal,
+            updated.goal,
+            "invalid goals must not change the stored value"
+        );
+
+        manager.archive(snapshot.id).unwrap();
+        assert_eq!(
+            manager
+                .set_goal(snapshot.id, "A later goal")
                 .unwrap_err()
                 .code,
             loom_core::ErrorCode::InvalidState

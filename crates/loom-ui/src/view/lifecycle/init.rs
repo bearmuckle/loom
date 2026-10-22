@@ -624,6 +624,7 @@ impl LoomView {
                 "No worker connected"
             }
             .to_owned(),
+            goal: None,
             state: AgentSessionState::Idle,
             created_at: if demo_mode {
                 demo_age(9 * 60_000)

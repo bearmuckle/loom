@@ -213,6 +213,9 @@ impl InProcessConnection {
             ClientRequest::Session(SessionRequest::RenameAgentSession { .. }) => {
                 self.session_dispatch(request, request_id)
             }
+            ClientRequest::Session(SessionRequest::SetAgentSessionGoal { .. }) => {
+                self.session_dispatch(request, request_id)
+            }
             ClientRequest::Session(SessionRequest::SetAgentSessionTitleSource { .. }) => {
                 self.session_dispatch(request, request_id)
             }

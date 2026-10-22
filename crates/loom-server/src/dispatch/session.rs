@@ -48,6 +48,13 @@ impl InProcessConnection {
                     SessionResponse::AgentSessionRenamed(snapshot),
                 ))
             }
+            ClientRequest::Session(SessionRequest::SetAgentSessionGoal { session_id, goal }) => {
+                let (snapshot, record) = self.backend.sessions()?.set_goal(session_id, goal)?;
+                self.backend.journal()?.append_session(record);
+                Ok(ServerResponse::Session(
+                    SessionResponse::AgentSessionGoalChanged(snapshot),
+                ))
+            }
             ClientRequest::Session(SessionRequest::SetAgentSessionTitleSource {
                 session_id,
                 source,

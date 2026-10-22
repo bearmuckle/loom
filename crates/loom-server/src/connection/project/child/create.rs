@@ -352,6 +352,7 @@ impl InProcessConnection {
             id: child_session_id,
             workspace_id: parent_snapshot.workspace_id,
             name: child_name.clone(),
+            goal: None,
             state: loom_core::AgentSessionState::Idle,
             created_at: timestamp,
             updated_at: timestamp,

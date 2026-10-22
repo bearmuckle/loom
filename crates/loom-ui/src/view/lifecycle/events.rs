@@ -244,6 +244,19 @@ impl LoomView {
                     self.update_session_list();
                 }
             }
+            ServerEvent::AgentSessionGoalChanged { session_id, goal } => {
+                if let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == *session_id)
+                {
+                    session.goal = Some(goal.clone());
+                }
+                if self.active_session.id == *session_id {
+                    self.active_session.goal = Some(goal.clone());
+                    self.update_session_list();
+                }
+            }
             ServerEvent::AgentSessionArchived { session_id } => {
                 // The event can refer to a descendant archived as part of a
                 // project cascade, so only apply it to the session it names.

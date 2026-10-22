@@ -91,6 +91,10 @@ pub enum ServerEvent {
         #[serde(default)]
         source: loom_core::SessionTitleSource,
     },
+    AgentSessionGoalChanged {
+        session_id: AgentSessionId,
+        goal: String,
+    },
     AgentSessionTitleSourceChanged {
         session_id: AgentSessionId,
         source: loom_core::SessionTitleSource,
@@ -174,6 +178,9 @@ impl ServerEventEnvelope {
                 name,
                 source,
             },
+            SessionEvent::AgentSessionGoalChanged { session_id, goal } => {
+                ServerEvent::AgentSessionGoalChanged { session_id, goal }
+            }
             SessionEvent::AgentSessionTitleSourceChanged { session_id, source } => {
                 ServerEvent::AgentSessionTitleSourceChanged { session_id, source }
             }

@@ -328,6 +328,7 @@ pub(super) fn pending_project_code_child_fixture() -> ProjectCodeChildFixture {
         id: child_session_id,
         workspace_id: workspace_record.id,
         name: "Code child".to_owned(),
+        goal: None,
         state: AgentSessionState::Idle,
         created_at,
         updated_at: created_at,

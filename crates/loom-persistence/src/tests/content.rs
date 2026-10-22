@@ -101,6 +101,7 @@ fn reconnect_event_decoder_accepts_compressed_rows_and_rejects_corruption() {
                 id: session_id,
                 workspace_id: WorkspaceId::new(),
                 name: "compressed event".to_owned(),
+                goal: None,
                 state: AgentSessionState::Idle,
                 created_at: Timestamp::from_unix_millis(1),
                 updated_at: Timestamp::from_unix_millis(1),

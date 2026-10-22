@@ -72,7 +72,8 @@ pub use project::{
     ProjectWorktreeStatus, TaskContextReference,
 };
 pub use session::{
-    AgentSessionSnapshot, AgentSessionState, SessionEvent, SessionEventRecord, SessionManagerState,
+    AgentSessionSnapshot, AgentSessionState, MAX_AGENT_SESSION_GOAL_BYTES, SessionEvent,
+    SessionEventRecord, SessionManagerState, normalize_session_goal,
 };
 pub use time::Timestamp;
 pub use title::{

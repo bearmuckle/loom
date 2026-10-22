@@ -43,6 +43,7 @@ fn session(id: AgentSessionId, name: &str) -> AgentSessionSnapshot {
         id,
         workspace_id: WorkspaceId::new(),
         name: name.to_owned(),
+        goal: None,
         state: AgentSessionState::Idle,
         created_at: timestamp,
         updated_at: timestamp,

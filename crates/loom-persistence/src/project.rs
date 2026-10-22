@@ -352,13 +352,14 @@ impl FilePersistence {
         transaction
             .execute(
                 "INSERT INTO sessions(
-                     id, workspace_id, name, state, title_source, created_at, updated_at
+                     id, workspace_id, name, goal, state, title_source, created_at, updated_at
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     child_snapshot.id.as_uuid().as_bytes().as_slice(),
                     child_snapshot.workspace_id.as_uuid().as_bytes().as_slice(),
                     child_snapshot.name,
+                    child_snapshot.goal,
                     session_state_name(child_snapshot.state),
                     session_title_source_name(child_snapshot.title_source),
                     created_at,

@@ -1441,6 +1441,9 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
         ServerEvent::AgentSessionRenamed { name, .. } => {
             println!("session renamed: {name}");
         }
+        ServerEvent::AgentSessionGoalChanged { goal, .. } => {
+            println!("session goal: {goal}");
+        }
         ServerEvent::AgentSessionTitleSourceChanged { source, .. } => {
             println!("session title source -> {source:?}");
         }

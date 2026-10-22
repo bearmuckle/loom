@@ -7,6 +7,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 16),
     workspace_id BLOB NOT NULL CHECK(length(workspace_id) = 16),
     name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+    -- The stated goal is optional until set, trimmed and non-empty when set,
+    -- and bounded like other durable free text.
+    goal TEXT CHECK(
+        goal IS NULL
+        OR (length(trim(goal)) > 0 AND length(CAST(goal AS BLOB)) <= 8192)
+    ),
     state TEXT NOT NULL CHECK(state IN (
         'idle', 'queued', 'planning', 'awaiting_approval', 'paused', 'executing',
         'evaluating', 'needs_input', 'completed', 'failed', 'cancelled', 'archived'
@@ -1249,6 +1255,27 @@ fn migrate_schema_transaction(connection: &Connection, from_version: u32) -> Res
                         })?;
                 }
                 version = 13;
+            }
+            // v14 adds the optional session goal. A database written before
+            // the column exists keeps no goal for every session.
+            13 => {
+                if migration_table_exists(&transaction, "sessions")?
+                    && !migration_column_exists(&transaction, "sessions", "goal")?
+                {
+                    transaction
+                        .execute_batch(
+                            "ALTER TABLE sessions ADD COLUMN goal TEXT
+                                 CHECK(goal IS NULL OR (length(trim(goal)) > 0
+                                     AND length(CAST(goal AS BLOB)) <= 8192));",
+                        )
+                        .map_err(|error| {
+                            persistence_error(
+                                format!("could not migrate persistence schema to v14: {error}"),
+                                true,
+                            )
+                        })?;
+                }
+                version = 14;
             }
             other => return Err(unsupported_database_error(other)),
         }

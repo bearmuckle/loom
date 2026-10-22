@@ -19,6 +19,8 @@ https://bearmuckle.github.io/loom/?demo=true
 - Providers: OpenAI, DeepSeek, OpenAI-compatible endpoints, Ollama, and GitHub
   Copilot login.
 - Coordinated child agents on isolated worktrees.
+- A durable project goal, set or read with `/goal`, that the project manager is
+  told on every run.
 
 ## Build and run
 

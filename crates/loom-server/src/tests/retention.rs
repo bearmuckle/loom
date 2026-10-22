@@ -178,6 +178,7 @@ fn durable_terminal_child(
         id: child_id,
         workspace_id: tree.workspace_id,
         name: child_name.to_owned(),
+        goal: None,
         state: AgentSessionState::Idle,
         created_at,
         updated_at: created_at,

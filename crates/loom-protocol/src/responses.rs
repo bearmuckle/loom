@@ -174,6 +174,8 @@ pub enum SessionResponse {
 
     AgentSessionRenamed(AgentSessionSnapshot),
 
+    AgentSessionGoalChanged(AgentSessionSnapshot),
+
     AgentSessionArchived(AgentSessionSnapshot),
 
     AgentSessionDeleted { session_id: AgentSessionId },

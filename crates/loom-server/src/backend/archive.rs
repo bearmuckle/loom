@@ -687,6 +687,7 @@ mod retention_eligibility_tests {
             id: AgentSessionId::new(),
             workspace_id: WorkspaceId::new(),
             name: "Archived".to_owned(),
+            goal: None,
             state: AgentSessionState::Archived,
             created_at: Timestamp::from_unix_millis(archived_at),
             updated_at: Timestamp::from_unix_millis(archived_at),

@@ -247,6 +247,13 @@ pub enum SessionRequest {
         name: String,
     },
 
+    /// Sets the session's durable goal. The backend trims and validates the
+    /// text before it changes any state.
+    SetAgentSessionGoal {
+        session_id: AgentSessionId,
+        goal: String,
+    },
+
     /// Records who chose a session's current title, so a person can pin a
     /// project's name (or hand it back to automation) without renaming it.
     SetAgentSessionTitleSource {

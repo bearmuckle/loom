@@ -258,6 +258,25 @@ pub(crate) fn session_header_title() -> gpui_kit::Div {
     div().flex().flex_1().min_w(px(0.)).flex_col()
 }
 
+/// The goal line the session header shows, or `None` when no goal is set.
+pub(crate) fn session_goal_label(goal: Option<&str>) -> Option<String> {
+    goal.map(|goal| format!("Goal: {goal}"))
+}
+
+/// The header's goal row, or `None` when the session has no goal.
+pub(crate) fn session_header_goal(goal: Option<&str>) -> Option<gpui_kit::AnyElement> {
+    session_goal_label(goal).map(|label| {
+        div()
+            .id("session-header-goal")
+            .test_support()
+            .truncate()
+            .text_xs()
+            .text_color(rgb(0x8f98a6))
+            .child(label)
+            .into_any_element()
+    })
+}
+
 pub(crate) fn session_header_actions() -> gpui_kit::Div {
     div().flex().flex_shrink_0().items_center().gap_1()
 }
@@ -332,6 +351,7 @@ pub(crate) fn empty_session_snapshot(workspace_id: WorkspaceId) -> AgentSessionS
         id: AgentSessionId::new(),
         workspace_id,
         name: "No session selected".to_owned(),
+        goal: None,
         state: AgentSessionState::Idle,
         created_at: now,
         updated_at: now,

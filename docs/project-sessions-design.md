@@ -113,6 +113,16 @@ delivery. Each child receives its bounded task, relevant context, project and
 parent identity, allowed delegation depth, permissions, and reporting
 expectations.
 
+The goal is stored on the root session and is a first-class durable attribute,
+not only the free text of a run. A person sets or reads it with `/goal`, and the
+backend journals the change as `AgentSessionGoalChanged`. The manager's
+instructions name the current goal on every run, so it survives transcript
+compaction and a restart that resumes the run. A run that is already executing
+keeps the instructions it started with, so a goal change reaches the next run.
+A session that has no goal adopts its first run's task, so sessions created
+before goals existed gain one. A delegated child session keeps its own task
+intent; the project goal is not copied into delegated task records.
+
 The manager may run independent tasks concurrently up to a configured
 workspace/backend limit. Start with a default cap of four active child agents
 per project; a later settings surface may configure a lower cap, but disabling

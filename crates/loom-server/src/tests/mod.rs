@@ -41,6 +41,7 @@ mod collaboration;
 mod event_pages;
 mod feed;
 mod filesystem;
+mod goal;
 mod idempotency;
 mod identity;
 mod project_child;

@@ -1,7 +1,28 @@
 use std::collections::BTreeMap;
 
-use crate::{AgentSessionId, EventSequence, SessionTitleSource, Timestamp, WorkspaceId};
+use crate::{
+    AgentSessionId, EventSequence, LoomError, Result, SessionTitleSource, Timestamp, WorkspaceId,
+};
 use serde::{Deserialize, Serialize};
+
+/// Longest accepted session goal, in bytes of its trimmed UTF-8 encoding.
+pub const MAX_AGENT_SESSION_GOAL_BYTES: usize = 8192;
+
+/// Trims and validates a session goal before any state changes.
+pub fn normalize_session_goal(raw: &str) -> Result<String> {
+    let goal = raw.trim();
+    if goal.is_empty() {
+        return Err(LoomError::invalid_request(
+            "agent session goal must not be empty",
+        ));
+    }
+    if goal.len() > MAX_AGENT_SESSION_GOAL_BYTES {
+        return Err(LoomError::invalid_request(format!(
+            "agent session goal must be at most {MAX_AGENT_SESSION_GOAL_BYTES} bytes"
+        )));
+    }
+    Ok(goal.to_owned())
+}
 
 /// Serializable snapshot of the session manager, owned by the neutral domain
 /// layer so storage does not depend on the session crate.
@@ -35,6 +56,11 @@ pub struct AgentSessionSnapshot {
     /// The session's name. A project's row in the sidebar is rendered from its
     /// root session's name, so this doubles as the project title.
     pub name: String,
+    /// The session's stated goal, trimmed and non-empty when set. A project's
+    /// root goal is what the manager is told it owns. The field is additive, so
+    /// a snapshot written before it existed reads as no goal.
+    #[serde(default)]
+    pub goal: Option<String>,
     pub state: AgentSessionState,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
@@ -67,6 +93,10 @@ pub enum SessionEvent {
         /// before it existed reads as `auto`.
         #[serde(default)]
         source: SessionTitleSource,
+    },
+    AgentSessionGoalChanged {
+        session_id: AgentSessionId,
+        goal: String,
     },
     /// The session's title source changed without renaming it, so automation
     /// starts or stops for that session.

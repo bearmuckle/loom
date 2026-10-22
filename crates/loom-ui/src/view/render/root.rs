@@ -412,6 +412,10 @@ impl Render for LoomView {
                                             .truncate()
                                             .child(self.active_session.name.clone()),
                                     )
+                                    .when_some(
+                                        session_header_goal(self.active_session.goal.as_deref()),
+                                        |element, goal| element.child(goal),
+                                    )
                                     .when(!layout.phone, |element| {
                                         element.child(
                                             div()

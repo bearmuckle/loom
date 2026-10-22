@@ -210,6 +210,7 @@ fn project_child_worktree_can_be_reviewed_fast_forwarded_and_cleaned_up() {
         id: child_session_id,
         workspace_id: workspace_record.id,
         name: "Code child".to_owned(),
+        goal: None,
         state: AgentSessionState::Idle,
         created_at,
         updated_at: created_at,

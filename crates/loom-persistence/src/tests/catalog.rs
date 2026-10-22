@@ -29,6 +29,35 @@ fn a_session_title_source_round_trips_through_the_catalog() {
 }
 
 #[test]
+fn a_session_goal_round_trips_through_the_catalog() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+    let persistence = FilePersistence::open(&path).unwrap();
+    let mut manager = SessionManager::default();
+    let (session, _) = manager
+        .create_in_workspace(WorkspaceId::new(), "Goal session")
+        .unwrap();
+    let (other, _) = manager
+        .create_in_workspace(session.workspace_id, "No goal session")
+        .unwrap();
+    let (with_goal, _) = manager
+        .set_goal(session.id, "Ship the durable goal")
+        .unwrap();
+
+    persistence
+        .save_state_with_sessions(&manager.export_state())
+        .unwrap();
+    let restored = persistence.load_sessions().unwrap().unwrap();
+
+    assert_eq!(restored, manager.export_state());
+    assert_eq!(
+        restored.sessions[&with_goal.id].goal.as_deref(),
+        Some("Ship the durable goal")
+    );
+    assert_eq!(restored.sessions[&other.id].goal, None);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn typed_session_catalog_round_trips_and_uses_the_picker_index() {
     let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
     let persistence = FilePersistence::open(&path).unwrap();
@@ -1282,6 +1311,7 @@ fn child_snapshot(
         id,
         workspace_id,
         name: name.to_owned(),
+        goal: None,
         state: AgentSessionState::Idle,
         created_at: Timestamp::now(),
         updated_at: Timestamp::now(),

@@ -130,6 +130,7 @@ fn add_code_child(
         id: child_session_id,
         workspace_id,
         name: name.to_owned(),
+        goal: None,
         state: AgentSessionState::Idle,
         created_at,
         updated_at: created_at,

@@ -2595,6 +2595,38 @@ fn repeated_undecodable_calls_fail_and_stay_retryable() {
 }
 
 #[test]
+fn a_compacted_request_keeps_the_session_goal_in_system_instructions() {
+    let root = workspace();
+    let mut runtime = context_runtime(&root);
+    runtime.task.system_instructions =
+        Some("The project goal is: ship the durable goal".to_owned());
+    runtime.options.context.max_input_tokens = Some(4_000);
+    for i in 0..30 {
+        runtime.messages.push(ModelMessage::new(
+            MessageRole::Assistant,
+            format!("Step {i}: {}", "work details ".repeat(100)),
+        ));
+    }
+    runtime
+        .messages
+        .push(ModelMessage::new(MessageRole::Assistant, "latest result"));
+
+    let (request, inspection) = runtime.model_request().unwrap();
+
+    assert!(inspection.compacted, "the fixture forces compaction");
+    assert!(
+        request.messages.iter().any(|message| {
+            message.role == MessageRole::System
+                && message
+                    .content
+                    .contains("The project goal is: ship the durable goal")
+        }),
+        "compaction must not drop a goal carried by the system instructions"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn context_checkpoint_survives_recovery_and_advances_only_for_new_history() {
     let root = workspace();
     let mut runtime = context_runtime(&root);

@@ -26,6 +26,7 @@ fn session(
         id,
         workspace_id: WorkspaceId::new(),
         name: name.to_owned(),
+        goal: None,
         state,
         created_at: Timestamp::from_unix_millis(created_at),
         updated_at: Timestamp::from_unix_millis(created_at),

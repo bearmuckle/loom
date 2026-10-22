@@ -46,10 +46,12 @@ impl LoomView {
     }
 
     pub(crate) fn run_slash_command(&mut self, text: &str, cx: &mut Context<Self>) {
-        let mut parts = text.split_whitespace();
+        // Split only the command name from its argument: a goal is free text,
+        // so everything after the command is the argument.
+        let mut parts = text.splitn(2, char::is_whitespace);
         let command = parts.next().unwrap_or_default();
         let name = command.trim_start_matches('/');
-        let argument = parts.next();
+        let argument = parts.next().map(str::trim).filter(|rest| !rest.is_empty());
         self.run_command(name, argument, cx);
     }
 
@@ -62,7 +64,7 @@ impl LoomView {
     ) {
         match name {
             "" | "help" => self.record_status(
-                "Commands: /new, /repo, /review, /stop, /archived, /providers, /settings, /about, /help",
+                "Commands: /new, /repo, /review, /stop, /archived, /goal, /providers, /settings, /about, /help",
             ),
             "new" => self.begin_source_dialog(SessionSourceDialogPurpose::StartSession, cx),
             "repo" | "repository" => {
@@ -85,6 +87,44 @@ impl LoomView {
                     self.record_status(format!("Use the model picker to switch to '{model}'."))
                 }
                 None => self.record_status(format!("Current model: {}", self.model.as_str())),
+            },
+            "goal" => match argument {
+                Some(goal) => match loom_core::normalize_session_goal(goal) {
+                    Ok(goal) => {
+                        let session_id = self.active_session.id;
+                        self.record_status("Setting goal...");
+                        self.dispatch(
+                            cx,
+                            ClientRequest::Session(SessionRequest::SetAgentSessionGoal {
+                                session_id,
+                                goal,
+                            }),
+                            move |view, response, _cx| match response.result {
+                                Ok(ServerResponse::Session(
+                                    SessionResponse::AgentSessionGoalChanged(snapshot),
+                                )) => {
+                                    view.active_session = snapshot;
+                                    view.update_session_list();
+                                    view.record_status("Goal updated.");
+                                }
+                                Err(error) => {
+                                    view.record_backend_error("set session goal", error)
+                                }
+                                Ok(response) => view.record_backend_error(
+                                    "set session goal",
+                                    unexpected_response("session goal", response),
+                                ),
+                            },
+                        );
+                    }
+                    Err(error) => self.record_backend_error("set session goal", error),
+                },
+                None => match self.active_session.goal.as_deref() {
+                    Some(goal) => self.record_status(format!("Goal: {goal}")),
+                    None => {
+                        self.record_status("No goal set. Use /goal <text> to set one.")
+                    }
+                },
             },
             command => self.record_status(format!("Unknown command '{command}'. Try /help.")),
         }

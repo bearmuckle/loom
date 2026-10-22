@@ -226,6 +226,7 @@ fn event_json_round_trip_preserves_sequence_and_session() {
         id: session_id,
         workspace_id: loom_core::WorkspaceId::new(),
         name: "Protocol fixture".to_owned(),
+        goal: None,
         state: AgentSessionState::Idle,
         created_at: Timestamp::from_unix_millis(1),
         updated_at: Timestamp::from_unix_millis(1),
@@ -575,6 +576,76 @@ fn archived_session_deletion_and_retention_policy_contracts_round_trip() {
         serde_json::from_str::<ArchiveRetentionPolicy>("{}").unwrap(),
         ArchiveRetentionPolicy::disabled()
     );
+}
+
+#[test]
+fn session_goal_contract_carries_a_durable_text_field() {
+    let session_id = AgentSessionId::new();
+    let request = RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::SetAgentSessionGoal {
+            session_id,
+            goal: "Ship the durable session goal".to_owned(),
+        },
+    ));
+    // Setting a goal is session control, so it is capability-gated, owner-only
+    // and deduplicated by request ID like a rename.
+    assert_eq!(
+        request.request.required_capability(),
+        Some(Capability::ControlAgentSession)
+    );
+    assert_eq!(
+        request.request.required_session_role(),
+        Some(loom_core::SessionRole::Owner)
+    );
+    assert_eq!(
+        request.request.access_target(),
+        Some(loom_protocol::AccessTarget::Session(session_id))
+    );
+    assert!(request.request.is_retryable_mutation());
+    assert_eq!(
+        decode_request(&encode_request(&request).unwrap()).unwrap(),
+        request
+    );
+
+    let snapshot = AgentSessionSnapshot {
+        id: session_id,
+        workspace_id: WorkspaceId::new(),
+        name: "Goal project".to_owned(),
+        goal: Some("Ship the durable session goal".to_owned()),
+        state: AgentSessionState::Idle,
+        created_at: Timestamp::from_unix_millis(1),
+        updated_at: Timestamp::from_unix_millis(1),
+        title_source: loom_core::SessionTitleSource::Auto,
+    };
+    let response = ResponseEnvelope::success(
+        loom_core::RequestId::new(),
+        ServerResponse::Session(SessionResponse::AgentSessionGoalChanged(snapshot.clone())),
+    );
+    assert_eq!(
+        decode_response(&encode_response(&response).unwrap()).unwrap(),
+        response
+    );
+
+    let event = ServerEventEnvelope {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        sequence: EventSequence::new(11),
+        session_id,
+        event: ServerEvent::AgentSessionGoalChanged {
+            session_id,
+            goal: "Ship the durable session goal".to_owned(),
+        },
+    };
+    assert_eq!(decode_event(&encode_event(&event).unwrap()).unwrap(), event);
+
+    // A snapshot written before the field existed still decodes, as no goal.
+    let mut older = serde_json::to_value(&snapshot).unwrap();
+    older
+        .as_object_mut()
+        .expect("a session snapshot encodes as an object")
+        .remove("goal");
+    let decoded: AgentSessionSnapshot = serde_json::from_value(older).unwrap();
+    assert_eq!(decoded.goal, None);
+    assert_eq!(decoded.name, snapshot.name);
 }
 
 #[test]

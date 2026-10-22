@@ -16,7 +16,8 @@ fn migrates_populated_v7_model_storage_without_cascading_dependents() {
     connection.execute_batch(
         "PRAGMA foreign_keys=ON;
          PRAGMA user_version=7;
-         INSERT INTO sessions VALUES (zeroblob(16), zeroblob(16), 'session', 'idle', 'auto', 1, 1);
+         INSERT INTO sessions(id, workspace_id, name, state, title_source, created_at, updated_at)
+             VALUES (zeroblob(16), zeroblob(16), 'session', 'idle', 'auto', 1, 1);
          INSERT INTO run_summaries VALUES (
              zeroblob(16), zeroblob(16), zeroblob(16), 0, 'executing', 1, 1, NULL,
              'task', 'legacy-model', NULL, 0, 0, 0, 0, 0, 0);
@@ -647,6 +648,77 @@ fn migrates_a_v11_database_by_adding_the_session_title_source_column() {
         )
         .unwrap();
     assert!(has_column, "the v13 migration adds the title source column");
+    drop(connection);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn migrates_a_v13_database_by_adding_the_session_goal_column() {
+    let path = std::env::temp_dir().join(format!(
+        "loom-persistence-migrate-v13-{}.db",
+        Uuid::new_v4()
+    ));
+    let session_id = AgentSessionId::new();
+    let workspace_id = WorkspaceId::new();
+    {
+        let connection = Connection::open(&path).unwrap();
+        // A v13 database predates the goal column, so the fixture is the
+        // current baseline without it.
+        let schema = super::super::schema::DATABASE_SCHEMA;
+        let start = schema
+            .find("    -- The stated goal")
+            .expect("baseline contains the goal column");
+        let end = start
+            + schema[start..]
+                .find("    ),\n")
+                .expect("baseline contains the goal column end")
+            + "    ),\n".len();
+        let mut older_schema = schema.to_owned();
+        older_schema.replace_range(start..end, "");
+        connection.execute_batch(&older_schema).unwrap();
+        connection
+            .execute(
+                "INSERT INTO session_store_meta(singleton, next_sequence) VALUES (1, 3)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions(id, workspace_id, name, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'A goal-less project', 'idle', 1, 1)",
+                params![
+                    session_id.as_uuid().as_bytes().as_slice(),
+                    workspace_id.as_uuid().as_bytes().as_slice(),
+                ],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", 13u32)
+            .unwrap();
+    }
+
+    let store = FilePersistence::open(&path).unwrap();
+    let restored = store.load_sessions().unwrap().unwrap();
+    assert_eq!(
+        restored.sessions[&session_id].goal, None,
+        "a session written before the column has no goal"
+    );
+    drop(store);
+
+    let connection = Connection::open(&path).unwrap();
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, DATABASE_SCHEMA_VERSION);
+    let has_column: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions')
+             WHERE name='goal')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(has_column, "the v14 migration adds the goal column");
     drop(connection);
     fs::remove_file(path).unwrap();
 }

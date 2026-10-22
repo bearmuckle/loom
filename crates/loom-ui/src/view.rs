@@ -264,6 +264,12 @@ const COMMANDS: &[CommandSpec] = &[
         shortcut: None,
     },
     CommandSpec {
+        name: "goal",
+        title: "Session goal",
+        description: "Set or show the goal the manager owns",
+        shortcut: None,
+    },
+    CommandSpec {
         name: "providers",
         title: "Providers",
         description: "Connect and configure model providers",
@@ -1864,6 +1870,7 @@ fn is_project_workspace_event(
         ServerEvent::AgentSessionCreated { .. }
         | ServerEvent::AgentSessionStateChanged { .. }
         | ServerEvent::AgentSessionRenamed { .. }
+        | ServerEvent::AgentSessionGoalChanged { .. }
         | ServerEvent::AgentSessionArchived { .. } => member_ids.contains(&event.session_id),
         _ => false,
     }

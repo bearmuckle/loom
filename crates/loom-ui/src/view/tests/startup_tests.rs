@@ -15,6 +15,7 @@ fn session(id: AgentSessionId, name: &str, updated_at: u64) -> AgentSessionSnaps
         id,
         workspace_id: WorkspaceId::new(),
         name: name.to_owned(),
+        goal: None,
         state: AgentSessionState::Idle,
         created_at: Timestamp::from_unix_millis(1),
         updated_at: Timestamp::from_unix_millis(updated_at),

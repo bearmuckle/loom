@@ -479,6 +479,7 @@ impl ClientRequest {
                 Some(Capability::CleanupProjectChildWorktree)
             }
             Self::Session(SessionRequest::RenameAgentSession { .. })
+            | Self::Session(SessionRequest::SetAgentSessionGoal { .. })
             | Self::Session(SessionRequest::SetAgentSessionTitleSource { .. })
             | Self::Session(SessionRequest::ArchiveAgentSession { .. }) => {
                 Some(Capability::ControlAgentSession)
@@ -716,6 +717,7 @@ impl ClientRequest {
             | Self::Collaboration(CollaborationRequest::AnswerAgentQuestion { .. })
             | Self::Collaboration(CollaborationRequest::ControlRun { .. }) => Some(Participant),
             Self::Session(SessionRequest::RenameAgentSession { .. })
+            | Self::Session(SessionRequest::SetAgentSessionGoal { .. })
             | Self::Session(SessionRequest::SetAgentSessionTitleSource { .. })
             | Self::Session(SessionRequest::ArchiveAgentSession { .. })
             | Self::Session(SessionRequest::DeleteAgentSession { .. })
@@ -761,6 +763,7 @@ impl ClientRequest {
             })
             | Self::Session(SessionRequest::GetAgentSessionInitialState { session_id, .. })
             | Self::Session(SessionRequest::RenameAgentSession { session_id, .. })
+            | Self::Session(SessionRequest::SetAgentSessionGoal { session_id, .. })
             | Self::Session(SessionRequest::SetAgentSessionTitleSource { session_id, .. })
             | Self::Session(SessionRequest::ArchiveAgentSession { session_id })
             | Self::Session(SessionRequest::DeleteAgentSession { session_id, .. })
@@ -910,6 +913,7 @@ impl ClientRequest {
                 | Self::Task(TaskRequest::CancelSessionTask { .. })
                 | Self::Session(SessionRequest::SetSessionApprovalPolicy { .. })
                 | Self::Session(SessionRequest::RenameAgentSession { .. })
+                | Self::Session(SessionRequest::SetAgentSessionGoal { .. })
                 | Self::Session(SessionRequest::SetAgentSessionTitleSource { .. })
                 | Self::Session(SessionRequest::ArchiveAgentSession { .. })
                 | Self::Session(SessionRequest::DeleteAgentSession { .. })
@@ -1292,7 +1296,7 @@ mod run_message_protocol_tests {
 
     #[test]
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 11));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 12));
         let project_id = ProjectId::new();
         let request = ClientRequest::Project(ProjectRequest::GetProjectSnapshot { project_id });
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));
@@ -1386,6 +1390,7 @@ mod run_message_protocol_tests {
                 id: AgentSessionId::from_uuid(*sub_project_id.as_uuid()),
                 workspace_id: loom_core::WorkspaceId::new(),
                 name: "Branch out".into(),
+                goal: None,
                 state: loom_core::AgentSessionState::Idle,
                 created_at: loom_core::Timestamp::from_unix_millis(1),
                 updated_at: loom_core::Timestamp::from_unix_millis(1),

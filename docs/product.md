@@ -25,6 +25,14 @@ accountable for results, communicates with its agents, handles blockers, and
 reviews and integrates code changes. The detailed behavior and implementation
 sequence are in [project sessions and coordinated sub-agents](project-sessions-design.md).
 
+The goal is a durable session attribute rather than a run's task text. In the
+client, `/goal <text>` states or replaces it and `/goal` with no argument reports
+the current value; the session header shows it beside the session name. The
+backend trims and bounds the text, journals the change, and tells the project
+manager the goal it owns on every run. A run started for a session with no goal
+adopts that run's task as the goal, so an existing project is not left without
+one.
+
 A **workspace** is a durable container for project roots and workspace-level
 settings. It is not a directory, repository, clone, filesystem root, or
 security boundary, and can exist before any project or repository has been

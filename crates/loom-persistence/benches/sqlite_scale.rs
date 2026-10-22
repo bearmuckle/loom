@@ -280,6 +280,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         id: *session_id,
                         workspace_id,
                         name: format!("Session {index}"),
+                        goal: None,
                         state: AgentSessionState::Idle,
                         created_at: now,
                         updated_at: now,

@@ -23,6 +23,7 @@ fn session(
         id,
         workspace_id,
         name: format!("session {id}"),
+        goal: None,
         state,
         created_at: timestamp,
         updated_at: timestamp,

@@ -76,6 +76,21 @@ that pin and what changes it, and the `SetSessionApprovalPolicy` response report
 the scope the change applies in (`applies_from: "next_run"`), because a run that
 is already executing keeps the decision it started with.
 
+A session snapshot also carries an optional `goal`, the trimmed, non-empty text
+that states what the session is for. The session-scoped `SetAgentSessionGoal`
+request sets it and returns the updated snapshot as
+`AgentSessionGoalChanged`. Blank or over-long goals (more than 8192 bytes after
+trimming) are rejected before any state changes, and an archived session or an
+unknown session ID is rejected without a partial update. A goal change is
+journalled as `AgentSessionGoalChanged`. A run that is already executing keeps
+the instructions it started with, so the change reaches the next run rather than
+interrupting the active one. A session with no goal adopts its run's
+task when a run starts, so an existing project gains a stated goal. The root
+session's goal is the project goal: the manager's instructions name it on every
+run, which keeps it outside the compactable transcript. Protocol 11.12 adds the
+field, request, response, and event; a snapshot written before it existed still
+decodes with no goal.
+
 The WebSocket service authenticates during the HTTP upgrade using a bearer
 token supplied in the `Authorization` header, or in a `loom.bearer.<token>`
 subprotocol for browser clients that cannot set handshake headers, then
