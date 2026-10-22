@@ -250,10 +250,10 @@ impl LoomView {
                     .iter_mut()
                     .find(|session| session.id == *session_id)
                 {
-                    session.goal = Some(goal.clone());
+                    session.goal = goal.clone();
                 }
                 if self.active_session.id == *session_id {
-                    self.active_session.goal = Some(goal.clone());
+                    self.active_session.goal = goal.clone();
                     self.update_session_list();
                 }
             }

@@ -96,7 +96,9 @@ pub enum SessionEvent {
     },
     AgentSessionGoalChanged {
         session_id: AgentSessionId,
-        goal: String,
+        /// The new goal, or `None` when the goal was cleared. A record written
+        /// before clearing existed always carries a goal.
+        goal: Option<String>,
     },
     /// The session's title source changed without renaming it, so automation
     /// starts or stops for that session.

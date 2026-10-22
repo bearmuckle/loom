@@ -93,7 +93,8 @@ pub enum ServerEvent {
     },
     AgentSessionGoalChanged {
         session_id: AgentSessionId,
-        goal: String,
+        /// The new goal, or `None` when the goal was cleared.
+        goal: Option<String>,
     },
     AgentSessionTitleSourceChanged {
         session_id: AgentSessionId,

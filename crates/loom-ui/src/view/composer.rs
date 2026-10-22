@@ -89,46 +89,54 @@ impl LoomView {
                 None => self.record_status(format!("Current model: {}", self.model.as_str())),
             },
             "goal" => match argument {
+                // `/goal clear` clears the durable goal; any other argument
+                // states or replaces it.
+                Some("clear") => self.set_session_goal(None, cx),
                 Some(goal) => match loom_core::normalize_session_goal(goal) {
-                    Ok(goal) => {
-                        let session_id = self.active_session.id;
-                        self.record_status("Setting goal...");
-                        self.dispatch(
-                            cx,
-                            ClientRequest::Session(SessionRequest::SetAgentSessionGoal {
-                                session_id,
-                                goal,
-                            }),
-                            move |view, response, _cx| match response.result {
-                                Ok(ServerResponse::Session(
-                                    SessionResponse::AgentSessionGoalChanged(snapshot),
-                                )) => {
-                                    view.active_session = snapshot;
-                                    view.update_session_list();
-                                    view.record_status("Goal updated.");
-                                }
-                                Err(error) => {
-                                    view.record_backend_error("set session goal", error)
-                                }
-                                Ok(response) => view.record_backend_error(
-                                    "set session goal",
-                                    unexpected_response("session goal", response),
-                                ),
-                            },
-                        );
-                    }
+                    Ok(goal) => self.set_session_goal(Some(goal), cx),
                     Err(error) => self.record_backend_error("set session goal", error),
                 },
                 None => match self.active_session.goal.as_deref() {
                     Some(goal) => self.record_status(format!("Goal: {goal}")),
-                    None => {
-                        self.record_status("No goal set. Use /goal <text> to set one.")
-                    }
+                    None => self.record_status(
+                        "No goal set. Use /goal <text> to set one, or /goal clear to clear it.",
+                    ),
                 },
             },
             command => self.record_status(format!("Unknown command '{command}'. Try /help.")),
         }
         cx.notify();
+    }
+
+    /// Sends the session's new goal, or `None` to clear it.
+    fn set_session_goal(&mut self, goal: Option<String>, cx: &mut Context<Self>) {
+        let session_id = self.active_session.id;
+        self.record_status(if goal.is_some() {
+            "Setting goal..."
+        } else {
+            "Clearing goal..."
+        });
+        self.dispatch(
+            cx,
+            ClientRequest::Session(SessionRequest::SetAgentSessionGoal { session_id, goal }),
+            move |view, response, _cx| match response.result {
+                Ok(ServerResponse::Session(SessionResponse::AgentSessionGoalChanged(snapshot))) => {
+                    let cleared = snapshot.goal.is_none();
+                    view.active_session = snapshot;
+                    view.update_session_list();
+                    view.record_status(if cleared {
+                        "Goal cleared."
+                    } else {
+                        "Goal updated."
+                    });
+                }
+                Err(error) => view.record_backend_error("set session goal", error),
+                Ok(response) => view.record_backend_error(
+                    "set session goal",
+                    unexpected_response("session goal", response),
+                ),
+            },
+        );
     }
 
     /// Handles the escape key: dismisses the innermost open dialog or pane, and

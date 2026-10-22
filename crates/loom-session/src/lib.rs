@@ -193,15 +193,17 @@ impl SessionManager {
 
     /// Sets the session's goal, trimming and validating it before any change.
     ///
-    /// An archived session is immutable, as it is for a rename. Setting the
-    /// same goal again is rejected so a retried request cannot journal a
-    /// duplicate change.
+    /// `None` clears the goal. An archived session is immutable, as it is for a
+    /// rename. Setting the goal it already has is rejected so a retried request
+    /// cannot journal a duplicate change.
     pub fn set_goal(
         &mut self,
         session_id: AgentSessionId,
-        goal: impl Into<String>,
+        goal: Option<String>,
     ) -> Result<(AgentSessionSnapshot, SessionEventRecord)> {
-        let goal = loom_core::normalize_session_goal(&goal.into())?;
+        let goal = goal
+            .map(|goal| loom_core::normalize_session_goal(&goal))
+            .transpose()?;
         let snapshot = self
             .sessions
             .get_mut(&session_id)
@@ -211,12 +213,12 @@ impl SessionManager {
                 "archived agent sessions cannot change their goal",
             ));
         }
-        if snapshot.goal.as_deref() == Some(goal.as_str()) {
+        if snapshot.goal == goal {
             return Err(LoomError::invalid_request(
                 "agent session already has the requested goal",
             ));
         }
-        snapshot.goal = Some(goal.clone());
+        snapshot.goal = goal.clone();
         snapshot.updated_at = Timestamp::now();
         let snapshot = snapshot.clone();
         let record = self.record(
@@ -582,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn sets_and_journals_the_goal_without_allowing_invalid_text() {
+    fn sets_clears_and_journals_the_goal_without_allowing_invalid_text() {
         let mut manager = SessionManager::default();
         let (snapshot, _) = manager
             .create_in_workspace(WorkspaceId::new(), "Goal")
@@ -590,13 +592,13 @@ mod tests {
         assert_eq!(snapshot.goal, None);
 
         let (updated, event) = manager
-            .set_goal(snapshot.id, "  Ship the goal feature  ")
+            .set_goal(snapshot.id, Some("  Ship the goal feature  ".to_owned()))
             .unwrap();
         assert_eq!(updated.goal.as_deref(), Some("Ship the goal feature"));
         assert!(matches!(
             event.event,
             SessionEvent::AgentSessionGoalChanged { ref goal, .. }
-                if goal == "Ship the goal feature"
+                if goal.as_deref() == Some("Ship the goal feature")
         ));
 
         let (fork, _) = manager.fork(snapshot.id, "Fork").unwrap();
@@ -607,11 +609,17 @@ mod tests {
 
         let too_long = "x".repeat(loom_core::MAX_AGENT_SESSION_GOAL_BYTES + 1);
         assert_eq!(
-            manager.set_goal(snapshot.id, "   ").unwrap_err().code,
+            manager
+                .set_goal(snapshot.id, Some("   ".to_owned()))
+                .unwrap_err()
+                .code,
             loom_core::ErrorCode::InvalidRequest
         );
         assert_eq!(
-            manager.set_goal(snapshot.id, too_long).unwrap_err().code,
+            manager
+                .set_goal(snapshot.id, Some(too_long))
+                .unwrap_err()
+                .code,
             loom_core::ErrorCode::InvalidRequest
         );
         assert_eq!(
@@ -620,13 +628,33 @@ mod tests {
             "invalid goals must not change the stored value"
         );
 
+        let (cleared, clear_event) = manager.set_goal(snapshot.id, None).unwrap();
+        assert_eq!(
+            cleared.goal, None,
+            "clearing leaves the session without a goal"
+        );
+        assert!(matches!(
+            clear_event.event,
+            SessionEvent::AgentSessionGoalChanged { goal: None, .. }
+        ));
+        assert_eq!(
+            manager.set_goal(snapshot.id, None).unwrap_err().code,
+            loom_core::ErrorCode::InvalidRequest,
+            "clearing an already clear goal journals nothing"
+        );
+
         manager.archive(snapshot.id).unwrap();
         assert_eq!(
             manager
-                .set_goal(snapshot.id, "A later goal")
+                .set_goal(snapshot.id, Some("A later goal".to_owned()))
                 .unwrap_err()
                 .code,
             loom_core::ErrorCode::InvalidState
+        );
+        assert_eq!(
+            manager.set_goal(snapshot.id, None).unwrap_err().code,
+            loom_core::ErrorCode::InvalidState,
+            "an archived session cannot clear its goal either"
         );
     }
 

@@ -40,7 +40,7 @@ fn a_session_goal_round_trips_through_the_catalog() {
         .create_in_workspace(session.workspace_id, "No goal session")
         .unwrap();
     let (with_goal, _) = manager
-        .set_goal(session.id, "Ship the durable goal")
+        .set_goal(session.id, Some("Ship the durable goal".to_owned()))
         .unwrap();
 
     persistence

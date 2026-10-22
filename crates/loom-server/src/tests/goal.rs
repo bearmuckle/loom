@@ -46,7 +46,16 @@ fn set_goal(
     connection.request(RequestEnvelope::new(ClientRequest::Session(
         SessionRequest::SetAgentSessionGoal {
             session_id,
-            goal: goal.to_owned(),
+            goal: Some(goal.to_owned()),
+        },
+    )))
+}
+
+fn clear_goal(connection: &InProcessConnection, session_id: AgentSessionId) -> ResponseEnvelope {
+    connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::SetAgentSessionGoal {
+            session_id,
+            goal: None,
         },
     )))
 }
@@ -91,7 +100,7 @@ fn a_goal_survives_restart_and_reaches_every_session_read() {
         assert!(events.iter().any(|event| matches!(
             &event.event,
             ServerEvent::AgentSessionGoalChanged { goal, .. }
-                if goal == "Ship the durable goal"
+                if goal.as_deref() == Some("Ship the durable goal")
         )));
 
         let initial = match connection
@@ -161,6 +170,111 @@ fn a_goal_survives_restart_and_reaches_every_session_read() {
 }
 
 #[test]
+fn clearing_a_goal_removes_it_from_every_session_read() {
+    let path = std::env::temp_dir().join(format!(
+        "loom-server-goal-clear-{}.db",
+        uuid::Uuid::new_v4()
+    ));
+    let workspace_id;
+    let session_id;
+    {
+        let backend = InProcessBackend::new_persistent(&path).unwrap();
+        let connection = backend.connect();
+        negotiate_m3(&connection);
+        (workspace_id, session_id) = create_workspace_and_session(&connection);
+        set_goal(&connection, session_id, "Ship the durable goal")
+            .result
+            .unwrap();
+
+        let cleared = clear_goal(&connection, session_id);
+        let ServerResponse::Session(SessionResponse::AgentSessionGoalChanged(snapshot)) =
+            cleared.result.unwrap()
+        else {
+            panic!("unexpected clear goal response");
+        };
+        assert_eq!(snapshot.goal, None);
+        let cleared_sequence = connection.request(RequestEnvelope::new(ClientRequest::Events(
+            EventsRequest::GetSessionEvents {
+                activity_detail: loom_protocol::ActivityDetail::Full,
+                session_id: Some(session_id),
+                workspace_id: None,
+                after_sequence: None,
+                stream_epoch: None,
+            },
+        )));
+        let ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) =
+            cleared_sequence.result.unwrap()
+        else {
+            panic!("unexpected session event response");
+        };
+        // The clear is journalled with no goal, so a connected client removes
+        // the goal line without refetching the session. The journal carries the
+        // set first and the clear last.
+        let goal_events = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                ServerEvent::AgentSessionGoalChanged { goal, .. } => Some(goal.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            goal_events,
+            vec![Some("Ship the durable goal".to_owned()), None]
+        );
+
+        let listed = match connection
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::ListWorkspaceSessions {
+                    workspace_id,
+                    include_archived: false,
+                },
+            )))
+            .result
+            .unwrap()
+        {
+            ServerResponse::Session(SessionResponse::AgentSessions { sessions }) => sessions,
+            response => panic!("unexpected session list response: {response:?}"),
+        };
+        assert_eq!(
+            listed
+                .iter()
+                .find(|session| session.id == session_id)
+                .and_then(|session| session.goal.as_deref()),
+            None
+        );
+        // Clearing an already clear goal is rejected before any state change.
+        assert_eq!(
+            clear_goal(&connection, session_id).result.unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        backend.shutdown().unwrap();
+    }
+
+    let backend = InProcessBackend::new_persistent(&path).unwrap();
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+    let snapshot = match connection
+        .request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::GetAgentSessionSnapshot {
+                session_id,
+                activity_detail: loom_protocol::ActivityDetail::Full,
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionSnapshot(snapshot)) => snapshot,
+        response => panic!("unexpected session snapshot response: {response:?}"),
+    };
+    assert_eq!(
+        snapshot.session.goal, None,
+        "a cleared goal stays cleared after a restart"
+    );
+    backend.shutdown().unwrap();
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn invalid_goal_requests_leave_the_session_unchanged() {
     let backend = InProcessBackend::new();
     let connection = backend.connect();
@@ -198,6 +312,11 @@ fn invalid_goal_requests_leave_the_session_unchanged() {
         .unwrap();
     let archived = set_goal(&connection, session_id, "A later goal");
     assert_eq!(archived.result.unwrap_err().code, ErrorCode::InvalidState);
+    let archived_clear = clear_goal(&connection, session_id);
+    assert_eq!(
+        archived_clear.result.unwrap_err().code,
+        ErrorCode::InvalidState
+    );
     backend.shutdown().unwrap();
 }
 

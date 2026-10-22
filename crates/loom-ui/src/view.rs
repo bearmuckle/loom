@@ -266,7 +266,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "goal",
         title: "Session goal",
-        description: "Set or show the goal the manager owns",
+        description: "Set, show, or clear the goal the manager owns",
         shortcut: None,
     },
     CommandSpec {

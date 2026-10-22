@@ -26,15 +26,16 @@ reviews and integrates code changes. The detailed behavior and implementation
 sequence are in [project sessions and coordinated sub-agents](project-sessions-design.md).
 
 The goal is a durable session attribute rather than a run's task text. In the
-client, `/goal <text>` states or replaces it and `/goal` with no argument reports
-the current value; the session header shows it beside the session name. The
-backend trims and bounds the text and journals the change. A session gains a
-goal only when a person sets one: a run's task stays a run attribute and is
-never promoted into a goal. A goal is stated on every model request, survives
-compaction and a restart, and reaches the next model turn of a run that is
-already executing. A run with a goal keeps working against it until the agent
-calls `claim_goal_reached` with evidence that the goal is reached, so setting a
-goal changes what the agent does instead of only labelling the session.
+client, `/goal <text>` states or replaces it, `/goal` with no argument reports
+the current value, and `/goal clear` clears it; the session header shows it
+beside the session name. The backend trims and bounds the text and journals the
+change. A session gains a goal only when a person sets one: a run's task stays a
+run attribute and is never promoted into a goal. A goal is stated on every
+model request, survives compaction and a restart, and reaches the next model
+turn of a run that is already executing. A run with a goal keeps working
+against it until the agent calls `claim_goal_reached` with evidence that the
+goal is reached, so setting a goal changes what the agent does instead of only
+labelling the session.
 
 A **workspace** is a durable container for project roots and workspace-level
 settings. It is not a directory, repository, clone, filesystem root, or

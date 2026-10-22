@@ -79,25 +79,30 @@ is already executing keeps the decision it started with.
 A session snapshot also carries an optional `goal`, the trimmed, non-empty text
 that states what the session is for. The session-scoped `SetAgentSessionGoal`
 request sets it and returns the updated snapshot as
-`AgentSessionGoalChanged`. Blank or over-long goals (more than 8192 bytes after
-trimming) are rejected before any state changes, and an archived session or an
+`AgentSessionGoalChanged`. The same request with no goal (`goal: null`) clears
+it, so clearing is explicit rather than an empty string; blank or over-long
+text is still rejected before any state change, and an archived session or an
 unknown session ID is rejected without a partial update. A goal change is
-journalled as `AgentSessionGoalChanged`. A session gains a goal only through
-this request: a run's task is never promoted into a goal. The goal is stated on
-every model request, which keeps it outside the compactable transcript and
-across a restart that resumes the run, and the durable session record is re-read
-before each model turn, so a goal changed while a run executes reaches that
-run's next turn instead of waiting for a new run.
+journalled as `AgentSessionGoalChanged`, which carries no goal when the goal was
+cleared, so a connected client removes or replaces the goal it shows. A session
+gains a goal only through this request: a run's task is never promoted into a
+goal. The goal is stated on every model request, which keeps it outside the
+compactable transcript and across a restart that resumes the run, and the
+durable session record is re-read before each model turn, so a goal changed
+while a run executes reaches that run's next turn instead of waiting for a new
+run.
 
 A run with a goal is goal-driven. Its request advertises `claim_goal_reached`,
 a control tool answered by the runtime, and no other tool use is needed for it.
 A turn that ends without a claim is answered with a bounded continuation that
 tells the agent to continue or claim; after the continuation budget the run
 completes with a summary that says the goal was not claimed, so an unproductive
-model cannot loop. A run blocked on `ask_user` stays resumable as usual. The
-root session's goal is the project goal, and the manager is told it owns it.
-Protocol 11.12 adds the field, request, response, and event; a snapshot written
-before it existed still decodes with no goal.
+model cannot loop. A run blocked on `ask_user` stays resumable as usual. A goal
+cleared during a run stops driving it at the next model turn, and a clear leaves
+the run's task text untouched. The root session's goal is the project goal, and
+the manager is told it owns it. Protocol 11.12 adds the field, request, response,
+and event; 11.13 adds clearing with a null goal. A snapshot written before the
+field existed still decodes with no goal.
 
 The WebSocket service authenticates during the HTTP upgrade using a bearer
 token supplied in the `Authorization` header, or in a `loom.bearer.<token>`

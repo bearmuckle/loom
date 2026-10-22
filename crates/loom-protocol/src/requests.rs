@@ -248,10 +248,10 @@ pub enum SessionRequest {
     },
 
     /// Sets the session's durable goal. The backend trims and validates the
-    /// text before it changes any state.
+    /// text before it changes any state. `None` clears the goal.
     SetAgentSessionGoal {
         session_id: AgentSessionId,
-        goal: String,
+        goal: Option<String>,
     },
 
     /// Records who chose a session's current title, so a person can pin a

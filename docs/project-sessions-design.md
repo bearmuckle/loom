@@ -114,12 +114,15 @@ parent identity, allowed delegation depth, permissions, and reporting
 expectations.
 
 The goal is stored on the root session and is a first-class durable attribute,
-not only the free text of a run. A person sets or reads it with `/goal`, and the
-backend journals the change as `AgentSessionGoalChanged`. A session gains a goal
-only that way; a run's task is not promoted into a goal. The goal is stated on
-every model request, so it survives transcript compaction and a restart that
-resumes the run, and the session record is re-read before each model turn so a
-goal changed during a run reaches that run's next turn.
+not only the free text of a run. A person sets, reads, or clears it with `/goal`
+(`/goal <text>` states or replaces it, `/goal` reports it, and `/goal clear`
+clears it), and the backend journals the change as `AgentSessionGoalChanged`,
+which carries no goal for a clear. A session gains a goal only that way; a run's
+task is not promoted into a goal. The goal is stated on every model request, so
+it survives transcript compaction and a restart that resumes the run, and the
+session record is re-read before each model turn so a goal changed during a run
+reaches that run's next turn. Clearing it during a run stops driving that run at
+its next turn.
 
 A run with a goal is goal-driven: it works against the goal and does not finish
 on a plain reply. It finishes when the agent calls `claim_goal_reached` with the

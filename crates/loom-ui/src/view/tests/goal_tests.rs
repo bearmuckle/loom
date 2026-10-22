@@ -37,7 +37,7 @@ fn goal_command_sets_free_text_and_reports_it(cx: &mut TestAppContext) {
         *session_id,
         view.read_with(cx, |view, _| view.active_session.id)
     );
-    assert_eq!(goal, "Ship the durable goal");
+    assert_eq!(goal, &Some("Ship the durable goal".to_owned()));
 
     let mut snapshot = view.read_with(cx, |view, _| view.active_session.clone());
     snapshot.goal = Some("Ship the durable goal".to_owned());
@@ -84,9 +84,67 @@ fn goal_command_reports_when_no_goal_is_set(cx: &mut TestAppContext) {
             view.status_banner
                 .as_ref()
                 .map(|banner| banner.text.as_str()),
-            Some("No goal set. Use /goal <text> to set one.")
+            Some("No goal set. Use /goal <text> to set one, or /goal clear to clear it.")
         );
     });
+}
+
+#[gpui_kit::test]
+fn goal_command_clear_sends_no_goal_and_removes_it(cx: &mut TestAppContext) {
+    let (backend, requests) = crate::backend_host::BackendWorker::deferred_for_test();
+    let view = cx.new(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.backend = backend.clone();
+        view.node_backends
+            .insert(view.default_backend_node_id.clone(), backend);
+        view.active_session.goal = Some("Ship the durable goal".to_owned());
+        view.sessions = vec![view.active_session.clone()];
+        view
+    });
+    view.update(cx, |view, cx| view.run_slash_command("/goal clear", cx));
+
+    let pending = requests
+        .try_recv()
+        .expect("clearing a goal asks the backend");
+    let ClientRequest::Session(SessionRequest::SetAgentSessionGoal { goal, .. }) =
+        &pending.request.request
+    else {
+        panic!("unexpected goal request: {:?}", pending.request.request);
+    };
+    assert_eq!(*goal, None, "clearing sends no goal text");
+
+    let mut snapshot = view.read_with(cx, |view, _| view.active_session.clone());
+    snapshot.goal = None;
+    pending
+        .reply
+        .send(ResponseEnvelope::success(
+            pending.request.request_id,
+            ServerResponse::Session(SessionResponse::AgentSessionGoalChanged(snapshot)),
+        ))
+        .unwrap();
+    cx.run_until_parked();
+
+    view.update(cx, |view, cx| {
+        assert_eq!(view.active_session.goal, None);
+        assert_eq!(view.sessions[0].goal, None);
+        assert_eq!(
+            view.status_banner
+                .as_ref()
+                .map(|banner| banner.text.as_str()),
+            Some("Goal cleared.")
+        );
+        view.run_slash_command("/goal", cx);
+        assert_eq!(
+            view.status_banner
+                .as_ref()
+                .map(|banner| banner.text.as_str()),
+            Some("No goal set. Use /goal <text> to set one, or /goal clear to clear it.")
+        );
+    });
+    assert!(
+        requests.try_recv().is_err(),
+        "reporting a cleared goal needs no request"
+    );
 }
 
 #[gpui_kit::test]
@@ -132,7 +190,7 @@ fn a_goal_event_updates_the_client_without_refetching(cx: &mut TestAppContext) {
         let session_id = view.active_session.id;
         view.consume_event(&ServerEvent::AgentSessionGoalChanged {
             session_id,
-            goal: "Ship the durable goal".to_owned(),
+            goal: Some("Ship the durable goal".to_owned()),
         });
         assert_eq!(
             view.active_session.goal.as_deref(),
@@ -142,6 +200,15 @@ fn a_goal_event_updates_the_client_without_refetching(cx: &mut TestAppContext) {
             view.sessions[0].goal.as_deref(),
             Some("Ship the durable goal")
         );
+
+        // A clear event removes the goal from the session and its list row
+        // without a refetch.
+        view.consume_event(&ServerEvent::AgentSessionGoalChanged {
+            session_id,
+            goal: None,
+        });
+        assert_eq!(view.active_session.goal, None);
+        assert_eq!(view.sessions[0].goal, None);
     });
 }
 

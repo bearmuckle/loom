@@ -584,7 +584,7 @@ fn session_goal_contract_carries_a_durable_text_field() {
     let request = RequestEnvelope::new(ClientRequest::Session(
         SessionRequest::SetAgentSessionGoal {
             session_id,
-            goal: "Ship the durable session goal".to_owned(),
+            goal: Some("Ship the durable session goal".to_owned()),
         },
     ));
     // Setting a goal is session control, so it is capability-gated, owner-only
@@ -632,10 +632,36 @@ fn session_goal_contract_carries_a_durable_text_field() {
         session_id,
         event: ServerEvent::AgentSessionGoalChanged {
             session_id,
-            goal: "Ship the durable session goal".to_owned(),
+            goal: Some("Ship the durable session goal".to_owned()),
         },
     };
     assert_eq!(decode_event(&encode_event(&event).unwrap()).unwrap(), event);
+
+    // Clearing is the same request with no goal, and its journaled event carries
+    // none, so a connected client removes the goal line instead of refetching.
+    let clear = RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::SetAgentSessionGoal {
+            session_id,
+            goal: None,
+        },
+    ));
+    assert_eq!(
+        decode_request(&encode_request(&clear).unwrap()).unwrap(),
+        clear
+    );
+    let cleared_event = ServerEventEnvelope {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        sequence: EventSequence::new(12),
+        session_id,
+        event: ServerEvent::AgentSessionGoalChanged {
+            session_id,
+            goal: None,
+        },
+    };
+    assert_eq!(
+        decode_event(&encode_event(&cleared_event).unwrap()).unwrap(),
+        cleared_event
+    );
 
     // A snapshot written before the field existed still decodes, as no goal.
     let mut older = serde_json::to_value(&snapshot).unwrap();
