@@ -53,6 +53,29 @@ logged, generation is logged as a warning, and the value itself is printed only
 when stdout is a terminal, so it is not captured by `journald` or container
 logs.
 
+A GitHub sign-in yields a second, different credential. The worker mints it for
+the person who signed in, returns it once on the poll that reports the sign-in,
+and keeps only its SHA-256 digest in the `person_tokens` table; the value is
+never logged, never written to durable state, and never shown to another
+connection. It is bound to that participant, so it is governed by the session
+roles that person holds rather than by operator authority, it adopts no
+ownerless session, and it cannot resume an identity it is already bound to. A
+sign-out revokes and deletes it, the worker keeps at most eight per person and
+revokes the oldest beyond that, and a listener restores the stored digests when
+it starts, so a restart does not end a person's sign-in.
+
+The credential is a bearer secret on the client, so the client keeps it apart
+from the non-secret identity store: the native client writes its own file with
+mode 0600, and the browser client keeps it in `localStorage`. `localStorage` is
+not a secret vault — any script running on the UI's origin can read it — so a
+deployment that serves the browser UI must serve it from an origin it trusts,
+and a person who suspects their credential was taken signs out, which revokes
+it on the worker. A client presents the credential only over `wss://` or a
+loopback `ws://` connection, since anything else would put it on the wire in
+the clear, and a worker that refuses it makes the client forget it instead of
+retrying with it. An operator that wants no personal credentials keeps
+`--no-github-sign-in`, which refuses the credential-less upgrade they need.
+
 The service binds to `127.0.0.1` by default. Binding a non-loopback address
 requires an explicit `--bind` choice; the bearer token defaults to the instance
 token described above, and `--token` or `--token-file` override it. The server

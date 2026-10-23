@@ -41,9 +41,11 @@ to it and does not download.
 ## Shared sessions and GitHub sign-in
 
 A worker can be shared by more than one person. People sign in with their own
-GitHub account instead of receiving a bearer token of their own; per-person
-tokens are retired. Operator bearer tokens remain, but only for headless
-clients such as scripts and CI.
+GitHub account instead of receiving a bearer token from the operator. A
+successful sign-in makes the worker issue that person a revocable credential of
+their own, so a later connection authenticates as them without another device
+flow. Operator bearer tokens remain, but only for headless clients such as
+scripts and CI.
 
 - Sign-in is on by default: an upgrade without a credential becomes a
   pre-login connection, and any GitHub account may sign in and then start with
@@ -83,9 +85,10 @@ clients such as scripts and CI.
 
 ### Signing in from a client
 
-A client holds no per-person token; it signs in on the connection it already
-has. Per-person tokens are retired, and an operator token is the only bearer
-credential left.
+A client signs in on the connection it already has, and keeps the credential the
+worker issues for later connections. An operator token is the credential the
+operator hands out; the personal one is minted by the worker and never
+distributed out of band.
 
 1. Open Settings → Workers, enter the worker URL (for example
    `ws://127.0.0.1:8765/ws`), and leave the access token empty. An empty token
@@ -102,23 +105,34 @@ credential left.
    connection that already holds an access token is not asked to sign in: its
    token is the credential, and it keeps operator authority even if it signs in
    for attribution.
-4. The worker binds the GitHub account to the connection. The client then loads
-   the workspaces, sessions, and roster it was refused while pre-login, and the
-   signed-in login appears in the session header and the People tab. Signing in
-   is what puts a person in the roster; an owner still grants the role. When the
-   client connected with an unrestricted operator token, the worker also makes
-   the person the owner of every session that has no owner, before it reports
-   the sign-in, so that client's refresh already shows the sessions it owns.
-   The client remembers the person per worker and resumes them on a later
-   connection with the same operator token, so a client restart shows them
-   online without another device flow. A connection accepted without a token
-   cannot resume an identity and asks for sign-in again.
-5. Select Sign out to end the binding. The person leaves the roster of every
-   session they could see, and a connection accepted without a credential
-   returns to the sign-in prompt. An operator connection keeps its authority.
-   Select Re-authenticate to replace the bound account: the client signs out,
-   then starts a fresh device flow, because the worker refuses a second sign-in
-   while an identity is bound.
+4. The worker binds the GitHub account to the connection and issues the person a
+   revocable credential of their own, returning it once on the poll that reports
+   the sign-in. The client then loads the workspaces, sessions, and roster it
+   was refused while pre-login, and the signed-in login appears in the session
+   header and the People tab. Signing in is what puts a person in the roster; an
+   owner still grants the role. When the client connected with an unrestricted
+   operator token, the worker also makes the person the owner of every session
+   that has no owner, before it reports the sign-in, so that client's refresh
+   already shows the sessions it owns. The client remembers the person per
+   worker and resumes them on a later connection with the same operator token,
+   so a client restart shows them online without another device flow.
+5. The client keeps that credential per worker and presents it as the bearer
+   credential on the next connection, which the worker binds to the same person
+   under that person's session roles. A reload or a restart therefore signs in
+   again without a device flow. The credential is a bearer secret, so the client
+   sends it only over `wss://` or a loopback `ws://` connection and stores it
+   owner-only; a worker that no longer honours it (after a sign-out elsewhere or
+   a reset database) makes the client forget it and fall back to the sign-in
+   prompt. The worker keeps the eight most recent credentials per person and
+   revokes the oldest beyond that, so a client that never signs out cannot grow
+   the store without bound.
+6. Select Sign out to end the binding. The person leaves the roster of every
+   session they could see, the credential the sign-in issued is revoked and its
+   stored row deleted, and a connection accepted without a credential returns to
+   the sign-in prompt. An operator connection keeps its authority. Select
+   Re-authenticate to replace the bound account: the client signs out, then
+   starts a fresh device flow, because the worker refuses a second sign-in while
+   an identity is bound.
 
 #### Which GitHub flow to use
 
@@ -138,13 +152,13 @@ acquire different things:
   repository access". It lets the worker clone, push, and open pull requests
   through the GitHub CLI app. It does not sign the person in to the worker.
 
-A worker sign-in binds the person to one connection, because the client stores
-no credential for them. Reloading the page, reconnecting, or opening the worker
-in a new tab on a connection accepted without an operator token repeats the
-device flow. The client does remember the login that signed in last on a worker
-and names them in the sign-in prompt ("Sign in again as …"), but that is a hint
-for the person, not a resumed session; only an operator connection with an
-unrestricted token resumes an identity, as described in step 4 above.
+A worker sign-in belongs to the person, not to the connection: the credential the
+worker issues is what a reload, a reconnect, or a second tab on the same device
+presents, so the device flow runs once rather than once per connection. Signing
+out revokes that credential, and an operator connection with an unrestricted
+token still resumes a remembered identity on its own, as described in step 4
+above. A worker that has not been upgraded yet sends no credential, so a client
+treats it as absent and falls back to signing in again.
 
 An operator token still behaves exactly as it did: enter it after the URL, and
 the connection has unrestricted authority with no person bound. It may also

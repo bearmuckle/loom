@@ -52,16 +52,46 @@ Properties of the amended decision:
 - Operator tokens are unaffected and remain unbound until the connection signs
   in, which is what `--token`/`--token-file` are for now.
 
+## Amendment: a worker-issued personal credential
+
+An interactive client no longer stays signed in only for the life of one
+connection. A completed GitHub sign-in makes the worker mint a credential for
+that person, return it once on the poll that reports the sign-in, and keep only
+its digest in the `person_tokens` table. A later connection presents it as the
+bearer credential and is bound to the same participant.
+
+Properties of this addition:
+
+- It is not an operator token. The credential carries the person's identity, so
+  it is subject to session roles, adopts no ownerless session, and cannot resume
+  an identity it is already bound to. Operator tokens keep their unrestricted,
+  unbound behavior and are never revoked by a sign-out.
+- The worker keeps only the digest, delivers the value exactly once, revokes and
+  deletes it on sign-out, and keeps at most eight per person, revoking the
+  oldest beyond that. A restart restores the stored digests into the listener's
+  store, so durability comes from the state database rather than from the
+  client.
+- The client treats it as a bearer secret: owner-only storage, `wss://` or
+  loopback `ws://` only, and it forgets the value when a worker refuses it.
+  `docs/security.md` states the residual risk of browser `localStorage` rather
+  than pretending the client can protect it.
+- The credential-less upgrade and its pre-login state still exist, because a
+  client with no credential at all must be able to start a sign-in.
+
 ## References
 
 - `crates/loom-server/src/auth.rs`: `AuthTokenStore`, `AuthorizationScope`,
-  `allows_capability`/`allows_session`/`allows_workspace`.
+  `allows_capability`/`allows_session`/`allows_workspace`, and the restored
+  participant-bound records a sign-in credential is verified against.
 - `crates/loom-server/src/remote.rs`: `BEARER_SUBPROTOCOL_PREFIX`,
   `request_auth` for the upgrade handshake, and the pre-login upgrade path.
 - `crates/loom-server/src/connection/protocol.rs`: per-request `auth.verify()`
   and the `negotiate` capability intersection.
 - `crates/loom-server/src/connection/identity.rs`: the pre-login request gate and
-  the sign-in binding.
+  the sign-in binding, and the credential a sign-out revokes.
+- `crates/loom-server/src/backend/person_tokens.rs`: minting, restoring,
+  revoking, and the per-person cap on sign-in credentials.
+- `crates/loom-persistence/src/schema.rs`: the `person_tokens` table.
 - `crates/loom-server/src/services/identity.rs`: sign-in policy, pending sign-ins,
   and the account-to-participant derivation.
 - `crates/loom-core/src/participant.rs`: `github_participant_id` and
