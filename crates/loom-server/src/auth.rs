@@ -2,12 +2,15 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use loom_core::{
     AgentSessionId, Capability, CapabilitySet, ErrorCode, LoomError,
-    MAX_PARTICIPANT_DISPLAY_NAME_BYTES, ParticipantIdentity, Result, WorkspaceId,
+    MAX_PARTICIPANT_DISPLAY_NAME_BYTES, ParticipantId, ParticipantIdentity, Result, WorkspaceId,
 };
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -130,6 +133,12 @@ impl AuthSession {
         self.participant.as_ref()
     }
 
+    /// The store this session was authenticated by, so a caller that revokes
+    /// the credential tells the store that holds it.
+    pub(crate) fn store(&self) -> &Arc<AuthTokenStore> {
+        &self.store
+    }
+
     pub fn verify(&self) -> Result<()> {
         let active = self
             .store
@@ -193,6 +202,9 @@ struct TokenRecord {
     scope: AuthorizationScope,
     participant: Option<ParticipantIdentity>,
     revoked: bool,
+    /// Registration order of this record, so the credentials of one person can
+    /// be pruned oldest first.
+    sequence: u64,
 }
 
 /// Validates and trims a participant display name.
@@ -213,6 +225,7 @@ pub fn validate_display_name(name: &str) -> Result<String> {
 #[derive(Clone, Debug, Default)]
 pub struct AuthTokenStore {
     tokens: Arc<Mutex<BTreeMap<String, TokenRecord>>>,
+    next_sequence: Arc<AtomicU64>,
 }
 
 impl AuthTokenStore {
@@ -282,6 +295,7 @@ impl AuthTokenStore {
                     scope: scope.clone(),
                     participant: participant.clone(),
                     revoked: false,
+                    sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed),
                 },
             );
         Ok(IssuedToken {
@@ -292,6 +306,64 @@ impl AuthTokenStore {
         })
     }
 
+    /// Registers a token loaded from durable state.
+    ///
+    /// The id, digest, scope, and participant are taken as given, because a
+    /// stored row carries only the digest of the value it was minted for: the
+    /// worker cannot reproduce the value, it can only verify it again. A
+    /// restored record behaves exactly like a minted one, so
+    /// [`Self::authenticate`], [`AuthSession::verify`], and [`Self::revoke`]
+    /// work unchanged.
+    pub(crate) fn insert_restored(
+        &self,
+        token_id: String,
+        digest: [u8; 32],
+        scope: AuthorizationScope,
+        participant: ParticipantIdentity,
+    ) -> Result<()> {
+        self.tokens
+            .lock()
+            .map_err(|_| auth_internal_error())?
+            .insert(
+                token_id,
+                TokenRecord {
+                    digest,
+                    scope,
+                    participant: Some(participant),
+                    revoked: false,
+                    sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed),
+                },
+            );
+        Ok(())
+    }
+
+    /// The digest a token value is stored and verified by.
+    ///
+    /// A caller that keeps credentials durably stores the same verifier this
+    /// store keeps, so a restored credential authenticates unchanged. A digest
+    /// is not a token: it cannot be presented to authenticate.
+    pub(crate) fn token_digest(token: &str) -> [u8; 32] {
+        digest(token)
+    }
+
+    /// The ids of the credentials bound to `participant`, oldest first.
+    pub(crate) fn participant_token_ids(&self, participant: ParticipantId) -> Result<Vec<String>> {
+        let tokens = self.tokens.lock().map_err(|_| auth_internal_error())?;
+        let mut ids = tokens
+            .iter()
+            .filter(|(_, record)| {
+                !record.revoked
+                    && record
+                        .participant
+                        .as_ref()
+                        .is_some_and(|bound| bound.id == participant)
+            })
+            .map(|(token_id, record)| (record.sequence, token_id.clone()))
+            .collect::<Vec<_>>();
+        ids.sort();
+        Ok(ids.into_iter().map(|(_, token_id)| token_id).collect())
+    }
+
     pub fn revoke(&self, token_id: &str) -> Result<bool> {
         let mut tokens = self.tokens.lock().map_err(|_| auth_internal_error())?;
         let Some(record) = tokens.get_mut(token_id) else {
@@ -299,6 +371,20 @@ impl AuthTokenStore {
         };
         record.revoked = true;
         Ok(true)
+    }
+
+    /// Drops a token record, reporting whether one was registered.
+    ///
+    /// [`Self::revoke`] keeps the record, so a revoked credential stays
+    /// distinguishable from one the worker never knew. This forgets it
+    /// instead, which is what a credential that was deleted everywhere gets.
+    pub(crate) fn delete(&self, token_id: &str) -> Result<bool> {
+        Ok(self
+            .tokens
+            .lock()
+            .map_err(|_| auth_internal_error())?
+            .remove(token_id)
+            .is_some())
     }
 
     pub fn revoke_all(&self) -> Result<()> {
@@ -474,6 +560,62 @@ mod tests {
         );
         assert!(validate_display_name("bad\nname").is_err());
         assert!(validate_display_name(&"x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn restored_tokens_verify_until_they_are_deleted_and_keep_their_order() {
+        let store = AuthTokenStore::new();
+        let participant = ParticipantIdentity {
+            id: ParticipantId::new(),
+            display_name: "Sam".to_owned(),
+        };
+        // A row loaded from durable storage carries the id and digest the
+        // worker kept, so the value a person holds authenticates again.
+        let first = store
+            .issue_for_participant(AuthorizationScope::all(), participant.clone())
+            .unwrap();
+        let restored_id = Uuid::new_v4().to_string();
+        store
+            .insert_restored(
+                restored_id.clone(),
+                AuthTokenStore::token_digest("loom-remembered"),
+                AuthorizationScope::all(),
+                participant.clone(),
+            )
+            .unwrap();
+
+        let session = store.authenticate("loom-remembered").unwrap();
+        assert_eq!(session.token_id(), restored_id);
+        session.verify().unwrap();
+        assert_eq!(session.participant(), Some(&participant));
+        assert_eq!(
+            store.participant_token_ids(participant.id).unwrap(),
+            vec![first.token_id.clone(), restored_id.clone()]
+        );
+        assert!(
+            store
+                .participant_token_ids(ParticipantId::new())
+                .unwrap()
+                .is_empty()
+        );
+
+        // Deleting is distinct from revoking: a revoked record stays known,
+        // a deleted one is gone.
+        assert!(store.revoke(&first.token_id).unwrap());
+        assert_eq!(
+            store.participant_token_ids(participant.id).unwrap(),
+            vec![restored_id.clone()]
+        );
+        assert!(store.delete(&restored_id).unwrap());
+        assert!(!store.delete(&restored_id).unwrap());
+        assert!(session.verify().is_err());
+        assert!(store.authenticate("loom-remembered").is_err());
+        assert!(
+            store
+                .participant_token_ids(participant.id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

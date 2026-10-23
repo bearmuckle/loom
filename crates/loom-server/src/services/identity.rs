@@ -17,6 +17,7 @@
 
 use std::{
     collections::BTreeMap,
+    fmt,
     sync::{Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
@@ -170,12 +171,39 @@ impl GitHubSignInConfig {
 
 struct SignInRecord {
     status: GitHubSignInStatus,
+    /// The credential a sign-in hands out to the client that started it; the
+    /// first read of a `signed_in` status takes it, so no later read repeats
+    /// it.
+    resume_token: Option<String>,
     expires_at: Instant,
     /// The person who started the sign-in; `None` for a connection that has no
     /// identity yet (a pre-login connection or an operator token). Only the
     /// initiator reads the status, so another connection cannot observe a
     /// sign-in it did not start.
     initiator: Option<ParticipantId>,
+}
+
+/// A sign-in status read by the connection that started it, beside the
+/// credential it hands out once.
+pub(crate) struct SignInStatus {
+    pub(crate) status: GitHubSignInStatus,
+    /// The credential for a later connection, present only on the first read
+    /// that reports [`GitHubSignInStatus::SignedIn`].
+    pub(crate) resume_token: Option<String>,
+}
+
+impl fmt::Debug for SignInStatus {
+    /// Reports whether a credential is present without formatting its value.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SignInStatus")
+            .field("status", &self.status)
+            .field(
+                "resume_token",
+                &self.resume_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// Owns the sign-in policy and the in-flight GitHub sign-ins of one worker.
@@ -238,6 +266,7 @@ impl IdentityService {
             login_id,
             SignInRecord {
                 status: GitHubSignInStatus::Pending,
+                resume_token: None,
                 expires_at,
                 initiator,
             },
@@ -256,15 +285,29 @@ impl IdentityService {
     }
 
     /// Records a terminal state, leaving an already-finalized sign-in as is.
-    pub(crate) fn finish(&self, login_id: &str, status: GitHubSignInStatus) {
+    ///
+    /// `resume_token` is the credential for a later connection; it is kept
+    /// beside the status so the first read reports both and no later read
+    /// repeats the value.
+    pub(crate) fn finish(
+        &self,
+        login_id: &str,
+        status: GitHubSignInStatus,
+        resume_token: Option<String>,
+    ) {
         if let Some(sign_in) = self.sign_ins().get_mut(login_id)
             && matches!(sign_in.status, GitHubSignInStatus::Pending)
         {
             sign_in.status = status;
+            sign_in.resume_token = resume_token;
         }
     }
 
-    /// The status as seen by `requester`.
+    /// The status as seen by `requester`, with the credential it hands out.
+    ///
+    /// The credential is taken out of the record, so it is delivered exactly
+    /// once: a client that loses the response cannot obtain it by polling
+    /// again and signs in once more instead.
     ///
     /// A person sees only a sign-in they started, and a connection without an
     /// identity sees only one started without one; anything else reads as not
@@ -274,7 +317,7 @@ impl IdentityService {
         login_id: &str,
         now: Instant,
         requester: Option<ParticipantId>,
-    ) -> Result<GitHubSignInStatus> {
+    ) -> Result<SignInStatus> {
         let mut sign_ins = self.sign_ins();
         let sign_in = sign_ins
             .get_mut(login_id)
@@ -292,7 +335,10 @@ impl IdentityService {
                 message: "GitHub device authorization expired".to_owned(),
             };
         }
-        Ok(sign_in.status.clone())
+        Ok(SignInStatus {
+            status: sign_in.status.clone(),
+            resume_token: sign_in.resume_token.take(),
+        })
     }
 }
 
@@ -395,16 +441,33 @@ mod tests {
             GitHubSignInStatus::SignedIn {
                 participant: identity("octocat"),
             },
+            Some("person-credential".to_owned()),
         );
         service
             .begin_pending("login-new".to_owned(), now, expires, None)
             .unwrap();
 
+        // The credential a finished sign-in hands out is read exactly once.
+        let finished = service.status_for("login-0", now, None).unwrap();
+        assert!(matches!(
+            finished.status,
+            GitHubSignInStatus::SignedIn { .. }
+        ));
+        assert_eq!(finished.resume_token.as_deref(), Some("person-credential"));
+        assert_eq!(
+            service
+                .status_for("login-0", now, None)
+                .unwrap()
+                .resume_token,
+            None
+        );
+
         // A pending sign-in materializes as a failure once it expires.
         let expired = service
             .status_for("login-1", now + Duration::from_secs(900), None)
             .unwrap();
-        assert!(matches!(expired, GitHubSignInStatus::Failed { .. }));
+        assert!(matches!(expired.status, GitHubSignInStatus::Failed { .. }));
+        assert_eq!(expired.resume_token, None);
 
         // A person sees only a sign-in they started; the connection with no
         // identity sees only one started without one.
@@ -434,7 +497,8 @@ mod tests {
         assert_eq!(
             service
                 .status_for("login-person", now, Some(started_here.id))
-                .unwrap(),
+                .unwrap()
+                .status,
             GitHubSignInStatus::Pending
         );
         assert_eq!(

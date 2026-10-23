@@ -156,23 +156,44 @@ fn start_sign_in(connection: &InProcessConnection) -> String {
     }
 }
 
+/// Polls a sign-in once, returning its status and the credential the worker
+/// hands out beside it.
+fn poll_sign_in(
+    connection: &InProcessConnection,
+    login_id: &str,
+) -> (GitHubSignInStatus, Option<String>) {
+    match access(
+        connection,
+        AccessRequest::GetGitHubSignInStatus {
+            login_id: login_id.to_owned(),
+        },
+    )
+    .expect("the sign-in is readable by its initiator")
+    {
+        AccessResponse::GitHubSignInStatus {
+            status,
+            resume_token,
+        } => (status, resume_token),
+        response => panic!("unexpected status response: {response:?}"),
+    }
+}
+
 /// Polls a sign-in until it stops being pending.
 fn await_sign_in(connection: &InProcessConnection, login_id: &str) -> GitHubSignInStatus {
+    await_sign_in_with_credential(connection, login_id).0
+}
+
+/// Polls a sign-in until it stops being pending, keeping the credential its
+/// first `signed_in` poll carries.
+fn await_sign_in_with_credential(
+    connection: &InProcessConnection,
+    login_id: &str,
+) -> (GitHubSignInStatus, Option<String>) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let status = match access(
-            connection,
-            AccessRequest::GetGitHubSignInStatus {
-                login_id: login_id.to_owned(),
-            },
-        )
-        .expect("the sign-in is readable by its initiator")
-        {
-            AccessResponse::GitHubSignInStatus { status, .. } => status,
-            response => panic!("unexpected status response: {response:?}"),
-        };
+        let (status, credential) = poll_sign_in(connection, login_id);
         if !matches!(status, GitHubSignInStatus::Pending) {
-            return status;
+            return (status, credential);
         }
         assert!(Instant::now() < deadline, "the sign-in did not settle");
         thread::sleep(Duration::from_millis(5));
@@ -190,6 +211,44 @@ fn pre_login_backend(config: GitHubSignInConfig) -> Arc<InProcessBackend> {
     let backend = InProcessBackend::new();
     backend.set_github_sign_in_config(config);
     backend
+}
+
+/// A pre-login backend that attached `store` as a remote listener does, so a
+/// sign-in can hand out a credential for a later connection.
+fn pre_login_backend_with_store(
+    config: GitHubSignInConfig,
+    store: &Arc<AuthTokenStore>,
+) -> Arc<InProcessBackend> {
+    let backend = pre_login_backend(config);
+    backend.attach_person_token_store(Arc::clone(store));
+    backend
+}
+
+/// Creates a workspace with one session in it, owned by nobody.
+fn create_session(connection: &InProcessConnection, name: &str) -> AgentSessionId {
+    let workspace = match send(
+        connection,
+        ClientRequest::Workspace(WorkspaceRequest::CreateWorkspace {
+            name: name.to_owned(),
+        }),
+    )
+    .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    match send(
+        connection,
+        ClientRequest::Workspace(WorkspaceRequest::CreateAgentSessionInWorkspace {
+            workspace_id: workspace.id,
+            name: name.to_owned(),
+        }),
+    )
+    .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    }
 }
 
 #[test]
@@ -272,7 +331,7 @@ fn a_person_signs_in_with_github_and_polls_the_sign_in() {
         ErrorCode::NotFound
     );
 
-    let status = await_sign_in(&connection, &login_id);
+    let (status, credential) = await_sign_in_with_credential(&connection, &login_id);
     let expected = ParticipantIdentity {
         id: github_participant_id(141030),
         display_name: "octocat".to_owned(),
@@ -285,6 +344,9 @@ fn a_person_signs_in_with_github_and_polls_the_sign_in() {
     );
     assert_eq!(participant_of(&connection), Some(expected.clone()));
     assert!(!connection.awaits_sign_in());
+    // An in-process backend has no listener, so it issues no credential for a
+    // later connection: the person is signed in on this one only.
+    assert_eq!(credential, None);
     // The person is in the directory, so an owner can grant them access.
     let AccessResponse::Participants { participants } =
         access(&connection, AccessRequest::ListParticipants).unwrap()
@@ -471,7 +533,8 @@ fn an_operator_token_connection_stays_unbound_until_it_signs_in() {
     let fixture = GitHubFixture::start(1, 141030, "octocat");
     let backend = InProcessBackend::new();
     backend.set_github_sign_in_config(fixture.config(&["octocat"]));
-    let tokens = AuthTokenStore::new();
+    let tokens = Arc::new(AuthTokenStore::new());
+    backend.attach_person_token_store(Arc::clone(&tokens));
     let issued = tokens.issue(AuthorizationScope::all()).unwrap();
     let connection = backend.connect_authenticated(tokens.authenticate(&issued.token).unwrap());
     negotiate(&connection);
@@ -498,9 +561,11 @@ fn an_operator_token_connection_stays_unbound_until_it_signs_in() {
         Some(github_participant_id(141030))
     );
 
-    // Signing out releases the person but keeps the operator token.
+    // Signing out releases the person but keeps the operator token, which a
+    // sign-out never revokes.
     access(&connection, AccessRequest::SignOutGitHub).unwrap();
     assert_eq!(participant_of(&connection), None);
+    assert!(tokens.authenticate(&issued.token).is_ok());
     assert!(
         send(
             &connection,
@@ -701,4 +766,241 @@ fn a_worker_without_a_configured_allowlist_accepts_any_github_account() {
     assert!(backend.github_sign_in_enabled());
     assert!(config.allows_login("anyone"));
     assert!(config.allows_login("OctoCat"));
+}
+
+#[test]
+fn a_completed_sign_in_hands_out_its_credential_once() {
+    let fixture = GitHubFixture::start(1, 141030, "octocat");
+    let store = Arc::new(AuthTokenStore::new());
+    let backend = pre_login_backend_with_store(fixture.config(&["octocat"]), &store);
+    let connection = backend.connect_pre_login();
+    negotiate(&connection);
+
+    let login_id = start_sign_in(&connection);
+    let (status, credential) = await_sign_in_with_credential(&connection, &login_id);
+    let GitHubSignInStatus::SignedIn { participant } = status else {
+        panic!("the sign-in should bind the person");
+    };
+    let credential = credential.expect("a served sign-in hands out a credential");
+    let signed_in = store
+        .authenticate(&credential)
+        .expect("the handed-out credential authenticates on this worker");
+    assert_eq!(signed_in.participant(), Some(&participant));
+    assert_eq!(
+        signed_in.scope(),
+        &AuthorizationScope::all(),
+        "the credential reaches what the person is granted, not more"
+    );
+
+    // The credential is delivered exactly once: a later poll reports the same
+    // status and carries none, so it cannot be collected by polling again.
+    let (later, repeated) = await_sign_in_with_credential(&connection, &login_id);
+    assert_eq!(
+        later,
+        GitHubSignInStatus::SignedIn {
+            participant: participant.clone(),
+        }
+    );
+    assert_eq!(repeated, None);
+    fixture.join();
+}
+
+#[test]
+fn a_sign_in_credential_binds_the_person_and_their_session_roles() {
+    let fixture = GitHubFixture::start(1, 141030, "octocat");
+    let person = ParticipantIdentity {
+        id: github_participant_id(141030),
+        display_name: "octocat".to_owned(),
+    };
+    let backend = InProcessBackend::new();
+    backend
+        .register_participants(std::slice::from_ref(&person))
+        .unwrap();
+    backend.set_github_sign_in_config(fixture.config(&["octocat"]));
+    let store = Arc::new(AuthTokenStore::new());
+    backend.attach_person_token_store(Arc::clone(&store));
+
+    // An operator owns two sessions and grants the person one of them.
+    let operator = backend.connect();
+    negotiate(&operator);
+    let granted = create_session(&operator, "Pairing");
+    let another = create_session(&operator, "Unrelated");
+    access(
+        &operator,
+        AccessRequest::GrantSessionAccess {
+            session_id: granted,
+            participant_id: person.id,
+        },
+    )
+    .unwrap();
+
+    let connection = backend.connect_pre_login();
+    negotiate(&connection);
+    let login_id = start_sign_in(&connection);
+    let (status, credential) = await_sign_in_with_credential(&connection, &login_id);
+    assert!(matches!(status, GitHubSignInStatus::SignedIn { .. }));
+    let credential = credential.expect("a served sign-in hands out a credential");
+    fixture.join();
+
+    // A later connection that presents the credential is the same person.
+    let person_connection = backend.connect_authenticated(store.authenticate(&credential).unwrap());
+    negotiate(&person_connection);
+    assert_eq!(participant_of(&person_connection), Some(person.clone()));
+
+    // It is not an operator: it adopts no ownerless session, it is held to the
+    // person's roles, and it cannot claim a remembered identity it already is.
+    assert!(!person_connection.adopts_ownerless_sessions());
+    assert!(!person_connection.retains_operator_authority());
+    assert_eq!(
+        access(
+            &person_connection,
+            AccessRequest::ResumeGitHubIdentity {
+                participant_id: person.id,
+            },
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::Conflict
+    );
+
+    // It reads the session the person was granted and nothing else.
+    assert!(
+        send(
+            &person_connection,
+            ClientRequest::Session(SessionRequest::GetAgentSession {
+                session_id: granted
+            }),
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        send(
+            &person_connection,
+            ClientRequest::Session(SessionRequest::GetAgentSession {
+                session_id: another
+            }),
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::AuthorizationDenied
+    );
+}
+
+#[test]
+fn signing_out_revokes_the_credential_the_connection_signed_in_with() {
+    let fixture = GitHubFixture::start(1, 141030, "octocat");
+    let store = Arc::new(AuthTokenStore::new());
+    let backend = pre_login_backend_with_store(fixture.config(&["octocat"]), &store);
+    let connection = backend.connect_pre_login();
+    negotiate(&connection);
+    let login_id = start_sign_in(&connection);
+    let (_, credential) = await_sign_in_with_credential(&connection, &login_id);
+    let credential = credential.expect("a served sign-in hands out a credential");
+    fixture.join();
+
+    let person_connection = backend.connect_authenticated(store.authenticate(&credential).unwrap());
+    negotiate(&person_connection);
+    assert!(matches!(
+        access(&person_connection, AccessRequest::SignOutGitHub).unwrap(),
+        AccessResponse::SignedOutGitHub
+    ));
+    // The connection is no longer bound, and the credential it authenticated
+    // with stops working, so signing out on one device ends it everywhere.
+    assert_eq!(person_connection.participant(), None);
+    assert_eq!(
+        store.authenticate(&credential).unwrap_err().code,
+        ErrorCode::AuthenticationFailed
+    );
+}
+
+#[test]
+fn a_sign_in_credential_survives_a_restart() {
+    let directory = std::env::temp_dir().join(format!(
+        "loom-server-sign-in-credential-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("state.sqlite");
+    let fixture = GitHubFixture::start(1, 141030, "octocat");
+
+    let (credential, person) = {
+        let backend = InProcessBackend::new_persistent(&path).unwrap();
+        backend.set_github_sign_in_config(fixture.config(&["octocat"]));
+        let store = Arc::new(AuthTokenStore::new());
+        backend.attach_person_token_store(Arc::clone(&store));
+        let connection = backend.connect_pre_login();
+        negotiate(&connection);
+        let login_id = start_sign_in(&connection);
+        let (status, credential) = await_sign_in_with_credential(&connection, &login_id);
+        let GitHubSignInStatus::SignedIn { participant } = status else {
+            panic!("the sign-in should bind the person");
+        };
+        fixture.join();
+        let credential = credential.expect("a served sign-in hands out a credential");
+        backend.shutdown().unwrap();
+        (credential, participant)
+    };
+
+    // A reopened worker restores the credential into the store its listener
+    // attaches, with the person the directory kept.
+    let backend = InProcessBackend::new_persistent(&path).unwrap();
+    let stored = backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .load_person_tokens()
+        .unwrap();
+    assert_eq!(stored.len(), 1, "the credential row is stored");
+    let store = Arc::new(AuthTokenStore::new());
+    backend.attach_person_token_store(Arc::clone(&store));
+    let restored = store
+        .authenticate(&credential)
+        .expect("the stored credential authenticates after a restart");
+    assert_eq!(restored.participant(), Some(&person));
+
+    let connection = backend.connect_authenticated(restored);
+    negotiate(&connection);
+    assert_eq!(participant_of(&connection), Some(person));
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn the_oldest_credential_is_revoked_when_a_person_signs_in_too_often() {
+    let sign_ins = MAX_PERSON_TOKENS + 1;
+    let fixture = GitHubFixture::start(sign_ins, 141030, "octocat");
+    let store = Arc::new(AuthTokenStore::new());
+    let backend = pre_login_backend_with_store(fixture.config(&["octocat"]), &store);
+    let mut credentials = Vec::new();
+    for _ in 0..sign_ins {
+        let connection = backend.connect_pre_login();
+        negotiate(&connection);
+        let login_id = start_sign_in(&connection);
+        let (status, credential) = await_sign_in_with_credential(&connection, &login_id);
+        assert!(matches!(status, GitHubSignInStatus::SignedIn { .. }));
+        credentials.push(credential.expect("each sign-in hands out a credential"));
+    }
+    fixture.join();
+
+    // The worker keeps the most recent credentials and revokes the oldest, so
+    // a client that never signs out cannot grow the store without bound.
+    assert_eq!(
+        store.authenticate(&credentials[0]).unwrap_err().code,
+        ErrorCode::AuthenticationFailed
+    );
+    for credential in &credentials[1..] {
+        assert!(
+            store.authenticate(credential).is_ok(),
+            "a recent credential still authenticates"
+        );
+    }
+    assert_eq!(
+        store
+            .participant_token_ids(github_participant_id(141030))
+            .unwrap()
+            .len(),
+        MAX_PERSON_TOKENS
+    );
 }

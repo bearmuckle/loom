@@ -691,6 +691,10 @@ impl InProcessBackend {
             self.last_feed_pruned_sequence
                 .store(feed.next_sequence.value(), Ordering::Relaxed);
             self.feed_bytes_since_prune.store(0, Ordering::Relaxed);
+            // The save rewrote the participant directory, which removes the
+            // stored sign-in credentials that hang off it, so they are written
+            // again while this save still owns the persist gate.
+            self.rewrite_person_token_rows();
         }
         result
     }

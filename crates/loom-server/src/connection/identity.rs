@@ -249,16 +249,17 @@ impl InProcessConnection {
         let spawn_result = thread::Builder::new()
             .name("github-sign-in".to_owned())
             .spawn(move || {
-                let status = match config.authenticator().poll(&device_for_poll) {
+                let (status, resume_token) = match config.authenticator().poll(&device_for_poll) {
                     Ok(token) => match github_account_ref_at(&token, &account_endpoint) {
-                        Ok(account) if !config.allows_login(&account.login) => {
+                        Ok(account) if !config.allows_login(&account.login) => (
                             GitHubSignInStatus::Failed {
                                 message: format!(
                                     "GitHub account '{}' is not allowed to sign in to this worker",
                                     account.login
                                 ),
-                            }
-                        }
+                            },
+                            None,
+                        ),
                         Ok(account) => {
                             let identity = config.identity_for(&account);
                             match connection.bind_participant(identity) {
@@ -272,24 +273,60 @@ impl InProcessConnection {
                                     // client's post-sign-in refresh already
                                     // sees the grants.
                                     connection.adopt_ownerless_sessions_for(&identity);
-                                    GitHubSignInStatus::SignedIn {
-                                        participant: identity,
-                                    }
+                                    // Also before the status is reported, so
+                                    // the first poll that reports `signed_in`
+                                    // carries the credential a later connection
+                                    // authenticates with. A failure costs only
+                                    // that: the person is signed in for this
+                                    // connection either way.
+                                    let resume_token = match connection
+                                        .backend
+                                        .issue_person_token(&identity)
+                                    {
+                                        Ok(resume_token) => resume_token,
+                                        Err(error) => {
+                                            log::warn!(
+                                                "[loom-server] {} signed in, but a credential for \
+                                                 a later connection could not be issued: {}",
+                                                identity.display_name,
+                                                error.message
+                                            );
+                                            None
+                                        }
+                                    };
+                                    (
+                                        GitHubSignInStatus::SignedIn {
+                                            participant: identity,
+                                        },
+                                        resume_token,
+                                    )
                                 }
-                                Err(error) => GitHubSignInStatus::Failed {
-                                    message: error.message,
-                                },
+                                Err(error) => (
+                                    GitHubSignInStatus::Failed {
+                                        message: error.message,
+                                    },
+                                    None,
+                                ),
                             }
                         }
-                        Err(error) => GitHubSignInStatus::Failed {
+                        Err(error) => (
+                            GitHubSignInStatus::Failed {
+                                message: error.message,
+                            },
+                            None,
+                        ),
+                    },
+                    Err(error) => (
+                        GitHubSignInStatus::Failed {
                             message: error.message,
                         },
-                    },
-                    Err(error) => GitHubSignInStatus::Failed {
-                        message: error.message,
-                    },
+                        None,
+                    ),
                 };
-                connection.backend.identity.finish(&worker_login_id, status);
+                connection
+                    .backend
+                    .identity
+                    .finish(&worker_login_id, status, resume_token);
             });
         if let Err(error) = spawn_result {
             self.backend.identity.remove(&login_id);
@@ -313,16 +350,23 @@ impl InProcessConnection {
 
     /// The state of a sign-in this connection started.
     pub(crate) fn github_sign_in_status(&self, login_id: &str) -> Result<ServerResponse> {
-        let status = self.backend.identity.status_for(
-            login_id,
-            Instant::now(),
-            self.participant().map(|participant| participant.id),
-        )?;
+        // Which sign-in a connection may read is keyed by the person its
+        // credential names, not by the person it is bound to: a sign-in binds
+        // a person to the connection just before the record is finished, so
+        // the binding can change between two polls of the same sign-in.
+        let requester = self
+            .auth_session()
+            .and_then(|auth| auth.participant().cloned())
+            .map(|participant| participant.id);
+        let sign_in = self
+            .backend
+            .identity
+            .status_for(login_id, Instant::now(), requester)?;
         Ok(ServerResponse::Access(AccessResponse::GitHubSignInStatus {
-            status,
-            // The credential is minted and stored by a follow-up change; until
-            // then a sign-in returns none.
-            resume_token: None,
+            status: sign_in.status,
+            // Taken out of the sign-in record, so the credential travels with
+            // the first poll that reports `signed_in` and no later one.
+            resume_token: sign_in.resume_token,
         }))
     }
 
@@ -372,12 +416,26 @@ impl InProcessConnection {
 
     /// Signs this connection out of GitHub, dropping its presence from every
     /// session roster a person can see.
+    ///
+    /// A connection that signed in with a person's credential stops that
+    /// credential, so signing out on one device ends it; an operator token the
+    /// connection authenticated with is kept.
     pub(crate) fn sign_out_github(&self) -> Result<ServerResponse> {
         let Some(participant) = self.unbind_participant() else {
             return Err(LoomError::invalid_request(
                 "this connection is not signed in to GitHub",
             ));
         };
+        if let Some(auth) = self.auth_session()
+            && let Err(error) = self.backend.revoke_person_token(&auth)
+        {
+            log::warn!(
+                "[loom-server] {} signed out, but the credential they signed in with could not \
+                 be revoked: {}",
+                participant.display_name,
+                error.message
+            );
+        }
         log::info!(
             "[loom-server] {} signed out of GitHub; participant {}",
             participant.display_name,

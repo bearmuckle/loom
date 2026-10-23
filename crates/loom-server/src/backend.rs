@@ -6,6 +6,7 @@ mod collaboration;
 mod constructors;
 mod filesystem;
 mod persistence;
+mod person_tokens;
 mod process_service;
 mod project;
 mod repository_service;

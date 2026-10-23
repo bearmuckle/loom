@@ -358,6 +358,7 @@ impl InProcessBackend {
             admissions: AdmissionService::new(),
             access: Arc::new(AccessService::new()),
             identity: IdentityService::new(),
+            person_tokens: Mutex::new(PersonTokenState::default()),
             collaboration: CollaborationService::new(),
             self_reference: Mutex::new(Weak::new()),
             request_lifecycle: RwLock::new(0),

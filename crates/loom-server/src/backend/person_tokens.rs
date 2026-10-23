@@ -1,0 +1,317 @@
+use super::*;
+
+use loom_core::ParticipantIdentity;
+use uuid::Uuid;
+
+impl InProcessBackend {
+    /// The sign-in credentials this worker hands out and keeps durable.
+    fn person_tokens(&self) -> MutexGuard<'_, PersonTokenState> {
+        self.person_tokens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The token store of the listener serving this backend, when one attached
+    /// it.
+    fn person_token_store(&self) -> Option<Arc<AuthTokenStore>> {
+        self.person_tokens().store.clone()
+    }
+
+    /// Attaches the store the listener authenticates connections with and
+    /// restores the durable sign-in credentials into it.
+    ///
+    /// Every listener attaches its own store, including the ones tests build
+    /// directly, so a credential a person keeps is recognized by the listener
+    /// that serves them. A restore failure is logged and never fails the
+    /// listener: a worker whose database is briefly unreadable still serves,
+    /// and people can sign in again instead of being locked out.
+    pub(crate) fn attach_person_token_store(&self, store: Arc<AuthTokenStore>) {
+        let restored = match self.restore_person_tokens(&store) {
+            Ok(restored) => restored,
+            Err(error) => {
+                log::warn!(
+                    "[loom-server] stored GitHub sign-in credentials could not be read; people \
+                     can sign in again, so no credential was restored: {}",
+                    error.message
+                );
+                Vec::new()
+            }
+        };
+        let mut state = self.person_tokens();
+        state.store = Some(store);
+        state.rows = restored
+            .into_iter()
+            .map(|row| (row.token_id, row))
+            .collect();
+    }
+
+    /// Registers every stored credential in `store`, returning the rows it
+    /// knows so they can be written again after a later state save.
+    fn restore_person_tokens(&self, store: &AuthTokenStore) -> Result<Vec<StoredPersonToken>> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(Vec::new());
+        };
+        let stored = persistence.load_person_tokens()?;
+        let mut restored = Vec::new();
+        for token in stored {
+            let token_id = Uuid::from_bytes(token.token_id).to_string();
+            let Some(participant) = self.access.known_identity(token.participant_id) else {
+                log::warn!(
+                    "[loom-server] a stored GitHub sign-in credential was dropped: participant \
+                     {} is not in the directory, so token {token_id} can no longer be used",
+                    token.participant_id
+                );
+                continue;
+            };
+            if let Err(error) = store.insert_restored(
+                token_id.clone(),
+                token.digest,
+                AuthorizationScope::all(),
+                participant.clone(),
+            ) {
+                log::warn!(
+                    "[loom-server] a stored GitHub sign-in credential of {} could not be \
+                     restored: token {token_id}: {}",
+                    participant.display_name,
+                    error.message
+                );
+                continue;
+            }
+            restored.push(token);
+        }
+        if !restored.is_empty() {
+            log::info!(
+                "[loom-server] restored {} GitHub sign-in credential(s) for a later connection",
+                restored.len()
+            );
+        }
+        Ok(restored)
+    }
+
+    /// Mints a credential that authenticates as `participant` on a later
+    /// connection, or `None` when no listener attached a store.
+    ///
+    /// The value is returned exactly once, to the connection that reports the
+    /// sign-in, and only its digest is kept. The person keeps the most recent
+    /// [`MAX_PERSON_TOKENS`] credentials: older ones are revoked and deleted,
+    /// so repeated sign-ins cannot grow the store without bound. A credential
+    /// that cannot be saved is revoked again before this returns, because one
+    /// the worker would not recognize after a restart is never handed out.
+    pub(crate) fn issue_person_token(
+        &self,
+        participant: &ParticipantIdentity,
+    ) -> Result<Option<String>> {
+        let Some(store) = self.person_token_store() else {
+            return Ok(None);
+        };
+        let issued = store.issue_for_participant(AuthorizationScope::all(), participant.clone())?;
+        let stored = StoredPersonToken {
+            token_id: stored_token_id(&issued.token_id)?,
+            digest: AuthTokenStore::token_digest(&issued.token),
+            participant_id: participant.id,
+            created_at: Timestamp::now(),
+        };
+        if let Some(persistence) = &self.persistence {
+            let saved = {
+                let _gate = self
+                    .state_persist_gate
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let saved = persistence.save_person_token(&stored);
+                if saved.is_ok() {
+                    self.person_tokens().rows.insert(stored.token_id, stored);
+                }
+                saved
+            };
+            if let Err(error) = saved {
+                // A credential the worker would not recognize after a restart
+                // is never handed out.
+                if let Err(revoke_error) = store.revoke(&issued.token_id) {
+                    log::warn!(
+                        "[loom-server] a GitHub sign-in credential of {} could not be saved or \
+                         revoked, so it stays unusable until the process restarts: {}",
+                        participant.display_name,
+                        revoke_error.message
+                    );
+                }
+                return Err(error);
+            }
+        }
+        self.prune_person_tokens(&store, participant);
+        Ok(Some(issued.token))
+    }
+
+    /// Writes the stored rows of the credentials this worker knows again.
+    ///
+    /// A full state save rewrites the participant directory as a whole, and a
+    /// credential row belongs to its person with a cascading delete, so that
+    /// save removes the rows. Writing them again right afterwards is what keeps
+    /// a credential a person holds across a restart. The caller holds the state
+    /// persist gate, so no credential is issued or revoked while this runs.
+    pub(crate) fn rewrite_person_token_rows(&self) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+        let rows = self
+            .person_tokens()
+            .rows
+            .values()
+            .copied()
+            .collect::<Vec<_>>();
+        for row in rows {
+            // A person who left the directory loses their credentials with the
+            // grant rows of the same save, so their credential is not written
+            // again.
+            if self.access.known_identity(row.participant_id).is_none() {
+                self.person_tokens().rows.remove(&row.token_id);
+                continue;
+            }
+            if let Err(error) = persistence.save_person_token(&row) {
+                log::warn!(
+                    "[loom-server] a stored GitHub sign-in credential of participant {} could \
+                     not be written again after a state save, so a restart would not restore it: \
+                     {}",
+                    row.participant_id,
+                    error.message
+                );
+            }
+        }
+    }
+
+    /// Revokes and deletes the credentials of `participant` beyond the cap,
+    /// oldest first.
+    fn prune_person_tokens(&self, store: &AuthTokenStore, participant: &ParticipantIdentity) {
+        let ids = match store.participant_token_ids(participant.id) {
+            Ok(ids) => ids,
+            Err(error) => {
+                log::warn!(
+                    "[loom-server] the GitHub sign-in credentials of {} could not be listed, so \
+                     none were pruned: {}",
+                    participant.display_name,
+                    error.message
+                );
+                return;
+            }
+        };
+        let excess = ids.len().saturating_sub(MAX_PERSON_TOKENS);
+        if excess == 0 {
+            return;
+        }
+        let mut pruned = 0_usize;
+        for token_id in ids.into_iter().take(excess) {
+            match store.revoke(&token_id) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    log::warn!(
+                        "[loom-server] the oldest GitHub sign-in credential of {} could not be \
+                         revoked: token {token_id}: {}",
+                        participant.display_name,
+                        error.message
+                    );
+                    continue;
+                }
+            }
+            if let Err(error) = store.delete(&token_id) {
+                log::warn!(
+                    "[loom-server] a revoked GitHub sign-in credential of {} was not dropped: \
+                     token {token_id}: {}",
+                    participant.display_name,
+                    error.message
+                );
+            }
+            self.delete_person_token_row(participant, &token_id);
+            pruned += 1;
+        }
+        log::info!(
+            "[loom-server] {} signed in on more than {MAX_PERSON_TOKENS} devices; {pruned} older \
+             credential(s) were revoked",
+            participant.display_name
+        );
+    }
+
+    /// Revokes the credential `session` authenticated with, when that
+    /// credential belongs to a person.
+    ///
+    /// An operator token is not bound to a person, so a sign-out never revokes
+    /// one, and a credential this backend does not know is left alone. The
+    /// revoked record is dropped as well, so nothing is left to revoke when the
+    /// person signs out again.
+    pub(crate) fn revoke_person_token(&self, session: &AuthSession) -> Result<()> {
+        let Some(participant) = session.participant() else {
+            return Ok(());
+        };
+        if !session.store().revoke(session.token_id())? {
+            return Ok(());
+        }
+        if let Err(error) = session.store().delete(session.token_id()) {
+            log::warn!(
+                "[loom-server] the revoked GitHub sign-in credential {} of {} is still in the \
+                 store: {}",
+                session.token_id(),
+                participant.display_name,
+                error.message
+            );
+        }
+        self.delete_person_token_row(participant, session.token_id());
+        log::info!(
+            "[loom-server] {} signed out, so credential {} was revoked for every later connection",
+            participant.display_name,
+            session.token_id()
+        );
+        Ok(())
+    }
+
+    /// Removes the durable row of a credential that no longer authenticates.
+    ///
+    /// A failure is logged instead of failing the caller: the credential is
+    /// already revoked in memory, so the sign-out or the pruning has taken
+    /// effect; only the stored row, which a restart would restore, is left.
+    fn delete_person_token_row(&self, participant: &ParticipantIdentity, token_id: &str) {
+        let Some(persistence) = &self.persistence else {
+            return;
+        };
+        let stored_id = match stored_token_id(token_id) {
+            Ok(stored_id) => stored_id,
+            Err(error) => {
+                log::warn!(
+                    "[loom-server] the stored row of a revoked GitHub sign-in credential of {} \
+                     could not be named: token {token_id}: {}",
+                    participant.display_name,
+                    error.message
+                );
+                return;
+            }
+        };
+        let _gate = self
+            .state_persist_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match persistence.delete_person_token(stored_id) {
+            Ok(_) => {}
+            Err(error) => log::warn!(
+                "[loom-server] the stored row of the revoked GitHub sign-in credential {} of {} \
+                 was not deleted, so a restart would restore it: {}",
+                token_id,
+                participant.display_name,
+                error.message
+            ),
+        }
+        self.person_tokens().rows.remove(&stored_id);
+    }
+}
+
+/// The durable form of a token id: the `Uuid` byte form the store's string id
+/// came from, so one credential is named the same in memory and in the
+/// database.
+fn stored_token_id(token_id: &str) -> Result<[u8; 16]> {
+    Uuid::parse_str(token_id)
+        .map(|uuid| *uuid.as_bytes())
+        .map_err(|error| {
+            LoomError::new(
+                ErrorCode::Internal,
+                format!("sign-in credential id is not a UUID: {error}"),
+                false,
+            )
+        })
+}

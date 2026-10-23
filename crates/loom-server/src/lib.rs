@@ -38,7 +38,7 @@ use loom_persistence::{
     DurableRunCheckpointWrite, DurableRunContextCheckpoint, DurableRunMessage,
     DurableRunMessageDelta, DurableRunRuntimeConfig, DurableRunSummary,
     DurableSessionProjectionRead, DurableSessionSettings, DurableStateWrite, FilePersistence,
-    Persistence, ProjectCancellationCascadeRecord,
+    Persistence, ProjectCancellationCascadeRecord, StoredPersonToken,
 };
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
@@ -117,6 +117,12 @@ use services::provider_credentials::{PinnedCredentialProvider, ProviderCredentia
 const FEED_PRUNE_AFTER_NEW_SEQUENCES: u64 = 64;
 const FEED_PRUNE_AFTER_NEW_BYTES: usize = 4 * 1024 * 1024;
 const MAX_NONTERMINAL_PROJECT_TASKS: usize = 50;
+/// Most sign-in credentials one person may hold at once.
+///
+/// A person signs in on every device they use, so the worker keeps the most
+/// recent few and revokes the oldest beyond this: a client that never signs out
+/// cannot grow the store without bound.
+const MAX_PERSON_TOKENS: usize = 8;
 
 #[derive(Deserialize)]
 struct GitHubApiRepository {
@@ -381,6 +387,10 @@ pub struct InProcessBackend {
     access: Arc<AccessService>,
     /// GitHub sign-in policy and pending sign-ins for people.
     identity: IdentityService,
+    /// The sign-in credentials a listener hands out and keeps durable, and the
+    /// store that authenticates them. An in-process backend has no listener and
+    /// issues none.
+    person_tokens: Mutex<PersonTokenState>,
     /// Per-run ordering of people's directions and control actions.
     collaboration: CollaborationService,
     self_reference: Mutex<Weak<InProcessBackend>>,
@@ -394,6 +404,19 @@ pub struct InProcessBackend {
     fail_next_state_save: AtomicBool,
     #[cfg(test)]
     project_cancellation_failpoint: AtomicUsize,
+}
+
+/// The sign-in credentials this worker hands out, and the store that
+/// authenticates them.
+#[derive(Default)]
+struct PersonTokenState {
+    /// The token store of the listener serving this backend, when one attached
+    /// it.
+    store: Option<Arc<AuthTokenStore>>,
+    /// The durable form of every credential the store knows, keyed by token id,
+    /// so the rows can be written again after a save of the participant
+    /// directory they hang off.
+    rows: BTreeMap<[u8; 16], StoredPersonToken>,
 }
 
 #[derive(Deserialize)]

@@ -424,6 +424,10 @@ impl RemoteServer {
         auth: Arc<AuthTokenStore>,
         config: RemoteServerConfig,
     ) -> Self {
+        // The store that authenticates this listener's connections also issues
+        // and revokes the credentials a GitHub sign-in hands out, and restores
+        // the ones stored before the last restart.
+        backend.attach_person_token_store(Arc::clone(&auth));
         Self {
             backend,
             auth,
@@ -2013,6 +2017,40 @@ mod unit_tests {
         ));
 
         drop(connection);
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_listener_attaches_the_token_store_it_authenticates_with() {
+        use loom_core::{ParticipantId, ParticipantIdentity};
+
+        let backend = InProcessBackend::new();
+        let auth = Arc::new(AuthTokenStore::new());
+        let server = RemoteServer::new(
+            backend.clone(),
+            auth.clone(),
+            RemoteServerConfig::local_ephemeral(),
+        )
+        .bind()
+        .await
+        .unwrap();
+
+        // The store the listener authenticates connections with is the one a
+        // sign-in mints its credential from, so a later connection is accepted
+        // by the same listener.
+        let person = ParticipantIdentity {
+            id: ParticipantId::new(),
+            display_name: "octocat".to_owned(),
+        };
+        let credential = backend
+            .issue_person_token(&person)
+            .unwrap()
+            .expect("a bound listener issues a credential for a person");
+        let session = auth
+            .authenticate(&credential)
+            .expect("the listener store authenticates the credential it issued");
+        assert_eq!(session.participant(), Some(&person));
+
         server.stop().await.unwrap();
     }
 
