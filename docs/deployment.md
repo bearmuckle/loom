@@ -131,8 +131,9 @@ acquire different things:
   the person starts read-only until an owner grants a role.
 - **Sign in to GitHub Copilot** — Settings → Providers, "GitHub Copilot". It
   gives the worker a GitHub Copilot model-provider credential. It is not a way
-  to join the roster: a connection that is waiting for a sign-in cannot reach
-  the Providers settings, and the credential belongs to the worker.
+  to join the roster: a connection that is waiting for a sign-in is refused the
+  provider requests, so the flow cannot complete before someone signs in, and
+  the credential belongs to the worker rather than to the person.
 - **Authorize GitHub repository access** — Settings → Providers, "GitHub
   repository access". It lets the worker clone, push, and open pull requests
   through the GitHub CLI app. It does not sign the person in to the worker.
