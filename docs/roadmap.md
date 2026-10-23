@@ -119,7 +119,7 @@ agent, observe its current step, approve an action, and retrieve its result.
 
 A scriptable, headless client of the existing versioned protocol for operators
 and automation, with no embedded backend and no second orchestration model. The
-working binary name is `loom-ctl`, the decision recorded from #330. M4.5 is
+working binary name is `loom-cli`, the decision recorded from #330. M4.5 is
 delivered as three reviewable slices:
 
 - **M4.5.1:** read-only verbs (`doctor`, `whoami`, `ls`, `get`, `events`,

@@ -1,4 +1,4 @@
-//! Argument parsing for `loom-ctl`.
+//! Argument parsing for `loom-cli`.
 //!
 //! Parsing is a two-phase split so that global flags are genuinely accepted
 //! anywhere: the first pass turns the tokens into flags and positional words,
@@ -25,9 +25,9 @@ const NAME_WORDS: usize = 6;
 /// The longest derived session name, in characters.
 const NAME_MAX_CHARS: usize = 48;
 /// The name `run` uses when the task has no words at all.
-const NAME_FALLBACK: &str = "loom-ctl run";
+const NAME_FALLBACK: &str = "loom-cli run";
 
-pub(crate) const HELP: &str = r#"Usage: loom-ctl <verb> [flags]
+pub(crate) const HELP: &str = r#"Usage: loom-cli <verb> [flags]
 
 Verbs:
   doctor                            report the negotiated protocol,
@@ -568,7 +568,7 @@ fn read_task_file(path: &str) -> Result<String, String> {
 
 /// The session name a task derives when `--name` is absent: the task's first six
 /// whitespace-separated words, at most 48 characters, without trailing
-/// whitespace, and `loom-ctl run` when the task has no words.
+/// whitespace, and `loom-cli run` when the task has no words.
 pub(crate) fn derived_name(task: &str) -> String {
     let mut name = String::new();
     for word in task.split_whitespace().take(NAME_WORDS) {

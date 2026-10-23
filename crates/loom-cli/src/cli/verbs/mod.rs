@@ -18,8 +18,8 @@ use loom_protocol::{
 };
 use serde_json::Value;
 
-use crate::ctl::args::{Invocation, Verb};
-use crate::ctl::{client::Client, exit};
+use crate::cli::args::{Invocation, Verb};
+use crate::cli::{client::Client, exit};
 
 /// Why a verb produced no success payload.
 #[derive(Debug)]
