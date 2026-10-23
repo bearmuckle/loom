@@ -1,17 +1,17 @@
 use super::{
     AboutBackend, AboutLink, AgentActivityData, AgentActivityRecord, AgentActivityStatus,
-    CONNECTION_LOST_COPY, CompletionKind, FileActivityOperation, LOOM_REPOSITORY_URL,
-    MAX_RUN_FAILURE_REASON_CHARS, ToolPart, ToolPartStatus, about_backend, about_backend_label,
-    about_build_version, about_git_revision, about_links, about_platform_label, about_protocol,
-    about_version_label, action_kind_label, activity_output, agent_question,
-    approval_policy_status_text, change_kind_label, command_line, command_purpose,
-    commands_matching, completion_for_value, disconnected_screen, endpoint_host, endpoint_label,
-    has_block_markdown, humanize_tool_output, is_redundant_completion_summary, rgb,
-    run_failure_reason, run_state_color, run_state_label, session_is_active, session_status_pill,
-    source_mount_path, tool_denial_count, tool_detail, tool_failure_count, tool_failure_reason,
-    tool_group_label, tool_group_status, tool_icon, tool_needs_attention, tool_outcome_notes,
-    tool_part_from_activity, tool_part_from_policy, tool_policy_note, tool_shows_output,
-    tool_status, tool_title, tool_title_for_activity, tool_usage_label, tool_usage_summary,
+    CompletionKind, FileActivityOperation, LOOM_REPOSITORY_URL, MAX_RUN_FAILURE_REASON_CHARS,
+    ToolPart, ToolPartStatus, about_backend, about_backend_label, about_build_version,
+    about_git_revision, about_links, about_platform_label, about_protocol, about_version_label,
+    action_kind_label, activity_output, agent_question, approval_policy_status_text,
+    change_kind_label, command_line, command_purpose, commands_matching, completion_for_value,
+    disconnected_screen, endpoint_host, endpoint_label, has_block_markdown, humanize_tool_output,
+    is_redundant_completion_summary, rgb, run_failure_reason, run_state_color, run_state_label,
+    session_is_active, session_status_pill, source_mount_path, tool_denial_count, tool_detail,
+    tool_failure_count, tool_failure_reason, tool_group_label, tool_group_status, tool_icon,
+    tool_needs_attention, tool_outcome_notes, tool_part_from_activity, tool_part_from_policy,
+    tool_policy_note, tool_shows_output, tool_status, tool_title, tool_title_for_activity,
+    tool_usage_label, tool_usage_summary,
 };
 use gpui_kit::assets::IconName as AssetIconName;
 use loom_core::{
@@ -1153,20 +1153,22 @@ fn disconnected_screen_copy_distinguishes_first_connect_from_connection_loss() {
     assert_eq!(fresh.heading, "No worker connected");
     assert!(!fresh.reconnect);
     assert!(fresh.details.is_none());
+    // A page that never had a worker is onboarded by the card itself: its
+    // primary control opens Settings, so it promises nothing automatic.
     assert_eq!(
-        fresh.footer,
-        "Not connected  ·  Connect a worker in Settings"
+        fresh.detail,
+        "Connect a worker in Settings to open your projects."
     );
 
     let lost = disconnected_screen(Some("the connection closed (code 1006)"));
-    assert_eq!(lost.heading, "Connection lost");
+    assert_eq!(lost.heading, "Reconnecting to your worker");
     assert!(lost.reconnect);
-    // The copy says what happened and what the client is doing, in plain
-    // language: no internal code, no raw transport reason, and no nested
+    // The copy says what happened and what it means for the user's work, in
+    // plain language: no internal code, no raw transport reason, and no nested
     // parentheses around a reason that already has its own.
     assert_eq!(
         lost.detail,
-        format!("{CONNECTION_LOST_COPY} Your projects and sessions are unchanged.")
+        "Loom lost the connection and is trying again. Your projects and sessions are unchanged."
     );
     for raw in [
         "1006",
@@ -1186,21 +1188,14 @@ fn disconnected_screen_copy_distinguishes_first_connect_from_connection_loss() {
         lost.details.as_deref(),
         Some("the connection closed (code 1006)")
     );
-    assert_eq!(
-        lost.empty,
-        "Reconnecting to reload your projects and sessions."
-    );
-    assert_eq!(lost.footer, "Disconnected  ·  reconnecting automatically");
 
-    // The attempt indicator is filled in from the reconnecting state, so the
-    // disconnected screen shows one progress line rather than a reason.
+    // The card shows one progress line under the copy, filled in from the
+    // reconnecting state, so the attempt count is never repeated elsewhere.
     let reconnecting = disconnected_screen(Some("the connection closed (code 1006)"))
-        .with_progress(Some(
-            "Reconnecting automatically · attempt 2 of 8 · next attempt in about 1s".to_owned(),
-        ));
+        .with_progress(Some("Attempt 2 of 8 · next attempt in about 1s".to_owned()));
     assert_eq!(
         reconnecting.progress.as_deref(),
-        Some("Reconnecting automatically · attempt 2 of 8 · next attempt in about 1s")
+        Some("Attempt 2 of 8 · next attempt in about 1s")
     );
     assert_eq!(disconnected_screen(None).progress, None);
 }

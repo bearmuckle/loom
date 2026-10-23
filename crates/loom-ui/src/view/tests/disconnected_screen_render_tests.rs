@@ -1,198 +1,267 @@
-//! Render tests for the browser disconnected (worker reconnect) screen.
+//! Render tests for the browser's startup and reconnect card.
 //!
-//! The screen itself is compiled only for wasm, where these tests cannot render
-//! it, so they compose the layout helpers that `render_startup_screen` uses and
-//! assert the reconnect controls stay inside the viewport. The narrow-phone
-//! case is the regression: the copy, the connection reason and the controls
-//! shared one unconstrained row and pushed the controls past the right edge.
+//! `render_startup_screen` runs in the browser, where these tests cannot go, so
+//! the screen is compiled on native test builds too and rendered here through a
+//! `LoomView` in the disconnected state. The card is the whole screen: a
+//! sidebar or an empty workspace pane beside it is what made startup read as a
+//! half-loaded client, so the card has to stay centred and its controls have to
+//! stay inside the viewport on a phone.
 
-use super::{
-    DisconnectedScreen, disconnected_footer, disconnected_header, disconnected_header_actions,
-    disconnected_header_copy, disconnected_screen, responsive_layout,
-};
-use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::{Icon, IconName, Sizable};
+use super::*;
 use gpui_kit::test::TestWindowExt;
-use gpui_kit::{Context, TestAppContext, TestSupportExt as _, Window, div, prelude::*, px, size};
+use gpui_kit::{Context, Entity, Render, TestAppContext, Window, WindowHandle, px, size};
 
-/// A close reason long enough to overflow the header when the copy cannot
-/// shrink or wrap.
+/// A close reason long enough to overflow the card when the copy cannot wrap.
 const LONG_CLOSE_REASON: &str = "the transport reported an unexpected end of stream while the worker was draining its queue and no close frame arrived 0123456789abcdefghijklmnopqrstuvwxyz";
 
-/// The header and the status bar of the disconnected screen, composed the way
-/// `render_startup_screen` composes them.
-struct DisconnectedChrome {
-    screen: DisconnectedScreen,
+/// The transport failure a lost worker reports.
+fn closed_connection() -> LoomError {
+    LoomError::new(ErrorCode::RequestCancelled, LONG_CLOSE_REASON, true)
 }
 
-impl DisconnectedChrome {
-    fn with_long_close_reason() -> Self {
-        let mut screen = disconnected_screen(Some(LONG_CLOSE_REASON));
-        screen.footer = "Disconnected  ·  a deliberately long status line that has to wrap instead of spilling outside its bar";
-        Self { screen }
+/// A window that renders only the screen under test, so the workspace behind it
+/// cannot satisfy or break the assertions.
+struct StatusScreenHost {
+    view: Entity<LoomView>,
+}
+
+impl Render for StatusScreenHost {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.view
+            .update(cx, |view, cx| view.render_startup_screen(window, cx))
     }
 }
 
-impl Render for DisconnectedChrome {
-    fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let layout = responsive_layout(window.bounds().size.width);
-        let screen = &self.screen;
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .child(
-                disconnected_header(layout)
-                    .child(
-                        disconnected_header_copy(layout)
-                            .id("disconnected-header-copy")
-                            .test_support()
-                            .child(screen.heading)
-                            .child(div().text_xs().child(screen.detail.clone())),
-                    )
-                    .child(
-                        disconnected_header_actions()
-                            .child(
-                                Button::new("disconnected-reconnect")
-                                    .label("Reconnect")
-                                    .small()
-                                    .when(layout.phone, |button| button.h(layout.control_size())),
-                            )
-                            .child(
-                                Button::new("disconnected-open-settings")
-                                    .icon(Icon::new(IconName::Settings))
-                                    .ghost()
-                                    .when(layout.phone, |button| {
-                                        button
-                                            .large()
-                                            .h(layout.control_size())
-                                            .w(layout.control_size())
-                                    })
-                                    .when(!layout.phone, |button| button.xsmall()),
-                            ),
-                    ),
-            )
-            .child(div().flex_1())
-            .child(
-                disconnected_footer(layout)
-                    .id("disconnected-footer")
-                    .test_support()
-                    .child(screen.footer),
-            )
-    }
+/// Opens a window on a view that lost its worker, with an automatic reconnect
+/// in flight.
+fn open_status_window(
+    cx: &mut TestAppContext,
+    width: f32,
+    height: f32,
+    configure: impl FnOnce(&mut LoomView),
+) -> WindowHandle<StatusScreenHost> {
+    cx.open_window(size(px(width), px(height)), |_, cx| {
+        let view = cx.new(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.browser_connection_lost = Some(LONG_CLOSE_REASON.to_owned());
+            view.reconnecting = Some(Reconnecting::new(
+                ConnectivityFailure::ConnectionLost,
+                &closed_connection(),
+            ));
+            configure(&mut view);
+            view
+        });
+        StatusScreenHost { view }
+    })
+}
+
+/// Whether `element` is painted inside `card`.
+fn inside(
+    element: gpui_kit::Bounds<gpui_kit::Pixels>,
+    card: gpui_kit::Bounds<gpui_kit::Pixels>,
+) -> bool {
+    element.left() >= card.left()
+        && element.right() <= card.right()
+        && element.top() >= card.top()
+        && element.bottom() <= card.bottom()
 }
 
 #[gpui_kit::test]
-fn phone_reconnect_controls_stack_below_the_copy_inside_the_viewport(cx: &mut TestAppContext) {
+fn the_reconnect_screen_is_one_centred_card(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    let handle = cx.open_window(size(px(390.), px(844.)), |_, _| {
-        DisconnectedChrome::with_long_close_reason()
-    });
+    let handle = open_status_window(cx, 1280., 800., |_| {});
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
         let viewport = window.viewport_size();
-        let copy = window.find("disconnected-header-copy").bounds();
-        let reconnect = window.find("disconnected-reconnect");
-        let settings = window.find("disconnected-open-settings");
+        let card = window.find("workspace-status-card").bounds();
+        // Centred on both axes: a sidebar or an empty workspace pane beside the
+        // card would push it off centre, which is what made startup read as a
+        // half-loaded client.
+        let centre_x = card.left() + card.size.width * 0.5;
+        let centre_y = card.top() + card.size.height * 0.5;
         assert!(
-            reconnect.visible(),
-            "the reconnect button must be reachable on a phone"
+            (centre_x - viewport.width * 0.5).abs() <= px(1.),
+            "the card is not horizontally centred: {card:?} in {viewport:?}"
         );
         assert!(
-            settings.visible(),
-            "the worker settings button must be reachable on a phone"
+            (centre_y - viewport.height * 0.5).abs() <= px(1.),
+            "the card is not vertically centred: {card:?} in {viewport:?}"
         );
-        let reconnect_bounds = reconnect.bounds();
+        // One bounded card, so the copy and the controls keep a readable width
+        // instead of stretching across a desktop window.
+        assert_eq!(card.size.width, px(420.));
+        assert!(card.size.height < viewport.height * 0.5, "{card:?}");
+
+        // The spinner, the heading, the one detail line and the one progress
+        // line all live inside the card, in that order.
+        let spinner = window.find("workspace-status-spinner").bounds();
+        let heading = window.find("workspace-status-heading").bounds();
+        let detail = window.find("workspace-status-detail").bounds();
+        let progress = window.find("workspace-status-progress").bounds();
+        for (id, element) in [
+            ("workspace-status-spinner", spinner),
+            ("workspace-status-heading", heading),
+            ("workspace-status-detail", detail),
+            ("workspace-status-progress", progress),
+        ] {
+            assert!(inside(element, card), "{id} escaped the card: {element:?}");
+        }
         assert!(
-            reconnect_bounds.top() >= copy.bottom(),
-            "the controls should move below the copy on a phone: {reconnect_bounds:?} vs {copy:?}"
+            spinner.bottom() <= heading.top(),
+            "the spinner follows the heading"
         );
-        for (id, bounds) in [
-            ("disconnected-reconnect", reconnect_bounds),
-            ("disconnected-open-settings", settings.bounds()),
+        assert!(
+            heading.bottom() <= detail.top(),
+            "the detail follows the heading"
+        );
+        assert!(
+            detail.bottom() <= progress.top(),
+            "the progress follows the detail"
+        );
+
+        // Retry now and Settings sit under the copy, inside the card.
+        let retry = window.find("workspace-status-primary");
+        let settings = window.find("workspace-status-settings");
+        assert!(retry.visible(), "the retry control is missing");
+        assert!(settings.visible(), "the settings control is missing");
+        let retry = retry.bounds();
+        let settings = settings.bounds();
+        assert!(
+            inside(retry, card),
+            "the retry control escaped the card: {retry:?}"
+        );
+        assert!(
+            inside(settings, card),
+            "the settings control escaped the card: {settings:?}"
+        );
+        assert!(
+            progress.bottom() <= retry.top(),
+            "the controls follow the progress line"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn phone_reconnect_controls_stay_inside_the_card_and_the_viewport(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = open_status_window(cx, 390., 844., |_| {});
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let viewport = window.viewport_size();
+        let card = window.find("workspace-status-card").bounds();
+        let retry = window.find("workspace-status-primary").bounds();
+        let settings = window.find("workspace-status-settings").bounds();
+        for (id, element) in [
+            ("workspace-status-card", card),
+            ("workspace-status-primary", retry),
+            ("workspace-status-settings", settings),
         ] {
             assert!(
-                bounds.size.width > px(0.),
-                "{id} collapsed to nothing: {bounds:?}"
+                element.size.width > px(0.),
+                "{id} collapsed to nothing: {element:?}"
             );
             assert!(
-                bounds.right() <= viewport.width,
-                "{id} ran off the right edge: {bounds:?}"
+                element.right() <= viewport.width,
+                "{id} ran off the right edge: {element:?}"
             );
             assert!(
-                bounds.bottom() <= viewport.height,
-                "{id} ran off the bottom: {bounds:?}"
+                element.bottom() <= viewport.height,
+                "{id} ran off the bottom: {element:?}"
             );
         }
         // Phone controls use finger-sized targets.
-        assert_eq!(reconnect_bounds.size.height, px(44.));
-        assert_eq!(settings.bounds().size.width, px(44.));
+        assert_eq!(retry.size.height, px(44.));
+        assert_eq!(settings.size.width, px(44.));
     })
     .unwrap();
 }
 
 #[gpui_kit::test]
-fn narrow_phone_reconnect_controls_stay_inside_the_viewport(cx: &mut TestAppContext) {
+fn a_narrow_phone_wraps_the_copy_instead_of_overflowing_the_card(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    let handle = cx.open_window(size(px(280.), px(600.)), |_, _| {
-        DisconnectedChrome::with_long_close_reason()
-    });
+    let handle = open_status_window(cx, 280., 600., |_| {});
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
         let viewport = window.viewport_size();
-        for id in ["disconnected-reconnect", "disconnected-open-settings"] {
-            let bounds = window.find(id).bounds();
+        let card = window.find("workspace-status-card").bounds();
+        assert!(
+            card.bottom() <= viewport.height,
+            "the card ran off the bottom: {card:?}"
+        );
+        let detail = window.find("workspace-status-detail").bounds();
+        assert!(
+            detail.size.height > px(30.),
+            "the detail line did not wrap inside the card: {detail:?}"
+        );
+        assert!(
+            inside(detail, card),
+            "the detail escaped the card: {detail:?}"
+        );
+        let retry = window.find("workspace-status-primary").bounds();
+        assert!(
+            inside(retry, card),
+            "the retry control escaped the card: {retry:?}"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_spent_reconnect_schedule_stops_the_spinner_and_keeps_the_retry(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = open_status_window(cx, 1280., 800., |view| {
+        if let Some(state) = view.reconnecting.as_mut() {
+            while state.take_attempt().is_some() {}
+        }
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        // The schedule stopped on its own, so the card stops claiming work is
+        // in flight and offers the control that starts it again.
+        assert!(
+            window.try_find("workspace-status-spinner").is_none(),
+            "a spent schedule must not keep spinning"
+        );
+        assert!(
+            window.find("workspace-status-primary").visible(),
+            "a spent schedule has to leave a way to try again"
+        );
+        assert!(
+            window.find("workspace-status-progress").visible(),
+            "the card says the automatic attempts stopped"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_startup_in_flight_shows_progress_and_offers_no_actions(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = open_status_window(cx, 1280., 800., |view| {
+        // A bootstrap in flight is progress, not a failure: no reconnect, no
+        // settings, and no raw details.
+        view.browser_starting = true;
+        view.browser_connection_lost = None;
+        view.reconnecting = None;
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.find("workspace-status-spinner").visible(),
+            "a startup in flight has to report that it is working"
+        );
+        for id in [
+            "workspace-status-primary",
+            "workspace-status-settings",
+            "workspace-status-details",
+            "workspace-status-progress",
+        ] {
             assert!(
-                bounds.size.width > px(0.),
-                "{id} collapsed to nothing: {bounds:?}"
-            );
-            assert!(
-                bounds.right() <= viewport.width,
-                "{id} ran off the right edge: {bounds:?}"
+                window.try_find(id).is_none(),
+                "{id} is offered while the client is still connecting"
             );
         }
-        // The status bar grows to fit a wrapped line rather than spilling.
-        let footer = window.find("disconnected-footer").bounds();
-        assert!(
-            footer.size.height >= px(24.),
-            "the status bar collapsed: {footer:?}"
-        );
-        assert!(
-            footer.bottom() <= viewport.height,
-            "the status bar ran off the bottom: {footer:?}"
-        );
-    })
-    .unwrap();
-}
-
-#[gpui_kit::test]
-fn desktop_reconnect_controls_share_the_header_row(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let handle = cx.open_window(size(px(1280.), px(800.)), |_, _| {
-        DisconnectedChrome::with_long_close_reason()
-    });
-    cx.update_window(handle.into(), |_, window, cx| {
-        window.render_frame(cx);
-        let viewport = window.viewport_size();
-        let copy = window.find("disconnected-header-copy").bounds();
-        let reconnect = window.find("disconnected-reconnect").bounds();
-        assert!(
-            reconnect.top() < copy.bottom(),
-            "the controls should sit beside the copy on a wide layout: {reconnect:?} vs {copy:?}"
-        );
-        let settings = window.find("disconnected-open-settings").bounds();
-        assert!(
-            reconnect.right() <= viewport.width,
-            "the reconnect button ran off the right edge: {reconnect:?}"
-        );
-        assert!(
-            settings.right() <= viewport.width,
-            "the settings button ran off the right edge: {settings:?}"
-        );
-        assert!(
-            settings.right() > reconnect.right(),
-            "the settings button should follow the reconnect button: {settings:?} vs {reconnect:?}"
-        );
     })
     .unwrap();
 }

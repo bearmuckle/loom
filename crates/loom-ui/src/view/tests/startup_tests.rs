@@ -124,7 +124,8 @@ fn a_sub_agent_without_its_root_lands_as_itself() {
 }
 
 /// The startup screen never reads as a failure: no reconnect action, no raw
-/// details, and copy that says what the client is doing.
+/// details, and copy that says what the client is doing. It offers no actions
+/// at all, because a bootstrap in flight is progress.
 #[test]
 fn the_startup_screen_offers_progress_instead_of_a_settings_prompt() {
     let connecting = startup_screen(false);
@@ -132,20 +133,15 @@ fn the_startup_screen_offers_progress_instead_of_a_settings_prompt() {
     assert!(!connecting.reconnect);
     assert!(connecting.details.is_none());
     assert!(connecting.progress.is_none());
-    assert_eq!(connecting.footer, "Connecting to the worker");
 
     let opening = startup_screen(true);
     assert_eq!(opening.heading, "Opening your most recent project");
     assert!(!opening.reconnect);
     assert!(opening.details.is_none());
-    assert_eq!(
-        opening.footer,
-        "Connected  ·  opening your most recent project"
-    );
+    assert!(opening.progress.is_none());
     // The two phases say different things, so neither can be mistaken for the
-    // disconnected screen's "connect a worker" or "connection lost" copy.
+    // disconnected screen's "connect a worker" or "reconnecting" copy.
     assert_ne!(connecting.detail, opening.detail);
-    assert_ne!(connecting.empty, opening.empty);
     assert_ne!(connecting.heading, disconnected_screen(None).heading);
     assert_ne!(
         opening.heading,

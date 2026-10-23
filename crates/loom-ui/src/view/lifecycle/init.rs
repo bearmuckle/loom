@@ -445,8 +445,6 @@ impl LoomView {
             rename_dialog: None,
             project_delete_dialog: None,
             source_dialog: None,
-            #[cfg(target_family = "wasm")]
-            welcome_dialog_dismissed: false,
             demo_workspace,
             login_enabled: true,
             github_connected: false,
@@ -847,8 +845,6 @@ impl LoomView {
             rename_dialog: None,
             project_delete_dialog: None,
             source_dialog: None,
-            #[cfg(target_family = "wasm")]
-            welcome_dialog_dismissed: false,
             demo_workspace: demo_mode,
             login_enabled: false,
             github_connected: false,
@@ -1079,8 +1075,6 @@ impl LoomView {
             rename_dialog: None,
             project_delete_dialog: None,
             source_dialog: None,
-            #[cfg(target_family = "wasm")]
-            welcome_dialog_dismissed: false,
             demo_workspace: false,
             login_enabled: true,
             github_connected: false,
@@ -1461,8 +1455,6 @@ impl LoomView {
             rename_dialog: None,
             project_delete_dialog: None,
             source_dialog: None,
-            #[cfg(target_family = "wasm")]
-            welcome_dialog_dismissed: false,
             demo_workspace: false,
             archived_sessions: ArchivedSessionsState::default(),
             login_enabled: true,
@@ -2252,6 +2244,24 @@ impl LoomView {
             });
         })
         .detach();
+    }
+
+    /// The reconnect card's primary control.
+    ///
+    /// A running schedule already retries on its own, so the control asks for
+    /// the same attempt immediately instead of waiting out the backoff. Without
+    /// a schedule (a bootstrap that failed before any request recorded a
+    /// connectivity failure) it reopens the browser transport instead.
+    #[cfg(any(target_family = "wasm", test))]
+    pub(crate) fn retry_worker_connection(&mut self, cx: &mut Context<Self>) {
+        if self.reconnecting.is_some() {
+            self.retry_status_action(cx);
+            return;
+        }
+        #[cfg(target_family = "wasm")]
+        self.reconnect_browser(cx);
+        #[cfg(not(target_family = "wasm"))]
+        let _ = cx;
     }
 
     /// Ends the browser startup screen once the landing project is on screen.

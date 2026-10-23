@@ -174,7 +174,7 @@ fn reconnecting_state_keeps_one_message_with_a_moving_attempt_indicator(cx: &mut
         assert_eq!(state.failure(), ConnectivityFailure::ConnectionLost);
         assert_eq!(
             state.progress(),
-            "Reconnecting automatically · attempt 1 of 8 · next attempt in about 1s"
+            "Attempt 1 of 8 · next attempt in about 1s"
         );
         assert_eq!(state.retry_label(), "Retry now");
         assert!(state.text().starts_with(CONNECTION_LOST_COPY));
@@ -184,7 +184,7 @@ fn reconnecting_state_keeps_one_message_with_a_moving_attempt_indicator(cx: &mut
         );
 
         assert_eq!(state.take_attempt(), Some(500));
-        assert!(state.progress().contains("attempt 2 of 8"));
+        assert!(state.progress().contains("Attempt 2 of 8"));
 
         // A later failure of the same kind keeps the state and its counter: one
         // state, not a stream of coded errors.
@@ -196,7 +196,7 @@ fn reconnecting_state_keeps_one_message_with_a_moving_attempt_indicator(cx: &mut
                 true,
             ),
         );
-        assert!(state.progress().contains("attempt 2 of 8"));
+        assert!(state.progress().contains("Attempt 2 of 8"));
         assert!(
             state
                 .details()
@@ -243,13 +243,13 @@ fn a_connectivity_failure_shows_one_plain_language_reconnecting_state(cx: &mut T
             banner
                 .progress
                 .as_deref()
-                .is_some_and(|progress| progress.contains("attempt 1 of 8"))
+                .is_some_and(|progress| progress.contains("Attempt 1 of 8"))
         );
         // The manual path is a control, not a sentence.
         assert!(banner.retryable);
         assert!(
             view.reconnect_progress()
-                .is_some_and(|progress| progress.contains("attempt 1 of 8"))
+                .is_some_and(|progress| progress.contains("Attempt 1 of 8"))
         );
 
         // Repeated failures while the worker stays down update that one state

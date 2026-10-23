@@ -178,11 +178,12 @@ impl LoomView {
         self.reload_sessions(cx);
     }
 
-    /// Runs the status banner's Retry control.
+    /// Runs the retry control of the reconnecting notice and the reconnect
+    /// card.
     ///
-    /// Only the reconnecting notice offers the control, so it restarts the
-    /// schedule and attempts immediately: a spent schedule can run again, and
-    /// a running one is asked to try now instead of waiting out its backoff.
+    /// Both surfaces show the same state, so a retry restarts the schedule and
+    /// attempts immediately: a spent schedule can run again, and a running one
+    /// is asked to try now instead of waiting out its backoff.
     pub(crate) fn retry_status_action(&mut self, cx: &mut Context<Self>) {
         let Some(state) = self.reconnecting.as_mut() else {
             return;

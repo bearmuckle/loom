@@ -12,15 +12,16 @@ use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::base::{Disableable, Selectable, TextSelectionLayer};
 use gpui_kit::component::bubble::{Bubble, BubbleContent, BubbleVariant};
 use gpui_kit::component::button::{Button, ButtonVariants};
-// Only the wasm disconnected screen still uses the dialog component.
-#[cfg(target_family = "wasm")]
-use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::input::{
     Input as KitInput, InputEvent, InputState, Textarea, TextareaState,
 };
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::scroll::ScrollableElement;
+// Only the browser startup and reconnect card spins, and that card is
+// compiled for the browser and for its tests.
+#[cfg(any(target_family = "wasm", test))]
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{
     Icon, IconName, IndexPath, Sizable,
     badge::Badge,
@@ -344,10 +345,6 @@ use crate::{
 use log::info;
 
 use archive::ArchivedSessionsState;
-// Only the disconnected screen spells out the lost-connection sentence, and
-// that screen exists in the browser and in its tests.
-#[cfg(any(target_family = "wasm", test))]
-use connectivity::CONNECTION_LOST_COPY;
 use connectivity::{
     ConnectivityFailure, Reconnecting, classify_connectivity_failure, error_details,
 };
@@ -777,8 +774,6 @@ pub(crate) struct LoomView {
     /// is never removed without it.
     pub(crate) project_delete_dialog: Option<ProjectDeleteDialogState>,
     source_dialog: Option<SessionSourceDialog>,
-    #[cfg(target_family = "wasm")]
-    welcome_dialog_dismissed: bool,
     pub(crate) demo_workspace: bool,
     pub(crate) login_enabled: bool,
     pub(crate) github_connected: bool,
@@ -1382,29 +1377,34 @@ fn task_activity_indicator(index: usize, status: SessionStatusPill) -> gpui_kit:
         .into_any_element()
 }
 
-/// Copy for the browser's disconnected screen, which differs depending on
-/// whether the client never connected or lost a connection it once had.
+/// The single card the browser client shows while it has no workspace: its
+/// startup progress from the first connect until the landing project is on
+/// screen, and its reconnect state once the worker is lost.
 ///
-/// Compiled on native test builds so the copy is covered without a browser.
+/// The card is deliberately not a stand-in for the workspace. A sidebar and an
+/// empty pane would read as a half-loaded client, and the same reconnecting
+/// sentence in several places reads as noise. The heading says what the client
+/// is doing, one line says what it means for the user's work, and one progress
+/// line carries the attempt count. Compiled on native test builds so the copy
+/// and the card are covered without a browser.
 #[cfg(any(target_family = "wasm", test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DisconnectedScreen {
     pub(crate) heading: &'static str,
     pub(crate) detail: String,
     /// The raw transport close reason, kept behind the screen's details
-    /// affordance. The headline copy never interpolates it.
+    /// affordance. The heading copy never interpolates it.
     pub(crate) details: Option<String>,
-    /// The attempt indicator shown while an automatic reconnect is running.
+    /// The one progress line shown while an automatic reconnect runs.
     pub(crate) progress: Option<String>,
-    pub(crate) sidebar: &'static str,
-    pub(crate) empty: &'static str,
-    pub(crate) footer: &'static str,
+    /// Whether the card's primary control retries the worker connection,
+    /// rather than offering Settings on a page that never had a worker.
     pub(crate) reconnect: bool,
 }
 
 #[cfg(any(target_family = "wasm", test))]
 impl DisconnectedScreen {
-    /// Fills in the attempt indicator from the view's reconnecting state.
+    /// Fills in the progress line from the view's reconnecting state.
     pub(crate) fn with_progress(mut self, progress: Option<String>) -> Self {
         self.progress = progress;
         self
@@ -1415,26 +1415,22 @@ impl DisconnectedScreen {
 pub(crate) fn disconnected_screen(connection_lost: Option<&str>) -> DisconnectedScreen {
     match connection_lost {
         // The reason is a transport string, so it is not part of the copy: the
-        // user reads what happened and what the client is doing about it, and
-        // the raw reason stays behind the details affordance.
+        // user reads what happened and what it means, and the raw reason stays
+        // behind the details affordance.
         Some(reason) => DisconnectedScreen {
-            heading: "Connection lost",
-            detail: format!("{CONNECTION_LOST_COPY} Your projects and sessions are unchanged."),
+            heading: "Reconnecting to your worker",
+            detail: "Loom lost the connection and is trying again. Your projects and sessions \
+                     are unchanged."
+                .to_owned(),
             details: Some(reason.to_owned()),
             progress: None,
-            sidebar: "Reconnecting to the worker.",
-            empty: "Reconnecting to reload your projects and sessions.",
-            footer: "Disconnected  ·  reconnecting automatically",
             reconnect: true,
         },
         None => DisconnectedScreen {
             heading: "No worker connected",
-            detail: "Connect a worker in Settings to begin.".to_owned(),
+            detail: "Connect a worker in Settings to open your projects.".to_owned(),
             details: None,
             progress: None,
-            sidebar: "Connect a worker to load projects.",
-            empty: "Connect a worker to create a project.",
-            footer: "Not connected  ·  Connect a worker in Settings",
             reconnect: false,
         },
     }
@@ -1461,17 +1457,6 @@ pub(crate) fn startup_screen(connected: bool) -> DisconnectedScreen {
         },
         details: None,
         progress: None,
-        sidebar: "Loading projects…",
-        empty: if connected {
-            "Opening the most recent project…"
-        } else {
-            "Connecting to the worker…"
-        },
-        footer: if connected {
-            "Connected  ·  opening your most recent project"
-        } else {
-            "Connecting to the worker"
-        },
         reconnect: false,
     }
 }
@@ -1480,9 +1465,9 @@ pub(crate) fn startup_screen(connected: bool) -> DisconnectedScreen {
 ///
 /// A page that has a worker URL bootstraps at once and shows only the startup
 /// screen, so it must not start with the settings dialog covering that screen.
-/// A page without one is onboarded by the welcome dialog, whose button opens
-/// Settings. Neither first frame has a covering surface, so the saved settings
-/// decide nothing here.
+/// A page without one is onboarded by that screen's own Settings action, so it
+/// starts without a dialog too. Neither first frame has a covering surface, so
+/// the saved settings decide nothing here.
 #[cfg(any(target_family = "wasm", test))]
 pub(crate) fn browser_startup_covering_surface() -> Option<CoveringSurface> {
     None
@@ -2220,8 +2205,6 @@ impl LoomView {
             rename_dialog: None,
             project_delete_dialog: None,
             source_dialog: None,
-            #[cfg(target_family = "wasm")]
-            welcome_dialog_dismissed: false,
             demo_workspace: false,
             login_enabled: false,
             github_connected: false,

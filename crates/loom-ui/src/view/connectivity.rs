@@ -240,7 +240,11 @@ impl Reconnecting {
         self.details = error_details(error);
     }
 
-    /// The attempt or countdown indicator shown under the message.
+    /// The one progress line shown under the message.
+    ///
+    /// The attempt count and the wait stay on a single line so the reconnect
+    /// card and the status banner can show them without repeating the copy
+    /// above them.
     pub(crate) fn progress(&self) -> String {
         if self.schedule.exhausted() {
             return format!(
@@ -249,7 +253,7 @@ impl Reconnecting {
             );
         }
         format!(
-            "Reconnecting automatically · attempt {} of {} · next attempt in about {}s",
+            "Attempt {} of {} · next attempt in about {}s",
             self.schedule.attempts() + 1,
             self.schedule.max_attempts(),
             delay_seconds(self.schedule.next_delay_millis())

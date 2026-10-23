@@ -49,262 +49,201 @@ impl LoomView {
     }
 
     /// The screen the browser client shows while it has no workspace to show:
-    /// the startup skeleton while it connects and opens its landing project, or
-    /// the disconnected screen once it has no worker to reach.
-    #[cfg(target_family = "wasm")]
+    /// one centred card, either the startup progress while it connects and
+    /// opens its landing project, or the reconnect state once it has no worker
+    /// to reach.
+    ///
+    /// The card carries the whole screen. Painting a sidebar or an empty pane
+    /// around it would make the client look half loaded, so the surface behind
+    /// it stays empty until the workspace is ready to be revealed in one paint.
+    #[cfg(any(target_family = "wasm", test))]
     pub(crate) fn render_startup_screen(
         &self,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
         let layout = responsive_layout(window.bounds().size.width);
+        #[cfg(target_family = "wasm")]
+        let transport_connected = self.connected;
+        #[cfg(not(target_family = "wasm"))]
+        let transport_connected = self.is_connected();
         let screen = if self.browser_starting {
-            startup_screen(self.connected)
+            startup_screen(transport_connected)
         } else {
             disconnected_screen(self.browser_connection_lost.as_deref())
         }
         .with_progress(self.reconnect_progress());
+        // The spinner reports work in flight: a bootstrap, or an automatic
+        // reconnect whose schedule still has attempts left. A spent schedule
+        // stopped on its own, so it offers the retry control instead.
+        let busy = self.browser_starting
+            || self
+                .reconnecting
+                .as_ref()
+                .is_some_and(|state| !state.schedule().exhausted());
+        let retry_label = self
+            .reconnecting
+            .as_ref()
+            .map(|state| state.retry_label())
+            .unwrap_or("Reconnect");
         // A bootstrap in flight is progress, not a failure: it offers neither a
         // settings prompt nor a reconnect, which would only look like something
         // to fix while the client is already working on it.
-        let offer_worker_settings = !self.browser_starting;
+        let offer_actions = !self.browser_starting;
         let details = screen.details.clone();
         div()
             .size_full()
             .relative()
-            .flex()
-            .flex_col()
             .bg(rgb(0x111318))
             .text_color(rgb(0xe5e7eb))
             .child(
                 div()
-                    .flex_1()
+                    .size_full()
                     .flex()
-                    .relative()
-                    .overflow_hidden()
-                    .when(!layout.phone, |row| {
-                        row.child(
-                            div()
-                                .w(layout.sidebar_width)
-                                .h_full()
-                                .p_2()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .bg(rgb(0x17191f))
-                                .border_r_1()
-                                .border_color(rgb(0x30343f))
-                                .child(div().flex().items_center().justify_between().child(
-                                    div().text_sm().text_color(rgb(0xf3f4f6)).child("Projects"),
-                                ))
-                                .child(
+                    .items_center()
+                    .justify_center()
+                    .p_4()
+                    .child(
+                        div()
+                            .id("workspace-status-card")
+                            .test_support()
+                            .w_full()
+                            .max_w(px(420.))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_3()
+                            .p_6()
+                            .rounded_lg()
+                            .bg(rgb(0x171c25))
+                            .border_1()
+                            .border_color(rgb(0x293244))
+                            .when(busy, |card| {
+                                card.child(
                                     div()
-                                        .mt_1()
+                                        .id("workspace-status-spinner")
+                                        .test_support()
+                                        .child(Spinner::new().large()),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id("workspace-status-heading")
+                                    .test_support()
+                                    .text_lg()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_center()
+                                    .child(screen.heading),
+                            )
+                            .child(
+                                div()
+                                    .id("workspace-status-detail")
+                                    .test_support()
+                                    .text_sm()
+                                    .text_color(rgb(0x8f98a6))
+                                    .text_center()
+                                    .child(screen.detail.clone()),
+                            )
+                            // One progress line, so the attempt count never repeats the
+                            // copy above it.
+                            .when_some(screen.progress.clone(), |card, progress| {
+                                card.child(
+                                    div()
+                                        .id("workspace-status-progress")
+                                        .test_support()
                                         .text_xs()
-                                        .text_color(rgb(0x8f98a6))
-                                        .child("Projects"),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .p_3()
-                                        .rounded_lg()
-                                        .bg(rgb(0x111318))
-                                        .border_1()
-                                        .border_color(rgb(0x293244))
-                                        .text_sm()
                                         .text_color(rgb(0x64748b))
-                                        .child(screen.sidebar),
+                                        .text_center()
+                                        .child(progress),
                                 )
-                                .child(
+                            })
+                            // The raw close reason is a transport string, so it stays
+                            // behind this disclosure instead of in the copy.
+                            .when_some(details, |card, raw| {
+                                card.child(
                                     div()
                                         .flex()
-                                        .justify_end()
-                                        .border_t_1()
-                                        .border_color(rgb(0x30343f))
-                                        .pt_2()
-                                        .when(offer_worker_settings, |footer| {
-                                            footer.child(
-                                                Button::new("disconnected-settings")
+                                        .flex_col()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            Button::new("workspace-status-details")
+                                                .label(if self.status_details_open {
+                                                    "Hide details"
+                                                } else {
+                                                    "Details"
+                                                })
+                                                .ghost()
+                                                .xsmall()
+                                                .on_click(cx.listener(|view, _, _, cx| {
+                                                    view.toggle_status_details(cx);
+                                                })),
+                                        )
+                                        .when(self.status_details_open, |column| {
+                                            column.child(
+                                                div()
+                                                    .id("workspace-status-raw-details")
+                                                    .test_support()
+                                                    .text_xs()
+                                                    .text_color(rgb(0x64748b))
+                                                    .text_center()
+                                                    .child(raw),
+                                            )
+                                        }),
+                                )
+                            })
+                            .when(offer_actions, |card| {
+                                card.child(
+                                    div()
+                                        .mt_1()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            Button::new("workspace-status-primary")
+                                                .label(if screen.reconnect {
+                                                    retry_label
+                                                } else {
+                                                    "Open Settings"
+                                                })
+                                                .small()
+                                                .when(layout.phone, |button| {
+                                                    button.h(layout.control_size())
+                                                })
+                                                .on_click(cx.listener(|view, _, _, cx| {
+                                                    if view.browser_connection_lost.is_some() {
+                                                        view.retry_worker_connection(cx);
+                                                    } else {
+                                                        view.open_settings_from_menu(cx);
+                                                    }
+                                                })),
+                                        )
+                                        .when(screen.reconnect, |row| {
+                                            row.child(
+                                                Button::new("workspace-status-settings")
                                                     .icon(Icon::new(IconName::Settings))
                                                     .ghost()
-                                                    .xsmall()
+                                                    .when(layout.phone, |button| {
+                                                        button
+                                                            .large()
+                                                            .h(layout.control_size())
+                                                            .w(layout.control_size())
+                                                    })
+                                                    .when(!layout.phone, |button| button.xsmall())
                                                     .on_click(cx.listener(|view, _, _, cx| {
                                                         view.open_settings_from_menu(cx);
                                                     })),
                                             )
                                         }),
-                                ),
-                        )
-                    })
-                    .child(
-                        div()
-                            .flex_1()
-                            .h_full()
-                            .flex()
-                            .flex_col()
-                            .overflow_hidden()
-                            .child(
-                                disconnected_header(layout)
-                                    .child(
-                                        disconnected_header_copy(layout)
-                                            .child(screen.heading)
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(0x8f98a6))
-                                                    .child(screen.detail),
-                                            )
-                                            .when_some(screen.progress.clone(), |copy, progress| {
-                                                copy.child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(rgb(0x64748b))
-                                                        .child(progress),
-                                                )
-                                            })
-                                            // The raw close reason is a transport
-                                            // string, so it stays behind this
-                                            // disclosure instead of in the copy.
-                                            .when_some(details.clone(), |copy, raw| {
-                                                copy.child(
-                                                    div()
-                                                        .mt_1()
-                                                        .flex()
-                                                        .items_center()
-                                                        .gap_1()
-                                                        .child(
-                                                            Button::new("disconnected-details")
-                                                                .label(
-                                                                    if self.status_details_open {
-                                                                        "Hide details"
-                                                                    } else {
-                                                                        "Details"
-                                                                    },
-                                                                )
-                                                                .ghost()
-                                                                .xsmall()
-                                                                .on_click(cx.listener(
-                                                                    |view, _, _, cx| {
-                                                                        view.toggle_status_details(
-                                                                            cx,
-                                                                        )
-                                                                    },
-                                                                )),
-                                                        )
-                                                        .when(self.status_details_open, |row| {
-                                                            row.child(
-                                                                div()
-                                                                    .text_xs()
-                                                                    .text_color(rgb(0x64748b))
-                                                                    .child(raw),
-                                                            )
-                                                        }),
-                                                )
-                                            }),
-                                    )
-                                    .child(
-                                        disconnected_header_actions()
-                                            .when(
-                                                screen.reconnect && offer_worker_settings,
-                                                |row| {
-                                                    row.child(
-                                                        Button::new("disconnected-reconnect")
-                                                            .label("Reconnect")
-                                                            .small()
-                                                            .when(layout.phone, |button| {
-                                                                button.h(layout.control_size())
-                                                            })
-                                                            .on_click(cx.listener(
-                                                                |view, _, _, cx| {
-                                                                    view.reconnect_browser(cx);
-                                                                },
-                                                            )),
-                                                    )
-                                                },
-                                            )
-                                            .when(offer_worker_settings, |row| {
-                                                row.child(
-                                                    Button::new("disconnected-open-settings")
-                                                        .icon(Icon::new(IconName::Settings))
-                                                        .ghost()
-                                                        .when(layout.phone, |button| {
-                                                            button
-                                                                .large()
-                                                                .h(layout.control_size())
-                                                                .w(layout.control_size())
-                                                        })
-                                                        .when(!layout.phone, |button| {
-                                                            button.xsmall()
-                                                        })
-                                                        .on_click(cx.listener(|view, _, _, cx| {
-                                                            view.open_settings_from_menu(cx);
-                                                        })),
-                                                )
-                                            }),
-                                    ),
-                            )
-                            .child(div().flex_1().flex().items_center().justify_center())
-                            .child(
-                                div()
-                                    .px_4()
-                                    .py_3()
-                                    .border_t_1()
-                                    .border_color(rgb(0x30343f))
-                                    .child(
-                                        div()
-                                            .p_3()
-                                            .rounded_lg()
-                                            .bg(rgb(0x171c25))
-                                            .border_1()
-                                            .border_color(rgb(0x293244))
-                                            .text_sm()
-                                            .text_color(rgb(0x64748b))
-                                            .child(screen.empty),
-                                    ),
-                            )
-                            .when(
-                                startup_screen_shows_settings(
-                                    self.settings_open(),
-                                    self.browser_starting,
-                                ),
-                                |element| {
-                                    let section =
-                                        self.settings_section().unwrap_or(SettingsSection::Agents);
-                                    element.child(self.render_settings_dialog(section, layout, cx))
-                                },
-                            ),
+                                )
+                            }),
                     ),
             )
-            .child(disconnected_footer(layout).child(screen.footer))
             .when(
-                !self.settings_open()
-                    && !self.welcome_dialog_dismissed
-                    && !self.browser_starting
-                    && self.browser_connection_lost.is_none(),
+                startup_screen_shows_settings(self.settings_open(), self.browser_starting),
                 |element| {
-                    element.child(
-                    Dialog::new(cx)
-                        .title("You’re ready to go")
-                        .on_close(cx.listener(|view, _, _, cx| {
-                            view.welcome_dialog_dismissed = true;
-                            cx.notify();
-                        }))
-                        .keyboard(false)
-                        .overlay_closable(false)
-                        .w(px(460.))
-                        .child(div().text_sm().text_color(rgb(0x8f98a6)).child(
-                            "Connect a Loom worker from Settings to load your sessions and models.",
-                        ))
-                        .child(
-                            Button::new("disconnected-connect-worker")
-                                .label("Open Settings")
-                                .small()
-                                .on_click(cx.listener(|view, _, _, cx| {
-                                    view.open_settings_from_menu(cx);
-                                })),
-                        ),
-                )
+                    let section = self.settings_section().unwrap_or(SettingsSection::Agents);
+                    element.child(self.render_settings_dialog(section, layout, cx))
                 },
             )
             .into_any()
