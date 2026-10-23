@@ -23,6 +23,7 @@ impl InProcessBackend {
                 auth: Some(auth),
                 participant,
                 presence,
+                person_token: None,
             })),
             pre_login: false,
             max_response_bytes: None,

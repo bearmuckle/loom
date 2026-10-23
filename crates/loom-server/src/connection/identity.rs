@@ -283,7 +283,14 @@ impl InProcessConnection {
                                         .backend
                                         .issue_person_token(&identity)
                                     {
-                                        Ok(resume_token) => resume_token,
+                                        Ok(Some(issued)) => {
+                                            // The connection keeps only the id, so
+                                            // signing out here revokes the credential
+                                            // it hands to the client.
+                                            connection.remember_person_token(issued.token_id);
+                                            Some(issued.token)
+                                        }
+                                        Ok(None) => None,
                                         Err(error) => {
                                             log::warn!(
                                                 "[loom-server] {} signed in, but a credential for \
@@ -432,6 +439,20 @@ impl InProcessConnection {
             log::warn!(
                 "[loom-server] {} signed out, but the credential they signed in with could not \
                  be revoked: {}",
+                participant.display_name,
+                error.message
+            );
+        }
+        // A connection accepted without a credential holds no credential of its
+        // own, so the one its sign-in handed to the client is the only handle on
+        // that sign-in. Revoking it here is what makes signing out end it
+        // everywhere.
+        if let Some(token_id) = self.take_person_token()
+            && let Err(error) = self.backend.revoke_person_token_id(&token_id)
+        {
+            log::warn!(
+                "[loom-server] {} signed out, but the credential their sign-in issued could not be \
+                 revoked: {}",
                 participant.display_name,
                 error.message
             );

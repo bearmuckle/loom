@@ -914,6 +914,32 @@ fn signing_out_revokes_the_credential_the_connection_signed_in_with() {
 }
 
 #[test]
+fn signing_out_revokes_the_credential_a_pre_login_sign_in_issued() {
+    let fixture = GitHubFixture::start(1, 141030, "octocat");
+    let store = Arc::new(AuthTokenStore::new());
+    let backend = pre_login_backend_with_store(fixture.config(&["octocat"]), &store);
+    let connection = backend.connect_pre_login();
+    negotiate(&connection);
+    let login_id = start_sign_in(&connection);
+    let (_, credential) = await_sign_in_with_credential(&connection, &login_id);
+    let credential = credential.expect("a served sign-in hands out a credential");
+    fixture.join();
+    assert!(store.authenticate(&credential).is_ok());
+
+    // This connection holds no credential of its own, so the one its sign-in
+    // handed to the client is the only handle on that sign-in. Signing out
+    // revokes it, which is what ends the kept sign-in on the other device too.
+    assert!(matches!(
+        access(&connection, AccessRequest::SignOutGitHub).unwrap(),
+        AccessResponse::SignedOutGitHub
+    ));
+    assert_eq!(
+        store.authenticate(&credential).unwrap_err().code,
+        ErrorCode::AuthenticationFailed
+    );
+}
+
+#[test]
 fn a_sign_in_credential_survives_a_restart() {
     let directory = std::env::temp_dir().join(format!(
         "loom-server-sign-in-credential-{}",

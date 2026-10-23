@@ -2045,7 +2045,8 @@ mod unit_tests {
         let credential = backend
             .issue_person_token(&person)
             .unwrap()
-            .expect("a bound listener issues a credential for a person");
+            .expect("a bound listener issues a credential for a person")
+            .token;
         let session = auth
             .authenticate(&credential)
             .expect("the listener store authenticates the credential it issued");

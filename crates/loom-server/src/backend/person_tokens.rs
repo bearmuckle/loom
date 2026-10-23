@@ -3,6 +3,16 @@ use super::*;
 use loom_core::ParticipantIdentity;
 use uuid::Uuid;
 
+/// A credential a sign-in issued: the value to hand to the client, and the id
+/// that revokes it again.
+///
+/// The value is a secret and must travel only to the connection that signed in;
+/// the id is not.
+pub(crate) struct IssuedPersonToken {
+    pub(crate) token: String,
+    pub(crate) token_id: String,
+}
+
 impl InProcessBackend {
     /// The sign-in credentials this worker hands out and keeps durable.
     fn person_tokens(&self) -> MutexGuard<'_, PersonTokenState> {
@@ -100,7 +110,7 @@ impl InProcessBackend {
     pub(crate) fn issue_person_token(
         &self,
         participant: &ParticipantIdentity,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<IssuedPersonToken>> {
         let Some(store) = self.person_token_store() else {
             return Ok(None);
         };
@@ -138,7 +148,10 @@ impl InProcessBackend {
             }
         }
         self.prune_person_tokens(&store, participant);
-        Ok(Some(issued.token))
+        Ok(Some(IssuedPersonToken {
+            token: issued.token,
+            token_id: issued.token_id,
+        }))
     }
 
     /// Writes the stored rows of the credentials this worker knows again.
@@ -220,7 +233,7 @@ impl InProcessBackend {
                     error.message
                 );
             }
-            self.delete_person_token_row(participant, &token_id);
+            self.delete_person_token_row(&token_id);
             pruned += 1;
         }
         log::info!(
@@ -253,11 +266,40 @@ impl InProcessBackend {
                 error.message
             );
         }
-        self.delete_person_token_row(participant, session.token_id());
+        self.delete_person_token_row(session.token_id());
         log::info!(
             "[loom-server] {} signed out, so credential {} was revoked for every later connection",
             participant.display_name,
             session.token_id()
+        );
+        Ok(())
+    }
+
+    /// Revokes the credential a sign-in on this connection issued.
+    ///
+    /// A connection accepted without a credential signs in and stays that way:
+    /// it carries no credential of its own, so the credential it hands to the
+    /// client is the only handle on that sign-in. Signing out revokes it here,
+    /// which is what makes "signing out ends it everywhere" true for the
+    /// connection that signed in without one.
+    pub(crate) fn revoke_person_token_id(&self, token_id: &str) -> Result<()> {
+        let Some(store) = self.person_token_store() else {
+            return Ok(());
+        };
+        if !store.revoke(token_id)? {
+            return Ok(());
+        }
+        if let Err(error) = store.delete(token_id) {
+            log::warn!(
+                "[loom-server] the revoked GitHub sign-in credential {token_id} is still in the \
+                 store: {}",
+                error.message
+            );
+        }
+        self.delete_person_token_row(token_id);
+        log::info!(
+            "[loom-server] a sign-out revoked the GitHub sign-in credential {token_id} for every \
+             later connection"
         );
         Ok(())
     }
@@ -267,7 +309,7 @@ impl InProcessBackend {
     /// A failure is logged instead of failing the caller: the credential is
     /// already revoked in memory, so the sign-out or the pruning has taken
     /// effect; only the stored row, which a restart would restore, is left.
-    fn delete_person_token_row(&self, participant: &ParticipantIdentity, token_id: &str) {
+    fn delete_person_token_row(&self, token_id: &str) {
         let Some(persistence) = &self.persistence else {
             return;
         };
@@ -275,9 +317,8 @@ impl InProcessBackend {
             Ok(stored_id) => stored_id,
             Err(error) => {
                 log::warn!(
-                    "[loom-server] the stored row of a revoked GitHub sign-in credential of {} \
-                     could not be named: token {token_id}: {}",
-                    participant.display_name,
+                    "[loom-server] the stored row of a revoked GitHub sign-in credential could not \
+                     be named: token {token_id}: {}",
                     error.message
                 );
                 return;
@@ -290,10 +331,8 @@ impl InProcessBackend {
         match persistence.delete_person_token(stored_id) {
             Ok(_) => {}
             Err(error) => log::warn!(
-                "[loom-server] the stored row of the revoked GitHub sign-in credential {} of {} \
+                "[loom-server] the stored row of the revoked GitHub sign-in credential {token_id} \
                  was not deleted, so a restart would restore it: {}",
-                token_id,
-                participant.display_name,
                 error.message
             ),
         }

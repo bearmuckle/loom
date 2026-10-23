@@ -582,6 +582,13 @@ struct ConnectionIdentity {
     /// The live presence of that person. Dropping the last clone of the
     /// connection removes it from the roster.
     presence: Option<Arc<ConnectionPresence>>,
+    /// The token id of the credential a GitHub sign-in on this connection
+    /// issued. Only the id is kept, never the value: the client holds that.
+    ///
+    /// A sign-out revokes it, so the credential a pre-login connection's
+    /// sign-in handed out stops working even though that connection carries
+    /// no credential of its own.
+    person_token: Option<String>,
 }
 
 impl InProcessConnection {
@@ -634,6 +641,19 @@ impl InProcessConnection {
     /// The operator credential this connection authenticated with, if any.
     fn auth_session(&self) -> Option<AuthSession> {
         self.identity_state().ok()?.auth.clone()
+    }
+
+    /// Records the credential a sign-in on this connection issued, so signing
+    /// out can revoke it.
+    pub(crate) fn remember_person_token(&self, token_id: String) {
+        if let Ok(mut state) = self.identity_state() {
+            state.person_token = Some(token_id);
+        }
+    }
+
+    /// Takes the credential this connection's sign-in issued, if any.
+    fn take_person_token(&self) -> Option<String> {
+        self.identity_state().ok()?.person_token.take()
     }
 
     fn authorized_capabilities(&self) -> CapabilitySet {
