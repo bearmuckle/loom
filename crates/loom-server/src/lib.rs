@@ -413,10 +413,6 @@ struct PersonTokenState {
     /// The token store of the listener serving this backend, when one attached
     /// it.
     store: Option<Arc<AuthTokenStore>>,
-    /// The durable form of every credential the store knows, keyed by token id,
-    /// so the rows can be written again after a save of the participant
-    /// directory they hang off.
-    rows: BTreeMap<[u8; 16], StoredPersonToken>,
 }
 
 #[derive(Deserialize)]

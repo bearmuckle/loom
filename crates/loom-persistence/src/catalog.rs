@@ -1508,11 +1508,16 @@ pub(crate) fn save_session_settings_rows(
     save_session_access_rows(transaction, settings)
 }
 
-/// Replaces the stored participants and session grants with `settings`.
+/// Saves `settings`' participant directory, then its session grants and access
+/// requests.
 ///
-/// Grants are rewritten as a whole, because the set is small and a revoke has
-/// to remove rows. A grant for a session that is not stored is skipped, so a
-/// session deleted concurrently cannot fail the write.
+/// The directory is upserted and only the people who left are removed: a person
+/// who is still there keeps the rows that belong to them, including the
+/// credentials a GitHub sign-in issued, which a full rewrite of the directory
+/// would delete with them. Grants and access requests are rewritten as a whole,
+/// because those sets are small and a revoke has to remove rows. A grant for a
+/// session that is not stored is skipped, so a session deleted concurrently
+/// cannot fail the write.
 fn save_session_access_rows(
     transaction: &Transaction<'_>,
     settings: &DurableSessionSettings,
@@ -1521,19 +1526,47 @@ fn save_session_access_rows(
         persistence_error(format!("could not save session access: {error}"), true)
     };
     transaction
-        .execute("DELETE FROM session_grants", [])
-        .map_err(write_error)?;
-    transaction
-        .execute("DELETE FROM participants", [])
-        .map_err(write_error)?;
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_participants (
+                participant_id BLOB PRIMARY KEY NOT NULL
+             ) WITHOUT ROWID, STRICT;
+             DELETE FROM _loom_wanted_participants;",
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not stage participants: {error}"), true)
+        })?;
     for (id, name) in &settings.participants {
+        let participant_id = id.as_uuid().as_bytes();
         transaction
             .execute(
-                "INSERT INTO participants(participant_id, display_name) VALUES (?1, ?2)",
-                params![id.as_uuid().as_bytes().as_slice(), name],
+                "INSERT INTO _loom_wanted_participants(participant_id) VALUES (?1)",
+                [participant_id.as_slice()],
+            )
+            .map_err(write_error)?;
+        transaction
+            .execute(
+                "INSERT INTO participants(participant_id, display_name) VALUES (?1, ?2)
+                 ON CONFLICT(participant_id) DO UPDATE SET display_name=excluded.display_name
+                 WHERE participants.display_name IS NOT excluded.display_name",
+                params![participant_id.as_slice(), name],
             )
             .map_err(write_error)?;
     }
+    // A person who is no longer in the directory leaves with everything that
+    // hangs off them, while a person who is still there keeps it.
+    transaction
+        .execute(
+            "DELETE FROM participants
+             WHERE NOT EXISTS (
+                SELECT 1 FROM _loom_wanted_participants wanted
+                WHERE wanted.participant_id=participants.participant_id
+             )",
+            [],
+        )
+        .map_err(write_error)?;
+    transaction
+        .execute("DELETE FROM session_grants", [])
+        .map_err(write_error)?;
     for grant in &settings.session_grants {
         transaction
             .execute(

@@ -2142,6 +2142,58 @@ fn save_participants(
 }
 
 #[test]
+fn a_state_save_keeps_the_credentials_of_the_people_it_still_knows() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+    let persistence = FilePersistence::open(&path).unwrap();
+    let sessions = SessionManager::default().export_state();
+    let participant_id = ParticipantId::new();
+    save_participants(
+        &persistence,
+        &sessions,
+        BTreeMap::from([(participant_id, "Sam".to_owned())]),
+    );
+    let token = StoredPersonToken {
+        token_id: [7; 16],
+        digest: [9; 32],
+        participant_id,
+        created_at: Timestamp::from_unix_millis(5),
+    };
+    persistence.save_person_token(&token).unwrap();
+
+    // A later save of the same directory leaves the person in place, so the
+    // credential that hangs off them stays: a sign-in only stops being usable
+    // when the person leaves or it is revoked.
+    save_participants(
+        &persistence,
+        &sessions,
+        BTreeMap::from([(participant_id, "Sam".to_owned())]),
+    );
+    assert_eq!(persistence.load_person_tokens().unwrap(), vec![token]);
+
+    // A rename is the same person, so it keeps the credential too.
+    save_participants(
+        &persistence,
+        &sessions,
+        BTreeMap::from([(participant_id, "Sam Renamed".to_owned())]),
+    );
+    assert_eq!(persistence.load_person_tokens().unwrap(), vec![token]);
+
+    let connection = Connection::open(&path).unwrap();
+    let name: String = connection
+        .query_row(
+            "SELECT display_name FROM participants WHERE participant_id = ?1",
+            [participant_id.as_uuid().as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(name, "Sam Renamed");
+    drop(connection);
+
+    drop(persistence);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn a_person_token_round_trips_and_is_deleted_by_id() {
     let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
     let persistence = FilePersistence::open(&path).unwrap();

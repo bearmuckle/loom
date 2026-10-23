@@ -36,33 +36,23 @@ impl InProcessBackend {
     /// listener: a worker whose database is briefly unreadable still serves,
     /// and people can sign in again instead of being locked out.
     pub(crate) fn attach_person_token_store(&self, store: Arc<AuthTokenStore>) {
-        let restored = match self.restore_person_tokens(&store) {
-            Ok(restored) => restored,
-            Err(error) => {
-                log::warn!(
-                    "[loom-server] stored GitHub sign-in credentials could not be read; people \
-                     can sign in again, so no credential was restored: {}",
-                    error.message
-                );
-                Vec::new()
-            }
-        };
-        let mut state = self.person_tokens();
-        state.store = Some(store);
-        state.rows = restored
-            .into_iter()
-            .map(|row| (row.token_id, row))
-            .collect();
+        if let Err(error) = self.restore_person_tokens(&store) {
+            log::warn!(
+                "[loom-server] stored GitHub sign-in credentials could not be read; people can \
+                 sign in again, so no credential was restored: {}",
+                error.message
+            );
+        }
+        self.person_tokens().store = Some(store);
     }
 
-    /// Registers every stored credential in `store`, returning the rows it
-    /// knows so they can be written again after a later state save.
-    fn restore_person_tokens(&self, store: &AuthTokenStore) -> Result<Vec<StoredPersonToken>> {
+    /// Registers every stored credential in `store`.
+    fn restore_person_tokens(&self, store: &AuthTokenStore) -> Result<()> {
         let Some(persistence) = &self.persistence else {
-            return Ok(Vec::new());
+            return Ok(());
         };
         let stored = persistence.load_person_tokens()?;
-        let mut restored = Vec::new();
+        let mut restored = 0_usize;
         for token in stored {
             let token_id = Uuid::from_bytes(token.token_id).to_string();
             let Some(participant) = self.access.known_identity(token.participant_id) else {
@@ -87,15 +77,15 @@ impl InProcessBackend {
                 );
                 continue;
             }
-            restored.push(token);
+            restored += 1;
         }
-        if !restored.is_empty() {
+        if restored > 0 {
             log::info!(
-                "[loom-server] restored {} GitHub sign-in credential(s) for a later connection",
-                restored.len()
+                "[loom-server] restored {restored} GitHub sign-in credential(s) for a later \
+                 connection"
             );
         }
-        Ok(restored)
+        Ok(())
     }
 
     /// Mints a credential that authenticates as `participant` on a later
@@ -127,11 +117,7 @@ impl InProcessBackend {
                     .state_persist_gate
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                let saved = persistence.save_person_token(&stored);
-                if saved.is_ok() {
-                    self.person_tokens().rows.insert(stored.token_id, stored);
-                }
-                saved
+                persistence.save_person_token(&stored)
             };
             if let Err(error) = saved {
                 // A credential the worker would not recognize after a restart
@@ -152,43 +138,6 @@ impl InProcessBackend {
             token: issued.token,
             token_id: issued.token_id,
         }))
-    }
-
-    /// Writes the stored rows of the credentials this worker knows again.
-    ///
-    /// A full state save rewrites the participant directory as a whole, and a
-    /// credential row belongs to its person with a cascading delete, so that
-    /// save removes the rows. Writing them again right afterwards is what keeps
-    /// a credential a person holds across a restart. The caller holds the state
-    /// persist gate, so no credential is issued or revoked while this runs.
-    pub(crate) fn rewrite_person_token_rows(&self) {
-        let Some(persistence) = &self.persistence else {
-            return;
-        };
-        let rows = self
-            .person_tokens()
-            .rows
-            .values()
-            .copied()
-            .collect::<Vec<_>>();
-        for row in rows {
-            // A person who left the directory loses their credentials with the
-            // grant rows of the same save, so their credential is not written
-            // again.
-            if self.access.known_identity(row.participant_id).is_none() {
-                self.person_tokens().rows.remove(&row.token_id);
-                continue;
-            }
-            if let Err(error) = persistence.save_person_token(&row) {
-                log::warn!(
-                    "[loom-server] a stored GitHub sign-in credential of participant {} could \
-                     not be written again after a state save, so a restart would not restore it: \
-                     {}",
-                    row.participant_id,
-                    error.message
-                );
-            }
-        }
     }
 
     /// Revokes and deletes the credentials of `participant` beyond the cap,
@@ -336,7 +285,6 @@ impl InProcessBackend {
                 error.message
             ),
         }
-        self.person_tokens().rows.remove(&stored_id);
     }
 }
 
