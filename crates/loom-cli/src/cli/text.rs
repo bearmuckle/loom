@@ -122,6 +122,10 @@ pub(crate) fn render(event: &ServerEvent, budget: usize) -> Rendered {
             ],
         ),
         ServerEvent::AgentSessionRenamed { name: renamed, .. } => name("session_renamed", renamed),
+        ServerEvent::AgentSessionGoalChanged { goal, .. } => match goal {
+            Some(goal) => name("session_goal", goal),
+            None => name("session_goal", "cleared"),
+        },
         ServerEvent::AgentSessionTitleSourceChanged { source, .. } => {
             body("session_title_source", [source_name(*source).to_owned()])
         }
@@ -294,6 +298,7 @@ pub(crate) const fn server_event_name(event: &ServerEvent) -> &'static str {
         ServerEvent::AgentSessionStateChanged { .. } => "agent_session_state_changed",
         ServerEvent::AgentSessionForked { .. } => "agent_session_forked",
         ServerEvent::AgentSessionRenamed { .. } => "agent_session_renamed",
+        ServerEvent::AgentSessionGoalChanged { .. } => "agent_session_goal_changed",
         ServerEvent::AgentSessionTitleSourceChanged { .. } => "agent_session_title_source_changed",
         ServerEvent::AgentSessionArchived { .. } => "agent_session_archived",
         ServerEvent::Agent { .. } => "agent",
