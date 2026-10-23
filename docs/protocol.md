@@ -769,3 +769,10 @@ The backend event stream is authoritative. A client connection should:
 Long-running model calls, tool calls, processes, and child agents must not
 depend on a frontend connection. A frontend can disconnect, reconnect from a
 different device, and continue controlling the same backend session.
+
+A session's events are journaled by whoever acts on it, so a client of a
+worker that more than one person can reach follows the open session's stream
+whether or not it has a run of its own: another person's run arrives there and
+nowhere else. That follow poll may be slower than the poll of a run this
+client started, because nothing is streaming yet, but it keeps running while a
+shared session is open.

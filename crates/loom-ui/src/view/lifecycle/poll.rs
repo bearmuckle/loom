@@ -2,6 +2,24 @@ use super::*;
 #[cfg(not(target_family = "wasm"))]
 use crate::connection::resume_github_identity;
 
+/// How often the open session's event stream is polled while this client's run
+/// is active: the transcript streams at this cadence.
+const ACTIVE_RUN_POLL_MILLIS: u64 = 250;
+
+/// How often the stream is polled while the run is parked on a durable project
+/// join. The server resumes such a run when its children finish, so the wait
+/// still has to become visible, and a second is enough for that.
+const PAUSED_RUN_POLL_MILLIS: u64 = 1_000;
+
+/// How often the stream is polled while the session is idle.
+///
+/// A worker this client reached at an address serves other people too, and
+/// their runs are journaled whether or not this client started them. The
+/// cadence only bounds how long another person's run takes to appear here: the
+/// first event it applies makes that run active on this client as well, and the
+/// poll then follows [`ACTIVE_RUN_POLL_MILLIS`].
+const IDLE_SESSION_POLL_MILLIS: u64 = 2_000;
+
 impl LoomView {
     /// Delays a poll while the worker is unreachable.
     ///
@@ -262,25 +280,83 @@ impl LoomView {
         )
     }
 
-    /// Polls the journal while a run is active. The protocol keeps the event
-    /// stream resumable, so polling is sufficient for both local and remote
-    /// connections without making the UI depend on a transport-specific push
-    /// implementation.
-    /// Whether the session event stream should keep being polled. A run that is
-    /// parked on a durable project join reports `Paused`, but the server
-    /// resumes it when its children finish, so polling must continue past the
-    /// active states or the wait never appears to complete.
+    /// Whether this client's own run keeps the stream polled.
+    ///
+    /// A run that is parked on a durable project join reports `Paused`, but the
+    /// server resumes it when its children finish, so polling must continue
+    /// past the active states or the wait never appears to complete.
     pub(crate) fn run_should_poll(&self) -> bool {
         self.run_is_active() || matches!(self.run_state, Some(AgentRunState::Paused))
     }
 
+    /// Whether the session event stream should keep being polled.
+    ///
+    /// The protocol keeps the event stream resumable, so polling is sufficient
+    /// for both local and remote connections without making the UI depend on a
+    /// transport-specific push implementation.
+    ///
+    /// A run this client started is followed until it settles, and that used to
+    /// be the whole rule. It left every other person's run invisible: their
+    /// events are journaled all the same, but a client with no run of its own
+    /// never asked for them, so the transcript of an open session stayed frozen
+    /// while a colleague's run streamed into the journal. The stream of a
+    /// session another client can write to is therefore followed while it is
+    /// idle as well.
+    pub(crate) fn session_events_should_poll(&self) -> bool {
+        self.run_should_poll() || self.follows_shared_session()
+    }
+
+    /// Whether another client can add events to the open session.
+    ///
+    /// Only a worker this client reached at an address serves anybody else: the
+    /// managed local worker is started for this client alone, and the demo
+    /// workspace has no worker at all. A connection waiting for a sign-in may
+    /// not read a session, and the placeholder this view holds before the first
+    /// session is listed has no stream to read, so neither is followed.
+    pub(crate) fn follows_shared_session(&self) -> bool {
+        !self.demo_workspace
+            && self.is_connected()
+            && !self.awaits_sign_in()
+            && self.active_worker_is_shared()
+            && self
+                .sessions
+                .iter()
+                .any(|session| session.id == self.active_session.id)
+    }
+
+    /// Whether the active session's worker was reached at an address.
+    ///
+    /// The startup worker of a native client is the managed local process, which
+    /// has no endpoint of its own, so nothing else can write to its journal. A
+    /// `--remote` endpoint and every configured worker node are servers, and
+    /// another person can act on a session there at any moment.
+    pub(crate) fn active_worker_is_shared(&self) -> bool {
+        let node_id = self.active_node_id();
+        if node_id == self.default_backend_node_id.as_str() {
+            return self.backend_endpoint.is_some();
+        }
+        self.worker_nodes
+            .iter()
+            .any(|node| node.status.node_id == node_id && node.url.is_some())
+    }
+
+    /// The cadence of one session event poll: the fastest that applies.
+    pub(crate) fn session_poll_delay_millis(&self) -> u64 {
+        if self.run_is_active() {
+            ACTIVE_RUN_POLL_MILLIS
+        } else if matches!(self.run_state, Some(AgentRunState::Paused)) {
+            PAUSED_RUN_POLL_MILLIS
+        } else {
+            IDLE_SESSION_POLL_MILLIS
+        }
+    }
+
     pub(crate) fn schedule_run_poll(&mut self, cx: &mut Context<Self>) {
-        if self.run_poll_scheduled || !self.run_should_poll() {
+        if self.run_poll_scheduled || !self.session_events_should_poll() {
             return;
         }
         self.run_poll_scheduled = true;
-        let active = self.run_is_active();
-        let delay = self.poll_delay_millis(if active { 250 } else { 1_000 });
+        let delay = self.poll_delay_millis(self.session_poll_delay_millis());
         cx.spawn(async move |view, cx| {
             #[cfg(target_family = "wasm")]
             {
@@ -294,13 +370,15 @@ impl LoomView {
                 });
                 let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
             }
+            // The cadence waits on the executor timer instead of a blocking
+            // sleep, so following a session holds no background thread while it
+            // waits.
             #[cfg(not(target_family = "wasm"))]
-            cx.background_spawn(async move {
-                std::thread::sleep(Duration::from_millis(delay));
-            })
-            .await;
+            cx.background_executor()
+                .timer(Duration::from_millis(delay))
+                .await;
             view.update(cx, |view, cx| {
-                if !view.run_should_poll() {
+                if !view.session_events_should_poll() {
                     view.run_poll_scheduled = false;
                 } else if view.transcript_loading {
                     // A transcript page rebuild replaces the message portion of

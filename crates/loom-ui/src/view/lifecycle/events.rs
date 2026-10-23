@@ -325,6 +325,21 @@ impl LoomView {
                     self.plan_collapsed = false;
                     self.review.clear_unread(InspectorTab::Run);
                 }
+                // The run's task is the prompt that started it. The client that
+                // sent the prompt already shows it, but a run this client only
+                // observes arrives as events and its durable messages are not
+                // read, so the transcript of everyone else watching the session
+                // would show the answer without the question. Adding it when the
+                // timeline does not carry it keeps a rebuild from showing it
+                // twice.
+                if !self
+                    .timeline
+                    .iter()
+                    .any(|item| matches!(item, TimelineItem::User(text) if text == &snapshot.task))
+                {
+                    self.timeline
+                        .push(TimelineItem::User(snapshot.task.clone()));
+                }
                 self.context_inspection = None;
                 self.active_run = Some(snapshot.clone());
                 self.active_run_id = Some(snapshot.id);
