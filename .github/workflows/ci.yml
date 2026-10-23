@@ -131,7 +131,7 @@ jobs:
       # claim is checked instead of being assumed to hold on stable. The SHA is
       # the head of the action's `1.99.0` branch, which is the branch that
       # installs exactly that toolchain.
-      - uses: dtolnay/rust-toolchain@ff7f6a3374ce205788da40198ec918bd5d67aea7 # 1.99.0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # 1.99.0
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Check the declared minimum supported Rust version
