@@ -424,7 +424,8 @@ fn github_login_kinds_name_the_flow_each_one_runs() {
     assert!(repository.contains("clone"), "{repository}");
     assert!(!repository.contains("model provider"), "{repository}");
     let identity = GitHubLoginKind::Identity.intro();
-    assert!(identity.contains("this connection"), "{identity}");
+    assert!(identity.contains("this device"), "{identity}");
+    assert!(identity.contains("Signing out"), "{identity}");
     assert!(identity.contains("no repository"), "{identity}");
 
     // The two credential flows say they are not the worker sign-in, and the

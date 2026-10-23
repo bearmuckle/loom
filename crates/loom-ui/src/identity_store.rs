@@ -4,8 +4,9 @@
 //! that reopened it. Remembering the participant id locally lets a reload
 //! resume the same person on an operator connection, so the roster shows them
 //! online instead of leaving them behind as an offline grant. The id is not a
-//! secret: the worker only resumes it for an operator token and only when the
-//! person is still in the worker's directory.
+//! secret: the worker only resumes it for an operator token or the person's own
+//! credential (see [`crate::credential_store`]), and only when the person is
+//! still in the worker's directory.
 //!
 //! Entries are keyed by [`worker_key`], never by a worker's reported node id:
 //! that id names one worker process and the server generates a new one on every

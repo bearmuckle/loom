@@ -286,11 +286,11 @@ impl LoomView {
                         .text_color(rgb(0xe5e7eb))
                         .child(message),
                 )
-                .child(div().text_xs().text_color(rgb(0x8f98a6)).child(
+                .child(div().text_xs().text_color(rgb(0x8f98a6)).child(format!(
                     "Signing in with GitHub puts you in the roster. You start read-only, and an \
-                     owner grants the role you need. A sign-in lasts for this connection, so a \
-                     reload asks again.",
-                ));
+                     owner grants the role you need. {}",
+                    self.sign_in_retention_note(self.active_node_id())
+                )));
             if self.offers_github_sign_in() {
                 let node_id = self.active_node_id().to_owned();
                 body = body.child(

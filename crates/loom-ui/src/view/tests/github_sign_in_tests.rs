@@ -41,6 +41,7 @@ fn signed_in_binds_the_identity_and_ends_the_wait(cx: &mut TestAppContext) {
             GitHubSignInStatus::SignedIn {
                 participant: octocat.clone(),
             },
+            None,
             cx,
         );
         assert!(!view.awaits_sign_in(), "a bound person ends the wait");
@@ -77,6 +78,7 @@ fn a_failed_sign_in_stays_in_the_pane(cx: &mut TestAppContext) {
                 message: "GitHub account 'someone' is not allowed to sign in to this worker"
                     .to_owned(),
             },
+            None,
             cx,
         );
         assert!(
@@ -109,6 +111,7 @@ fn signing_out_clears_the_identity_and_permissions(cx: &mut TestAppContext) {
             GitHubSignInStatus::SignedIn {
                 participant: octocat.clone(),
             },
+            None,
             cx,
         );
         view.collaboration.directory = vec![octocat.clone()];
@@ -171,6 +174,7 @@ fn an_operator_connection_keeps_its_authority(cx: &mut TestAppContext) {
             GitHubSignInStatus::SignedIn {
                 participant: octocat.clone(),
             },
+            None,
             cx,
         );
         assert_eq!(view.collaboration.identity.as_ref(), Some(&octocat));
@@ -224,9 +228,9 @@ fn a_remembered_person_is_named_in_the_sign_in_prompt(cx: &mut TestAppContext) {
     .unwrap();
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
-        // The stored person is a display hint only: the worker still refuses a
-        // resumed identity on this connection, so the prompt says a reload asks
-        // again instead of promising a lasting sign-in.
+        // The stored person is the sign-in prompt's hint: the credential the
+        // client keeps is what signs that person in again on a later
+        // connection, so the prompt names them instead of a fresh account.
         let prompt = window
             .find("composer-sign-in-message")
             .label()
@@ -237,6 +241,179 @@ fn a_remembered_person_is_named_in_the_sign_in_prompt(cx: &mut TestAppContext) {
             window.find("composer-sign-in-github").label(),
             Some("Sign in with GitHub")
         );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_sign_in_that_carries_a_credential_is_kept_for_the_worker(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.github_sign_in_available = true;
+        // A node of this test's own, so the entry it stores cannot be mistaken
+        // for another test's: the store a test build uses is shared in memory.
+        let node_id = format!("kept-sign-in-{}", ParticipantId::new());
+        let (backend, _jobs) = BackendWorker::deferred_for_test();
+        view.node_backends.insert(node_id.clone(), backend);
+        view.mark_node_pre_login(node_id.clone());
+        view.collaboration.identity_loaded = true;
+
+        // A worker that sends no credential keeps only the person.
+        view.apply_github_sign_in_status(
+            &node_id,
+            GitHubSignInStatus::SignedIn {
+                participant: person("octocat"),
+            },
+            None,
+            cx,
+        );
+        assert_eq!(crate::credential_store::load(&node_id), None);
+
+        // The poll that reports the sign-in can carry the person's own
+        // credential, which is what signs a later connection in as them.
+        let hubot = person("hubot");
+        view.apply_github_sign_in_status(
+            &node_id,
+            GitHubSignInStatus::SignedIn {
+                participant: hubot.clone(),
+            },
+            Some("github-sign-in-credential".to_owned()),
+            cx,
+        );
+        assert_eq!(
+            crate::credential_store::load(&node_id).as_deref(),
+            Some("github-sign-in-credential")
+        );
+        assert_eq!(view.remembered_identity(&node_id), Some(&hubot));
+        view
+    });
+}
+
+#[gpui_kit::test]
+fn signing_out_forgets_the_kept_credential(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.github_sign_in_available = true;
+        let node_id = format!("sign-out-{}", ParticipantId::new());
+        let (backend, _jobs) = BackendWorker::deferred_for_test();
+        view.node_backends.insert(node_id.clone(), backend);
+        view.mark_node_pre_login(node_id.clone());
+        view.collaboration.identity_loaded = true;
+        view.apply_github_sign_in_status(
+            &node_id,
+            GitHubSignInStatus::SignedIn {
+                participant: person("octocat"),
+            },
+            Some("github-sign-in-credential".to_owned()),
+            cx,
+        );
+        assert!(crate::credential_store::load(&node_id).is_some());
+
+        // Signing out revokes the credential on the worker, so the client must
+        // not present it on the next connection.
+        assert!(view.finish_sign_out_github(&node_id, signed_out(), cx));
+        assert_eq!(crate::credential_store::load(&node_id), None);
+        view
+    });
+}
+
+#[gpui_kit::test]
+fn removing_a_worker_node_forgets_the_kept_credential(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        let url = format!("ws://worker-{}.example:8765", ParticipantId::new());
+        let node_id = format!("removed-{}", ParticipantId::new());
+        let mut node =
+            connection_placeholder(1, url.clone(), WorkerConnectionState::Connected, None);
+        node.status.node_id = node_id.clone();
+        view.worker_nodes.push(node);
+        let identity_key = crate::identity_store::worker_key(Some(url.as_str()));
+        crate::credential_store::save(&identity_key, "github-sign-in-credential");
+
+        view.remove_worker_node(1, cx);
+        assert_eq!(crate::credential_store::load(&identity_key), None);
+        view
+    });
+}
+
+#[gpui_kit::test]
+fn a_kept_credential_does_not_make_a_connection_an_operator(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.github_sign_in_available = true;
+        let node_id = view.default_backend_node_id.clone();
+        // The connect paths mark every connection opened without an operator
+        // token, including one the kept credential signs in straight away.
+        view.mark_node_unsigned(node_id.clone());
+        view.collaboration.identity_loaded = true;
+        let octocat = person("octocat");
+        view.apply_github_sign_in_status(
+            &node_id,
+            GitHubSignInStatus::SignedIn {
+                participant: octocat.clone(),
+            },
+            Some("github-sign-in-credential".to_owned()),
+            cx,
+        );
+        assert!(
+            !view.node_uses_operator_token(&node_id),
+            "a person credential grants no operator authority"
+        );
+        // The worker's roles decide what the connection may do.
+        assert!(!view.session_permissions().can_act);
+        assert!(!view.session_permissions().can_manage);
+
+        view.collaboration.replace_roster(
+            view.active_session.id,
+            vec![loom_core::RosterEntry {
+                participant: octocat.clone(),
+                role: loom_core::SessionRole::Owner,
+                presence: loom_core::PresenceStatus::Online,
+                connections: 1,
+                last_active_at: None,
+            }],
+        );
+        assert!(
+            view.session_permissions().can_manage,
+            "a granted role is what widens the connection"
+        );
+        view
+    });
+}
+
+#[gpui_kit::test]
+fn the_sign_in_prompt_says_the_sign_in_is_remembered(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.github_sign_in_available = true;
+        view.mark_node_pre_login(view.default_backend_node_id.clone());
+        view.collaboration.identity_loaded = true;
+        // A connection whose transport is not secure for secrets cannot keep
+        // the credential, so its prompt must not promise a remembered sign-in.
+        assert_eq!(
+            view.sign_in_retention_note("a-worker-with-no-connection"),
+            crate::view::collaboration::UNSAVED_SIGN_IN_NOTE
+        );
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("composer-sign-in-note").label(),
+            Some(crate::view::collaboration::KEPT_SIGN_IN_NOTE),
+            "the prompt says the sign-in outlives the connection"
+        );
+        assert!(!crate::view::collaboration::KEPT_SIGN_IN_NOTE.contains("for the connection"));
+        assert!(crate::view::collaboration::KEPT_SIGN_IN_NOTE.contains("signing out"));
     })
     .unwrap();
 }

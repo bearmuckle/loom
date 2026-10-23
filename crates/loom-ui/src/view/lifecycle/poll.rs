@@ -422,9 +422,18 @@ impl LoomView {
                             }
                         };
                         let unsigned = token.is_empty();
-                        let connection =
-                            ClientConnection::remote(candidate_url.clone(), token, &remote_options)
-                                .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
+                        // The GitHub sign-in the client kept for this worker:
+                        // a reconnect without an operator token replays it, and
+                        // a worker that refuses it is retried once without.
+                        let identity_key =
+                            crate::identity_store::worker_key(Some(candidate_url.as_str()));
+                        let connection = connect_remote(
+                            &candidate_url,
+                            &token,
+                            &remote_options,
+                            &identity_key,
+                        )
+                        .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
                         let negotiation = match negotiate(&connection) {
                             Ok(negotiation) => negotiation,
                             Err(error) => {
@@ -450,8 +459,6 @@ impl LoomView {
                         // The remembered identity is stored under the address
                         // this worker is reached at, so it survives the worker
                         // restarting under a new instance id.
-                        let identity_key =
-                            crate::identity_store::worker_key(Some(candidate_url.as_str()));
                         // A connection accepted without a credential cannot
                         // resume a person, so the stored participant is kept as
                         // a hint for the sign-in prompt instead.
@@ -476,6 +483,7 @@ impl LoomView {
                             status,
                             candidate_url,
                             pre_login,
+                            unsigned,
                             remembered,
                             negotiation
                                 .capabilities
@@ -496,6 +504,7 @@ impl LoomView {
                             status,
                             connected_url,
                             pre_login,
+                            unsigned,
                             remembered,
                             offers_sign_in,
                         )) if is_pending => {
@@ -506,6 +515,8 @@ impl LoomView {
                             // that read.
                             if pre_login {
                                 view.mark_node_pre_login(status.node_id.clone());
+                            } else if unsigned {
+                                view.mark_node_unsigned(status.node_id.clone());
                             }
                             if let Some(identity) = remembered {
                                 view.remember_identity(status.node_id.clone(), identity);
@@ -518,7 +529,7 @@ impl LoomView {
                                 cx,
                             );
                         }
-                        Ok((connection, _, _, _, _, _)) => {
+                        Ok((connection, _, _, _, _, _, _)) => {
                             cx.spawn(async move |view, cx| {
                                 let result =
                                     cx.background_spawn(async move { connection.close() })                                    .await;

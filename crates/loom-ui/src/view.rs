@@ -87,17 +87,18 @@ use crate::{
     },
 };
 
-#[cfg(not(target_family = "wasm"))]
-use crate::connection::{
-    attach_session_repository, create_session_in_workspace, create_workspace, current_participant,
-    list_models_from_backend, list_workspace_sessions, list_workspaces, redact_secret,
-    unexpected_response,
-};
 #[cfg(target_family = "wasm")]
 use crate::connection::{
-    attach_session_repository_async, create_session_in_workspace_async, create_workspace_async,
-    current_participant_async, list_models_from_backend, list_workspace_sessions_async,
-    list_workspaces_async, probe_worker_connection,
+    BrowserConnectFailure, attach_session_repository_async, connect_browser,
+    create_session_in_workspace_async, create_workspace_async, current_participant_async,
+    list_models_from_backend, list_workspace_sessions_async, list_workspaces_async,
+    probe_worker_connection,
+};
+#[cfg(not(target_family = "wasm"))]
+use crate::connection::{
+    attach_session_repository, connect_remote, create_session_in_workspace, create_workspace,
+    current_participant, list_models_from_backend, list_workspace_sessions, list_workspaces,
+    redact_secret, unexpected_response,
 };
 #[cfg(target_family = "wasm")]
 use crate::connection::{redact_secret, unexpected_response};
@@ -335,7 +336,7 @@ use crate::connection::{
 use crate::{
     browser::BrowserOptions,
     connection::{
-        list_models_async, negotiate_async, set_workspace_config_async, worker_node_status_async,
+        list_models_async, set_workspace_config_async, worker_node_status_async,
         workspace_config_async,
     },
 };
@@ -706,8 +707,11 @@ pub(crate) struct LoomView {
     /// Multi-user identity, roster, composer recipient, run revision, and
     /// credential state for the active session.
     pub(crate) collaboration: crate::collaboration::CollaborationState,
-    /// Worker nodes whose transport was opened without an operator token, so a
-    /// fresh connection to them is pre-login and may only sign in with GitHub.
+    /// Worker nodes whose transport was opened without an operator token, so
+    /// the connection holds no operator authority and the worker's session roles
+    /// govern it. Such a node may already be signed in as a person, when the
+    /// client replayed the credential it keeps for that worker; signing out
+    /// returns it to the sign-in prompt.
     pub(crate) unsigned_nodes: BTreeSet<String>,
     /// Worker nodes known to await a GitHub sign-in: the connection is bound to
     /// no person and the worker refuses everything but signing in. A signed-in
@@ -715,10 +719,10 @@ pub(crate) struct LoomView {
     /// returns it to the sign-in prompt.
     pub(crate) awaiting_sign_in_nodes: BTreeSet<String>,
     /// The person each node's connection was last signed in as, read from
-    /// [`crate::identity_store`] when the connection settles. It is display
-    /// only: a connection accepted without a credential cannot resume an
-    /// identity, so the sign-in prompt names the remembered person instead of
-    /// promising one. Keyed by node id, never read while rendering a request.
+    /// [`crate::identity_store`] when the connection settles. It names the
+    /// person in a sign-in prompt and is display only: signing in again is what
+    /// the credential in [`crate::credential_store`] is for. Keyed by node id,
+    /// never read while rendering a request.
     pub(crate) remembered_identities: BTreeMap<String, ParticipantIdentity>,
     /// Whether the connected worker advertises `git_hub_sign_in`, which is what
     /// lets a person join the roster by signing in.

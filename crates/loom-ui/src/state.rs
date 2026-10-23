@@ -485,8 +485,8 @@ impl GitHubLoginKind {
                  in to the worker."
             }
             Self::Identity => {
-                "Binds you to this connection, so a reload or reconnect asks again. It grants no \
-                 repository or model access."
+                "Signs you in to this worker on this device, so a reload signs you in again. Signing \
+                 out forgets the sign-in. It grants no repository or model access."
             }
         }
     }
@@ -501,7 +501,7 @@ impl GitHubLoginKind {
                 "Repository access is authorized. Cloning, pushing, and pull requests are \
                  available."
             }
-            Self::Identity => "You are signed in to this worker for this connection.",
+            Self::Identity => "You are signed in to this worker on this device.",
         }
     }
 }

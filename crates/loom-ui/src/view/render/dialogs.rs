@@ -1075,20 +1075,23 @@ impl LoomView {
         let message = if operator {
             "Connected with an access token. Link a GitHub account for attribution.".to_owned()
         } else if let Some(identity) = remembered {
-            // Display only: a pre-login connection cannot resume this person, so
-            // the stored login is a hint for who the sign-in will be.
+            // Display only: the sign-in prompt names the person the flow will
+            // sign in as, if the client kept a credential to resume them.
             format!(
-                "Sign in again as {}. A sign-in lasts for the connection, so a reload asks again.",
-                identity.display_name
+                "Sign in again as {}. {}",
+                identity.display_name,
+                self.sign_in_retention_note(&node_id)
             )
         } else if awaiting_sign_in {
-            "This worker is waiting for a GitHub sign-in. A sign-in lasts for the connection, so a \
-             reload asks again."
-                .to_owned()
+            format!(
+                "This worker is waiting for a GitHub sign-in. {}",
+                self.sign_in_retention_note(&node_id)
+            )
         } else {
-            "Sign in with GitHub to join this worker's roster. A sign-in lasts for the connection, \
-             so a reload asks again."
-                .to_owned()
+            format!(
+                "Sign in with GitHub to join this worker's roster. {}",
+                self.sign_in_retention_note(&node_id)
+            )
         };
         row = row.child(div().flex_1().child(message));
         if can_sign_in {

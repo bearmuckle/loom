@@ -34,6 +34,9 @@ impl LoomView {
         // A remote worker without a token is an unsigned connection: it is
         // accepted as pre-login and signs in with GitHub instead.
         let mut unsigned = false;
+        // The identity is remembered under the worker's durable identity, not
+        // `node_status.node_id`, which names this worker process only.
+        let identity_key = crate::identity_store::worker_key(options.remote.as_deref());
         let (connection, workspace_root, owned_backend) = if let Some(remote_url) = &options.remote
         {
             info!("connecting to remote backend");
@@ -44,10 +47,11 @@ impl LoomView {
             }
             let token = options.token.clone().unwrap_or_default();
             unsigned = token.trim().is_empty();
-            let connection = ClientConnection::remote(
-                remote_url.clone(),
-                token,
+            let connection = connect_remote(
+                remote_url,
+                &token,
                 &remote_connection_options(options),
+                &identity_key,
             )?;
             let workspace_root = options
                 .project
@@ -86,9 +90,6 @@ impl LoomView {
         let remote_options = remote_connection_options(options);
         let node_status = worker_node_status(&connection)?;
         let participant = current_participant(&connection)?;
-        // The identity is remembered under the worker's durable identity, not
-        // `node_status.node_id`, which names this worker process only.
-        let identity_key = crate::identity_store::worker_key(backend_endpoint.as_deref());
         // A connection accepted without a credential cannot resume a person, so
         // the stored participant is kept as a hint for the sign-in prompt
         // instead; a signed connection resumes it as before.
@@ -145,6 +146,12 @@ impl LoomView {
                 backend_endpoint,
             )?
         };
+        if unsigned {
+            // Opened without an operator token. A replayed sign-in may already
+            // have bound a person, but the connection still holds no operator
+            // token, so it stays governed by the worker's session roles.
+            view.mark_node_unsigned(node_id.clone());
+        }
         if let Some(identity) = remembered {
             view.remember_identity(node_id, identity);
         }
@@ -1126,9 +1133,19 @@ impl LoomView {
                 "remote URL must not contain credentials; provide the access token separately",
             ));
         }
-        let connection = ClientConnection::browser(options.remote(), options.token())?;
+        let remote = options.remote().trim();
+        // The durable key of the worker this page reaches: the kept sign-in and
+        // the remembered identity are stored under it.
+        let identity_key =
+            crate::identity_store::worker_key((!remote.is_empty()).then_some(remote));
+        // A page with no operator token replays the GitHub sign-in the client
+        // kept for this worker. The browser reports a refused credential only as
+        // a closed socket, so the connect itself retries once without it.
+        let (connection, negotiation) =
+            connect_browser(options.remote(), options.token(), &identity_key)
+                .await
+                .map_err(BrowserConnectFailure::into_error)?;
         let mut cleanup_guard = ConnectionCleanupGuard::new(connection.clone());
-        let negotiation = negotiate_async(&connection).await?;
         let node_status = worker_node_status_async(&connection).await?;
         let github_sign_in_available = negotiation
             .capabilities
@@ -1138,9 +1155,6 @@ impl LoomView {
         // person signs in.
         let unsigned = options.token().trim().is_empty();
         let participant = current_participant_async(&connection).await?;
-        let remote = options.remote().trim();
-        let identity_key =
-            crate::identity_store::worker_key((!remote.is_empty()).then_some(remote));
         // A connection accepted without a credential cannot resume a person, so
         // the stored participant is kept as a hint for the sign-in prompt
         // instead; a signed connection resumes it as before.
@@ -1286,9 +1300,17 @@ impl LoomView {
             .collect();
 
         let preferences = UiPreferences::load();
+        // A page opened without an operator token stays unsigned even when a
+        // replayed sign-in already bound a person: it is governed by the
+        // worker's session roles, never by operator authority.
+        let unsigned_nodes = if unsigned {
+            BTreeSet::from([default_backend_node_id.clone()])
+        } else {
+            BTreeSet::new()
+        };
         let view = Self {
             connected: true,
-            unsigned_nodes: BTreeSet::new(),
+            unsigned_nodes,
             awaiting_sign_in_nodes: BTreeSet::new(),
             remembered_identities: BTreeMap::new(),
             github_sign_in_available,
@@ -1627,10 +1649,16 @@ impl LoomView {
             let result = cx
                 .background_spawn(async move {
                     let unsigned = token.trim().is_empty();
-                    let connection = ClientConnection::remote(
-                        connect_url,
-                        token.clone(),
+                    // The GitHub sign-in the client kept for this worker, if
+                    // any: a connection opened without an operator token replays
+                    // it, so the node comes up signed in as that person.
+                    let identity_key =
+                        crate::identity_store::worker_key(Some(node_url.as_str()));
+                    let connection = connect_remote(
+                        &connect_url,
+                        &token,
                         &remote_options,
+                        &identity_key,
                     )
                     .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
                     let negotiation = match negotiate(&connection) {
@@ -1662,8 +1690,6 @@ impl LoomView {
                         && current_participant(&connection)
                             .map(|participant| participant.is_none())
                             .unwrap_or(false);
-                    let identity_key =
-                        crate::identity_store::worker_key(Some(node_url.as_str()));
                     // A connection accepted without a credential cannot resume
                     // a person, so the stored participant is kept as a hint for
                     // the sign-in prompt instead.
@@ -1702,6 +1728,7 @@ impl LoomView {
                         node_url,
                         credential_detail,
                         pre_login,
+                        unsigned,
                         remembered,
                         negotiation
                             .capabilities
@@ -1723,6 +1750,7 @@ impl LoomView {
                         connected_url,
                         credential_detail,
                         pre_login,
+                        unsigned,
                         remembered,
                         offers_sign_in,
                     )) if is_pending => {
@@ -1732,6 +1760,8 @@ impl LoomView {
                         // pre-login connection is refused that read.
                         if pre_login {
                             view.mark_node_pre_login(status.node_id.clone());
+                        } else if unsigned {
+                            view.mark_node_unsigned(status.node_id.clone());
                         }
                         if let Some(identity) = remembered {
                             view.remember_identity(status.node_id.clone(), identity);
@@ -1751,7 +1781,7 @@ impl LoomView {
                             view.clear_node_on_render = true;
                         }
                     }
-                    Ok((connection, _, _, _, _, _, _)) => {
+                    Ok((connection, _, _, _, _, _, _, _)) => {
                         if let Err(error) = connection.close() {
                             view.record_status(format!(
                                 "A completed worker connection was discarded, but the transport could not be closed: {}",
@@ -1834,17 +1864,20 @@ impl LoomView {
         cx.spawn(async move |_, cx| {
             let result = async {
                 let unsigned = token.trim().is_empty();
-                let connection = ClientConnection::browser(&url, &token)
-                    .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
-                let negotiation = match negotiate_async(&connection).await {
-                    Ok(negotiation) => negotiation,
-                    Err(error) => {
-                        let cleanup_failed = connection.close().is_err();
-                        return Err((
-                            WorkerConnectionStage::Negotiation,
-                            error,
-                            cleanup_failed,
-                        ));
+                // The GitHub sign-in the client kept for this worker, if any: a
+                // connection opened without an operator token replays it, and a
+                // worker that refuses it closes the socket, which the connect
+                // retries once without.
+                let identity_key = crate::identity_store::worker_key(Some(node_url.as_str()));
+                let (connection, negotiation) = match connect_browser(&url, &token, &identity_key)
+                    .await
+                {
+                    Ok(connected) => connected,
+                    Err(BrowserConnectFailure::Transport(error)) => {
+                        return Err((WorkerConnectionStage::Transport, error, false));
+                    }
+                    Err(BrowserConnectFailure::Negotiation(error)) => {
+                        return Err((WorkerConnectionStage::Negotiation, error, false));
                     }
                 };
                 let status = match worker_node_status_async(&connection).await {
@@ -1863,8 +1896,6 @@ impl LoomView {
                         .await
                         .map(|participant| participant.is_none())
                         .unwrap_or(false);
-                let identity_key =
-                    crate::identity_store::worker_key(Some(node_url.as_str()));
                 // A connection accepted without a credential cannot resume a
                 // person, so the stored participant is kept as a hint for the
                 // sign-in prompt instead.
@@ -1888,6 +1919,7 @@ impl LoomView {
                     status,
                     node_url,
                     pre_login,
+                    unsigned,
                     remembered,
                     negotiation
                         .capabilities
@@ -1903,15 +1935,23 @@ impl LoomView {
                         && node.connection_state == WorkerConnectionState::Connecting
                 });
                 match result {
-                    Ok((connection, status, connected_url, pre_login, remembered, offers_sign_in))
-                        if is_pending =>
-                    {
+                    Ok((
+                        connection,
+                        status,
+                        connected_url,
+                        pre_login,
+                        unsigned,
+                        remembered,
+                        offers_sign_in,
+                    )) if is_pending => {
                         view.github_sign_in_available |= offers_sign_in;
                         // Marked before the node is added, because adding it
                         // reloads every connected worker's sessions and a
                         // pre-login connection is refused that read.
                         if pre_login {
                             view.mark_node_pre_login(status.node_id.clone());
+                        } else if unsigned {
+                            view.mark_node_unsigned(status.node_id.clone());
                         }
                         if let Some(identity) = remembered {
                             view.remember_identity(status.node_id.clone(), identity);
@@ -1925,7 +1965,7 @@ impl LoomView {
                             view.clear_node_on_render = true;
                         }
                     }
-                    Ok((connection, _, _, _, _, _)) => {
+                    Ok((connection, _, _, _, _, _, _)) => {
                         if let Err(error) = connection.close() {
                             view.record_status(format!(
                                 "A completed worker connection was discarded, but the transport could not be closed: {}",

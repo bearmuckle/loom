@@ -215,11 +215,15 @@ impl LoomView {
                         .ok();
                         return;
                     }
-                    DeviceLoginStatus::SignedIn(participant) => {
+                    DeviceLoginStatus::SignedIn {
+                        participant,
+                        resume_token,
+                    } => {
                         view.update(cx, |view, cx| {
                             view.apply_github_sign_in_status(
                                 &node_id,
                                 GitHubSignInStatus::SignedIn { participant },
+                                resume_token,
                                 cx,
                             );
                         })
@@ -1182,11 +1186,16 @@ async fn resolve_workspace_id_async(
 /// The status a device-login poll reports.
 ///
 /// The Copilot and repository flows end in a configured credential; an
-/// identity flow ends in a person, which is what `SignedIn` carries.
+/// identity flow ends in a person, which is what `SignedIn` carries. That
+/// status also carries the person's own credential when the worker minted one,
+/// which it returns only on the poll that first reports the sign-in.
 enum DeviceLoginStatus {
     Pending,
     Configured,
-    SignedIn(ParticipantIdentity),
+    SignedIn {
+        participant: ParticipantIdentity,
+        resume_token: Option<String>,
+    },
     Failed(String),
 }
 
@@ -1278,17 +1287,16 @@ fn github_login_status(
         }),
         (
             GitHubLoginKind::Identity,
-            // The worker's sign-in credential is not stored by the client yet,
-            // so it is read here and left unused.
             ServerResponse::Access(AccessResponse::GitHubSignInStatus {
                 status,
-                resume_token: _,
+                resume_token,
             }),
         ) => Ok(match status {
             GitHubSignInStatus::Pending => DeviceLoginStatus::Pending,
-            GitHubSignInStatus::SignedIn { participant } => {
-                DeviceLoginStatus::SignedIn(participant)
-            }
+            GitHubSignInStatus::SignedIn { participant } => DeviceLoginStatus::SignedIn {
+                participant,
+                resume_token,
+            },
             GitHubSignInStatus::Failed { message } => DeviceLoginStatus::Failed(message),
         }),
         (_, response) => Err(unexpected_response("GitHub login status", response)),

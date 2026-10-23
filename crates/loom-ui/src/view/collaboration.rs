@@ -61,11 +61,43 @@ impl LoomView {
         }
     }
 
+    /// Whether the sign-in on `node_id` is kept on this device.
+    ///
+    /// The client stores the person's own credential so the next connection
+    /// signs in as them, but only over a transport that is secure for secrets:
+    /// the credential is a bearer secret, so anything else would put it on the
+    /// wire in the clear.
+    pub(crate) fn sign_in_is_remembered(&self, node_id: &str) -> bool {
+        self.node_backends
+            .get(node_id)
+            .is_some_and(BackendWorker::secure_for_secrets)
+    }
+
+    /// What the sign-in prompts say about how long a sign-in lasts.
+    pub(crate) fn sign_in_retention_note(&self, node_id: &str) -> &'static str {
+        if self.sign_in_is_remembered(node_id) {
+            KEPT_SIGN_IN_NOTE
+        } else {
+            UNSAVED_SIGN_IN_NOTE
+        }
+    }
+
     /// Whether the connected worker advertises `git_hub_sign_in`.
     pub(crate) fn offers_github_sign_in(&self) -> bool {
         self.github_sign_in_available
     }
 }
+
+/// The sign-in prompts' note when the client keeps the sign-in for the worker.
+///
+/// Signing out revokes the person's credential, so the note names both halves:
+/// the sign-in outlives the connection, and signing out ends it.
+pub(crate) const KEPT_SIGN_IN_NOTE: &str = "This sign-in is remembered on this device, and signing out forgets it and revokes the \
+     credential.";
+
+/// The note when the transport is not secure for secrets, so nothing is kept.
+pub(crate) const UNSAVED_SIGN_IN_NOTE: &str =
+    "A sign-in lasts for this connection, so a reload asks again.";
 
 impl LoomView {
     /// Loads who this connection is, then the active session's roster and
@@ -1104,12 +1136,13 @@ impl LoomView {
         &mut self,
         node_id: &str,
         status: GitHubSignInStatus,
+        resume_token: Option<String>,
         cx: &mut Context<Self>,
     ) {
         match status {
             GitHubSignInStatus::Pending => {}
             GitHubSignInStatus::SignedIn { participant } => {
-                self.complete_identity_sign_in(node_id.to_owned(), participant, cx);
+                self.complete_identity_sign_in(node_id.to_owned(), participant, resume_token, cx);
             }
             GitHubSignInStatus::Failed { message } => {
                 self.github_login = Some(GitHubLoginState::Error(message));
@@ -1128,6 +1161,7 @@ impl LoomView {
         &mut self,
         node_id: String,
         participant: ParticipantIdentity,
+        resume_token: Option<String>,
         cx: &mut Context<Self>,
     ) {
         // Remember the person per worker so a reload can resume them on the
@@ -1135,6 +1169,23 @@ impl LoomView {
         // worker's durable identity, not the node id its process reported.
         let identity_key = self.identity_key_for_node(&node_id);
         crate::identity_store::save(&identity_key, &participant);
+        // The worker mints the person their own revocable credential and
+        // returns it once, on the poll that reports the sign-in. Keeping it is
+        // what signs the next connection in as them instead of asking for a
+        // device flow again, so it is stored next to the remembered identity,
+        // but only over a transport that is secure for secrets: it is a bearer
+        // credential, and nothing may put it on the wire in the clear.
+        if let Some(credential) = resume_token.filter(|token| !token.trim().is_empty()) {
+            if self.sign_in_is_remembered(&node_id) {
+                crate::credential_store::save(&identity_key, &credential);
+            } else {
+                log::debug!(
+                    "[loom-ui] not keeping the GitHub sign-in for worker '{}': the connection is \
+                     not secure for secrets",
+                    identity_key
+                );
+            }
+        }
         self.remember_identity(node_id.clone(), participant.clone());
         self.awaiting_sign_in_nodes.remove(&node_id);
         let signed_in_the_active_node = self.active_node_id() == node_id;
@@ -1230,7 +1281,11 @@ impl LoomView {
     ) -> bool {
         let signed_out = match response.result {
             Ok(ServerResponse::Access(AccessResponse::SignedOutGitHub)) => {
-                crate::identity_store::clear(&self.identity_key_for_node(node_id));
+                let identity_key = self.identity_key_for_node(node_id);
+                crate::identity_store::clear(&identity_key);
+                // Signing out revokes the person's credential on the worker, so
+                // the client must not present it again on the next connection.
+                crate::credential_store::clear(&identity_key);
                 self.remembered_identities.remove(node_id);
                 self.collaboration.reset_after_sign_out();
                 if self.unsigned_nodes.contains(node_id) {

@@ -501,6 +501,114 @@ pub(crate) async fn resume_github_identity_async(
     }
 }
 
+/// Opens the native transport for `url` with the credential this connection may
+/// present.
+///
+/// A connection with no operator token replays the GitHub sign-in the client
+/// kept for that worker, so a reload signs in as that person instead of asking
+/// for a device flow again; every other connection uses its token as before.
+///
+/// The worker refuses a credential it no longer honours by failing the
+/// handshake, which is synchronous natively. A stale credential is therefore
+/// cleared and the connection is opened once more without it, which leaves the
+/// node pre-login so it shows the ordinary sign-in prompt.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn connect_remote(
+    url: &str,
+    operator_token: &str,
+    options: &loom_local::RemoteConnectionOptions,
+    identity_key: &str,
+) -> Result<ClientConnection, LoomError> {
+    let stored = crate::credential_store::load(identity_key);
+    let Some(credential) = crate::credential_store::replayable(operator_token, stored, url) else {
+        return ClientConnection::remote(url.to_owned(), operator_token.to_owned(), options);
+    };
+    match ClientConnection::remote(url.to_owned(), credential, options) {
+        Ok(connection) => Ok(connection),
+        Err(error) if refused_a_credential(&error) => {
+            log::debug!(
+                "[loom-ui] the worker refused the kept GitHub sign-in for worker '{}'; \
+                 reconnecting without it: {}",
+                identity_key,
+                error.message
+            );
+            crate::credential_store::clear(identity_key);
+            ClientConnection::remote(url.to_owned(), String::new(), options)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether `error` is the worker refusing the credential a connection presented.
+#[cfg(not(target_family = "wasm"))]
+fn refused_a_credential(error: &LoomError) -> bool {
+    matches!(
+        error.code,
+        ErrorCode::AuthenticationFailed
+            | ErrorCode::AuthenticationRequired
+            | ErrorCode::AuthorizationDenied
+    )
+}
+
+/// Why a browser connect failed.
+///
+/// The view reports a transport that could not be created differently from a
+/// worker that closed it before negotiation, so the two stay apart here.
+#[cfg(target_family = "wasm")]
+pub(crate) enum BrowserConnectFailure {
+    Transport(LoomError),
+    Negotiation(LoomError),
+}
+
+#[cfg(target_family = "wasm")]
+impl BrowserConnectFailure {
+    pub(crate) fn into_error(self) -> LoomError {
+        match self {
+            Self::Transport(error) | Self::Negotiation(error) => error,
+        }
+    }
+}
+
+/// Opens the browser transport for a bootstrap or a reconnect.
+///
+/// The browser cannot inspect a handshake refusal: a worker that does not accept
+/// the credential closes the socket and the first request reports it. A connect
+/// that presented a kept sign-in therefore clears it and retries once without
+/// it, so a sign-in revoked elsewhere lands on the ordinary sign-in prompt
+/// instead of a dead connection. The retry never repeats.
+#[cfg(target_family = "wasm")]
+pub(crate) async fn connect_browser(
+    url: &str,
+    operator_token: &str,
+    identity_key: &str,
+) -> Result<(ClientConnection, NegotiationResult), BrowserConnectFailure> {
+    let stored = crate::credential_store::load(identity_key);
+    let kept = crate::credential_store::replayable(operator_token, stored, url);
+    let connection = ClientConnection::browser(url, kept.as_deref().unwrap_or(operator_token))
+        .map_err(BrowserConnectFailure::Transport)?;
+    let error = match negotiate_async(&connection).await {
+        Ok(negotiation) => return Ok((connection, negotiation)),
+        Err(error) if kept.is_some() => error,
+        Err(error) => return Err(BrowserConnectFailure::Negotiation(error)),
+    };
+    log::debug!(
+        "[loom-ui] the worker did not accept the kept GitHub sign-in for worker '{}'; retrying \
+         without it: {}",
+        identity_key,
+        error.message
+    );
+    crate::credential_store::clear(identity_key);
+    if let Err(close) = connection.close() {
+        log::debug!("[loom-ui] could not close the rejected worker transport: {close}");
+    }
+    let retry =
+        ClientConnection::browser(url, operator_token).map_err(BrowserConnectFailure::Transport)?;
+    let negotiation = negotiate_async(&retry)
+        .await
+        .map_err(BrowserConnectFailure::Negotiation)?;
+    Ok((retry, negotiation))
+}
+
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn negotiate(connection: &ClientConnection) -> Result<NegotiationResult, LoomError> {
     let response = connection.request_with_timeout(

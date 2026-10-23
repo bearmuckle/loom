@@ -343,9 +343,12 @@ impl LoomView {
             )
             .child(
                 div()
+                    .id("composer-sign-in-note")
+                    .test_support()
+                    .aria_label(self.sign_in_retention_note(&node_id))
                     .text_xs()
                     .text_color(rgb(0x8f98a6))
-                    .child("A sign-in lasts for this connection, so a reload asks again."),
+                    .child(self.sign_in_retention_note(&node_id)),
             );
         if self.offers_github_sign_in() {
             body = body.child(

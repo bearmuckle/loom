@@ -13,6 +13,16 @@ impl LoomView {
         self.awaiting_sign_in_nodes.insert(node_id);
     }
 
+    /// Records that `node_id` was opened without an operator token.
+    ///
+    /// Such a connection may already be signed in as a person, because the
+    /// client replayed the credential it kept for the worker, and the worker
+    /// binds that person from the first request. It still holds no operator
+    /// token, so it stays governed by the session roles the worker reports.
+    pub(crate) fn mark_node_unsigned(&mut self, node_id: String) {
+        self.unsigned_nodes.insert(node_id);
+    }
+
     /// The person this node's connection was last signed in as, if the client
     /// remembered one.
     ///
@@ -232,6 +242,9 @@ impl LoomView {
             self.node_session_load_errors.remove(&node.status.node_id);
             let identity_key = worker_entry_identity_key(self.backend_endpoint.as_deref(), &node);
             crate::identity_store::clear(&identity_key);
+            // The kept sign-in is a secret bound to that worker, so removing
+            // the node forgets it as well as the person it belonged to.
+            crate::credential_store::clear(&identity_key);
             self.remembered_identities.remove(&node.status.node_id);
         }
         if let Some(url) = &node.url {
