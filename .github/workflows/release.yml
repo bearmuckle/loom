@@ -145,7 +145,7 @@ jobs:
             zlib1g-dev \
             file \
             patchelf
-      - uses: taiki-e/install-action@9b9bdfc420b7f9201199638bc0b87bb35174e627 # cargo-deb
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # cargo-deb
         if: runner.os == 'Linux'
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
