@@ -1,12 +1,12 @@
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, Capability, CapabilitySet,
-    EventSequence, InteractionId, ProtocolVersion, RunId, SessionLimits, StepId, Timestamp,
-    WorkspaceId,
+    EventSequence, GitHubSignInStatus, InteractionId, ParticipantId, ParticipantIdentity,
+    ProtocolVersion, RunId, SessionLimits, StepId, Timestamp, WorkspaceId,
 };
 use loom_model::{ModelId, ToolCall};
 use loom_protocol::{
-    AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, AgentEvent,
-    AgentPlanStep, AgentRunSnapshot, AgentRunState, ArchiveRetentionPolicy,
+    AccessResponse, AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
+    AgentEvent, AgentPlanStep, AgentRunSnapshot, AgentRunState, ArchiveRetentionPolicy,
     CURRENT_PROTOCOL_VERSION, ClientFrame, ClientRequest, ContextAssemblyOptions, ControlRequest,
     ControlResponse, FileActivityOperation, FilesystemRequest, FilesystemResponse,
     GitHubCopilotLoginStatus, ProviderRequest, ProviderResponse, RequestEnvelope, ResponseEnvelope,
@@ -201,6 +201,54 @@ fn browser_repository_login_round_trips_without_access_tokens() {
     assert_eq!(
         decode_request(&encode_request(&configure).unwrap()).unwrap(),
         configure
+    );
+}
+
+#[test]
+fn github_sign_in_status_carries_an_optional_person_credential() {
+    let participant = ParticipantIdentity {
+        id: ParticipantId::new(),
+        display_name: "bjornharrtell".to_owned(),
+    };
+    let signed_in = ServerResponse::Access(AccessResponse::GitHubSignInStatus {
+        status: GitHubSignInStatus::SignedIn {
+            participant: participant.clone(),
+        },
+        resume_token: Some("loom-person-credential".to_owned()),
+    });
+
+    // A poll that reports `signed_in` may carry the person's own credential,
+    // and the response round-trips with it.
+    let encoded = serde_json::to_value(&signed_in).unwrap();
+    assert_eq!(
+        encoded["data"]["data"]["resume_token"],
+        serde_json::json!("loom-person-credential")
+    );
+    // The credential is not a provider or GitHub token: the status payload
+    // carries no such secret.
+    let payload = encoded.to_string();
+    for secret in ["gho_", "ghu_", "access_token", "provider"] {
+        assert!(
+            !payload.contains(secret),
+            "a sign-in status must not carry {secret}"
+        );
+    }
+    assert_eq!(
+        serde_json::from_value::<ServerResponse>(encoded).unwrap(),
+        signed_in
+    );
+
+    // A `None` credential is absent from the JSON entirely, and a status with
+    // no field decodes as `None`, which is the shape an older worker sends.
+    let without_credential = ServerResponse::Access(AccessResponse::GitHubSignInStatus {
+        status: GitHubSignInStatus::SignedIn { participant },
+        resume_token: None,
+    });
+    let encoded = serde_json::to_value(&without_credential).unwrap();
+    assert!(encoded["data"]["data"].get("resume_token").is_none());
+    assert_eq!(
+        serde_json::from_value::<ServerResponse>(encoded).unwrap(),
+        without_credential
     );
 }
 

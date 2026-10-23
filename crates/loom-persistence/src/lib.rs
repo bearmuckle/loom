@@ -72,7 +72,7 @@ pub use schema::*;
 /// column where the payload column already exists. The upgrade path
 /// additionally re-applies the idempotent baseline batches, so a bump is what
 /// hands new baseline objects (such as indexes) to existing databases.
-const DATABASE_SCHEMA_VERSION: u32 = 14;
+const DATABASE_SCHEMA_VERSION: u32 = 15;
 /// Oldest schema version that the migration ladder can upgrade in place.
 const DATABASE_MIN_MIGRATABLE_VERSION: u32 = 2;
 /// Maximum UTF-8 bytes stored for a raw or provider-qualified model selector.
@@ -177,6 +177,22 @@ pub struct DurableSessionSettings {
     /// `RunRevision`). Rows are upserted after the run summaries of the same
     /// write, and disappear with their run.
     pub run_action_sequences: BTreeMap<RunId, u64>,
+}
+
+/// One person's stored sign-in credential.
+///
+/// Only the digest of the issued token is kept, so a stored row can verify a
+/// presented credential but never reproduce it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoredPersonToken {
+    /// Identifier carried beside the token, so one credential can be revoked.
+    pub token_id: [u8; 16],
+    /// Digest of the token the person presents on a later connection.
+    pub digest: [u8; 32],
+    /// The person the credential authenticates.
+    pub participant_id: ParticipantId,
+    /// When the credential was issued.
+    pub created_at: Timestamp,
 }
 
 /// Durable form of the worker node's archive-retention policy.

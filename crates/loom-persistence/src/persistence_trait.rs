@@ -103,6 +103,12 @@ pub trait SessionRepository: Send + Sync {
     fn load_access_requests(&self) -> Result<Vec<SessionAccessRequest>>;
     /// Loads the accepted-action count of every run that has one.
     fn load_run_action_sequences(&self) -> Result<BTreeMap<RunId, u64>>;
+    /// Loads every stored person sign-in credential.
+    fn load_person_tokens(&self) -> Result<Vec<StoredPersonToken>>;
+    /// Stores one person credential, replacing the row with the same id.
+    fn save_person_token(&self, token: &StoredPersonToken) -> Result<()>;
+    /// Removes the credential with `token_id`, reporting whether one was stored.
+    fn delete_person_token(&self, token_id: [u8; 16]) -> Result<bool>;
     fn load_session_usage(
         &self,
         session_id: AgentSessionId,
@@ -134,6 +140,15 @@ impl SessionRepository for FilePersistence {
     }
     fn load_run_action_sequences(&self) -> Result<BTreeMap<RunId, u64>> {
         FilePersistence::load_run_action_sequences(self)
+    }
+    fn load_person_tokens(&self) -> Result<Vec<StoredPersonToken>> {
+        FilePersistence::load_person_tokens(self)
+    }
+    fn save_person_token(&self, token: &StoredPersonToken) -> Result<()> {
+        FilePersistence::save_person_token(self, token)
+    }
+    fn delete_person_token(&self, token_id: [u8; 16]) -> Result<bool> {
+        FilePersistence::delete_person_token(self, token_id)
     }
     fn load_session_usage(
         &self,
@@ -168,6 +183,15 @@ impl<T: SessionRepository + ?Sized> SessionRepository for Arc<T> {
     }
     fn load_run_action_sequences(&self) -> Result<BTreeMap<RunId, u64>> {
         (**self).load_run_action_sequences()
+    }
+    fn load_person_tokens(&self) -> Result<Vec<StoredPersonToken>> {
+        (**self).load_person_tokens()
+    }
+    fn save_person_token(&self, token: &StoredPersonToken) -> Result<()> {
+        (**self).save_person_token(token)
+    }
+    fn delete_person_token(&self, token_id: [u8; 16]) -> Result<bool> {
+        (**self).delete_person_token(token_id)
     }
     fn load_session_usage(
         &self,

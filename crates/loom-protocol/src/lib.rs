@@ -1180,16 +1180,19 @@ mod run_message_protocol_tests {
             }),
             ServerResponse::Access(AccessResponse::GitHubSignInStatus {
                 status: GitHubSignInStatus::Pending,
+                resume_token: None,
             }),
             ServerResponse::Access(AccessResponse::GitHubSignInStatus {
                 status: GitHubSignInStatus::SignedIn {
                     participant: participant.clone(),
                 },
+                resume_token: Some("person-credential".to_owned()),
             }),
             ServerResponse::Access(AccessResponse::GitHubSignInStatus {
                 status: GitHubSignInStatus::Failed {
                     message: "expired".to_owned(),
                 },
+                resume_token: None,
             }),
             ServerResponse::Access(AccessResponse::SignedOutGitHub),
         ];
@@ -1207,6 +1210,21 @@ mod run_message_protocol_tests {
                 response
             );
         }
+        // The credential is optional: a response without it leaves the field
+        // out of the JSON, and one that has no field at all, as an older
+        // worker sends, decodes as no credential.
+        let without_credential = ServerResponse::Access(AccessResponse::GitHubSignInStatus {
+            status: GitHubSignInStatus::SignedIn { participant },
+            resume_token: None,
+        });
+        let encoded = serde_json::to_value(&without_credential).unwrap();
+        assert!(encoded["data"]["data"].get("resume_token").is_none());
+        let ServerResponse::Access(AccessResponse::GitHubSignInStatus { resume_token, .. }) =
+            serde_json::from_value(encoded).unwrap()
+        else {
+            panic!("a sign-in status decodes as a sign-in status");
+        };
+        assert_eq!(resume_token, None);
         assert_eq!(
             serde_json::to_value(ClientRequest::Access(AccessRequest::SignOutGitHub)).unwrap(),
             serde_json::json!({"type": "access", "data": {"type": "sign_out_git_hub"}})
@@ -1296,7 +1314,7 @@ mod run_message_protocol_tests {
 
     #[test]
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 13));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 14));
         let project_id = ProjectId::new();
         let request = ClientRequest::Project(ProjectRequest::GetProjectSnapshot { project_id });
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));

@@ -537,7 +537,7 @@ async fn await_github_sign_in(
             .result
             .unwrap()
         {
-            ServerResponse::Access(AccessResponse::GitHubSignInStatus { status }) => status,
+            ServerResponse::Access(AccessResponse::GitHubSignInStatus { status, .. }) => status,
             response => panic!("unexpected status response: {response:?}"),
         };
         if !matches!(status, loom_core::GitHubSignInStatus::Pending) {

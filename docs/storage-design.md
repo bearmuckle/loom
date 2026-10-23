@@ -43,6 +43,11 @@ Large immutable values—including message bodies, tool output, checkpoint file 
 
 Runtime objects, locks, provider clients, filesystem watchers, and UI caches are reconstructed and are not persisted.
 
+People the backend knows are `participants` rows. A credential a person's GitHub
+sign-in issues is one `person_tokens` row: a 16-byte token id, the token's
+32-byte digest, the participant it authenticates, and its issue time. The token
+itself is never stored, and the row is removed with its participant.
+
 The workspace-config JSON stores `project_agent_concurrency` with a serde
 default of four (valid values are one through sixteen) and
 `run_admission_timeout_secs` with a serde default of 1800 (valid values are 60

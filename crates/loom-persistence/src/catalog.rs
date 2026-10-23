@@ -703,6 +703,89 @@ impl FilePersistence {
                 )
             })
     }
+
+    /// Loads every stored person sign-in credential, oldest first.
+    pub fn load_person_tokens(&self) -> Result<Vec<StoredPersonToken>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let read_error = |error: rusqlite::Error| {
+            persistence_error(format!("could not read person tokens: {error}"), true)
+        };
+        let mut statement = connection
+            .prepare(
+                "SELECT token_id, digest, participant_id, created_at FROM person_tokens
+                 ORDER BY participant_id, created_at, token_id",
+            )
+            .map_err(read_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(read_error)?;
+        let mut tokens = Vec::new();
+        for row in rows {
+            let (token_id, digest, participant_id, created_at) = row.map_err(read_error)?;
+            tokens.push(StoredPersonToken {
+                token_id: decode_fixed_bytes(&token_id, "person token id")?,
+                digest: decode_fixed_bytes(&digest, "person token digest")?,
+                participant_id: ParticipantId::from_uuid(decode_uuid(
+                    &participant_id,
+                    "participant id",
+                )?),
+                created_at: decode_timestamp(created_at)?,
+            });
+        }
+        Ok(tokens)
+    }
+
+    /// Stores one person credential, replacing the row with the same token id.
+    pub fn save_person_token(&self, token: &StoredPersonToken) -> Result<()> {
+        let connection = self.connection_for_write()?;
+        connection
+            .execute(
+                "INSERT INTO person_tokens(token_id, digest, participant_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(token_id) DO UPDATE SET
+                    digest=excluded.digest,
+                    participant_id=excluded.participant_id,
+                    created_at=excluded.created_at
+                 WHERE person_tokens.digest IS NOT excluded.digest
+                    OR person_tokens.participant_id IS NOT excluded.participant_id
+                    OR person_tokens.created_at IS NOT excluded.created_at",
+                params![
+                    token.token_id.as_slice(),
+                    token.digest.as_slice(),
+                    token.participant_id.as_uuid().as_bytes().as_slice(),
+                    encode_timestamp(token.created_at)?,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not save person token: {error}"), true)
+            })?;
+        Ok(())
+    }
+
+    /// Removes the person credential with `token_id`, reporting whether one was
+    /// stored.
+    pub fn delete_person_token(&self, token_id: [u8; 16]) -> Result<bool> {
+        let connection = self.connection_for_write()?;
+        let removed = connection
+            .execute(
+                "DELETE FROM person_tokens WHERE token_id = ?1",
+                [token_id.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not delete person token: {error}"), true)
+            })?;
+        Ok(removed > 0)
+    }
 }
 pub(crate) fn save_session_rows(
     transaction: &Transaction<'_>,

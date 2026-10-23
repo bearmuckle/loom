@@ -320,6 +320,9 @@ impl InProcessConnection {
         )?;
         Ok(ServerResponse::Access(AccessResponse::GitHubSignInStatus {
             status,
+            // The credential is minted and stored by a follow-up change; until
+            // then a sign-in returns none.
+            resume_token: None,
         }))
     }
 

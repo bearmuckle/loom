@@ -526,12 +526,13 @@ version. 11.5 adds access requests. 11.6 adds GitHub sign-in. 11.7 adds the
 activity-detail projection. 11.8 adds provider API-key removal. 11.9 adds
 resuming a remembered GitHub identity. 11.10 adds creating a sub project from
 the project it branches out of. 11.11 adds automatic project titles,
-`SetAgentSessionTitleSource`, and the title source a rename reports. Every
-addition is a new enum variant, a
-capability, or a field with a compatible default (an omitted field keeps the
-older behavior), so clients of an older 11.x minor keep working; they simply
-never send the new requests, negotiate the new capability, or ask for the new
-behavior.
+`SetAgentSessionTitleSource`, and the title source a rename reports. 11.12 adds
+the session goal field, request, response, and event; 11.13 adds clearing it.
+11.14 adds the one-time sign-in credential. Every addition is a new enum
+variant, a capability, or a field with a compatible default (an omitted field
+keeps the older behavior), so clients of an older 11.x minor keep working; they
+simply never send the new requests, negotiate the new capability, or ask for
+the new behavior.
 
 ### Signing in with GitHub
 
@@ -583,6 +584,14 @@ A sign-in is a GitHub device flow:
    participant }`, which binds presence again without a new device flow. The
    worker resumes only a person already in its directory and only on an operator
    token; a connection accepted without a credential still has to sign in.
+
+The poll that first reports `signed_in` may also carry `resume_token`, the
+person's own revocable credential. The client stores it and presents it as the
+bearer credential on a later connection; the worker then binds that connection
+to the same person, subject to the session roles that person holds. It is not
+an operator token: it reaches only what that person is granted. The worker
+keeps only the credential's digest, and a sign-out revokes it. An older worker
+sends no field at all, so a client treats it as optional.
 
 Anyone with a GitHub account *may* complete the device flow, but a signed-in
 person holds no session grants until an owner grants one (see access requests).

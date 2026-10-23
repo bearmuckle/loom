@@ -724,6 +724,57 @@ fn migrates_a_v13_database_by_adding_the_session_goal_column() {
 }
 
 #[test]
+fn migrates_a_v14_database_by_adding_the_person_token_table() {
+    let path = std::env::temp_dir().join(format!(
+        "loom-persistence-migrate-v14-{}.db",
+        Uuid::new_v4()
+    ));
+    {
+        let connection = Connection::open(&path).unwrap();
+        // A v14 database predates the person credentials a sign-in issues. The
+        // baseline the ladder re-applies is what adds the table.
+        connection
+            .execute_batch(
+                "CREATE TABLE sentinel(value TEXT);
+                 INSERT INTO sentinel(value) VALUES ('keep');
+                 PRAGMA user_version = 14;",
+            )
+            .unwrap();
+    }
+
+    // Opening is lazy; the first read runs the migration ladder.
+    let store = FilePersistence::open(&path).unwrap();
+    assert!(store.load_person_tokens().unwrap().is_empty());
+    drop(store);
+
+    let connection = Connection::open(&path).unwrap();
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, DATABASE_SCHEMA_VERSION);
+    for (kind, name) in [
+        ("table", "person_tokens"),
+        ("index", "person_tokens_by_participant"),
+    ] {
+        let present: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                 WHERE type=?1 AND name=?2)",
+                params![kind, name],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(present, "the v15 migration adds the baseline {kind} {name}");
+    }
+    let sentinel: String = connection
+        .query_row("SELECT value FROM sentinel", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(sentinel, "keep", "a migration keeps unrelated tables");
+    drop(connection);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn migrates_a_v4_database_by_adding_the_archive_retention_policy_table() {
     let path =
         std::env::temp_dir().join(format!("loom-persistence-migrate-v4-{}.db", Uuid::new_v4()));

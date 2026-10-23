@@ -168,7 +168,7 @@ fn await_sign_in(connection: &InProcessConnection, login_id: &str) -> GitHubSign
         )
         .expect("the sign-in is readable by its initiator")
         {
-            AccessResponse::GitHubSignInStatus { status } => status,
+            AccessResponse::GitHubSignInStatus { status, .. } => status,
             response => panic!("unexpected status response: {response:?}"),
         };
         if !matches!(status, GitHubSignInStatus::Pending) {

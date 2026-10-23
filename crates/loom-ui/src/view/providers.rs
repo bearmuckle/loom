@@ -1278,7 +1278,12 @@ fn github_login_status(
         }),
         (
             GitHubLoginKind::Identity,
-            ServerResponse::Access(AccessResponse::GitHubSignInStatus { status }),
+            // The worker's sign-in credential is not stored by the client yet,
+            // so it is read here and left unused.
+            ServerResponse::Access(AccessResponse::GitHubSignInStatus {
+                status,
+                resume_token: _,
+            }),
         ) => Ok(match status {
             GitHubSignInStatus::Pending => DeviceLoginStatus::Pending,
             GitHubSignInStatus::SignedIn { participant } => {

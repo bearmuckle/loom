@@ -437,6 +437,16 @@ pub(crate) fn decode_uuid(bytes: &[u8], field: &str) -> Result<Uuid> {
     })
 }
 
+pub(crate) fn decode_fixed_bytes<const N: usize>(bytes: &[u8], field: &str) -> Result<[u8; N]> {
+    <[u8; N]>::try_from(bytes).map_err(|_| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("persisted {field} is not {N} bytes"),
+            false,
+        )
+    })
+}
+
 pub(crate) fn persistence_error(message: String, retryable: bool) -> LoomError {
     LoomError::new(ErrorCode::Persistence, message, retryable)
 }

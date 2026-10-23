@@ -2108,3 +2108,102 @@ fn session_deletion_reaches_the_store_through_the_persistence_trait_object() {
     drop(store);
     fs::remove_file(path).unwrap();
 }
+
+/// Saves one state whose participant directory is `participants` and nothing
+/// else, which is how a person is created and removed.
+fn save_participants(
+    persistence: &FilePersistence,
+    sessions: &loom_session::SessionManagerState,
+    participants: BTreeMap<ParticipantId, String>,
+) {
+    let settings = DurableSessionSettings {
+        participants,
+        ..DurableSessionSettings::default()
+    };
+    persistence
+        .save_state(DurableStateWrite {
+            sessions,
+            workspaces: None,
+            settings: Some(&settings),
+            workspace_configs: None,
+            providers: None,
+            usage: None,
+            idempotency: None,
+            run_summaries: None,
+            run_runtime_configs: None,
+            run_context_checkpoints: None,
+            run_plans: None,
+            run_messages: None,
+            run_activities: None,
+            filesystem_records: None,
+            feed: None,
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_person_token_round_trips_and_is_deleted_by_id() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+    let persistence = FilePersistence::open(&path).unwrap();
+    let sessions = SessionManager::default().export_state();
+    let participant_id = ParticipantId::new();
+    save_participants(
+        &persistence,
+        &sessions,
+        BTreeMap::from([(participant_id, "Sam".to_owned())]),
+    );
+    let token = StoredPersonToken {
+        token_id: [7; 16],
+        digest: [9; 32],
+        participant_id,
+        created_at: Timestamp::from_unix_millis(5),
+    };
+
+    persistence.save_person_token(&token).unwrap();
+
+    assert_eq!(persistence.load_person_tokens().unwrap(), vec![token]);
+    assert!(persistence.delete_person_token(token.token_id).unwrap());
+    assert!(persistence.load_person_tokens().unwrap().is_empty());
+    assert!(
+        !persistence.delete_person_token(token.token_id).unwrap(),
+        "a revoked credential is already gone"
+    );
+
+    drop(persistence);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_person_token_disappears_with_its_participant() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+    let persistence = FilePersistence::open(&path).unwrap();
+    let sessions = SessionManager::default().export_state();
+    let participant_id = ParticipantId::new();
+    save_participants(
+        &persistence,
+        &sessions,
+        BTreeMap::from([(participant_id, "Sam".to_owned())]),
+    );
+    persistence
+        .save_person_token(&StoredPersonToken {
+            token_id: [7; 16],
+            digest: [9; 32],
+            participant_id,
+            created_at: Timestamp::from_unix_millis(5),
+        })
+        .unwrap();
+
+    // Removing the person removes their credentials with them.
+    save_participants(&persistence, &sessions, BTreeMap::new());
+
+    assert!(persistence.load_person_tokens().unwrap().is_empty());
+    let connection = Connection::open(&path).unwrap();
+    let stored: i64 = connection
+        .query_row("SELECT COUNT(*) FROM person_tokens", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(stored, 0, "the cascade removes the stored row");
+
+    drop(connection);
+    drop(persistence);
+    fs::remove_file(path).unwrap();
+}

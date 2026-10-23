@@ -578,8 +578,17 @@ pub enum AccessResponse {
 
     /// The state of a GitHub sign-in; `signed_in` carries the person this
     /// connection is now bound to.
+    ///
+    /// `resume_token` is the person's own revocable credential for later
+    /// connections. The worker returns it once, on the poll that first reports
+    /// `signed_in`; it is not an operator token, because the worker binds it to
+    /// that one person and their session roles. The worker stores only its
+    /// digest, and a sign-out revokes it. An older worker sends no field, so a
+    /// client treats it as optional.
     GitHubSignInStatus {
         status: GitHubSignInStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume_token: Option<String>,
     },
 
     /// The connection signed out of GitHub and holds no participant identity.

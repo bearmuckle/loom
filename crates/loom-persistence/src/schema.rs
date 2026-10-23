@@ -515,6 +515,18 @@ CREATE TABLE IF NOT EXISTS session_access_requests (
     created_at INTEGER NOT NULL CHECK(created_at >= 0),
     UNIQUE(session_id, participant_id)
 ) WITHOUT ROWID, STRICT;
+-- One revocable credential a person holds for later connections, issued when
+-- they sign in. Only its digest is stored, never the token itself, and it
+-- disappears with its person.
+CREATE TABLE IF NOT EXISTS person_tokens (
+    token_id BLOB PRIMARY KEY NOT NULL CHECK(length(token_id) = 16),
+    digest BLOB NOT NULL CHECK(length(digest) = 32),
+    participant_id BLOB NOT NULL REFERENCES participants(participant_id) ON DELETE CASCADE
+        CHECK(length(participant_id) = 16),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0)
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS person_tokens_by_participant
+    ON person_tokens(participant_id, created_at, token_id);
 -- Count of people's actions accepted on a run, the last part of its
 -- RunRevision. Stored so a revision issued before a restart never matches a
 -- different run state after it.
@@ -1276,6 +1288,11 @@ fn migrate_schema_transaction(connection: &Connection, from_version: u32) -> Res
                         })?;
                 }
                 version = 14;
+            }
+            // v15 adds the person credentials a GitHub sign-in issues, a new
+            // baseline table.
+            14 => {
+                version = 15;
             }
             other => return Err(unsupported_database_error(other)),
         }
