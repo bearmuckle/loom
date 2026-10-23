@@ -321,12 +321,32 @@ impl LoomView {
     /// connection, which may read, sign in, and do nothing else.
     fn render_sign_in_prompt(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let node_id = self.active_node_id().to_owned();
-        let mut body = div().flex().flex_col().gap_2().child(
-            div()
-                .text_sm()
-                .text_color(rgb(0xe5e7eb))
-                .child("Sign in to this worker to send messages and start runs."),
+        // A remembered person is a hint only: the connection cannot resume an
+        // identity, so the prompt names them and still starts a device flow.
+        let remembered = self.remembered_identity(&node_id);
+        let message = remembered.map_or_else(
+            || "Sign in to this worker to send messages and start runs.".to_owned(),
+            |identity| format!("Sign in again as {}", identity.display_name),
         );
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .id("composer-sign-in-message")
+                    .test_support()
+                    .aria_label(message.clone())
+                    .text_sm()
+                    .text_color(rgb(0xe5e7eb))
+                    .child(message),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x8f98a6))
+                    .child("A sign-in lasts for this connection, so a reload asks again."),
+            );
         if self.offers_github_sign_in() {
             body = body.child(
                 Button::new("composer-sign-in-github")

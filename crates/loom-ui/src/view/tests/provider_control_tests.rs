@@ -399,6 +399,132 @@ fn agent_output_settings_live_in_the_agents_section(cx: &mut TestAppContext) {
 }
 
 #[test]
+fn github_login_kinds_name_the_flow_each_one_runs() {
+    use crate::state::GitHubLoginKind;
+
+    // Each flow acquires something different, so neither the heading nor the
+    // explanation may read like one generic GitHub login.
+    assert_eq!(
+        GitHubLoginKind::Copilot.pane_title(),
+        "Sign in to GitHub Copilot"
+    );
+    assert_eq!(
+        GitHubLoginKind::Repository.pane_title(),
+        "Authorize GitHub repository access"
+    );
+    assert_eq!(
+        GitHubLoginKind::Identity.pane_title(),
+        "Sign in to this worker"
+    );
+
+    let copilot = GitHubLoginKind::Copilot.intro();
+    assert!(copilot.contains("model provider"), "{copilot}");
+    assert!(!copilot.contains("repository"), "{copilot}");
+    let repository = GitHubLoginKind::Repository.intro();
+    assert!(repository.contains("clone"), "{repository}");
+    assert!(!repository.contains("model provider"), "{repository}");
+    let identity = GitHubLoginKind::Identity.intro();
+    assert!(identity.contains("this connection"), "{identity}");
+    assert!(identity.contains("no repository"), "{identity}");
+
+    // The two credential flows say they are not the worker sign-in, and the
+    // worker sign-in says it grants no credential.
+    assert!(copilot.contains("does not sign you in"), "{copilot}");
+    assert!(repository.contains("does not sign you in"), "{repository}");
+
+    assert_ne!(copilot, repository);
+    assert_ne!(repository, identity);
+
+    let copilot_success = GitHubLoginKind::Copilot.success_message();
+    assert!(
+        copilot_success.contains("GitHub Copilot"),
+        "{copilot_success}"
+    );
+    let repository_success = GitHubLoginKind::Repository.success_message();
+    assert!(
+        repository_success.contains("Repository"),
+        "{repository_success}"
+    );
+    let identity_success = GitHubLoginKind::Identity.success_message();
+    assert!(identity_success.contains("signed in"), "{identity_success}");
+    assert_ne!(copilot_success, repository_success);
+    assert_ne!(repository_success, identity_success);
+}
+
+#[gpui_kit::test]
+fn the_providers_section_separates_copilot_from_repository_access(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        crate::connection::negotiate(&view.connection).unwrap();
+        view.login_enabled = true;
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Providers));
+        view
+    });
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("settings-github-copilot-title").label(),
+            Some("GitHub Copilot")
+        );
+        assert_eq!(
+            window.find("connect-github-account").label(),
+            Some("Sign in to Copilot")
+        );
+        assert_eq!(
+            window.find("connect-github-repository").label(),
+            Some("Authorize repository")
+        );
+        assert_ne!(
+            window.find("connect-github-account").label(),
+            Some("Connect GitHub"),
+            "the Copilot card must not read as a general GitHub login"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_login_pane_explains_which_flow_it_runs(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.github_login_kind = crate::state::GitHubLoginKind::Identity;
+        view.show_github_login(GitHubLoginState::Awaiting {
+            verification_uri: "https://github.com/login/device".to_owned(),
+            user_code: "ABCD-1234".to_owned(),
+            expires_in: 900,
+        });
+        view
+    });
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("github-login-intro").label(),
+            Some(crate::state::GitHubLoginKind::Identity.intro())
+        );
+    })
+    .unwrap();
+    cx.update_window(handle.into(), |_, window, cx| {
+        let view = window.root::<LoomView>().unwrap().unwrap();
+        view.update(cx, |view, _| {
+            view.github_login_kind = crate::state::GitHubLoginKind::Copilot;
+        });
+    })
+    .unwrap();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("github-login-intro").label(),
+            Some(crate::state::GitHubLoginKind::Copilot.intro())
+        );
+    })
+    .unwrap();
+}
+
+#[test]
 fn github_login_kind_secure_messages_differ() {
     assert!(
         crate::state::GitHubLoginKind::Copilot

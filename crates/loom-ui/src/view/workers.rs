@@ -13,6 +13,22 @@ impl LoomView {
         self.awaiting_sign_in_nodes.insert(node_id);
     }
 
+    /// The person this node's connection was last signed in as, if the client
+    /// remembered one.
+    ///
+    /// This is a display hint for the pre-login prompts only: the worker refuses
+    /// a resumed identity on a connection accepted without a credential, so the
+    /// prompt names the person and still starts a fresh device flow.
+    pub(crate) fn remembered_identity(&self, node_id: &str) -> Option<&ParticipantIdentity> {
+        self.remembered_identities.get(node_id)
+    }
+
+    /// Records the person `node_id` was last signed in as, for the prompts that
+    /// stand in for the composer before a sign-in.
+    pub(crate) fn remember_identity(&mut self, node_id: String, identity: ParticipantIdentity) {
+        self.remembered_identities.insert(node_id, identity);
+    }
+
     /// The durable key of the worker behind `node_id`.
     ///
     /// The remembered GitHub identity has to outlive the worker, and a worker's
@@ -216,6 +232,7 @@ impl LoomView {
             self.node_session_load_errors.remove(&node.status.node_id);
             let identity_key = worker_entry_identity_key(self.backend_endpoint.as_deref(), &node);
             crate::identity_store::clear(&identity_key);
+            self.remembered_identities.remove(&node.status.node_id);
         }
         if let Some(url) = &node.url {
             let count = self.workspace_config.worker_nodes.len();

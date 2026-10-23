@@ -1135,6 +1135,7 @@ impl LoomView {
         // worker's durable identity, not the node id its process reported.
         let identity_key = self.identity_key_for_node(&node_id);
         crate::identity_store::save(&identity_key, &participant);
+        self.remember_identity(node_id.clone(), participant.clone());
         self.awaiting_sign_in_nodes.remove(&node_id);
         let signed_in_the_active_node = self.active_node_id() == node_id;
         if signed_in_the_active_node {
@@ -1230,6 +1231,7 @@ impl LoomView {
         let signed_out = match response.result {
             Ok(ServerResponse::Access(AccessResponse::SignedOutGitHub)) => {
                 crate::identity_store::clear(&self.identity_key_for_node(node_id));
+                self.remembered_identities.remove(node_id);
                 self.collaboration.reset_after_sign_out();
                 if self.unsigned_nodes.contains(node_id) {
                     // The connection was accepted without a credential, so

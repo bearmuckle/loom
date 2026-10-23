@@ -466,8 +466,42 @@ impl GitHubLoginKind {
     /// The pane heading for this kind of flow.
     pub(crate) fn pane_title(self) -> &'static str {
         match self {
+            Self::Copilot => "Sign in to GitHub Copilot",
+            Self::Repository => "Authorize GitHub repository access",
             Self::Identity => "Sign in to this worker",
-            Self::Copilot | Self::Repository => "Connect GitHub account",
+        }
+    }
+
+    /// The one-line intro under the pane heading: what this flow acquires, and
+    /// what it deliberately does not.
+    pub(crate) fn intro(self) -> &'static str {
+        match self {
+            Self::Copilot => {
+                "Lets this worker use GitHub Copilot as a model provider. It does not sign you \
+                 in to the worker."
+            }
+            Self::Repository => {
+                "Lets this worker clone, push, and open pull requests. It does not sign you \
+                 in to the worker."
+            }
+            Self::Identity => {
+                "Binds you to this connection, so a reload or reconnect asks again. It grants no \
+                 repository or model access."
+            }
+        }
+    }
+
+    /// The line the pane shows once this flow completes.
+    pub(crate) fn success_message(self) -> &'static str {
+        match self {
+            Self::Copilot => {
+                "GitHub Copilot is connected. This worker can use it as a model provider."
+            }
+            Self::Repository => {
+                "Repository access is authorized. Cloning, pushing, and pull requests are \
+                 available."
+            }
+            Self::Identity => "You are signed in to this worker for this connection.",
         }
     }
 }

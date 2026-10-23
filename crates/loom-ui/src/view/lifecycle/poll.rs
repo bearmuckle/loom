@@ -452,9 +452,14 @@ impl LoomView {
                         // restarting under a new instance id.
                         let identity_key =
                             crate::identity_store::worker_key(Some(candidate_url.as_str()));
-                        if !unsigned
-                            && let Some(saved) = crate::identity_store::load(&identity_key)
-                        {
+                        // A connection accepted without a credential cannot
+                        // resume a person, so the stored participant is kept as
+                        // a hint for the sign-in prompt instead.
+                        let saved = crate::identity_store::load(&identity_key);
+                        let mut remembered = None;
+                        if unsigned {
+                            remembered = saved;
+                        } else if let Some(saved) = saved {
                             match resume_github_identity(&connection, saved.id) {
                                 Ok(Some(_)) => {}
                                 Ok(None) => crate::identity_store::clear(&identity_key),
@@ -471,6 +476,7 @@ impl LoomView {
                             status,
                             candidate_url,
                             pre_login,
+                            remembered,
                             negotiation
                                 .capabilities
                                 .contains(loom_core::Capability::GitHubSignIn),
@@ -485,9 +491,14 @@ impl LoomView {
                             && node.connection.is_none()
                     });
                     match result {
-                        Ok((connection, status, connected_url, pre_login, offers_sign_in))
-                            if is_pending =>
-                        {
+                        Ok((
+                            connection,
+                            status,
+                            connected_url,
+                            pre_login,
+                            remembered,
+                            offers_sign_in,
+                        )) if is_pending => {
                             view.github_sign_in_available |= offers_sign_in;
                             // Marked before the node is attached, because
                             // attaching reloads every connected worker's
@@ -495,6 +506,9 @@ impl LoomView {
                             // that read.
                             if pre_login {
                                 view.mark_node_pre_login(status.node_id.clone());
+                            }
+                            if let Some(identity) = remembered {
+                                view.remember_identity(status.node_id.clone(), identity);
                             }
                             view.attach_reconnected_worker_node(
                                 id,
@@ -504,7 +518,7 @@ impl LoomView {
                                 cx,
                             );
                         }
-                        Ok((connection, _, _, _, _)) => {
+                        Ok((connection, _, _, _, _, _)) => {
                             cx.spawn(async move |view, cx| {
                                 let result =
                                     cx.background_spawn(async move { connection.close() })                                    .await;

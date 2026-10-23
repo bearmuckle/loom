@@ -191,6 +191,57 @@ fn an_operator_connection_keeps_its_authority(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn a_remembered_person_is_named_in_the_sign_in_prompt(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.github_sign_in_available = true;
+        view.mark_node_pre_login(view.default_backend_node_id.clone());
+        view.collaboration.identity_loaded = true;
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("composer-sign-in-message").label(),
+            Some("Sign in to this worker to send messages and start runs."),
+            "a connection with no remembered person keeps the generic prompt"
+        );
+        assert_eq!(
+            window.find("composer-sign-in-github").label(),
+            Some("Sign in with GitHub")
+        );
+    })
+    .unwrap();
+    cx.update_window(handle.into(), |_, window, cx| {
+        let view = window.root::<LoomView>().unwrap().unwrap();
+        view.update(cx, |view, _| {
+            let node_id = view.active_node_id().to_owned();
+            view.remember_identity(node_id, person("octocat"));
+        });
+    })
+    .unwrap();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        // The stored person is a display hint only: the worker still refuses a
+        // resumed identity on this connection, so the prompt says a reload asks
+        // again instead of promising a lasting sign-in.
+        let prompt = window
+            .find("composer-sign-in-message")
+            .label()
+            .unwrap_or_default()
+            .to_owned();
+        assert_eq!(prompt, "Sign in again as octocat");
+        assert_eq!(
+            window.find("composer-sign-in-github").label(),
+            Some("Sign in with GitHub")
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn an_unsigned_connection_shows_the_sign_in_prompt(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {

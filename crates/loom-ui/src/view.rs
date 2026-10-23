@@ -41,8 +41,8 @@ use gpui_kit::{
 };
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, ErrorCode,
-    EventSequence, LoomError, ProtocolVersion, RepositoryId, RunId, Timestamp, ToolCallId,
-    UsageSnapshot, WorkspaceId, WorkspaceRecord,
+    EventSequence, LoomError, ParticipantIdentity, ProtocolVersion, RepositoryId, RunId, Timestamp,
+    ToolCallId, UsageSnapshot, WorkspaceId, WorkspaceRecord,
 };
 #[cfg(not(target_family = "wasm"))]
 use loom_model::GITHUB_COPILOT_DEFAULT_MODEL;
@@ -714,6 +714,12 @@ pub(crate) struct LoomView {
     /// node leaves this set while staying in `unsigned_nodes`, so signing out
     /// returns it to the sign-in prompt.
     pub(crate) awaiting_sign_in_nodes: BTreeSet<String>,
+    /// The person each node's connection was last signed in as, read from
+    /// [`crate::identity_store`] when the connection settles. It is display
+    /// only: a connection accepted without a credential cannot resume an
+    /// identity, so the sign-in prompt names the remembered person instead of
+    /// promising one. Keyed by node id, never read while rendering a request.
+    pub(crate) remembered_identities: BTreeMap<String, ParticipantIdentity>,
     /// Whether the connected worker advertises `git_hub_sign_in`, which is what
     /// lets a person join the roster by signing in.
     pub(crate) github_sign_in_available: bool,
@@ -2169,6 +2175,7 @@ impl LoomView {
             collaboration: crate::collaboration::CollaborationState::default(),
             unsigned_nodes: BTreeSet::new(),
             awaiting_sign_in_nodes: BTreeSet::new(),
+            remembered_identities: BTreeMap::new(),
             github_sign_in_available: false,
             github_login_node_id: None,
             composer_input: None,

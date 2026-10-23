@@ -120,6 +120,31 @@ credential left.
    then starts a fresh device flow, because the worker refuses a second sign-in
    while an identity is bound.
 
+#### Which GitHub flow to use
+
+Three GitHub device flows exist, and the client labels them apart because they
+acquire different things:
+
+- **Sign in to this worker** — the sign-in that binds a person to the
+  connection. The People tab, the prompt that stands in for the composer, and
+  the WORKERS settings row offer it. It grants no repository or model access;
+  the person starts read-only until an owner grants a role.
+- **Sign in to GitHub Copilot** — Settings → Providers, "GitHub Copilot". It
+  gives the worker a GitHub Copilot model-provider credential. It is not a way
+  to join the roster: a connection that is waiting for a sign-in cannot reach
+  the Providers settings, and the credential belongs to the worker.
+- **Authorize GitHub repository access** — Settings → Providers, "GitHub
+  repository access". It lets the worker clone, push, and open pull requests
+  through the GitHub CLI app. It does not sign the person in to the worker.
+
+A worker sign-in binds the person to one connection, because the client stores
+no credential for them. Reloading the page, reconnecting, or opening the worker
+in a new tab on a connection accepted without an operator token repeats the
+device flow. The client does remember the login that signed in last on a worker
+and names them in the sign-in prompt ("Sign in again as …"), but that is a hint
+for the person, not a resumed session; only an operator connection with an
+unrestricted token resumes an identity, as described in step 4 above.
+
 An operator token still behaves exactly as it did: enter it after the URL, and
 the connection has unrestricted authority with no person bound. It may also
 sign in on top of the token, and the worker refuses a second sign-in while one

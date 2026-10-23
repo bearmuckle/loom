@@ -269,18 +269,27 @@ impl LoomView {
         let manage = self.session_permissions().can_manage && state.is_participant_bound();
         let mut body = div().flex().flex_col().gap_2();
         if sign_in_required {
+            // A remembered person is a hint only: the connection cannot resume
+            // an identity, so the prompt names them and still starts a device
+            // flow.
+            let message = self.remembered_identity(self.active_node_id()).map_or_else(
+                || "You are not signed in to this worker.".to_owned(),
+                |identity| format!("Sign in again as {}", identity.display_name),
+            );
             body = body
                 .child(
                     div()
                         .id("roster-sign-in-required")
                         .test_support()
+                        .aria_label(message.clone())
                         .text_size(card_value_font())
                         .text_color(rgb(0xe5e7eb))
-                        .child("You are not signed in to this worker."),
+                        .child(message),
                 )
                 .child(div().text_xs().text_color(rgb(0x8f98a6)).child(
                     "Signing in with GitHub puts you in the roster. You start read-only, and an \
-                     owner grants the role you need.",
+                     owner grants the role you need. A sign-in lasts for this connection, so a \
+                     reload asks again.",
                 ));
             if self.offers_github_sign_in() {
                 let node_id = self.active_node_id().to_owned();

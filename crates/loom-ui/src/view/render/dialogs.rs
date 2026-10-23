@@ -651,13 +651,10 @@ impl LoomView {
                                 .text_color(rgb(0xfca5a5))
                                 .child(error.clone()),
                         )
-                        .child(
-                            div()
-                                .mt_2()
-                                .text_xs()
-                                .text_color(rgb(0x8f98a6))
-                                .child("Connect GitHub in Settings to browse repositories."),
-                        )
+                        .child(div().mt_2().text_xs().text_color(rgb(0x8f98a6)).child(
+                            "Authorize GitHub repository access in Settings to browse \
+                                     repositories.",
+                        ))
                         .child(
                             Button::new("connect-github-from-repository-picker")
                                 .label("Open GitHub settings")
@@ -1038,6 +1035,7 @@ impl LoomView {
             .text_xs()
             .text_color(rgb(0x8f98a6));
         let can_sign_in = self.login_enabled && self.offers_github_sign_in();
+        let remembered = self.remembered_identity(&node_id);
         if let Some(login) = identity {
             row = row
                 .child(
@@ -1074,12 +1072,23 @@ impl LoomView {
                 );
             return row;
         }
-        let message = if awaiting_sign_in {
-            "This worker is waiting for a GitHub sign-in."
-        } else if operator {
-            "Connected with an access token. Link a GitHub account for attribution."
+        let message = if operator {
+            "Connected with an access token. Link a GitHub account for attribution.".to_owned()
+        } else if let Some(identity) = remembered {
+            // Display only: a pre-login connection cannot resume this person, so
+            // the stored login is a hint for who the sign-in will be.
+            format!(
+                "Sign in again as {}. A sign-in lasts for the connection, so a reload asks again.",
+                identity.display_name
+            )
+        } else if awaiting_sign_in {
+            "This worker is waiting for a GitHub sign-in. A sign-in lasts for the connection, so a \
+             reload asks again."
+                .to_owned()
         } else {
-            "Sign in with GitHub to join this worker's roster."
+            "Sign in with GitHub to join this worker's roster. A sign-in lasts for the connection, \
+             so a reload asks again."
+                .to_owned()
         };
         row = row.child(div().flex_1().child(message));
         if can_sign_in {
@@ -1219,7 +1228,7 @@ impl LoomView {
             GitHubLoginState::Success => div()
                 .text_sm()
                 .text_color(rgb(0x9ad7bd))
-                .child("GitHub is connected. Repository browsing and the GitHub Copilot provider are available."),
+                .child(self.github_login_kind.success_message()),
             GitHubLoginState::Error(error) => div()
                 .text_sm()
                 .text_color(rgb(0xfca5a5))
@@ -1274,6 +1283,16 @@ impl LoomView {
                                 this.close_github_login(cx);
                             })),
                     ),
+            )
+            .child(
+                div()
+                    .id("github-login-intro")
+                    .test_support()
+                    .aria_label(self.github_login_kind.intro())
+                    .mt_2()
+                    .text_xs()
+                    .text_color(rgb(0x8f98a6))
+                    .child(self.github_login_kind.intro()),
             )
             .child(div().mt_4().child(body))
             .into_any()
@@ -1592,10 +1611,17 @@ impl LoomView {
                                 div()
                                     .flex_1()
                                     .min_w(px(0.))
-                                    .child(div().text_sm().child("GitHub"))
+                                    .child(
+                                        div()
+                                            .id("settings-github-copilot-title")
+                                            .test_support()
+                                            .aria_label("GitHub Copilot")
+                                            .text_sm()
+                                            .child("GitHub Copilot"),
+                                    )
                                     .child(div().text_xs().text_color(rgb(0x8f98a6)).child(
-                                        "Browse and clone repositories, and add GitHub \
-                                                 Copilot as a model provider.",
+                                        "Lets this worker use GitHub Copilot as a model \
+                                         provider. Separate from signing in to the worker.",
                                     )),
                             )
                             .child(
@@ -1616,9 +1642,9 @@ impl LoomView {
                                         element.child(
                                             Button::new("connect-github-account")
                                                 .label(if self.github_connected {
-                                                    "Reconnect"
+                                                    "Reconnect Copilot"
                                                 } else {
-                                                    "Connect GitHub"
+                                                    "Sign in to Copilot"
                                                 })
                                                 .small()
                                                 .on_click(cx.listener(Self::toggle_github_login)),
@@ -1647,9 +1673,9 @@ impl LoomView {
                                 element.child(
                                     Button::new("connect-github-repository")
                                         .label(if self.github_repository_connected {
-                                            "Re-authorize"
+                                            "Re-authorize repository"
                                         } else {
-                                            "Authorize"
+                                            "Authorize repository"
                                         })
                                         .small()
                                         .on_click(cx.listener(
