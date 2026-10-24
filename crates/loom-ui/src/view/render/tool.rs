@@ -969,7 +969,7 @@ impl LoomView {
 
         let parent = cx.entity();
         let timeline_view = cx.new(|cx| {
-            let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
+            let scroller = cx.new(|cx| TimelineScrollerState::new(0, cx));
             TimelineView::new(parent, scroller)
         });
         self.timeline_view = Some(timeline_view.clone());

@@ -16,7 +16,6 @@ use gpui_kit::component::input::{
     Input as KitInput, InputEvent, InputState, Textarea, TextareaState,
 };
 use gpui_kit::component::list::{List, ListDelegate, ListEvent, ListItem, ListState};
-use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::scroll::ScrollableElement;
 // Only the browser startup and reconnect card spins, and that card is
 // compiled for the browser and for its tests.
@@ -86,6 +85,7 @@ use crate::{
         BASE_FONT_SIZE, CONVERSATION_FONT_SIZE, ERROR_CARD_ACCENT, ERROR_CARD_FOREGROUND,
         ERROR_CARD_SURFACE, change_color, mono_font, mono_size, rgb,
     },
+    view::timeline_scroller::{TimelineScroller, TimelineScrollerState},
 };
 
 #[cfg(target_family = "wasm")]
@@ -2033,7 +2033,7 @@ pub(crate) struct TimelineRevision {
 
 pub(crate) struct TimelineView {
     parent: Entity<LoomView>,
-    scroller: Entity<MessageScrollerState>,
+    scroller: Entity<TimelineScrollerState>,
     parent_subscription: Option<Subscription>,
     scroller_subscription: Option<Subscription>,
     session_id: Option<AgentSessionId>,
@@ -2318,6 +2318,7 @@ mod source;
 mod sub_project;
 mod surfaces;
 mod timeline;
+mod timeline_scroller;
 mod workers;
 
 #[cfg(test)]

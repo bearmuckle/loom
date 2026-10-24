@@ -1,7 +1,7 @@
 use super::*;
 
 impl TimelineView {
-    pub(crate) fn new(parent: Entity<LoomView>, scroller: Entity<MessageScrollerState>) -> Self {
+    pub(crate) fn new(parent: Entity<LoomView>, scroller: Entity<TimelineScrollerState>) -> Self {
         Self {
             parent,
             scroller,
@@ -196,16 +196,7 @@ impl Render for TimelineView {
             // pick finger-sized controls on a phone.
             let layout = responsive_layout(window.bounds().size.width);
             let parent_for_rows = self.parent.clone();
-            let row_style = gpui_kit::StyleRefinement {
-                padding: gpui_kit::EdgesRefinement {
-                    top: Some(px(0.).into()),
-                    right: Some(px(0.).into()),
-                    bottom: Some(px(0.).into()),
-                    left: Some(px(0.).into()),
-                },
-                ..Default::default()
-            };
-            let timeline = MessageScroller::new(
+            let timeline = TimelineScroller::new(
                 "timeline-scroller",
                 self.scroller.clone(),
                 move |index, _window, cx| {
@@ -227,7 +218,6 @@ impl Render for TimelineView {
                         .into_any_element()
                 },
             )
-            .with_row_style(row_style)
             .with_jump_button_label("Jump to latest")
             .with_bottom_fade(gpui_kit::Hsla::from(rgb(0x111318)));
             div()
