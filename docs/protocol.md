@@ -477,6 +477,14 @@ is observable; the run itself proceeds on a backend worker. Clients follow
 progress through the session event stream, which receives assistant deltas
 while a model call is still open.
 
+A session accepts a new run only while it is `idle`. A run that completed,
+failed, was cancelled, or is waiting for approval leaves the session in that
+state, so a later start in the same session is refused with `invalid_state`
+rather than replacing or restarting the previous run. A headless client that
+wants to start work therefore resolves an idle session or creates a new one;
+`loom-cli run` does exactly that and reports the refusal instead of retrying
+under another session name.
+
 `PauseAgentRun` and `InterruptAgentRun` raise a control flag and cancel the
 in-flight model stream rather than waiting for it, so they are answered while
 a model call is open. Requests that need exclusive access to a busy run
@@ -755,6 +763,37 @@ without a revision check, so they are ordered and attributed too.
   request was approved, denied, or withdrawn. Delivered to the owners and the
   requester (the requester sees it on the cross-session stream even before
   holding a grant).
+
+## Headless polling client
+
+`loom-cli` reads the journal with one pull loop; this slice adds no push
+subscription. It sends `GetSessionEvents` with `after_sequence` and never waits
+for unsolicited server events.
+
+- **Polling.** The interval starts at 250 ms and doubles per empty poll to a
+  2000 ms ceiling; the first response that carries an event resets it to 250 ms.
+- **Paging.** While a response names `next_after_sequence`, the client requests
+  the next page at once with that cursor, so one logical batch is not split
+  across polls. A response that names no continuation has reached the latest
+  journaled event.
+- **Snapshot replaces the cursor.** A `SessionEventsSnapshot` answer means the
+  requested cursor is no longer retained. The client replaces its local
+  projection state, renders only events newer than the highest sequence it has
+  already rendered, and resumes from `latest_sequence` in that response. It
+  never reprints an event it already emitted and never skips one between the
+  snapshot's `oldest_sequence` and `latest_sequence`.
+- **Epoch.** `stream_epoch` names one backend instance. A change of epoch
+  invalidates the cursor: the client discards its cursor and treats the next
+  response as a snapshot.
+- **Cursor persistence.** An optional local cursor file records the URL, the
+  session, the last rendered sequence, and the epoch. It is written atomically,
+  through a temporary file plus a rename, after each rendered batch. The cursor
+  file is client-local; the backend stores no per-client cursor.
+- **Read-only verbs.** `ls`, `get`, `events`, and `peek` issue no mutation, so a
+  read-only-scoped token can run them.
+- **Anchoring.** The durable journal and `RequestId` idempotency remain the only
+  authorities for resume and retries. `loom-cli run` starts a run and returns its
+  ids without waiting, so waiting for completion stays a client concern.
 
 ## Reconnect and consistency
 
