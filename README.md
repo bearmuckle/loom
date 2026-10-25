@@ -79,80 +79,11 @@ duration syntax and the sweep.
 
 ## Headless client
 
-`loom-cli` is the headless binary of the `crates/loom-cli` package and a pure
-client of the versioned protocol: it embeds no backend, opens no SQLite
-database, and manages no worker. The package ships it beside the `loom` demo
-shell:
-
-```sh
-cargo run -p loom-cli --bin loom-cli -- doctor
-```
-
-Point it at a worker with `--connect <url>` (or `LOOM_URL`). The bearer token
-comes only from `--token-file <path>` (or `LOOM_TOKEN_FILE`); there is
-deliberately no `--token` flag, so a token never appears on a command line.
-`--ca-file` adds TLS roots, and a plaintext `ws://` URL to a non-loopback host
-needs the explicit `--allow-insecure-remote` opt-in.
-
-| Verb | Purpose |
-| --- | --- |
-| `doctor` | Negotiated protocol, capability intersection, participant, and worker node. |
-| `whoami` | The participant bound to the token. |
-| `ls [--workspace <id>] [--archived]` | Workspaces, or the sessions of one workspace. |
-| `get <session-id> [--metadata]` | One session snapshot, or that snapshot with its active run metadata. |
-| `events --session <id> [--after <seq>] [--cursor-file <path>] [--follow] [--format text\|jsonl] [--max-bytes <n>]` | Session events, followed until the run completes or the caller interrupts. |
-| `peek --session <id> [--lines <n>] [--format text\|jsonl] [--max-bytes <n>]` | The tail of the session's current output; 200 lines by default. |
-| `run --workspace <id> (--task <text> \| --task-file <path>) [--name <name>] [--model <id>] [--repo <source> [--revision <rev>] [--path <path>]] [--as-directory <path>] [--approval-policy default\|auto] [--request-id <uuid>]` | Reuse or create the session named `--name`, attach the inputs, set the approval policy, and start one run. |
-
-`events` and `peek` bound the tool payload of each rendered event to 4096 bytes
-by default; `--max-bytes` changes that cap.
-
-`--format text` is the default and is the documented, byte-stable `loom-text/1`
-projection: one line per event as `<seq> <kind> <body>`, with the body escaped
-so it never contains a raw newline, both ends of oversized tool output kept with
-an exact `[... N bytes omitted ...]` marker, and explicit `pending_approval` and
-`question` markers for the states that block a run. The same journal plus the
-same cursor produces identical bytes.
-
-`--format jsonl` writes one JSON object per line that carries `seq` and
-`stream_epoch`, so a caller can resume. `--json` prints one envelope containing
-the request id the call used. `--json` with `--follow` keeps every followed
-event in that envelope, so prefer `--format jsonl` for a long follow.
-
-A `SessionEventsSnapshot` cannot page: it carries only the newest part of the
-retained window. When the cursor sits below the first sequence that window
-carries, the events in between are gone from the response and cannot be fetched
-again by this verb. `events` prints the window, reports the missing range as
-`warning gap <first>..<last>` on stderr and as a `gap` field in its `--json`
-envelope, and resumes at the head of the window rather than claiming a complete
-suffix. A first read without a cursor has no gap; starting from the current
-window is its documented behaviour.
-
-| Exit code | Meaning |
-| --- | --- |
-| `0` | ok |
-| `1` | internal error |
-| `2` | usage error |
-| `3` | blocked by a pending approval or a missing capability |
-| `4` | timeout |
-| `5` | not found or gone |
-| `6` | protocol or auth mismatch |
-| `7` | transport unreachable |
-
-`ls`, `get`, `events`, and `peek` are read-only and work with a
-read-only-scoped token. `run` starts a run and prints its ids; no verb in this
-slice waits for a run to finish.
-
-`run` is the one mutation. It reuses the workspace session whose name matches
-`--name` (or a name derived from the task) and otherwise creates it, attaches
-`--repo` or `--as-directory` only when it created the session, and sets the
-approval policy before the run starts. A created session is pinned to
-`--approval-policy` (the `default` preset when the flag is absent); a reused
-session is only changed when the flag is given, so a plain run never overwrites
-a policy a person set. `--request-id` is the idempotency key
-of the run start, so repeating the same command returns the same run. A worker
-accepts a run only in an idle session, so reusing a session that already ran
-reports `invalid_state` (exit `5`) and creates nothing.
+`loom-cli` is the headless client of the versioned protocol, shipped as a
+second binary by the `loom-cli` package. It reads a worker and, with `run`,
+starts one agent run; it embeds no backend and opens no database. See
+[the headless client guide](docs/headless-client.md) for its verbs, output
+contract, exit codes, resume behaviour, and cursor file.
 
 ## Providers
 
@@ -168,6 +99,7 @@ vault.
 
 - [Architecture](docs/architecture.md)
 - [Deployment](docs/deployment.md)
+- [Headless client](docs/headless-client.md)
 - [Security and trust model](docs/security.md)
 - [Product scope](docs/product.md)
 - [Protocol](docs/protocol.md)
