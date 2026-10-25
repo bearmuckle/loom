@@ -81,9 +81,15 @@ async fn server_with_backend_and_frame_limit(
         max_frame_bytes,
         DEFAULT_MAX_IN_FLIGHT_REQUESTS,
         DEFAULT_MAX_IN_FLIGHT_CONTROL_REQUESTS,
+        TEST_HEARTBEAT,
     )
     .await
 }
+
+/// A short heartbeat keeps the tests that wait on one fast. The server drops a
+/// connection that is silent for three intervals, so a test that stops reading
+/// a socket for a while needs a longer one.
+const TEST_HEARTBEAT: Duration = Duration::from_millis(25);
 
 /// The standard test server with explicit per-connection in-flight limits.
 async fn server_with_limits(
@@ -91,6 +97,7 @@ async fn server_with_limits(
     max_frame_bytes: usize,
     max_in_flight_requests: usize,
     max_in_flight_control_requests: usize,
+    heartbeat_interval: Duration,
 ) -> (
     Arc<InProcessBackend>,
     Arc<AuthTokenStore>,
@@ -105,7 +112,7 @@ async fn server_with_limits(
         Arc::clone(&backend),
         Arc::clone(&auth),
         RemoteServerConfig {
-            heartbeat_interval: Duration::from_millis(25),
+            heartbeat_interval,
             request_timeout: Duration::from_secs(5),
             max_frame_bytes,
             max_in_flight_requests,
@@ -2093,9 +2100,17 @@ const BLOCKING_TERMINAL_COMMAND: &str = "sleep 5";
 #[tokio::test]
 async fn a_pipelining_client_is_refused_at_the_in_flight_limit_and_keeps_control_requests() {
     // One in-flight request per class, so the first frame holds the
-    // connection's only ordinary permit for as long as it runs.
-    let (_backend, _auth, token, server) =
-        server_with_limits(InProcessBackend::new(), DEFAULT_MAX_FRAME_BYTES, 1, 1).await;
+    // connection's only ordinary permit for as long as it runs. The pipelining
+    // socket is not read while the second connection is set up, so a heartbeat
+    // as short as the default would have the server drop it as silent.
+    let (_backend, _auth, token, server) = server_with_limits(
+        InProcessBackend::new(),
+        DEFAULT_MAX_FRAME_BYTES,
+        1,
+        1,
+        Duration::from_secs(2),
+    )
+    .await;
     let mut setup = WebSocketTransport::new(server.websocket_url(), token.token.clone())
         .connect()
         .await
