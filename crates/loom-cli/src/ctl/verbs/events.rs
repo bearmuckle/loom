@@ -36,7 +36,7 @@ pub(super) async fn events<C: Client>(
     out: &mut dyn Write,
 ) -> Result<(Value, Option<RequestId>), Failure> {
     let mut caller = Caller::new(client);
-    handshake(&mut caller).await?;
+    handshake(&mut caller, &invocation.verb).await?;
     let url = invocation.globals.connect.clone().unwrap_or_default();
     let json_output = invocation.globals.json;
 
@@ -167,7 +167,7 @@ pub(super) async fn peek<C: Client>(
     out: &mut dyn Write,
 ) -> Result<(Value, Option<RequestId>), Failure> {
     let mut caller = Caller::new(client);
-    handshake(&mut caller).await?;
+    handshake(&mut caller, &invocation.verb).await?;
     let (request_id, response) = caller
         .call(ClientRequest::Events(
             EventsRequest::GetRecentSessionEvents {

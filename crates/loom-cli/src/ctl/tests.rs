@@ -9,19 +9,21 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use loom_core::{
-    AgentSessionId, AgentSessionSnapshot, Capability, CapabilitySet, EventSequence,
-    ProtocolVersion, RunId, ToolCallId, WorkspaceId,
+    AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, Capability,
+    CapabilitySet, EventSequence, ProtocolVersion, RequestId, RunId, ToolCallId, WorkspaceId,
 };
 use loom_model::ModelId;
 use loom_protocol::{
-    ActivityDetail, AgentEvent, CURRENT_PROTOCOL_VERSION, ClientRequest, ControlRequest,
-    ControlResponse, EventsRequest, EventsResponse, RequestEnvelope, ResponseEnvelope, RunRequest,
-    RunResponse, ServerEvent, ServerEventEnvelope, ServerResponse, SessionRequest, SessionResponse,
+    ActivityDetail, AgentEvent, AgentRunSnapshot, AgentSessionSnapshotProjection,
+    CURRENT_PROTOCOL_VERSION, ClientRequest, ControlRequest, ControlResponse, EventsRequest,
+    EventsResponse, FilesystemRequest, FilesystemResponse, RepositoryRequest, RepositoryResponse,
+    RequestEnvelope, ResponseEnvelope, RunRequest, RunResponse, ServerEvent, ServerEventEnvelope,
+    ServerResponse, SessionDirectory, SessionRepository, SessionRequest, SessionResponse,
     WorkspaceRequest, WorkspaceResponse,
 };
 use loom_server::{InProcessBackend, InProcessConnection};
 
-use crate::ctl::args::{self, Format, Parsed, Verb};
+use crate::ctl::args::{self, ApprovalPreset, Format, Parsed, Verb};
 use crate::ctl::client::Client;
 use crate::ctl::client::testing::{InProcessClient, Wrapped};
 use crate::ctl::exit;
@@ -918,7 +920,635 @@ fn the_token_is_only_accepted_from_a_file() {
     }
 }
 
-// 7. The parser.
+// 7. The `run` verb: the session it reuses or creates, the inputs it attaches,
+// the policy it pins, and the run start it makes replayable.
+
+/// A backend with one workspace and no session, which is the state a first
+/// `run` meets.
+struct EmptyFixture {
+    backend: Arc<InProcessBackend>,
+    control: InProcessConnection,
+    workspace: loom_protocol::WorkspaceRecord,
+}
+
+fn empty_fixture() -> EmptyFixture {
+    let backend = InProcessBackend::new();
+    let control = backend.connect();
+    negotiate(&control);
+    let workspace = create_workspace(&control, "ctl run workspace");
+    EmptyFixture {
+        backend,
+        control,
+        workspace,
+    }
+}
+
+/// The workspace's live sessions, exactly as `run` resolves them.
+fn live_sessions(
+    connection: &InProcessConnection,
+    workspace: WorkspaceId,
+) -> Vec<AgentSessionSnapshot> {
+    match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::ListWorkspaceSessions {
+                workspace_id: workspace,
+                include_archived: false,
+            },
+        )))
+        .result
+    {
+        Ok(ServerResponse::Session(SessionResponse::AgentSessions { sessions })) => sessions,
+        other => panic!("unexpected workspace sessions response: {other:?}"),
+    }
+}
+
+fn run_snapshot(connection: &InProcessConnection, run_id: RunId) -> AgentRunSnapshot {
+    match connection
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::GetAgentRun { run_id },
+        )))
+        .result
+    {
+        Ok(ServerResponse::Run(RunResponse::AgentRun(snapshot))) => snapshot,
+        other => panic!("unexpected agent run response: {other:?}"),
+    }
+}
+
+fn session_projection(
+    connection: &InProcessConnection,
+    session_id: AgentSessionId,
+) -> AgentSessionSnapshotProjection {
+    match connection
+        .request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::GetAgentSessionSnapshotMetadata {
+                session_id,
+                activity_detail: ActivityDetail::Full,
+            },
+        )))
+        .result
+    {
+        Ok(ServerResponse::Session(SessionResponse::AgentSessionSnapshot(projection))) => {
+            *projection
+        }
+        other => panic!("unexpected session metadata response: {other:?}"),
+    }
+}
+
+fn session_directories(
+    connection: &InProcessConnection,
+    session_id: AgentSessionId,
+) -> Vec<SessionDirectory> {
+    match connection
+        .request(RequestEnvelope::new(ClientRequest::Filesystem(
+            FilesystemRequest::ListSessionDirectories { session_id },
+        )))
+        .result
+    {
+        Ok(ServerResponse::Filesystem(FilesystemResponse::SessionDirectories { directories })) => {
+            directories
+        }
+        other => panic!("unexpected session directories response: {other:?}"),
+    }
+}
+
+fn session_repositories(
+    connection: &InProcessConnection,
+    session_id: AgentSessionId,
+) -> Vec<SessionRepository> {
+    match connection
+        .request(RequestEnvelope::new(ClientRequest::Repository(
+            RepositoryRequest::ListSessionRepositories { session_id },
+        )))
+        .result
+    {
+        Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositories {
+            repositories,
+        })) => repositories,
+        other => panic!("unexpected session repositories response: {other:?}"),
+    }
+}
+
+/// The ids of the runs a session's journal recorded as started.
+fn started_run_ids(connection: &InProcessConnection, session_id: AgentSessionId) -> Vec<RunId> {
+    journal(connection, session_id)
+        .iter()
+        .filter_map(|envelope| match &envelope.event {
+            ServerEvent::Agent {
+                event: AgentEvent::RunStarted { snapshot },
+            } => Some(snapshot.id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The run id and state of the second line `run` prints.
+fn printed_run(stdout: &str) -> (RunId, String) {
+    let mut words = stdout
+        .lines()
+        .nth(1)
+        .unwrap_or_else(|| panic!("'run' printed '{stdout}'"))
+        .split(' ');
+    assert_eq!(words.next(), Some("run"));
+    let run_id = words
+        .next()
+        .and_then(|id| id.parse::<RunId>().ok())
+        .unwrap_or_else(|| panic!("'run' printed no run id in '{stdout}'"));
+    let state = words
+        .next()
+        .unwrap_or_else(|| panic!("'run' printed no run state in '{stdout}'"))
+        .to_owned();
+    (run_id, state)
+}
+
+#[test]
+fn run_prints_the_session_and_the_started_run() {
+    let fixture = empty_fixture();
+    let workspace = fixture.workspace.id.to_string();
+    let request_id = RequestId::new().to_string();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let outcome = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--task",
+            "say hello",
+            "--request-id",
+            &request_id,
+        ],
+    );
+    assert_eq!(outcome.code, exit::OK, "{}", outcome.stderr);
+    assert_eq!(outcome.stderr, "");
+
+    // The session this invocation created is the one it printed, and its name
+    // is derived from the task.
+    let sessions = live_sessions(&fixture.control, fixture.workspace.id);
+    assert_eq!(sessions.len(), 1);
+    let session = &sessions[0];
+    assert_eq!(session.name, "say hello");
+    let (run_id, state) = printed_run(&outcome.stdout);
+    assert_eq!(state, "executing");
+    assert_eq!(
+        outcome.stdout,
+        format!("session {} say hello\nrun {run_id} executing\n", session.id),
+        "the whole output is the two contract lines"
+    );
+
+    // The printed run is the run the worker holds for that session.
+    let snapshot = run_snapshot(&fixture.control, run_id);
+    assert_eq!(snapshot.id, run_id);
+    assert_eq!(snapshot.session_id, session.id);
+    assert_eq!(started_run_ids(&fixture.control, session.id), vec![run_id]);
+
+    // The default policy parks the run on its first write, which is a stable
+    // state to shut down from.
+    fixture.backend.shutdown().unwrap();
+}
+
+#[test]
+fn a_replayed_request_id_returns_the_same_run_and_reuses_the_session() {
+    let fixture = empty_fixture();
+    let workspace = fixture.workspace.id.to_string();
+    let request_id = RequestId::new().to_string();
+    let arguments = [
+        "run",
+        "--workspace",
+        &workspace,
+        "--task",
+        "say hello",
+        "--request-id",
+        &request_id,
+    ];
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let first = run(&mut client, &arguments);
+    assert_eq!(first.code, exit::OK, "{}", first.stderr);
+    let replay = run(&mut client, &arguments);
+    assert_eq!(replay.code, exit::OK, "{}", replay.stderr);
+    assert_eq!(
+        replay.stdout, first.stdout,
+        "the replay reports the same run"
+    );
+
+    let sessions = live_sessions(&fixture.control, fixture.workspace.id);
+    assert_eq!(sessions.len(), 1, "a replay does not create a session");
+    let session_id = sessions[0].id;
+    let started = started_run_ids(&fixture.control, session_id);
+    assert_eq!(started.len(), 1, "the run start is idempotent: {started:?}");
+    assert_eq!(started[0], printed_run(&replay.stdout).0);
+
+    // Without `--request-id` the session is still reused. A second run cannot
+    // start in it: the worker keeps a session to one run and refuses the next
+    // with `invalid_state` until the session is reused for a fresh one, which
+    // is why the verb resolves the session by name instead of starting blindly.
+    let fresh = run(
+        &mut client,
+        &["run", "--workspace", &workspace, "--task", "say hello"],
+    );
+    assert_eq!(fresh.code, exit::GONE);
+    assert_eq!(fresh.stdout, "");
+    assert!(fresh.stderr.contains("invalid_state"), "{}", fresh.stderr);
+    assert_eq!(
+        live_sessions(&fixture.control, fixture.workspace.id).len(),
+        1,
+        "the reused session is the only one"
+    );
+    assert_eq!(started_run_ids(&fixture.control, session_id), started);
+
+    fixture.backend.shutdown().unwrap();
+}
+
+#[test]
+fn an_invocation_with_the_same_name_reuses_the_session() {
+    let fixture = empty_fixture();
+    let workspace = fixture.workspace.id.to_string();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    // The first invocation names a model this worker does not offer, so it
+    // fails after creating the session and leaves an idle one behind.
+    let failed = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--name",
+            "shared session",
+            "--task",
+            "first task",
+            "--model",
+            "deterministic/absent-model",
+        ],
+    );
+    assert_eq!(failed.code, exit::INTERNAL, "{}", failed.stderr);
+    assert_eq!(failed.stdout, "");
+    let created = live_sessions(&fixture.control, fixture.workspace.id);
+    assert_eq!(created.len(), 1);
+    assert_eq!(created[0].name, "shared session");
+    assert_eq!(created[0].state, AgentSessionState::Idle);
+
+    // A second invocation with a different task and the same name reuses it.
+    let second = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--name",
+            "shared session",
+            "--task",
+            "second task",
+        ],
+    );
+    assert_eq!(second.code, exit::OK, "{}", second.stderr);
+    let sessions = live_sessions(&fixture.control, fixture.workspace.id);
+    assert_eq!(
+        sessions.len(),
+        1,
+        "the session was reused, not created twice"
+    );
+    assert_eq!(sessions[0].id, created[0].id);
+    assert!(
+        second
+            .stdout
+            .starts_with(&format!("session {} shared session\n", created[0].id)),
+        "{}",
+        second.stdout
+    );
+    let (run_id, _) = printed_run(&second.stdout);
+    assert_eq!(run_snapshot(&fixture.control, run_id).task, "second task");
+
+    fixture.backend.shutdown().unwrap();
+}
+
+#[test]
+fn a_directory_is_attached_by_a_fresh_session_and_not_twice() {
+    let fixture = empty_fixture();
+    let workspace = fixture.workspace.id.to_string();
+    let directory = temporary_path("attach-directory");
+    std::fs::create_dir_all(&directory).unwrap();
+    let source = directory.to_string_lossy().into_owned();
+    let path = directory
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let request_id = RequestId::new().to_string();
+    let arguments = [
+        "run",
+        "--workspace",
+        &workspace,
+        "--task",
+        "mount a directory",
+        "--as-directory",
+        &source,
+        "--request-id",
+        &request_id,
+    ];
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let attached = run(&mut client, &arguments);
+    assert_eq!(attached.code, exit::OK, "{}", attached.stderr);
+    let sessions = live_sessions(&fixture.control, fixture.workspace.id);
+    assert_eq!(sessions.len(), 1);
+    let directories = session_directories(&fixture.control, sessions[0].id);
+    assert_eq!(directories.len(), 1);
+    assert_eq!(
+        directories[0].path, path,
+        "--path defaults to the source name"
+    );
+
+    // The replay reuses the session and therefore attaches nothing, which is
+    // what makes it succeed rather than collide with the mounted directory.
+    let replay = run(&mut client, &arguments);
+    assert_eq!(replay.code, exit::OK, "{}", replay.stderr);
+    assert_eq!(replay.stdout, attached.stdout);
+    assert_eq!(
+        session_directories(&fixture.control, sessions[0].id).len(),
+        1,
+        "a replay does not attach a second directory"
+    );
+
+    fixture.backend.shutdown().unwrap();
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn a_repository_is_attached_by_a_fresh_session_and_not_twice() {
+    let fixture = empty_fixture();
+    let workspace = fixture.workspace.id.to_string();
+    let repository = temporary_path("attach-repository");
+    std::fs::create_dir_all(&repository).unwrap();
+    match std::process::Command::new("git")
+        .arg("init")
+        .arg(&repository)
+        .output()
+    {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => panic!(
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+        Err(error) => {
+            println!("skipping: git init could not be spawned: {error}");
+            std::fs::remove_dir_all(&repository).ok();
+            return;
+        }
+    }
+    let source = repository.to_string_lossy().into_owned();
+    let path = repository
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let request_id = RequestId::new().to_string();
+    let arguments = [
+        "run",
+        "--workspace",
+        &workspace,
+        "--task",
+        "clone a repository",
+        "--repo",
+        &source,
+        "--request-id",
+        &request_id,
+    ];
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let attached = run(&mut client, &arguments);
+    assert_eq!(attached.code, exit::OK, "{}", attached.stderr);
+    let sessions = live_sessions(&fixture.control, fixture.workspace.id);
+    assert_eq!(sessions.len(), 1);
+    let repositories = session_repositories(&fixture.control, sessions[0].id);
+    assert_eq!(repositories.len(), 1);
+    assert_eq!(repositories[0].path, path);
+
+    let replay = run(&mut client, &arguments);
+    assert_eq!(replay.code, exit::OK, "{}", replay.stderr);
+    assert_eq!(replay.stdout, attached.stdout);
+    assert_eq!(
+        session_repositories(&fixture.control, sessions[0].id).len(),
+        1,
+        "a replay does not attach a second repository"
+    );
+
+    fixture.backend.shutdown().unwrap();
+    std::fs::remove_dir_all(&repository).ok();
+}
+
+#[test]
+fn the_approval_policy_flag_pins_the_session_policy() {
+    let fixture = empty_fixture();
+    let workspace = fixture.workspace.id.to_string();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let auto = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--task",
+            "auto task",
+            "--approval-policy",
+            "auto",
+        ],
+    );
+    assert_eq!(auto.code, exit::OK, "{}", auto.stderr);
+    let automatic = session_projection(&fixture.control, printed_session(&auto.stdout));
+    assert_eq!(automatic.approval_policy, ApprovalPolicy::auto_approve());
+    assert!(automatic.auto_approve_actions);
+
+    let default = run(
+        &mut client,
+        &["run", "--workspace", &workspace, "--task", "default task"],
+    );
+    assert_eq!(default.code, exit::OK, "{}", default.stderr);
+    let pinned = session_projection(&fixture.control, printed_session(&default.stdout));
+    assert_eq!(pinned.approval_policy, ApprovalPolicy::default());
+    assert!(!pinned.auto_approve_actions);
+
+    fixture.backend.shutdown().unwrap();
+}
+
+/// The session id the first line `run` prints names.
+fn printed_session(stdout: &str) -> AgentSessionId {
+    let mut words = stdout
+        .lines()
+        .next()
+        .unwrap_or_else(|| panic!("'run' printed '{stdout}'"))
+        .split(' ');
+    assert_eq!(words.next(), Some("session"));
+    words
+        .next()
+        .and_then(|id| id.parse::<AgentSessionId>().ok())
+        .unwrap_or_else(|| panic!("'run' printed no session id in '{stdout}'"))
+}
+
+#[test]
+fn a_task_file_supplies_the_task_text() {
+    let fixture = empty_fixture();
+    let workspace = fixture.workspace.id.to_string();
+    let task_file = temporary_path("task-file.md");
+    std::fs::write(&task_file, "audit the build\n").unwrap();
+    let task_text = task_file.to_string_lossy().into_owned();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let outcome = run(
+        &mut client,
+        &["run", "--workspace", &workspace, "--task-file", &task_text],
+    );
+    assert_eq!(outcome.code, exit::OK, "{}", outcome.stderr);
+    let (run_id, _) = printed_run(&outcome.stdout);
+    assert_eq!(
+        run_snapshot(&fixture.control, run_id).task,
+        "audit the build",
+        "the task is the file's text without its trailing newline"
+    );
+    let sessions = live_sessions(&fixture.control, fixture.workspace.id);
+    assert_eq!(sessions[0].name, "audit the build");
+
+    fixture.backend.shutdown().unwrap();
+    std::fs::remove_file(&task_file).ok();
+}
+
+#[test]
+fn run_reports_conflicting_flags_an_invalid_request_id_and_an_unknown_workspace() {
+    let fixture = empty_fixture();
+    let workspace = fixture.workspace.id.to_string();
+    let task_file = temporary_path("conflicting-task.md");
+    std::fs::write(&task_file, "a task").unwrap();
+    let task_text = task_file.to_string_lossy().into_owned();
+    let directory = temporary_path("conflicting-directory");
+    std::fs::create_dir_all(&directory).unwrap();
+    let directory_text = directory.to_string_lossy().into_owned();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    for arguments in [
+        vec![
+            "run",
+            "--workspace",
+            workspace.as_str(),
+            "--task",
+            "a task",
+            "--task-file",
+            task_text.as_str(),
+        ],
+        vec![
+            "run",
+            "--workspace",
+            workspace.as_str(),
+            "--task",
+            "a task",
+            "--repo",
+            directory_text.as_str(),
+            "--as-directory",
+            directory_text.as_str(),
+        ],
+        vec![
+            "run",
+            "--workspace",
+            workspace.as_str(),
+            "--task",
+            "a task",
+            "--request-id",
+            "not-a-uuid",
+        ],
+        vec!["run", "--workspace", workspace.as_str()],
+        vec![
+            "run",
+            "--workspace",
+            workspace.as_str(),
+            "--task",
+            "a task",
+            "--revision",
+            "main",
+            "--as-directory",
+            directory_text.as_str(),
+        ],
+    ] {
+        let outcome = run_owned(&mut client, &owned(&arguments));
+        assert_eq!(outcome.code, exit::USAGE, "{arguments:?}");
+        assert_eq!(outcome.stdout, "", "{arguments:?}");
+        assert!(!outcome.stderr.is_empty(), "{arguments:?}");
+    }
+    assert!(
+        live_sessions(&fixture.control, fixture.workspace.id).is_empty(),
+        "a usage error creates no session"
+    );
+
+    // A workspace id the worker does not know is `not_found`.
+    let missing = WorkspaceId::new().to_string();
+    let outcome = run(
+        &mut client,
+        &["run", "--workspace", &missing, "--task", "a task"],
+    );
+    assert_eq!(outcome.code, exit::GONE);
+    assert_eq!(outcome.stdout, "");
+    assert!(outcome.stderr.contains("not_found"), "{}", outcome.stderr);
+
+    fixture.backend.shutdown().unwrap();
+    std::fs::remove_file(&task_file).ok();
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+fn owned(arguments: &[&str]) -> Vec<String> {
+    arguments.iter().map(|value| (*value).to_owned()).collect()
+}
+
+#[test]
+fn the_run_json_envelope_carries_the_run_start_request_id() {
+    let fixture = empty_fixture();
+    let workspace = fixture.workspace.id.to_string();
+    let request_id = RequestId::new().to_string();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let outcome = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--task",
+            "say hello",
+            "--request-id",
+            &request_id,
+            "--json",
+        ],
+    );
+    assert_eq!(outcome.code, exit::OK, "{}", outcome.stderr);
+    let envelope: serde_json::Value = serde_json::from_str(outcome.stdout.trim()).unwrap();
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["verb"], "run");
+    assert_eq!(envelope["request_id"], request_id.as_str());
+    assert_eq!(envelope["data"]["request_id"], request_id.as_str());
+    assert_eq!(envelope["data"]["created"], true);
+    assert_eq!(envelope["data"]["session"]["name"], "say hello");
+    assert_eq!(
+        envelope["data"]["run"]["state"], "executing",
+        "the state is the snake_case name the text line uses"
+    );
+
+    let session_id: AgentSessionId = envelope["data"]["session"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let run_id: RunId = envelope["data"]["run"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let snapshot = run_snapshot(&fixture.control, run_id);
+    assert_eq!(snapshot.session_id, session_id);
+    assert_eq!(snapshot.id, run_id);
+
+    fixture.backend.shutdown().unwrap();
+}
+
+// 8. The parser.
 
 fn parse(arguments: &[&str]) -> Result<Parsed, String> {
     let arguments: Vec<String> = arguments.iter().map(|value| (*value).to_owned()).collect();
@@ -1073,6 +1703,207 @@ fn the_worker_url_comes_from_the_flag_then_the_environment() {
     );
     assert_eq!(args::resolve_connect(None, Some("   ".to_owned())), None);
     assert_eq!(args::resolve_connect(None, None), None);
+}
+
+#[test]
+fn the_parser_applies_the_run_defaults_and_rejects_its_conflicts() {
+    let workspace = WorkspaceId::new().to_string();
+    let pinned = RequestId::new().to_string();
+    let parsed = invocation(&[
+        "run",
+        "--workspace",
+        &workspace,
+        "--task",
+        "  keep   this workspace tidy  ",
+        "--request-id",
+        &pinned,
+    ]);
+    let Verb::Run(args) = &parsed.verb else {
+        panic!("run did not parse as the run verb");
+    };
+    assert_eq!(args.workspace.to_string(), workspace);
+    assert_eq!(args.task, "  keep   this workspace tidy  ");
+    assert_eq!(args.name, "keep this workspace tidy");
+    assert_eq!(args.model.as_str(), "deterministic/demo");
+    assert_eq!(args.approval, ApprovalPreset::Default);
+    assert_eq!(
+        args.request_id.map(|id| id.to_string()).as_deref(),
+        Some(pinned.as_str())
+    );
+    assert!(args.repository.is_none());
+    assert!(args.directory.is_none());
+
+    // A name derived from the task keeps six words and at most 48 characters.
+    assert_eq!(
+        args::derived_name("one two three four five six seven eight"),
+        "one two three four five six"
+    );
+    assert_eq!(args::derived_name("   \n\t"), "loom-ctl run");
+    assert_eq!(args::derived_name(&"a".repeat(100)).len(), 48);
+
+    // An attach source lands at its final path component without `.git`.
+    assert_eq!(
+        args::default_attach_path("https://github.com/acme/widgets.git").as_deref(),
+        Some("widgets")
+    );
+    assert_eq!(
+        args::default_attach_path("/tmp/some/dir/").as_deref(),
+        Some("dir")
+    );
+    assert_eq!(args::default_attach_path("/"), None);
+
+    let repository = invocation(&[
+        "run",
+        "--workspace",
+        &workspace,
+        "--task",
+        "clone",
+        "--repo",
+        "https://github.com/acme/widgets.git",
+        "--revision",
+        "main",
+        "--path",
+        "vendor",
+        "--approval-policy",
+        "auto",
+    ]);
+    let Verb::Run(args) = &repository.verb else {
+        panic!("run did not parse as the run verb");
+    };
+    let attach = args.repository.as_ref().expect("a repository attach");
+    assert_eq!(attach.source, "https://github.com/acme/widgets.git");
+    assert_eq!(attach.path, "vendor");
+    assert_eq!(attach.revision.as_deref(), Some("main"));
+    assert_eq!(args.approval, ApprovalPreset::Auto);
+
+    let directory = invocation(&[
+        "run",
+        "--workspace",
+        &workspace,
+        "--task",
+        "mount",
+        "--as-directory=/tmp/demo",
+    ]);
+    let Verb::Run(args) = &directory.verb else {
+        panic!("run did not parse as the run verb");
+    };
+    let attach = args.directory.as_ref().expect("a directory attach");
+    assert_eq!(attach.source, "/tmp/demo");
+    assert_eq!(attach.path, "demo");
+    assert_eq!(attach.revision, None);
+
+    assert!(parse_error(&["run", "--workspace", &workspace]).contains("requires --task"));
+    assert!(
+        parse_error(&[
+            "run",
+            "--workspace",
+            &workspace,
+            "--task",
+            "a",
+            "--task-file",
+            "/tmp/t"
+        ])
+        .contains("not both")
+    );
+    assert!(
+        parse_error(&[
+            "run",
+            "--workspace",
+            &workspace,
+            "--task",
+            "a",
+            "--repo",
+            "/tmp/a",
+            "--as-directory",
+            "/tmp/b",
+        ])
+        .contains("not both")
+    );
+    assert!(
+        parse_error(&[
+            "run",
+            "--workspace",
+            &workspace,
+            "--task",
+            "a",
+            "--as-directory",
+            "/tmp/a",
+            "--revision",
+            "main",
+        ])
+        .contains("--revision only applies to --repo")
+    );
+    assert!(
+        parse_error(&[
+            "run",
+            "--workspace",
+            &workspace,
+            "--task",
+            "a",
+            "--path",
+            "x"
+        ])
+        .contains("--path requires")
+    );
+    assert!(
+        parse_error(&[
+            "run",
+            "--workspace",
+            &workspace,
+            "--task",
+            "a",
+            "--approval-policy",
+            "sometimes",
+        ])
+        .contains("must be default or auto")
+    );
+    assert!(
+        parse_error(&[
+            "run",
+            "--workspace",
+            &workspace,
+            "--task",
+            "a",
+            "--request-id",
+            "not-a-uuid",
+        ])
+        .contains("not a valid request id")
+    );
+    assert!(
+        parse_error(&[
+            "run",
+            "--workspace",
+            &workspace,
+            "--task",
+            "a",
+            "--name",
+            "  "
+        ])
+        .contains("--name must not be empty")
+    );
+    assert!(
+        parse_error(&[
+            "run",
+            "--workspace",
+            &workspace,
+            "--task-file",
+            "/tmp/loom-ctl-definitely-absent-task-file",
+        ])
+        .contains("could not read the task file")
+    );
+    assert!(
+        parse_error(&[
+            "run",
+            "--workspace",
+            &workspace,
+            "--task",
+            "a",
+            "--repo",
+            "/",
+        ])
+        .contains("has no final path component")
+    );
+    assert!(parse_error(&["whoami", "--task", "a"]).contains("does not apply to 'whoami'"));
 }
 
 #[test]
