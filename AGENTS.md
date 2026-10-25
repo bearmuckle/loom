@@ -18,7 +18,7 @@ agent, bot, or tool. Deployment providers match a commit to its author, and an
 AI identity misattributes the work.
 
 - Use the human author's name and a reachable email. For the repository owner's
-  own work, use `Björn Harrtell <141030+bjornharrtell@users.noreply.github.com>`.
+  own work, use `rastermanden <1125134+rastermanden@users.noreply.github.com>`.
 - When landing a change authored by another contributor, use that contributor's
   identity, such as their GitHub noreply address, instead of the repository
   owner's.
