@@ -21,7 +21,7 @@
 //!   safe to repeat.
 //!
 //! The verb returns as soon as `AgentRunStarted` arrives. It never polls and
-//! never waits for the run: `loom-ctl events --follow` is the verb that watches
+//! never waits for the run: `loom-cli events --follow` is the verb that watches
 //! one.
 
 use std::io::Write;
@@ -33,9 +33,9 @@ use loom_protocol::{
 };
 use serde_json::{Value, json};
 
-use crate::ctl::args::{ApprovalPreset, Invocation, RunArgs};
-use crate::ctl::client::Client;
-use crate::ctl::text::run_state_name;
+use crate::cli::args::{ApprovalPreset, Invocation, RunArgs};
+use crate::cli::client::Client;
+use crate::cli::text::run_state_name;
 
 use super::{Caller, Failure, emit, handshake};
 

@@ -11,9 +11,9 @@ use loom_protocol::{
 };
 use serde_json::{Value, json};
 
-use crate::ctl::args::Invocation;
-use crate::ctl::client::Client;
-use crate::ctl::text::{run_state_name, session_state_name};
+use crate::cli::args::Invocation;
+use crate::cli::client::Client;
+use crate::cli::text::{run_state_name, session_state_name};
 
 use super::Caller;
 use super::{Failure, emit, handshake};

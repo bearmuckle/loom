@@ -482,7 +482,7 @@ failed, was cancelled, or is waiting for approval leaves the session in that
 state, so a later start in the same session is refused with `invalid_state`
 rather than replacing or restarting the previous run. A headless client that
 wants to start work therefore resolves an idle session or creates a new one;
-`loom-ctl run` does exactly that and reports the refusal instead of retrying
+`loom-cli run` does exactly that and reports the refusal instead of retrying
 under another session name.
 
 `PauseAgentRun` and `InterruptAgentRun` raise a control flag and cancel the
@@ -766,7 +766,7 @@ without a revision check, so they are ordered and attributed too.
 
 ## Headless polling client
 
-`loom-ctl` reads the journal with one pull loop; this slice adds no push
+`loom-cli` reads the journal with one pull loop; this slice adds no push
 subscription. It sends `GetSessionEvents` with `after_sequence` and never waits
 for unsolicited server events.
 
@@ -792,7 +792,7 @@ for unsolicited server events.
 - **Read-only verbs.** `ls`, `get`, `events`, and `peek` issue no mutation, so a
   read-only-scoped token can run them.
 - **Anchoring.** The durable journal and `RequestId` idempotency remain the only
-  authorities for resume and retries. `loom-ctl run` starts a run and returns its
+  authorities for resume and retries. `loom-cli run` starts a run and returns its
   ids without waiting, so waiting for completion stays a client concern.
 
 ## Reconnect and consistency

@@ -1,4 +1,4 @@
-//! `loom-ctl`: the command-line client contract.
+//! `loom-cli`: the command-line client contract.
 //!
 //! # Surface
 //!
@@ -141,7 +141,7 @@ pub use client::{Client, RemoteClient};
 
 use args::{Invocation, Parsed};
 
-/// Entry point of the `loom-ctl` binary: parses the arguments, connects, runs
+/// Entry point of the `loom-cli` binary: parses the arguments, connects, runs
 /// the verb, and maps every outcome to an exit code. A usage error never
 /// panics on user input.
 pub fn main(arguments: Vec<String>) -> i32 {
