@@ -34,7 +34,7 @@ pub(super) async fn doctor<C: Client>(
         ServerResponse::Control(ControlResponse::Capabilities(discovered)) => discovered,
         _ => return Err(Failure::unexpected(request_id, "capability discovery")),
     };
-    let negotiated = handshake(&mut caller).await?;
+    let negotiated = handshake(&mut caller, &invocation.verb).await?;
     let (request_id, response) = caller
         .call(ClientRequest::Access(AccessRequest::GetCurrentParticipant))
         .await?;
@@ -91,7 +91,7 @@ pub(super) async fn whoami<C: Client>(
     out: &mut dyn Write,
 ) -> Result<(Value, Option<RequestId>), Failure> {
     let mut caller = Caller::new(client);
-    handshake(&mut caller).await?;
+    handshake(&mut caller, &invocation.verb).await?;
     let (request_id, response) = caller
         .call(ClientRequest::Access(AccessRequest::GetCurrentParticipant))
         .await?;
@@ -117,7 +117,7 @@ pub(super) async fn ls<C: Client>(
     out: &mut dyn Write,
 ) -> Result<(Value, Option<RequestId>), Failure> {
     let mut caller = Caller::new(client);
-    handshake(&mut caller).await?;
+    handshake(&mut caller, &invocation.verb).await?;
     let data = match workspace {
         None => {
             let (request_id, response) = caller
@@ -180,7 +180,7 @@ pub(super) async fn get<C: Client>(
     out: &mut dyn Write,
 ) -> Result<(Value, Option<RequestId>), Failure> {
     let mut caller = Caller::new(client);
-    handshake(&mut caller).await?;
+    handshake(&mut caller, &invocation.verb).await?;
     let (request_id, response) = caller
         .call(ClientRequest::Session(SessionRequest::GetAgentSession {
             session_id: session,
