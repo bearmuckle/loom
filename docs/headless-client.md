@@ -55,6 +55,7 @@ The examples below use the installed binary name. In a checkout, replace
 | `project tasks <session-id>` | The project's delegated tasks with status, owner, target, model, dependency blocks, and intent. |
 | `project children <session-id>` | The direct child agents with their task, run, pending approval, and pending question. |
 | `project messages <session-id> [--after <seq>] [--limit <n>]` | One page of the project's agent message history; `--limit` is 1 to 512 and 100 by default. |
+| `project send <session-id> (--text <text> \| --text-file <path>) [--request-id <uuid>]` | A direction to a delegated child's active run, with the same rules as `send`. |
 | `project child pause\|resume\|interrupt\|cancel <task-id> --session <id>` | Control one delegated child task. |
 | `project archive <session-id> [--request-id <uuid>]` | Archive a project root with its idle members; the id must name such a root. |
 | `project delete <session-id> [--force] [--yes] [--request-id <uuid>]` | Delete a project root and its tree; the id must name such a root. |
@@ -66,8 +67,8 @@ The examples below use the installed binary name. In a checkout, replace
 
 `node`, `whoami`, `ls`, `get`, `events`, `peek`, `retention get`, and every
 `project` read are read-only, issue no mutation, and work with a read-only-scoped
-token. `run` starts a run; `send`, `answer`, `approve`, `deny`, and `stop`
-control one; `wait`, `status`, `liveness`, and `result` read one.
+token. `run` starts a run; `send`, `project send`, `answer`, `approve`, `deny`,
+and `stop` control one; `wait`, `status`, `liveness`, and `result` read one.
 `retention set`, `session archive`, `session delete` (and its `delete` alias),
 `project archive`, `project delete`, `project worktree integrate`, and
 `project worktree cleanup` are operator-level mutations. No verb waits for a run
@@ -107,8 +108,9 @@ by default; `--max-bytes` changes that cap.
 
 `replayed` is `true` when the worker answered this call's mutating request
 from its idempotency cache instead of acting again, which happens only when the
-caller repeats a `--request-id`; a repeated archive, deletion, integration, or
-cleanup is recognised that way. A failure uses the same envelope with `ok: false`
+caller repeats a `--request-id`; a repeated archive, deletion, integration,
+cleanup, or child direction is recognised that way. A failure
+uses the same envelope with `ok: false`
 and an `error` object carrying `code`, `message`, `retryable`, and `exit_code`.
 `events` adds `gap { after, before, missing }` to `data` when a snapshot could
 not carry every event after the cursor, and `null` otherwise.
@@ -289,6 +291,9 @@ authoritative projection of the hierarchy and its tasks, and they negotiate
 `Session/GetAgentSessionSnapshotMetadata` per direct child and negotiates
 `read_agent_session`, and `project messages` also pages
 `Project/ListProjectAgentMessages` under `read_project_agent_messages`.
+`project send` is not a read: it also sends
+`Session/GetAgentSessionSnapshotMetadata`, `Collaboration/GetRunRevision`, and
+`Collaboration/DirectAgent`, and it is described below.
 
 The text output is byte-stable, one line per record. The task intent, the child
 task summary, the child pending question, and the message bodies are bounded by
@@ -319,7 +324,8 @@ Under `--json`, `project get` and `project tree` carry the `ProjectSnapshot`
 itself, `project tasks` carries `{"project_id", "tasks"}`, `project children`
 carries `{"project_id", "children": [{"agent", "task", "run"}], "count"}`
 with `task` and `run` null when absent, `project messages` carries
-`{"project_id", "session_id", "messages", "next_after_project_sequence"}`, and
+`{"project_id", "session_id", "messages", "next_after_project_sequence"}`,
+`project send` carries `{"action", "run", "revision"}` like `send`, and
 `project child` carries `{"action", "task", "run"}`.
 
 `project child` maps the sub-verb onto `Project/ControlProjectChild`: `pause` is
@@ -332,10 +338,36 @@ child. A task id that no task in that project names is reported as `not_found`
 also `not_found` (exit `5`), a denied capability is exit `3`, and a worker's
 `invalid_state` refusal is exit `5`.
 
-Message history is read-only here, and there is deliberately no send verb: an
-agent-attributed message is reserved for the server-bound agent tool, so a
-client cannot write one on an agent's behalf. To redirect a live child, a person
-sends the direction to that child's run with `send --run`.
+Message history is read-only here, and there is deliberately no verb that sends
+an agent-attributed message: the worker refuses
+`Project/SendProjectAgentMessage` for every client connection, because that
+channel is reserved for the server-bound agent tool. A person directs a live
+child instead, with `project send`.
+
+### `project send`
+
+`project send <session-id> (--text <text> | --text-file <path>)` directs a
+delegated child's active run. It is deliberately not
+`Project/SendProjectAgentMessage` and it stores no durable project message: it
+reads `Project/GetProjectSnapshotForSession` and requires the session to be the
+target of a delegated task in it, otherwise it is a usage error naming
+`project children <root>`. It then reads the child's
+`Session/GetAgentSessionSnapshotMetadata` for the active run and reaches that
+run exactly as `send --run` does: `Collaboration/GetRunRevision` followed by
+`Collaboration/DirectAgent`, one retry after a `Conflict`, and the same
+`sent <run-id> <state>` text and `{"action", "run", "revision"}` payload.
+
+`--text-file` reads UTF-8 and drops one trailing line ending, like
+`run --task-file`, so a file written with a trailing newline carries the same
+text as the `--text` value. A child whose session reports no active run is
+`invalid_state` (exit `5`) with that metadata request id, and no direction is
+sent. The verb negotiates `read_project`, `read_agent_session`, `read_agent_run`,
+and `control_agent_run`.
+
+`--request-id <uuid>` keys the `Collaboration/DirectAgent` request, so a repeat
+is answered from the worker's durable cache with the same `data` and
+`replayed: true`; the snapshot, metadata, and revision reads always keep fresh
+ids.
 
 ## Worker status and retention
 
@@ -647,4 +679,8 @@ loom-cli session archive <session-id> \
   --request-id 0199f0f4-0000-7000-8000-000000000002
 loom-cli project worktree cleanup <project-root-id> --task <task-id> \
   --remove --request-id 0199f0f4-0000-7000-8000-000000000003
+
+# Direct a delegated child's active run, and key the repeat of the direction.
+loom-cli project send <child-session-id> --text "prefer the smaller diff" \
+  --request-id 0199f0f4-0000-7000-8000-000000000004
 ```

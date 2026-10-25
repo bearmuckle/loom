@@ -1281,6 +1281,16 @@ fn each_verb_negotiates_only_the_capabilities_its_requests_need() {
             ],
         ),
         (
+            vec!["project", "send", &session, "--text", "go"],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadProject,
+                Capability::ReadAgentSession,
+                Capability::ReadAgentRun,
+                Capability::ControlAgentRun,
+            ],
+        ),
+        (
             vec!["project", "child", "pause", &task, "--session", &session],
             vec![
                 Capability::JsonProtocol,
@@ -4057,6 +4067,7 @@ fn the_parser_accepts_a_request_id_on_every_mutating_verb() {
     let task_text = TaskId::new().to_string();
     for arguments in [
         vec!["send", "--run", &run_text, "--text", "go"],
+        vec!["project", "send", &session, "--text", "go"],
         vec!["answer", "--run", &run_text, "--text", "yes"],
         vec!["approve", "--run", &run_text, "--tool-call", &call],
         vec!["deny", "--run", &run_text, "--tool-call", &call],
@@ -4094,6 +4105,7 @@ fn the_parser_accepts_a_request_id_on_every_mutating_verb() {
     let equals = format!("--request-id={key}");
     for keyed in [
         vec!["send", "--run", &run_text, "--text", "go", &equals],
+        vec!["project", "send", &session, "--text", "go", &equals],
         vec!["session", "archive", &session, &equals],
         vec!["session", "delete", &session, &equals],
         vec!["project", "archive", &session, &equals],
@@ -4198,6 +4210,7 @@ fn verb_request_id(verb: &Verb) -> Option<RequestId> {
         | Verb::SessionDelete { request_id, .. }
         | Verb::ProjectArchive { request_id, .. }
         | Verb::ProjectDelete { request_id, .. }
+        | Verb::ProjectSend { request_id, .. }
         | Verb::ProjectWorktreeIntegrate { request_id, .. }
         | Verb::ProjectWorktreeCleanup { request_id, .. } => *request_id,
         _ => None,
@@ -5549,11 +5562,11 @@ fn the_parser_covers_the_lifecycle_verbs() {
         parse_error(&["project", "delete", &session, "--force"]).contains("pass --yes to confirm")
     );
     assert!(parse_error(&["project"]).contains(
-        "requires 'get', 'tree', 'tasks', 'children', 'messages', 'child', 'archive', \
+        "requires 'get', 'tree', 'tasks', 'children', 'messages', 'send', 'child', 'archive', \
              'delete', 'worktrees', or 'worktree'"
     ));
     assert!(parse_error(&["project", "nope"]).contains(
-        "use get, tree, tasks, children, messages, child, archive, delete, worktrees, \
+        "use get, tree, tasks, children, messages, send, child, archive, delete, worktrees, \
                  or worktree"
     ));
     assert!(
@@ -8208,6 +8221,195 @@ fn project_child_controls_send_the_snapshot_manager() {
     );
 }
 
+/// A real delegated child: a session with a started run, named as the target of
+/// a task in a synthetic snapshot.
+///
+/// `create_project_child` is `pub(crate)` in `loom-server`, so a test produces
+/// the hierarchy by rewriting the project read while the run itself stays real.
+fn real_delegated_child(fixture: &Fixture) -> (AgentSessionId, RunId, ProjectSnapshot) {
+    let child = create_session(&fixture.control, fixture.workspace.id, "delegated child").id;
+    pin_auto_policy(&fixture.control, child);
+    let run_id = start_run(&fixture.control, child);
+    await_run_state(&fixture.control, child, AgentRunState::Completed);
+    let root = fixture.session.id;
+    let mut project = fake_project(root, &[root, child], Vec::new());
+    project.tasks.push(fake_task(
+        project.project_id,
+        root,
+        child,
+        "delegated child",
+    ));
+    (child, run_id, project)
+}
+
+#[test]
+fn project_send_directs_a_delegated_childs_active_run() {
+    let fixture = fixture();
+    let (child, run_id, project) = real_delegated_child(&fixture);
+    let root = fixture.session.id;
+    let child_text = child.to_string();
+    let root_text = root.to_string();
+    let run_text = run_id.to_string();
+    // The revision a client that read the run would direct it against.
+    let read_revision = run_revision(&fixture.control, run_id);
+    let directs = Rc::new(Cell::new(0usize));
+    let carried = Rc::new(RefCell::new(Vec::new()));
+    let counted = Rc::clone(&directs);
+    let recorded = Rc::clone(&carried);
+    let mut client = with_project_snapshot(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        child,
+        project,
+    )
+    .before(move |envelope| {
+        if let ClientRequest::Collaboration(CollaborationRequest::DirectAgent {
+            expected, ..
+        }) = &mut envelope.request
+        {
+            counted.set(counted.get() + 1);
+            // The first direction is deliberately stale, so the worker answers
+            // a conflict and the client has to re-read and retry exactly once.
+            if counted.get() == 1 {
+                expected.action_sequence += 1;
+            }
+            recorded.borrow_mut().push(*expected);
+        }
+    });
+
+    // A session that is not the target of a delegated task is a usage error,
+    // and it names the verb that lists the children.
+    let not_a_child = run(
+        &mut client,
+        &["project", "send", &root_text, "--text", "go"],
+    );
+    assert_eq!(not_a_child.code, exit::USAGE, "{}", not_a_child.stderr);
+    assert_eq!(not_a_child.stdout, "");
+    assert!(
+        not_a_child.stderr.contains("project children"),
+        "{}",
+        not_a_child.stderr
+    );
+    assert_eq!(
+        directs.get(),
+        0,
+        "nothing is directed for a session that is not a child"
+    );
+
+    let directed = run(
+        &mut client,
+        &[
+            "project",
+            "send",
+            &child_text,
+            "--text",
+            "prefer the smaller diff",
+        ],
+    );
+    assert_eq!(directed.code, exit::OK, "{}", directed.stderr);
+    assert_eq!(directed.stderr, "");
+    assert!(
+        directed.stdout.starts_with(&format!("sent {run_text} ")),
+        "{}",
+        directed.stdout
+    );
+    assert_eq!(directs.get(), 2, "one stale direction and one retry");
+    let carried = carried.borrow();
+    assert_ne!(
+        carried[0], read_revision,
+        "the first direction was stale, so the conflict was not accidental"
+    );
+    assert_eq!(
+        carried[1], read_revision,
+        "the retry carries the revision the client re-read from the worker"
+    );
+    drop(carried);
+
+    // The direction reached the child's session and continues its run.
+    await_event(&fixture.control, child, |event| {
+        matches!(
+            event,
+            ServerEvent::Agent {
+                event: AgentEvent::UserMessage { text, .. }
+            } if text.contains("prefer the smaller diff")
+        )
+    });
+
+    // The same verb in `--json` keeps the `send` payload.
+    let as_json = run(
+        &mut client,
+        &["project", "send", &child_text, "--text", "again", "--json"],
+    );
+    assert_eq!(as_json.code, exit::OK, "{}", as_json.stderr);
+    let envelope = json_envelope(&as_json);
+    assert_eq!(envelope["verb"], "project send");
+    assert_eq!(envelope["data"]["action"], "send");
+    assert_eq!(envelope["data"]["run"]["id"], run_text);
+    assert!(envelope["data"]["revision"]["action_sequence"].is_number());
+    assert_eq!(
+        envelope["replayed"], false,
+        "an unkeyed direction is never a replay"
+    );
+    assert_eq!(directs.get(), 3, "the second direction is a new request");
+}
+
+#[test]
+fn project_send_refuses_a_child_without_an_active_run() {
+    let fixture = fixture();
+    let child = create_session(&fixture.control, fixture.workspace.id, "idle child").id;
+    let root = fixture.session.id;
+    let mut project = fake_project(root, &[root, child], Vec::new());
+    project
+        .tasks
+        .push(fake_task(project.project_id, root, child, "idle child"));
+    let directs = Rc::new(Cell::new(0usize));
+    let counted = Rc::clone(&directs);
+    let mut client = with_project_snapshot(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        child,
+        project,
+    )
+    .before(move |envelope| {
+        if matches!(
+            &envelope.request,
+            ClientRequest::Collaboration(CollaborationRequest::DirectAgent { .. })
+        ) {
+            counted.set(counted.get() + 1);
+        }
+    });
+
+    let child_text = child.to_string();
+    let outcome = run(
+        &mut client,
+        &["project", "send", &child_text, "--text", "go", "--json"],
+    );
+    assert_eq!(outcome.code, exit::GONE, "{}", outcome.stderr);
+    assert_eq!(outcome.stderr, "");
+    let envelope = json_envelope(&outcome);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["verb"], "project send");
+    assert_eq!(envelope["error"]["code"], "invalid_state");
+    assert_eq!(envelope["error"]["exit_code"], 5);
+    assert_eq!(envelope["error"]["retryable"], false);
+    assert_eq!(
+        envelope["request_id"].as_str().map(str::len),
+        Some(36),
+        "the metadata request id is carried"
+    );
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("project child resume"),
+        "{}",
+        envelope["error"]["message"]
+    );
+    assert_eq!(
+        directs.get(),
+        0,
+        "no direction is sent for a child with no active run"
+    );
+}
+
 #[test]
 fn project_reads_of_a_real_session_use_the_single_root_fallback() {
     let (fixture, directory) = persistent_fixture("project-fallback");
@@ -8350,6 +8552,52 @@ fn the_parser_covers_the_project_verbs() {
         assert_eq!(action, expected);
     }
 
+    // `project send` takes the direction inline or from a file, never both.
+    let text_file = temporary_path("project-send-text.txt");
+    std::fs::write(&text_file, "prefer the smaller diff\r\n").unwrap();
+    let text_path = text_file.to_string_lossy().into_owned();
+    let Verb::ProjectSend {
+        session: parsed,
+        text,
+        request_id,
+    } = invocation(&[
+        "project",
+        "send",
+        &session,
+        "--text",
+        "prefer the smaller diff",
+    ])
+    .verb
+    else {
+        panic!("project send parses as project send")
+    };
+    assert_eq!(parsed, session_id);
+    assert_eq!(text, "prefer the smaller diff");
+    assert_eq!(request_id, None);
+
+    let key = RequestId::new();
+    let Verb::ProjectSend {
+        text, request_id, ..
+    } = invocation(&[
+        "project",
+        "send",
+        &session,
+        "--text-file",
+        &text_path,
+        "--request-id",
+        &key.to_string(),
+    ])
+    .verb
+    else {
+        panic!("project send parses as project send")
+    };
+    assert_eq!(
+        text, "prefer the smaller diff",
+        "the file's one trailing line ending is dropped"
+    );
+    assert_eq!(request_id, Some(key));
+    std::fs::remove_file(&text_file).ok();
+
     assert_eq!(
         args::named_verb(&["project".to_owned(), "get".to_owned()]),
         "project"
@@ -8369,6 +8617,46 @@ fn the_parser_covers_the_project_verbs() {
     assert!(
         parse_error(&["project", "child", "stop", &task, "--session", &session])
             .contains("unknown project child action")
+    );
+    assert!(
+        parse_error(&[
+            "project",
+            "child",
+            "pause",
+            &task,
+            "--session",
+            &session,
+            "--text",
+            "go"
+        ])
+        .contains("does not apply")
+    );
+    assert!(parse_error(&["project", "send", &session]).contains("requires --text"));
+    assert!(
+        parse_error(&[
+            "project",
+            "send",
+            &session,
+            "--text",
+            "go",
+            "--text-file",
+            "/tmp/loom-cli-text.txt"
+        ])
+        .contains("not both")
+    );
+    assert!(
+        parse_error(&[
+            "project",
+            "send",
+            &session,
+            "--text-file",
+            "/tmp/loom-cli-definitely-absent-text-file"
+        ])
+        .contains("could not read the text file")
+    );
+    assert!(
+        parse_error(&["project", "send", &session, "--text", "go", "extra"])
+            .contains("one session id")
     );
     assert!(parse_error(&["project", "child", "pause"]).contains("requires a <task-id>"));
     assert!(

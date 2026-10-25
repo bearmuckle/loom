@@ -282,8 +282,9 @@ async fn revision<C: Client>(
 }
 
 /// Reads the revision, sends one run action, and retries once after a conflict
-/// when `retry` allows it.
-async fn act<C: Client, F>(
+/// when `retry` allows it. `project send` shares it, so a direction to a
+/// delegated child's run has exactly the rules of `send`.
+pub(super) async fn act<C: Client, F>(
     caller: &mut Caller<'_, C>,
     run_id: RunId,
     retry: bool,
@@ -341,7 +342,7 @@ fn run_action(
 }
 
 /// Emits the text and payload of one accepted run action.
-fn finish_action(
+pub(super) fn finish_action(
     invocation: &Invocation,
     action: &str,
     tool_call_id: Option<ToolCallId>,

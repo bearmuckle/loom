@@ -288,6 +288,17 @@ pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
                 Capability::ReadProjectAgentMessages,
             ]);
         }
+        // A direction to a delegated child's run reads the project snapshot for
+        // the task, the child's session metadata for its active run, and the run
+        // revision, so all three reads are part of the verb.
+        Verb::ProjectSend { .. } => {
+            capabilities.extend([
+                Capability::ReadProject,
+                Capability::ReadAgentSession,
+                Capability::ReadAgentRun,
+                Capability::ControlAgentRun,
+            ]);
+        }
         // The manager session id of the control comes from the project
         // snapshot, so the ability to read that snapshot is part of the verb.
         Verb::ProjectChild { .. } => {
@@ -588,6 +599,11 @@ pub(crate) async fn run<C: Client>(
             after,
             limit,
         } => project::messages(client, invocation, *session, *after, *limit, out).await,
+        Verb::ProjectSend {
+            session,
+            text,
+            request_id,
+        } => project::send(client, invocation, *session, text, *request_id, out).await,
         Verb::ProjectChild {
             session,
             task,

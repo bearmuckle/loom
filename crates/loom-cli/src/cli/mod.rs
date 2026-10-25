@@ -17,6 +17,7 @@
 //! | `peek` | `Events/GetRecentSessionEvents` |
 //! | `run` | `Control/Negotiate`, `Workspace/ListWorkspaceSessions`, `Workspace/CreateAgentSessionInWorkspace`, `Repository/AttachSessionRepository`, `Filesystem/AttachSessionDirectory`, `Session/SetSessionApprovalPolicy`, `Run/StartSessionAgentRunWithOptions` |
 //! | `send` | `Collaboration/GetRunRevision`, `Collaboration/DirectAgent` |
+//! | `project send` | `Project/GetProjectSnapshotForSession`, `Session/GetAgentSessionSnapshotMetadata`, `Collaboration/GetRunRevision`, `Collaboration/DirectAgent` |
 //! | `answer` | `Collaboration/GetRunRevision`, `Collaboration/AnswerAgentQuestion` |
 //! | `approve`, `deny` | `Collaboration/GetRunRevision`, `Collaboration/ControlRun` with `Approve`/`Reject` |
 //! | `stop` | `Collaboration/GetRunRevision`, `Collaboration/ControlRun` with `Interrupt`, plus `Session/ArchiveAgentSession` with `--archive` |
@@ -41,11 +42,11 @@
 //! | `project worktree integrate` | `Project/GetProjectSnapshotForSession`, `Project/IntegrateProjectChild` |
 //! | `project worktree cleanup` | `Project/GetProjectSnapshotForSession`, `Project/CleanupProjectChildWorktree` |
 //!
-//! The mutating requests of `run`, `send`, `answer`, `approve`, `deny`, `stop`,
-//! `delete`, `session archive`, `session delete`, `project archive`,
-//! `project delete`, `project worktree integrate`, and `project worktree
-//! cleanup` are the ones `--request-id` keys. Everything else a verb sends,
-//! such as
+//! The mutating requests of `run`, `send`, `project send`, `answer`, `approve`,
+//! `deny`, `stop`, `delete`, `session archive`, `session delete`, `project
+//! archive`, `project delete`, `project worktree integrate`, and `project
+//! worktree cleanup` are the ones `--request-id` keys. Everything else a verb
+//! sends, such as
 //! `Collaboration/GetRunRevision` and `Project/GetProjectSnapshotForSession`,
 //! is a read with a fresh id, and only the verb's own mutation carries the
 //! caller's key:
@@ -54,6 +55,7 @@
 //! | --- | --- | --- |
 //! | `run` | `Run/StartSessionAgentRunWithOptions` | `--new` also derives the session creation, the input attachments, and the policy change |
 //! | `send` | `Collaboration/DirectAgent` | — |
+//! | `project send` | `Collaboration/DirectAgent` | — |
 //! | `answer` | `Collaboration/AnswerAgentQuestion` | — |
 //! | `approve`, `deny` | `Collaboration/ControlRun` | — |
 //! | `stop` | `Collaboration/ControlRun` | `Session/ArchiveAgentSession` with `--archive` |
@@ -142,10 +144,11 @@
 //! project id, and a child's id resolves to the project it belongs to, so the
 //! same command works from the root and from a child. `project get` and
 //! `project tree` report the members, `project tasks` the delegated tasks,
-//! `project children` the direct children of the addressed session, and
-//! `project messages` one page of the project's agent message history. Those
-//! reads negotiate `read_project`, `project children` also `read_agent_session`,
-//! and `project messages` also `read_project_agent_messages`, so a
+//! `project children` the direct children of the addressed session,
+//! `project messages` one page of the project's agent message history, and
+//! `project send` a direction to a delegated child's active run. Those reads
+//! negotiate `read_project`, `project children` also `read_agent_session`, and
+//! `project messages` also `read_project_agent_messages`, so a
 //! read-only-scoped token can run them.
 //!
 //! The project id every later request needs comes from
@@ -154,10 +157,24 @@
 //! `Project/ListProjectAgentMessages` with `--after` as
 //! `after_project_sequence` and `--limit` (1 to 512, 100 by default) as the page
 //! size, and prints a final `next <sequence>` line only when the worker sets
-//! `next_after_project_sequence`. Message history is read-only here: there is
-//! deliberately no send verb, because an agent-attributed message is reserved
-//! for the server-bound agent tool, and a person redirects a live child with
-//! `send --run`.
+//! `next_after_project_sequence`. Message history is read-only here, and
+//! `project send` is not a message: an agent-attributed message is reserved for
+//! the server-bound agent tool, and the worker refuses
+//! `Project/SendProjectAgentMessage` for every client connection, so a person
+//! directs a live child through `Collaboration/DirectAgent` instead.
+//!
+//! `project send <session-id> (--text <text> | --text-file <path>)` reads one
+//! `Project/GetProjectSnapshotForSession` and requires the session to be the
+//! target of a task in it, otherwise it is a usage error naming `project
+//! children`. It then reads the child's
+//! `Session/GetAgentSessionSnapshotMetadata` and directs the run that metadata
+//! reports through the same `Collaboration/GetRunRevision` and
+//! `Collaboration/DirectAgent` exchange as `send`: the same
+//! `sent <run-id> <state>` text, the same `action`, `run`, and `revision`
+//! payload, and the same single retry after a `Conflict`. A child whose session
+//! reports no active run is `invalid_state` (exit `5`) with the metadata
+//! request id, and no direction is sent. It negotiates `read_project`,
+//! `read_agent_session`, `read_agent_run`, and `control_agent_run`.
 //!
 //! `project child pause|resume|interrupt|cancel` maps the sub-verb onto
 //! `Project/ControlProjectChild` as `Pause`, `Continue`, `Interrupt`, and
@@ -206,7 +223,9 @@
 //!
 //! `send`, `answer`, `approve`, and `deny` read `Collaboration/GetRunRevision`,
 //! send their collaboration request with that revision, and on `Conflict`
-//! re-read once and retry, because their intent is idempotent. `stop` sends
+//! re-read once and retry, because their intent is idempotent. `project send` is
+//! the same exchange with a delegated child's run, so it keeps the same output,
+//! payload, and single retry. `stop` sends
 //! `Interrupt` and refuses the same conflict unless `--retry-on-conflict` is
 //! given, so a stale revision cannot interrupt a run the caller has not seen.
 //! A conflict that survives the allowed retry is reported with the protocol's
@@ -284,9 +303,9 @@
 //! reuses. `replayed` is `true` only when the worker answered a mutating
 //! request of this invocation from its idempotency cache instead of acting
 //! again, which happens only when the caller repeated a `--request-id`; it is
-//! how a repeated archive, deletion, integration, or cleanup reports that the
-//! mutation was applied once. Every other success reports `false`, and a
-//! failure envelope has no such field.
+//! how a repeated archive, deletion, integration, cleanup, or child direction
+//! reports that the mutation was applied once. Every other success reports
+//! `false`, and a failure envelope has no such field.
 //! `events` adds `gap` (`after`, `before`, `missing`) when a snapshot
 //! could not carry every event after the cursor, and `null` otherwise.
 //!
