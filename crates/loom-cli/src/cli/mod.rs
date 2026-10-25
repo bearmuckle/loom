@@ -27,6 +27,11 @@
 //! | `retention get` | `Control/GetArchiveRetentionPolicy` |
 //! | `retention set` | `Control/GetArchiveRetentionPolicy`, `Control/SetArchiveRetentionPolicy` |
 //! | `delete` | `Project/GetProjectSnapshotForSession`, `Session/DeleteAgentSession` |
+//! | `session archive` | `Project/GetProjectSnapshotForSession`, `Session/ArchiveAgentSession` |
+//! | `session delete` | `Project/GetProjectSnapshotForSession`, `Session/DeleteAgentSession` |
+//! | `project archive` | `Project/GetProjectSnapshotForSession`, `Session/ArchiveAgentSession` |
+//! | `project delete` | `Project/GetProjectSnapshotForSession`, `Session/DeleteAgentSession` |
+//! | `project worktree cleanup` | `Project/GetProjectSnapshotForSession`, `Project/CleanupProjectChildWorktree` |
 //!
 //! Every verb first sends `Control/Negotiate` with the version this build
 //! speaks and with only the capabilities it uses, because a worker refuses an
@@ -36,6 +41,34 @@
 //! token can run them. `retention set` and `delete` are operator-level
 //! mutations: a token without `configure_archive_retention` or
 //! `delete_agent_session` is refused at negotiation with exit `3`.
+//!
+//! `session archive`, `session delete` (and its `delete` alias), `project
+//! archive`, `project delete`, and `project worktree cleanup` are the
+//! operator-level lifecycle verbs, and they are separate operations: archiving
+//! moves a session to the archived state and keeps its transcript, checkpoints,
+//! and every checkout, deletion removes the durable state, and worktree cleanup
+//! decides the fate of one delegated task's checkout. Each one reads
+//! `Project/GetProjectSnapshotForSession` before it mutates anything, because an
+//! id alone does not say whether it names a project root whose operation reaches
+//! other sessions.
+//!
+//! `session archive` accepts any session and requires `--yes` when the id is a
+//! project root whose archive the worker cascades to its live members, so the
+//! blast radius is one explicit decision. `project archive` and `project delete`
+//! require the id to name such a root and spell the scope themselves; `project
+//! delete` keeps the `--yes` requirement because deletion is irreversible and
+//! `--force` still has to be confirmed. The worker stays the authority on which
+//! sessions may change state: archiving a project root while a child task is
+//! unfinished or a child session is active is refused as `invalid_state` (exit
+//! `5`), and a deletion of a live child is cancelled by the worker rather than
+//! by this client.
+//!
+//! `project worktree cleanup` resolves the project, the manager session, and the
+//! worktree record from the snapshot by `--task`, so the caller never supplies
+//! an id the worker did not report. The disposition is explicit: `--keep`
+//! retains the checkout, `--remove` removes it and is refused while it holds
+//! changes, and `--discard` removes it with those changes and therefore also
+//! needs `--yes`. A checkout is never removed without one of those flags.
 //!
 //! `node` prints one line per field of `WorkerNodeStatus`, with absent health
 //! samples as `unknown`. `retention get` prints `window`, `force-discard`, and

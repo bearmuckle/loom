@@ -231,8 +231,17 @@ pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
                 Capability::ConfigureArchiveRetention,
             ]);
         }
-        Verb::Delete { .. } => {
+        Verb::SessionArchive { .. } | Verb::ProjectArchive { .. } => {
+            capabilities.extend([Capability::ReadProject, Capability::ControlAgentSession]);
+        }
+        Verb::SessionDelete { .. } | Verb::Delete { .. } | Verb::ProjectDelete { .. } => {
             capabilities.extend([Capability::ReadProject, Capability::DeleteAgentSession]);
+        }
+        Verb::ProjectWorktreeCleanup { .. } => {
+            capabilities.extend([
+                Capability::ReadProject,
+                Capability::CleanupProjectChildWorktree,
+            ]);
         }
     }
     CapabilitySet::new(capabilities)
@@ -363,11 +372,34 @@ pub(crate) async fn run<C: Client>(
         }
         Verb::RetentionGet => operator::retention_get(client, invocation, out).await,
         Verb::RetentionSet(args) => operator::retention_set(client, invocation, args, out).await,
+        Verb::SessionArchive { session, yes } => {
+            operator::archive(client, invocation, *session, false, *yes, out).await
+        }
+        Verb::SessionDelete {
+            session,
+            force,
+            yes,
+        } => operator::delete(client, invocation, *session, *force, *yes, false, out).await,
+        Verb::ProjectArchive { session } => {
+            operator::archive(client, invocation, *session, true, false, out).await
+        }
+        Verb::ProjectDelete {
+            session,
+            force,
+            yes,
+        } => operator::delete(client, invocation, *session, *force, *yes, true, out).await,
+        Verb::ProjectWorktreeCleanup {
+            session,
+            task,
+            disposition,
+        } => {
+            operator::worktree_cleanup(client, invocation, *session, *task, *disposition, out).await
+        }
         Verb::Delete {
             session,
             force,
             yes,
-        } => operator::delete(client, invocation, *session, *force, *yes, out).await,
+        } => operator::delete(client, invocation, *session, *force, *yes, false, out).await,
     }
 }
 

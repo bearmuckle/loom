@@ -6,13 +6,14 @@
 //! doubles rewrite a protocol answer that would otherwise need a pruned journal
 //! or a second worker.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, Author, Capability,
     CapabilitySet, CollaborationEntryKind, EventSequence, ProjectAgentRecord, ProjectId,
-    ProjectSnapshot, ProjectWorktreeRecord, ProjectWorktreeStatus, ProtocolVersion, RepositoryId,
-    RequestId, RunId, TaskId, Timestamp, ToolCallId, WorkspaceId,
+    ProjectSnapshot, ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord,
+    ProjectWorktreeStatus, ProtocolVersion, RepositoryId, RequestId, RunId, TaskId, Timestamp,
+    ToolCallId, WorkspaceId,
 };
 use loom_model::ModelId;
 use loom_protocol::{
@@ -25,7 +26,7 @@ use loom_protocol::{
 };
 use loom_server::{InProcessBackend, InProcessConnection};
 
-use crate::cli::args::{self, ApprovalPreset, Format, Parsed, Verb};
+use crate::cli::args::{self, ApprovalPreset, Format, Parsed, Verb, WorktreeDisposition};
 use crate::cli::client::Client;
 use crate::cli::client::testing::{InProcessClient, Wrapped};
 use crate::cli::exit;
@@ -1016,6 +1017,7 @@ fn each_verb_negotiates_only_the_capabilities_its_requests_need() {
     let workspace = WorkspaceId::new().to_string();
     let session = AgentSessionId::new().to_string();
     let run = RunId::new().to_string();
+    let task = TaskId::new().to_string();
     let cases: Vec<(Vec<&str>, Vec<Capability>)> = vec![
         (vec!["whoami"], vec![Capability::JsonProtocol]),
         (
@@ -1155,6 +1157,48 @@ fn each_verb_negotiates_only_the_capabilities_its_requests_need() {
                 Capability::JsonProtocol,
                 Capability::ReadProject,
                 Capability::DeleteAgentSession,
+            ],
+        ),
+        (
+            vec!["session", "archive", &session],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadProject,
+                Capability::ControlAgentSession,
+            ],
+        ),
+        (
+            vec!["session", "delete", &session],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadProject,
+                Capability::DeleteAgentSession,
+            ],
+        ),
+        (
+            vec!["project", "archive", &session],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadProject,
+                Capability::ControlAgentSession,
+            ],
+        ),
+        (
+            vec!["project", "delete", &session],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadProject,
+                Capability::DeleteAgentSession,
+            ],
+        ),
+        (
+            vec![
+                "project", "worktree", "cleanup", &session, "--task", &task, "--keep",
+            ],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadProject,
+                Capability::CleanupProjectChildWorktree,
             ],
         ),
         (
@@ -4234,4 +4278,675 @@ fn the_parser_covers_the_operator_verbs() {
     assert!(parse_error(&["delete"]).contains("requires a <session-id>"));
     assert!(parse_error(&["delete", &session, &session]).contains("one session id"));
     assert!(parse_error(&["delete", &session, "--force"]).contains("pass --yes to confirm"));
+}
+
+#[test]
+fn the_parser_covers_the_lifecycle_verbs() {
+    let session = AgentSessionId::new().to_string();
+    let task = TaskId::new().to_string();
+
+    assert!(matches!(
+        invocation(&["session", "archive", &session]).verb,
+        Verb::SessionArchive { yes: false, .. }
+    ));
+    assert!(matches!(
+        invocation(&["session", "archive", &session, "--yes"]).verb,
+        Verb::SessionArchive { yes: true, .. }
+    ));
+    assert!(matches!(
+        invocation(&["session", "delete", &session]).verb,
+        Verb::SessionDelete {
+            force: false,
+            yes: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        invocation(&["session", "delete", &session, "--force", "--yes"]).verb,
+        Verb::SessionDelete {
+            force: true,
+            yes: true,
+            ..
+        }
+    ));
+    assert!(matches!(
+        invocation(&["project", "archive", &session]).verb,
+        Verb::ProjectArchive { .. }
+    ));
+    assert!(matches!(
+        invocation(&["project", "delete", &session, "--yes"]).verb,
+        Verb::ProjectDelete {
+            force: false,
+            yes: true,
+            ..
+        }
+    ));
+
+    let cleanup = |flag: &str| {
+        let Verb::ProjectWorktreeCleanup {
+            task: parsed_task,
+            disposition,
+            ..
+        } = invocation(&[
+            "project", "worktree", "cleanup", &session, "--task", &task, flag,
+        ])
+        .verb
+        else {
+            panic!("'project worktree cleanup' parses as its own verb");
+        };
+        assert_eq!(parsed_task.to_string(), task);
+        disposition
+    };
+    assert_eq!(cleanup("--keep"), WorktreeDisposition::Keep);
+    assert_eq!(cleanup("--remove"), WorktreeDisposition::Remove);
+    assert!(matches!(
+        invocation(&[
+            "project",
+            "worktree",
+            "cleanup",
+            &session,
+            "--task",
+            &task,
+            "--discard",
+            "--yes",
+        ])
+        .verb,
+        Verb::ProjectWorktreeCleanup {
+            disposition: WorktreeDisposition::Discard,
+            ..
+        }
+    ));
+
+    assert!(parse_error(&["session"]).contains("requires 'archive' or 'delete'"));
+    assert!(parse_error(&["session", "nope"]).contains("use archive or delete"));
+    assert!(parse_error(&["session", "archive"]).contains("requires a <session-id>"));
+    assert!(parse_error(&["session", "archive", &session, &session]).contains("one session id"));
+    assert!(
+        parse_error(&["session", "delete", &session, "--force"]).contains("pass --yes to confirm")
+    );
+    assert!(
+        parse_error(&["project", "delete", &session, "--force"]).contains("pass --yes to confirm")
+    );
+    assert!(parse_error(&["project"]).contains("requires 'archive', 'delete', or 'worktree'"));
+    assert!(parse_error(&["project", "nope"]).contains("use archive, delete, or worktree"));
+    assert!(parse_error(&["project", "worktree"]).contains("requires 'cleanup'"));
+    assert!(parse_error(&["project", "worktree", "nope"]).contains("use cleanup"));
+    assert!(
+        parse_error(&["project", "worktree", "cleanup", &session, "--keep"])
+            .contains("requires --task")
+    );
+    assert!(
+        parse_error(&["project", "worktree", "cleanup", &session, "--task", &task])
+            .contains("requires --keep, --remove, or --discard")
+    );
+    assert!(
+        parse_error(&[
+            "project", "worktree", "cleanup", &session, "--task", &task, "--keep", "--remove",
+        ])
+        .contains("accepts one of --keep, --remove, or --discard")
+    );
+    assert!(
+        parse_error(&[
+            "project",
+            "worktree",
+            "cleanup",
+            &session,
+            "--task",
+            &task,
+            "--discard",
+        ])
+        .contains("pass --yes to confirm")
+    );
+    assert!(parse_error(&["project", "archive", &session, "--yes"]).contains("does not apply"));
+    assert!(
+        parse_error(&[
+            "project", "worktree", "cleanup", &session, "--task", "nope", "--keep"
+        ])
+        .contains("not a valid task id")
+    );
+}
+
+#[test]
+fn session_archive_archives_one_session_and_keeps_its_worktrees() {
+    let (fixture, directory) = persistent_fixture("session-archive");
+    let session = fixture.session.id;
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let archived = run(&mut client, &["session", "archive", &session.to_string()]);
+    assert_eq!(archived.code, exit::OK, "{}", archived.stderr);
+    assert_eq!(
+        archived.stdout,
+        format!("archived {session}\nretained 0 worktrees\n")
+    );
+    assert_eq!(
+        session_snapshot(&fixture.control, session).state,
+        AgentSessionState::Archived
+    );
+
+    // Archiving is a state change, not a deletion: the record is still there,
+    // and the worker refuses to archive it twice.
+    let again = run(&mut client, &["session", "archive", &session.to_string()]);
+    assert_eq!(again.code, exit::GONE, "{}", again.stderr);
+    assert!(again.stderr.contains("invalid_state"), "{}", again.stderr);
+    assert_eq!(
+        session_snapshot(&fixture.control, session).state,
+        AgentSessionState::Archived
+    );
+    drop(client);
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn session_archive_requires_yes_before_a_project_cascade() {
+    let (fixture, directory) = persistent_fixture("archive-yes");
+    let session = fixture.session.id;
+    let child = AgentSessionId::new();
+    let mut project = fake_project(
+        session,
+        &[session, child],
+        vec![fake_worktree(session, child, "wt-1", "repo")],
+    );
+    // A live member is what the worker cascades to; an archived one is skipped.
+    project.agents[1].state = AgentSessionState::Idle;
+
+    // The preflight refuses before the archive request: the fail hook would turn
+    // a sent request into an internal error.
+    let mut cascade = with_project_snapshot(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        session,
+        project.clone(),
+    )
+    .fail_on(|request| {
+        matches!(
+            request,
+            ClientRequest::Session(SessionRequest::ArchiveAgentSession { .. })
+        )
+        .then(|| {
+            loom_core::LoomError::new(
+                loom_core::ErrorCode::Internal,
+                "the archive request reached the worker",
+                false,
+            )
+        })
+    });
+    let refused = run(&mut cascade, &["session", "archive", &session.to_string()]);
+    assert_eq!(refused.code, exit::USAGE, "{}", refused.stderr);
+    assert!(refused.stderr.contains("2 sessions"), "{}", refused.stderr);
+    assert!(refused.stderr.contains("--yes"), "{}", refused.stderr);
+    assert_eq!(
+        session_snapshot(&fixture.control, session).state,
+        AgentSessionState::Idle
+    );
+
+    // With --yes the same command archives the tree and names what it kept.
+    let mut text = with_project_snapshot(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        session,
+        project,
+    );
+    let printed = run(
+        &mut text,
+        &["session", "archive", &session.to_string(), "--yes"],
+    );
+    assert_eq!(printed.code, exit::OK, "{}", printed.stderr);
+    assert_eq!(
+        printed.stdout,
+        format!("archived {session}\narchived {child}\nretained worktree wt-1 repo\n")
+    );
+
+    // The envelope states the same facts. It archives a session of its own, so
+    // the run above does not have to be undone first.
+    let second = create_session(&fixture.control, fixture.workspace.id, "second session");
+    let mut second_project = fake_project(
+        second.id,
+        &[second.id, child],
+        vec![fake_worktree(second.id, child, "wt-1", "repo")],
+    );
+    second_project.agents[1].state = AgentSessionState::Idle;
+    let mut confirmed = with_project_snapshot(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        second.id,
+        second_project,
+    );
+    let archived = run(
+        &mut confirmed,
+        &[
+            "session",
+            "archive",
+            &second.id.to_string(),
+            "--yes",
+            "--json",
+        ],
+    );
+    assert_eq!(archived.code, exit::OK, "{}", archived.stderr);
+    let envelope = json_envelope(&archived);
+    assert_eq!(envelope["verb"], "session archive");
+    assert_eq!(envelope["data"]["session_id"], second.id.to_string());
+    assert_eq!(envelope["data"]["cascade"], true);
+    assert_eq!(
+        envelope["data"]["archived_sessions"],
+        serde_json::json!([second.id.to_string(), child.to_string()])
+    );
+    assert_eq!(
+        envelope["data"]["retained_worktrees"],
+        serde_json::json!([{"name": "wt-1", "path": "repo"}])
+    );
+    drop(cascade);
+    drop(confirmed);
+    drop(text);
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn session_archive_of_a_project_member_stays_on_that_session() {
+    let (fixture, directory) = persistent_fixture("archive-member");
+    let session = fixture.session.id;
+    let root = AgentSessionId::new();
+    // The member is not the root, so the worker archives only this session even
+    // though the project owns another live member and a checkout for it.
+    let mut project = fake_project(
+        root,
+        &[root, session],
+        vec![fake_worktree(root, session, "wt-1", "repo")],
+    );
+    project.agents[0].state = AgentSessionState::Idle;
+    let mut client = with_project_snapshot(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        session,
+        project,
+    );
+    let archived = run(&mut client, &["session", "archive", &session.to_string()]);
+    assert_eq!(archived.code, exit::OK, "{}", archived.stderr);
+    assert_eq!(
+        archived.stdout,
+        format!("archived {session}\nretained worktree wt-1 repo\n")
+    );
+    drop(client);
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn session_delete_is_the_same_operation_as_delete() {
+    let (fixture, directory) = persistent_fixture("session-delete");
+    let first = fixture.session.id;
+    let second = create_session(&fixture.control, fixture.workspace.id, "second session");
+    archive_session(&fixture.control, first);
+    archive_session(&fixture.control, second.id);
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let explicit = run(
+        &mut client,
+        &["session", "delete", &first.to_string(), "--json"],
+    );
+    assert_eq!(explicit.code, exit::OK, "{}", explicit.stderr);
+    let envelope = json_envelope(&explicit);
+    assert_eq!(envelope["verb"], "session delete");
+    assert_eq!(
+        envelope["data"]["deleted_sessions"],
+        serde_json::json!([first.to_string()])
+    );
+
+    // The original spelling is the same operation, and keeps its own verb name.
+    let alias = run(&mut client, &["delete", &second.id.to_string()]);
+    assert_eq!(alias.code, exit::OK, "{}", alias.stderr);
+    assert_eq!(alias.stdout, format!("deleted {}\n", second.id));
+
+    // A rejected command line still names the verb the caller typed.
+    let missing_id = run(&mut client, &["session", "archive", "--json"]);
+    assert_eq!(missing_id.code, exit::USAGE, "{}", missing_id.stderr);
+    assert_eq!(json_envelope(&missing_id)["verb"], "session");
+    let unknown_sub_verb = run(&mut client, &["project", "nope", "--json"]);
+    assert_eq!(
+        unknown_sub_verb.code,
+        exit::USAGE,
+        "{}",
+        unknown_sub_verb.stderr
+    );
+    assert_eq!(json_envelope(&unknown_sub_verb)["verb"], "project");
+    drop(client);
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn project_archive_and_delete_require_a_project_root() {
+    let (fixture, directory) = persistent_fixture("project-root");
+    let session = fixture.session.id;
+    let session_text = session.to_string();
+
+    // A plain session is not a project root, so the project spelling refuses it
+    // before sending any mutation.
+    let mut plain = Wrapped::new(InProcessClient::new(&fixture.backend)).fail_on(|request| {
+        matches!(
+            request,
+            ClientRequest::Session(SessionRequest::ArchiveAgentSession { .. })
+                | ClientRequest::Session(SessionRequest::DeleteAgentSession { .. })
+        )
+        .then(|| {
+            loom_core::LoomError::new(
+                loom_core::ErrorCode::Internal,
+                "a project mutation reached the worker",
+                false,
+            )
+        })
+    });
+    let refused_archive = run(&mut plain, &["project", "archive", &session_text]);
+    assert_eq!(
+        refused_archive.code,
+        exit::USAGE,
+        "{}",
+        refused_archive.stderr
+    );
+    assert!(
+        refused_archive.stderr.contains("not a project root"),
+        "{}",
+        refused_archive.stderr
+    );
+    assert!(
+        refused_archive.stderr.contains("session archive"),
+        "{}",
+        refused_archive.stderr
+    );
+    let refused_delete = run(&mut plain, &["project", "delete", &session_text, "--yes"]);
+    assert_eq!(
+        refused_delete.code,
+        exit::USAGE,
+        "{}",
+        refused_delete.stderr
+    );
+    assert!(
+        refused_delete.stderr.contains("session delete"),
+        "{}",
+        refused_delete.stderr
+    );
+
+    // A real project root is archived, and then deleted, through the project
+    // spelling. Neither command needs --yes for the archive, because the verb
+    // itself names the tree; the delete needs it because it is irreversible.
+    let child = AgentSessionId::new();
+    let mut project = fake_project(session, &[session, child], Vec::new());
+    project.agents[1].state = AgentSessionState::Idle;
+    let mut root = with_project_snapshot(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        session,
+        project.clone(),
+    );
+    let archived = run(&mut root, &["project", "archive", &session_text]);
+    assert_eq!(archived.code, exit::OK, "{}", archived.stderr);
+    assert_eq!(
+        archived.stdout,
+        format!("archived {session}\narchived {child}\nretained 0 worktrees\n")
+    );
+    assert_eq!(
+        session_snapshot(&fixture.control, session).state,
+        AgentSessionState::Archived
+    );
+
+    let deleted = run(&mut root, &["project", "delete", &session_text, "--yes"]);
+    assert_eq!(deleted.code, exit::OK, "{}", deleted.stderr);
+    assert_eq!(
+        deleted.stdout,
+        format!("deleted {session}\ndeleted {child}\n")
+    );
+    let gone = run(&mut root, &["get", &session_text]);
+    assert_eq!(gone.code, exit::GONE, "{}", gone.stderr);
+    drop(root);
+    drop(plain);
+    close_persistent_fixture(fixture, directory);
+}
+
+/// A client whose project snapshot and cleanup answer are decided by the test.
+fn cleanup_client(
+    backend: &Arc<InProcessBackend>,
+    session: AgentSessionId,
+    project: ProjectSnapshot,
+    answer: ProjectWorktreeRecord,
+    sent: Rc<RefCell<Vec<ClientRequest>>>,
+) -> Wrapped<InProcessClient> {
+    Wrapped::new(InProcessClient::new(backend))
+        .before(move |envelope| sent.borrow_mut().push(envelope.request.clone()))
+        .after(move |request, response| match request {
+            ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession { session_id })
+                if *session_id == session =>
+            {
+                response.result = Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(
+                    project.clone(),
+                )));
+            }
+            ClientRequest::Project(ProjectRequest::CleanupProjectChildWorktree { .. }) => {
+                response.result = Ok(ServerResponse::Project(
+                    ProjectResponse::ProjectChildWorktreeUpdated(Box::new(answer.clone())),
+                ));
+            }
+            _ => {}
+        })
+}
+
+#[test]
+fn project_worktree_cleanup_reports_what_it_kept_or_removed() {
+    let (fixture, directory) = persistent_fixture("worktree-cleanup");
+    let session = fixture.session.id;
+    let task = TaskId::new();
+    let mut worktree = fake_worktree(session, AgentSessionId::new(), "wt-1", "repo");
+    worktree.task_id = task;
+    let project = fake_project(session, &[session], vec![worktree.clone()]);
+    let session_text = session.to_string();
+    let task_text = task.to_string();
+
+    // A task without a worktree record is refused after the preflight read and
+    // before any cleanup request.
+    let missing_sent = Rc::new(RefCell::new(Vec::new()));
+    let mut missing = cleanup_client(
+        &fixture.backend,
+        session,
+        fake_project(session, &[session], Vec::new()),
+        worktree.clone(),
+        Rc::clone(&missing_sent),
+    );
+    let refused = run(
+        &mut missing,
+        &[
+            "project",
+            "worktree",
+            "cleanup",
+            &session_text,
+            "--task",
+            &task_text,
+            "--keep",
+        ],
+    );
+    assert_eq!(refused.code, exit::USAGE, "{}", refused.stderr);
+    assert!(
+        refused.stderr.contains("no project worktree is recorded"),
+        "{}",
+        refused.stderr
+    );
+    assert!(
+        !missing_sent.borrow().iter().any(|request| matches!(
+            request,
+            ClientRequest::Project(ProjectRequest::CleanupProjectChildWorktree { .. })
+        )),
+        "a refused cleanup must not reach the worker"
+    );
+
+    // --keep retains the checkout the snapshot records, and the request carries
+    // the record's own project and manager, not what the caller typed.
+    let kept_sent = Rc::new(RefCell::new(Vec::new()));
+    let mut retained = worktree.clone();
+    retained.status = ProjectWorktreeStatus::Retained;
+    retained.cleanup_disposition = Some(ProjectWorktreeCleanupDisposition::Retain);
+    let mut keep = cleanup_client(
+        &fixture.backend,
+        session,
+        project.clone(),
+        retained,
+        Rc::clone(&kept_sent),
+    );
+    let kept = run(
+        &mut keep,
+        &[
+            "project",
+            "worktree",
+            "cleanup",
+            &session_text,
+            "--task",
+            &task_text,
+            "--keep",
+            "--json",
+        ],
+    );
+    assert_eq!(kept.code, exit::OK, "{}", kept.stderr);
+    let envelope = json_envelope(&kept);
+    assert_eq!(envelope["verb"], "project worktree cleanup");
+    assert_eq!(envelope["data"]["disposition"], "keep");
+    assert_eq!(envelope["data"]["task_id"], task_text);
+    assert_eq!(envelope["data"]["worktree"]["status"], "retained");
+    let cleanup = kept_sent
+        .borrow()
+        .iter()
+        .find_map(|request| match request {
+            ClientRequest::Project(ProjectRequest::CleanupProjectChildWorktree {
+                project_id,
+                manager_session_id,
+                task_id,
+                disposition,
+            }) => Some((*project_id, *manager_session_id, *task_id, *disposition)),
+            _ => None,
+        })
+        .expect("a cleanup request reached the worker");
+    assert_eq!(
+        cleanup,
+        (
+            worktree.project_id,
+            session,
+            task,
+            ProjectWorktreeCleanupDisposition::Retain
+        )
+    );
+
+    // --remove reports the removed checkout, and --discard also reports what it
+    // threw away, because that loss has nowhere else to be seen.
+    for (flag, disposition, note) in [
+        (
+            "--remove",
+            ProjectWorktreeCleanupDisposition::RemoveClean,
+            None,
+        ),
+        (
+            "--discard",
+            ProjectWorktreeCleanupDisposition::DiscardChanges,
+            Some(
+                "the manager discarded this checkout, so its 2 uncommitted path(s) will not be landed",
+            ),
+        ),
+    ] {
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let mut removed = worktree.clone();
+        removed.status = ProjectWorktreeStatus::Removed;
+        removed.cleanup_disposition = Some(disposition);
+        removed.error = note.map(str::to_owned);
+        let mut client = cleanup_client(
+            &fixture.backend,
+            session,
+            project.clone(),
+            removed,
+            Rc::clone(&sent),
+        );
+        let mut arguments = vec![
+            "project",
+            "worktree",
+            "cleanup",
+            &session_text,
+            "--task",
+            &task_text,
+            flag,
+        ];
+        if note.is_some() {
+            arguments.push("--yes");
+        }
+        let outcome = run_owned(
+            &mut client,
+            &arguments
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(outcome.code, exit::OK, "{}", outcome.stderr);
+        let mut expected = String::from("removed worktree wt-1 repo\n");
+        if let Some(note) = note {
+            expected.push_str(&format!("note {note}\n"));
+        }
+        assert_eq!(outcome.stdout, expected);
+        let cleanup = sent
+            .borrow()
+            .iter()
+            .find_map(|request| match request {
+                ClientRequest::Project(ProjectRequest::CleanupProjectChildWorktree {
+                    disposition,
+                    ..
+                }) => Some(*disposition),
+                _ => None,
+            })
+            .expect("a cleanup request reached the worker");
+        assert_eq!(cleanup, disposition);
+    }
+    drop(missing);
+    drop(keep);
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn project_worktree_cleanup_states_every_status_in_text() {
+    let (fixture, directory) = persistent_fixture("worktree-status");
+    let session = fixture.session.id;
+    let task = TaskId::new();
+    let mut worktree = fake_worktree(session, AgentSessionId::new(), "wt-1", "repo");
+    worktree.task_id = task;
+    let project = fake_project(session, &[session], vec![worktree.clone()]);
+    let task_text = task.to_string();
+
+    let cases = [
+        (ProjectWorktreeStatus::Retained, "retained"),
+        (ProjectWorktreeStatus::Removed, "removed"),
+        (ProjectWorktreeStatus::Creating, "creating"),
+        (ProjectWorktreeStatus::Ready, "ready"),
+        (ProjectWorktreeStatus::Stale, "stale"),
+        (ProjectWorktreeStatus::Conflict, "conflict"),
+        (ProjectWorktreeStatus::Integrating, "integrating"),
+        (ProjectWorktreeStatus::Integrated, "integrated"),
+        (ProjectWorktreeStatus::RecoveryRequired, "recovery_required"),
+        (ProjectWorktreeStatus::CleanupPending, "cleanup_pending"),
+    ];
+    for (status, word) in cases {
+        let mut answer = worktree.clone();
+        answer.status = status;
+        answer.cleanup_disposition = Some(ProjectWorktreeCleanupDisposition::RemoveClean);
+        let mut client = cleanup_client(
+            &fixture.backend,
+            session,
+            project.clone(),
+            answer,
+            Rc::new(RefCell::new(Vec::new())),
+        );
+        let outcome = run(
+            &mut client,
+            &[
+                "project",
+                "worktree",
+                "cleanup",
+                &session.to_string(),
+                "--task",
+                &task_text,
+                "--remove",
+            ],
+        );
+        assert_eq!(outcome.code, exit::OK, "{}", outcome.stderr);
+        let expected = match status {
+            ProjectWorktreeStatus::Retained | ProjectWorktreeStatus::Removed => {
+                format!("{word} worktree wt-1 repo\n")
+            }
+            _ => format!("worktree wt-1 repo {word}\n"),
+        };
+        assert_eq!(outcome.stdout, expected);
+    }
+    close_persistent_fixture(fixture, directory);
 }
