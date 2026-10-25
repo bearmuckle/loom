@@ -1,19 +1,21 @@
 //! The operator verbs: worker node health, archive retention, the session and
 //! project lifecycle, and deletion.
 //!
-//! `node` and `retention get` are reads. `retention set`, the archive, delete,
-//! and worktree-cleanup verbs are operator-level mutations that the token's
-//! capabilities already gate. The policy is worker-wide, so `retention set`
-//! reports it as stored and says the next sweep applies it rather than claiming
-//! an immediate deletion. The lifecycle verbs read the project snapshot before
-//! they mutate anything, because an id alone does not say whether it names a
-//! project root whose operation reaches other sessions.
+//! `node`, `retention get`, and the worktree inspection verbs are reads.
+//! `retention set`, the archive, delete, integration, and worktree-cleanup verbs
+//! are operator-level mutations that the token's capabilities already gate. The
+//! policy is worker-wide, so `retention set` reports it as stored and says the
+//! next sweep applies it rather than claiming an immediate deletion. The
+//! lifecycle verbs read the project snapshot before they mutate anything,
+//! because an id alone does not say whether it names a project root whose
+//! operation reaches other sessions.
 
 use std::io::Write;
 
 use loom_core::{
-    AgentSessionId, AgentSessionState, ProjectSnapshot, ProjectWorktreeCleanupDisposition,
-    ProjectWorktreeRecord, ProjectWorktreeStatus, TaskId,
+    AgentSessionId, AgentSessionState, GitDiff, GitDiffLineKind, GitRepositoryStatus,
+    ProjectSnapshot, ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord,
+    ProjectWorktreeStatus, TaskId,
 };
 use loom_protocol::{
     ArchiveRetentionPolicy, ClientRequest, ControlRequest, ControlResponse, ProjectRequest,
@@ -23,7 +25,9 @@ use serde_json::{Value, json};
 
 use crate::cli::args::{Invocation, RetentionSetArgs, WorktreeDisposition};
 use crate::cli::client::Client;
+use crate::cli::text::escape;
 
+use super::supervise::file_status_name;
 use super::{Caller, Failure, Outcome, capability_names, emit, handshake};
 
 /// `node`: the worker's id, name, and the health its status carries.
@@ -273,15 +277,7 @@ pub(super) async fn worktree_cleanup<C: Client>(
     let mut caller = Caller::new(client);
     handshake(&mut caller, &invocation.verb).await?;
     let project: ProjectSnapshot = load_project(&mut caller, session_id).await?;
-    let Some(worktree) = project
-        .worktrees
-        .iter()
-        .find(|worktree| worktree.task_id == task_id)
-    else {
-        return Err(Failure::Usage(format!(
-            "no project worktree is recorded for task {task_id}"
-        )));
-    };
+    let worktree = worktree_record(&project, task_id)?;
     let (request_id, response) = caller
         .call(ClientRequest::Project(
             ProjectRequest::CleanupProjectChildWorktree {
@@ -342,6 +338,385 @@ pub(super) async fn worktree_cleanup<C: Client>(
         "worktree": &updated,
     });
     Ok(Outcome::new(data, caller.primary))
+}
+
+/// `project worktrees`: every checkout the project's snapshot records.
+///
+/// The snapshot is the whole answer, so this is a read: it lists the durable
+/// records in snapshot order and never opens a checkout.
+pub(super) async fn worktrees<C: Client>(
+    client: &mut C,
+    invocation: &Invocation,
+    session_id: AgentSessionId,
+    out: &mut dyn Write,
+) -> Result<Outcome, Failure> {
+    let mut caller = Caller::new(client);
+    handshake(&mut caller, &invocation.verb).await?;
+    let project: ProjectSnapshot = load_project(&mut caller, session_id).await?;
+    if !invocation.globals.json {
+        emit(out, &format!("project {}\n", project.project_id))?;
+        emit(out, &format!("worktrees {}\n", project.worktrees.len()))?;
+        for worktree in &project.worktrees {
+            emit(
+                out,
+                &format!(
+                    "worktree {} {} {} {}\n",
+                    worktree.task_id,
+                    worktree_status_name(worktree.status),
+                    worktree.worktree_name,
+                    worktree.relative_path
+                ),
+            )?;
+        }
+    }
+    let data = json!({
+        "session_id": session_id.to_string(),
+        "project_id": project.project_id.to_string(),
+        "root_session_id": project.root_session_id.to_string(),
+        "worktrees": project.worktrees,
+    });
+    Ok(Outcome::new(data, caller.primary))
+}
+
+/// `project worktree get`: the durable record one delegated task owns.
+///
+/// Only the snapshot is read: the record is the worker's own state, so the verb
+/// reports it without opening the checkout or reviewing it.
+pub(super) async fn worktree_get<C: Client>(
+    client: &mut C,
+    invocation: &Invocation,
+    session_id: AgentSessionId,
+    task_id: TaskId,
+    out: &mut dyn Write,
+) -> Result<Outcome, Failure> {
+    let mut caller = Caller::new(client);
+    handshake(&mut caller, &invocation.verb).await?;
+    let project: ProjectSnapshot = load_project(&mut caller, session_id).await?;
+    let worktree = worktree_record(&project, task_id)?;
+    if !invocation.globals.json {
+        emit(
+            out,
+            &format!(
+                "worktree {} {}\n",
+                worktree.worktree_name, worktree.relative_path
+            ),
+        )?;
+        emit(out, &format!("task {}\n", worktree.task_id))?;
+        emit(out, &format!("project {}\n", worktree.project_id))?;
+        emit(out, &format!("owner {}\n", worktree.parent_session_id))?;
+        emit(out, &format!("child {}\n", worktree.child_session_id))?;
+        emit(
+            out,
+            &format!("parent-repository {}\n", worktree.parent_repository_id),
+        )?;
+        emit(
+            out,
+            &format!("child-repository {}\n", worktree.child_repository_id),
+        )?;
+        emit(out, &format!("branch {}\n", worktree.branch_name))?;
+        emit(
+            out,
+            &format!("parent-revision {}\n", worktree.base_revision),
+        )?;
+        emit(
+            out,
+            &format!(
+                "child-revision {}\n",
+                or_dash(worktree.result_revision.as_deref())
+            ),
+        )?;
+        emit(
+            out,
+            &format!(
+                "integrated-revision {}\n",
+                or_dash(worktree.integrated_revision.as_deref())
+            ),
+        )?;
+        emit(
+            out,
+            &format!("status {}\n", worktree_status_name(worktree.status)),
+        )?;
+        for path in &worktree.conflict_paths {
+            emit(out, &format!("conflict {}\n", escape(path)))?;
+        }
+        emit(
+            out,
+            &format!(
+                "cleanup {}\n",
+                or_dash(worktree.cleanup_disposition.map(cleanup_disposition_name))
+            ),
+        )?;
+        if let Some(note) = &worktree.error {
+            emit(out, &format!("note {}\n", escape(note)))?;
+        }
+    }
+    let data = json!({
+        "session_id": session_id.to_string(),
+        "project_id": worktree.project_id.to_string(),
+        "task_id": task_id.to_string(),
+        "worktree": worktree,
+    });
+    Ok(Outcome::new(data, caller.primary))
+}
+
+/// `project worktree diff`: the worker's bounded review of one checkout.
+///
+/// The review is the worker's own answer, so this verb never re-bounds the
+/// diff and never runs Git itself. Every printed line is escaped, so a hunk can
+/// never span two physical lines.
+pub(super) async fn worktree_diff<C: Client>(
+    client: &mut C,
+    invocation: &Invocation,
+    session_id: AgentSessionId,
+    task_id: TaskId,
+    out: &mut dyn Write,
+) -> Result<Outcome, Failure> {
+    let mut caller = Caller::new(client);
+    handshake(&mut caller, &invocation.verb).await?;
+    let project: ProjectSnapshot = load_project(&mut caller, session_id).await?;
+    let record = worktree_record(&project, task_id)?;
+    let (request_id, response) = caller
+        .call(ClientRequest::Project(
+            ProjectRequest::GetProjectChildReview {
+                project_id: record.project_id,
+                manager_session_id: record.parent_session_id,
+                task_id,
+            },
+        ))
+        .await?;
+    let (worktree, status, diff) = match response {
+        ServerResponse::Project(ProjectResponse::ProjectChildReview {
+            worktree,
+            status,
+            diff,
+        }) => (*worktree, status, diff),
+        _ => return Err(Failure::unexpected(request_id, "project child review")),
+    };
+    let counts = diffstat(&diff, &status);
+    let changed = changed_paths(&status);
+    if !invocation.globals.json {
+        emit(
+            out,
+            &format!(
+                "worktree {} {}\n",
+                worktree.worktree_name, worktree.relative_path
+            ),
+        )?;
+        emit(
+            out,
+            &format!("branch {}\n", or_dash(status.branch.as_deref())),
+        )?;
+        emit(out, &format!("head {}\n", or_dash(status.head.as_deref())))?;
+        emit(
+            out,
+            &format!("parent-revision {}\n", worktree.base_revision),
+        )?;
+        emit(
+            out,
+            &format!("status {}\n", worktree_status_name(worktree.status)),
+        )?;
+        emit(
+            out,
+            &format!(
+                "diffstat {} {} {}\n",
+                counts.files, counts.added, counts.removed
+            ),
+        )?;
+        for changed in &changed {
+            emit(
+                out,
+                &format!(
+                    "changed {} {}\n",
+                    changed["status"].as_str().unwrap_or("unknown"),
+                    escape(changed["path"].as_str().unwrap_or("-"))
+                ),
+            )?;
+        }
+        if diff.binary {
+            emit(out, "diff binary\n")?;
+        }
+        if diff.truncated {
+            emit(out, "diff truncated\n")?;
+        }
+        // A bounded diff that held no hunks says so, so an empty report cannot
+        // be mistaken for an unchanged checkout that Git failed to describe.
+        if diff.hunks.is_empty() && !diff.binary {
+            emit(out, "diff none\n")?;
+        }
+        for line in diff.hunks.iter().flat_map(|hunk| &hunk.lines) {
+            emit(
+                out,
+                &format!(
+                    "diff {} {}\n",
+                    diff_line_name(line.kind),
+                    escape(&line.content)
+                ),
+            )?;
+        }
+    }
+    let data = json!({
+        "session_id": session_id.to_string(),
+        "project_id": project.project_id.to_string(),
+        "task_id": task_id.to_string(),
+        "worktree": worktree,
+        "status": status,
+        "diff": diff,
+        "diffstat": {
+            "files": counts.files,
+            "added": counts.added,
+            "removed": counts.removed,
+        },
+        "changed_paths": changed,
+    });
+    Ok(Outcome::new(data, caller.primary))
+}
+
+/// `project worktree integrate`: fast-forward the parent with the task's result.
+///
+/// The expected parent revision is the flag when it is given and the record's
+/// base revision otherwise, because that is what the checkout and the review
+/// were created from. The worker keeps the ancestor check and answers a
+/// conflict when the parent moved; this verb sends exactly one request, so a
+/// conflict is reported as it is and the checkout is left untouched.
+pub(super) async fn worktree_integrate<C: Client>(
+    client: &mut C,
+    invocation: &Invocation,
+    session_id: AgentSessionId,
+    task_id: TaskId,
+    expected_parent_revision: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<Outcome, Failure> {
+    let mut caller = Caller::new(client);
+    handshake(&mut caller, &invocation.verb).await?;
+    let project: ProjectSnapshot = load_project(&mut caller, session_id).await?;
+    let record = worktree_record(&project, task_id)?;
+    let expected = expected_parent_revision.unwrap_or(&record.base_revision);
+    let (request_id, response) = caller
+        .call(ClientRequest::Project(
+            ProjectRequest::IntegrateProjectChild {
+                project_id: record.project_id,
+                manager_session_id: record.parent_session_id,
+                task_id,
+                expected_parent_revision: expected.to_owned(),
+            },
+        ))
+        .await?;
+    let updated = match response {
+        ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(worktree)) => {
+            *worktree
+        }
+        _ => {
+            return Err(Failure::unexpected(request_id, "project child integration"));
+        }
+    };
+    if !invocation.globals.json {
+        emit(
+            out,
+            &format!(
+                "integrated worktree {} {}\n",
+                updated.worktree_name, updated.relative_path
+            ),
+        )?;
+        emit(
+            out,
+            &format!(
+                "child-revision {}\n",
+                or_dash(updated.result_revision.as_deref())
+            ),
+        )?;
+        emit(
+            out,
+            &format!(
+                "integrated-revision {}\n",
+                or_dash(updated.integrated_revision.as_deref())
+            ),
+        )?;
+    }
+    let data = json!({
+        "session_id": session_id.to_string(),
+        "project_id": updated.project_id.to_string(),
+        "task_id": task_id.to_string(),
+        "expected_parent_revision": expected,
+        "worktree": &updated,
+    });
+    Ok(Outcome::new(data, caller.primary))
+}
+
+/// The worktree record one delegated task owns, which every worktree verb
+/// resolves from the snapshot the worker reports.
+fn worktree_record(
+    project: &ProjectSnapshot,
+    task_id: TaskId,
+) -> Result<&ProjectWorktreeRecord, Failure> {
+    project
+        .worktrees
+        .iter()
+        .find(|worktree| worktree.task_id == task_id)
+        .ok_or_else(|| {
+            Failure::Usage(format!(
+                "no project worktree is recorded for task {task_id}"
+            ))
+        })
+}
+
+/// The `-` placeholder the worktree text uses for an absent value.
+fn or_dash(value: Option<&str>) -> &str {
+    value.unwrap_or("-")
+}
+
+/// The protocol's snake_case spelling of a cleanup disposition, stated
+/// explicitly so a wire rename cannot change the text contract.
+fn cleanup_disposition_name(disposition: ProjectWorktreeCleanupDisposition) -> &'static str {
+    match disposition {
+        ProjectWorktreeCleanupDisposition::Retain => "retain",
+        ProjectWorktreeCleanupDisposition::RemoveClean => "remove_clean",
+        ProjectWorktreeCleanupDisposition::DiscardChanges => "discard_changes",
+    }
+}
+
+/// One line's kind word in the `diff` projection.
+fn diff_line_name(kind: GitDiffLineKind) -> &'static str {
+    match kind {
+        GitDiffLineKind::Context => "context",
+        GitDiffLineKind::Added => "added",
+        GitDiffLineKind::Removed => "removed",
+    }
+}
+
+/// The file count and hunk-line counts of one review, which `result` reports the
+/// same way.
+struct DiffCounts {
+    files: usize,
+    added: usize,
+    removed: usize,
+}
+
+fn diffstat(diff: &GitDiff, status: &GitRepositoryStatus) -> DiffCounts {
+    let lines = || diff.hunks.iter().flat_map(|hunk| &hunk.lines);
+    DiffCounts {
+        files: status.files.len(),
+        added: lines()
+            .filter(|line| line.kind == GitDiffLineKind::Added)
+            .count(),
+        removed: lines()
+            .filter(|line| line.kind == GitDiffLineKind::Removed)
+            .count(),
+    }
+}
+
+/// The changed paths of one review, with the status word `result` already uses.
+fn changed_paths(status: &GitRepositoryStatus) -> Vec<Value> {
+    status
+        .files
+        .iter()
+        .map(|file| {
+            json!({
+                "path": file.path,
+                "status": file_status_name(file.worktree),
+                "conflicted": file.conflicted,
+            })
+        })
+        .collect()
 }
 
 /// The sessions one archive reaches, resolved from the snapshot read before the

@@ -52,14 +52,21 @@ The examples below use the installed binary name. In a checkout, replace
 | `session delete <session-id> [--force] [--yes]` | Permanently delete an archived session, or a project root with its descendants. |
 | `project archive <session-id>` | Archive a project root with its idle members; the id must name such a root. |
 | `project delete <session-id> [--force] [--yes]` | Delete a project root and its tree; the id must name such a root. |
+| `project worktrees <session-id>` | The checkouts the project's snapshot records, in snapshot order. |
+| `project worktree get <session-id> --task <task-id>` | The durable worktree record of one delegated task; the checkout is not opened. |
+| `project worktree diff <session-id> --task <task-id>` | The worker's bounded review of one checkout: status, diffstat, changed paths, and hunks. |
+| `project worktree integrate <session-id> --task <task-id> [--expected-parent-revision <rev>]` | Fast-forward the parent with the task's result revision; a conflict is reported, never retried. |
 | `project worktree cleanup <session-id> --task <task-id> (--keep \| --remove \| --discard) [--yes]` | Keep or remove the checkout recorded for one delegated task. |
 
 `node`, `whoami`, `ls`, `get`, `events`, `peek`, and `retention get` are
-read-only, issue no mutation, and work with a read-only-scoped token. `run`
+read-only, issue no mutation, and work with a read-only-scoped token. So are
+`project worktrees`, `project worktree get`, and `project worktree diff`, whose
+requests only read the snapshot and the worker's review. `run`
 starts a run; `send`, `answer`, `approve`, `deny`, and `stop` control one;
 `wait`, `status`, `liveness`, and `result` read one. `retention set`,
 `session archive`, `session delete` (and its `delete` alias), `project
-archive`, `project delete`, and `project worktree cleanup` are operator-level
+archive`, `project delete`, `project worktree integrate`, and `project worktree
+cleanup` are operator-level
 mutations. No verb waits for a run except `wait`, which is always bounded by
 `--timeout`.
 
@@ -368,6 +375,104 @@ recorded worktree exits `2` after the read, and the worker refuses a task that i
 not terminal as `invalid_state` (exit `5`). The command needs the
 `cleanup_project_child_worktree` capability.
 
+### Worktree inspection and integration
+
+Listing, inspection, review, integration, and cleanup are separate operations
+over the same worker-owned records, and each has its own verb. Every one of them
+resolves the project id and the manager session from the worktree record in
+`Project/GetProjectSnapshotForSession`, so the caller never supplies an id the
+worker did not report; a task without a record exits `2` after that read and
+before any further request.
+
+`project worktrees <session-id>` lists what the snapshot records, one line per
+record in snapshot order:
+
+```text
+project <project-id>
+worktrees <count>
+worktree <task-id> <status> <worktree-name> <relative-path>
+```
+
+`worktrees 0` states an empty project explicitly. `--json` reports `session_id`,
+`project_id`, `root_session_id`, and `worktrees`, each entry being the protocol
+record. The verb needs the `read_project` capability.
+
+`project worktree get <session-id> --task <task-id>` reports the durable record
+and never opens the checkout, so it answers from the snapshot alone:
+
+```text
+worktree <name> <relative-path>
+task <task-id>
+project <project-id>
+owner <parent-session-id>
+child <child-session-id>
+parent-repository <repository-id>
+child-repository <repository-id>
+branch <branch-name>
+parent-revision <base-revision>
+child-revision <result-revision or ->
+integrated-revision <integrated-revision or ->
+status <status>
+conflict <path>
+cleanup <disposition or ->
+note <error text>
+```
+
+There is one `conflict` line per recorded conflict path and none when the list
+is empty; `note` appears only when the record carries an error. An absent value
+is `-`, and the disposition words are the protocol's snake_case spellings:
+`retain`, `remove_clean`, `discard_changes`. `--json` reports `session_id`,
+`project_id`, `task_id`, and the record as `worktree`. The verb needs
+`read_project`.
+
+`project worktree diff <session-id> --task <task-id>` prints the worker's own
+review, which is already bounded by the worker's byte limit, so the client never
+re-bounds it and never runs Git itself:
+
+```text
+worktree <name> <relative-path>
+branch <branch or ->
+head <head or ->
+parent-revision <base-revision>
+status <worktree status word>
+diffstat <files> <added> <removed>
+changed <file-status> <path>
+diff binary
+diff truncated
+diff none
+diff <context|added|removed> <line content>
+```
+
+`diffstat` counts files as the number of changed paths and added/removed as the
+hunk lines of that kind. `diff binary` marks a binary diff, `diff truncated`
+marks one the worker's bound cut, and `diff none` states a diff that holds no
+hunks and is not binary. One `diff` line follows per hunk line, with its content
+escaped, so no line can span two physical lines. `--json` reports the protocol
+`worktree`, `status`, and `diff` payloads together with `diffstat` and
+`changed_paths` (`path`, `status`, `conflicted`). The verb needs `read_project`
+and `read_project_child_review`.
+
+`project worktree integrate <session-id> --task <task-id>
+[--expected-parent-revision <rev>]` fast-forwards the parent with the task's
+result. The expected parent revision is the flag when it is given and the
+record's `base_revision` otherwise, because that is the revision the checkout
+and the review were created from. The worker keeps the ancestor check and
+refuses a rewritten or unrelated parent; the client sends exactly one
+integration request and never retries. A `conflict` answer is therefore reported
+as the failure it is: exit `1` with the protocol code `conflict`, the worker's
+message naming the conflicting paths, and the checkout left untouched. On
+success the text is:
+
+```text
+integrated worktree <name> <relative-path>
+child-revision <result-revision or ->
+integrated-revision <integrated-revision or ->
+```
+
+`--json` reports `session_id`, `project_id`, `task_id`,
+`expected_parent_revision`, and the updated record as `worktree`. The verb needs
+`read_project` and `integrate_project_child`.
+
 ## Exit codes
 
 | Exit code | Meaning |
@@ -423,6 +528,12 @@ loom-cli retention set --window 14d --force-discard true --sub-agent 10m
 # Delete an archived session, then a whole archived project with confirmation.
 loom-cli delete <session-id>
 loom-cli delete <project-root-id> --yes
+
+# Inspect the checkouts of a project and land one child's result, then tidy it.
+loom-cli project worktrees <project-root-id>
+loom-cli project worktree get <project-root-id> --task <task-id>
+loom-cli project worktree diff <project-root-id> --task <task-id>
+loom-cli project worktree integrate <project-root-id> --task <task-id>
 
 # Keep a project's checkouts while archiving it, then tidy one child worktree.
 loom-cli project archive <project-root-id>

@@ -96,6 +96,19 @@ Verbs:
                                     delete a project root and its tree; the
                                     id must name such a root, and --yes is
                                     required
+  project worktrees <session-id>    list the checkouts the project's snapshot
+                                    records
+  project worktree get <session-id> --task <task-id>
+                                    report one delegated task's durable
+                                    worktree record
+  project worktree diff <session-id> --task <task-id>
+                                    report the worker's bounded review of one
+                                    checkout
+  project worktree integrate <session-id> --task <task-id>
+      [--expected-parent-revision <rev>]
+                                    fast-forward the parent with the task's
+                                    result revision; a conflict is reported,
+                                    never retried
   project worktree cleanup <session-id> --task <task-id>
       (--keep | --remove | --discard) [--yes]
                                     keep or remove the checkout of one
@@ -378,6 +391,28 @@ pub(crate) enum Verb {
         force: bool,
         yes: bool,
     },
+    /// `project worktrees`: every checkout the project's snapshot records.
+    ProjectWorktrees {
+        session: AgentSessionId,
+    },
+    /// `project worktree get`: one delegated task's durable worktree record.
+    ProjectWorktreeGet {
+        session: AgentSessionId,
+        task: TaskId,
+    },
+    /// `project worktree diff`: the worker's bounded review of one checkout.
+    ProjectWorktreeDiff {
+        session: AgentSessionId,
+        task: TaskId,
+    },
+    /// `project worktree integrate`: fast-forward the parent with the task's
+    /// result, expecting `expected_parent_revision` (or the record's base
+    /// revision) as the parent tip.
+    ProjectWorktreeIntegrate {
+        session: AgentSessionId,
+        task: TaskId,
+        expected_parent_revision: Option<String>,
+    },
     /// `project worktree cleanup`: keep or remove one delegated task's
     /// checkout.
     ProjectWorktreeCleanup {
@@ -453,6 +488,10 @@ pub(crate) fn verb_name(verb: &Verb) -> &'static str {
         Verb::SessionDelete { .. } => "session delete",
         Verb::ProjectArchive { .. } => "project archive",
         Verb::ProjectDelete { .. } => "project delete",
+        Verb::ProjectWorktrees { .. } => "project worktrees",
+        Verb::ProjectWorktreeGet { .. } => "project worktree get",
+        Verb::ProjectWorktreeDiff { .. } => "project worktree diff",
+        Verb::ProjectWorktreeIntegrate { .. } => "project worktree integrate",
         Verb::ProjectWorktreeCleanup { .. } => "project worktree cleanup",
         Verb::Delete { .. } => "delete",
     }
@@ -509,6 +548,7 @@ fn arity(name: &str) -> Option<bool> {
         | "--as-directory" | "--approval-policy" | "--request-id" => true,
         "--run" | "--text" | "--tool-call" | "--reason" | "--until" | "--timeout" => true,
         "--window" | "--force-discard" | "--sub-agent" => true,
+        "--expected-parent-revision" => true,
         "--new" | "--archive" | "--retry-on-conflict" | "--force" | "--yes" | "--tree" => false,
         "--keep" | "--remove" | "--discard" => false,
         _ => return None,
@@ -976,11 +1016,12 @@ fn parse_session(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
 }
 
 /// The `project` sub-verbs: the project-scoped `archive` and `delete`, which
-/// require the id to name a project root, and `worktree cleanup`, which acts on
-/// one delegated task's checkout.
+/// require the id to name a project root, `worktrees` and `worktree`, which read
+/// and act on the checkouts the snapshot records, and `worktree cleanup`, which
+/// acts on one delegated task's checkout.
 fn parse_project(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
     let Some(sub_verb) = rest.first() else {
-        return Err("project requires 'archive', 'delete', or 'worktree'".to_owned());
+        return Err("project requires 'archive', 'delete', 'worktree', or 'worktrees'".to_owned());
     };
     flags.verb = format!("project {sub_verb}");
     match sub_verb.as_str() {
@@ -1004,24 +1045,57 @@ fn parse_project(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
                 yes,
             })
         }
+        "worktrees" => Ok(Verb::ProjectWorktrees {
+            session: one_session_id(flags, rest)?,
+        }),
         "worktree" => parse_project_worktree(flags, rest),
         other => Err(format!(
-            "unknown project sub-verb '{other}'; use archive, delete, or worktree"
+            "unknown project sub-verb '{other}'; use archive, delete, worktree, or worktrees"
         )),
     }
 }
 
-/// The `project worktree` sub-verbs, of which only `cleanup` is exposed.
+/// The `project worktree` sub-verbs: `get`, `diff`, `integrate`, and `cleanup`.
 fn parse_project_worktree(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
     let Some(sub_verb) = rest.get(1) else {
-        return Err("project worktree requires 'cleanup'".to_owned());
+        return Err(
+            "project worktree requires 'get', 'diff', 'integrate', or 'cleanup'".to_owned(),
+        );
     };
-    if sub_verb != "cleanup" {
-        return Err(format!(
-            "unknown project worktree sub-verb '{sub_verb}'; use cleanup"
-        ));
+    flags.verb = format!("project worktree {sub_verb}");
+    match sub_verb.as_str() {
+        "get" => {
+            let session = one_session_id(flags, rest)?;
+            Ok(Verb::ProjectWorktreeGet {
+                session,
+                task: parse_id("task id", &flags.required("--task")?)?,
+            })
+        }
+        "diff" => {
+            let session = one_session_id(flags, rest)?;
+            Ok(Verb::ProjectWorktreeDiff {
+                session,
+                task: parse_id("task id", &flags.required("--task")?)?,
+            })
+        }
+        "integrate" => {
+            let session = one_session_id(flags, rest)?;
+            let task = flags.required("--task")?;
+            Ok(Verb::ProjectWorktreeIntegrate {
+                session,
+                task: parse_id("task id", &task)?,
+                expected_parent_revision: flags.value("--expected-parent-revision"),
+            })
+        }
+        "cleanup" => parse_worktree_cleanup(flags, rest),
+        other => Err(format!(
+            "unknown project worktree sub-verb '{other}'; use get, diff, integrate, or cleanup"
+        )),
     }
-    flags.verb = "project worktree cleanup".to_owned();
+}
+
+/// `project worktree cleanup`: the explicit disposition of one checkout.
+fn parse_worktree_cleanup(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
     let session = one_session_id(flags, rest)?;
     let task = flags.required("--task")?;
     let keep = flags.flag("--keep");

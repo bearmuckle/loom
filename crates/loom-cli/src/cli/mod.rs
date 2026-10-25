@@ -31,6 +31,10 @@
 //! | `session delete` | `Project/GetProjectSnapshotForSession`, `Session/DeleteAgentSession` |
 //! | `project archive` | `Project/GetProjectSnapshotForSession`, `Session/ArchiveAgentSession` |
 //! | `project delete` | `Project/GetProjectSnapshotForSession`, `Session/DeleteAgentSession` |
+//! | `project worktrees` | `Project/GetProjectSnapshotForSession` |
+//! | `project worktree get` | `Project/GetProjectSnapshotForSession` |
+//! | `project worktree diff` | `Project/GetProjectSnapshotForSession`, `Project/GetProjectChildReview` |
+//! | `project worktree integrate` | `Project/GetProjectSnapshotForSession`, `Project/IntegrateProjectChild` |
 //! | `project worktree cleanup` | `Project/GetProjectSnapshotForSession`, `Project/CleanupProjectChildWorktree` |
 //!
 //! Every verb first sends `Control/Negotiate` with the version this build
@@ -69,6 +73,18 @@
 //! retains the checkout, `--remove` removes it and is refused while it holds
 //! changes, and `--discard` removes it with those changes and therefore also
 //! needs `--yes`. A checkout is never removed without one of those flags.
+//!
+//! Listing, inspection, review, integration, and cleanup are separate operations
+//! over the same worker-owned records. `project worktrees` lists the checkouts a
+//! project's snapshot holds, `project worktree get` reports one durable record
+//! without opening it, and `project worktree diff` asks the worker for its own
+//! bounded review of one checkout, so the client never re-bounds a diff it did
+//! not compute. `project worktree integrate` fast-forwards the parent with the
+//! task's result under the revision the checkout was created from (or
+//! `--expected-parent-revision`); the worker keeps its ancestor and conflict
+//! rules, and the client sends exactly one integration request, so a conflict is
+//! reported as the failure it is rather than retried. Every one of them resolves
+//! the project and the manager session from the snapshot by `--task`.
 //!
 //! `node` prints one line per field of `WorkerNodeStatus`, with absent health
 //! samples as `unknown`. `retention get` prints `window`, `force-discard`, and
