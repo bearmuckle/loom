@@ -1,14 +1,17 @@
 //! The project verbs: the hierarchy, delegated tasks, child sessions, message
-//! history, and child control.
+//! history, the direction to a child's run, and child control.
 //!
 //! Every read is addressed by the id of any project member session, so one
 //! verb works from the project root and from any child: the root session id is
 //! also the project id, and the worker resolves a child's id to its project.
-//! All of them are reads and negotiate no mutating capability.
+//! The reads negotiate no mutating capability; only `project send` mutates, and
+//! it keys its own mutation with `--request-id`.
 //!
-//! There is deliberately no message send verb: an agent-attributed message is
-//! reserved for the server-bound agent tool, and a person redirects a live
-//! child with `send --run`.
+//! There is deliberately no agent message verb: an agent-attributed message is
+//! reserved for the server-bound agent tool, so `Project/SendProjectAgentMessage`
+//! is refused for every client connection. `project send` therefore directs a
+//! delegated child's active run through `Collaboration/DirectAgent`, exactly as
+//! `send --run` does, and it stores no durable project message.
 //!
 //! `project child` sends the requester that the server-owned task record names
 //! as the manager, never an id from a flag, so a client cannot stand in for the
@@ -17,12 +20,13 @@
 use std::io::Write;
 
 use loom_core::{
-    AgentMessageKind, AgentSessionId, DelegatedTaskRecord, DelegatedTaskStatus, LoomError,
-    ProjectAgentRecord, ProjectSnapshot, RequestId, TaskId,
+    AgentMessageKind, AgentSessionId, DelegatedTaskRecord, DelegatedTaskStatus, ErrorCode,
+    LoomError, ProjectAgentRecord, ProjectSnapshot, RequestId, TaskId,
 };
 use loom_protocol::{
-    ActivityDetail, AgentSessionSnapshotProjection, ClientRequest, ProjectChildControlAction,
-    ProjectRequest, ProjectResponse, ServerResponse, SessionRequest, SessionResponse,
+    ActivityDetail, AgentSessionSnapshotProjection, ClientRequest, CollaborationRequest,
+    ProjectChildControlAction, ProjectRequest, ProjectResponse, ServerResponse, SessionRequest,
+    SessionResponse,
 };
 use serde_json::{Value, json};
 
@@ -30,6 +34,7 @@ use crate::cli::args::{DEFAULT_MAX_BYTES, Invocation, ProjectChildAction};
 use crate::cli::client::Client;
 use crate::cli::text::{bound, escape, run_state_name, session_state_name};
 
+use super::supervise::{act, finish_action};
 use super::{Caller, Failure, Outcome, emit, handshake};
 
 /// `project get`: the project's members and the project it was branched from.
@@ -267,6 +272,82 @@ pub(super) async fn messages<C: Client>(
         "next_after_project_sequence": next,
     });
     Ok(Outcome::new(data, caller.primary))
+}
+
+/// `project send`: a follow-up direction to a delegated child's active run.
+///
+/// This is deliberately not `Project/SendProjectAgentMessage`: the worker
+/// refuses that request for every client connection, because an
+/// agent-attributed message is reserved for the server-bound agent tool. A
+/// person directs a live child through `Collaboration/DirectAgent`, with the
+/// same rules as `send --run`: the run revision is read first, the direction
+/// is retried once after a conflict, and `--request-id` keys that mutation.
+pub(super) async fn send<C: Client>(
+    client: &mut C,
+    invocation: &Invocation,
+    session_id: AgentSessionId,
+    text: &str,
+    request_id: Option<RequestId>,
+    out: &mut dyn Write,
+) -> Result<Outcome, Failure> {
+    let mut caller = Caller::new(client);
+    handshake(&mut caller, &invocation.verb).await?;
+    // The task record is what makes the session a delegated child of this
+    // project, so a plain session id is a usage error instead of a direction.
+    let (_, project) = snapshot(&mut caller, session_id).await?;
+    let Some(task) = project
+        .tasks
+        .iter()
+        .find(|task| task.target_session_id == session_id)
+    else {
+        return Err(Failure::Usage(format!(
+            "'{session_id}' is not the target of a delegated task in project {}; use 'project \
+             children {}' to list the children",
+            project.project_id, project.root_session_id
+        )));
+    };
+    // The run to direct is the one the child's own session metadata reports, so
+    // the caller never supplies a run id of its own.
+    let (metadata_request, projection) = session_projection(&mut caller, session_id).await?;
+    let Some(active) = projection.active_run.as_ref() else {
+        return Err(Failure::Server {
+            request_id: metadata_request,
+            error: LoomError::new(
+                ErrorCode::InvalidState,
+                format!(
+                    "'{session_id}' has no active run to direct; resume it first with `project \
+                     child resume {} --session {session_id}`",
+                    task.task_id
+                ),
+                false,
+            ),
+        });
+    };
+    let run_id = active.run.id;
+    let outcome = act(
+        &mut caller,
+        run_id,
+        true,
+        request_id,
+        "direct the child agent",
+        |expected| {
+            ClientRequest::Collaboration(CollaborationRequest::DirectAgent {
+                run_id,
+                expected,
+                text: text.to_owned(),
+            })
+        },
+    )
+    .await?;
+    finish_action(
+        invocation,
+        "send",
+        None,
+        &outcome,
+        caller.primary,
+        caller.replayed(),
+        out,
+    )
 }
 
 /// `project child`: one control action on a delegated task.

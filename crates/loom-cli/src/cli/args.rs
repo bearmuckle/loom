@@ -107,6 +107,10 @@ Verbs:
   project messages <session-id> [--after <seq>] [--limit <n>]
                                     print a page of the project's agent
                                     messages; --limit is 1..512, default 100
+  project send <session-id> (--text <text> | --text-file <path>)
+               [--request-id <uuid>]
+                                    direct the active run of a delegated
+                                    child and print its state
   project child pause|resume|interrupt|cancel <task-id> --session <id>
                                     control one delegated child task
   project archive <session-id> [--request-id <uuid>]
@@ -163,11 +167,14 @@ text lines, so it refuses `--format verb`.
 
 `send`, `answer`, `approve`, and `deny` read the run revision, act against
 it, and retry once after a conflict, because their intent is idempotent.
+`project send` reads one `Project/GetProjectSnapshotForSession`, requires the
+session to be the target of a task in it, reads the session metadata for the
+child's active run, and then directs that run with the same rules as `send`.
 `stop` refuses a conflict unless --retry-on-conflict is given, so a stale
 revision cannot interrupt a run whose state the caller has not seen.
 
-`--request-id` on `run`, `send`, `answer`, `approve`, `deny`, `stop`,
-`delete`, `session archive`, `session delete`, `project archive`,
+`--request-id` on `run`, `send`, `project send`, `answer`, `approve`, `deny`,
+`stop`, `delete`, `session archive`, `session delete`, `project archive`,
 `project delete`, `project worktree integrate`, and `project worktree
 cleanup` is the idempotency key of that verb's own mutation: a request the
 worker has already answered under that id is answered from its durable cache
@@ -225,12 +232,22 @@ changes; only --discard, with --yes, throws them away.
 Every `project` read is addressed by the id of any project member session; a
 project root's session id is also its project id. All of them are reads and
 negotiate no mutating capability, so a read-only-scoped token can run them.
-Message history is read-only as well: there is no send verb, because an
-agent-attributed message is reserved for the server-bound agent tool and a
-person redirects a live child with `send --run`. `project child` names the task
-id the project snapshot reports and sends the server-owned task's requester as
-the manager, so no flag can supply one. An unknown session is `not_found`
-(exit 5), and so is a task id the project does not name.
+Message history is read-only as well: there is no agent message verb, because
+an agent-attributed message is reserved for the server-bound agent tool.
+`project send` is a direction to the addressed child's active run with exactly
+the rules of `send --run`, and it is not a durable project message: it reads
+the child's session metadata for the run, then sends
+`Collaboration/DirectAgent`. `project child` names the task id the project
+snapshot reports and sends the server-owned task's requester as the manager, so
+no flag can supply one. An unknown session is `not_found` (exit 5), and so is a
+task id the project does not name. A child whose session carries no active run
+is `invalid_state` (exit 5) and no direction is sent.
+
+`--request-id` keys the mutation of `project send` and not the reads before it:
+a repeated id is answered from the worker's durable cache instead of directing
+the child twice, and the `--json` envelope then reports `replayed: true`. The
+project snapshot read, the session metadata read, and the run revision read
+always keep fresh ids.
 
 Global flags, accepted anywhere as --flag value or --flag=value:
   --connect <url>             worker WebSocket URL (fallback LOOM_URL)
@@ -558,6 +575,14 @@ pub(crate) enum Verb {
         after: Option<u64>,
         limit: u32,
     },
+    /// `project send`: a direction to a delegated child's active run.
+    ProjectSend {
+        session: AgentSessionId,
+        text: String,
+        /// The direction's idempotency key, or `None` when the caller left it
+        /// open. The pre-reads before it are never keyed.
+        request_id: Option<RequestId>,
+    },
     /// `project child`: one control action on a delegated task.
     ProjectChild {
         session: AgentSessionId,
@@ -636,6 +661,7 @@ pub(crate) fn verb_name(verb: &Verb) -> &'static str {
         Verb::ProjectTasks { .. } => "project tasks",
         Verb::ProjectChildren { .. } => "project children",
         Verb::ProjectMessages { .. } => "project messages",
+        Verb::ProjectSend { .. } => "project send",
         Verb::ProjectChild { action, .. } => match action {
             ProjectChildAction::Pause => "project child pause",
             ProjectChildAction::Resume => "project child resume",
@@ -693,7 +719,7 @@ fn arity(name: &str) -> Option<bool> {
         | "--lines" | "--limit" => true,
         "--archived" | "--metadata" | "--follow" => false,
         "--task" | "--task-file" | "--name" | "--model" | "--repo" | "--revision" | "--path"
-        | "--as-directory" | "--approval-policy" | "--request-id" => true,
+        | "--as-directory" | "--approval-policy" | "--request-id" | "--text-file" => true,
         "--run" | "--text" | "--tool-call" | "--reason" | "--until" | "--timeout" => true,
         "--window" | "--force-discard" | "--sub-agent" => true,
         "--expected-parent-revision" => true,
@@ -1190,14 +1216,15 @@ fn parse_session(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
 }
 
 /// The `project` sub-verbs: the reads addressed by any project member session,
-/// the child control addressed by a task id the snapshot names, the
-/// project-scoped `archive` and `delete`, and the `worktrees`/`worktree` verbs
-/// that read and act on the checkouts the snapshot records.
+/// the direction to a delegated child's active run, the child control
+/// addressed by a task id the snapshot names, the project-scoped `archive` and
+/// `delete`, and the `worktrees`/`worktree` verbs that read and act on the
+/// checkouts the snapshot records.
 fn parse_project(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
     let Some(sub_verb) = rest.first() else {
         return Err(
-            "project requires 'get', 'tree', 'tasks', 'children', 'messages', 'child', \
-             'archive', 'delete', 'worktrees', or 'worktree'"
+            "project requires 'get', 'tree', 'tasks', 'children', 'messages', 'send', \
+             'child', 'archive', 'delete', 'worktrees', or 'worktree'"
                 .to_owned(),
         );
     };
@@ -1238,6 +1265,27 @@ fn parse_project(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
                 session,
                 after,
                 limit,
+            })
+        }
+        "send" => {
+            let request_id = parse_request_id(flags)?;
+            let session = one_session_id(flags, rest)?;
+            let text = match (flags.value("--text"), flags.value("--text-file")) {
+                (Some(_), Some(_)) => {
+                    return Err("project send accepts --text or --text-file, not both".to_owned());
+                }
+                (Some(text), None) => text,
+                (None, Some(path)) => read_input_file("text", &path)?,
+                (None, None) => {
+                    return Err(
+                        "project send requires --text <text> or --text-file <path>".to_owned()
+                    );
+                }
+            };
+            Ok(Verb::ProjectSend {
+                session,
+                text,
+                request_id,
             })
         }
         "child" => {
@@ -1300,7 +1348,7 @@ fn parse_project(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
         }),
         "worktree" => parse_project_worktree(flags, rest),
         other => Err(format!(
-            "unknown project sub-verb '{other}'; use get, tree, tasks, children, messages, \
+            "unknown project sub-verb '{other}'; use get, tree, tasks, children, messages, send, \
              child, archive, delete, worktrees, or worktree"
         )),
     }
@@ -1411,7 +1459,7 @@ fn parse_run(flags: &mut FlagSet) -> Result<RunArgs, String> {
             return Err("run accepts --task or --task-file, not both".to_owned());
         }
         (Some(task), None) => task,
-        (None, Some(path)) => read_task_file(&path)?,
+        (None, Some(path)) => read_input_file("task", &path)?,
         (None, None) => return Err("run requires --task <text> or --task-file <path>".to_owned()),
     };
     let name = match flags.value("--name") {
@@ -1485,14 +1533,16 @@ fn parse_run(flags: &mut FlagSet) -> Result<RunArgs, String> {
     })
 }
 
-/// Reads a task file as UTF-8, dropping one trailing line ending.
+/// Reads the task file or the direction text file as UTF-8, dropping one
+/// trailing line ending.
 ///
 /// Exactly one newline is removed, so a file that ends with `\n` and one that
-/// ends with `\r\n` produce the same task, and any further trailing whitespace
-/// the author wrote is kept as part of the task.
-fn read_task_file(path: &str) -> Result<String, String> {
+/// ends with `\r\n` produce the same text, and any further trailing whitespace
+/// the author wrote is kept as part of it. `what` names the flag the file came
+/// from, so the error names the flag the caller passed.
+fn read_input_file(what: &str, path: &str) -> Result<String, String> {
     let text = std::fs::read_to_string(path)
-        .map_err(|error| format!("could not read the task file '{path}': {error}"))?;
+        .map_err(|error| format!("could not read the {what} file '{path}': {error}"))?;
     Ok(match text.strip_suffix('\n') {
         Some(trimmed) => trimmed.strip_suffix('\r').unwrap_or(trimmed).to_owned(),
         None => text,
