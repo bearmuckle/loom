@@ -511,6 +511,7 @@ pub(crate) async fn run<C: Client>(
             session,
             task,
             expected_parent_revision,
+            request_id,
         } => {
             operator::worktree_integrate(
                 client,
@@ -518,6 +519,7 @@ pub(crate) async fn run<C: Client>(
                 *session,
                 *task,
                 expected_parent_revision.as_deref(),
+                *request_id,
                 out,
             )
             .await
