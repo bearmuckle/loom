@@ -185,12 +185,19 @@ pub(super) async fn retention_set<C: Client>(
 /// archive` refuses an id that is not such a root, so the project spelling can
 /// never quietly archive a single unrelated session. Archiving keeps every
 /// checkout, so the command reports the worktrees it retained.
+///
+/// `--request-id` keys the archive request alone: the snapshot pre-read always
+/// keeps a fresh id, because it is a lookup, and a repeated key is answered
+/// from the worker's durable cache instead of archiving a second time, which
+/// the `--json` envelope reports as `replayed`. Without the flag the archive
+/// uses a fresh id, so it is a new operation.
 pub(super) async fn archive<C: Client>(
     client: &mut C,
     invocation: &Invocation,
     session_id: AgentSessionId,
     require_project_root: bool,
     yes: bool,
+    request_id: Option<RequestId>,
     out: &mut dyn Write,
 ) -> Result<Outcome, Failure> {
     let mut caller = Caller::new(client);
@@ -214,9 +221,14 @@ pub(super) async fn archive<C: Client>(
         )));
     }
     let (request_id, response) = caller
-        .call(ClientRequest::Session(
-            SessionRequest::ArchiveAgentSession { session_id },
-        ))
+        .call_with_id(
+            // The caller's key, when it named one, is the archive's id: a
+            // repeated command is answered from the worker's cache with the
+            // same payload instead of archiving twice. The pre-read above keeps
+            // a fresh id.
+            request_id.unwrap_or_default(),
+            ClientRequest::Session(SessionRequest::ArchiveAgentSession { session_id }),
+        )
         .await?;
     match response {
         ServerResponse::Session(SessionResponse::AgentSessionArchived(session))
@@ -254,7 +266,7 @@ pub(super) async fn archive<C: Client>(
             .collect::<Vec<_>>(),
         "cascade": targets.len() > 1,
     });
-    Ok(Outcome::new(data, caller.primary))
+    Ok(Outcome::new(data, caller.primary).with_replayed(caller.replayed()))
 }
 
 /// `project worktree cleanup`: keep or remove the checkout recorded for one
@@ -266,12 +278,19 @@ pub(super) async fn archive<C: Client>(
 /// `--remove` refuses one that holds changes while `--discard` throws them
 /// away. The worker also refuses a task that is not terminal, and this command
 /// never retries that refusal.
+///
+/// `--request-id` keys the cleanup request alone: the snapshot pre-read always
+/// keeps a fresh id, and a repeated key is answered from the worker's durable
+/// cache instead of cleaning up a second time, which the `--json` envelope
+/// reports as `replayed`. Without the flag the cleanup uses a fresh id, so it
+/// is a new operation.
 pub(super) async fn worktree_cleanup<C: Client>(
     client: &mut C,
     invocation: &Invocation,
     session_id: AgentSessionId,
     task_id: TaskId,
     disposition: WorktreeDisposition,
+    request_id: Option<RequestId>,
     out: &mut dyn Write,
 ) -> Result<Outcome, Failure> {
     let mut caller = Caller::new(client);
@@ -279,14 +298,18 @@ pub(super) async fn worktree_cleanup<C: Client>(
     let project: ProjectSnapshot = load_project(&mut caller, session_id).await?;
     let worktree = worktree_record(&project, task_id)?;
     let (request_id, response) = caller
-        .call(ClientRequest::Project(
-            ProjectRequest::CleanupProjectChildWorktree {
+        .call_with_id(
+            // The caller's key, when it named one, is the cleanup's id, so a
+            // replay reports the same record and removes nothing twice. The
+            // pre-read above keeps a fresh id.
+            request_id.unwrap_or_default(),
+            ClientRequest::Project(ProjectRequest::CleanupProjectChildWorktree {
                 project_id: worktree.project_id,
                 manager_session_id: worktree.parent_session_id,
                 task_id,
                 disposition: cleanup_disposition(disposition),
-            },
-        ))
+            }),
+        )
         .await?;
     let updated = match response {
         ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(worktree)) => {
@@ -337,7 +360,7 @@ pub(super) async fn worktree_cleanup<C: Client>(
         "disposition": disposition.name(),
         "worktree": &updated,
     });
-    Ok(Outcome::new(data, caller.primary))
+    Ok(Outcome::new(data, caller.primary).with_replayed(caller.replayed()))
 }
 
 /// `project worktrees`: every checkout the project's snapshot records.
@@ -782,6 +805,9 @@ impl<'a> ArchiveScope<'a> {
 
 /// The project snapshot for one session, which every lifecycle verb reads
 /// before it mutates anything.
+///
+/// It is a read, so it always keeps a fresh id: `--request-id` keys the
+/// mutation the verb then sends, never this lookup.
 async fn load_project<C: Client>(
     caller: &mut Caller<'_, C>,
     session_id: AgentSessionId,
@@ -831,6 +857,7 @@ fn worktree_status_name(status: ProjectWorktreeStatus) -> &'static str {
 /// the worker, which is the authority on which sessions may be deleted.
 /// `project delete` additionally requires the id to name a project root, so a
 /// mistyped id is refused instead of quietly deleting one session.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn delete<C: Client>(
     client: &mut C,
     invocation: &Invocation,

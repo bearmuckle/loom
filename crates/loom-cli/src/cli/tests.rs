@@ -4006,7 +4006,10 @@ fn the_parser_accepts_a_request_id_on_every_mutating_verb() {
     let request_id = RequestId::new();
     let key = request_id.to_string();
 
-    // Every mutating verb takes the flag, with and without it present.
+    // Every mutating verb takes the flag, with and without it present. The
+    // operator lifecycle verbs key their own archive, deletion, or cleanup
+    // request the same way.
+    let task_text = TaskId::new().to_string();
     for arguments in [
         vec!["send", "--run", &run_text, "--text", "go"],
         vec!["answer", "--run", &run_text, "--text", "yes"],
@@ -4014,6 +4017,13 @@ fn the_parser_accepts_a_request_id_on_every_mutating_verb() {
         vec!["deny", "--run", &run_text, "--tool-call", &call],
         vec!["stop", "--run", &run_text],
         vec!["delete", &session],
+        vec!["session", "archive", &session],
+        vec!["session", "delete", &session],
+        vec!["project", "archive", &session],
+        vec!["project", "delete", &session],
+        vec![
+            "project", "worktree", "cleanup", &session, "--task", &task_text, "--remove",
+        ],
     ] {
         assert_eq!(
             verb_request_id(&invocation(&arguments).verb),
@@ -4029,11 +4039,22 @@ fn the_parser_accepts_a_request_id_on_every_mutating_verb() {
         );
     }
     let equals = format!("--request-id={key}");
-    assert_eq!(
-        verb_request_id(&invocation(&["send", "--run", &run_text, "--text", "go", &equals]).verb),
-        Some(request_id),
-        "the equals form reaches the same place"
-    );
+    for keyed in [
+        vec!["send", "--run", &run_text, "--text", "go", &equals],
+        vec!["session", "archive", &session, &equals],
+        vec!["session", "delete", &session, &equals],
+        vec!["project", "archive", &session, &equals],
+        vec!["project", "delete", &session, &equals],
+        vec![
+            "project", "worktree", "cleanup", &session, "--task", &task_text, "--keep", &equals,
+        ],
+    ] {
+        assert_eq!(
+            verb_request_id(&invocation(&keyed).verb),
+            Some(request_id),
+            "the equals form reaches the same place: {keyed:?}"
+        );
+    }
 
     // A verb whose mutation the flag does not key rejects it as a usage error.
     let mut offline = OfflineClient;
@@ -4110,7 +4131,12 @@ fn verb_request_id(verb: &Verb) -> Option<RequestId> {
         | Verb::Approve { request_id, .. }
         | Verb::Deny { request_id, .. }
         | Verb::Stop { request_id, .. }
-        | Verb::Delete { request_id, .. } => *request_id,
+        | Verb::Delete { request_id, .. }
+        | Verb::SessionArchive { request_id, .. }
+        | Verb::SessionDelete { request_id, .. }
+        | Verb::ProjectArchive { request_id, .. }
+        | Verb::ProjectDelete { request_id, .. }
+        | Verb::ProjectWorktreeCleanup { request_id, .. } => *request_id,
         _ => None,
     }
 }
@@ -5618,6 +5644,57 @@ fn session_archive_archives_one_session_and_keeps_its_worktrees() {
 }
 
 #[test]
+fn session_archive_replays_its_answer_under_the_same_key() {
+    let (fixture, directory) = persistent_fixture("archive-replay");
+    let session = fixture.session.id;
+    let session_text = session.to_string();
+    let mut client = InProcessClient::new(&fixture.backend);
+    let request_id = RequestId::new().to_string();
+    let arguments = [
+        "session",
+        "archive",
+        "--json",
+        &session_text,
+        "--request-id",
+        &request_id,
+    ];
+
+    let first = run(&mut client, &arguments);
+    assert_eq!(first.code, exit::OK, "{}", first.stderr);
+    let first_envelope = json_envelope(&first);
+    assert_eq!(first_envelope["verb"], "session archive");
+    assert_eq!(first_envelope["replayed"], false);
+    assert_eq!(first_envelope["data"]["session_id"], session_text.as_str());
+    assert_eq!(
+        session_snapshot(&fixture.control, session).state,
+        AgentSessionState::Archived
+    );
+
+    // Archiving is terminal, so the second answer can only come from the
+    // worker's cache, and it says so.
+    let replay = run(&mut client, &arguments);
+    assert_eq!(replay.code, exit::OK, "{}", replay.stderr);
+    let replay_envelope = json_envelope(&replay);
+    assert_eq!(replay_envelope["replayed"], true);
+    assert_eq!(replay_envelope["data"], first_envelope["data"]);
+
+    // The journal records the archive once, which is what the key promises: a
+    // repeated command is answered, not applied again.
+    let archives = journal(&fixture.control, session)
+        .iter()
+        .filter(|envelope| {
+            matches!(
+                envelope.event,
+                ServerEvent::AgentSessionArchived { session_id: archived } if archived == session
+            )
+        })
+        .count();
+    assert_eq!(archives, 1, "the session is archived exactly once");
+    drop(client);
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
 fn session_archive_requires_yes_before_a_project_cascade() {
     let (fixture, directory) = persistent_fixture("archive-yes");
     let session = fixture.session.id;
@@ -5784,6 +5861,51 @@ fn session_delete_is_the_same_operation_as_delete() {
         unknown_sub_verb.stderr
     );
     assert_eq!(json_envelope(&unknown_sub_verb)["verb"], "project");
+    drop(client);
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn session_delete_replays_its_answer_under_the_same_key() {
+    let (fixture, directory) = persistent_fixture("session-delete-replay");
+    let session = fixture.session.id;
+    archive_session(&fixture.control, session);
+    // A deleted session has no snapshot left to read, so the wrapper answers
+    // the pre-read for both invocations and the second one reaches the keyed
+    // deletion.
+    let mut client = with_project_snapshot(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        session,
+        fake_project(session, &[session], Vec::new()),
+    );
+    let session_text = session.to_string();
+    let request_id = RequestId::new().to_string();
+    let arguments = [
+        "session",
+        "delete",
+        "--json",
+        &session_text,
+        "--request-id",
+        &request_id,
+    ];
+
+    let first = run(&mut client, &arguments);
+    assert_eq!(first.code, exit::OK, "{}", first.stderr);
+    let first_envelope = json_envelope(&first);
+    assert_eq!(first_envelope["verb"], "session delete");
+    assert_eq!(first_envelope["replayed"], false);
+    let gone = run(&mut client, &["get", &session_text]);
+    assert_eq!(gone.code, exit::GONE, "{}", gone.stderr);
+
+    let replay = run(&mut client, &arguments);
+    assert_eq!(replay.code, exit::OK, "{}", replay.stderr);
+    let replay_envelope = json_envelope(&replay);
+    assert_eq!(
+        replay_envelope["replayed"], true,
+        "the answer is served from the worker's cache"
+    );
+    assert_eq!(replay_envelope["data"], first_envelope["data"]);
+
     drop(client);
     close_persistent_fixture(fixture, directory);
 }
@@ -6261,6 +6383,94 @@ fn fake_diff() -> GitDiff {
         }],
         truncated: false,
     }
+}
+
+#[test]
+fn project_worktree_cleanup_answers_a_repeated_key_the_same_way() {
+    let (fixture, directory) = persistent_fixture("worktree-cleanup-replay");
+    let session = fixture.session.id;
+    let task = TaskId::new();
+    let mut worktree = fake_worktree(session, AgentSessionId::new(), "wt-1", "repo");
+    worktree.task_id = task;
+    let project = fake_project(session, &[session], vec![worktree.clone()]);
+    let mut removed = worktree.clone();
+    removed.status = ProjectWorktreeStatus::Removed;
+    removed.cleanup_disposition = Some(ProjectWorktreeCleanupDisposition::RemoveClean);
+    // Every cleanup request the verb sent, by the id it was sent under.
+    let keys = Rc::new(RefCell::new(Vec::new()));
+    let recorded = Rc::clone(&keys);
+    let mut client = Wrapped::new(InProcessClient::new(&fixture.backend))
+        .before(move |envelope| {
+            if matches!(
+                envelope.request,
+                ClientRequest::Project(ProjectRequest::CleanupProjectChildWorktree { .. })
+            ) {
+                recorded.borrow_mut().push(envelope.request_id);
+            }
+        })
+        .after(move |request, response| match request {
+            ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession { session_id })
+                if *session_id == session =>
+            {
+                response.result = Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(
+                    project.clone(),
+                )));
+            }
+            ClientRequest::Project(ProjectRequest::CleanupProjectChildWorktree { .. }) => {
+                response.result = Ok(ServerResponse::Project(
+                    ProjectResponse::ProjectChildWorktreeUpdated(Box::new(removed.clone())),
+                ));
+            }
+            _ => {}
+        });
+    let session_text = session.to_string();
+    let task_text = task.to_string();
+    let request_id = RequestId::new().to_string();
+    let arguments = [
+        "project",
+        "worktree",
+        "cleanup",
+        "--json",
+        &session_text,
+        "--task",
+        &task_text,
+        "--remove",
+        "--request-id",
+        &request_id,
+    ];
+
+    let first = run(&mut client, &arguments);
+    assert_eq!(first.code, exit::OK, "{}", first.stderr);
+    let first_envelope = json_envelope(&first);
+    assert_eq!(first_envelope["verb"], "project worktree cleanup");
+    assert_eq!(first_envelope["data"]["worktree"]["status"], "removed");
+
+    // A repeated key sends the cleanup under the same id, so a worker that
+    // already answered it replays that answer instead of cleaning up twice.
+    // Both the project snapshot and the cleanup answer are the test's own here,
+    // because a git-backed project with a terminal delegated task is what only
+    // the server's project tests build; the archive and delete replay tests
+    // cover the worker's cache itself.
+    let replay = run(&mut client, &arguments);
+    assert_eq!(replay.code, exit::OK, "{}", replay.stderr);
+    let replay_envelope = json_envelope(&replay);
+    assert_eq!(
+        replay_envelope["data"], first_envelope["data"],
+        "the answer, including the worktree status, is the same"
+    );
+    assert_eq!(
+        replay_envelope["data"]["worktree"]["status"], first_envelope["data"]["worktree"]["status"],
+        "the reported status did not change with the repetition"
+    );
+    let key = request_id.parse::<RequestId>().unwrap();
+    assert_eq!(
+        *keys.borrow(),
+        vec![key, key],
+        "both cleanups carry the caller's key"
+    );
+
+    drop(client);
+    close_persistent_fixture(fixture, directory);
 }
 
 #[test]

@@ -47,16 +47,16 @@ The examples below use the installed binary name. In a checkout, replace
 | `result --session <id> [--task <id>]` | Branch, head, diffstat, changed paths, and task evidence. |
 | `retention get` | The worker-wide archive-retention policy, with a disabled window as `off`. |
 | `retention set [--window <duration>] [--force-discard <bool>] [--sub-agent <duration>]` | Merge the given fields into the stored worker-wide archive-retention policy. |
-| `delete <session-id> [--force] [--yes]` | Permanently delete an archived session, or a project root with its descendants; the same operation as `session delete`. |
-| `session archive <session-id> [--yes]` | Archive one session, and the live descendants of a project root that cascades; every checkout is kept. |
-| `session delete <session-id> [--force] [--yes]` | Permanently delete an archived session, or a project root with its descendants. |
-| `project archive <session-id>` | Archive a project root with its idle members; the id must name such a root. |
-| `project delete <session-id> [--force] [--yes]` | Delete a project root and its tree; the id must name such a root. |
+| `delete <session-id> [--force] [--yes] [--request-id <uuid>]` | Permanently delete an archived session, or a project root with its descendants; the same operation as `session delete`. |
+| `session archive <session-id> [--yes] [--request-id <uuid>]` | Archive one session, and the live descendants of a project root that cascades; every checkout is kept. |
+| `session delete <session-id> [--force] [--yes] [--request-id <uuid>]` | Permanently delete an archived session, or a project root with its descendants. |
+| `project archive <session-id> [--request-id <uuid>]` | Archive a project root with its idle members; the id must name such a root. |
+| `project delete <session-id> [--force] [--yes] [--request-id <uuid>]` | Delete a project root and its tree; the id must name such a root. |
 | `project worktrees <session-id>` | The checkouts the project's snapshot records, in snapshot order. |
 | `project worktree get <session-id> --task <task-id>` | The durable worktree record of one delegated task; the checkout is not opened. |
 | `project worktree diff <session-id> --task <task-id>` | The worker's bounded review of one checkout: status, diffstat, changed paths, and hunks. |
 | `project worktree integrate <session-id> --task <task-id> [--expected-parent-revision <rev>]` | Fast-forward the parent with the task's result revision; a conflict is reported, never retried. |
-| `project worktree cleanup <session-id> --task <task-id> (--keep \| --remove \| --discard) [--yes]` | Keep or remove the checkout recorded for one delegated task. |
+| `project worktree cleanup <session-id> --task <task-id> (--keep \| --remove \| --discard) [--yes] [--request-id <uuid>]` | Keep or remove the checkout recorded for one delegated task. |
 
 `node`, `whoami`, `ls`, `get`, `events`, `peek`, and `retention get` are
 read-only, issue no mutation, and work with a read-only-scoped token. So are
@@ -99,13 +99,16 @@ by default; `--max-bytes` changes that cap.
 `--json` prints one envelope per call:
 
 ```json
-{"ok":true,"verb":"whoami","request_id":"…","data":{…}}
+{"ok":true,"verb":"whoami","request_id":"…","replayed":false,"data":{…}}
 ```
 
-A failure uses the same envelope with `ok: false` and an `error` object carrying
-`code`, `message`, `retryable`, and `exit_code`. `events` adds
-`gap { after, before, missing }` to `data` when a snapshot could not carry every
-event after the cursor, and `null` otherwise.
+`replayed` is `true` when the worker answered this call's mutating request
+from its idempotency cache instead of acting again, which happens only when the
+caller repeats a `--request-id`; a repeated archive, deletion, or cleanup is
+recognised that way. A failure uses the same envelope with `ok: false` and an
+`error` object carrying `code`, `message`, `retryable`, and `exit_code`.
+`events` adds `gap { after, before, missing }` to `data` when a snapshot could
+not carry every event after the cursor, and `null` otherwise.
 
 `--json` with `--follow` keeps every followed event in that one envelope, so
 prefer `--format jsonl` for a long follow.
@@ -149,9 +152,10 @@ only changed when the flag is given, so a plain run never overwrites a policy a
 person set.
 
 `--request-id` is the idempotency key of the run start, so repeating the same
-command returns the same run instead of starting a second one. A worker accepts
-a run only in an idle session, so reusing a session that already ran reports
-`invalid_state` (exit `5`) and creates nothing.
+command returns the same run instead of starting a second one, and the `--json`
+envelope reports `replayed: true` when the answer came from that cache. A
+worker accepts a run only in an idle session, so reusing a session that already
+ran reports `invalid_state` (exit `5`) and creates nothing.
 
 ### `run --new`
 
@@ -328,6 +332,14 @@ Archiving keeps the record and its worktrees, so it is not a deletion and frees
 no checkout. This client exposes no restore verb; the protocol's
 `Session/RestoreAgentSession` is the only path back.
 
+`--request-id <uuid>` keys the archive request of `session archive` and
+`project archive`, so repeating the command with the same id is answered from
+the worker's durable cache instead of archiving twice, and the `--json`
+envelope then reports `replayed: true` with the same `data`. The
+`Project/GetProjectSnapshotForSession` read before it always keeps a fresh id,
+because it is a lookup and not the mutation. Without the flag the archive uses
+a fresh id, so it is a new operation.
+
 ### Deletion
 
 `session delete <session-id>` (and `delete`, its original name) permanently
@@ -353,6 +365,13 @@ cancels the live work of a project tree before removing it. Both spellings need
 the `delete_agent_session` capability, and a read-only-scoped token is refused
 with exit `3`.
 
+`--request-id <uuid>` keys the deletion of `session delete`, `project delete`,
+and `delete`. Repeating the command with the same id is answered from the
+worker's durable cache with the same `data` and `replayed: true`, even though
+the session is gone and cannot be deleted again. The snapshot read before it
+always keeps a fresh id, because it is a lookup and not the deletion. Without
+the flag the deletion uses a fresh id, so it is a new operation.
+
 ### Worktree cleanup
 
 `project worktree cleanup <session-id> --task <task-id> --keep|--remove|--discard`
@@ -374,6 +393,12 @@ or `worktree <name> <path> <status>` when the record ends in another state, and
 recorded worktree exits `2` after the read, and the worker refuses a task that is
 not terminal as `invalid_state` (exit `5`). The command needs the
 `cleanup_project_child_worktree` capability.
+
+`--request-id <uuid>` keys the cleanup request, so repeating the command with
+the same id is answered from the worker's durable cache with the same `data`
+and `replayed: true`, which means the checkout was cleaned up once. The
+snapshot read before it always keeps a fresh id. Without the flag the cleanup
+uses a fresh id, so it is a new operation.
 
 ### Worktree inspection and integration
 
@@ -539,4 +564,10 @@ loom-cli project worktree integrate <project-root-id> --task <task-id>
 loom-cli project archive <project-root-id>
 loom-cli project worktree cleanup <project-root-id> --task <task-id> --keep
 loom-cli project worktree cleanup <project-root-id> --task <task-id> --remove
+
+# Retry an archive or a cleanup safely by keying it, so a repeat is a replay.
+loom-cli session archive <session-id> \
+  --request-id 0199f0f4-0000-7000-8000-000000000002
+loom-cli project worktree cleanup <project-root-id> --task <task-id> \
+  --remove --request-id 0199f0f4-0000-7000-8000-000000000003
 ```

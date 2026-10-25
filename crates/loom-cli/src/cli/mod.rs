@@ -38,10 +38,12 @@
 //! | `project worktree cleanup` | `Project/GetProjectSnapshotForSession`, `Project/CleanupProjectChildWorktree` |
 //!
 //! The mutating requests of `run`, `send`, `answer`, `approve`, `deny`, `stop`,
-//! and `delete` are the ones `--request-id` keys. Everything else a verb sends,
-//! such as `Collaboration/GetRunRevision` and
-//! `Project/GetProjectSnapshotForSession`, is a read with a fresh id, and only
-//! the verb's own mutation carries the caller's key:
+//! `delete`, `session archive`, `session delete`, `project archive`,
+//! `project delete`, and `project worktree cleanup` are the ones `--request-id`
+//! keys. Everything else a verb sends, such as
+//! `Collaboration/GetRunRevision` and `Project/GetProjectSnapshotForSession`,
+//! is a read with a fresh id, and only the verb's own mutation carries the
+//! caller's key:
 //!
 //! | verb | keyed request | derived request |
 //! | --- | --- | --- |
@@ -50,7 +52,10 @@
 //! | `answer` | `Collaboration/AnswerAgentQuestion` | — |
 //! | `approve`, `deny` | `Collaboration/ControlRun` | — |
 //! | `stop` | `Collaboration/ControlRun` | `Session/ArchiveAgentSession` with `--archive` |
-//! | `delete` | `Session/DeleteAgentSession` | — |
+//! | `delete`, `session delete` | `Session/DeleteAgentSession` | — |
+//! | `session archive`, `project archive` | `Session/ArchiveAgentSession` | — |
+//! | `project delete` | `Session/DeleteAgentSession` | — |
+//! | `project worktree cleanup` | `Project/CleanupProjectChildWorktree` | — |
 //!
 //! Every verb first sends `Control/Negotiate` with the version this build
 //! speaks and with only the capabilities it uses, because a worker refuses an
@@ -234,8 +239,10 @@
 //! start instead, because that is the id its caller chose and the key a replay
 //! reuses. `replayed` is `true` only when the worker answered a mutating
 //! request of this invocation from its idempotency cache instead of acting
-//! again, which happens only when the caller repeated a `--request-id`; every
-//! other success reports `false`, and a failure envelope has no such field.
+//! again, which happens only when the caller repeated a `--request-id`; it is
+//! how a repeated archive, deletion, or cleanup reports that the mutation was
+//! applied once. Every other success reports `false`, and a failure envelope
+//! has no such field.
 //! `events` adds `gap` (`after`, `before`, `missing`) when a snapshot
 //! could not carry every event after the cursor, and `null` otherwise.
 //!
