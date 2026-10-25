@@ -29,6 +29,10 @@
 //! | `delete` | `Project/GetProjectSnapshotForSession`, `Session/DeleteAgentSession` |
 //! | `session archive` | `Project/GetProjectSnapshotForSession`, `Session/ArchiveAgentSession` |
 //! | `session delete` | `Project/GetProjectSnapshotForSession`, `Session/DeleteAgentSession` |
+//! | `project get`, `project tree`, `project tasks` | `Project/GetProjectSnapshotForSession` |
+//! | `project children` | `Project/GetProjectSnapshotForSession`, `Session/GetAgentSessionSnapshotMetadata` per direct child |
+//! | `project messages` | `Project/GetProjectSnapshotForSession`, `Project/ListProjectAgentMessages` |
+//! | `project child` | `Project/GetProjectSnapshotForSession`, `Project/ControlProjectChild` |
 //! | `project archive` | `Project/GetProjectSnapshotForSession`, `Session/ArchiveAgentSession` |
 //! | `project delete` | `Project/GetProjectSnapshotForSession`, `Session/DeleteAgentSession` |
 //! | `project worktrees` | `Project/GetProjectSnapshotForSession` |
@@ -62,10 +66,10 @@
 //! Every verb first sends `Control/Negotiate` with the version this build
 //! speaks and with only the capabilities it uses, because a worker refuses an
 //! unnegotiated connection. `node`, `whoami`, `ls`, `get`, `events`, `peek`,
-//! and `retention get` are the read-only verbs: they send nothing that mutates
-//! and negotiate only the capabilities their reads need, so a read-only-scoped
-//! token can run them. `retention set` and `delete` are operator-level
-//! mutations: a token without `configure_archive_retention` or
+//! `retention get`, and every `project` read are the read-only verbs: they send
+//! nothing that mutates and negotiate only the capabilities their reads need, so
+//! a read-only-scoped token can run them. `retention set` and `delete` are
+//! operator-level mutations: a token without `configure_archive_retention` or
 //! `delete_agent_session` is refused at negotiation with exit `3`.
 //!
 //! `session archive`, `session delete` (and its `delete` alias), `project
@@ -128,6 +132,42 @@
 //! sent. The worker remains the authority on which session states may be
 //! deleted: a non-archived session that is not a project root is refused with
 //! `invalid_state` (exit `5`) and nothing changes.
+//!
+//! # Projects and child agents
+//!
+//! The `project` verbs expose the project and child-agent lifecycle that the
+//! worker already stores, alongside the project-scoped `archive`, `delete`, and
+//! `worktree cleanup` described above. Every project read is addressed by the id
+//! of any project member session: a project root's session id is also its
+//! project id, and a child's id resolves to the project it belongs to, so the
+//! same command works from the root and from a child. `project get` and
+//! `project tree` report the members, `project tasks` the delegated tasks,
+//! `project children` the direct children of the addressed session, and
+//! `project messages` one page of the project's agent message history. Those
+//! reads negotiate `read_project`, `project children` also `read_agent_session`,
+//! and `project messages` also `read_project_agent_messages`, so a
+//! read-only-scoped token can run them.
+//!
+//! The project id every later request needs comes from
+//! `Project/GetProjectSnapshotForSession`, which is the authoritative projection
+//! of the hierarchy and its tasks. `project messages` pages
+//! `Project/ListProjectAgentMessages` with `--after` as
+//! `after_project_sequence` and `--limit` (1 to 512, 100 by default) as the page
+//! size, and prints a final `next <sequence>` line only when the worker sets
+//! `next_after_project_sequence`. Message history is read-only here: there is
+//! deliberately no send verb, because an agent-attributed message is reserved
+//! for the server-bound agent tool, and a person redirects a live child with
+//! `send --run`.
+//!
+//! `project child pause|resume|interrupt|cancel` maps the sub-verb onto
+//! `Project/ControlProjectChild` as `Pause`, `Continue`, `Interrupt`, and
+//! `Cancel`. The manager session id is never taken from a flag: the task is
+//! looked up in the snapshot, and its `requester_session_id` is sent as the
+//! manager, because only the server-owned task record says which run owns the
+//! child. A task id the project does not name is reported as `not_found` (exit
+//! `5`) from the snapshot, without a control request. A worker refusal keeps its
+//! own mapping: a denied capability is exit `3` and an invalid child state is
+//! exit `5`.
 //!
 //! `run` starts a run, and it is described here because its requests are the
 //! longest sequence the client sends:

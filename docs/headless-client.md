@@ -50,6 +50,12 @@ The examples below use the installed binary name. In a checkout, replace
 | `delete <session-id> [--force] [--yes] [--request-id <uuid>]` | Permanently delete an archived session, or a project root with its descendants; the same operation as `session delete`. |
 | `session archive <session-id> [--yes] [--request-id <uuid>]` | Archive one session, and the live descendants of a project root that cascades; every checkout is kept. |
 | `session delete <session-id> [--force] [--yes] [--request-id <uuid>]` | Permanently delete an archived session, or a project root with its descendants. |
+| `project get <session-id>` | One project's members, their depth and parent, and the project it was branched from. |
+| `project tree <session-id>` | The same hierarchy as an indented pre-order tree. |
+| `project tasks <session-id>` | The project's delegated tasks with status, owner, target, model, dependency blocks, and intent. |
+| `project children <session-id>` | The direct child agents with their task, run, pending approval, and pending question. |
+| `project messages <session-id> [--after <seq>] [--limit <n>]` | One page of the project's agent message history; `--limit` is 1 to 512 and 100 by default. |
+| `project child pause\|resume\|interrupt\|cancel <task-id> --session <id>` | Control one delegated child task. |
 | `project archive <session-id> [--request-id <uuid>]` | Archive a project root with its idle members; the id must name such a root. |
 | `project delete <session-id> [--force] [--yes] [--request-id <uuid>]` | Delete a project root and its tree; the id must name such a root. |
 | `project worktrees <session-id>` | The checkouts the project's snapshot records, in snapshot order. |
@@ -58,17 +64,14 @@ The examples below use the installed binary name. In a checkout, replace
 | `project worktree integrate <session-id> --task <task-id> [--expected-parent-revision <rev>] [--request-id <uuid>]` | Fast-forward the parent with the task's result revision; a conflict is reported, never retried. |
 | `project worktree cleanup <session-id> --task <task-id> (--keep \| --remove \| --discard) [--yes] [--request-id <uuid>]` | Keep or remove the checkout recorded for one delegated task. |
 
-`node`, `whoami`, `ls`, `get`, `events`, `peek`, and `retention get` are
-read-only, issue no mutation, and work with a read-only-scoped token. So are
-`project worktrees`, `project worktree get`, and `project worktree diff`, whose
-requests only read the snapshot and the worker's review. `run`
-starts a run; `send`, `answer`, `approve`, `deny`, and `stop` control one;
-`wait`, `status`, `liveness`, and `result` read one. `retention set`,
-`session archive`, `session delete` (and its `delete` alias), `project
-archive`, `project delete`, `project worktree integrate`, and `project worktree
-cleanup` are operator-level
-mutations. No verb waits for a run except `wait`, which is always bounded by
-`--timeout`.
+`node`, `whoami`, `ls`, `get`, `events`, `peek`, `retention get`, and every
+`project` read are read-only, issue no mutation, and work with a read-only-scoped
+token. `run` starts a run; `send`, `answer`, `approve`, `deny`, and `stop`
+control one; `wait`, `status`, `liveness`, and `result` read one.
+`retention set`, `session archive`, `session delete` (and its `delete` alias),
+`project archive`, `project delete`, `project worktree integrate`, and
+`project worktree cleanup` are operator-level mutations. No verb waits for a run
+except `wait`, which is always bounded by `--timeout`.
 
 Every verb negotiates only the capabilities its own requests need. `doctor`
 reports the intersection the worker granted, so its capability list is the
@@ -269,6 +272,67 @@ state is `dead` (exit `0`), an id the worker does not know is `gone` (exit
 added, removed), and changed paths, plus the evidence links of `--task` when it
 is given. A session with no repository and no evidence prints
 `nothing to report` and sets `empty` in the `--json` envelope.
+
+## Projects and child agents
+
+Every `project` verb is addressed by the id of any project member session: a
+project root's session id is also its project id, and the worker resolves a
+child's id to the project it belongs to. The same command therefore works from
+the root and from a child.
+
+The reads send `Project/GetProjectSnapshotForSession`, which is the worker's
+authoritative projection of the hierarchy and its tasks, and they negotiate
+`read_project`; `project children` also sends
+`Session/GetAgentSessionSnapshotMetadata` per direct child and negotiates
+`read_agent_session`, and `project messages` also pages
+`Project/ListProjectAgentMessages` under `read_project_agent_messages`.
+
+The text output is byte-stable, one line per record. The task intent, the child
+task summary, the child pending question, and the message bodies are bounded by
+the same 4096-byte budget before they are escaped, so an over-budget value keeps
+its first and last halves around an exact `[... N bytes omitted ...]` marker:
+
+```
+project <project-id> root <root-session-id> parent <parent-project-id|->
+agent <session-id> <state> depth <n> parent <parent-session-id|->
+<indent><session-id> <state> <task-summary|->
+task <task-id> <status> owner <session-id> target <session-id> model <id> code <true|false> blocked-by <dep,dep|-> intent <text>
+child <session-id> task <task-id|-> <status|-> session <state> run <run-id|-> <state|-> approval <tool-call-id|-> question <text|->
+message <project-sequence> <kind> from <session-id> to <session-id> task <task-id|-> <body>
+next <project-sequence>
+```
+
+`get` prints the header and one `agent` line per member in snapshot order.
+`tree` prints the same header and walks from the root following
+`parent_session_id`, indenting two spaces per depth below the root, with
+siblings in snapshot order; a walk that would miss a member falls back to
+snapshot order so every member is printed once. `tasks` reports
+`blocked-by` as the dependencies that are still unfinished or absent from the
+snapshot. `children` lists only the addressed session's direct children.
+`messages` prints the returned page in server order and adds `next` only when
+the worker set `next_after_project_sequence`.
+
+Under `--json`, `project get` and `project tree` carry the `ProjectSnapshot`
+itself, `project tasks` carries `{"project_id", "tasks"}`, `project children`
+carries `{"project_id", "children": [{"agent", "task", "run"}], "count"}`
+with `task` and `run` null when absent, `project messages` carries
+`{"project_id", "session_id", "messages", "next_after_project_sequence"}`, and
+`project child` carries `{"action", "task", "run"}`.
+
+`project child` maps the sub-verb onto `Project/ControlProjectChild`: `pause` is
+`Pause`, `resume` is `Continue`, `interrupt` is `Interrupt`, and `cancel` is
+`Cancel`. The manager session id is never taken from a flag: the command reads
+the project snapshot and sends the `requester_session_id` of the task it names,
+because only the server-owned task record says which manager run owns the
+child. A task id that no task in that project names is reported as `not_found`
+(exit `5`) from the snapshot, without a control request; an unknown session is
+also `not_found` (exit `5`), a denied capability is exit `3`, and a worker's
+`invalid_state` refusal is exit `5`.
+
+Message history is read-only here, and there is deliberately no send verb: an
+agent-attributed message is reserved for the server-bound agent tool, so a
+client cannot write one on an agent's behalf. To redirect a live child, a person
+sends the direction to that child's run with `send --run`.
 
 ## Worker status and retention
 

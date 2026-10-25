@@ -15,6 +15,7 @@
 
 mod events;
 mod operator;
+mod project;
 mod query;
 mod run;
 mod supervise;
@@ -274,6 +275,23 @@ pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
         }
         Verb::ProjectWorktreeIntegrate { .. } => {
             capabilities.extend([Capability::ReadProject, Capability::IntegrateProjectChild]);
+        }
+        Verb::ProjectGet { .. } | Verb::ProjectTree { .. } | Verb::ProjectTasks { .. } => {
+            capabilities.push(Capability::ReadProject);
+        }
+        Verb::ProjectChildren { .. } => {
+            capabilities.extend([Capability::ReadProject, Capability::ReadAgentSession]);
+        }
+        Verb::ProjectMessages { .. } => {
+            capabilities.extend([
+                Capability::ReadProject,
+                Capability::ReadProjectAgentMessages,
+            ]);
+        }
+        // The manager session id of the control comes from the project
+        // snapshot, so the ability to read that snapshot is part of the verb.
+        Verb::ProjectChild { .. } => {
+            capabilities.extend([Capability::ReadProject, Capability::ControlProjectChild]);
         }
     }
     CapabilitySet::new(capabilities)
@@ -559,6 +577,22 @@ pub(crate) async fn run<C: Client>(
             )
             .await
         }
+        Verb::ProjectGet { session } => project::get(client, invocation, *session, out).await,
+        Verb::ProjectTree { session } => project::tree(client, invocation, *session, out).await,
+        Verb::ProjectTasks { session } => project::tasks(client, invocation, *session, out).await,
+        Verb::ProjectChildren { session } => {
+            project::children(client, invocation, *session, out).await
+        }
+        Verb::ProjectMessages {
+            session,
+            after,
+            limit,
+        } => project::messages(client, invocation, *session, *after, *limit, out).await,
+        Verb::ProjectChild {
+            session,
+            task,
+            action,
+        } => project::child(client, invocation, *session, *task, *action, out).await,
     }
 }
 

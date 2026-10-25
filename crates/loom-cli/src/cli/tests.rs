@@ -15,27 +15,30 @@ use std::{
 };
 
 use loom_core::{
-    AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, Author, Capability,
-    CapabilitySet, CollaborationEntryKind, DelegatedTaskRecord, DelegatedTaskStatus, EventSequence,
-    GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus, GitFileStatusKind,
-    GitRepositoryStatus, ProjectAgentPermissions, ProjectAgentRecord, ProjectId, ProjectSnapshot,
+    AgentMessageId, AgentMessageKind, AgentMessageRecord, AgentSessionId, AgentSessionSnapshot,
+    AgentSessionState, ApprovalPolicy, Author, Capability, CapabilitySet, CollaborationEntryKind,
+    DelegatedTaskRecord, DelegatedTaskStatus, EventSequence, GitDiff, GitDiffHunk, GitDiffLine,
+    GitDiffLineKind, GitFileStatus, GitFileStatusKind, GitRepositoryStatus,
+    ProjectAgentPermissions, ProjectAgentRecord, ProjectId, ProjectSnapshot,
     ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord, ProjectWorktreeStatus,
-    ProtocolVersion, RepositoryId, RequestId, RunId, RunRevision, TaskId, Timestamp, ToolCallId,
-    WorkspaceId,
+    ProtocolVersion, RepositoryId, RequestId, RunAttemptId, RunId, RunRevision, TaskId, Timestamp,
+    ToolCallId, WorkspaceId,
 };
-use loom_model::ModelId;
+use loom_model::{ModelId, ToolCall};
 use loom_protocol::{
-    ActivityDetail, AgentEvent, AgentRunSnapshot, AgentRunState, AgentSessionSnapshotProjection,
-    CURRENT_PROTOCOL_VERSION, ClientRequest, CollaborationRequest, CollaborationResponse,
-    ControlRequest, ControlResponse, EventsRequest, EventsResponse, FilesystemRequest,
-    FilesystemResponse, ProjectRequest, ProjectResponse, RepositoryRequest, RepositoryResponse,
-    RequestEnvelope, ResponseEnvelope, RunRequest, RunResponse, ServerEvent, ServerEventEnvelope,
-    ServerResponse, SessionDirectory, SessionRepository, SessionRequest, SessionResponse,
-    WorkspaceRequest, WorkspaceResponse,
+    ActivityDetail, AgentEvent, AgentRunSnapshot, AgentRunSnapshotProjection, AgentRunState,
+    AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION, ClientRequest, CollaborationRequest,
+    CollaborationResponse, ControlRequest, ControlResponse, EventsRequest, EventsResponse,
+    FilesystemRequest, FilesystemResponse, ProjectChildControlAction, ProjectRequest,
+    ProjectResponse, RepositoryRequest, RepositoryResponse, RequestEnvelope, ResponseEnvelope,
+    RunRequest, RunResponse, ServerEvent, ServerEventEnvelope, ServerResponse, SessionDirectory,
+    SessionRepository, SessionRequest, SessionResponse, WorkspaceRequest, WorkspaceResponse,
 };
 use loom_server::{InProcessBackend, InProcessConnection};
 
-use crate::cli::args::{self, ApprovalPreset, Format, Parsed, Verb, WorktreeDisposition};
+use crate::cli::args::{
+    self, ApprovalPreset, Format, Parsed, ProjectChildAction, Verb, WorktreeDisposition,
+};
 use crate::cli::client::Client;
 use crate::cli::client::testing::{InProcessClient, Wrapped};
 use crate::cli::exit;
@@ -1247,6 +1250,42 @@ fn each_verb_negotiates_only_the_capabilities_its_requests_need() {
                 Capability::JsonProtocol,
                 Capability::ReadProject,
                 Capability::IntegrateProjectChild,
+            ],
+        ),
+        (
+            vec!["project", "get", &session],
+            vec![Capability::JsonProtocol, Capability::ReadProject],
+        ),
+        (
+            vec!["project", "tree", &session],
+            vec![Capability::JsonProtocol, Capability::ReadProject],
+        ),
+        (
+            vec!["project", "tasks", &session],
+            vec![Capability::JsonProtocol, Capability::ReadProject],
+        ),
+        (
+            vec!["project", "children", &session],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadProject,
+                Capability::ReadAgentSession,
+            ],
+        ),
+        (
+            vec!["project", "messages", &session],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadProject,
+                Capability::ReadProjectAgentMessages,
+            ],
+        ),
+        (
+            vec!["project", "child", "pause", &task, "--session", &session],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadProject,
+                Capability::ControlProjectChild,
             ],
         ),
         (
@@ -5459,13 +5498,14 @@ fn the_parser_covers_the_lifecycle_verbs() {
     assert!(
         parse_error(&["project", "delete", &session, "--force"]).contains("pass --yes to confirm")
     );
-    assert!(
-        parse_error(&["project"])
-            .contains("requires 'archive', 'delete', 'worktree', or 'worktrees'")
-    );
-    assert!(
-        parse_error(&["project", "nope"]).contains("use archive, delete, worktree, or worktrees")
-    );
+    assert!(parse_error(&["project"]).contains(
+        "requires 'get', 'tree', 'tasks', 'children', 'messages', 'child', 'archive', \
+             'delete', 'worktrees', or 'worktree'"
+    ));
+    assert!(parse_error(&["project", "nope"]).contains(
+        "use get, tree, tasks, children, messages, child, archive, delete, worktrees, \
+                 or worktree"
+    ));
     assert!(
         parse_error(&["project", "worktree"])
             .contains("requires 'get', 'diff', 'integrate', or 'cleanup'")
@@ -7246,4 +7286,1046 @@ fn project_worktree_integrate_answers_a_repeated_key_the_same_way() {
 
     drop(client);
     close_persistent_fixture(fixture, directory);
+}
+// 10. The project verbs: the hierarchy, tasks, children, messages, and child
+// control.
+
+/// The moment every synthetic record is stamped with, so a projection built
+/// from them is stable across runs.
+fn synthetic_time() -> Timestamp {
+    Timestamp::from_unix_millis(1_760_000_000_000)
+}
+
+/// The project a `project` verb test drives: a root, two direct children, a
+/// completed task, a blocked task whose second dependency the snapshot does not
+/// carry, one child parked on an approval, one parked on a question, and two
+/// ordered messages.
+///
+/// `create_project_child` is `pub(crate)` in `loom-server`, so a hierarchy is
+/// only ever produced here by rewriting the answers of the project and session
+/// reads with [`Wrapped`].
+struct SyntheticProject {
+    snapshot: ProjectSnapshot,
+    root: AgentSessionId,
+    first: AgentSessionId,
+    second: AgentSessionId,
+    completed: TaskId,
+    blocked: TaskId,
+    missing: TaskId,
+    approval: ToolCallId,
+    question: String,
+    first_run: RunId,
+    second_run: RunId,
+    controlled_run: RunId,
+    messages: Vec<AgentMessageRecord>,
+    next: Option<u64>,
+}
+
+impl SyntheticProject {
+    /// The session ids the synthetic snapshot carries.
+    fn members(&self) -> Vec<AgentSessionId> {
+        self.snapshot
+            .agents
+            .iter()
+            .map(|agent| agent.session_id)
+            .collect()
+    }
+
+    /// The session metadata projection of one member: the two seeded children
+    /// are parked on a blocking state, and every other member is idle.
+    fn projection(&self, session_id: AgentSessionId) -> AgentSessionSnapshotProjection {
+        let (state, blocking) = if session_id == self.first {
+            (
+                AgentSessionState::AwaitingApproval,
+                AgentRunState::AwaitingApproval,
+            )
+        } else if session_id == self.second {
+            (AgentSessionState::NeedsInput, AgentRunState::NeedsInput)
+        } else {
+            return AgentSessionSnapshotProjection {
+                session: self.session(session_id, AgentSessionState::Idle),
+                active_run: None,
+                latest_sequence: EventSequence::default(),
+                approval_policy: ApprovalPolicy::default(),
+                auto_approve_actions: true,
+            };
+        };
+        let run_id = if session_id == self.first {
+            self.first_run
+        } else {
+            self.second_run
+        };
+        let pending_approval = (session_id == self.first).then(|| ToolCall {
+            id: self.approval,
+            name: "fs.write".to_owned(),
+            arguments: serde_json::json!({ "path": "src/lib.rs" }),
+        });
+        let pending_input = (session_id == self.second).then(|| self.question.clone());
+        AgentSessionSnapshotProjection {
+            session: self.session(session_id, state),
+            active_run: Some(AgentRunSnapshotProjection {
+                run: self.run(session_id, run_id, blocking),
+                plan: Vec::new(),
+                plan_progress: Default::default(),
+                messages: Vec::new(),
+                pending_approval,
+                pending_input,
+                usage: Default::default(),
+                activities: Vec::new(),
+                message_timeline_ordinals: Vec::new(),
+            }),
+            latest_sequence: EventSequence::default(),
+            approval_policy: ApprovalPolicy::default(),
+            auto_approve_actions: true,
+        }
+    }
+
+    fn session(
+        &self,
+        session_id: AgentSessionId,
+        state: AgentSessionState,
+    ) -> AgentSessionSnapshot {
+        AgentSessionSnapshot {
+            id: session_id,
+            workspace_id: WorkspaceId::new(),
+            name: format!("child {session_id}"),
+            goal: None,
+            state,
+            created_at: synthetic_time(),
+            updated_at: synthetic_time(),
+            title_source: Default::default(),
+        }
+    }
+
+    fn run(
+        &self,
+        session_id: AgentSessionId,
+        run_id: RunId,
+        state: AgentRunState,
+    ) -> AgentRunSnapshot {
+        AgentRunSnapshot {
+            id: run_id,
+            attempt_id: RunAttemptId::new(),
+            control_revision: 0,
+            session_id,
+            task: "delegate the work".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            state,
+            started_at: synthetic_time(),
+            updated_at: synthetic_time(),
+            completed_at: None,
+            summary: None,
+            evidence: Vec::new(),
+            approval_policy: None,
+        }
+    }
+
+    /// The task a successful control answers with: the blocked task, now
+    /// running, with a paused run.
+    fn controlled_task(&self) -> DelegatedTaskRecord {
+        let mut task = self.snapshot.tasks[1].clone();
+        task.status = DelegatedTaskStatus::Running;
+        task
+    }
+
+    fn controlled_run_snapshot(&self) -> AgentRunSnapshot {
+        self.run(self.second, self.controlled_run, AgentRunState::Paused)
+    }
+}
+
+fn synthetic_project() -> SyntheticProject {
+    let root = AgentSessionId::new();
+    let first = AgentSessionId::new();
+    let second = AgentSessionId::new();
+    let project_id = ProjectId::from_uuid(*root.as_uuid());
+    let completed = TaskId::new();
+    let blocked = TaskId::new();
+    let missing = TaskId::new();
+    let approval = ToolCallId::new();
+    let first_run = RunId::new();
+    let second_run = RunId::new();
+    let controlled_run = RunId::new();
+    let question = "which migration should land first?".to_owned();
+    let timestamp = synthetic_time();
+    let agent = |session_id, parent_session_id, depth, state, task_summary: Option<&str>| {
+        ProjectAgentRecord {
+            session_id,
+            project_id,
+            parent_session_id,
+            depth,
+            state,
+            task_summary: task_summary.map(str::to_owned),
+            output_cursor: EventSequence::default(),
+            updated_at: timestamp,
+        }
+    };
+    let task = |task_id, target_session_id, intent: &str, dependencies: Vec<TaskId>, status| {
+        DelegatedTaskRecord {
+            task_id,
+            project_id,
+            requester_session_id: root,
+            target_session_id,
+            child_name: "child".to_owned(),
+            intent: intent.to_owned(),
+            model_id: "deterministic/demo".to_owned(),
+            context_references: Vec::new(),
+            dependencies,
+            code_change: false,
+            permissions: ProjectAgentPermissions::default(),
+            status,
+            created_at: timestamp,
+            updated_at: timestamp,
+        }
+    };
+    let message =
+        |project_sequence, task_id, sender_session_id, target_session_id, kind, body: &str| {
+            AgentMessageRecord {
+                message_id: AgentMessageId::new(),
+                project_id,
+                task_id,
+                sender_session_id,
+                target_session_id,
+                kind,
+                project_sequence,
+                accepted_at: timestamp,
+                body: body.to_owned(),
+            }
+        };
+    SyntheticProject {
+        snapshot: ProjectSnapshot {
+            project_id,
+            root_session_id: root,
+            parent_project_id: None,
+            agents: vec![
+                agent(root, None, 1, AgentSessionState::Executing, None),
+                agent(
+                    first,
+                    Some(root),
+                    2,
+                    AgentSessionState::AwaitingApproval,
+                    Some("review the schema"),
+                ),
+                agent(second, Some(root), 2, AgentSessionState::NeedsInput, None),
+            ],
+            tasks: vec![
+                task(
+                    completed,
+                    first,
+                    "review the schema",
+                    Vec::new(),
+                    DelegatedTaskStatus::Completed,
+                ),
+                task(
+                    blocked,
+                    second,
+                    "land the migration",
+                    vec![completed, missing],
+                    DelegatedTaskStatus::Blocked,
+                ),
+            ],
+            worktrees: Vec::new(),
+        },
+        root,
+        first,
+        second,
+        completed,
+        blocked,
+        missing,
+        approval,
+        question,
+        first_run,
+        second_run,
+        controlled_run,
+        messages: vec![
+            message(
+                3,
+                Some(completed),
+                root,
+                first,
+                AgentMessageKind::Direction,
+                "review the schema",
+            ),
+            message(
+                4,
+                None,
+                first,
+                root,
+                AgentMessageKind::Result,
+                "the schema is consistent\nand ready",
+            ),
+        ],
+        next: None,
+    }
+}
+
+/// A project root with one direct child that has no task record and no run,
+/// which the text projection prints as `-`.
+fn sparse_project() -> (SyntheticProject, AgentSessionId) {
+    let mut project = synthetic_project();
+    let child = AgentSessionId::new();
+    project.snapshot.agents.truncate(1);
+    project.snapshot.agents.push(ProjectAgentRecord {
+        session_id: child,
+        project_id: project.snapshot.project_id,
+        parent_session_id: Some(project.root),
+        depth: 2,
+        state: AgentSessionState::Idle,
+        task_summary: None,
+        output_cursor: EventSequence::default(),
+        updated_at: synthetic_time(),
+    });
+    project.snapshot.tasks.clear();
+    project.snapshot.worktrees.clear();
+    project.messages.clear();
+    (project, child)
+}
+
+/// Answers every project read and child metadata read from the synthetic
+/// project, so the verbs run against an authoritative snapshot that no
+/// in-process worker can create.
+fn with_synthetic_project(
+    client: Wrapped<InProcessClient>,
+    project: SyntheticProject,
+) -> Wrapped<InProcessClient> {
+    client.after(move |request, response| match request {
+        ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession { session_id })
+            if project.members().contains(session_id) =>
+        {
+            response.result = Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(
+                project.snapshot.clone(),
+            )));
+        }
+        ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata {
+            session_id,
+            ..
+        }) if project.members().contains(session_id) => {
+            response.result = Ok(ServerResponse::Session(
+                SessionResponse::AgentSessionSnapshot(Box::new(project.projection(*session_id))),
+            ));
+        }
+        ClientRequest::Project(ProjectRequest::ListProjectAgentMessages { .. }) => {
+            response.result = Ok(ServerResponse::Project(
+                ProjectResponse::ProjectAgentMessages {
+                    messages: project.messages.clone(),
+                    next_after_project_sequence: project.next,
+                },
+            ));
+        }
+        ClientRequest::Project(ProjectRequest::ControlProjectChild { .. }) => {
+            response.result = Ok(ServerResponse::Project(
+                ProjectResponse::ProjectChildControlled {
+                    task: Box::new(project.controlled_task()),
+                    run: Some(Box::new(project.controlled_run_snapshot())),
+                },
+            ));
+        }
+        _ => {}
+    })
+}
+
+#[test]
+fn project_get_and_tree_print_the_hierarchy() {
+    let fixture = fixture();
+    let project = synthetic_project();
+    let (root, first, second) = (project.root, project.first, project.second);
+    let project_id = project.snapshot.project_id;
+    let mut client = with_synthetic_project(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        project,
+    );
+    let root_text = root.to_string();
+
+    let get = run(&mut client, &["project", "get", &root_text]);
+    assert_eq!(get.code, exit::OK, "{}", get.stderr);
+    assert_eq!(
+        get.stdout,
+        format!(
+            "project {project_id} root {root} parent -\n\
+             agent {root} executing depth 1 parent -\n\
+             agent {first} awaiting_approval depth 2 parent {root}\n\
+             agent {second} needs_input depth 2 parent {root}\n"
+        )
+    );
+
+    // Every member id addresses the same project.
+    let from_child = run(&mut client, &["project", "get", &first.to_string()]);
+    assert_eq!(from_child.stdout, get.stdout);
+
+    let tree = run(&mut client, &["project", "tree", &root_text]);
+    assert_eq!(tree.code, exit::OK, "{}", tree.stderr);
+    assert_eq!(
+        tree.stdout,
+        format!(
+            "project {project_id} root {root} parent -\n{root} executing -\n  {first} awaiting_approval review the schema\n  {second} needs_input -\n"
+        )
+    );
+
+    // Both reads report the snapshot itself under `--json`.
+    let as_json = run(&mut client, &["project", "get", &root_text, "--json"]);
+    let envelope = json_envelope(&as_json);
+    assert_eq!(envelope["verb"], "project get");
+    assert_eq!(envelope["data"]["project_id"], project_id.to_string());
+    assert_eq!(envelope["data"]["root_session_id"], root.to_string());
+    assert_eq!(
+        envelope["data"]["parent_project_id"],
+        serde_json::Value::Null
+    );
+    let agents = envelope["data"]["agents"].as_array().expect("agents");
+    assert_eq!(agents.len(), 3);
+    assert_eq!(agents[1]["session_id"], first.to_string());
+    assert_eq!(agents[1]["depth"], 2);
+
+    let tree_json = run(&mut client, &["project", "tree", &root_text, "--json"]);
+    let tree_envelope = json_envelope(&tree_json);
+    assert_eq!(tree_envelope["verb"], "project tree");
+    assert_eq!(tree_envelope["data"], envelope["data"]);
+}
+
+#[test]
+fn project_tree_walks_from_the_root_in_sibling_order() {
+    let fixture = fixture();
+    let mut project = synthetic_project();
+    // The snapshot order is deliberately not the hierarchy order, so a tree that
+    // simply echoed the snapshot would print the child before its parent.
+    project.snapshot.agents.swap(0, 1);
+    let (root, first, second) = (project.root, project.first, project.second);
+    let project_id = project.snapshot.project_id;
+    let mut client = with_synthetic_project(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        project,
+    );
+    let root_text = root.to_string();
+
+    let tree = run(&mut client, &["project", "tree", &root_text]);
+    assert_eq!(
+        tree.stdout,
+        format!(
+            "project {project_id} root {root} parent -\n{root} executing -\n  {first} awaiting_approval review the schema\n  {second} needs_input -\n"
+        )
+    );
+
+    // `get` still prints the snapshot order it was given.
+    let get = run(&mut client, &["project", "get", &root_text]);
+    let first_line = format!("agent {first} awaiting_approval depth 2 parent {root}");
+    assert_eq!(get.stdout.lines().nth(1), Some(first_line.as_str()));
+}
+
+#[test]
+fn project_tree_falls_back_to_snapshot_order_for_an_orphan() {
+    let fixture = fixture();
+    let mut project = synthetic_project();
+    // A member whose parent is not in the snapshot cannot be reached by the
+    // walk, so every member is printed in snapshot order instead.
+    let orphan = AgentSessionId::new();
+    project.snapshot.agents.push(ProjectAgentRecord {
+        session_id: orphan,
+        project_id: project.snapshot.project_id,
+        parent_session_id: Some(AgentSessionId::new()),
+        depth: 3,
+        state: AgentSessionState::Idle,
+        task_summary: Some("stranded".to_owned()),
+        output_cursor: EventSequence::default(),
+        updated_at: synthetic_time(),
+    });
+    let (root, first, second) = (project.root, project.first, project.second);
+    let project_id = project.snapshot.project_id;
+    let mut client = with_synthetic_project(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        project,
+    );
+
+    let tree = run(&mut client, &["project", "tree", &root.to_string()]);
+    assert_eq!(tree.code, exit::OK, "{}", tree.stderr);
+    assert_eq!(
+        tree.stdout,
+        format!(
+            "project {project_id} root {root} parent -\n{root} executing -\n  {first} awaiting_approval review the schema\n  {second} needs_input -\n    {orphan} idle stranded\n"
+        )
+    );
+}
+
+#[test]
+fn project_tasks_report_status_dependencies_and_intent() {
+    let fixture = fixture();
+    let project = synthetic_project();
+    let (root, first, second) = (project.root, project.first, project.second);
+    let (completed, blocked, missing) = (project.completed, project.blocked, project.missing);
+    let project_id = project.snapshot.project_id;
+    let mut client = with_synthetic_project(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        project,
+    );
+
+    let tasks = run(&mut client, &["project", "tasks", &root.to_string()]);
+    assert_eq!(tasks.code, exit::OK, "{}", tasks.stderr);
+    assert_eq!(
+        tasks.stdout,
+        format!(
+            "project {project_id} tasks 2\n\
+             task {completed} completed owner {root} target {first} model deterministic/demo code false blocked-by - intent review the schema\n\
+             task {blocked} blocked owner {root} target {second} model deterministic/demo code false blocked-by {missing} intent land the migration\n"
+        )
+    );
+
+    let as_json = run(
+        &mut client,
+        &["project", "tasks", &root.to_string(), "--json"],
+    );
+    let envelope = json_envelope(&as_json);
+    assert_eq!(envelope["verb"], "project tasks");
+    assert_eq!(envelope["data"]["project_id"], project_id.to_string());
+    assert_eq!(
+        envelope["data"]["tasks"][0]["task_id"],
+        completed.to_string()
+    );
+    assert_eq!(envelope["data"]["tasks"][0]["status"], "completed");
+    assert_eq!(envelope["data"]["tasks"][1]["status"], "blocked");
+    assert_eq!(
+        envelope["data"]["tasks"][1]["dependencies"],
+        serde_json::json!([completed.to_string(), missing.to_string()])
+    );
+}
+
+#[test]
+fn project_tree_escapes_a_task_summary_onto_one_line() {
+    let fixture = fixture();
+    let mut project = synthetic_project();
+    project.snapshot.agents[1].task_summary = Some("review the schema\nand ready".to_owned());
+    let (root, first, second) = (project.root, project.first, project.second);
+    let project_id = project.snapshot.project_id;
+    let mut client = with_synthetic_project(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        project,
+    );
+
+    let tree = run(&mut client, &["project", "tree", &root.to_string()]);
+    assert_eq!(tree.code, exit::OK, "{}", tree.stderr);
+    assert_eq!(
+        tree.stdout,
+        format!(
+            "project {project_id} root {root} parent -\n{root} executing -\n  {first} awaiting_approval review the schema\\nand ready\n  {second} needs_input -\n"
+        )
+    );
+    // The escaped summary keeps one member on one physical line.
+    assert_eq!(tree.stdout.lines().count(), 4);
+}
+
+#[test]
+fn project_tasks_bound_an_over_budget_intent() {
+    let fixture = fixture();
+    let mut project = synthetic_project();
+    let long = "a".repeat(5000);
+    project.snapshot.tasks[0].intent = long.clone();
+    let (root, first, second) = (project.root, project.first, project.second);
+    let (completed, blocked, missing) = (project.completed, project.blocked, project.missing);
+    let project_id = project.snapshot.project_id;
+    let mut client = with_synthetic_project(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        project,
+    );
+
+    let tasks = run(&mut client, &["project", "tasks", &root.to_string()]);
+    assert_eq!(tasks.code, exit::OK, "{}", tasks.stderr);
+    // 5000 bytes over a 4096-byte budget keeps 2048 bytes at each end and drops
+    // the 904 in between, and the line stays on one physical line.
+    assert_eq!(
+        tasks.stdout,
+        format!(
+            "project {project_id} tasks 2\n\
+             task {completed} completed owner {root} target {first} model deterministic/demo code false blocked-by - intent {}[... 904 bytes omitted ...]{}\n\
+             task {blocked} blocked owner {root} target {second} model deterministic/demo code false blocked-by {missing} intent land the migration\n",
+            &long[..2048],
+            &long[5000 - 2048..],
+        )
+    );
+    assert_eq!(tasks.stdout.lines().count(), 3);
+}
+
+#[test]
+fn project_children_report_task_run_and_blocking_state() {
+    let fixture = fixture();
+    let project = synthetic_project();
+    let (root, first, second) = (project.root, project.first, project.second);
+    let (completed, blocked, question) =
+        (project.completed, project.blocked, project.question.clone());
+    let (first_run, second_run, approval) =
+        (project.first_run, project.second_run, project.approval);
+    let project_id = project.snapshot.project_id;
+    let mut client = with_synthetic_project(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        project,
+    );
+
+    let children = run(&mut client, &["project", "children", &root.to_string()]);
+    assert_eq!(children.code, exit::OK, "{}", children.stderr);
+    assert_eq!(
+        children.stdout,
+        format!(
+            "project {project_id} children 2\n\
+             child {first} task {completed} completed session awaiting_approval run {first_run} awaiting_approval approval {approval} question -\n\
+             child {second} task {blocked} blocked session needs_input run {second_run} needs_input approval - question {question}\n"
+        )
+    );
+
+    // Only direct children are listed, so a child with no children of its own
+    // reports none.
+    let nested = run(&mut client, &["project", "children", &first.to_string()]);
+    assert_eq!(nested.stdout, format!("project {project_id} children 0\n"));
+
+    let as_json = run(
+        &mut client,
+        &["project", "children", &root.to_string(), "--json"],
+    );
+    let envelope = json_envelope(&as_json);
+    assert_eq!(envelope["verb"], "project children");
+    assert_eq!(envelope["data"]["count"], 2);
+    assert_eq!(
+        envelope["data"]["children"][0]["agent"]["session_id"],
+        first.to_string()
+    );
+    assert_eq!(
+        envelope["data"]["children"][0]["task"]["task_id"],
+        completed.to_string()
+    );
+    assert_eq!(
+        envelope["data"]["children"][0]["run"]["id"],
+        first_run.to_string()
+    );
+    assert_eq!(
+        envelope["data"]["children"][0]["run"]["state"],
+        "awaiting_approval"
+    );
+    assert_eq!(
+        envelope["data"]["children"][1]["run"]["state"],
+        "needs_input"
+    );
+}
+
+#[test]
+fn project_children_print_an_absent_task_and_run_as_dash() {
+    let fixture = fixture();
+    let (project, child) = sparse_project();
+    let root = project.root;
+    let project_id = project.snapshot.project_id;
+    let mut client = with_synthetic_project(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        project,
+    );
+
+    let children = run(&mut client, &["project", "children", &root.to_string()]);
+    assert_eq!(children.code, exit::OK, "{}", children.stderr);
+    assert_eq!(
+        children.stdout,
+        format!(
+            "project {project_id} children 1\n\
+             child {child} task - - session idle run - - approval - question -\n"
+        )
+    );
+
+    let as_json = run(
+        &mut client,
+        &["project", "children", &root.to_string(), "--json"],
+    );
+    let envelope = json_envelope(&as_json);
+    assert_eq!(envelope["data"]["count"], 1);
+    assert_eq!(
+        envelope["data"]["children"][0]["agent"]["session_id"],
+        child.to_string()
+    );
+    assert_eq!(
+        envelope["data"]["children"][0]["task"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        envelope["data"]["children"][0]["run"],
+        serde_json::Value::Null
+    );
+}
+
+#[test]
+fn project_messages_page_the_history() {
+    let fixture = fixture();
+    let project = synthetic_project();
+    let (root, first, completed) = (project.root, project.first, project.completed);
+    let project_id = project.snapshot.project_id;
+    let captured = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = std::rc::Rc::clone(&captured);
+    let client = Wrapped::new(InProcessClient::new(&fixture.backend)).before(move |envelope| {
+        sink.borrow_mut().push(envelope.request.clone());
+    });
+    let mut client = with_synthetic_project(client, project);
+    let root_text = root.to_string();
+
+    let page = run(&mut client, &["project", "messages", &root_text]);
+    assert_eq!(page.code, exit::OK, "{}", page.stderr);
+    assert_eq!(
+        page.stdout,
+        format!(
+            "project {project_id} messages 2\n\
+             message 3 direction from {root} to {first} task {completed} review the schema\n\
+             message 4 result from {first} to {root} task - the schema is consistent\\nand ready\n"
+        )
+    );
+    // No worker-set continuation means no `next` line.
+    assert!(!page.stdout.contains("next "), "{}", page.stdout);
+
+    // The default page asks for the server's order from the start, 100 at a
+    // time.
+    let default_page = captured
+        .borrow()
+        .iter()
+        .find_map(|request| match request {
+            ClientRequest::Project(ProjectRequest::ListProjectAgentMessages {
+                project_id,
+                session_id,
+                after_project_sequence,
+                limit,
+            }) => Some((*project_id, *session_id, *after_project_sequence, *limit)),
+            _ => None,
+        })
+        .expect("a project message page request");
+    assert_eq!(default_page, (project_id, root, None, 100));
+
+    let paged = run(
+        &mut client,
+        &[
+            "project", "messages", &root_text, "--after", "3", "--limit", "2",
+        ],
+    );
+    assert_eq!(paged.code, exit::OK, "{}", paged.stderr);
+    let paged_request = captured
+        .borrow()
+        .iter()
+        .rev()
+        .find_map(|request| match request {
+            ClientRequest::Project(ProjectRequest::ListProjectAgentMessages {
+                project_id,
+                session_id,
+                after_project_sequence,
+                limit,
+            }) => Some((*project_id, *session_id, *after_project_sequence, *limit)),
+            _ => None,
+        })
+        .expect("a paged message request");
+    assert_eq!(paged_request, (project_id, root, Some(3), 2));
+
+    let as_json = run(&mut client, &["project", "messages", &root_text, "--json"]);
+    let envelope = json_envelope(&as_json);
+    assert_eq!(envelope["verb"], "project messages");
+    assert_eq!(envelope["data"]["project_id"], project_id.to_string());
+    assert_eq!(envelope["data"]["session_id"], root_text);
+    assert_eq!(envelope["data"]["messages"][0]["project_sequence"], 3);
+    assert_eq!(envelope["data"]["messages"][0]["kind"], "direction");
+    assert_eq!(
+        envelope["data"]["messages"][1]["task_id"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        envelope["data"]["next_after_project_sequence"],
+        serde_json::Value::Null
+    );
+}
+
+#[test]
+fn project_messages_print_next_only_when_the_worker_sets_it() {
+    let fixture = fixture();
+    let mut project = synthetic_project();
+    project.next = Some(4);
+    let root = project.root;
+    let mut client = with_synthetic_project(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        project,
+    );
+    let root_text = root.to_string();
+
+    let page = run(&mut client, &["project", "messages", &root_text]);
+    assert_eq!(page.code, exit::OK, "{}", page.stderr);
+    assert_eq!(page.stdout.lines().last(), Some("next 4"));
+
+    let as_json = run(&mut client, &["project", "messages", &root_text, "--json"]);
+    let envelope = json_envelope(&as_json);
+    assert_eq!(envelope["data"]["next_after_project_sequence"], 4);
+}
+
+#[test]
+fn project_child_controls_send_the_snapshot_manager() {
+    let fixture = fixture();
+    let project = synthetic_project();
+    let (root, blocked) = (project.root, project.blocked);
+    let controlled_run = project.controlled_run;
+    let project_id = project.snapshot.project_id;
+    let captured = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = std::rc::Rc::clone(&captured);
+    let client = Wrapped::new(InProcessClient::new(&fixture.backend)).before(move |envelope| {
+        sink.borrow_mut().push(envelope.request.clone());
+    });
+    let mut client = with_synthetic_project(client, project);
+    let root_text = root.to_string();
+    let task_text = blocked.to_string();
+
+    for (word, expected) in [
+        ("pause", ProjectChildControlAction::Pause),
+        ("resume", ProjectChildControlAction::Continue),
+        ("interrupt", ProjectChildControlAction::Interrupt),
+        ("cancel", ProjectChildControlAction::Cancel),
+    ] {
+        let outcome = run(
+            &mut client,
+            &[
+                "project",
+                "child",
+                word,
+                &task_text,
+                "--session",
+                &root_text,
+            ],
+        );
+        assert_eq!(outcome.code, exit::OK, "{}", outcome.stderr);
+        assert_eq!(
+            outcome.stdout,
+            format!("{word} {blocked} status running run {controlled_run} paused\n")
+        );
+        let control = captured
+            .borrow()
+            .iter()
+            .rev()
+            .find_map(|request| match request {
+                ClientRequest::Project(ProjectRequest::ControlProjectChild {
+                    project_id,
+                    manager_session_id,
+                    task_id,
+                    action,
+                }) => Some((*project_id, *manager_session_id, *task_id, *action)),
+                _ => None,
+            })
+            .expect("a control request");
+        assert_eq!(control, (project_id, root, blocked, expected));
+    }
+
+    let as_json = run(
+        &mut client,
+        &[
+            "project",
+            "child",
+            "pause",
+            &task_text,
+            "--session",
+            &root_text,
+            "--json",
+        ],
+    );
+    let envelope = json_envelope(&as_json);
+    assert_eq!(envelope["verb"], "project child pause");
+    assert_eq!(envelope["data"]["action"], "pause");
+    assert_eq!(envelope["data"]["task"]["task_id"], task_text);
+    assert_eq!(envelope["data"]["task"]["status"], "running");
+    assert_eq!(envelope["data"]["run"]["id"], controlled_run.to_string());
+    assert_eq!(envelope["data"]["run"]["state"], "paused");
+
+    // A task id the project does not name is not found from the snapshot, and
+    // no control request is sent for it.
+    let before = captured.borrow().len();
+    let unknown_task = TaskId::new().to_string();
+    let unknown = run(
+        &mut client,
+        &[
+            "project",
+            "child",
+            "pause",
+            &unknown_task,
+            "--session",
+            &root_text,
+        ],
+    );
+    assert_eq!(unknown.code, exit::GONE, "{}", unknown.stderr);
+    assert_eq!(unknown.stdout, "");
+    assert!(
+        unknown.stderr.contains("delegated task"),
+        "{}",
+        unknown.stderr
+    );
+    assert!(
+        !captured.borrow()[before..].iter().any(|request| matches!(
+            request,
+            ClientRequest::Project(ProjectRequest::ControlProjectChild { .. })
+        )),
+        "no control request is sent for a task the project does not name"
+    );
+}
+
+#[test]
+fn project_reads_of_a_real_session_use_the_single_root_fallback() {
+    let (fixture, directory) = persistent_fixture("project-fallback");
+    let session = fixture.session.id;
+    let project_id = ProjectId::from_uuid(*session.as_uuid());
+    let session_text = session.to_string();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let get = run(&mut client, &["project", "get", &session_text]);
+    assert_eq!(get.code, exit::OK, "{}", get.stderr);
+    assert_eq!(
+        get.stdout,
+        format!(
+            "project {project_id} root {session} parent -\n\
+             agent {session} idle depth 1 parent -\n"
+        )
+    );
+
+    let tree = run(&mut client, &["project", "tree", &session_text]);
+    assert_eq!(tree.code, exit::OK, "{}", tree.stderr);
+    assert_eq!(
+        tree.stdout,
+        format!("project {project_id} root {session} parent -\n{session} idle -\n")
+    );
+
+    let tasks = run(&mut client, &["project", "tasks", &session_text]);
+    assert_eq!(tasks.code, exit::OK, "{}", tasks.stderr);
+    assert_eq!(tasks.stdout, format!("project {project_id} tasks 0\n"));
+
+    let children = run(&mut client, &["project", "children", &session_text]);
+    assert_eq!(children.code, exit::OK, "{}", children.stderr);
+    assert_eq!(
+        children.stdout,
+        format!("project {project_id} children 0\n")
+    );
+
+    let messages = run(&mut client, &["project", "messages", &session_text]);
+    assert_eq!(messages.code, exit::OK, "{}", messages.stderr);
+    assert_eq!(
+        messages.stdout,
+        format!("project {project_id} messages 0\n")
+    );
+
+    // An unknown session is passed through as the worker's `not_found`.
+    let unknown = run(
+        &mut client,
+        &["project", "get", &AgentSessionId::new().to_string()],
+    );
+    assert_eq!(unknown.code, exit::GONE, "{}", unknown.stderr);
+    assert_eq!(unknown.stdout, "");
+    assert!(unknown.stderr.contains("not_found"), "{}", unknown.stderr);
+
+    drop(client);
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn the_parser_covers_the_project_verbs() {
+    let session_id = AgentSessionId::new();
+    let session = session_id.to_string();
+    let task_id = TaskId::new();
+    let task = task_id.to_string();
+
+    for (arguments, expected) in [
+        (vec!["project", "get", &session], "project get"),
+        (vec!["project", "tree", &session], "project tree"),
+        (vec!["project", "tasks", &session], "project tasks"),
+        (vec!["project", "children", &session], "project children"),
+        (vec!["project", "messages", &session], "project messages"),
+        (
+            vec![
+                "project",
+                "child",
+                "interrupt",
+                &task,
+                "--session",
+                &session,
+            ],
+            "project child interrupt",
+        ),
+    ] {
+        assert_eq!(args::verb_name(&invocation(&arguments).verb), expected);
+    }
+
+    assert!(matches!(
+        invocation(&["project", "get", &session]).verb,
+        Verb::ProjectGet { session: parsed } if parsed == session_id
+    ));
+    assert!(matches!(
+        invocation(&["project", "tree", &session]).verb,
+        Verb::ProjectTree { session: parsed } if parsed == session_id
+    ));
+    assert!(matches!(
+        invocation(&["project", "tasks", &session]).verb,
+        Verb::ProjectTasks { session: parsed } if parsed == session_id
+    ));
+    assert!(matches!(
+        invocation(&["project", "children", &session]).verb,
+        Verb::ProjectChildren { session: parsed } if parsed == session_id
+    ));
+
+    let Verb::ProjectMessages {
+        session: parsed,
+        after,
+        limit,
+    } = invocation(&["project", "messages", &session]).verb
+    else {
+        panic!("project messages parses as project messages")
+    };
+    assert_eq!(parsed, session_id);
+    assert_eq!(after, None);
+    assert_eq!(limit, 100);
+
+    let Verb::ProjectMessages { after, limit, .. } = invocation(&[
+        "project", "messages", &session, "--after", "3", "--limit", "512",
+    ])
+    .verb
+    else {
+        panic!("project messages parses as project messages")
+    };
+    assert_eq!(after, Some(3));
+    assert_eq!(limit, 512);
+
+    for (word, expected) in [
+        ("pause", ProjectChildAction::Pause),
+        ("resume", ProjectChildAction::Resume),
+        ("interrupt", ProjectChildAction::Interrupt),
+        ("cancel", ProjectChildAction::Cancel),
+    ] {
+        let Verb::ProjectChild {
+            session: parsed,
+            task: parsed_task,
+            action,
+        } = invocation(&["project", "child", word, &task, "--session", &session]).verb
+        else {
+            panic!("project child parses as project child")
+        };
+        assert_eq!(parsed, session_id);
+        assert_eq!(parsed_task, task_id);
+        assert_eq!(action, expected);
+    }
+
+    assert_eq!(
+        args::named_verb(&["project".to_owned(), "get".to_owned()]),
+        "project"
+    );
+    assert!(parse_error(&["project"]).contains("requires 'get'"));
+    assert!(parse_error(&["project", "nope", &session]).contains("unknown project sub-verb"));
+    assert!(parse_error(&["project", "get"]).contains("requires a <session-id>"));
+    assert!(parse_error(&["project", "get", &session, &session]).contains("one session id"));
+    assert!(parse_error(&["project", "get", &session, "--limit", "5"]).contains("does not apply"));
+    assert!(parse_error(&["project", "messages", &session, "--after", "soon"]).contains("--after"));
+    for bad in ["0", "513", "many"] {
+        let message = parse_error(&["project", "messages", &session, "--limit", bad]);
+        assert!(message.contains("--limit"), "{message}");
+    }
+    assert!(parse_error(&["project", "child", "pause", &task]).contains("requires --session"));
+    assert!(parse_error(&["project", "child"]).contains("pause, resume, interrupt, or cancel"));
+    assert!(
+        parse_error(&["project", "child", "stop", &task, "--session", &session])
+            .contains("unknown project child action")
+    );
+    assert!(parse_error(&["project", "child", "pause"]).contains("requires a <task-id>"));
+    assert!(
+        parse_error(&[
+            "project",
+            "child",
+            "pause",
+            &task,
+            "--session",
+            &session,
+            "extra"
+        ])
+        .contains("one task id")
+    );
 }
