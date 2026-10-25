@@ -145,8 +145,23 @@ jobs:
             zlib1g-dev \
             file \
             patchelf
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # cargo-deb
+      # `with.tool` is required: a commit-SHA pin no longer names the tool the
+      # way `taiki-e/install-action@cargo-deb` did, and without it the action
+      # installs nothing and the `.deb` step fails with `no such command: deb`
+      # (release 0.15). Pinned to the same revision as `.github/workflows/pages.yml`
+      # so Dependabot updates one pin.
+      - name: Install cargo-deb
         if: runner.os == 'Linux'
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deb
+      # Fail here rather than after the release build if the install above ever
+      # stops providing the subcommand.
+      - name: Check cargo-deb is installed
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          cargo-deb --version
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
