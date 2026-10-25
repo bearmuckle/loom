@@ -29,6 +29,7 @@ The examples below use the installed binary name. In a checkout, replace
 | Verb | Purpose |
 | --- | --- |
 | `doctor` | Negotiated protocol, capability intersection, participant, and worker node. |
+| `node` | The worker node's id, name, capabilities, and health. |
 | `whoami` | The participant bound to the token. |
 | `ls [--workspace <id>] [--archived]` | Workspaces, or the sessions of one workspace. |
 | `get <session-id> [--metadata]` | One session snapshot, or that snapshot with its active run metadata. |
@@ -44,12 +45,16 @@ The examples below use the installed binary name. In a checkout, replace
 | `status --session <id> [--format text\|verb]` | The session and its latest run; `--format verb` prints one declaration line. |
 | `liveness --session <id>` | `alive`, `dead`, `gone`, or `unknown`. |
 | `result --session <id> [--task <id>]` | Branch, head, diffstat, changed paths, and task evidence. |
+| `retention get` | The worker-wide archive-retention policy, with a disabled window as `off`. |
+| `retention set [--window <duration>] [--force-discard <bool>] [--sub-agent <duration>]` | Merge the given fields into the stored worker-wide archive-retention policy. |
+| `delete <session-id> [--force] [--yes]` | Permanently delete an archived session, or a project root with its descendants. |
 
-`ls`, `get`, `events`, and `peek` are read-only, issue no mutation, and work
-with a read-only-scoped token. `run` starts a run; `send`, `answer`,
-`approve`, `deny`, and `stop` control one; `wait`, `status`, `liveness`, and
-`result` read one. No verb waits for a run except `wait`, which is always
-bounded by `--timeout`.
+`node`, `whoami`, `ls`, `get`, `events`, `peek`, and `retention get` are
+read-only, issue no mutation, and work with a read-only-scoped token. `run`
+starts a run; `send`, `answer`, `approve`, `deny`, and `stop` control one;
+`wait`, `status`, `liveness`, and `result` read one. `retention set` and
+`delete` are operator-level mutations. No verb waits for a run except `wait`,
+which is always bounded by `--timeout`.
 
 Every verb negotiates only the capabilities its own requests need. `doctor`
 reports the intersection the worker granted, so its capability list is the
@@ -191,6 +196,59 @@ added, removed), and changed paths, plus the evidence links of `--task` when it
 is given. A session with no repository and no evidence prints
 `nothing to report` and sets `empty` in the `--json` envelope.
 
+## Worker status and retention
+
+`node` reports the worker node's id, name, online flag, capabilities, and the
+health its status snapshot carries, one line per field: `node_id`, `name`,
+`online`, `capabilities`, `cpu_count`, `cpu_usage_percent`,
+`memory_usage_percent`, `memory_total_bytes`, `memory_available_bytes`,
+`disk_total_bytes`, and `disk_available_bytes`. A sample the worker did not
+carry is `unknown`. `--json` carries the `WorkerNodeStatus` object.
+
+`retention get` prints the policy the worker stored as `window`,
+`force-discard`, and `sub-agent`, with a disabled window as `off`. `retention
+set` merges only the flags it was given into that stored policy, so `retention
+set --window 14d` changes the window and leaves the other two fields alone; at
+least one of `--window`, `--force-discard`, or `--sub-agent` is required. The
+duration syntax is the server's: `<n><unit>` with `ms`, `s`, `m`, `h`, `d`, or
+`w`, a bare number of seconds, or `off`/`never`. `--force-discard` takes
+`1`/`true`/`yes` or `0`/`false`/`no`.
+
+The command stores the policy durably and prints `stored for this worker; the
+next sweep applies it`: it never deletes anything itself. The policy is one
+worker-wide default, not a per-session setting, so a session that is already
+archived is subject to the next sweep rather than deleted by the command, and a
+session archived later is subject to a later one. A worker restarted on the
+same state database without flags keeps the stored policy. `--json` reports the
+stored policy plus `applies_from: "next_sweep"`.
+
+`node` and `retention get` are reads. `retention set` needs
+`configure_archive_retention`; a token without it exits `3`.
+
+## Destructive operations
+
+`delete <session-id>` permanently removes an archived session. There is no
+interactive prompt in a headless client, so the id is the confirmation, and
+archiving is terminal: neither the protocol nor this client offers a restore or
+unarchive.
+
+The client reads `Project/GetProjectSnapshotForSession` first, because an id
+alone does not say whether it names a project root. A root with another member
+or a delegated task removes its whole tree, and `--yes` is required whenever
+that would remove more than one session; `--yes` is also required with
+`--force`. Without the confirmation the command exits `2` after the read and
+before the delete request, so nothing is removed. `--force` carries the
+protocol's meaning: it discards dirty or locked linked worktrees that would
+otherwise refuse the deletion, and the command reports each worktree it
+discarded as `discarded worktree <name> <path>` (`discarded 0 worktrees` when
+there was nothing to discard). `--json` reports `deleted_sessions` and
+`discarded_worktrees`.
+
+A session that is not archived and is not a project root is refused by the
+worker as `invalid_state` (exit `5`) and nothing changes. `delete` needs the
+`delete_agent_session` capability, and a read-only-scoped token is refused with
+exit `3`.
+
 ## Exit codes
 
 | Exit code | Meaning |
@@ -237,4 +295,13 @@ loom-cli wait --session <session-id> --until blocked --timeout 30
 loom-cli approve --run <run-id> --tool-call <tool-call-id>
 loom-cli wait --session <session-id> --until terminal --timeout 600
 loom-cli result --session <session-id>
+
+# Inspect the worker and change its worker-wide retention policy.
+loom-cli node
+loom-cli retention get
+loom-cli retention set --window 14d --force-discard true --sub-agent 10m
+
+# Delete an archived session, then a whole archived project with confirmation.
+loom-cli delete <session-id>
+loom-cli delete <project-root-id> --yes
 ```

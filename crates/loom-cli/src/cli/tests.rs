@@ -10,17 +10,18 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, Author, Capability,
-    CapabilitySet, CollaborationEntryKind, EventSequence, ProtocolVersion, RequestId, RunId,
-    ToolCallId, WorkspaceId,
+    CapabilitySet, CollaborationEntryKind, EventSequence, ProjectAgentRecord, ProjectId,
+    ProjectSnapshot, ProjectWorktreeRecord, ProjectWorktreeStatus, ProtocolVersion, RepositoryId,
+    RequestId, RunId, TaskId, Timestamp, ToolCallId, WorkspaceId,
 };
 use loom_model::ModelId;
 use loom_protocol::{
     ActivityDetail, AgentEvent, AgentRunSnapshot, AgentRunState, AgentSessionSnapshotProjection,
     CURRENT_PROTOCOL_VERSION, ClientRequest, CollaborationRequest, ControlRequest, ControlResponse,
-    EventsRequest, EventsResponse, FilesystemRequest, FilesystemResponse, RepositoryRequest,
-    RepositoryResponse, RequestEnvelope, ResponseEnvelope, RunRequest, RunResponse, ServerEvent,
-    ServerEventEnvelope, ServerResponse, SessionDirectory, SessionRepository, SessionRequest,
-    SessionResponse, WorkspaceRequest, WorkspaceResponse,
+    EventsRequest, EventsResponse, FilesystemRequest, FilesystemResponse, ProjectRequest,
+    ProjectResponse, RepositoryRequest, RepositoryResponse, RequestEnvelope, ResponseEnvelope,
+    RunRequest, RunResponse, ServerEvent, ServerEventEnvelope, ServerResponse, SessionDirectory,
+    SessionRepository, SessionRequest, SessionResponse, WorkspaceRequest, WorkspaceResponse,
 };
 use loom_server::{InProcessBackend, InProcessConnection};
 
@@ -101,6 +102,37 @@ fn fixture() -> Fixture {
         workspace,
         session,
     }
+}
+
+/// A durable fixture, needed by the verbs the backend only offers when it has
+/// state to persist: archive-retention changes and session deletion.
+fn persistent_fixture(label: &str) -> (Fixture, PathBuf) {
+    let directory = temporary_path(label);
+    std::fs::create_dir_all(&directory).unwrap();
+    let backend = InProcessBackend::new_persistent(directory.join("state.sqlite")).unwrap();
+    let control = backend.connect();
+    negotiate(&control);
+    let workspace = create_workspace(&control, "persistent test workspace");
+    let session = create_session(&control, workspace.id, "persistent test session");
+    (
+        Fixture {
+            backend,
+            control,
+            workspace,
+            session,
+        },
+        directory,
+    )
+}
+
+fn close_persistent_fixture(fixture: Fixture, directory: PathBuf) {
+    let Fixture {
+        backend, control, ..
+    } = fixture;
+    drop(control);
+    let _ = backend.shutdown();
+    drop(backend);
+    let _ = std::fs::remove_dir_all(directory);
 }
 
 fn negotiate(connection: &InProcessConnection) {
@@ -923,9 +955,32 @@ fn a_read_only_scoped_token_can_read_but_cannot_start_a_run() {
                 "--session".to_owned(),
                 session_text.clone(),
             ],
+            vec!["node".to_owned()],
+            vec!["retention".to_owned(), "get".to_owned()],
         ] {
             let outcome = run_async_owned(&mut client, &arguments).await;
             assert_eq!(outcome.code, exit::OK, "{arguments:?}: {}", outcome.stderr);
+        }
+
+        // The read-only token carries neither operator capability, so both
+        // writes are refused with exit 3 and change nothing.
+        for arguments in [
+            vec![
+                "retention".to_owned(),
+                "set".to_owned(),
+                "--window".to_owned(),
+                "14d".to_owned(),
+            ],
+            vec!["delete".to_owned(), session_text.clone()],
+        ] {
+            let outcome = run_async_owned(&mut client, &arguments).await;
+            assert_eq!(
+                outcome.code,
+                exit::BLOCKED,
+                "{arguments:?}: {}",
+                outcome.stderr
+            );
+            assert_eq!(outcome.stdout, "", "{arguments:?}");
         }
 
         // The token does not carry the capabilities a run needs, so the write
@@ -1077,6 +1132,30 @@ fn each_verb_negotiates_only_the_capabilities_its_requests_need() {
         (
             vec!["liveness", "--session", &session],
             vec![Capability::JsonProtocol, Capability::ReadAgentSession],
+        ),
+        (
+            vec!["node"],
+            vec![Capability::JsonProtocol, Capability::ReadWorkerNodeStatus],
+        ),
+        (
+            vec!["retention", "get"],
+            vec![Capability::JsonProtocol, Capability::ReadWorkerNodeStatus],
+        ),
+        (
+            vec!["retention", "set", "--window", "14d"],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadWorkerNodeStatus,
+                Capability::ConfigureArchiveRetention,
+            ],
+        ),
+        (
+            vec!["delete", &session],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadProject,
+                Capability::DeleteAgentSession,
+            ],
         ),
         (
             vec!["result", "--session", &session],
@@ -3658,4 +3737,498 @@ fn liveness_reports_each_verdict_with_its_exit_code() {
     assert_eq!(envelope["ok"], true);
     assert_eq!(envelope["data"]["verdict"], "unknown");
     assert_eq!(envelope["data"]["state"], serde_json::Value::Null);
+}
+
+// 9. Operator verbs: worker node status, archive retention, and deletion.
+
+fn scripted_node() -> loom_protocol::WorkerNodeStatus {
+    loom_protocol::WorkerNodeStatus {
+        node_id: "node-1".to_owned(),
+        name: "worker".to_owned(),
+        online: true,
+        capabilities: CapabilitySet::new([
+            Capability::ReadWorkerNodeStatus,
+            Capability::JsonProtocol,
+        ]),
+        resources: loom_protocol::WorkerNodeResources {
+            cpu_count: 8,
+            cpu_usage_percent: Some(42),
+            memory_usage_percent: None,
+            memory_total_bytes: Some(17_179_869_184),
+            memory_available_bytes: Some(8_589_934_592),
+            disk_total_bytes: Some(512_110_190_592),
+            disk_available_bytes: None,
+        },
+    }
+}
+
+#[test]
+fn node_prints_one_line_per_field_and_the_json_envelope() {
+    let fixture = fixture();
+    let node = scripted_node();
+    let scripted = node.clone();
+    let mut client =
+        Wrapped::new(InProcessClient::new(&fixture.backend)).after(move |request, response| {
+            if matches!(
+                request,
+                ClientRequest::Control(ControlRequest::GetWorkerNodeStatus)
+            ) {
+                response.result = Ok(ServerResponse::Control(ControlResponse::WorkerNodeStatus(
+                    scripted.clone(),
+                )));
+            }
+        });
+
+    let text = run(&mut client, &["node"]);
+    assert_eq!(text.code, exit::OK, "{}", text.stderr);
+    assert_eq!(text.stderr, "");
+    assert_eq!(
+        text.stdout,
+        "node_id node-1\n\
+         name worker\n\
+         online true\n\
+         capabilities 2 read_worker_node_status,json_protocol\n\
+         cpu_count 8\n\
+         cpu_usage_percent 42\n\
+         memory_usage_percent unknown\n\
+         memory_total_bytes 17179869184\n\
+         memory_available_bytes 8589934592\n\
+         disk_total_bytes 512110190592\n\
+         disk_available_bytes unknown\n"
+    );
+
+    let envelope = run(&mut client, &["node", "--json"]);
+    assert_eq!(envelope.code, exit::OK, "{}", envelope.stderr);
+    let value = json_envelope(&envelope);
+    assert_eq!(value["verb"], "node");
+    assert_eq!(value["data"], serde_json::to_value(&node).unwrap());
+}
+
+#[test]
+fn retention_get_and_set_report_and_persist_the_worker_policy() {
+    let directory = temporary_path("retention");
+    std::fs::create_dir_all(&directory).unwrap();
+    let database = directory.join("state.sqlite");
+
+    {
+        let backend = InProcessBackend::new_persistent(&database).unwrap();
+        let mut client = InProcessClient::new(&backend);
+
+        let default = run(&mut client, &["retention", "get"]);
+        assert_eq!(default.code, exit::OK, "{}", default.stderr);
+        assert_eq!(
+            default.stdout,
+            "window off\nforce-discard false\nsub-agent 10m\n"
+        );
+
+        let set = run(
+            &mut client,
+            &[
+                "retention",
+                "set",
+                "--window",
+                "14d",
+                "--force-discard",
+                "true",
+                "--sub-agent",
+                "10m",
+            ],
+        );
+        assert_eq!(set.code, exit::OK, "{}", set.stderr);
+        assert_eq!(
+            set.stdout,
+            "window 14d\nforce-discard true\nsub-agent 10m\n\
+             stored for this worker; the next sweep applies it\n"
+        );
+
+        let read_back = run(&mut client, &["retention", "get", "--json"]);
+        assert_eq!(read_back.code, exit::OK, "{}", read_back.stderr);
+        let envelope = json_envelope(&read_back);
+        assert_eq!(envelope["verb"], "retention get");
+        assert_eq!(envelope["data"]["window"], "14d");
+        assert_eq!(envelope["data"]["force_discard_worktrees"], true);
+        assert_eq!(envelope["data"]["sub_agent"], "10m");
+        backend.shutdown().unwrap();
+    }
+
+    // A restart on the same state database keeps the stored policy without a
+    // flag, exactly as the server flags promise.
+    {
+        let reopened = InProcessBackend::new_persistent(&database).unwrap();
+        let mut client = InProcessClient::new(&reopened);
+        let persisted = run(&mut client, &["retention", "get"]);
+        assert_eq!(persisted.code, exit::OK, "{}", persisted.stderr);
+        assert_eq!(
+            persisted.stdout,
+            "window 14d\nforce-discard true\nsub-agent 10m\n"
+        );
+
+        let set_json = run(
+            &mut client,
+            &["retention", "set", "--window", "off", "--json"],
+        );
+        assert_eq!(set_json.code, exit::OK, "{}", set_json.stderr);
+        let envelope = json_envelope(&set_json);
+        assert_eq!(envelope["verb"], "retention set");
+        assert_eq!(envelope["data"]["window"], "off");
+        assert_eq!(envelope["data"]["force_discard_worktrees"], true);
+        assert_eq!(envelope["data"]["applies_from"], "next_sweep");
+
+        let off = run(&mut client, &["retention", "get"]);
+        assert_eq!(
+            off.stdout,
+            "window off\nforce-discard true\nsub-agent 10m\n"
+        );
+        reopened.shutdown().unwrap();
+    }
+
+    // The disabled window is durable too, and the other fields keep their
+    // stored values because the update only named the window.
+    {
+        let reopened = InProcessBackend::new_persistent(&database).unwrap();
+        let mut client = InProcessClient::new(&reopened);
+        let persisted = run(&mut client, &["retention", "get"]);
+        assert_eq!(persisted.code, exit::OK, "{}", persisted.stderr);
+        assert_eq!(
+            persisted.stdout,
+            "window off\nforce-discard true\nsub-agent 10m\n"
+        );
+        reopened.shutdown().unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn retention_set_rejects_a_bad_duration_and_an_empty_update() {
+    let fixture = fixture();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let bad = run(&mut client, &["retention", "set", "--window", "later"]);
+    assert_eq!(bad.code, exit::USAGE);
+    assert_eq!(bad.stdout, "");
+    for expected in ["--window", "30s", "14d", "off", "later"] {
+        assert!(bad.stderr.contains(expected), "{}", bad.stderr);
+    }
+
+    let bad_sub_agent = run(&mut client, &["retention", "set", "--sub-agent", "2x"]);
+    assert_eq!(bad_sub_agent.code, exit::USAGE);
+    assert!(bad_sub_agent.stderr.contains("--sub-agent"));
+
+    let bad_force = run(
+        &mut client,
+        &["retention", "set", "--force-discard", "sometimes"],
+    );
+    assert_eq!(bad_force.code, exit::USAGE);
+    assert!(bad_force.stderr.contains("--force-discard"));
+
+    let empty = run(&mut client, &["retention", "set"]);
+    assert_eq!(empty.code, exit::USAGE);
+    assert!(
+        empty.stderr.contains("requires --window"),
+        "{}",
+        empty.stderr
+    );
+
+    let unknown = run(&mut client, &["retention", "show"]);
+    assert_eq!(unknown.code, exit::USAGE);
+    assert!(unknown.stderr.contains("get or set"), "{}", unknown.stderr);
+
+    let no_sub_verb = run(&mut client, &["retention"]);
+    assert_eq!(no_sub_verb.code, exit::USAGE);
+    assert!(
+        no_sub_verb.stderr.contains("requires 'get' or 'set'"),
+        "{}",
+        no_sub_verb.stderr
+    );
+}
+
+fn archive_session(connection: &InProcessConnection, session_id: AgentSessionId) {
+    let archived = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::ArchiveAgentSession { session_id },
+    )));
+    assert!(matches!(
+        archived.result,
+        Ok(ServerResponse::Session(
+            SessionResponse::AgentSessionArchived(_)
+        ))
+    ));
+}
+
+fn fake_project(
+    root: AgentSessionId,
+    agents: &[AgentSessionId],
+    worktrees: Vec<ProjectWorktreeRecord>,
+) -> ProjectSnapshot {
+    ProjectSnapshot {
+        project_id: ProjectId::from_uuid(*root.as_uuid()),
+        root_session_id: root,
+        parent_project_id: None,
+        agents: agents
+            .iter()
+            .map(|session_id| ProjectAgentRecord {
+                session_id: *session_id,
+                project_id: ProjectId::from_uuid(*root.as_uuid()),
+                parent_session_id: (*session_id != root).then_some(root),
+                depth: if *session_id == root { 1 } else { 2 },
+                state: AgentSessionState::Archived,
+                task_summary: None,
+                output_cursor: EventSequence::default(),
+                updated_at: Timestamp::now(),
+            })
+            .collect(),
+        tasks: Vec::new(),
+        worktrees,
+    }
+}
+
+fn fake_worktree(
+    parent: AgentSessionId,
+    child: AgentSessionId,
+    name: &str,
+    path: &str,
+) -> ProjectWorktreeRecord {
+    ProjectWorktreeRecord {
+        project_id: ProjectId::from_uuid(*parent.as_uuid()),
+        task_id: TaskId::new(),
+        parent_session_id: parent,
+        child_session_id: child,
+        parent_repository_id: RepositoryId::new(),
+        child_repository_id: RepositoryId::new(),
+        relative_path: path.to_owned(),
+        worktree_name: name.to_owned(),
+        branch_name: "loom/test".to_owned(),
+        base_revision: "0".repeat(40),
+        base_refresh: None,
+        result_revision: None,
+        integrated_revision: None,
+        status: ProjectWorktreeStatus::Ready,
+        conflict_paths: Vec::new(),
+        error: None,
+        cleanup_disposition: None,
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
+    }
+}
+
+fn with_project_snapshot(
+    client: Wrapped<InProcessClient>,
+    target: AgentSessionId,
+    project: ProjectSnapshot,
+) -> Wrapped<InProcessClient> {
+    client.after(move |request, response| {
+        if matches!(
+            request,
+            ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession { session_id })
+                if *session_id == target
+        ) {
+            response.result = Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(
+                project.clone(),
+            )));
+        }
+    })
+}
+
+#[test]
+fn delete_removes_an_archived_session_and_refuses_a_live_one() {
+    let (fixture, directory) = persistent_fixture("delete-removes");
+    let session = fixture.session.id;
+    archive_session(&fixture.control, session);
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let deleted = run(&mut client, &["delete", &session.to_string()]);
+    assert_eq!(deleted.code, exit::OK, "{}", deleted.stderr);
+    assert_eq!(deleted.stdout, format!("deleted {session}\n"));
+    let gone = run(&mut client, &["get", &session.to_string()]);
+    assert_eq!(gone.code, exit::GONE, "{}", gone.stderr);
+
+    // A second session is not archived, so the worker refuses it and its
+    // durable state is unchanged.
+    let live = create_session(&fixture.control, fixture.workspace.id, "live session");
+    let refused = run(&mut client, &["delete", &live.id.to_string()]);
+    assert_eq!(refused.code, exit::GONE, "{}", refused.stderr);
+    assert!(
+        refused.stderr.contains("invalid_state"),
+        "{}",
+        refused.stderr
+    );
+    assert_eq!(
+        session_snapshot(&fixture.control, live.id).state,
+        AgentSessionState::Idle
+    );
+
+    // A force deletion with no worktree still says explicitly that it discarded
+    // none, so an operator can tell a clean removal from an unperformed one.
+    archive_session(&fixture.control, live.id);
+    let forced = run(
+        &mut client,
+        &["delete", &live.id.to_string(), "--force", "--yes"],
+    );
+    assert_eq!(forced.code, exit::OK, "{}", forced.stderr);
+    assert_eq!(
+        forced.stdout,
+        format!("deleted {}\ndiscarded 0 worktrees\n", live.id)
+    );
+    drop(client);
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn delete_requires_yes_before_a_cascade_or_a_force_discard() {
+    let (fixture, directory) = persistent_fixture("delete-yes");
+    let session = fixture.session.id;
+    archive_session(&fixture.control, session);
+
+    // `--force` without `--yes` is refused before a connection is even used.
+    let mut offline = OfflineClient;
+    let refused = run(&mut offline, &["delete", &session.to_string(), "--force"]);
+    assert_eq!(refused.code, exit::USAGE, "{}", refused.stderr);
+    assert!(refused.stderr.contains("--yes"), "{}", refused.stderr);
+
+    // A project root that cascades is refused after the read-only preflight and
+    // before the delete request: the fail hook would turn a sent delete into an
+    // internal error.
+    let child = AgentSessionId::new();
+    let project = fake_project(session, &[session, child], Vec::new());
+    let mut cascade = with_project_snapshot(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        session,
+        project.clone(),
+    )
+    .fail_on(|request| {
+        matches!(
+            request,
+            ClientRequest::Session(SessionRequest::DeleteAgentSession { .. })
+        )
+        .then(|| {
+            loom_core::LoomError::new(
+                loom_core::ErrorCode::Internal,
+                "the delete request reached the worker",
+                false,
+            )
+        })
+    });
+    let refused = run(&mut cascade, &["delete", &session.to_string()]);
+    assert_eq!(refused.code, exit::USAGE, "{}", refused.stderr);
+    assert!(refused.stderr.contains("2 sessions"), "{}", refused.stderr);
+    assert!(refused.stderr.contains("--yes"), "{}", refused.stderr);
+
+    // With `--yes` the same cascade proceeds and names every session it removed.
+    let mut confirmed = with_project_snapshot(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        session,
+        project,
+    );
+    let deleted = run(
+        &mut confirmed,
+        &["delete", &session.to_string(), "--yes", "--json"],
+    );
+    assert_eq!(deleted.code, exit::OK, "{}", deleted.stderr);
+    let envelope = json_envelope(&deleted);
+    assert_eq!(envelope["verb"], "delete");
+    assert_eq!(envelope["data"]["force"], false);
+    assert_eq!(
+        envelope["data"]["deleted_sessions"],
+        serde_json::json!([session.to_string(), child.to_string()])
+    );
+    drop(cascade);
+    drop(confirmed);
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn delete_force_reports_the_worktrees_it_discards() {
+    let (fixture, directory) = persistent_fixture("delete-force");
+    let session = fixture.session.id;
+    archive_session(&fixture.control, session);
+    let child = AgentSessionId::new();
+    let project = fake_project(
+        session,
+        &[session],
+        vec![fake_worktree(session, child, "wt-1", "repo")],
+    );
+    let mut client = with_project_snapshot(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        session,
+        project,
+    );
+
+    let deleted = run(
+        &mut client,
+        &["delete", &session.to_string(), "--force", "--yes"],
+    );
+    assert_eq!(deleted.code, exit::OK, "{}", deleted.stderr);
+    assert_eq!(
+        deleted.stdout,
+        format!("deleted {session}\ndiscarded worktree wt-1 repo\n")
+    );
+
+    let again = run(
+        &mut client,
+        &["delete", &session.to_string(), "--force", "--yes", "--json"],
+    );
+    assert_eq!(again.code, exit::GONE, "{}", again.stderr);
+    drop(client);
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn the_parser_covers_the_operator_verbs() {
+    let session = AgentSessionId::new().to_string();
+
+    assert!(matches!(invocation(&["node"]).verb, Verb::Node));
+    assert!(matches!(
+        invocation(&["retention", "get"]).verb,
+        Verb::RetentionGet
+    ));
+    let Verb::RetentionSet(set) = invocation(&[
+        "retention",
+        "set",
+        "--window",
+        "14d",
+        "--force-discard=true",
+        "--sub-agent",
+        "10m",
+    ])
+    .verb
+    else {
+        panic!("retention set parses as retention set");
+    };
+    assert_eq!(set.window_ms, Some(Some(1_209_600_000)));
+    assert_eq!(set.force_discard_worktrees, Some(true));
+    assert_eq!(set.sub_agent_ms, Some(Some(600_000)));
+
+    let Verb::RetentionSet(off) = invocation(&["retention", "set", "--window=off"]).verb else {
+        panic!("retention set parses as retention set");
+    };
+    assert_eq!(off.window_ms, Some(None));
+    assert_eq!(off.force_discard_worktrees, None);
+    assert_eq!(off.sub_agent_ms, None);
+
+    assert!(matches!(
+        invocation(&["delete", &session]).verb,
+        Verb::Delete {
+            force: false,
+            yes: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        invocation(&["delete", &session, "--force", "--yes"]).verb,
+        Verb::Delete {
+            force: true,
+            yes: true,
+            ..
+        }
+    ));
+
+    assert!(parse_error(&["node", "extra"]).contains("takes no positional"));
+    assert!(parse_error(&["retention"]).contains("requires 'get' or 'set'"));
+    assert!(parse_error(&["retention", "nope"]).contains("get or set"));
+    assert!(parse_error(&["retention", "get", "set"]).contains("one sub-verb"));
+    assert!(parse_error(&["retention", "set"]).contains("requires --window"));
+    assert!(parse_error(&["retention", "get", "--window", "1d"]).contains("does not apply"));
+    assert!(parse_error(&["retention", "set", "--window", "soon"]).contains("30s, 5m, 12h, 14d"));
+    assert!(parse_error(&["delete"]).contains("requires a <session-id>"));
+    assert!(parse_error(&["delete", &session, &session]).contains("one session id"));
+    assert!(parse_error(&["delete", &session, "--force"]).contains("pass --yes to confirm"));
 }

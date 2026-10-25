@@ -16,7 +16,7 @@ use crate::cli::client::Client;
 use crate::cli::text::{run_state_name, session_state_name};
 
 use super::Caller;
-use super::{Failure, Outcome, emit, handshake};
+use super::{Failure, Outcome, capability_names, emit, handshake};
 
 /// `doctor`: discovery, negotiation, the participant, and the worker node.
 pub(super) async fn doctor<C: Client>(
@@ -254,18 +254,4 @@ fn participant_value(participant: Option<&ParticipantIdentity>) -> Value {
         None => Value::Null,
         Some(participant) => serde_json::to_value(participant).unwrap_or(Value::Null),
     }
-}
-
-/// The negotiated capabilities as their snake_case protocol names, in the
-/// order the protocol's own set orders them.
-fn capability_names(capabilities: &loom_core::CapabilitySet) -> Vec<String> {
-    capabilities
-        .iter()
-        .map(|capability| {
-            serde_json::to_value(capability)
-                .ok()
-                .and_then(|value| value.as_str().map(str::to_owned))
-                .unwrap_or_default()
-        })
-        .collect()
 }

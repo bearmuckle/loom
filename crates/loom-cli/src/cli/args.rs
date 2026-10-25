@@ -34,6 +34,8 @@ pub(crate) const HELP: &str = r#"Usage: loom-cli <verb> [flags]
 Verbs:
   doctor                            report the negotiated protocol,
                                     capabilities, participant and worker node
+  node                              report the worker node's id, name, and
+                                    health
   whoami                            report this connection's participant
   ls [--workspace <id>] [--archived]
                                     list workspaces, or one workspace's sessions
@@ -71,6 +73,16 @@ Verbs:
   result --session <id> [--task <id>]
                                     report branch, head, diffstat, changed
                                     paths, and task evidence
+  retention get                     report the worker's archive-retention
+                                    policy
+  retention set [--window <duration>] [--force-discard <bool>]
+                [--sub-agent <duration>]
+                                    store a worker-wide archive-retention
+                                    policy; the next sweep applies it
+  delete <session-id> [--force] [--yes]
+                                    delete an archived session, or a project
+                                    root with its descendants; --yes is
+                                    required for a cascade or with --force
 
 `run` never prints more than `session <id> <name>` and `run <id> <state>`: it
 returns as soon as the worker accepts the run. --repo and --as-directory are
@@ -102,6 +114,14 @@ stderr and in the --json envelope, and resumes at the head; those older events
 are no longer retrievable through this verb. --json with --follow collects
 every followed event in one envelope, so prefer --format jsonl for a long
 follow.
+
+`delete` is explicit and irreversible: there is no interactive prompt in a
+headless client, so the session id is the confirmation. The worker refuses a
+session that is not archived unless it is a project root, and archiving is
+terminal, so nothing restores a deleted session. --yes is required when the
+command would remove more than one session (a project root cascades) and
+whenever --force is given: --force discards dirty or locked worktrees that
+would otherwise refuse the deletion.
 
 Global flags, accepted anywhere as --flag value or --flag=value:
   --connect <url>             worker WebSocket URL (fallback LOOM_URL)
@@ -219,9 +239,22 @@ pub(crate) struct RunArgs {
     pub new: bool,
 }
 
+/// The flags of `retention set`.
+///
+/// Each field is `None` when its flag was absent, so that value is kept from
+/// the policy the worker already stores. A window flag carries `Some(None)` for
+/// `off`, which disables that window.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RetentionSetArgs {
+    pub window_ms: Option<Option<u64>>,
+    pub force_discard_worktrees: Option<bool>,
+    pub sub_agent_ms: Option<Option<u64>>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum Verb {
     Doctor,
+    Node,
     WhoAmI,
     Ls {
         workspace: Option<WorkspaceId>,
@@ -274,6 +307,15 @@ pub(crate) enum Verb {
         session: AgentSessionId,
         task: Option<TaskId>,
     },
+    RetentionGet,
+    RetentionSet(RetentionSetArgs),
+    /// `delete`: the id is the confirmation. `force` discards dirty or locked
+    /// worktrees; `yes` acknowledges a cascade or a force discard.
+    Delete {
+        session: AgentSessionId,
+        force: bool,
+        yes: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -291,6 +333,7 @@ pub(crate) enum Parsed {
 pub(crate) fn verb_name(verb: &Verb) -> &'static str {
     match verb {
         Verb::Doctor => "doctor",
+        Verb::Node => "node",
         Verb::WhoAmI => "whoami",
         Verb::Ls { .. } => "ls",
         Verb::Get { .. } => "get",
@@ -306,6 +349,9 @@ pub(crate) fn verb_name(verb: &Verb) -> &'static str {
         Verb::Status { .. } => "status",
         Verb::Liveness { .. } => "liveness",
         Verb::Result { .. } => "result",
+        Verb::RetentionGet => "retention get",
+        Verb::RetentionSet(_) => "retention set",
+        Verb::Delete { .. } => "delete",
     }
 }
 
@@ -323,6 +369,7 @@ pub(crate) fn named_verb(arguments: &[String]) -> &'static str {
         .find(|argument| !argument.starts_with('-'))
         .map(|name| match name.as_str() {
             "doctor" => "doctor",
+            "node" => "node",
             "whoami" => "whoami",
             "ls" => "ls",
             "get" => "get",
@@ -338,6 +385,8 @@ pub(crate) fn named_verb(arguments: &[String]) -> &'static str {
             "status" => "status",
             "liveness" => "liveness",
             "result" => "result",
+            "retention" => "retention",
+            "delete" => "delete",
             _ => "",
         })
         .unwrap_or("")
@@ -354,7 +403,8 @@ fn arity(name: &str) -> Option<bool> {
         "--task" | "--task-file" | "--name" | "--model" | "--repo" | "--revision" | "--path"
         | "--as-directory" | "--approval-policy" | "--request-id" => true,
         "--run" | "--text" | "--tool-call" | "--reason" | "--until" | "--timeout" => true,
-        "--new" | "--archive" | "--retry-on-conflict" => false,
+        "--window" | "--force-discard" | "--sub-agent" => true,
+        "--new" | "--archive" | "--retry-on-conflict" | "--force" | "--yes" => false,
         _ => return None,
     })
 }
@@ -448,6 +498,10 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
         "doctor" => {
             no_positionals(&flags.verb, rest)?;
             Verb::Doctor
+        }
+        "node" => {
+            no_positionals(&flags.verb, rest)?;
+            Verb::Node
         }
         "whoami" => {
             no_positionals(&flags.verb, rest)?;
@@ -628,6 +682,28 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
                 task,
             }
         }
+        "retention" => parse_retention(&mut flags, rest)?,
+        "delete" => {
+            let Some(session) = rest.first() else {
+                return Err("delete requires a <session-id>".to_owned());
+            };
+            if rest.len() > 1 {
+                return Err(format!("delete takes one session id, got '{}'", rest[1]));
+            }
+            let force = flags.flag("--force");
+            let yes = flags.flag("--yes");
+            if force && !yes {
+                return Err(
+                    "delete --force discards dirty or locked worktrees; pass --yes to confirm"
+                        .to_owned(),
+                );
+            }
+            Verb::Delete {
+                session: parse_id("session id", session)?,
+                force,
+                yes,
+            }
+        }
         other => return Err(format!("unknown verb '{other}'; try --help")),
     };
     flags.finish()?;
@@ -693,6 +769,57 @@ fn parse_id<T: FromStr>(what: &str, value: &str) -> Result<T, String> {
     value
         .parse::<T>()
         .map_err(|_| format!("'{value}' is not a valid {what}"))
+}
+
+/// The `retention` sub-verbs: `get` reads the policy, `set` merges the given
+/// fields into it. No flag on `set` means there is nothing to store.
+fn parse_retention(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
+    let Some(sub_verb) = rest.first() else {
+        return Err("retention requires 'get' or 'set'".to_owned());
+    };
+    if rest.len() > 1 {
+        return Err(format!("retention takes one sub-verb, got '{}'", rest[1]));
+    }
+    flags.verb = format!("retention {sub_verb}");
+    match sub_verb.as_str() {
+        "get" => Ok(Verb::RetentionGet),
+        "set" => {
+            let window_ms = match flags.value("--window") {
+                Some(value) => Some(
+                    loom_core::parse_retention_window(&value, "--window")
+                        .map_err(|error| error.message)?,
+                ),
+                None => None,
+            };
+            let force_discard_worktrees = match flags.value("--force-discard") {
+                Some(value) => Some(
+                    loom_core::parse_force_discard(&value, "--force-discard")
+                        .map_err(|error| error.message)?,
+                ),
+                None => None,
+            };
+            let sub_agent_ms = match flags.value("--sub-agent") {
+                Some(value) => Some(
+                    loom_core::parse_retention_window(&value, "--sub-agent")
+                        .map_err(|error| error.message)?,
+                ),
+                None => None,
+            };
+            if window_ms.is_none() && force_discard_worktrees.is_none() && sub_agent_ms.is_none() {
+                return Err(
+                    "retention set requires --window, --force-discard, or --sub-agent".to_owned(),
+                );
+            }
+            Ok(Verb::RetentionSet(RetentionSetArgs {
+                window_ms,
+                force_discard_worktrees,
+                sub_agent_ms,
+            }))
+        }
+        other => Err(format!(
+            "unknown retention sub-verb '{other}'; use get or set"
+        )),
+    }
 }
 
 /// The flags of `run`, which is the one verb whose flags interact: the task and

@@ -397,6 +397,15 @@ reason, and retries later. The native desktop client runs the same sweep for the
 durable backend it embeds, so a retention policy set from the client acts even
 without a separate `loom-server` process.
 
+Change the policy at runtime with `loom-cli retention set`, and read it back
+with `loom-cli retention get`; see [the headless
+client](headless-client.md#worker-status-and-retention). The command stores the
+policy durably for this worker and reports that the next sweep applies it, so a
+session that is already archived is removed by that sweep rather than by the
+command, and a restart on the same state database without flags keeps the
+stored policy. The flags described above remain the startup input that
+overrides the stored policy.
+
 ## Persistence fail-stop and reopen
 
 A durable state save can fail for a reason that clears on its own, most often a

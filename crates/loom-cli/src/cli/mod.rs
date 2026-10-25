@@ -9,6 +9,7 @@
 //! | verb | requests |
 //! | --- | --- |
 //! | `doctor` | `Control/DiscoverCapabilities`, `Control/Negotiate`, `Access/GetCurrentParticipant`, `Control/GetWorkerNodeStatus` |
+//! | `node` | `Control/GetWorkerNodeStatus` |
 //! | `whoami` | `Access/GetCurrentParticipant` |
 //! | `ls` | `Workspace/ListWorkspaces`, or `Workspace/ListWorkspaceSessions` with `--workspace` |
 //! | `get` | `Session/GetAgentSession`, plus `Session/GetAgentSessionSnapshotMetadata` with `--metadata` |
@@ -23,13 +24,37 @@
 //! | `status` | `Session/GetAgentSessionSnapshotMetadata` |
 //! | `liveness` | `Session/GetAgentSessionSnapshotMetadata` |
 //! | `result` | `Repository/ListSessionRepositories`, `Repository/GetSessionVcsStatus`, `Repository/GetSessionVcsDiff`, `Task/GetSessionTaskEvidence` |
+//! | `retention get` | `Control/GetArchiveRetentionPolicy` |
+//! | `retention set` | `Control/GetArchiveRetentionPolicy`, `Control/SetArchiveRetentionPolicy` |
+//! | `delete` | `Project/GetProjectSnapshotForSession`, `Session/DeleteAgentSession` |
 //!
 //! Every verb first sends `Control/Negotiate` with the version this build
 //! speaks and with only the capabilities it uses, because a worker refuses an
-//! unnegotiated connection. `ls`, `get`, `events`, and `peek` are the read-only
-//! verbs: they send nothing else, so they issue no mutation and leave the
-//! worker's journal and session snapshots untouched, and they negotiate only
-//! the read-only capabilities they use.
+//! unnegotiated connection. `node`, `whoami`, `ls`, `get`, `events`, `peek`,
+//! and `retention get` are the read-only verbs: they send nothing that mutates
+//! and negotiate only the capabilities their reads need, so a read-only-scoped
+//! token can run them. `retention set` and `delete` are operator-level
+//! mutations: a token without `configure_archive_retention` or
+//! `delete_agent_session` is refused at negotiation with exit `3`.
+//!
+//! `node` prints one line per field of `WorkerNodeStatus`, with absent health
+//! samples as `unknown`. `retention get` prints `window`, `force-discard`, and
+//! `sub-agent`, with a disabled window as `off`. `retention set` merges the
+//! flags it was given into the policy the worker already stores (a flag that is
+//! absent keeps its stored value), and reports the stored result followed by
+//! `stored for this worker; the next sweep applies it`: changing the policy
+//! never starts a sweep, and a session already archived is deleted by that next
+//! round rather than by the command.
+//!
+//! `delete` reads `Project/GetProjectSnapshotForSession` before it sends the
+//! mutation, because the id alone does not say whether it names a project root
+//! that cascades. A root with another member or a delegated task removes its
+//! whole tree, so `--yes` is required when that tree is larger than the target
+//! itself; `--force` requires `--yes` as well, because it discards dirty or
+//! locked worktrees. Both checks happen before `Session/DeleteAgentSession` is
+//! sent. The worker remains the authority on which session states may be
+//! deleted: a non-archived session that is not a project root is refused with
+//! `invalid_state` (exit `5`) and nothing changes.
 //!
 //! `run` starts a run, and it is described here because its requests are the
 //! longest sequence the client sends:
