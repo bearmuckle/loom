@@ -162,10 +162,10 @@ Restoring an archived session returns it to `Idle` and keeps its rows,
 transcript, checkpoints, filesystem root, and worktrees, so deletion is the only
 terminal removal and the retention sweep stops considering it. The archived
 subtree membership of a project root is recorded durably in
-`archived_project_members`: a root row plus one member row per archived
-descendant. The root row's foreign key cascades with the root, while a member
-row deliberately outlives the member session, so a member the sweep deleted can
-still be detected. The rows are cleared when the root is restored or dropped
+`archived_project_members`: one member row per archived descendant. The row's
+`root_session_id` foreign key cascades with the root, while the member row
+itself deliberately outlives the member session, so a member the sweep deleted
+can still be detected. The rows are cleared when the root is restored or dropped
 with the root. A restore request that finds a recorded member without a session
 row is refused with the missing session ids and changes nothing. The table moves
 the schema from version 15 to 16.
