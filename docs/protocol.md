@@ -477,6 +477,14 @@ is observable; the run itself proceeds on a backend worker. Clients follow
 progress through the session event stream, which receives assistant deltas
 while a model call is still open.
 
+A session accepts a new run only while it is `idle`. A run that completed,
+failed, was cancelled, or is waiting for approval leaves the session in that
+state, so a later start in the same session is refused with `invalid_state`
+rather than replacing or restarting the previous run. A headless client that
+wants to start work therefore resolves an idle session or creates a new one;
+`loom-ctl run` does exactly that and reports the refusal instead of retrying
+under another session name.
+
 `PauseAgentRun` and `InterruptAgentRun` raise a control flag and cancel the
 in-flight model stream rather than waiting for it, so they are answered while
 a model call is open. Requests that need exclusive access to a busy run
