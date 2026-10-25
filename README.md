@@ -79,12 +79,13 @@ duration syntax and the sweep.
 
 ## Headless client
 
-`loom-ctl` is a second binary in `crates/loom-cli` and a pure client of the
-versioned protocol: it embeds no backend, opens no SQLite database, and manages
-no worker. The `loom-cli` crate ships it:
+`loom-cli` is the headless binary of the `crates/loom-cli` package and a pure
+client of the versioned protocol: it embeds no backend, opens no SQLite
+database, and manages no worker. The package ships it beside the `loom` demo
+shell:
 
 ```sh
-cargo run -p loom-cli --bin loom-ctl -- doctor
+cargo run -p loom-cli --bin loom-cli -- doctor
 ```
 
 Point it at a worker with `--connect <url>` (or `LOOM_URL`). The bearer token

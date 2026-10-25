@@ -11,8 +11,8 @@ name = "loom"
 path = "src/main.rs"
 
 [[bin]]
-name = "loom-ctl"
-path = "src/bin/loom-ctl.rs"
+name = "loom-cli"
+path = "src/bin/loom-cli.rs"
 
 [dependencies]
 loom-agent.workspace = true

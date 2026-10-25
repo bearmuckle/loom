@@ -16,10 +16,10 @@ use loom_protocol::{
 };
 use serde_json::{Value, json};
 
-use crate::ctl::args::{EventsArgs, Format, Invocation, PeekArgs};
-use crate::ctl::client::Client;
-use crate::ctl::cursor::{self, Cursor};
-use crate::ctl::text::{self, Rendered};
+use crate::cli::args::{EventsArgs, Format, Invocation, PeekArgs};
+use crate::cli::client::Client;
+use crate::cli::cursor::{self, Cursor};
+use crate::cli::text::{self, Rendered};
 
 use super::{Caller, Failure, emit, handshake};
 

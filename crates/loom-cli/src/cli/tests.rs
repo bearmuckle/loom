@@ -1,4 +1,4 @@
-//! Tests for the `loom-ctl` contract, driven through the in-process backend.
+//! Tests for the `loom-cli` contract, driven through the in-process backend.
 //!
 //! Every test talks to a real `InProcessBackend` over the same `Client` seam the
 //! binary uses, so the pinned output, exit codes, and cursor behaviour are the
@@ -23,15 +23,15 @@ use loom_protocol::{
 };
 use loom_server::{InProcessBackend, InProcessConnection};
 
-use crate::ctl::args::{self, ApprovalPreset, Format, Parsed, Verb};
-use crate::ctl::client::Client;
-use crate::ctl::client::testing::{InProcessClient, Wrapped};
-use crate::ctl::exit;
-use crate::ctl::run_command;
-use crate::ctl::text;
+use crate::cli::args::{self, ApprovalPreset, Format, Parsed, Verb};
+use crate::cli::client::Client;
+use crate::cli::client::testing::{InProcessClient, Wrapped};
+use crate::cli::exit;
+use crate::cli::run_command;
+use crate::cli::text;
 
 /// The connection URL the cursor-file tests pretend to have connected to.
-const URL: &str = "ws://ctl.test.invalid/control";
+const URL: &str = "ws://cli.test.invalid/control";
 
 /// What one CLI run printed and returned.
 struct Outcome {
@@ -256,7 +256,7 @@ fn lines(stdout: &str) -> Vec<&str> {
 }
 
 fn temporary_path(suffix: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("loom-ctl-{}-{suffix}", WorkspaceId::new()))
+    std::env::temp_dir().join(format!("loom-cli-{}-{suffix}", WorkspaceId::new()))
 }
 
 /// The capabilities a test's direct control connection negotiates: everything
@@ -787,7 +787,7 @@ fn a_read_only_scoped_token_can_read_but_cannot_start_a_run() {
                 .await
                 .unwrap();
         let transport = WebSocketTransport::new(server.websocket_url(), "read-only-token");
-        let mut client = crate::ctl::client::RemoteClient::new(transport.connect().await.unwrap());
+        let mut client = crate::cli::client::RemoteClient::new(transport.connect().await.unwrap());
 
         let ls = run_async(&mut client, &["ls"]).await;
         assert_eq!(ls.code, exit::OK, "{}", ls.stderr);
@@ -1846,7 +1846,7 @@ fn the_parser_applies_the_run_defaults_and_rejects_its_conflicts() {
         args::derived_name("one two three four five six seven eight"),
         "one two three four five six"
     );
-    assert_eq!(args::derived_name("   \n\t"), "loom-ctl run");
+    assert_eq!(args::derived_name("   \n\t"), "loom-cli run");
     assert_eq!(args::derived_name(&"a".repeat(100)).len(), 48);
 
     // An attach source lands at its final path component without `.git`.
@@ -1995,7 +1995,7 @@ fn the_parser_applies_the_run_defaults_and_rejects_its_conflicts() {
             "--workspace",
             &workspace,
             "--task-file",
-            "/tmp/loom-ctl-definitely-absent-task-file",
+            "/tmp/loom-cli-definitely-absent-task-file",
         ])
         .contains("could not read the task file")
     );
@@ -2022,7 +2022,7 @@ fn help_short_circuits_parsing_whatever_else_is_given() {
         parse(&["events", "--help", "--mystery"]),
         Ok(Parsed::Help)
     ));
-    assert!(args::HELP.contains("loom-ctl"));
+    assert!(args::HELP.contains("loom-cli"));
     assert!(args::HELP.contains("--cursor-file"));
     assert!(args::HELP.contains("--token-file"));
 }
