@@ -1062,6 +1062,20 @@ fn the_parser_rejects_unknown_verbs_flags_and_missing_values() {
 }
 
 #[test]
+fn the_worker_url_comes_from_the_flag_then_the_environment() {
+    assert_eq!(
+        args::resolve_connect(Some("ws://flag".to_owned()), Some("ws://env".to_owned())).as_deref(),
+        Some("ws://flag")
+    );
+    assert_eq!(
+        args::resolve_connect(None, Some("ws://env".to_owned())).as_deref(),
+        Some("ws://env")
+    );
+    assert_eq!(args::resolve_connect(None, Some("   ".to_owned())), None);
+    assert_eq!(args::resolve_connect(None, None), None);
+}
+
+#[test]
 fn help_short_circuits_parsing_whatever_else_is_given() {
     assert!(matches!(parse(&["--help"]), Ok(Parsed::Help)));
     assert!(matches!(parse(&["-h"]), Ok(Parsed::Help)));
