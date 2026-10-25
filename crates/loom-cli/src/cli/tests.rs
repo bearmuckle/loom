@@ -10,10 +10,10 @@ use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, Author, Capability,
-    CapabilitySet, CollaborationEntryKind, EventSequence, ProjectAgentRecord, ProjectId,
-    ProjectSnapshot, ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord,
-    ProjectWorktreeStatus, ProtocolVersion, RepositoryId, RequestId, RunId, TaskId, Timestamp,
-    ToolCallId, WorkspaceId,
+    CapabilitySet, CollaborationEntryKind, DelegatedTaskRecord, DelegatedTaskStatus, EventSequence,
+    ProjectAgentPermissions, ProjectAgentRecord, ProjectId, ProjectSnapshot,
+    ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord, ProjectWorktreeStatus,
+    ProtocolVersion, RepositoryId, RequestId, RunId, TaskId, Timestamp, ToolCallId, WorkspaceId,
 };
 use loom_model::ModelId;
 use loom_protocol::{
@@ -1130,6 +1130,14 @@ fn each_verb_negotiates_only_the_capabilities_its_requests_need() {
         (
             vec!["status", "--session", &session],
             vec![Capability::JsonProtocol, Capability::ReadAgentSession],
+        ),
+        (
+            vec!["status", "--session", &session, "--tree"],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadAgentSession,
+                Capability::ReadProject,
+            ],
         ),
         (
             vec!["liveness", "--session", &session],
@@ -3482,6 +3490,14 @@ fn the_parser_covers_the_control_verbs_and_rejects_their_mistakes() {
         }
     ));
     assert!(matches!(
+        invocation(&["status", "--session", &session]).verb,
+        Verb::Status { tree: false, .. }
+    ));
+    assert!(matches!(
+        invocation(&["status", "--session", &session, "--tree"]).verb,
+        Verb::Status { tree: true, .. }
+    ));
+    assert!(matches!(
         invocation(&["liveness", "--session", &session]).verb,
         Verb::Liveness { .. }
     ));
@@ -3512,6 +3528,17 @@ fn the_parser_covers_the_control_verbs_and_rejects_their_mistakes() {
     assert!(
         parse_error(&["status", "--session", &session, "--format", "jsonl"])
             .contains("text or verb")
+    );
+    assert!(
+        parse_error(&[
+            "status",
+            "--session",
+            &session,
+            "--tree",
+            "--format",
+            "verb"
+        ])
+        .contains("--format text")
     );
     assert!(parse_error(&["liveness"]).contains("requires --session"));
     assert!(
@@ -3716,6 +3743,63 @@ fn status_prints_its_lines_and_the_derived_declaration() {
         format!("blocked: awaiting_approval {run_id}")
     );
     assert_eq!(envelope["data"]["state"], "awaiting_approval");
+}
+
+#[test]
+fn status_tree_reports_a_standalone_session_as_a_one_agent_project() {
+    let fixture = fixture();
+    let session_id = fixture.session.id;
+    let session_text = session_id.to_string();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    // A session that no project records is a one-agent project of its own, and
+    // its project id is its own id.
+    let tree = run(
+        &mut client,
+        &["status", "--session", &session_text, "--tree"],
+    );
+    assert_eq!(tree.code, exit::OK, "{}", tree.stderr);
+    assert_eq!(
+        tree.stdout,
+        format!(
+            "session {session_id} idle {}\nproject {session_id} done\nroot {session_id}\nagent {session_id} 1 idle done -\n",
+            fixture.session.name
+        )
+    );
+
+    let json = run(
+        &mut client,
+        &["status", "--session", &session_text, "--tree", "--json"],
+    );
+    assert_eq!(json.code, exit::OK, "{}", json.stderr);
+    let envelope = json_envelope(&json);
+    let project = &envelope["data"]["project"];
+    assert_eq!(project["id"], session_text.as_str());
+    assert_eq!(project["root_session_id"], session_text.as_str());
+    assert_eq!(project["parent_project_id"], serde_json::Value::Null);
+    assert_eq!(project["verdict"], "done");
+    assert_eq!(
+        project["counts"],
+        serde_json::json!({"agents": 1, "tasks": 0, "worktrees": 0, "decisions": 0})
+    );
+    assert_eq!(project["agents"][0]["session_id"], session_text.as_str());
+    assert_eq!(project["agents"][0]["depth"], 1);
+    assert_eq!(project["agents"][0]["state"], "idle");
+    assert_eq!(project["agents"][0]["verdict"], "done");
+    assert_eq!(
+        project["agents"][0]["task_summary"],
+        serde_json::Value::Null
+    );
+    assert!(project["tasks"].as_array().unwrap().is_empty());
+    assert!(project["worktrees"].as_array().unwrap().is_empty());
+    assert!(project["decisions"].as_array().unwrap().is_empty());
+    // The keys of the plain payload stay as they are.
+    assert_eq!(envelope["data"]["state"], "idle");
+    assert_eq!(envelope["data"]["verdict"], "done");
+    assert_eq!(
+        envelope["data"]["pending_tool_call"],
+        serde_json::Value::Null
+    );
 }
 
 #[test]
@@ -4028,6 +4112,30 @@ fn fake_project(
     }
 }
 
+fn fake_task(
+    project_id: ProjectId,
+    requester: AgentSessionId,
+    target: AgentSessionId,
+    name: &str,
+) -> DelegatedTaskRecord {
+    DelegatedTaskRecord {
+        task_id: TaskId::new(),
+        project_id,
+        requester_session_id: requester,
+        target_session_id: target,
+        child_name: name.to_owned(),
+        intent: "review the change".to_owned(),
+        model_id: "deterministic/demo".to_owned(),
+        context_references: Vec::new(),
+        dependencies: Vec::new(),
+        code_change: true,
+        permissions: ProjectAgentPermissions::default(),
+        status: DelegatedTaskStatus::Running,
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
+    }
+}
+
 fn fake_worktree(
     parent: AgentSessionId,
     child: AgentSessionId,
@@ -4073,6 +4181,326 @@ fn with_project_snapshot(
             )));
         }
     })
+}
+
+#[test]
+fn status_tree_projects_agents_tasks_worktrees_and_decisions() {
+    let fixture = fixture();
+    let root = fixture.session.id;
+    let child = create_session(&fixture.control, fixture.workspace.id, "project child").id;
+    pin_default_policy(&fixture.control, child);
+    let run_id = start_run(&fixture.control, child);
+    let projection = await_run_state(&fixture.control, child, AgentRunState::AwaitingApproval);
+    let approval = projection
+        .active_run
+        .as_ref()
+        .and_then(|active| active.pending_approval.as_ref())
+        .expect("a pending approval");
+    let (call, tool_name) = (approval.id, approval.name.clone());
+
+    let mut project = fake_project(root, &[root, child], Vec::new());
+    project.parent_project_id = Some(ProjectId::new());
+    project.agents[0].state = AgentSessionState::Idle;
+    project.agents[1].state = AgentSessionState::AwaitingApproval;
+    project.agents[1].task_summary = Some("wire the status tree".to_owned());
+    project.tasks = vec![fake_task(project.project_id, root, child, "reviewer")];
+    let task_id = project.tasks[0].task_id;
+    let mut worktree = fake_worktree(root, child, "wt-1", "project-worktrees/child");
+    worktree.status = ProjectWorktreeStatus::Conflict;
+    worktree.result_revision = Some("1".repeat(40));
+    worktree.integrated_revision = Some("2".repeat(40));
+    worktree.conflict_paths = vec!["src/main.rs".to_owned()];
+    project.worktrees = vec![worktree];
+    let project_id = project.project_id;
+    let parent_project_id = project.parent_project_id.expect("a parent project");
+    let (base_revision, result_revision, integrated_revision) = (
+        project.worktrees[0].base_revision.clone(),
+        "1".repeat(40),
+        "2".repeat(40),
+    );
+
+    let mut client = with_project_snapshot(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        child,
+        project,
+    );
+    let child_text = child.to_string();
+    let tree = run(&mut client, &["status", "--session", &child_text, "--tree"]);
+    assert_eq!(tree.code, exit::OK, "{}", tree.stderr);
+    let expected = [
+        format!("session {child} awaiting_approval project child"),
+        format!("run {run_id} awaiting_approval"),
+        format!("project {project_id} blocked"),
+        format!("parent {parent_project_id}"),
+        format!("root {root}"),
+        format!("agent {root} 1 idle done -"),
+        format!("agent {child} 2 awaiting_approval blocked wire the status tree"),
+        format!("task {task_id} running reviewer"),
+        format!(
+            "worktree wt-1 conflict project-worktrees/child {base_revision} {result_revision} \
+             {integrated_revision}"
+        ),
+        "conflict wt-1 src/main.rs".to_owned(),
+        format!("decision approval {child} {call} {tool_name}"),
+    ]
+    .join("\n");
+    assert_eq!(tree.stdout, format!("{expected}\n"));
+
+    let json = run(
+        &mut client,
+        &["status", "--session", &child_text, "--tree", "--json"],
+    );
+    assert_eq!(json.code, exit::OK, "{}", json.stderr);
+    let envelope = json_envelope(&json);
+    let project = &envelope["data"]["project"];
+    assert_eq!(project["id"], project_id.to_string().as_str());
+    assert_eq!(project["root_session_id"], root.to_string().as_str());
+    assert_eq!(
+        project["parent_project_id"],
+        parent_project_id.to_string().as_str()
+    );
+    assert_eq!(project["verdict"], "blocked");
+    assert_eq!(
+        project["counts"],
+        serde_json::json!({"agents": 2, "tasks": 1, "worktrees": 1, "decisions": 1})
+    );
+    assert_eq!(project["agents"][0]["verdict"], "done");
+    assert_eq!(project["agents"][1]["verdict"], "blocked");
+    assert_eq!(project["agents"][1]["state"], "awaiting_approval");
+    assert_eq!(project["agents"][1]["task_summary"], "wire the status tree");
+    assert_eq!(project["tasks"][0]["task_id"], task_id.to_string().as_str());
+    assert_eq!(project["tasks"][0]["status"], "running");
+    assert_eq!(project["tasks"][0]["child_name"], "reviewer");
+    assert_eq!(project["worktrees"][0]["worktree_name"], "wt-1");
+    assert_eq!(project["worktrees"][0]["status"], "conflict");
+    assert_eq!(
+        project["worktrees"][0]["relative_path"],
+        "project-worktrees/child"
+    );
+    assert_eq!(
+        project["worktrees"][0]["base_revision"],
+        base_revision.as_str()
+    );
+    assert_eq!(
+        project["worktrees"][0]["result_revision"],
+        result_revision.as_str()
+    );
+    assert_eq!(
+        project["worktrees"][0]["integrated_revision"],
+        integrated_revision.as_str()
+    );
+    assert_eq!(
+        project["worktrees"][0]["conflict_paths"],
+        serde_json::json!(["src/main.rs"])
+    );
+    assert_eq!(project["decisions"][0]["session_id"], child_text.as_str());
+    assert_eq!(
+        project["decisions"][0]["run_id"],
+        run_id.to_string().as_str()
+    );
+    assert_eq!(project["decisions"][0]["run_state"], "awaiting_approval");
+    assert_eq!(project["decisions"][0]["kind"], "approval");
+    assert_eq!(
+        project["decisions"][0]["tool_call_id"],
+        call.to_string().as_str()
+    );
+    assert_eq!(project["decisions"][0]["tool_name"], tool_name.as_str());
+    assert_eq!(envelope["data"]["verdict"], "blocked");
+    assert_eq!(
+        envelope["data"]["declaration"],
+        format!("blocked: awaiting_approval {run_id}")
+    );
+    assert_eq!(envelope["data"]["run"]["id"], run_id.to_string().as_str());
+    assert_eq!(
+        envelope["data"]["pending_tool_call"],
+        call.to_string().as_str()
+    );
+}
+
+#[test]
+fn status_tree_reports_a_question_decision() {
+    let fixture = fixture();
+    let root = fixture.session.id;
+    let child = create_session(&fixture.control, fixture.workspace.id, "question child").id;
+    pin_default_policy(&fixture.control, child);
+    start_run(&fixture.control, child);
+    let mut projection = await_run_state(&fixture.control, child, AgentRunState::AwaitingApproval);
+    // A question blocks a run the same way an approval does, so the real
+    // projection carries the other blocked shape with one rewrite instead of
+    // provoking a provider question.
+    let active = projection.active_run.as_mut().expect("a run");
+    active.pending_approval = None;
+    active.pending_input = Some("which branch should I use?".to_owned());
+    active.run.state = AgentRunState::NeedsInput;
+    projection.session.state = AgentSessionState::NeedsInput;
+    let child_run = projection.active_run.as_ref().expect("a run").run.id;
+
+    let mut blocked_project = fake_project(root, &[root, child], Vec::new());
+    blocked_project.agents[0].state = AgentSessionState::Idle;
+    blocked_project.agents[1].state = AgentSessionState::NeedsInput;
+    // A snapshot that does not list the requested session still reports its own
+    // decision, which is the second half of this test.
+    let mut unlisted_project = fake_project(root, &[root], Vec::new());
+    unlisted_project.agents[0].state = AgentSessionState::Idle;
+    let doctored = projection.clone();
+    let mut client =
+        Wrapped::new(InProcessClient::new(&fixture.backend)).after(move |request, response| {
+            match request {
+                ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession {
+                    session_id,
+                }) if *session_id == root => {
+                    response.result = Ok(ServerResponse::Project(
+                        ProjectResponse::ProjectSnapshot(blocked_project.clone()),
+                    ));
+                }
+                ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession {
+                    session_id,
+                }) if *session_id == child => {
+                    response.result = Ok(ServerResponse::Project(
+                        ProjectResponse::ProjectSnapshot(unlisted_project.clone()),
+                    ));
+                }
+                ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata {
+                    session_id,
+                    ..
+                }) if *session_id == child => {
+                    response.result = Ok(ServerResponse::Session(
+                        SessionResponse::AgentSessionSnapshot(Box::new(doctored.clone())),
+                    ));
+                }
+                _ => {}
+            }
+        });
+
+    // The requested root has no run, so the decision of the child it does not
+    // own comes from the one extra metadata read.
+    let root_text = root.to_string();
+    let tree = run(&mut client, &["status", "--session", &root_text, "--tree"]);
+    assert_eq!(tree.code, exit::OK, "{}", tree.stderr);
+    let expected = [
+        format!("session {root} idle {}", fixture.session.name),
+        format!("project {root} blocked"),
+        format!("root {root}"),
+        format!("agent {root} 1 idle done -"),
+        format!("agent {child} 2 needs_input blocked -"),
+        format!("decision question {child} which branch should I use?"),
+    ]
+    .join("\n");
+    assert_eq!(tree.stdout, format!("{expected}\n"));
+    let json = run(
+        &mut client,
+        &["status", "--session", &root_text, "--tree", "--json"],
+    );
+    assert_eq!(json.code, exit::OK, "{}", json.stderr);
+    let envelope = json_envelope(&json);
+    let decisions = &envelope["data"]["project"]["decisions"];
+    assert_eq!(envelope["data"]["project"]["verdict"], "blocked");
+    assert_eq!(decisions[0]["kind"], "question");
+    assert_eq!(decisions[0]["session_id"], child.to_string().as_str());
+    assert_eq!(decisions[0]["run_id"], child_run.to_string().as_str());
+    assert_eq!(decisions[0]["run_state"], "needs_input");
+    assert_eq!(decisions[0]["question"], "which branch should I use?");
+
+    // A snapshot that does not list the requested session reports its own
+    // decision after the listed agents.
+    let child_text = child.to_string();
+    let tree = run(&mut client, &["status", "--session", &child_text, "--tree"]);
+    assert_eq!(tree.code, exit::OK, "{}", tree.stderr);
+    let expected = [
+        format!("session {child} needs_input question child"),
+        format!("run {child_run} needs_input"),
+        format!("project {root} done"),
+        format!("root {root}"),
+        format!("agent {root} 1 idle done -"),
+        format!("decision question {child} which branch should I use?"),
+    ]
+    .join("\n");
+    assert_eq!(tree.stdout, format!("{expected}\n"));
+    let json = run(
+        &mut client,
+        &["status", "--session", &child_text, "--tree", "--json"],
+    );
+    let envelope = json_envelope(&json);
+    let decisions = &envelope["data"]["project"]["decisions"];
+    assert_eq!(decisions.as_array().unwrap().len(), 1);
+    assert_eq!(decisions[0]["session_id"], child_text.as_str());
+    assert_eq!(decisions[0]["kind"], "question");
+}
+
+#[test]
+fn status_tree_prints_dashes_for_an_unintegrated_worktree() {
+    let fixture = fixture();
+    let root = fixture.session.id;
+    let child = create_session(&fixture.control, fixture.workspace.id, "fresh child").id;
+    let mut project = fake_project(root, &[root], Vec::new());
+    project.agents[0].state = AgentSessionState::Idle;
+    project.worktrees = vec![fake_worktree(
+        root,
+        child,
+        "wt-2",
+        "project-worktrees/fresh",
+    )];
+    let base_revision = project.worktrees[0].base_revision.clone();
+
+    // A worktree with no result or integrated revision prints a dash for each,
+    // and an empty conflict list prints no conflict line.
+    let mut client = with_project_snapshot(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        root,
+        project,
+    );
+    let root_text = root.to_string();
+    let tree = run(&mut client, &["status", "--session", &root_text, "--tree"]);
+    assert_eq!(tree.code, exit::OK, "{}", tree.stderr);
+    let expected = [
+        format!("session {root} idle {}", fixture.session.name),
+        format!("project {root} done"),
+        format!("root {root}"),
+        format!("agent {root} 1 idle done -"),
+        format!("worktree wt-2 ready project-worktrees/fresh {base_revision} - -"),
+    ]
+    .join("\n");
+    assert_eq!(tree.stdout, format!("{expected}\n"));
+
+    let json = run(
+        &mut client,
+        &["status", "--session", &root_text, "--tree", "--json"],
+    );
+    assert_eq!(json.code, exit::OK, "{}", json.stderr);
+    let envelope = json_envelope(&json);
+    let worktree = &envelope["data"]["project"]["worktrees"][0];
+    assert_eq!(worktree["result_revision"], serde_json::Value::Null);
+    assert_eq!(worktree["integrated_revision"], serde_json::Value::Null);
+    assert_eq!(worktree["conflict_paths"], serde_json::json!([]));
+}
+
+#[test]
+fn status_tree_fails_when_the_project_read_fails() {
+    let fixture = fixture();
+    let session_text = fixture.session.id.to_string();
+    let mut client = Wrapped::new(InProcessClient::new(&fixture.backend)).fail_on(|request| {
+        matches!(request, ClientRequest::Project(_)).then(|| {
+            loom_core::LoomError::new(
+                loom_core::ErrorCode::Internal,
+                "the connection dropped",
+                true,
+            )
+        })
+    });
+
+    // The verb reports the failed read as its own failure and prints nothing,
+    // because no line is written before the request it reports succeeded.
+    let tree = run(
+        &mut client,
+        &["status", "--session", &session_text, "--tree"],
+    );
+    assert_eq!(tree.code, exit::UNREACHABLE, "{}", tree.stderr);
+    assert_eq!(tree.stdout, "");
+    assert!(
+        tree.stderr.contains("connection dropped"),
+        "{}",
+        tree.stderr
+    );
 }
 
 #[test]

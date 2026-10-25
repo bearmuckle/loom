@@ -66,9 +66,10 @@ Verbs:
   wait --session <id> [--until blocked|terminal] [--timeout <seconds>]
                                     poll until the run blocks or reaches a
                                     terminal state; always time-bounded
-  status --session <id> [--format text|verb]
+  status --session <id> [--format text|verb] [--tree]
                                     report the session and its latest run;
                                     --format verb prints one declaration line
+                                    and --tree adds the project projection
   liveness --session <id>           report alive, dead, gone, or unknown
   result --session <id> [--task <id>]
                                     report branch, head, diffstat, changed
@@ -117,6 +118,15 @@ mutations of the verb use fresh ids. On a session this invocation creates,
 --approval-policy (default when absent) is pinned before the run starts; on a
 reused session it is only changed when the flag is given, so a plain run does
 not overwrite a policy a person set.
+
+`status --tree` reports the project the session belongs to as well: one line
+per agent, delegated task, and worktree, the conflict paths of a worktree, and
+one `decision` line per agent waiting on an approval or a question. The
+requested session's pending decision appears once, as a `decision` line,
+instead of the plain `pending` line. The project verdict is derived by this
+client from the agent states, in the order blocked, paused, working, failed,
+done, and archived only when every agent is archived. `--tree` reports several
+text lines, so it refuses `--format verb`.
 
 `send`, `answer`, `approve`, and `deny` read the run revision, act against
 it, and retry once after a conflict, because their intent is idempotent.
@@ -334,6 +344,8 @@ pub(crate) enum Verb {
     Status {
         session: AgentSessionId,
         format: StatusFormat,
+        /// `--tree`: also print the project the session belongs to.
+        tree: bool,
     },
     Liveness {
         session: AgentSessionId,
@@ -497,7 +509,7 @@ fn arity(name: &str) -> Option<bool> {
         | "--as-directory" | "--approval-policy" | "--request-id" => true,
         "--run" | "--text" | "--tool-call" | "--reason" | "--until" | "--timeout" => true,
         "--window" | "--force-discard" | "--sub-agent" => true,
-        "--new" | "--archive" | "--retry-on-conflict" | "--force" | "--yes" => false,
+        "--new" | "--archive" | "--retry-on-conflict" | "--force" | "--yes" | "--tree" => false,
         "--keep" | "--remove" | "--discard" => false,
         _ => return None,
     })
@@ -753,9 +765,16 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
                     return Err(format!("--format must be text or verb, got '{other}'"));
                 }
             };
+            let tree = flags.flag("--tree");
+            if tree && format == StatusFormat::Verb {
+                return Err(
+                    "--tree reports a project, so use --format text to print its lines".to_owned(),
+                );
+            }
             Verb::Status {
                 session: parse_id("session id", &session)?,
                 format,
+                tree,
             }
         }
         "liveness" => {

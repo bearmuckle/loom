@@ -4,6 +4,14 @@
 //! module contract names, and either print text lines or return the payload a
 //! `--json` envelope carries. A verb therefore never writes output when `--json`
 //! is set, and never writes a line before the request it prints succeeded.
+//!
+//! `status --tree` is the one verb that projects a second authority: it reads
+//! `Project/GetProjectSnapshotForSession` in addition to the session metadata
+//! and reports the project, its agents, delegated tasks, worktrees, and the
+//! pending decisions of the agents that block. The worker stays authoritative
+//! for the records; this client only derives the verdict words and reads one
+//! more session metadata projection per blocked agent, because the project
+//! record says that an agent waits but not on which approval or question.
 
 mod events;
 mod operator;
@@ -213,8 +221,14 @@ pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
         Verb::Wait { .. } => {
             capabilities.extend([Capability::ReadAgentSession, Capability::ReadAgentRun]);
         }
-        Verb::Status { .. } | Verb::Liveness { .. } => {
+        Verb::Liveness { .. } => capabilities.push(Capability::ReadAgentSession),
+        Verb::Status { tree, .. } => {
             capabilities.push(Capability::ReadAgentSession);
+            // The tree is projected from the project snapshot, so it also
+            // negotiates that read; a plain `status` never asks for it.
+            if *tree {
+                capabilities.push(Capability::ReadProject);
+            }
         }
         Verb::Result { .. } => {
             capabilities.extend([
@@ -363,9 +377,11 @@ pub(crate) async fn run<C: Client>(
             until,
             timeout_secs,
         } => supervise::wait(client, invocation, *session, *until, *timeout_secs, out).await,
-        Verb::Status { session, format } => {
-            supervise::status(client, invocation, *session, *format, out).await
-        }
+        Verb::Status {
+            session,
+            format,
+            tree,
+        } => supervise::status(client, invocation, *session, *format, *tree, out).await,
         Verb::Liveness { session } => supervise::liveness(client, invocation, *session, out).await,
         Verb::Result { session, task } => {
             supervise::result(client, invocation, *session, *task, out).await

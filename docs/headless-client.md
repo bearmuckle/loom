@@ -42,7 +42,7 @@ The examples below use the installed binary name. In a checkout, replace
 | `deny --run <id> --tool-call <id> [--reason <text>]` | Deny the blocked tool call. |
 | `stop --run <id> [--session <id> --archive] [--retry-on-conflict]` | Interrupt the run, optionally archiving its session afterwards. |
 | `wait --session <id> [--until blocked\|terminal] [--timeout <seconds>]` | Poll until the run blocks or reaches a terminal state; 60 seconds by default. |
-| `status --session <id> [--format text\|verb]` | The session and its latest run; `--format verb` prints one declaration line. |
+| `status --session <id> [--format text\|verb] [--tree]` | The session and its latest run; `--format verb` prints one declaration line, `--tree` adds the project projection. |
 | `liveness --session <id>` | `alive`, `dead`, `gone`, or `unknown`. |
 | `result --session <id> [--task <id>]` | Branch, head, diffstat, changed paths, and task evidence. |
 | `retention get` | The worker-wide archive-retention policy, with a disabled window as `off`. |
@@ -193,6 +193,62 @@ uses: `working: …`, `blocked: …`, `paused: …`, `done: …`, or `failed: �
 followed by the run state and the run id. The word is derived by this client
 from the run state; no worker writes it. A session with no run is
 `done: idle -`.
+
+### `status --tree`
+
+`status --tree` returns the whole picture a supervisor needs from one command:
+the requested session and its run as above, then the project it belongs to. It
+reads `Project/GetProjectSnapshotForSession` and, for every project agent whose
+record is `awaiting_approval` or `needs_input`, one
+`Session/GetAgentSessionSnapshotMetadata` to learn which approval or question
+that agent waits on. The requested session reuses the projection the verb
+already read, so its own pending decision appears once, as a `decision` line,
+instead of the plain `pending` line.
+
+One line per record, fields separated by spaces, free text escaped the way the
+`loom-text/1` projection escapes it:
+
+```
+project <project-id> <verdict>
+parent <project-id>
+root <session-id>
+agent <session-id> <depth> <state> <verdict> <task-summary-or-dash>
+task <task-id> <status> <child-name>
+worktree <worktree-name> <status> <relative-path> <base-revision> <result-revision-or-dash> <integrated-revision-or-dash>
+conflict <worktree-name> <path>
+decision approval <session-id> <tool-call-id> <tool-name>
+decision question <session-id> <question-text>
+```
+
+`parent` appears only for a sub project, `conflict` appears after the worktree
+it belongs to, and `-` stands for an absent task summary, result revision, or
+integrated revision. The order is the project, its parent and root, then the
+agents, tasks, and worktrees in snapshot order, then the decisions in agent
+order; a requested session the snapshot does not list comes last.
+
+A per-agent verdict is derived from the session state: `done` for idle and
+completed, `working` for queued, planning, executing, and evaluating,
+`blocked` for awaiting approval and needs input, `paused`, `failed` for failed
+and cancelled, and `archived`. The exact state word is still printed, so a
+cancelled agent stays distinguishable from a failed one. The project verdict is
+the first matching word of `blocked`, `paused`, `working`, `failed`, `done`,
+and `archived`; `archived` therefore only wins when every agent is archived, and
+a project with no agent is `done`. No worker writes these words: they are
+derived by this client from the records the worker returns.
+
+`--json` carries the same projection under `data.project` — `id`,
+`root_session_id`, `parent_project_id`, `verdict`, `counts` (`agents`, `tasks`,
+`worktrees`, `decisions`), `agents`, `tasks`, `worktrees`, and `decisions` —
+with the protocol records serialized as they are and the derived `verdict`
+added to each agent. A decision carries `session_id`, `run_id`, `run_state`,
+`kind`, and either `tool_call_id` and `tool_name` or `question`, all taken from
+the session projection rather than from the project record. The top-level
+`session`, `run`, `state`, `verdict`, `declaration`, and `pending_tool_call`
+keys stay as they are without `--tree`.
+
+`--tree` reports a project, so it refuses `--format verb` with a usage error
+(exit `2`) before any connection is made, and it negotiates `read_project` in
+addition to `read_agent_session`.
 
 `liveness` never guesses. A session that is archived or in a terminal session
 state is `dead` (exit `0`), an id the worker does not know is `gone` (exit
