@@ -479,7 +479,7 @@ impl LoomView {
                     .label(delete_label)
                     .danger()
                     .small()
-                    .disabled(delete_in_flight.is_some())
+                    .disabled(delete_in_flight.is_some() || restore_in_flight.is_some())
                     .accessibility_label(format!("{delete_label}: {}", row.label))
                     .on_click({
                         let view = cx.entity();
