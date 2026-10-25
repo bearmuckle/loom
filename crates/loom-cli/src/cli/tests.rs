@@ -4831,8 +4831,9 @@ fn status_tree_projects_agents_tasks_worktrees_and_decisions() {
     project.worktrees = vec![worktree];
     let project_id = project.project_id;
     let parent_project_id = project.parent_project_id.expect("a parent project");
-    let (base_revision, result_revision, integrated_revision) = (
+    let (base_revision, worktree_task_id, result_revision, integrated_revision) = (
         project.worktrees[0].base_revision.clone(),
+        project.worktrees[0].task_id,
         "1".repeat(40),
         "2".repeat(40),
     );
@@ -4855,8 +4856,8 @@ fn status_tree_projects_agents_tasks_worktrees_and_decisions() {
         format!("agent {child} 2 awaiting_approval blocked wire the status tree"),
         format!("task {task_id} running reviewer"),
         format!(
-            "worktree wt-1 conflict project-worktrees/child {base_revision} {result_revision} \
-             {integrated_revision}"
+            "worktree wt-1 project-worktrees/child conflict {worktree_task_id} {base_revision} \
+             {result_revision} {integrated_revision}"
         ),
         "conflict wt-1 src/main.rs".to_owned(),
         format!("decision approval {child} {call} {tool_name}"),
@@ -5059,6 +5060,7 @@ fn status_tree_prints_dashes_for_an_unintegrated_worktree() {
         "project-worktrees/fresh",
     )];
     let base_revision = project.worktrees[0].base_revision.clone();
+    let task_id = project.worktrees[0].task_id;
 
     // A worktree with no result or integrated revision prints a dash for each,
     // and an empty conflict list prints no conflict line.
@@ -5075,7 +5077,7 @@ fn status_tree_prints_dashes_for_an_unintegrated_worktree() {
         format!("project {root} done"),
         format!("root {root}"),
         format!("agent {root} 1 idle done -"),
-        format!("worktree wt-2 ready project-worktrees/fresh {base_revision} - -"),
+        format!("worktree wt-2 project-worktrees/fresh ready {task_id} {base_revision} - -"),
     ]
     .join("\n");
     assert_eq!(tree.stdout, format!("{expected}\n"));
@@ -5090,6 +5092,54 @@ fn status_tree_prints_dashes_for_an_unintegrated_worktree() {
     assert_eq!(worktree["result_revision"], serde_json::Value::Null);
     assert_eq!(worktree["integrated_revision"], serde_json::Value::Null);
     assert_eq!(worktree["conflict_paths"], serde_json::json!([]));
+}
+
+#[test]
+fn status_tree_and_project_worktrees_print_one_worktree_line() {
+    let fixture = fixture();
+    let root = fixture.session.id;
+    let mut worktree = fake_worktree(
+        root,
+        AgentSessionId::new(),
+        "wt-1",
+        "project-worktrees/child",
+    );
+    worktree.result_revision = Some("1".repeat(40));
+    let (task_id, base_revision, result_revision) = (
+        worktree.task_id,
+        worktree.base_revision.clone(),
+        worktree.result_revision.clone().expect("a result revision"),
+    );
+
+    // Both verbs project one record, so both print the same `worktree` line.
+    let expected = format!(
+        "worktree wt-1 project-worktrees/child ready {task_id} {base_revision} {result_revision} -"
+    );
+    let project = fake_project(root, &[root], vec![worktree]);
+    let mut client = with_project_snapshot(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        root,
+        project,
+    );
+    let root_text = root.to_string();
+    let tree = run(&mut client, &["status", "--session", &root_text, "--tree"]);
+    assert_eq!(tree.code, exit::OK, "{}", tree.stderr);
+    let listed = run(&mut client, &["project", "worktrees", &root_text]);
+    assert_eq!(listed.code, exit::OK, "{}", listed.stderr);
+
+    let worktree_lines = |stdout: &str| {
+        stdout
+            .lines()
+            .filter(|line| line.starts_with("worktree "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(worktree_lines(&tree.stdout), vec![expected]);
+    assert_eq!(
+        worktree_lines(&listed.stdout),
+        worktree_lines(&tree.stdout),
+        "status --tree and project worktrees print the one worktree line"
+    );
 }
 
 #[test]
@@ -6578,8 +6628,13 @@ fn project_worktrees_lists_the_snapshot_records() {
     assert_eq!(
         listed.stdout,
         format!(
-            "project {}\nworktrees 2\nworktree {} ready wt-1 repo\nworktree {} stale wt-2 repo-b\n",
-            project.project_id, first.task_id, second.task_id
+            "project {}\nworktrees 2\nworktree wt-1 repo ready {} {} - -\n\
+             worktree wt-2 repo-b stale {} {} - -\n",
+            project.project_id,
+            first.task_id,
+            first.base_revision,
+            second.task_id,
+            second.base_revision
         )
     );
 

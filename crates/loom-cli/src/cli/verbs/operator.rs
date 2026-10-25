@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 
 use crate::cli::args::{Invocation, RetentionSetArgs, WorktreeDisposition};
 use crate::cli::client::Client;
-use crate::cli::text::escape;
+use crate::cli::text::{escape, worktree_line, worktree_status_name};
 
 use super::supervise::file_status_name;
 use super::{Caller, Failure, Outcome, capability_names, emit, handshake};
@@ -380,16 +380,7 @@ pub(super) async fn worktrees<C: Client>(
         emit(out, &format!("project {}\n", project.project_id))?;
         emit(out, &format!("worktrees {}\n", project.worktrees.len()))?;
         for worktree in &project.worktrees {
-            emit(
-                out,
-                &format!(
-                    "worktree {} {} {} {}\n",
-                    worktree.task_id,
-                    worktree_status_name(worktree.status),
-                    worktree.worktree_name,
-                    worktree.relative_path
-                ),
-            )?;
+            emit(out, &worktree_line(worktree))?;
         }
     }
     let data = json!({
@@ -840,23 +831,6 @@ fn cleanup_disposition(disposition: WorktreeDisposition) -> ProjectWorktreeClean
         WorktreeDisposition::Keep => ProjectWorktreeCleanupDisposition::Retain,
         WorktreeDisposition::Remove => ProjectWorktreeCleanupDisposition::RemoveClean,
         WorktreeDisposition::Discard => ProjectWorktreeCleanupDisposition::DiscardChanges,
-    }
-}
-
-/// The protocol's snake_case spelling of a worktree status, stated explicitly so
-/// a wire rename cannot change the text contract.
-fn worktree_status_name(status: ProjectWorktreeStatus) -> &'static str {
-    match status {
-        ProjectWorktreeStatus::Creating => "creating",
-        ProjectWorktreeStatus::Ready => "ready",
-        ProjectWorktreeStatus::Stale => "stale",
-        ProjectWorktreeStatus::Conflict => "conflict",
-        ProjectWorktreeStatus::Integrating => "integrating",
-        ProjectWorktreeStatus::Integrated => "integrated",
-        ProjectWorktreeStatus::RecoveryRequired => "recovery_required",
-        ProjectWorktreeStatus::CleanupPending => "cleanup_pending",
-        ProjectWorktreeStatus::Retained => "retained",
-        ProjectWorktreeStatus::Removed => "removed",
     }
 }
 

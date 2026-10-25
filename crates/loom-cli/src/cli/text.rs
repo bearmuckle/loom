@@ -6,7 +6,9 @@
 //! Every kind and every fallback variant name is an explicit match arm spelled
 //! exactly like its snake_case serde name: no `Debug` output reaches a user.
 
-use loom_core::{AgentSessionState, EventSequence, LimitStatus};
+use loom_core::{
+    AgentSessionState, EventSequence, LimitStatus, ProjectWorktreeRecord, ProjectWorktreeStatus,
+};
 use loom_model::ToolCall;
 use loom_protocol::{AgentEvent, AgentRunState, ServerEvent, ToolResult};
 use serde_json::Value;
@@ -271,6 +273,41 @@ pub(crate) const fn run_state_name(state: AgentRunState) -> &'static str {
         AgentRunState::Failed => "failed",
         AgentRunState::Cancelled => "cancelled",
     }
+}
+
+/// The status word of a worktree: the protocol's serde spelling, stated
+/// explicitly so a wire rename cannot change the text contract.
+pub(crate) const fn worktree_status_name(status: ProjectWorktreeStatus) -> &'static str {
+    match status {
+        ProjectWorktreeStatus::Creating => "creating",
+        ProjectWorktreeStatus::Ready => "ready",
+        ProjectWorktreeStatus::Stale => "stale",
+        ProjectWorktreeStatus::Conflict => "conflict",
+        ProjectWorktreeStatus::Integrating => "integrating",
+        ProjectWorktreeStatus::Integrated => "integrated",
+        ProjectWorktreeStatus::RecoveryRequired => "recovery_required",
+        ProjectWorktreeStatus::CleanupPending => "cleanup_pending",
+        ProjectWorktreeStatus::Retained => "retained",
+        ProjectWorktreeStatus::Removed => "removed",
+    }
+}
+
+/// The one `worktree` record line `status --tree` and `project worktrees` print,
+/// so a record reads the same in either verb.
+///
+/// The name and path lead, so the `worktree <name> <path>` header of the
+/// single-worktree verbs is already a prefix of this line.
+pub(crate) fn worktree_line(worktree: &ProjectWorktreeRecord) -> String {
+    format!(
+        "worktree {} {} {} {} {} {} {}\n",
+        escape(&worktree.worktree_name),
+        escape(&worktree.relative_path),
+        worktree_status_name(worktree.status),
+        worktree.task_id,
+        worktree.base_revision,
+        worktree.result_revision.as_deref().unwrap_or("-"),
+        worktree.integrated_revision.as_deref().unwrap_or("-"),
+    )
 }
 
 fn source_name(source: loom_core::SessionTitleSource) -> &'static str {

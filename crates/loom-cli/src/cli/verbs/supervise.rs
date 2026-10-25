@@ -21,8 +21,8 @@ use std::{
 
 use loom_core::{
     AgentSessionId, AgentSessionState, DelegatedTaskStatus, ErrorCode, GitFileStatusKind,
-    ProjectSnapshot, ProjectWorktreeStatus, RequestId, RunControlAction, RunId, RunRevision,
-    SessionRepository, ToolCallId,
+    ProjectSnapshot, RequestId, RunControlAction, RunId, RunRevision, SessionRepository,
+    ToolCallId,
 };
 use loom_protocol::{
     ActivityDetail, AgentRunSnapshot, AgentSessionSnapshotProjection, ClientRequest,
@@ -35,7 +35,7 @@ use serde_json::{Value, json};
 use crate::cli::args::{Invocation, StatusFormat, WaitUntil};
 use crate::cli::client::Client;
 use crate::cli::exit;
-use crate::cli::text::{escape, run_state_name, session_state_name};
+use crate::cli::text::{escape, run_state_name, session_state_name, worktree_line};
 
 use super::{Caller, Failure, Outcome, derived_id, emit, handshake};
 
@@ -762,22 +762,6 @@ fn task_status_name(status: DelegatedTaskStatus) -> &'static str {
     }
 }
 
-/// The status word of a worktree: the protocol's serde spelling.
-fn worktree_status_name(status: ProjectWorktreeStatus) -> &'static str {
-    match status {
-        ProjectWorktreeStatus::Creating => "creating",
-        ProjectWorktreeStatus::Ready => "ready",
-        ProjectWorktreeStatus::Stale => "stale",
-        ProjectWorktreeStatus::Conflict => "conflict",
-        ProjectWorktreeStatus::Integrating => "integrating",
-        ProjectWorktreeStatus::Integrated => "integrated",
-        ProjectWorktreeStatus::RecoveryRequired => "recovery_required",
-        ProjectWorktreeStatus::CleanupPending => "cleanup_pending",
-        ProjectWorktreeStatus::Retained => "retained",
-        ProjectWorktreeStatus::Removed => "removed",
-    }
-}
-
 /// The text lines of the project projection: the project, its root, one line
 /// per agent, task, and worktree with that worktree's conflict paths, then the
 /// decisions in agent order.
@@ -820,18 +804,7 @@ fn emit_project(out: &mut dyn Write, project: &ProjectTree) -> Result<(), Failur
         )?;
     }
     for worktree in &snapshot.worktrees {
-        emit(
-            out,
-            &format!(
-                "worktree {} {} {} {} {} {}\n",
-                escape(&worktree.worktree_name),
-                worktree_status_name(worktree.status),
-                escape(&worktree.relative_path),
-                worktree.base_revision,
-                worktree.result_revision.as_deref().unwrap_or("-"),
-                worktree.integrated_revision.as_deref().unwrap_or("-"),
-            ),
-        )?;
+        emit(out, &worktree_line(worktree))?;
         for path in &worktree.conflict_paths {
             emit(
                 out,
@@ -1189,7 +1162,9 @@ async fn session_projection<C: Client>(
 mod tests {
     use loom_core::{AgentSessionState, DelegatedTaskStatus, ProjectWorktreeStatus};
 
-    use super::{agent_verdict, project_verdict, task_status_name, worktree_status_name};
+    use crate::cli::text::worktree_status_name;
+
+    use super::{agent_verdict, project_verdict, task_status_name};
 
     #[test]
     fn every_session_state_has_a_verdict_word() {
