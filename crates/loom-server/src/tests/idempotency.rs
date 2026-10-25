@@ -49,7 +49,8 @@ fn request_slot_is_released_after_a_cached_response() {
     ));
 
     let replay = connection.request(RequestEnvelope::with_request_id(request_id, request));
-    assert_eq!(first, replay);
+    assert_eq!(first.result, replay.result);
+    assert!(!first.replayed && replay.replayed);
     assert!(matches!(
         first.result,
         Ok(ServerResponse::Workspace(
@@ -59,6 +60,49 @@ fn request_slot_is_released_after_a_cached_response() {
     assert!(
         backend.idempotency_store.in_flight_request_ids().is_empty(),
         "a cached response must release its idempotency slot"
+    );
+}
+
+#[test]
+fn a_cached_answer_is_marked_as_a_replay() {
+    let backend = InProcessBackend::new();
+    let connection = backend.connect();
+    negotiate(&connection);
+
+    let request_id = RequestId::new();
+    let request = ClientRequest::Workspace(WorkspaceRequest::CreateWorkspace {
+        name: "replayed".to_owned(),
+    });
+    let first = connection.request(RequestEnvelope::with_request_id(
+        request_id,
+        request.clone(),
+    ));
+    assert!(matches!(
+        first.result,
+        Ok(ServerResponse::Workspace(
+            WorkspaceResponse::WorkspaceCreated(_)
+        ))
+    ));
+    assert!(
+        !first.replayed,
+        "the answer to the first request must not be marked as a replay"
+    );
+
+    let replay = connection.request(RequestEnvelope::with_request_id(
+        request_id,
+        request.clone(),
+    ));
+    assert_eq!(replay.result, first.result);
+    assert!(
+        replay.replayed,
+        "a cached answer must be marked as a replay"
+    );
+
+    let repeated = connection.request(RequestEnvelope::with_request_id(request_id, request));
+    assert_eq!(repeated.result, first.result);
+    assert!(
+        repeated.replayed,
+        "marking the returned copy must not contaminate the cached record"
     );
 }
 
