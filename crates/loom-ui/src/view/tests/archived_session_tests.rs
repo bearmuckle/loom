@@ -9,10 +9,11 @@ use loom_core::Capability;
 use loom_protocol::{ArchiveRetentionPolicy, SessionRequest, SessionResponse};
 
 use crate::view::archive::{
-    ArchivedSessionEntry, ArchivedSessionsState, PROJECT_DELETE_CANCELLATION,
-    RETENTION_WINDOW_PRESETS, RetentionPolicyState, RetentionPolicyText, RetentionWindowChoice,
-    archived_age_label, archived_session_groups, delete_archived_session_request, is_project_tree,
-    project_deletion_consequence, project_row_consequence, retention_editable_state,
+    ArchivedDeletionDeadline, ArchivedSessionEntry, ArchivedSessionsState,
+    PROJECT_DELETE_CANCELLATION, RETENTION_WINDOW_PRESETS, RetentionPolicyState,
+    RetentionPolicyText, RetentionWindowChoice, archived_age_label, archived_session_groups,
+    delete_archived_session_request, is_project_tree, project_deletion_consequence,
+    project_row_consequence, restore_archived_session_request, retention_editable_state,
     retention_policy_state, retention_window_choice, retention_window_choices,
     retention_window_label, sub_agent_retention_window_choice, sub_agent_retention_window_choices,
 };
@@ -35,6 +36,43 @@ fn entry(session: AgentSessionSnapshot) -> ArchivedSessionEntry {
     ArchivedSessionEntry {
         node_id: "test-node".to_owned(),
         session,
+    }
+}
+
+/// The retention state of a policy with the given general and sub-agent windows.
+fn available_retention(
+    retention_ms: Option<u64>,
+    sub_agent_ms: Option<u64>,
+) -> RetentionPolicyState {
+    RetentionPolicyState::Available(ArchiveRetentionPolicy {
+        retention_ms,
+        force_discard_worktrees: false,
+        sub_agent_retention_ms: sub_agent_ms,
+    })
+}
+
+/// A delegated task of `root` targeting `target`.
+fn delegated_task(
+    root: AgentSessionId,
+    target: AgentSessionId,
+    child_name: &str,
+    status: loom_core::DelegatedTaskStatus,
+) -> loom_core::DelegatedTaskRecord {
+    loom_core::DelegatedTaskRecord {
+        task_id: loom_core::TaskId::new(),
+        project_id: loom_core::ProjectId::from_uuid(*root.as_uuid()),
+        requester_session_id: root,
+        target_session_id: target,
+        child_name: child_name.to_owned(),
+        intent: "inspect the archive pane".to_owned(),
+        model_id: "deterministic/demo".to_owned(),
+        context_references: Vec::new(),
+        dependencies: Vec::new(),
+        code_change: false,
+        permissions: loom_core::ProjectAgentPermissions::default(),
+        status,
+        created_at: Timestamp::from_unix_millis(1),
+        updated_at: Timestamp::from_unix_millis(1),
     }
 }
 
@@ -102,7 +140,13 @@ fn archived_sessions_list_one_row_per_project_with_the_tree_size() {
         }
     }
 
-    let groups = archived_session_groups(&entries, &[project], &BTreeMap::new(), now);
+    let groups = archived_session_groups(
+        &entries,
+        &[project],
+        &BTreeMap::new(),
+        now,
+        &RetentionPolicyState::Unavailable,
+    );
 
     assert_eq!(
         groups.len(),
@@ -144,7 +188,13 @@ fn archived_sessions_list_one_row_per_project_with_the_tree_size() {
 
     // A session with no project snapshot still groups under the trailing
     // heading, with no row of its own in any project.
-    let without_projects = archived_session_groups(&entries, &[], &BTreeMap::new(), now);
+    let without_projects = archived_session_groups(
+        &entries,
+        &[],
+        &BTreeMap::new(),
+        now,
+        &RetentionPolicyState::Unavailable,
+    );
     assert_eq!(without_projects.len(), 1);
     assert_eq!(without_projects[0].label, "No project");
     assert_eq!(without_projects[0].rows.len(), entries.len());
@@ -161,8 +211,13 @@ fn an_archived_sub_agent_of_an_unarchived_project_is_not_listed_at_all() {
     let entries = vec![entry(archived_session(child, "Researcher", now))];
     let names = BTreeMap::from([(root, "Checkout flow".to_owned())]);
 
-    let groups =
-        archived_session_groups(&entries, &[project_snapshot(root, &[child])], &names, now);
+    let groups = archived_session_groups(
+        &entries,
+        &[project_snapshot(root, &[child])],
+        &names,
+        now,
+        &RetentionPolicyState::Unavailable,
+    );
     assert!(groups.is_empty(), "{groups:?}");
 }
 
@@ -183,6 +238,7 @@ fn a_session_that_only_covers_itself_is_not_a_project_row() {
         &[project_snapshot(lonely, &[])],
         &BTreeMap::new(),
         now,
+        &RetentionPolicyState::Unavailable,
     );
 
     assert_eq!(groups.len(), 1);
@@ -457,6 +513,190 @@ fn delete_requests_carry_the_force_choice() {
 }
 
 #[test]
+fn restore_requests_target_the_archived_session() {
+    let session_id = AgentSessionId::new();
+    assert!(matches!(
+        restore_archived_session_request(session_id),
+        ClientRequest::Session(SessionRequest::RestoreAgentSession { session_id: requested })
+            if requested == session_id
+    ));
+}
+
+#[test]
+fn deletion_deadlines_render_compactly() {
+    let now = 1_700_000_000_000u64;
+    assert_eq!(
+        ArchivedDeletionDeadline::At(now + 30_000).label(now),
+        "deletes in <1m"
+    );
+    assert_eq!(
+        ArchivedDeletionDeadline::At(now + 9 * 60_000).label(now),
+        "deletes in 9m"
+    );
+    assert_eq!(
+        ArchivedDeletionDeadline::At(now + 3_600_000).label(now),
+        "deletes in 1h"
+    );
+    assert_eq!(
+        ArchivedDeletionDeadline::At(now + 64 * 60_000).label(now),
+        "deletes in 1h 4m"
+    );
+    assert_eq!(
+        ArchivedDeletionDeadline::At(now + 3 * 86_400_000).label(now),
+        "deletes in 3d"
+    );
+    assert_eq!(ArchivedDeletionDeadline::At(now).label(now), "deletes now");
+    assert_eq!(
+        ArchivedDeletionDeadline::At(now - 1).label(now),
+        "deletes now",
+        "a window that already closed reads as due"
+    );
+    assert_eq!(
+        ArchivedDeletionDeadline::KeptIndefinitely.label(now),
+        "kept indefinitely"
+    );
+    assert_eq!(
+        ArchivedDeletionDeadline::Unknown.label(now),
+        "deletion time unknown"
+    );
+    assert_eq!(
+        ArchivedDeletionDeadline::Blocked("blocked: task 'Researcher' is not terminal".to_owned())
+            .label(now),
+        "blocked: task 'Researcher' is not terminal"
+    );
+}
+
+#[test]
+fn a_project_row_counts_down_to_the_earliest_member_window() {
+    let now = 1_700_000_000_000u64;
+    let day = 86_400_000u64;
+    let root = AgentSessionId::new();
+    let child = AgentSessionId::new();
+    let entries = vec![
+        entry(archived_session(root, "Checkout flow", now - day)),
+        entry(archived_session(child, "Researcher", now - 60_000)),
+    ];
+    // The root keeps a week and the sub-agent ten minutes, so the sub-agent's
+    // shorter window is the one the whole row counts down to.
+    let groups = archived_session_groups(
+        &entries,
+        &[project_snapshot(root, &[child])],
+        &BTreeMap::new(),
+        now,
+        &available_retention(Some(7 * day), Some(600_000)),
+    );
+    let deadline = groups[0].rows[0].deadline.clone();
+    assert_eq!(
+        deadline,
+        ArchivedDeletionDeadline::At(now - 60_000 + 600_000),
+        "the earliest window any member has dates the row"
+    );
+    assert_eq!(deadline.label(now), "deletes in 9m");
+    // The countdown moves with the clock instead of freezing when the row was
+    // built.
+    assert_eq!(deadline.label(now + 480_000), "deletes in 1m");
+    assert_eq!(deadline.label(now + 540_000), "deletes now");
+}
+
+#[test]
+fn a_plain_row_counts_down_with_the_general_window() {
+    let now = 1_700_000_000_000u64;
+    let day = 86_400_000u64;
+    let session = AgentSessionId::new();
+    let entries = vec![entry(archived_session(session, "Standalone", now - day))];
+    let groups = archived_session_groups(
+        &entries,
+        &[],
+        &BTreeMap::new(),
+        now,
+        &available_retention(Some(7 * day), Some(600_000)),
+    );
+    assert_eq!(
+        groups[0].rows[0].deadline,
+        ArchivedDeletionDeadline::At(now - day + 7 * day),
+        "a session no project covers reads the general window, not the sub-agent one"
+    );
+    assert_eq!(groups[0].rows[0].deadline.label(now), "deletes in 6d");
+}
+
+#[test]
+fn a_blocker_or_a_disabled_window_replaces_the_countdown() {
+    let now = 1_700_000_000_000u64;
+    let root = AgentSessionId::new();
+    let child = AgentSessionId::new();
+    let retention = available_retention(Some(86_400_000), Some(600_000));
+
+    // A task that is not terminal blocks the row whatever the windows say, and
+    // a terminal one does not.
+    let mut project = project_snapshot(root, &[child]);
+    project.tasks.push(delegated_task(
+        root,
+        child,
+        "Researcher",
+        loom_core::DelegatedTaskStatus::Running,
+    ));
+    let entries = vec![entry(archived_session(root, "Checkout flow", now - 60_000))];
+    let groups = archived_session_groups(
+        &entries,
+        std::slice::from_ref(&project),
+        &BTreeMap::new(),
+        now,
+        &retention,
+    );
+    assert_eq!(
+        groups[0].rows[0].deadline,
+        ArchivedDeletionDeadline::Blocked("blocked: task 'Researcher' is not terminal".to_owned())
+    );
+    project.tasks[0].status = loom_core::DelegatedTaskStatus::Completed;
+    let groups = archived_session_groups(
+        &entries,
+        std::slice::from_ref(&project),
+        &BTreeMap::new(),
+        now,
+        &retention,
+    );
+    assert_eq!(
+        groups[0].rows[0].deadline,
+        ArchivedDeletionDeadline::At(now - 60_000 + 86_400_000)
+    );
+
+    // A member whose archive time is ahead of the clock is blocked as well.
+    let session = AgentSessionId::new();
+    let ahead = vec![entry(archived_session(session, "Ahead", now + 60_000))];
+    let groups = archived_session_groups(&ahead, &[], &BTreeMap::new(), now, &retention);
+    assert_eq!(
+        groups[0].rows[0].deadline,
+        ArchivedDeletionDeadline::Blocked("blocked: archive time is ahead of the clock".to_owned())
+    );
+
+    // A window that is turned off keeps the row indefinitely, and a policy the
+    // client cannot read cannot date it at all.
+    let kept = vec![entry(archived_session(session, "Kept", now - 60_000))];
+    let groups = archived_session_groups(
+        &kept,
+        &[],
+        &BTreeMap::new(),
+        now,
+        &available_retention(None, Some(600_000)),
+    );
+    assert_eq!(
+        groups[0].rows[0].deadline,
+        ArchivedDeletionDeadline::KeptIndefinitely
+    );
+    for unknown in [
+        RetentionPolicyState::Loading,
+        RetentionPolicyState::Unavailable,
+    ] {
+        let groups = archived_session_groups(&kept, &[], &BTreeMap::new(), now, &unknown);
+        assert_eq!(
+            groups[0].rows[0].deadline,
+            ArchivedDeletionDeadline::Unknown,
+            "an unknown policy renders as unknown"
+        );
+    }
+}
+
+#[test]
 fn archived_session_management_advertises_its_capabilities() {
     let capabilities = crate::connection::negotiation_capabilities();
     assert!(capabilities.contains(Capability::DeleteAgentSession));
@@ -573,6 +813,161 @@ fn deleting_without_force_reports_the_refusal_and_keeps_the_row(cx: &mut TestApp
 }
 
 #[gpui_kit::test]
+fn restoring_an_archived_session_removes_the_row_and_returns_it_to_idle(cx: &mut TestAppContext) {
+    let view = cx.new(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        crate::connection::negotiate(&view.connection).unwrap();
+        let (workspace, archived) = archived_session_on(&view.connection, "restore me");
+        view.workspace_id = workspace.id;
+        view.workspaces = vec![workspace];
+        view.session_node_ids
+            .insert(archived.id, view.default_backend_node_id.clone());
+        view.active_session = archived.clone();
+        view.sessions = vec![archived];
+        view.open_archived_sessions(cx);
+        view
+    });
+    cx.run_until_parked();
+
+    let session_id = cx.update(|cx| {
+        let view = view.read(cx);
+        assert_eq!(view.archived_sessions.entries.len(), 1);
+        assert!(
+            view.archived_sessions.clock_running,
+            "the surface ticks while it is open"
+        );
+        view.archived_sessions.entries[0].session.id
+    });
+
+    view.update(cx, |view, cx| view.restore_archived_session(session_id, cx));
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(view.archived_sessions.restore_in_flight.is_none());
+        assert!(view.archived_sessions.restore_refusal.is_none());
+        assert!(
+            !view
+                .archived_sessions
+                .entries
+                .iter()
+                .any(|entry| entry.session.id == session_id),
+            "the restored row leaves the surface"
+        );
+        let status = view.status_banner.as_ref().map(|note| note.text.clone());
+        assert_eq!(status.as_deref(), Some("Session restored"));
+        assert_eq!(
+            listed_sessions(view, view.workspace_id)
+                .into_iter()
+                .find(|session| session.id == session_id)
+                .map(|session| session.state),
+            Some(AgentSessionState::Idle),
+            "the worker returned the session to the same state it keeps"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn a_restore_without_a_worker_or_with_an_unexpected_answer_is_reported(cx: &mut TestAppContext) {
+    let view = cx.new(|cx| LoomView::new_for_test(cx.focus_handle()));
+
+    // No loaded row and no assigned worker: there is nowhere to send the
+    // request, so the surface says so instead of guessing a backend.
+    let unknown = AgentSessionId::new();
+    view.update(cx, |view, cx| view.restore_archived_session(unknown, cx));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(view.archived_sessions.restore_in_flight.is_none());
+        assert_eq!(
+            view.status_banner.as_ref().map(|note| note.text.as_str()),
+            Some("Cannot restore the session: no worker owns it")
+        );
+    });
+
+    // A restore already in flight is not started again.
+    let session_id = AgentSessionId::new();
+    view.update(cx, |view, cx| {
+        view.archived_sessions.restore_in_flight = Some(session_id);
+        view.restore_archived_session(session_id, cx);
+        assert_eq!(view.archived_sessions.restore_in_flight, Some(session_id));
+    });
+
+    // A refusal shows the backend's reason, so it can be corrected and retried.
+    view.update(cx, |view, cx| {
+        let request = RequestEnvelope::new(restore_archived_session_request(session_id));
+        view.finish_archived_session_restore(
+            session_id,
+            ResponseEnvelope::failure(
+                request.request_id,
+                LoomError::new(
+                    ErrorCode::InvalidState,
+                    "cannot restore session: archived descendant session(s) were deleted",
+                    false,
+                ),
+            ),
+            cx,
+        );
+    });
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(view.archived_sessions.restore_in_flight.is_none());
+        let refusal = view
+            .archived_sessions
+            .restore_refusal
+            .clone()
+            .expect("a refused restore is shown in the surface");
+        assert!(refusal.contains("descendant"), "{refusal}");
+    });
+
+    // Any other successful answer is an unexpected response, not a restore.
+    view.update(cx, |view, cx| {
+        let request = RequestEnvelope::new(restore_archived_session_request(session_id));
+        view.finish_archived_session_restore(
+            session_id,
+            ResponseEnvelope::success(
+                request.request_id,
+                ServerResponse::Workspace(WorkspaceResponse::Workspaces { workspaces: vec![] }),
+            ),
+            cx,
+        );
+    });
+    cx.update(|cx| {
+        let view = view.read(cx);
+        let refusal = view
+            .archived_sessions
+            .restore_refusal
+            .clone()
+            .expect("an unexpected answer is reported");
+        assert!(refusal.contains("unexpected"), "{refusal}");
+    });
+}
+
+#[gpui_kit::test]
+fn the_archive_clock_stops_once_the_surface_is_closed(cx: &mut TestAppContext) {
+    let view = cx.new(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.open_archived_sessions(cx);
+        view
+    });
+
+    let ticking = view.update(cx, |view, cx| view.tick_archived_sessions_clock(cx));
+    assert!(ticking, "an open surface keeps its labels moving");
+
+    view.update(cx, |view, cx| {
+        view.close_archived_sessions(cx);
+        assert!(!view.tick_archived_sessions_clock(cx));
+        assert!(
+            !view.archived_sessions.clock_running,
+            "a closed surface stops its clock"
+        );
+        // Opening it again starts a clock of its own.
+        view.open_archived_sessions(cx);
+        assert!(view.archived_sessions.clock_running);
+    });
+}
+
+#[gpui_kit::test]
 fn loading_archived_sessions_reuses_a_project_snapshot_the_client_already_has(
     cx: &mut TestAppContext,
 ) {
@@ -606,6 +1001,7 @@ fn loading_archived_sessions_reuses_a_project_snapshot_the_client_already_has(
             &view.archived_sessions.projects,
             &view.known_session_names(),
             Timestamp::now().as_unix_millis(),
+            &view.archived_sessions.retention,
         );
         assert!(
             groups.is_empty(),
@@ -1232,6 +1628,85 @@ fn archived_sessions_surface_renders_the_policy_and_the_rows(cx: &mut TestAppCon
             Some("Delete project: Archived project")
         );
         assert!(window.find(("archived-session-force", 0usize)).visible());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn an_archived_row_renders_its_deadline_and_restore_action(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let root = AgentSessionId::new();
+    let child = AgentSessionId::new();
+    let mut built = None;
+    let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            let workspace_id = view.workspace_id;
+            let archived_at = Timestamp::now().as_unix_millis();
+            let session = move |id, name: &str| AgentSessionSnapshot {
+                id,
+                workspace_id,
+                name: name.to_owned(),
+                goal: None,
+                state: AgentSessionState::Archived,
+                created_at: Timestamp::from_unix_millis(archived_at),
+                updated_at: Timestamp::from_unix_millis(archived_at),
+                title_source: loom_core::SessionTitleSource::Auto,
+            };
+            view.show_surface(CoveringSurface::ArchivedSessions);
+            view.archived_sessions = ArchivedSessionsState {
+                loaded: true,
+                entries: vec![
+                    entry(session(root, "Archived project")),
+                    entry(session(child, "Archived child")),
+                    entry(session(AgentSessionId::new(), "Standalone")),
+                ],
+                projects: vec![project_snapshot(root, &[child])],
+                retention: available_retention(Some(7 * 86_400_000), Some(600_000)),
+                ..ArchivedSessionsState::default()
+            };
+            view
+        });
+        built = Some(view.clone());
+        gpui_kit::component::Root::new(view, window, cx)
+    });
+    let view = built.expect("the window built the view");
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        // The project row offers a project restore; the standalone session
+        // beneath it offers a plain one.
+        assert_eq!(
+            window.find(("archived-session-restore", 0usize)).label(),
+            Some("Restore project: Archived project")
+        );
+        assert_eq!(
+            window.find(("archived-session-restore", 1usize)).label(),
+            Some("Restore: Standalone")
+        );
+        let deadline = window
+            .find(("archived-session-deadline", 0usize))
+            .label()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(deadline.starts_with("deletes in"), "{deadline}");
+        // The project row counts down to its sub-agent's shorter window.
+        assert!(deadline.ends_with('m'), "{deadline}");
+        assert!(window.find(("archived-session-deadline", 1usize)).visible());
+    })
+    .unwrap();
+
+    // A refused restore is its own block, next to the delete refusal.
+    view.update(cx, |view, cx| {
+        view.archived_sessions.restore_refusal =
+            Some("archived descendant session(s) were deleted".to_owned());
+        cx.notify();
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.find("archived-session-restore-refusal").visible());
+        assert!(window.find(("archived-session-restore", 0usize)).visible());
     })
     .unwrap();
 }

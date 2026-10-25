@@ -27,6 +27,54 @@ pub(crate) struct ArchivedSessionEntry {
     pub(crate) session: AgentSessionSnapshot,
 }
 
+/// How long an archived-session row has before the retention sweep deletes it.
+///
+/// The window counts from a session's archive time, which is its `updated_at`,
+/// the same value the row's age reads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ArchivedDeletionDeadline {
+    /// The sweep may delete the row at this millisecond timestamp.
+    At(u64),
+    /// No member has a retention window, so nothing deletes the row on its own.
+    KeptIndefinitely,
+    /// A reason the row cannot be swept yet, checked before any window.
+    Blocked(String),
+    /// The worker's policy is not known, so no window can be read.
+    Unknown,
+}
+
+impl ArchivedDeletionDeadline {
+    /// The row's text, relative to `now_millis`.
+    pub(crate) fn label(&self, now_millis: u64) -> String {
+        match self {
+            Self::At(at) if *at <= now_millis => "deletes now".to_owned(),
+            Self::At(at) => format!("deletes in {}", compact_remaining(*at - now_millis)),
+            Self::KeptIndefinitely => "kept indefinitely".to_owned(),
+            Self::Blocked(reason) => reason.clone(),
+            Self::Unknown => "deletion time unknown".to_owned(),
+        }
+    }
+}
+
+/// A compact remaining time: `<1m`, `9m`, `1h 4m`, `3d`.
+fn compact_remaining(remaining_millis: u64) -> String {
+    if remaining_millis < 60_000 {
+        return "<1m".to_owned();
+    }
+    let minutes = remaining_millis / 60_000;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return match minutes % 60 {
+            0 => format!("{hours}h"),
+            rest => format!("{hours}h {rest}m"),
+        };
+    }
+    format!("{}d", hours / 24)
+}
+
 /// One archived-session row.
 ///
 /// A project contributes exactly one row, which carries the whole tree: the
@@ -42,6 +90,8 @@ pub(crate) struct ArchivedSessionRow {
     pub(crate) node_id: String,
     /// `Archived 3d ago`, from the newest archived member's archive timestamp.
     pub(crate) age: String,
+    /// When the retention sweep may delete the row, or why it cannot yet.
+    pub(crate) deadline: ArchivedDeletionDeadline,
     /// How many sessions a deletion removes: the whole tree for a project row,
     /// one for a plain row.
     pub(crate) session_count: usize,
@@ -446,6 +496,72 @@ fn keep_members_named_by(
         .sort_by_key(|agent| (agent.depth, agent.session_id));
 }
 
+/// Whether a delegated task's status lets its project be swept.
+fn task_is_terminal(status: loom_core::DelegatedTaskStatus) -> bool {
+    matches!(
+        status,
+        loom_core::DelegatedTaskStatus::Completed
+            | loom_core::DelegatedTaskStatus::Failed
+            | loom_core::DelegatedTaskStatus::Cancelled
+    )
+}
+
+/// The deletion deadline one archived-session row shows.
+///
+/// A project that still holds a task which is not terminal, or a member whose
+/// archive time is ahead of the clock, blocks the row rather than dating it:
+/// the sweep would not take it anyway, and a countdown would read as a promise.
+/// Otherwise the earliest window any member has dates the row, a root member
+/// reading the general window and every other member the sub-agent window. A
+/// row no member has a window for is kept indefinitely.
+fn archived_row_deadline(
+    members: &[&ArchivedSessionEntry],
+    tasks: &[loom_core::DelegatedTaskRecord],
+    root_session_id: Option<AgentSessionId>,
+    retention: &RetentionPolicyState,
+    now_millis: u64,
+) -> ArchivedDeletionDeadline {
+    if let Some(task) = tasks.iter().find(|task| !task_is_terminal(task.status)) {
+        return ArchivedDeletionDeadline::Blocked(format!(
+            "blocked: task '{}' is not terminal",
+            task.child_name
+        ));
+    }
+    if members
+        .iter()
+        .any(|member| member.session.updated_at.as_unix_millis() > now_millis)
+    {
+        return ArchivedDeletionDeadline::Blocked(
+            "blocked: archive time is ahead of the clock".to_owned(),
+        );
+    }
+    let RetentionPolicyState::Available(policy) = retention else {
+        return ArchivedDeletionDeadline::Unknown;
+    };
+    let mut earliest: Option<u64> = None;
+    for member in members {
+        let window = if Some(member.session.id) == root_session_id {
+            policy.retention()
+        } else {
+            policy.sub_agent_retention()
+        };
+        let Some(window) = window else {
+            continue;
+        };
+        let window_millis = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
+        let at = member
+            .session
+            .updated_at
+            .as_unix_millis()
+            .saturating_add(window_millis);
+        earliest = Some(earliest.map_or(at, |current| current.min(at)));
+    }
+    earliest.map_or(
+        ArchivedDeletionDeadline::KeptIndefinitely,
+        ArchivedDeletionDeadline::At,
+    )
+}
+
 /// Groups archived sessions by the project the backend projects for them.
 ///
 /// A project the client can resolve that covers at least one archived session
@@ -456,11 +572,15 @@ fn keep_members_named_by(
 /// A session any known snapshot names as a project member is hidden, even when
 /// the snapshot kept for its project does not name it: the pane never shows a
 /// sub-agent as a plain row.
+///
+/// Each row is also dated against `retention`, so the surface can show when the
+/// sweep may delete it and why it cannot yet.
 pub(crate) fn archived_session_groups(
     entries: &[ArchivedSessionEntry],
     projects: &[loom_core::ProjectSnapshot],
     session_names: &BTreeMap<AgentSessionId, String>,
     now_millis: u64,
+    retention: &RetentionPolicyState,
 ) -> Vec<ArchivedSessionGroup> {
     let by_id = entries
         .iter()
@@ -514,6 +634,13 @@ pub(crate) fn archived_session_groups(
             .map(|entry| entry.session.name.clone())
             .or_else(|| session_names.get(&project.root_session_id).cloned())
             .unwrap_or_else(|| format!("Project {}", short_session_id(project.root_session_id)));
+        // The deletion removes the whole tree, so every archived member dates
+        // the row: a sub-agent's shorter window can come due before the root's.
+        let archived_members = project
+            .agents
+            .iter()
+            .filter_map(|agent| by_id.get(&agent.session_id).copied())
+            .collect::<Vec<_>>();
         groups.push(ArchivedSessionGroup {
             project_root: Some(project.root_session_id),
             label: label.clone(),
@@ -522,6 +649,13 @@ pub(crate) fn archived_session_groups(
                 label,
                 node_id,
                 age: archived_age_label(newest.session.updated_at.as_unix_millis(), now_millis),
+                deadline: archived_row_deadline(
+                    &archived_members,
+                    &project.tasks,
+                    Some(project.root_session_id),
+                    retention,
+                    now_millis,
+                ),
                 session_count: project.agents.len(),
                 is_project: true,
             }],
@@ -553,6 +687,15 @@ pub(crate) fn archived_session_groups(
                     label: entry.session.name.clone(),
                     node_id: entry.node_id.clone(),
                     age: archived_age_label(entry.session.updated_at.as_unix_millis(), now_millis),
+                    // A session no project covers is the root of its own tree,
+                    // so the general window applies to it.
+                    deadline: archived_row_deadline(
+                        &[entry],
+                        &[],
+                        Some(entry.session.id),
+                        retention,
+                        now_millis,
+                    ),
                     session_count: 1,
                     is_project: false,
                 })
@@ -569,6 +712,12 @@ pub(crate) fn delete_archived_session_request(
     force: bool,
 ) -> ClientRequest {
     ClientRequest::Session(SessionRequest::DeleteAgentSession { session_id, force })
+}
+
+/// The restore request for one archived session, which returns it to `Idle`
+/// without removing anything it stored.
+pub(crate) fn restore_archived_session_request(session_id: AgentSessionId) -> ClientRequest {
+    ClientRequest::Session(SessionRequest::RestoreAgentSession { session_id })
 }
 
 /// The archived-session surface state. `entries` and `projects` are the last
@@ -609,6 +758,14 @@ pub(crate) struct ArchivedSessionsState {
     pub(crate) force: BTreeSet<AgentSessionId>,
     /// The session with a delete request in flight, if any.
     pub(crate) delete_in_flight: Option<AgentSessionId>,
+    /// The session with a restore request in flight, if any.
+    pub(crate) restore_in_flight: Option<AgentSessionId>,
+    /// The last refused restore and the backend's reason. A refusal leaves the
+    /// row in place, so it can be corrected and retried.
+    pub(crate) restore_refusal: Option<String>,
+    /// Whether the surface's clock is ticking, which refreshes the row labels
+    /// that depend on the current time.
+    pub(crate) clock_running: bool,
 }
 
 impl LoomView {
@@ -625,6 +782,7 @@ impl LoomView {
             &self.archived_sessions.projects,
             &self.known_session_names(),
             now_millis,
+            &self.archived_sessions.retention,
         )
     }
 
@@ -634,7 +792,57 @@ impl LoomView {
         // else covered the conversation, including a phone's session drawer.
         self.show_surface(CoveringSurface::ArchivedSessions);
         self.archived_sessions.refusal = None;
+        self.archived_sessions.restore_refusal = None;
+        self.start_archived_sessions_clock(cx);
         self.reload_archived_sessions(cx);
+    }
+
+    /// Refreshes the surface's time-dependent labels while it is on screen.
+    ///
+    /// The deletion countdown and the archive age both move with the clock, so
+    /// an idle surface would otherwise keep showing the time it was drawn at.
+    /// The loop ends, and clears its flag, as soon as the surface is no longer
+    /// the covering surface.
+    pub(crate) fn start_archived_sessions_clock(&mut self, cx: &mut Context<Self>) {
+        if self.archived_sessions.clock_running {
+            return;
+        }
+        self.archived_sessions.clock_running = true;
+        cx.spawn(async move |view, cx| {
+            loop {
+                #[cfg(target_family = "wasm")]
+                {
+                    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+                        if let Some(window) = web_sys::window() {
+                            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                                &resolve, 1_000,
+                            );
+                        }
+                    });
+                    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+                }
+                #[cfg(not(target_family = "wasm"))]
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let ticking = view
+                    .update(cx, |view, cx| view.tick_archived_sessions_clock(cx))
+                    .unwrap_or(false);
+                if !ticking {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Applies one tick of the surface's clock. Returns whether it keeps
+    /// ticking, which stops once the surface is no longer the covering surface.
+    pub(crate) fn tick_archived_sessions_clock(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.archived_sessions_open() {
+            cx.notify();
+            return true;
+        }
+        self.archived_sessions.clock_running = false;
+        false
     }
 
     /// Closes the archived-sessions surface, which is the surface its own close
@@ -1267,6 +1475,103 @@ impl LoomView {
                 cx.notify();
             }
         }
+    }
+
+    /// Restores one archived session, which returns it to `Idle` and leaves
+    /// everything it stored in place. The request goes to the worker that owns
+    /// the session; a project root restores its archived descendants with it.
+    pub(crate) fn restore_archived_session(
+        &mut self,
+        session_id: AgentSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.archived_sessions.restore_in_flight.is_some() {
+            log::info!(
+                "[loom-ui] ignoring the restore of archived session {session_id}: another restore is already in flight"
+            );
+            return;
+        }
+        let Some(node_id) = self.archived_session_node(session_id) else {
+            log::warn!("[loom-ui] ignoring the restore of {session_id}: no worker owns it");
+            self.record_status("Cannot restore the session: no worker owns it");
+            cx.notify();
+            return;
+        };
+        self.archived_sessions.restore_in_flight = Some(session_id);
+        self.archived_sessions.restore_refusal = None;
+        log::info!("[loom-ui] restoring archived session {session_id} on worker {node_id}");
+        self.dispatch_to_node(
+            cx,
+            node_id,
+            restore_archived_session_request(session_id),
+            move |view, response, cx| {
+                view.finish_archived_session_restore(session_id, response, cx);
+            },
+        );
+        cx.notify();
+    }
+
+    /// Applies the answer to a restore request.
+    ///
+    /// A refusal leaves the row in place and shows the backend's reason, so the
+    /// user can correct it and retry. Success drops every row the restore took
+    /// out of the archive and reloads the listing from the workers.
+    pub(crate) fn finish_archived_session_restore(
+        &mut self,
+        session_id: AgentSessionId,
+        response: ResponseEnvelope,
+        cx: &mut Context<Self>,
+    ) {
+        self.archived_sessions.restore_in_flight = None;
+        match response.result {
+            Ok(ServerResponse::Session(SessionResponse::AgentSessionRestored(snapshot))) => {
+                if snapshot.id != session_id {
+                    log::warn!(
+                        "[loom-ui] the restore of {session_id} reported session {} as restored",
+                        snapshot.id
+                    );
+                }
+                log::info!("[loom-ui] restored archived session {}", snapshot.id);
+                self.archived_sessions.restore_refusal = None;
+                let project = self
+                    .project_root_snapshot(session_id)
+                    .filter(is_project_tree);
+                let restored = match &project {
+                    Some(project) => project
+                        .agents
+                        .iter()
+                        .map(|agent| agent.session_id)
+                        .chain(std::iter::once(session_id))
+                        .collect::<BTreeSet<_>>(),
+                    None => BTreeSet::from([session_id]),
+                };
+                self.archived_sessions
+                    .entries
+                    .retain(|entry| !restored.contains(&entry.session.id));
+                self.record_status(if project.is_some() {
+                    "Project restored"
+                } else {
+                    "Session restored"
+                });
+                self.reload_archived_sessions(cx);
+            }
+            Err(error) => {
+                log::warn!(
+                    "[loom-ui] restoring archived session {session_id} was refused: {:?}: {}",
+                    error.code,
+                    error.message
+                );
+                self.archived_sessions.restore_refusal = Some(error.message);
+            }
+            Ok(response) => {
+                log::warn!(
+                    "[loom-ui] restoring archived session {session_id} returned an unexpected response"
+                );
+                let error = unexpected_response("archived session restore", response);
+                self.archived_sessions.restore_refusal = Some(error.message);
+            }
+        }
+        cx.notify();
     }
 
     /// Applies a confirmed removal of `deleted` and every session the backend

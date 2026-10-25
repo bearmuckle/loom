@@ -13,6 +13,8 @@ struct ArchivedSessionRowStyle {
     index: usize,
     force: bool,
     delete_in_flight: Option<AgentSessionId>,
+    restore_in_flight: Option<AgentSessionId>,
+    now_millis: u64,
     first_in_group: bool,
     phone: bool,
 }
@@ -60,6 +62,23 @@ impl LoomView {
                     .child(format!("Delete refused: {refusal}")),
             );
         }
+        if let Some(refusal) = &self.archived_sessions.restore_refusal {
+            content = content.child(
+                div()
+                    .id("archived-session-restore-refusal")
+                    .test_support()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
+                    .bg(rgb(0x2a1c22))
+                    .border_1()
+                    .border_color(rgb(0x7f1d1d))
+                    .text_sm()
+                    .text_color(rgb(0xfca5a5))
+                    .child(format!("Restore refused: {refusal}")),
+            );
+        }
         if let Some(error) = &self.archived_sessions.error {
             content = content.child(
                 div()
@@ -96,6 +115,7 @@ impl LoomView {
         } else {
             let force = self.archived_sessions.force.clone();
             let delete_in_flight = self.archived_sessions.delete_in_flight;
+            let restore_in_flight = self.archived_sessions.restore_in_flight;
             let mut row_index = 0usize;
             for group in &groups {
                 let mut card = settings_card();
@@ -105,6 +125,8 @@ impl LoomView {
                         index: row_index,
                         force: force.contains(&row.session_id),
                         delete_in_flight,
+                        restore_in_flight,
+                        now_millis: now,
                         first_in_group,
                         phone,
                     };
@@ -394,12 +416,19 @@ impl LoomView {
         let session_id = row.session_id;
         let is_project = row.is_project;
         let delete_in_flight = style.delete_in_flight;
+        let restore_in_flight = style.restore_in_flight;
         let phone = style.phone;
+        let restore_label = if is_project {
+            "Restore project"
+        } else {
+            "Restore"
+        };
         let delete_label = if is_project {
             "Delete project"
         } else {
             "Delete"
         };
+        let deadline = row.deadline.label(style.now_millis);
         let consequence = if is_project {
             project_row_consequence(row.session_count)
         } else {
@@ -424,6 +453,23 @@ impl LoomView {
                             let checked = *checked;
                             view.update(cx, |view, cx| {
                                 view.set_archived_session_force(session_id, checked, cx);
+                            });
+                        }
+                    }),
+            )
+            .child(
+                Button::new(("archived-session-restore", index))
+                    .label(restore_label)
+                    .small()
+                    .disabled(restore_in_flight.is_some() || delete_in_flight.is_some())
+                    .accessibility_label(format!("{restore_label}: {}", row.label))
+                    .on_click({
+                        let view = cx.entity();
+                        move |_, _, cx| {
+                            // A restore removes nothing, so it needs no
+                            // confirmation, not even for a whole project.
+                            view.update(cx, |view, cx| {
+                                view.restore_archived_session(session_id, cx);
                             });
                         }
                     }),
@@ -495,6 +541,15 @@ impl LoomView {
                             .text_color(rgb(0x8f98a6))
                             .child(row.age.clone()),
                     ),
+            )
+            .child(
+                div()
+                    .id(("archived-session-deadline", index))
+                    .test_support()
+                    .aria_label(deadline.clone())
+                    .text_xs()
+                    .text_color(rgb(0x64748b))
+                    .child(deadline),
             )
             .child(
                 div()
