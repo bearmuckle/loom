@@ -51,11 +51,7 @@ impl InProcessBackend {
                             return Err(LoomError::not_found("delegated task", task.task_id));
                         };
                         *task = updated_task;
-                        self.journal()?.append_server_event(
-                            CURRENT_PROTOCOL_VERSION,
-                            task.requester_session_id,
-                            ServerEvent::ProjectTaskUpdated { task: task.clone() },
-                        );
+                        self.journal_project_task_update(task.clone())?;
                     }
                 }
             }
@@ -86,11 +82,7 @@ impl InProcessBackend {
                     *task = persistence
                         .load_delegated_task(task.task_id)?
                         .ok_or_else(|| LoomError::not_found("delegated task", task.task_id))?;
-                    self.journal()?.append_server_event(
-                        CURRENT_PROTOCOL_VERSION,
-                        task.requester_session_id,
-                        ServerEvent::ProjectTaskUpdated { task: task.clone() },
-                    );
+                    self.journal_project_task_update(task.clone())?;
                 }
             }
             connection.reconcile_project_child_integrations(project_id)?;
@@ -99,6 +91,56 @@ impl InProcessBackend {
             connection
                 .drain_workspace_project_admissions(workspace_id, reconcile_persisted_runs)?;
         }
+        Ok(())
+    }
+
+    /// Journals one delegated-task update together with the child's own agent
+    /// record.
+    ///
+    /// The task record only tells the requester that its delegated task moved;
+    /// a client following the parent's stream learns the child's state from
+    /// `ProjectAgentUpdated`, so a child that belongs to a parent reports its
+    /// agent record to that parent before the task update reaches the
+    /// requester. The snapshot read is best effort: the durable task update is
+    /// the fact that must not be lost, so a failed lookup is logged and only
+    /// the agent event is dropped.
+    pub(crate) fn journal_project_task_update(
+        &self,
+        task: loom_core::DelegatedTaskRecord,
+    ) -> Result<()> {
+        let agent = match self.persistence.as_ref() {
+            Some(persistence) => match persistence.load_project_snapshot(task.project_id) {
+                Ok(project) => project.and_then(|project| {
+                    project
+                        .agents
+                        .into_iter()
+                        .find(|agent| agent.session_id == task.target_session_id)
+                }),
+                Err(error) => {
+                    log::warn!(
+                        "could not journal the state of child {} to its parent: {}",
+                        task.target_session_id,
+                        error.message
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        if let Some(agent) = agent
+            && let Some(parent_session_id) = agent.parent_session_id
+        {
+            self.journal()?.append_server_event(
+                CURRENT_PROTOCOL_VERSION,
+                parent_session_id,
+                ServerEvent::ProjectAgentUpdated { agent },
+            );
+        }
+        self.journal()?.append_server_event(
+            CURRENT_PROTOCOL_VERSION,
+            task.requester_session_id,
+            ServerEvent::ProjectTaskUpdated { task },
+        );
         Ok(())
     }
 
@@ -125,11 +167,7 @@ impl InProcessBackend {
             let task = persistence
                 .load_delegated_task(task.task_id)?
                 .ok_or_else(|| LoomError::not_found("delegated task", task.task_id))?;
-            self.journal()?.append_server_event(
-                CURRENT_PROTOCOL_VERSION,
-                task.requester_session_id,
-                ServerEvent::ProjectTaskUpdated { task },
-            );
+            self.journal_project_task_update(task)?;
         }
         // A finished sub agent can be reclaimed once its result is final; the
         // workspace must opt in, and code work waits for integration.

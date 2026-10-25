@@ -552,6 +552,349 @@ fn bounding_a_multibyte_text_lands_on_character_boundaries() {
     assert_eq!(text::bound("short", 64), "short");
 }
 
+#[test]
+fn project_events_carry_the_identity_of_each_record() {
+    let fixture = fixture();
+    let project_id = ProjectId::new();
+    let timestamp = Timestamp::now();
+    let parent = AgentSessionId::new();
+    let agent = ProjectAgentRecord {
+        session_id: AgentSessionId::new(),
+        project_id,
+        parent_session_id: Some(parent),
+        depth: 2,
+        state: AgentSessionState::Executing,
+        task_summary: None,
+        output_cursor: EventSequence::default(),
+        updated_at: timestamp,
+    };
+    let changed = ProjectAgentRecord {
+        state: AgentSessionState::Completed,
+        ..agent.clone()
+    };
+    let task = DelegatedTaskRecord {
+        task_id: TaskId::new(),
+        project_id,
+        requester_session_id: parent,
+        target_session_id: agent.session_id,
+        child_name: "child-a".to_owned(),
+        intent: "Do the delegated work".to_owned(),
+        model_id: "deterministic/demo".to_owned(),
+        context_references: vec![],
+        dependencies: vec![],
+        code_change: false,
+        permissions: ProjectAgentPermissions::default(),
+        status: DelegatedTaskStatus::Running,
+        created_at: timestamp,
+        updated_at: timestamp,
+    };
+    // Over the 64 byte budget and holding newlines, so one line can prove both
+    // that the body is bounded and that it is escaped into a single field.
+    let body =
+        "line one\nline two\nline three\nline four\nline five\nline six\nline seven".to_owned();
+    let message = AgentMessageRecord {
+        message_id: AgentMessageId::new(),
+        project_id,
+        task_id: Some(task.task_id),
+        sender_session_id: agent.session_id,
+        target_session_id: parent,
+        kind: AgentMessageKind::Progress,
+        project_sequence: 4,
+        accepted_at: timestamp,
+        body: body.clone(),
+    };
+    let envelope = |sequence, event| ServerEventEnvelope {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        sequence: EventSequence::new(sequence),
+        session_id: fixture.session.id,
+        event,
+    };
+    let scripted = vec![
+        envelope(
+            1,
+            ServerEvent::ProjectAgentCreated {
+                agent: agent.clone(),
+            },
+        ),
+        envelope(
+            2,
+            ServerEvent::ProjectAgentUpdated {
+                agent: changed.clone(),
+            },
+        ),
+        envelope(3, ServerEvent::ProjectTaskUpdated { task: task.clone() }),
+        envelope(
+            4,
+            ServerEvent::ProjectAgentMessageAccepted {
+                message: message.clone(),
+            },
+        ),
+    ];
+    let mut client =
+        Wrapped::new(InProcessClient::new(&fixture.backend)).after(move |request, response| {
+            if !matches!(
+                request,
+                ClientRequest::Events(EventsRequest::GetSessionEvents { .. })
+            ) {
+                return;
+            }
+            if let Ok(ServerResponse::Events(EventsResponse::SessionEvents {
+                stream_epoch, ..
+            })) = &response.result
+            {
+                response.result = Ok(ServerResponse::Events(EventsResponse::SessionEvents {
+                    events: scripted.clone(),
+                    stream_epoch: stream_epoch.clone(),
+                    next_after_sequence: None,
+                }));
+            }
+        });
+
+    let outcome = run(
+        &mut client,
+        &[
+            "events",
+            "--session",
+            &fixture.session.id.to_string(),
+            "--max-bytes",
+            "64",
+        ],
+    );
+    assert_eq!(outcome.code, exit::OK);
+    let bounded = text::escape(&text::bound(&body, 64));
+    assert!(
+        bounded.contains("bytes omitted"),
+        "the body is over the budget: {bounded}"
+    );
+    assert!(
+        bounded.contains("\\n"),
+        "the newlines stay escaped: {bounded}"
+    );
+    let expected = [
+        format!(
+            "1 project_child_created project {project_id} child {} parent {parent} depth 2 state executing",
+            agent.session_id
+        ),
+        format!(
+            "2 project_child_state_changed project {project_id} child {} state completed",
+            changed.session_id
+        ),
+        format!(
+            "3 project_task_updated project {project_id} task {} running child {} child-a",
+            task.task_id, task.target_session_id
+        ),
+        format!(
+            "4 project_message project {project_id} message {} progress from {} to {parent} seq 4 {bounded}",
+            message.message_id, message.sender_session_id
+        ),
+    ];
+    assert_eq!(outcome.stdout, expected.join("\n") + "\n");
+}
+
+/// A worktree record whose fields are fixed except for the parts a lifecycle
+/// step sets, so the projection of every status can be pinned.
+fn lifecycle_worktree(status: ProjectWorktreeStatus) -> ProjectWorktreeRecord {
+    let timestamp = Timestamp::now();
+    ProjectWorktreeRecord {
+        project_id: ProjectId::new(),
+        task_id: TaskId::new(),
+        parent_session_id: AgentSessionId::new(),
+        child_session_id: AgentSessionId::new(),
+        parent_repository_id: RepositoryId::new(),
+        child_repository_id: RepositoryId::new(),
+        relative_path: "worktrees/child-a".to_owned(),
+        worktree_name: "child-a".to_owned(),
+        branch_name: "loom/child-a".to_owned(),
+        base_revision: "1111111".to_owned(),
+        base_refresh: None,
+        result_revision: None,
+        integrated_revision: None,
+        status,
+        conflict_paths: vec![],
+        error: None,
+        cleanup_disposition: None,
+        created_at: timestamp,
+        updated_at: timestamp,
+    }
+}
+
+#[test]
+fn worktree_records_name_the_lifecycle_step_their_status_records() {
+    let fixture = fixture();
+    let integrating = lifecycle_worktree(ProjectWorktreeStatus::Integrating);
+    let integrated = ProjectWorktreeRecord {
+        result_revision: Some("2222222".to_owned()),
+        integrated_revision: Some("3333333".to_owned()),
+        ..lifecycle_worktree(ProjectWorktreeStatus::Integrated)
+    };
+    let conflict = ProjectWorktreeRecord {
+        result_revision: Some("2222222".to_owned()),
+        conflict_paths: vec!["src/a.rs".to_owned(), "src/b.rs".to_owned()],
+        ..lifecycle_worktree(ProjectWorktreeStatus::Conflict)
+    };
+    let cleanup_pending = lifecycle_worktree(ProjectWorktreeStatus::CleanupPending);
+    let retained = ProjectWorktreeRecord {
+        cleanup_disposition: Some(ProjectWorktreeCleanupDisposition::Retain),
+        ..lifecycle_worktree(ProjectWorktreeStatus::Retained)
+    };
+    let removed = ProjectWorktreeRecord {
+        cleanup_disposition: Some(ProjectWorktreeCleanupDisposition::DiscardChanges),
+        error: Some("discarded 2 changed files".to_owned()),
+        ..lifecycle_worktree(ProjectWorktreeStatus::Removed)
+    };
+    let ready = lifecycle_worktree(ProjectWorktreeStatus::Ready);
+    let records = [
+        &integrating,
+        &integrated,
+        &conflict,
+        &cleanup_pending,
+        &retained,
+        &removed,
+        &ready,
+    ];
+    let scripted = records
+        .iter()
+        .enumerate()
+        .map(|(index, worktree)| ServerEventEnvelope {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            sequence: EventSequence::new(index as u64 + 1),
+            session_id: fixture.session.id,
+            event: ServerEvent::ProjectChildWorktreeUpdated {
+                worktree: (*worktree).clone(),
+            },
+        })
+        .collect::<Vec<_>>();
+    let mut client =
+        Wrapped::new(InProcessClient::new(&fixture.backend)).after(move |request, response| {
+            if !matches!(
+                request,
+                ClientRequest::Events(EventsRequest::GetSessionEvents { .. })
+            ) {
+                return;
+            }
+            if let Ok(ServerResponse::Events(EventsResponse::SessionEvents {
+                stream_epoch, ..
+            })) = &response.result
+            {
+                response.result = Ok(ServerResponse::Events(EventsResponse::SessionEvents {
+                    events: scripted.clone(),
+                    stream_epoch: stream_epoch.clone(),
+                    next_after_sequence: None,
+                }));
+            }
+        });
+
+    let outcome = run(
+        &mut client,
+        &["events", "--session", &fixture.session.id.to_string()],
+    );
+    assert_eq!(outcome.code, exit::OK);
+    let head = |sequence: u64, kind: &str, worktree: &ProjectWorktreeRecord| {
+        format!(
+            "{sequence} {kind} project {} worktree child-a {}",
+            worktree.project_id,
+            text::worktree_status_name(worktree.status)
+        )
+    };
+    let expected = [
+        format!(
+            "{} task {} worktrees/child-a base 1111111 result - integrated -",
+            head(1, "project_integration_started", &integrating),
+            integrating.task_id
+        ),
+        format!(
+            "{} task {} worktrees/child-a base 1111111 result 2222222 integrated 3333333",
+            head(2, "project_integration_completed", &integrated),
+            integrated.task_id
+        ),
+        format!(
+            "{} task {} worktrees/child-a base 1111111 result 2222222 integrated - conflicts src/a.rs,src/b.rs",
+            head(3, "project_integration_conflict", &conflict),
+            conflict.task_id
+        ),
+        format!(
+            "{} task {} worktrees/child-a base 1111111 result - integrated - disposition -",
+            head(4, "project_worktree_cleanup", &cleanup_pending),
+            cleanup_pending.task_id
+        ),
+        format!(
+            "{} task {} worktrees/child-a base 1111111 result - integrated - disposition retain",
+            head(5, "project_worktree_cleanup", &retained),
+            retained.task_id
+        ),
+        format!(
+            "{} task {} worktrees/child-a base 1111111 result - integrated - disposition discard_changes note discarded 2 changed files",
+            head(6, "project_worktree_cleanup", &removed),
+            removed.task_id
+        ),
+        format!(
+            "{} task {} worktrees/child-a base 1111111 result - integrated -",
+            head(7, "project_worktree_updated", &ready),
+            ready.task_id
+        ),
+    ];
+    assert_eq!(outcome.stdout, expected.join("\n") + "\n");
+}
+
+#[test]
+fn project_events_carry_the_typed_payload_in_jsonl() {
+    let fixture = fixture();
+    let worktree = ProjectWorktreeRecord {
+        result_revision: Some("2222222".to_owned()),
+        integrated_revision: Some("3333333".to_owned()),
+        ..lifecycle_worktree(ProjectWorktreeStatus::Integrated)
+    };
+    let scripted = vec![ServerEventEnvelope {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        sequence: EventSequence::new(9),
+        session_id: fixture.session.id,
+        event: ServerEvent::ProjectChildWorktreeUpdated {
+            worktree: worktree.clone(),
+        },
+    }];
+    let mut client =
+        Wrapped::new(InProcessClient::new(&fixture.backend)).after(move |request, response| {
+            if !matches!(
+                request,
+                ClientRequest::Events(EventsRequest::GetSessionEvents { .. })
+            ) {
+                return;
+            }
+            if let Ok(ServerResponse::Events(EventsResponse::SessionEvents {
+                stream_epoch, ..
+            })) = &response.result
+            {
+                response.result = Ok(ServerResponse::Events(EventsResponse::SessionEvents {
+                    events: scripted.clone(),
+                    stream_epoch: stream_epoch.clone(),
+                    next_after_sequence: None,
+                }));
+            }
+        });
+
+    let outcome = run(
+        &mut client,
+        &[
+            "events",
+            "--session",
+            &fixture.session.id.to_string(),
+            "--format",
+            "jsonl",
+        ],
+    );
+    assert_eq!(outcome.code, exit::OK);
+    let value: serde_json::Value =
+        serde_json::from_str(outcome.stdout.trim_end()).expect("one JSON object");
+    assert_eq!(value["kind"], "project_integration_completed");
+    assert_eq!(value["event"]["type"], "project_child_worktree_updated");
+    let payload = &value["event"]["data"]["worktree"];
+    assert_eq!(payload["project_id"], worktree.project_id.to_string());
+    assert_eq!(payload["task_id"], worktree.task_id.to_string());
+    assert_eq!(payload["base_revision"], "1111111");
+    assert_eq!(payload["result_revision"], "2222222");
+    assert_eq!(payload["integrated_revision"], "3333333");
+}
+
 // 3. Cursor resume, deduplication, and the snapshot resynchronisation.
 
 /// Starts a deterministic run, waits for it to settle, and returns the journal

@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 
 use crate::cli::args::{Invocation, RetentionSetArgs, WorktreeDisposition};
 use crate::cli::client::Client;
-use crate::cli::text::{escape, worktree_line, worktree_status_name};
+use crate::cli::text::{cleanup_disposition_name, escape, worktree_line, worktree_status_name};
 
 use super::supervise::file_status_name;
 use super::{Caller, Failure, Outcome, capability_names, emit, handshake};
@@ -688,16 +688,6 @@ fn worktree_record(
 /// The `-` placeholder the worktree text uses for an absent value.
 fn or_dash(value: Option<&str>) -> &str {
     value.unwrap_or("-")
-}
-
-/// The protocol's snake_case spelling of a cleanup disposition, stated
-/// explicitly so a wire rename cannot change the text contract.
-fn cleanup_disposition_name(disposition: ProjectWorktreeCleanupDisposition) -> &'static str {
-    match disposition {
-        ProjectWorktreeCleanupDisposition::Retain => "retain",
-        ProjectWorktreeCleanupDisposition::RemoveClean => "remove_clean",
-        ProjectWorktreeCleanupDisposition::DiscardChanges => "discard_changes",
-    }
 }
 
 /// One line's kind word in the `diff` projection.

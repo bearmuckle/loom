@@ -118,6 +118,66 @@ not carry every event after the cursor, and `null` otherwise.
 `--json` with `--follow` keeps every followed event in that one envelope, so
 prefer `--format jsonl` for a long follow.
 
+### Project and worktree event projections
+
+A client that follows a project learns its tree's lifecycle from ordinary
+session events, and each one is rendered as its own kind instead of the generic
+`event` fallback. Every body names the project and the record it is about, so a
+line identifies itself without any out-of-band state:
+
+| Kind | Body after the kind |
+| --- | --- |
+| `project_child_created` | `project <project-id> child <session-id> parent <session-id-or-dash> depth <depth> state <state>` |
+| `project_child_state_changed` | `project <project-id> child <session-id> state <state>` |
+| `project_task_updated` | `project <project-id> task <task-id> <status> child <session-id> <child-name>` |
+| `project_message` | `project <project-id> message <message-id> <kind> from <session-id> to <session-id> seq <project-sequence> <body>` |
+| `project_integration_started` | worktree body |
+| `project_integration_completed` | worktree body |
+| `project_integration_conflict` | worktree body |
+| `project_worktree_cleanup` | worktree body |
+| `project_worktree_updated` | worktree body |
+
+The five worktree kinds share one body, which always carries the checkout's
+identity and both revisions:
+
+```
+project <project-id> worktree <name> <status> task <task-id> <relative-path> base <base-revision> result <result-revision-or-dash> integrated <integrated-revision-or-dash>
+```
+
+The kind names the lifecycle step the record's status carries:
+
+| Status | Kind |
+| --- | --- |
+| `integrating` | `project_integration_started` |
+| `integrated` | `project_integration_completed` |
+| `conflict` | `project_integration_conflict` |
+| `cleanup_pending`, `retained`, `removed` | `project_worktree_cleanup` |
+| `creating`, `ready`, `stale`, `recovery_required` | `project_worktree_updated` |
+
+The parts that only some records have come last: `conflicts <comma-joined
+paths>` when the record holds conflict paths, `disposition
+<disposition-or-dash>` on the cleanup kinds only (spelled `retain`,
+`remove_clean`, or `discard_changes`), and `note <error>` when the record
+carries one — a forced discard records there what it threw away, so that loss
+stays in the stream instead of disappearing with the checkout. `-` stands for
+an absent value, and states, statuses, and dispositions use their protocol
+snake_case spelling.
+
+`project_child_created`, `project_task_updated`, and the worktree kinds are
+journaled on the parent's stream, and `project_message` on the recipient's (and,
+for a branch route, the root's). A child state change is journaled as
+`project_child_state_changed` beside the task update, so a supervisor that
+follows only the parent never has to infer a child's state from its task
+status.
+
+These are ordinary session events, so nothing about reading them is special:
+the `--after` and `--cursor-file` cursor, a changed `stream_epoch` invalidating
+the stored cursor, the `gap` report of a bounded snapshot, and snapshot
+resynchronisation all apply unchanged. The `project_message` body is bounded by
+the same `--max-bytes` cap as tool output and is always the last field.
+`--format jsonl` carries the rendered `kind` and `text` plus the full typed
+payload in `event`, so no caller has to parse the text.
+
 ## Resume and the cursor file
 
 `events` starts from `--after <seq>` when it is given, otherwise from the local

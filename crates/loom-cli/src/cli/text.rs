@@ -7,7 +7,8 @@
 //! exactly like its snake_case serde name: no `Debug` output reaches a user.
 
 use loom_core::{
-    AgentSessionState, EventSequence, LimitStatus, ProjectWorktreeRecord, ProjectWorktreeStatus,
+    AgentMessageKind, AgentSessionState, DelegatedTaskStatus, EventSequence, LimitStatus,
+    ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord, ProjectWorktreeStatus,
 };
 use loom_model::ToolCall;
 use loom_protocol::{AgentEvent, AgentRunState, ServerEvent, ToolResult};
@@ -112,7 +113,8 @@ fn call_arguments(call: &ToolCall, budget: usize) -> String {
     bound(&json_text(&call.arguments), budget)
 }
 
-/// Projects one server event with the `--max-bytes` budget for tool payloads.
+/// Projects one server event with the `--max-bytes` budget for bounded text,
+/// which is tool payloads and a project message body.
 pub(crate) fn render(event: &ServerEvent, budget: usize) -> Rendered {
     match event {
         ServerEvent::AgentSessionCreated { .. } => body("session_created", []),
@@ -134,6 +136,66 @@ pub(crate) fn render(event: &ServerEvent, budget: usize) -> Rendered {
         ServerEvent::AgentSessionArchived { .. } => body("session_archived", []),
         ServerEvent::AgentSessionRestored { .. } => body("session_restored", []),
         ServerEvent::Agent { event } => render_agent(event, budget),
+        ServerEvent::ProjectAgentCreated { agent } => {
+            let parent = agent.parent_session_id.map(|parent| parent.to_string());
+            body(
+                "project_child_created",
+                [
+                    "project".to_owned(),
+                    agent.project_id.to_string(),
+                    "child".to_owned(),
+                    agent.session_id.to_string(),
+                    "parent".to_owned(),
+                    or_dash(parent.as_deref()).to_owned(),
+                    "depth".to_owned(),
+                    agent.depth.to_string(),
+                    "state".to_owned(),
+                    session_state_name(agent.state).to_owned(),
+                ],
+            )
+        }
+        ServerEvent::ProjectAgentUpdated { agent } => body(
+            "project_child_state_changed",
+            [
+                "project".to_owned(),
+                agent.project_id.to_string(),
+                "child".to_owned(),
+                agent.session_id.to_string(),
+                "state".to_owned(),
+                session_state_name(agent.state).to_owned(),
+            ],
+        ),
+        ServerEvent::ProjectTaskUpdated { task } => body(
+            "project_task_updated",
+            [
+                "project".to_owned(),
+                task.project_id.to_string(),
+                "task".to_owned(),
+                task.task_id.to_string(),
+                task_status_name(task.status).to_owned(),
+                "child".to_owned(),
+                task.target_session_id.to_string(),
+                task.child_name.clone(),
+            ],
+        ),
+        ServerEvent::ProjectAgentMessageAccepted { message } => body(
+            "project_message",
+            [
+                "project".to_owned(),
+                message.project_id.to_string(),
+                "message".to_owned(),
+                message.message_id.to_string(),
+                message_kind_name(message.kind).to_owned(),
+                "from".to_owned(),
+                message.sender_session_id.to_string(),
+                "to".to_owned(),
+                message.target_session_id.to_string(),
+                "seq".to_owned(),
+                message.project_sequence.to_string(),
+                bound(&message.body, budget),
+            ],
+        ),
+        ServerEvent::ProjectChildWorktreeUpdated { worktree } => render_worktree(worktree),
         other => name("event", server_event_name(other)),
     }
 }
@@ -244,6 +306,77 @@ fn json_value(status: &LimitStatus) -> Value {
     serde_json::to_value(status).unwrap_or(Value::Null)
 }
 
+/// The `-` placeholder this projection uses for an absent value.
+fn or_dash(value: Option<&str>) -> &str {
+    value.unwrap_or("-")
+}
+
+/// Projects one worktree record.
+///
+/// The kind names the lifecycle step the record's status carries: `integrating`
+/// is `project_integration_started`, `integrated` is
+/// `project_integration_completed`, `conflict` is `project_integration_conflict`,
+/// the cleanup statuses (`cleanup_pending`, `retained`, `removed`) share
+/// `project_worktree_cleanup`, and every other status is
+/// `project_worktree_updated`. The body therefore always carries the identity of
+/// the checkout and its revisions, and appends the conflict paths, the cleanup
+/// disposition, and the note of a record that has them, because a forced
+/// discard records there what it threw away.
+fn render_worktree(worktree: &ProjectWorktreeRecord) -> Rendered {
+    let mut parts = vec![
+        "project".to_owned(),
+        worktree.project_id.to_string(),
+        "worktree".to_owned(),
+        worktree.worktree_name.clone(),
+        worktree_status_name(worktree.status).to_owned(),
+        "task".to_owned(),
+        worktree.task_id.to_string(),
+        worktree.relative_path.clone(),
+        "base".to_owned(),
+        worktree.base_revision.clone(),
+        "result".to_owned(),
+        or_dash(worktree.result_revision.as_deref()).to_owned(),
+        "integrated".to_owned(),
+        or_dash(worktree.integrated_revision.as_deref()).to_owned(),
+    ];
+    if !worktree.conflict_paths.is_empty() {
+        parts.push("conflicts".to_owned());
+        parts.push(worktree.conflict_paths.join(","));
+    }
+    // Only a cleanup step has a disposition: the statuses that reach here are
+    // the ones the cleanup verb records.
+    if matches!(
+        worktree.status,
+        ProjectWorktreeStatus::CleanupPending
+            | ProjectWorktreeStatus::Retained
+            | ProjectWorktreeStatus::Removed
+    ) {
+        parts.push("disposition".to_owned());
+        parts.push(or_dash(worktree.cleanup_disposition.map(cleanup_disposition_name)).to_owned());
+    }
+    if let Some(note) = &worktree.error {
+        parts.push("note".to_owned());
+        parts.push(note.clone());
+    }
+    body(worktree_kind(worktree.status), parts)
+}
+
+/// The kind word of a worktree status: the lifecycle step the status records.
+const fn worktree_kind(status: ProjectWorktreeStatus) -> &'static str {
+    match status {
+        ProjectWorktreeStatus::Integrating => "project_integration_started",
+        ProjectWorktreeStatus::Integrated => "project_integration_completed",
+        ProjectWorktreeStatus::Conflict => "project_integration_conflict",
+        ProjectWorktreeStatus::CleanupPending
+        | ProjectWorktreeStatus::Retained
+        | ProjectWorktreeStatus::Removed => "project_worktree_cleanup",
+        ProjectWorktreeStatus::Creating
+        | ProjectWorktreeStatus::Ready
+        | ProjectWorktreeStatus::Stale
+        | ProjectWorktreeStatus::RecoveryRequired => "project_worktree_updated",
+    }
+}
+
 pub(crate) const fn session_state_name(state: AgentSessionState) -> &'static str {
     match state {
         AgentSessionState::Idle => "idle",
@@ -258,6 +391,41 @@ pub(crate) const fn session_state_name(state: AgentSessionState) -> &'static str
         AgentSessionState::Failed => "failed",
         AgentSessionState::Cancelled => "cancelled",
         AgentSessionState::Archived => "archived",
+    }
+}
+
+/// The status word of a delegated task: the protocol's serde spelling, stated
+/// explicitly so a wire rename cannot change the text contract.
+pub(crate) const fn task_status_name(status: DelegatedTaskStatus) -> &'static str {
+    match status {
+        DelegatedTaskStatus::Queued => "queued",
+        DelegatedTaskStatus::Running => "running",
+        DelegatedTaskStatus::Blocked => "blocked",
+        DelegatedTaskStatus::Completed => "completed",
+        DelegatedTaskStatus::Failed => "failed",
+        DelegatedTaskStatus::Cancelled => "cancelled",
+    }
+}
+
+/// The cleanup disposition's spelling, stated explicitly for the same reason.
+pub(crate) const fn cleanup_disposition_name(
+    disposition: ProjectWorktreeCleanupDisposition,
+) -> &'static str {
+    match disposition {
+        ProjectWorktreeCleanupDisposition::Retain => "retain",
+        ProjectWorktreeCleanupDisposition::RemoveClean => "remove_clean",
+        ProjectWorktreeCleanupDisposition::DiscardChanges => "discard_changes",
+    }
+}
+
+const fn message_kind_name(kind: AgentMessageKind) -> &'static str {
+    match kind {
+        AgentMessageKind::Progress => "progress",
+        AgentMessageKind::Result => "result",
+        AgentMessageKind::Question => "question",
+        AgentMessageKind::Blocker => "blocker",
+        AgentMessageKind::Direction => "direction",
+        AgentMessageKind::Answer => "answer",
     }
 }
 

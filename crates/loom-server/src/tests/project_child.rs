@@ -1601,6 +1601,177 @@ fn delegated_children_require_durable_storage_on_ephemeral_backends() {
     fs::remove_dir_all(&backend.session_root_base).unwrap();
 }
 
+/// A child state change reaches the parent's stream: the parent learns the
+/// child's own agent record, followed by the delegated task update it already
+/// received.
+#[test]
+fn a_child_state_change_journals_the_agent_record_to_its_parent() {
+    let temp = std::env::temp_dir().join(format!("loom-child-state-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&temp).unwrap();
+    let path = temp.join("state.sqlite");
+    let backend = InProcessBackend::new_persistent(&path).unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Child state".into(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let root = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Manager".into(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+
+    // The durable records a delegated child owns: its session, hierarchy edge,
+    // and task, created the way the manager tool creates them.
+    let child_id = AgentSessionId::new();
+    let created_at = Timestamp::now();
+    let child = AgentSessionSnapshot {
+        id: child_id,
+        workspace_id: workspace.id,
+        name: "Child".into(),
+        goal: None,
+        state: AgentSessionState::Idle,
+        created_at,
+        updated_at: created_at,
+        title_source: loom_core::SessionTitleSource::Auto,
+    };
+    let task = loom_core::DelegatedTaskRecord {
+        task_id: loom_core::TaskId::new(),
+        project_id: ProjectId::from_uuid(*root.id.as_uuid()),
+        requester_session_id: root.id,
+        target_session_id: child_id,
+        child_name: child.name.clone(),
+        intent: "Report the current state".into(),
+        model_id: "deterministic/demo".into(),
+        context_references: vec![],
+        dependencies: vec![],
+        code_change: false,
+        permissions: loom_core::ProjectAgentPermissions::default(),
+        status: loom_core::DelegatedTaskStatus::Queued,
+        created_at,
+        updated_at: created_at,
+    };
+    backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .create_project_child(
+            RequestId::new(),
+            &child,
+            backend.sessions().unwrap().next_sequence().next(),
+            &task,
+        )
+        .unwrap();
+    let (_, created_event) = backend
+        .sessions()
+        .unwrap()
+        .create_in_workspace_with_id(workspace.id, child_id, child.name.clone())
+        .unwrap();
+    backend.journal().unwrap().append_session(created_event);
+
+    let (_, record) = backend
+        .sessions()
+        .unwrap()
+        .transition(child_id, AgentSessionState::Completed)
+        .unwrap();
+    backend.journal().unwrap().append_session(record);
+    // The project snapshot reads the durable session rows, which a checkpoint
+    // writes; persist them so the child's state change is what the snapshot
+    // reports.
+    let sessions = backend.sessions().unwrap();
+    let state = sessions.export_state();
+    drop(sessions);
+    backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .save_state(loom_persistence::DurableStateWrite {
+            sessions: &state,
+            workspaces: None,
+            settings: None,
+            workspace_configs: None,
+            providers: None,
+            usage: None,
+            idempotency: None,
+            run_summaries: None,
+            run_runtime_configs: None,
+            run_context_checkpoints: None,
+            run_plans: None,
+            run_messages: None,
+            run_activities: None,
+            filesystem_records: None,
+            feed: None,
+        })
+        .unwrap();
+    backend
+        .update_project_task_for_session_state(child_id, AgentSessionState::Completed)
+        .unwrap();
+
+    let events = connection.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
+            session_id: Some(root.id),
+            workspace_id: None,
+            after_sequence: None,
+            stream_epoch: None,
+        },
+    )));
+    let ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) =
+        events.result.unwrap()
+    else {
+        panic!("unexpected parent events response");
+    };
+    let agent_update = events
+        .iter()
+        .position(|envelope| match &envelope.event {
+            ServerEvent::ProjectAgentUpdated { agent } if agent.session_id == child_id => {
+                assert_eq!(envelope.session_id, root.id);
+                assert_eq!(agent.project_id, task.project_id);
+                assert_eq!(agent.parent_session_id, Some(root.id));
+                assert_eq!(agent.state, AgentSessionState::Completed);
+                true
+            }
+            _ => false,
+        })
+        .expect("the parent's stream carries the child's agent record");
+    let task_update = events
+        .iter()
+        .position(|envelope| {
+            matches!(
+                &envelope.event,
+                ServerEvent::ProjectTaskUpdated { task: update }
+                    if update.task_id == task.task_id
+            )
+        })
+        .expect("the parent's stream carries the task update");
+    assert!(
+        agent_update < task_update,
+        "the child's state change precedes the task update"
+    );
+
+    drop(connection);
+    drop(backend);
+    let _ = fs::remove_dir_all(&temp);
+    let _ = fs::remove_file(path.with_extension("credentials.json"));
+}
+
 /// A workspace that opts in archives a completed delegated sub agent, while an
 /// opted-out workspace keeps it visible. Code work is archived only after its
 /// result is integrated, which the project integration tests cover.
