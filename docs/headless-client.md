@@ -228,7 +228,7 @@ parent <project-id>
 root <session-id>
 agent <session-id> <depth> <state> <verdict> <task-summary-or-dash>
 task <task-id> <status> <child-name>
-worktree <worktree-name> <status> <relative-path> <base-revision> <result-revision-or-dash> <integrated-revision-or-dash>
+worktree <worktree-name> <relative-path> <status> <task-id> <base-revision> <result-revision-or-dash> <integrated-revision-or-dash>
 conflict <worktree-name> <path>
 decision approval <session-id> <tool-call-id> <tool-name>
 decision question <session-id> <question-text>
@@ -236,7 +236,10 @@ decision question <session-id> <question-text>
 
 `parent` appears only for a sub project, `conflict` appears after the worktree
 it belongs to, and `-` stands for an absent task summary, result revision, or
-integrated revision. The order is the project, its parent and root, then the
+integrated revision. The `worktree` line is the one
+[`project worktrees`](#worktree-inspection-and-integration) line, so a record
+reads the same in both verbs and its task id joins it to a `task` line without
+`--json`. The order is the project, its parent and root, then the
 agents, tasks, and worktrees in snapshot order, then the decisions in agent
 order; a requested session the snapshot does not list comes last.
 
@@ -479,12 +482,16 @@ record in snapshot order:
 ```text
 project <project-id>
 worktrees <count>
-worktree <task-id> <status> <worktree-name> <relative-path>
+worktree <worktree-name> <relative-path> <status> <task-id> <base-revision> <result-revision-or-dash> <integrated-revision-or-dash>
 ```
 
-`worktrees 0` states an empty project explicitly. `--json` reports `session_id`,
-`project_id`, `root_session_id`, and `worktrees`, each entry being the protocol
-record. The verb needs the `read_project` capability.
+The `worktree` line is the same one `status --tree` prints, so a supervisor can
+read a record the same way in either verb; the name and path lead, so the
+`worktree <name> <relative-path>` header of `project worktree get` and
+`project worktree diff` is a prefix of it. `worktrees 0` states an empty project
+explicitly. `--json` reports `session_id`, `project_id`, `root_session_id`, and
+`worktrees`, each entry being the protocol record. The verb needs the
+`read_project` capability.
 
 `project worktree get <session-id> --task <task-id>` reports the durable record
 and never opens the checkout, so it answers from the snapshot alone:
