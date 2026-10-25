@@ -21,7 +21,7 @@
 //! | `approve`, `deny` | `Collaboration/GetRunRevision`, `Collaboration/ControlRun` with `Approve`/`Reject` |
 //! | `stop` | `Collaboration/GetRunRevision`, `Collaboration/ControlRun` with `Interrupt`, plus `Session/ArchiveAgentSession` with `--archive` |
 //! | `wait` | `Collaboration/GetRunRevision`, `Session/GetAgentSessionSnapshotMetadata` polling |
-//! | `status` | `Session/GetAgentSessionSnapshotMetadata` |
+//! | `status` | `Session/GetAgentSessionSnapshotMetadata`, plus `Project/GetProjectSnapshotForSession` and one `Session/GetAgentSessionSnapshotMetadata` per blocked agent with `--tree` |
 //! | `liveness` | `Session/GetAgentSessionSnapshotMetadata` |
 //! | `result` | `Repository/ListSessionRepositories`, `Repository/GetSessionVcsStatus`, `Repository/GetSessionVcsDiff`, `Task/GetSessionTaskEvidence` |
 //! | `retention get` | `Control/GetArchiveRetentionPolicy` |
@@ -145,6 +145,18 @@
 //! executing, and evaluating, `blocked` for awaiting approval and needs input,
 //! `paused`, `done` for completed, and `failed` for failed and cancelled. The
 //! line is derived by this client from the run state; no worker writes it.
+//!
+//! `status --tree` additionally projects the agent session's project: the
+//! project verdict, its agents with a verdict each, its delegated tasks, its
+//! worktrees with their conflict paths, and one decision per agent waiting on an
+//! approval or a question. The records come from
+//! `Project/GetProjectSnapshotForSession` unchanged; this client derives the
+//! verdict words, which are the `status` word set plus `archived`, and reads the
+//! metadata of every agent whose project record is `awaiting_approval` or
+//! `needs_input` to learn which decision it waits on. The requested session
+//! reuses its own projection, so its pending decision appears once as a
+//! `decision` line instead of the plain `pending` line.
+//!
 //! `liveness` never guesses: an archived or terminal session is `dead`, a
 //! session the worker does not know is `gone` with exit `5`, a transport
 //! failure is `unknown` with exit `7`, and anything else is `alive`.

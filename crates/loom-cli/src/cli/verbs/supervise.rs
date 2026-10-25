@@ -13,13 +13,15 @@ use std::{
 };
 
 use loom_core::{
-    AgentSessionId, AgentSessionState, ErrorCode, GitFileStatusKind, RequestId, RunControlAction,
-    RunId, RunRevision, SessionRepository, ToolCallId,
+    AgentSessionId, AgentSessionState, DelegatedTaskStatus, ErrorCode, GitFileStatusKind,
+    ProjectSnapshot, ProjectWorktreeStatus, RequestId, RunControlAction, RunId, RunRevision,
+    SessionRepository, ToolCallId,
 };
 use loom_protocol::{
     ActivityDetail, AgentRunSnapshot, AgentSessionSnapshotProjection, ClientRequest,
-    CollaborationRequest, CollaborationResponse, RepositoryRequest, RepositoryResponse,
-    RunActionOutcome, ServerResponse, SessionRequest, SessionResponse, TaskRequest, TaskResponse,
+    CollaborationRequest, CollaborationResponse, ProjectRequest, ProjectResponse,
+    RepositoryRequest, RepositoryResponse, RunActionOutcome, ServerResponse, SessionRequest,
+    SessionResponse, TaskRequest, TaskResponse,
 };
 use serde_json::{Value, json};
 
@@ -444,12 +446,14 @@ fn until_name(until: WaitUntil) -> &'static str {
     }
 }
 
-/// `status`: the session and its latest run, derived into a declaration.
+/// `status`: the session and its latest run, derived into a declaration, plus
+/// the project projection when `--tree` asks for it.
 pub(super) async fn status<C: Client>(
     client: &mut C,
     invocation: &Invocation,
     session_id: AgentSessionId,
     format: StatusFormat,
+    tree: bool,
     out: &mut dyn Write,
 ) -> Result<Outcome, Failure> {
     let mut caller = Caller::new(client);
@@ -458,6 +462,10 @@ pub(super) async fn status<C: Client>(
     let run = projection.active_run.as_ref().map(|active| &active.run);
     let declaration = declaration(run.map(|run| run.state));
     let state = run.map(|run| run_state_name(run.state)).unwrap_or("idle");
+    let project = match tree {
+        true => Some(project_tree(&mut caller, session_id, &projection).await?),
+        false => None,
+    };
     if !invocation.globals.json {
         match format {
             StatusFormat::Verb => emit(
@@ -487,14 +495,21 @@ pub(super) async fn status<C: Client>(
                             run_state_name(active.run.state)
                         ),
                     )?;
-                    if let Some(pending) = &active.pending_approval {
+                    // The tree reports the requested session's pending
+                    // decision once, as a `decision` line.
+                    if project.is_none()
+                        && let Some(pending) = &active.pending_approval
+                    {
                         emit(out, &format!("pending {}\n", pending.id))?;
                     }
+                }
+                if let Some(project) = &project {
+                    emit_project(out, project)?;
                 }
             }
         }
     }
-    let data = json!({
+    let mut data = json!({
         "session": projection.session,
         "run": projection.active_run.as_ref().map(|active| run_value(&active.run)),
         "state": state,
@@ -509,7 +524,338 @@ pub(super) async fn status<C: Client>(
             .as_ref()
             .and_then(|active| active.pending_approval.as_ref().map(|call| call.id.to_string())),
     });
+    if let Some(project) = &project {
+        data["project"] = project_value(project);
+    }
     Ok(Outcome::new(data, caller.primary))
+}
+
+/// The project projection of one session: the worker's records plus the verdict
+/// words and decisions this client derives from them.
+struct ProjectTree {
+    snapshot: ProjectSnapshot,
+    verdict: &'static str,
+    decisions: Vec<Decision>,
+}
+
+/// One pending approval or question a project agent waits on.
+enum Decision {
+    Approval {
+        session_id: AgentSessionId,
+        run_id: RunId,
+        run_state: &'static str,
+        tool_call_id: ToolCallId,
+        tool_name: String,
+    },
+    Question {
+        session_id: AgentSessionId,
+        run_id: RunId,
+        run_state: &'static str,
+        question: String,
+    },
+}
+
+impl Decision {
+    fn value(&self) -> Value {
+        match self {
+            Self::Approval {
+                session_id,
+                run_id,
+                run_state,
+                tool_call_id,
+                tool_name,
+            } => json!({
+                "session_id": session_id.to_string(),
+                "run_id": run_id.to_string(),
+                "run_state": run_state,
+                "kind": "approval",
+                "tool_call_id": tool_call_id.to_string(),
+                "tool_name": tool_name,
+            }),
+            Self::Question {
+                session_id,
+                run_id,
+                run_state,
+                question,
+            } => json!({
+                "session_id": session_id.to_string(),
+                "run_id": run_id.to_string(),
+                "run_state": run_state,
+                "kind": "question",
+                "question": question,
+            }),
+        }
+    }
+}
+
+/// Reads the project of `session_id`, then the metadata of every blocked agent
+/// in it: the project record says an agent waits, but only the session
+/// projection says on which approval or question. A failed read is the verb's
+/// failure, so a partial tree is never printed.
+async fn project_tree<C: Client>(
+    caller: &mut Caller<'_, C>,
+    session_id: AgentSessionId,
+    requested: &AgentSessionSnapshotProjection,
+) -> Result<ProjectTree, Failure> {
+    let (request_id, response) = caller
+        .call(ClientRequest::Project(
+            ProjectRequest::GetProjectSnapshotForSession { session_id },
+        ))
+        .await?;
+    let snapshot = match response {
+        ServerResponse::Project(ProjectResponse::ProjectSnapshot(snapshot)) => snapshot,
+        _ => return Err(Failure::unexpected(request_id, "project snapshot")),
+    };
+    let verdict = project_verdict(snapshot.agents.iter().map(|agent| agent.state));
+    let mut decisions = Vec::new();
+    let mut listed = false;
+    for agent in &snapshot.agents {
+        let decision = if agent.session_id == session_id {
+            listed = true;
+            pending_decision(requested)
+        } else if matches!(
+            agent.state,
+            AgentSessionState::AwaitingApproval | AgentSessionState::NeedsInput
+        ) {
+            let (_, projection) = session_projection(caller, agent.session_id).await?;
+            pending_decision(&projection)
+        } else {
+            None
+        };
+        decisions.extend(decision);
+    }
+    // A snapshot that does not list the requested session still reports its own
+    // decision, after every listed agent's.
+    if !listed {
+        decisions.extend(pending_decision(requested));
+    }
+    Ok(ProjectTree {
+        snapshot,
+        verdict,
+        decisions,
+    })
+}
+
+/// The decision one session waits on, taken from its own projection.
+fn pending_decision(projection: &AgentSessionSnapshotProjection) -> Option<Decision> {
+    let active = projection.active_run.as_ref()?;
+    let session_id = projection.session.id;
+    let run_id = active.run.id;
+    let run_state = run_state_name(active.run.state);
+    if let Some(call) = &active.pending_approval {
+        return Some(Decision::Approval {
+            session_id,
+            run_id,
+            run_state,
+            tool_call_id: call.id,
+            tool_name: call.name.clone(),
+        });
+    }
+    active
+        .pending_input
+        .clone()
+        .map(|question| Decision::Question {
+            session_id,
+            run_id,
+            run_state,
+            question,
+        })
+}
+
+/// The project verdict, which is the first matching word of the per-agent
+/// verdicts. `archived` is the last resort, so it only wins when every agent is
+/// archived, and a project with no agent at all is `done`.
+fn project_verdict(states: impl IntoIterator<Item = AgentSessionState>) -> &'static str {
+    let verdicts = states.into_iter().map(agent_verdict).collect::<Vec<_>>();
+    for word in ["blocked", "paused", "working", "failed", "done"] {
+        if verdicts.contains(&word) {
+            return word;
+        }
+    }
+    if verdicts.is_empty() {
+        "done"
+    } else {
+        "archived"
+    }
+}
+
+/// The verdict word of one session state: the `status` word set plus `archived`.
+fn agent_verdict(state: AgentSessionState) -> &'static str {
+    match state {
+        AgentSessionState::Idle | AgentSessionState::Completed => "done",
+        AgentSessionState::Queued
+        | AgentSessionState::Planning
+        | AgentSessionState::Executing
+        | AgentSessionState::Evaluating => "working",
+        AgentSessionState::AwaitingApproval | AgentSessionState::NeedsInput => "blocked",
+        AgentSessionState::Paused => "paused",
+        AgentSessionState::Failed | AgentSessionState::Cancelled => "failed",
+        AgentSessionState::Archived => "archived",
+    }
+}
+
+/// The status word of a delegated task: the protocol's serde spelling.
+fn task_status_name(status: DelegatedTaskStatus) -> &'static str {
+    match status {
+        DelegatedTaskStatus::Queued => "queued",
+        DelegatedTaskStatus::Running => "running",
+        DelegatedTaskStatus::Blocked => "blocked",
+        DelegatedTaskStatus::Completed => "completed",
+        DelegatedTaskStatus::Failed => "failed",
+        DelegatedTaskStatus::Cancelled => "cancelled",
+    }
+}
+
+/// The status word of a worktree: the protocol's serde spelling.
+fn worktree_status_name(status: ProjectWorktreeStatus) -> &'static str {
+    match status {
+        ProjectWorktreeStatus::Creating => "creating",
+        ProjectWorktreeStatus::Ready => "ready",
+        ProjectWorktreeStatus::Stale => "stale",
+        ProjectWorktreeStatus::Conflict => "conflict",
+        ProjectWorktreeStatus::Integrating => "integrating",
+        ProjectWorktreeStatus::Integrated => "integrated",
+        ProjectWorktreeStatus::RecoveryRequired => "recovery_required",
+        ProjectWorktreeStatus::CleanupPending => "cleanup_pending",
+        ProjectWorktreeStatus::Retained => "retained",
+        ProjectWorktreeStatus::Removed => "removed",
+    }
+}
+
+/// The text lines of the project projection: the project, its root, one line
+/// per agent, task, and worktree with that worktree's conflict paths, then the
+/// decisions in agent order.
+fn emit_project(out: &mut dyn Write, project: &ProjectTree) -> Result<(), Failure> {
+    let snapshot = &project.snapshot;
+    emit(
+        out,
+        &format!("project {} {}\n", snapshot.project_id, project.verdict),
+    )?;
+    if let Some(parent) = &snapshot.parent_project_id {
+        emit(out, &format!("parent {parent}\n"))?;
+    }
+    emit(out, &format!("root {}\n", snapshot.root_session_id))?;
+    for agent in &snapshot.agents {
+        emit(
+            out,
+            &format!(
+                "agent {} {} {} {} {}\n",
+                agent.session_id,
+                agent.depth,
+                session_state_name(agent.state),
+                agent_verdict(agent.state),
+                agent
+                    .task_summary
+                    .as_deref()
+                    .map(escape)
+                    .unwrap_or_else(|| "-".to_owned()),
+            ),
+        )?;
+    }
+    for task in &snapshot.tasks {
+        emit(
+            out,
+            &format!(
+                "task {} {} {}\n",
+                task.task_id,
+                task_status_name(task.status),
+                escape(&task.child_name),
+            ),
+        )?;
+    }
+    for worktree in &snapshot.worktrees {
+        emit(
+            out,
+            &format!(
+                "worktree {} {} {} {} {} {}\n",
+                escape(&worktree.worktree_name),
+                worktree_status_name(worktree.status),
+                escape(&worktree.relative_path),
+                worktree.base_revision,
+                worktree.result_revision.as_deref().unwrap_or("-"),
+                worktree.integrated_revision.as_deref().unwrap_or("-"),
+            ),
+        )?;
+        for path in &worktree.conflict_paths {
+            emit(
+                out,
+                &format!(
+                    "conflict {} {}\n",
+                    escape(&worktree.worktree_name),
+                    escape(path)
+                ),
+            )?;
+        }
+    }
+    for decision in &project.decisions {
+        match decision {
+            Decision::Approval {
+                session_id,
+                tool_call_id,
+                tool_name,
+                ..
+            } => emit(
+                out,
+                &format!(
+                    "decision approval {session_id} {tool_call_id} {}\n",
+                    escape(tool_name)
+                ),
+            )?,
+            Decision::Question {
+                session_id,
+                question,
+                ..
+            } => emit(
+                out,
+                &format!("decision question {session_id} {}\n", escape(question)),
+            )?,
+        }
+    }
+    Ok(())
+}
+
+/// The `data.project` payload: the protocol records serialized as they are,
+/// with the derived verdict on each agent and the derived decisions.
+fn project_value(project: &ProjectTree) -> Value {
+    let snapshot = &project.snapshot;
+    json!({
+        "id": snapshot.project_id.to_string(),
+        "root_session_id": snapshot.root_session_id.to_string(),
+        "parent_project_id": snapshot.parent_project_id.map(|id| id.to_string()),
+        "verdict": project.verdict,
+        "counts": {
+            "agents": snapshot.agents.len(),
+            "tasks": snapshot.tasks.len(),
+            "worktrees": snapshot.worktrees.len(),
+            "decisions": project.decisions.len(),
+        },
+        "agents": snapshot
+            .agents
+            .iter()
+            .map(|agent| {
+                let mut value = serde_json::to_value(agent).unwrap_or(Value::Null);
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("verdict".to_owned(), json!(agent_verdict(agent.state)));
+                }
+                value
+            })
+            .collect::<Vec<_>>(),
+        "tasks": snapshot
+            .tasks
+            .iter()
+            .map(|task| serde_json::to_value(task).unwrap_or(Value::Null))
+            .collect::<Vec<_>>(),
+        "worktrees": snapshot
+            .worktrees
+            .iter()
+            .map(|worktree| serde_json::to_value(worktree).unwrap_or(Value::Null))
+            .collect::<Vec<_>>(),
+        "decisions": project
+            .decisions
+            .iter()
+            .map(Decision::value)
+            .collect::<Vec<_>>(),
+    })
 }
 
 /// The declaration word derived from a run state. No worker writes this; the
@@ -778,5 +1124,73 @@ async fn session_projection<C: Client>(
             Ok((request_id, *projection))
         }
         _ => Err(Failure::unexpected(request_id, "session metadata")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use loom_core::{AgentSessionState, DelegatedTaskStatus, ProjectWorktreeStatus};
+
+    use super::{agent_verdict, project_verdict, task_status_name, worktree_status_name};
+
+    #[test]
+    fn every_session_state_has_a_verdict_word() {
+        for (state, verdict) in [
+            (AgentSessionState::Idle, "done"),
+            (AgentSessionState::Queued, "working"),
+            (AgentSessionState::Planning, "working"),
+            (AgentSessionState::Executing, "working"),
+            (AgentSessionState::Evaluating, "working"),
+            (AgentSessionState::AwaitingApproval, "blocked"),
+            (AgentSessionState::NeedsInput, "blocked"),
+            (AgentSessionState::Paused, "paused"),
+            (AgentSessionState::Completed, "done"),
+            (AgentSessionState::Failed, "failed"),
+            (AgentSessionState::Cancelled, "failed"),
+            (AgentSessionState::Archived, "archived"),
+        ] {
+            assert_eq!(agent_verdict(state), verdict, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn a_project_verdict_is_the_first_matching_word() {
+        use AgentSessionState::{Archived, AwaitingApproval, Executing, Failed, Idle, Paused};
+
+        assert_eq!(project_verdict(std::iter::empty()), "done");
+        assert_eq!(project_verdict([Archived, Archived]), "archived");
+        assert_eq!(project_verdict([Idle, Archived]), "done");
+        assert_eq!(project_verdict([Idle, AwaitingApproval, Paused]), "blocked");
+        assert_eq!(project_verdict([Paused, Executing]), "paused");
+        assert_eq!(project_verdict([Executing, Failed]), "working");
+        assert_eq!(project_verdict([Failed, Archived]), "failed");
+    }
+
+    #[test]
+    fn task_and_worktree_statuses_use_the_protocol_spelling() {
+        for (status, name) in [
+            (DelegatedTaskStatus::Queued, "queued"),
+            (DelegatedTaskStatus::Running, "running"),
+            (DelegatedTaskStatus::Blocked, "blocked"),
+            (DelegatedTaskStatus::Completed, "completed"),
+            (DelegatedTaskStatus::Failed, "failed"),
+            (DelegatedTaskStatus::Cancelled, "cancelled"),
+        ] {
+            assert_eq!(task_status_name(status), name, "{status:?}");
+        }
+        for (status, name) in [
+            (ProjectWorktreeStatus::Creating, "creating"),
+            (ProjectWorktreeStatus::Ready, "ready"),
+            (ProjectWorktreeStatus::Stale, "stale"),
+            (ProjectWorktreeStatus::Conflict, "conflict"),
+            (ProjectWorktreeStatus::Integrating, "integrating"),
+            (ProjectWorktreeStatus::Integrated, "integrated"),
+            (ProjectWorktreeStatus::RecoveryRequired, "recovery_required"),
+            (ProjectWorktreeStatus::CleanupPending, "cleanup_pending"),
+            (ProjectWorktreeStatus::Retained, "retained"),
+            (ProjectWorktreeStatus::Removed, "removed"),
+        ] {
+            assert_eq!(worktree_status_name(status), name, "{status:?}");
+        }
     }
 }
