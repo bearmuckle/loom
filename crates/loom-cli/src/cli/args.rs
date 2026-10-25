@@ -83,19 +83,20 @@ Verbs:
                 [--sub-agent <duration>]
                                     store a worker-wide archive-retention
                                     policy; the next sweep applies it
-  session archive <session-id> [--yes]
+  session archive <session-id> [--yes] [--request-id <uuid>]
                                     archive one session, keeping its
                                     transcript, checkpoints, and every
                                     worktree; --yes is required when the id
                                     is a project root whose archive also
                                     reaches its descendants
-  session delete <session-id> [--force] [--yes]
+  session delete <session-id> [--force] [--yes] [--request-id <uuid>]
                                     delete an archived session, or a project
                                     root with its descendants; --yes is
                                     required for a cascade or with --force
-  project archive <session-id>      archive a project root with its idle
+  project archive <session-id> [--request-id <uuid>]
+                                    archive a project root with its idle
                                     members; the id must name such a root
-  project delete <session-id> [--force] [--yes]
+  project delete <session-id> [--force] [--yes] [--request-id <uuid>]
                                     delete a project root and its tree; the
                                     id must name such a root, and --yes is
                                     required
@@ -113,7 +114,7 @@ Verbs:
                                     result revision; a conflict is reported,
                                     never retried
   project worktree cleanup <session-id> --task <task-id>
-      (--keep | --remove | --discard) [--yes]
+      (--keep | --remove | --discard) [--yes] [--request-id <uuid>]
                                     keep or remove the checkout of one
                                     delegated task; --discard throws away
                                     uncommitted changes and needs --yes
@@ -149,17 +150,21 @@ it, and retry once after a conflict, because their intent is idempotent.
 `stop` refuses a conflict unless --retry-on-conflict is given, so a stale
 revision cannot interrupt a run whose state the caller has not seen.
 
-`--request-id` on `run`, `send`, `answer`, `approve`, `deny`, `stop`, and
-`delete` is the idempotency key of that verb's own mutation: a request the
-worker has already answered under that id is answered from its durable cache
-instead of acting a second time, and the --json envelope then reports
-`replayed: true`. The key covers the mutation alone. Reads are never keyed:
-`send`, `answer`, `approve`, `deny`, and `stop` read the run revision first and
-keep a fresh id for that read, so a repeated command whose run has since moved
-is refused as a conflict that names the key rather than replayed, and the
-mutation is still never applied twice. `stop --archive` archives the session
-under an id derived from the key, so a replay does not archive twice, and
-`delete` keys the deletion while its project pre-read keeps a fresh id.
+`--request-id` on `run`, `send`, `answer`, `approve`, `deny`, `stop`,
+`delete`, `session archive`, `session delete`, `project archive`,
+`project delete`, and `project worktree cleanup` is the idempotency key of
+that verb's own mutation: a request the worker has already answered under that
+id is answered from its durable cache instead of acting a second time, so a
+repeated archive, deletion, or cleanup is applied once, and the --json
+envelope then reports `replayed: true`. The key covers the mutation alone.
+Reads are never keyed: `send`, `answer`, `approve`, `deny`, and `stop` read the
+run revision first and keep a fresh id for that read, so a repeated command
+whose run has since moved is refused as a conflict that names the key rather
+than replayed, and the mutation is still never applied twice. `stop --archive`
+archives the session under an id derived from the key, so a replay does not
+archive twice. The lifecycle verbs key the archive, deletion, or cleanup
+request while their project snapshot pre-read keeps a fresh id, so a repeated
+`session delete` is answered from the cache even though the session is gone.
 Reusing one key for a different mutation is refused the same way. A verb
 without the flag, and any verb that does not take it such as `wait` or `ls`,
 behaves exactly as before.
@@ -407,22 +412,34 @@ pub(crate) enum Verb {
     SessionArchive {
         session: AgentSessionId,
         yes: bool,
+        /// The archive request's idempotency key, or `None` when the caller
+        /// left it open. The project pre-read is never keyed.
+        request_id: Option<RequestId>,
     },
     /// `session delete`: the explicit spelling of `delete`.
     SessionDelete {
         session: AgentSessionId,
         force: bool,
         yes: bool,
+        /// The deletion's idempotency key, or `None` when the caller left it
+        /// open. The project pre-read is never keyed.
+        request_id: Option<RequestId>,
     },
     /// `project archive`: archive a project root with its idle members.
     ProjectArchive {
         session: AgentSessionId,
+        /// The archive request's idempotency key, or `None` when the caller
+        /// left it open. The project pre-read is never keyed.
+        request_id: Option<RequestId>,
     },
     /// `project delete`: delete a project root with its tree.
     ProjectDelete {
         session: AgentSessionId,
         force: bool,
         yes: bool,
+        /// The deletion's idempotency key, or `None` when the caller left it
+        /// open. The project pre-read is never keyed.
+        request_id: Option<RequestId>,
     },
     /// `project worktrees`: every checkout the project's snapshot records.
     ProjectWorktrees {
@@ -452,6 +469,9 @@ pub(crate) enum Verb {
         session: AgentSessionId,
         task: TaskId,
         disposition: WorktreeDisposition,
+        /// The cleanup request's idempotency key, or `None` when the caller
+        /// left it open. The project pre-read is never keyed.
+        request_id: Option<RequestId>,
     },
     /// `delete`: the id is the confirmation. `force` discards dirty or locked
     /// worktrees; `yes` acknowledges a cascade or a force discard.
@@ -1044,13 +1064,16 @@ fn parse_session(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
     flags.verb = format!("session {sub_verb}");
     match sub_verb.as_str() {
         "archive" => {
+            let request_id = parse_request_id(flags)?;
             let session = one_session_id(flags, rest)?;
             Ok(Verb::SessionArchive {
                 session,
                 yes: flags.flag("--yes"),
+                request_id,
             })
         }
         "delete" => {
+            let request_id = parse_request_id(flags)?;
             let session = one_session_id(flags, rest)?;
             let force = flags.flag("--force");
             let yes = flags.flag("--yes");
@@ -1065,6 +1088,7 @@ fn parse_session(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
                 session,
                 force,
                 yes,
+                request_id,
             })
         }
         other => Err(format!(
@@ -1085,8 +1109,10 @@ fn parse_project(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
     match sub_verb.as_str() {
         "archive" => Ok(Verb::ProjectArchive {
             session: one_session_id(flags, rest)?,
+            request_id: parse_request_id(flags)?,
         }),
         "delete" => {
+            let request_id = parse_request_id(flags)?;
             let session = one_session_id(flags, rest)?;
             let force = flags.flag("--force");
             let yes = flags.flag("--yes");
@@ -1101,6 +1127,7 @@ fn parse_project(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
                 session,
                 force,
                 yes,
+                request_id,
             })
         }
         "worktrees" => Ok(Verb::ProjectWorktrees {
@@ -1154,6 +1181,8 @@ fn parse_project_worktree(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, 
 
 /// `project worktree cleanup`: the explicit disposition of one checkout.
 fn parse_worktree_cleanup(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
+    flags.verb = "project worktree cleanup".to_owned();
+    let request_id = parse_request_id(flags)?;
     let session = one_session_id(flags, rest)?;
     let task = flags.required("--task")?;
     let keep = flags.flag("--keep");
@@ -1185,6 +1214,7 @@ fn parse_worktree_cleanup(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, 
         session,
         task: parse_id("task id", &task)?,
         disposition,
+        request_id,
     })
 }
 

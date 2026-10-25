@@ -453,22 +453,51 @@ pub(crate) async fn run<C: Client>(
         }
         Verb::RetentionGet => operator::retention_get(client, invocation, out).await,
         Verb::RetentionSet(args) => operator::retention_set(client, invocation, args, out).await,
-        Verb::SessionArchive { session, yes } => {
-            operator::archive(client, invocation, *session, false, *yes, out).await
-        }
+        Verb::SessionArchive {
+            session,
+            yes,
+            request_id,
+        } => operator::archive(client, invocation, *session, false, *yes, *request_id, out).await,
         Verb::SessionDelete {
             session,
             force,
             yes,
-        } => operator::delete(client, invocation, *session, *force, *yes, false, None, out).await,
-        Verb::ProjectArchive { session } => {
-            operator::archive(client, invocation, *session, true, false, out).await
+            request_id,
+        } => {
+            operator::delete(
+                client,
+                invocation,
+                *session,
+                *force,
+                *yes,
+                false,
+                *request_id,
+                out,
+            )
+            .await
         }
+        Verb::ProjectArchive {
+            session,
+            request_id,
+        } => operator::archive(client, invocation, *session, true, false, *request_id, out).await,
         Verb::ProjectDelete {
             session,
             force,
             yes,
-        } => operator::delete(client, invocation, *session, *force, *yes, true, None, out).await,
+            request_id,
+        } => {
+            operator::delete(
+                client,
+                invocation,
+                *session,
+                *force,
+                *yes,
+                true,
+                *request_id,
+                out,
+            )
+            .await
+        }
         Verb::ProjectWorktrees { session } => {
             operator::worktrees(client, invocation, *session, out).await
         }
@@ -497,8 +526,18 @@ pub(crate) async fn run<C: Client>(
             session,
             task,
             disposition,
+            request_id,
         } => {
-            operator::worktree_cleanup(client, invocation, *session, *task, *disposition, out).await
+            operator::worktree_cleanup(
+                client,
+                invocation,
+                *session,
+                *task,
+                *disposition,
+                *request_id,
+                out,
+            )
+            .await
         }
         Verb::Delete {
             session,
