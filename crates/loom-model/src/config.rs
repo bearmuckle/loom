@@ -15,6 +15,12 @@ pub const GITHUB_COPILOT_DEFAULT_MODEL: &str = "gpt-6-luna";
 pub const OPENAI_PROVIDER_ID: &str = "openai";
 pub const OPENAI_API_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
 pub const OPENAI_DEFAULT_MODEL: &str = "gpt-6-luna";
+/// The provider id of an operator-supplied OpenAI-compatible gateway, which is
+/// registered from the environment rather than from the Providers dialog.
+pub const OPENAI_COMPATIBLE_PROVIDER_ID: &str = "openai-compatible";
+/// The one credential-store reference a gateway registered from the environment
+/// is stored under, so a provider summary carries a reference and never a key.
+pub const OPENAI_COMPATIBLE_CREDENTIAL_REF: &str = "openai-compatible";
 pub const DEEPSEEK_PROVIDER_ID: &str = "deepseek";
 pub const DEEPSEEK_API_ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
 pub const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-flash";

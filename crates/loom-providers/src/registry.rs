@@ -4,6 +4,15 @@ use super::*;
 /// account may be used for writes and pull requests.
 const GITHUB_WRITE_ACCESS_CREDENTIAL_REF: &str = "github-write-access";
 
+/// Endpoint of an OpenAI-compatible gateway an operator supplies for a worker
+/// that has no UI to configure one.
+const OPENAI_COMPATIBLE_ENDPOINT_ENV: &str = "LOOM_OPENAI_ENDPOINT";
+/// The gateway's API key. It is stored in the credential store and never kept in
+/// a provider configuration, a display name, a log line, or a client response.
+const OPENAI_COMPATIBLE_API_KEY_ENV: &str = "LOOM_API_KEY";
+/// The single model the gateway advertises; `OPENAI_DEFAULT_MODEL` when unset.
+const OPENAI_COMPATIBLE_MODEL_ENV: &str = "LOOM_MODEL";
+
 #[derive(Clone)]
 pub struct ProviderRegistry {
     pub configurations: Arc<Mutex<BTreeMap<ProviderId, ProviderConfig>>>,
@@ -130,25 +139,81 @@ impl ProviderRegistry {
     }
 
     pub fn configured(credentials: Arc<dyn CredentialStore>) -> Result<Self> {
+        Self::configured_from(credentials, |name| std::env::var(name).ok())
+    }
+
+    /// [`ProviderRegistry::configured`] with the environment lookup injected, so
+    /// the variable combinations can be exercised without touching the process
+    /// environment. `lookup` returns the value of a variable, `None` when it is
+    /// unset.
+    ///
+    /// A set `LOOM_OPENAI_ENDPOINT` registers one OpenAI-compatible gateway
+    /// whose key is read from `LOOM_API_KEY` and whose model comes from
+    /// `LOOM_MODEL`. A keyless gateway is deliberately unsupported: the request
+    /// would be sent without an `Authorization` header, so a set endpoint with a
+    /// missing or blank key refuses the start before anything is stored or
+    /// registered.
+    pub fn configured_from(
+        credentials: Arc<dyn CredentialStore>,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
         let registry = Self::with_credentials(Arc::clone(&credentials));
-        let model =
-            std::env::var("LOOM_OPENAI_MODEL").unwrap_or_else(|_| OPENAI_DEFAULT_MODEL.to_owned());
+        let model = lookup("LOOM_OPENAI_MODEL").unwrap_or_else(|| OPENAI_DEFAULT_MODEL.to_owned());
         registry.register(ProviderConfig::openai(model))?;
-        let deepseek_model = std::env::var("LOOM_DEEPSEEK_MODEL")
-            .unwrap_or_else(|_| DEEPSEEK_DEFAULT_MODEL.to_owned());
+        let deepseek_model =
+            lookup("LOOM_DEEPSEEK_MODEL").unwrap_or_else(|| DEEPSEEK_DEFAULT_MODEL.to_owned());
         registry.register(ProviderConfig::deepseek(deepseek_model))?;
         registry.register(ProviderConfig::github_copilot(CredentialRef::new(
             GITHUB_COPILOT_CREDENTIAL_REF,
         )))?;
-        if let Some(endpoint) = std::env::var_os("LOOM_OLLAMA_ENDPOINT") {
-            let endpoint = endpoint.to_string_lossy();
-            if !endpoint.trim().is_empty() {
-                let model =
-                    std::env::var("LOOM_OLLAMA_MODEL").unwrap_or_else(|_| "llama3.2".to_owned());
-                registry.register(ProviderConfig::ollama(endpoint.into_owned(), model))?;
-            }
+        if let Some(endpoint) = lookup("LOOM_OLLAMA_ENDPOINT")
+            && !endpoint.trim().is_empty()
+        {
+            let model = lookup("LOOM_OLLAMA_MODEL").unwrap_or_else(|| "llama3.2".to_owned());
+            registry.register(ProviderConfig::ollama(endpoint, model))?;
         }
+        registry.register_configured_gateway(&lookup)?;
         Ok(registry)
+    }
+
+    /// Registers the OpenAI-compatible gateway the environment describes, or
+    /// registers nothing when `LOOM_OPENAI_ENDPOINT` is unset or blank. The key
+    /// is stored in the credential store under one stable reference, so the
+    /// provider configuration holds only that reference.
+    fn register_configured_gateway(&self, lookup: &impl Fn(&str) -> Option<String>) -> Result<()> {
+        let Some(endpoint) = lookup(OPENAI_COMPATIBLE_ENDPOINT_ENV) else {
+            return Ok(());
+        };
+        let endpoint = endpoint.trim().to_owned();
+        if endpoint.is_empty() {
+            return Ok(());
+        }
+        // A keyless gateway is deliberately unsupported: the provider would send
+        // its requests without an `Authorization` header. Refuse before storing
+        // a credential or registering a provider, so a set endpoint can never
+        // produce a half-configured gateway.
+        let api_key = lookup(OPENAI_COMPATIBLE_API_KEY_ENV)
+            .map(|key| key.trim().to_owned())
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| {
+                LoomError::invalid_request(format!(
+                    "{OPENAI_COMPATIBLE_API_KEY_ENV} is required when \
+                     {OPENAI_COMPATIBLE_ENDPOINT_ENV} is set"
+                ))
+            })?;
+        let model = lookup(OPENAI_COMPATIBLE_MODEL_ENV)
+            .map(|model| model.trim().to_owned())
+            .filter(|model| !model.is_empty())
+            .unwrap_or_else(|| OPENAI_DEFAULT_MODEL.to_owned());
+        let credential = CredentialRef::new(OPENAI_COMPATIBLE_CREDENTIAL_REF);
+        self.credentials.store(&credential, api_key)?;
+        self.register(ProviderConfig::openai_compatible(
+            OPENAI_COMPATIBLE_PROVIDER_ID,
+            configured_gateway_display_name(),
+            endpoint,
+            configured_gateway_descriptor(&model),
+            Some(credential),
+        ))
     }
 
     pub fn build_demo(credentials: Arc<dyn CredentialStore>, include_github_copilot: bool) -> Self {
@@ -1154,6 +1219,32 @@ impl ModelProvider for AccountingProvider {
     }
 }
 
+/// Display name of the gateway registered from the environment. It is a fixed
+/// string, so nothing an operator exports can reach a provider summary.
+fn configured_gateway_display_name() -> &'static str {
+    "OpenAI-compatible gateway"
+}
+
+/// The single model a configured gateway advertises. It declares no limits and
+/// matches the capabilities of [`OpenAiCompatibleProvider::new`], because a
+/// gateway can serve any model name with any real window.
+fn configured_gateway_descriptor(model: &str) -> ModelDescriptor {
+    ModelDescriptor {
+        id: ModelId::new(model),
+        provider: ProviderId::new(OPENAI_COMPATIBLE_PROVIDER_ID),
+        display_name: model.to_owned(),
+        context_window: None,
+        max_input_tokens: None,
+        max_output_tokens: None,
+        capabilities: ModelCapabilities {
+            streaming: false,
+            tool_calling: true,
+            vision: false,
+            json_mode: true,
+        },
+    }
+}
+
 /// Fill limits the persisted configuration never recorded from the built-in
 /// provider descriptor. Only `None` values are replaced, so an existing install
 /// picks up newly advertised caps (such as a provider's maximum output tokens)
@@ -1414,5 +1505,297 @@ mod selection_tests {
             registry.usage().unwrap().summary(None, Some(&raw)).requests,
             2
         );
+    }
+}
+
+#[cfg(test)]
+mod gateway_tests {
+    use super::*;
+
+    /// The gateway key the endpoint-and-key tests export. No provider summary may
+    /// ever carry it back.
+    const GATEWAY_KEY: &str = "gateway-secret-key-value";
+    const GATEWAY_ENDPOINT: &str = "http://127.0.0.1:8000/v1/chat/completions";
+
+    /// Runs [`ProviderRegistry::configured_from`] against exactly the variables
+    /// in `variables`, so a test never touches the process environment.
+    fn configured_with(
+        variables: &[(&str, &str)],
+    ) -> (Result<ProviderRegistry>, Arc<InMemoryCredentialStore>) {
+        let credentials = Arc::new(InMemoryCredentialStore::default());
+        let variables = variables
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        let store: Arc<dyn CredentialStore> = credentials.clone();
+        let registry =
+            ProviderRegistry::configured_from(store, move |name| variables.get(name).cloned());
+        (registry, credentials)
+    }
+
+    fn registered_provider_ids(registry: &ProviderRegistry) -> Vec<String> {
+        registry
+            .export_configs()
+            .unwrap()
+            .into_iter()
+            .map(|config| config.id.as_str().to_owned())
+            .collect()
+    }
+
+    fn gateway(registry: &ProviderRegistry) -> ProviderSummary {
+        registry
+            .list_providers()
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.id.as_str() == OPENAI_COMPATIBLE_PROVIDER_ID)
+            .expect("the gateway should be registered")
+    }
+
+    #[test]
+    fn nothing_set_registers_no_gateway_and_keeps_the_existing_providers() {
+        let (registry, credentials) = configured_with(&[]);
+        let registry = registry.unwrap();
+        assert_eq!(
+            registered_provider_ids(&registry),
+            vec![
+                DEEPSEEK_PROVIDER_ID.to_owned(),
+                GITHUB_COPILOT_PROVIDER_ID.to_owned(),
+                OPENAI_PROVIDER_ID.to_owned(),
+            ]
+        );
+        assert_eq!(
+            registry
+                .export_configs()
+                .unwrap()
+                .into_iter()
+                .find(|config| config.id.as_str() == OPENAI_PROVIDER_ID)
+                .unwrap()
+                .models[0]
+                .id
+                .as_str(),
+            OPENAI_DEFAULT_MODEL
+        );
+        assert!(
+            !registered_provider_ids(&registry).contains(&OPENAI_COMPATIBLE_PROVIDER_ID.to_owned())
+        );
+        assert!(
+            credentials
+                .resolve(&CredentialRef::new(OPENAI_COMPATIBLE_CREDENTIAL_REF))
+                .is_err(),
+            "nothing set must store no gateway credential"
+        );
+    }
+
+    #[test]
+    fn a_blank_endpoint_registers_no_gateway() {
+        let (registry, credentials) = configured_with(&[
+            (OPENAI_COMPATIBLE_ENDPOINT_ENV, "   "),
+            (OPENAI_COMPATIBLE_API_KEY_ENV, GATEWAY_KEY),
+        ]);
+        let registry = registry.unwrap();
+        assert!(
+            !registered_provider_ids(&registry).contains(&OPENAI_COMPATIBLE_PROVIDER_ID.to_owned())
+        );
+        assert!(
+            credentials
+                .resolve(&CredentialRef::new(OPENAI_COMPATIBLE_CREDENTIAL_REF))
+                .is_err(),
+            "a blank endpoint must not store the key"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_without_a_key_is_refused_before_anything_is_stored() {
+        for variables in [
+            vec![(OPENAI_COMPATIBLE_ENDPOINT_ENV, GATEWAY_ENDPOINT)],
+            vec![
+                (OPENAI_COMPATIBLE_ENDPOINT_ENV, GATEWAY_ENDPOINT),
+                (OPENAI_COMPATIBLE_API_KEY_ENV, "   "),
+            ],
+        ] {
+            let (registry, credentials) = configured_with(&variables);
+            let error = registry.expect_err("a keyless gateway must be refused");
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+            assert!(!error.retryable);
+            assert!(
+                error.message.contains(OPENAI_COMPATIBLE_API_KEY_ENV),
+                "{error}"
+            );
+            assert!(
+                error.message.contains(OPENAI_COMPATIBLE_ENDPOINT_ENV),
+                "{error}"
+            );
+            assert!(
+                credentials
+                    .resolve(&CredentialRef::new(OPENAI_COMPATIBLE_CREDENTIAL_REF))
+                    .is_err(),
+                "a refused gateway must store no credential"
+            );
+        }
+    }
+
+    #[test]
+    fn an_endpoint_and_key_register_the_gateway_with_the_default_model() {
+        let (registry, credentials) = configured_with(&[
+            (OPENAI_COMPATIBLE_ENDPOINT_ENV, GATEWAY_ENDPOINT),
+            (OPENAI_COMPATIBLE_API_KEY_ENV, GATEWAY_KEY),
+        ]);
+        let registry = registry.unwrap();
+        let gateway = gateway(&registry);
+        assert_eq!(gateway.kind, ProviderKind::OpenAiCompatible);
+        assert_eq!(gateway.display_name, "OpenAI-compatible gateway");
+        assert!(gateway.api_key_configurable);
+        assert_eq!(gateway.models.len(), 1);
+        assert_eq!(gateway.models[0].id.as_str(), OPENAI_DEFAULT_MODEL);
+        assert_eq!(gateway.models[0].display_name, OPENAI_DEFAULT_MODEL);
+        assert_eq!(gateway.models[0].context_window, None);
+        assert_eq!(gateway.models[0].max_input_tokens, None);
+        assert_eq!(gateway.models[0].max_output_tokens, None);
+        assert_eq!(
+            gateway.models[0].capabilities,
+            ModelCapabilities {
+                streaming: false,
+                tool_calling: true,
+                vision: false,
+                json_mode: true,
+            }
+        );
+        assert_eq!(
+            gateway.credential_id.as_deref(),
+            Some(OPENAI_COMPATIBLE_CREDENTIAL_REF)
+        );
+        assert_eq!(
+            credentials
+                .resolve(&CredentialRef::new(OPENAI_COMPATIBLE_CREDENTIAL_REF))
+                .unwrap(),
+            GATEWAY_KEY
+        );
+        // The stored reference is the provider's only trace of the key.
+        let config = registry
+            .export_configs()
+            .unwrap()
+            .into_iter()
+            .find(|config| config.id.as_str() == OPENAI_COMPATIBLE_PROVIDER_ID)
+            .unwrap();
+        assert_eq!(
+            config
+                .credential
+                .map(|reference| reference.as_str().to_owned()),
+            Some(OPENAI_COMPATIBLE_CREDENTIAL_REF.to_owned())
+        );
+        assert_eq!(config.endpoint.as_deref(), Some(GATEWAY_ENDPOINT));
+        let serialized = serde_json::to_string(&registry.list_providers().unwrap()).unwrap();
+        assert!(!serialized.contains(GATEWAY_KEY), "{serialized}");
+        assert!(!serialized.contains("Bearer"), "{serialized}");
+    }
+
+    #[test]
+    fn the_model_variable_selects_the_gateway_model_and_stays_out_of_listings() {
+        let (registry, credentials) = configured_with(&[
+            (OPENAI_COMPATIBLE_ENDPOINT_ENV, GATEWAY_ENDPOINT),
+            (OPENAI_COMPATIBLE_API_KEY_ENV, GATEWAY_KEY),
+            (OPENAI_COMPATIBLE_MODEL_ENV, " qwen2.5-coder "),
+        ]);
+        let registry = registry.unwrap();
+        let gateway = gateway(&registry);
+        assert_eq!(gateway.models.len(), 1);
+        assert_eq!(gateway.models[0].id.as_str(), "qwen2.5-coder");
+        assert_eq!(
+            gateway.models[0].provider.as_str(),
+            OPENAI_COMPATIBLE_PROVIDER_ID
+        );
+        assert_eq!(
+            gateway.credential_id.as_deref(),
+            Some(OPENAI_COMPATIBLE_CREDENTIAL_REF)
+        );
+        assert!(
+            registry
+                .list_models()
+                .unwrap()
+                .iter()
+                .any(|model| model.id.as_str() == "qwen2.5-coder")
+        );
+        assert_eq!(
+            credentials
+                .resolve(&CredentialRef::new(OPENAI_COMPATIBLE_CREDENTIAL_REF))
+                .unwrap(),
+            GATEWAY_KEY
+        );
+        let serialized = serde_json::to_string(&registry.list_providers().unwrap()).unwrap();
+        assert!(!serialized.contains(GATEWAY_KEY), "{serialized}");
+        assert!(!serialized.contains("Bearer"), "{serialized}");
+    }
+
+    #[test]
+    fn a_blank_model_variable_falls_back_to_the_default_model() {
+        let (registry, _) = configured_with(&[
+            (OPENAI_COMPATIBLE_ENDPOINT_ENV, GATEWAY_ENDPOINT),
+            (OPENAI_COMPATIBLE_API_KEY_ENV, GATEWAY_KEY),
+            (OPENAI_COMPATIBLE_MODEL_ENV, "  "),
+        ]);
+        let registry = registry.unwrap();
+        assert_eq!(
+            gateway(&registry).models[0].id.as_str(),
+            OPENAI_DEFAULT_MODEL
+        );
+    }
+
+    #[test]
+    fn a_key_or_a_model_alone_changes_nothing() {
+        for variables in [
+            vec![(OPENAI_COMPATIBLE_API_KEY_ENV, GATEWAY_KEY)],
+            vec![(OPENAI_COMPATIBLE_MODEL_ENV, "qwen2.5-coder")],
+            vec![
+                (OPENAI_COMPATIBLE_API_KEY_ENV, GATEWAY_KEY),
+                (OPENAI_COMPATIBLE_MODEL_ENV, "qwen2.5-coder"),
+            ],
+        ] {
+            let (registry, credentials) = configured_with(&variables);
+            let registry = registry.unwrap();
+            assert_eq!(
+                registered_provider_ids(&registry),
+                vec![
+                    DEEPSEEK_PROVIDER_ID.to_owned(),
+                    GITHUB_COPILOT_PROVIDER_ID.to_owned(),
+                    OPENAI_PROVIDER_ID.to_owned(),
+                ],
+                "{variables:?} must register no gateway"
+            );
+            assert!(
+                credentials
+                    .resolve(&CredentialRef::new(OPENAI_COMPATIBLE_CREDENTIAL_REF))
+                    .is_err(),
+                "{variables:?} must store no credential"
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_variables_leave_the_ollama_registration_unchanged() {
+        let (registry, _) = configured_with(&[
+            (OPENAI_COMPATIBLE_ENDPOINT_ENV, GATEWAY_ENDPOINT),
+            (OPENAI_COMPATIBLE_API_KEY_ENV, GATEWAY_KEY),
+            ("LOOM_OLLAMA_ENDPOINT", "http://127.0.0.1:11435"),
+        ]);
+        let registry = registry.unwrap();
+        let providers = registry.list_providers().unwrap();
+        assert!(
+            providers
+                .iter()
+                .any(|provider| provider.id.as_str() == OPENAI_COMPATIBLE_PROVIDER_ID)
+        );
+        let ollama = providers
+            .iter()
+            .find(|provider| provider.id.as_str() == "ollama")
+            .expect("the Ollama provider should stay registered");
+        assert_eq!(ollama.kind, ProviderKind::Ollama);
+        assert_eq!(ollama.models[0].id.as_str(), "llama3.2");
+        let config = registry
+            .export_configs()
+            .unwrap()
+            .into_iter()
+            .find(|config| config.id.as_str() == "ollama")
+            .unwrap();
+        assert_eq!(config.endpoint.as_deref(), Some("http://127.0.0.1:11435"));
     }
 }

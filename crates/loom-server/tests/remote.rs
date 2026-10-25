@@ -17,8 +17,8 @@ use loom_protocol::{
 use loom_server::{
     AuthTokenStore, AuthorizationScope, DEFAULT_MAX_FRAME_BYTES,
     DEFAULT_MAX_IN_FLIGHT_CONTROL_REQUESTS, DEFAULT_MAX_IN_FLIGHT_REQUESTS, GitHubSignInConfig,
-    InProcessBackend, RemoteServer, RemoteServerConfig, ServerTlsConfig, WEBSOCKET_TLS_SUPPORTED,
-    WebSocketConnection, WebSocketTransport,
+    InProcessBackend, ProviderRegistryChoice, RemoteServer, RemoteServerConfig, ServerTlsConfig,
+    WEBSOCKET_TLS_SUPPORTED, WebSocketConnection, WebSocketTransport, open_backend_named_with,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{
@@ -2244,5 +2244,109 @@ async fn a_pipelining_client_is_refused_at_the_in_flight_limit_and_keeps_control
 
     drop(pipelining);
     drop(other);
+    server.stop().await.unwrap();
+}
+
+/// The `--providers demo` selection end to end: the backend is opened through
+/// the demo constructor, the WebSocket server is the standard test server, and a
+/// `deterministic/demo` run is started and driven to completion while its
+/// streamed events arrive.
+#[tokio::test]
+async fn the_demo_provider_choice_serves_a_deterministic_run_over_the_wire() {
+    let backend =
+        open_backend_named_with(ProviderRegistryChoice::Demo, None, Some("demo-worker")).unwrap();
+    let (_backend, _auth, token, server) = server_with_backend(backend).await;
+    let mut connection = WebSocketTransport::new(server.websocket_url(), token.token)
+        .connect()
+        .await
+        .unwrap();
+    negotiate(&mut connection).await;
+
+    // The selection reaches clients: the demo registry lists the deterministic
+    // and the local OpenAI-compatible providers.
+    let response = connection
+        .request(RequestEnvelope::new(ClientRequest::Provider(
+            ProviderRequest::ListProviders,
+        )))
+        .await
+        .unwrap();
+    let Ok(ServerResponse::Provider(ProviderResponse::Providers { providers })) = response.result
+    else {
+        panic!("unexpected provider response: {:?}", response.result);
+    };
+    for id in ["deterministic", "openai-compatible"] {
+        assert!(
+            providers.iter().any(|provider| provider.id.as_str() == id),
+            "the demo profile must list the {id} provider: {providers:?}"
+        );
+    }
+
+    let workspace_id = create_workspace(&mut connection).await;
+    let session = session(&mut connection, workspace_id).await;
+    let run_id = match connection
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::StartSessionAgentRun {
+                session_id: session.id,
+                task: "demo registry run".to_owned(),
+                model: ModelId::new("deterministic/demo"),
+                system_instructions: None,
+                repository_instructions: None,
+            },
+        )))
+        .await
+        .unwrap()
+        .result
+        .unwrap()
+    {
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
+        response => panic!("unexpected run response: {response:?}"),
+    };
+
+    let mut after = None;
+    let mut deltas = 0;
+    let mut completed = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !completed && tokio::time::Instant::now() < deadline {
+        let batch = events(&mut connection, session.id, after).await;
+        if batch.is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            continue;
+        }
+        for event in batch {
+            after = Some(event.sequence);
+            match &event.event {
+                ServerEvent::Agent {
+                    event:
+                        AgentEvent::AssistantMessageDelta {
+                            run_id: event_run, ..
+                        },
+                } if *event_run == run_id => deltas += 1,
+                ServerEvent::Agent {
+                    event: AgentEvent::RunCompleted { snapshot },
+                } if snapshot.id == run_id => completed = true,
+                _ => {}
+            }
+        }
+    }
+
+    assert!(
+        deltas > 0,
+        "the demo run must stream assistant deltas over the wire"
+    );
+    assert!(
+        completed,
+        "the deterministic demo run must complete within the deadline"
+    );
+    let run = connection
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::GetAgentRun { run_id },
+        )))
+        .await
+        .unwrap();
+    assert!(matches!(
+        run.result.unwrap(),
+        ServerResponse::Run(RunResponse::AgentRun(snapshot))
+            if snapshot.state == loom_agent::AgentRunState::Completed
+    ));
     server.stop().await.unwrap();
 }

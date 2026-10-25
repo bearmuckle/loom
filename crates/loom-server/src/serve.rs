@@ -77,6 +77,51 @@ fn confirm_state_wipe(path: &Path, status: SchemaStatus) -> Result<bool, LoomErr
     ))
 }
 
+/// Which provider registry a started backend serves: the configured registry an
+/// operator sets up from the Providers dialog or the environment, or the demo
+/// registry that needs no credential at all.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ProviderRegistryChoice {
+    /// OpenAI, DeepSeek, GitHub Copilot, the optional Ollama runtime, and the
+    /// optional OpenAI-compatible gateway the environment registers.
+    #[default]
+    Configured,
+    /// `deterministic/demo` with the local OpenAI-compatible demo model, for
+    /// tests and local automation rather than an exposed production worker.
+    Demo,
+}
+
+impl ProviderRegistryChoice {
+    /// The word `--providers` accepts for the configured registry.
+    pub const CONFIGURED: &'static str = "configured";
+    /// The word `--providers` accepts for the demo registry.
+    pub const DEMO: &'static str = "demo";
+
+    /// Parses one `--providers` value. Anything but the two accepted words is
+    /// refused, and the message names the flag and both accepted values so an
+    /// operator can correct the command line without reading the help text.
+    pub fn parse(value: &str) -> Result<Self, LoomError> {
+        match value {
+            Self::CONFIGURED => Ok(Self::Configured),
+            Self::DEMO => Ok(Self::Demo),
+            other => Err(LoomError::invalid_request(format!(
+                "--providers must be '{}' or '{}', not '{other}'",
+                Self::CONFIGURED,
+                Self::DEMO
+            ))),
+        }
+    }
+
+    /// The word this choice is written as, so the startup log line carries the
+    /// profile name and nothing else.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Configured => Self::CONFIGURED,
+            Self::Demo => Self::DEMO,
+        }
+    }
+}
+
 /// Opens the backend the operator asked for: the durable database at
 /// `persistence`, or the in-memory backend when this instance has no durable
 /// database. Both binaries serve the backend this returns.
@@ -94,9 +139,30 @@ pub fn open_backend_named(
     persistence: Option<&Path>,
     node_name: Option<&str>,
 ) -> Result<Arc<InProcessBackend>, LoomError> {
-    match persistence {
-        Some(path) => InProcessBackend::new_persistent_with_github_copilot_named(path, node_name),
-        None => InProcessBackend::new_with_github_copilot_named(node_name),
+    open_backend_named_with(ProviderRegistryChoice::Configured, persistence, node_name)
+}
+
+/// [`open_backend_named`] with the provider registry profile `--providers`
+/// selects. The selected profile is logged once here, as just its word, so an
+/// operator can tell which registry a worker serves without any endpoint or key
+/// reaching a log line.
+pub fn open_backend_named_with(
+    choice: ProviderRegistryChoice,
+    persistence: Option<&Path>,
+    node_name: Option<&str>,
+) -> Result<Arc<InProcessBackend>, LoomError> {
+    log::info!("Provider registry: {}", choice.as_str());
+    match (choice, persistence) {
+        (ProviderRegistryChoice::Configured, Some(path)) => {
+            InProcessBackend::new_persistent_with_github_copilot_named(path, node_name)
+        }
+        (ProviderRegistryChoice::Configured, None) => {
+            InProcessBackend::new_with_github_copilot_named(node_name)
+        }
+        (ProviderRegistryChoice::Demo, Some(path)) => {
+            InProcessBackend::new_persistent_with_demo_named(path, node_name)
+        }
+        (ProviderRegistryChoice::Demo, None) => InProcessBackend::new_with_demo_named(node_name),
     }
 }
 
@@ -223,4 +289,145 @@ pub fn bind_exposure_warning(
          the bearer token and every protocol frame are sent in plaintext; do not expose this \
          listener to an untrusted network"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use loom_core::ErrorCode;
+    use loom_model::{GITHUB_COPILOT_PROVIDER_ID, OPENAI_PROVIDER_ID};
+
+    use super::{ProviderRegistryChoice, open_backend_named_with};
+
+    fn temporary_database() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "loom-providers-demo-{}.db",
+            loom_core::RunId::new()
+        ))
+    }
+
+    /// Whether the process exports a gateway configuration. The configured
+    /// registry reads the process environment, so the gateway assertion only
+    /// holds when nothing is exported; no test mutates it.
+    fn gateway_exported() -> bool {
+        ["LOOM_OPENAI_ENDPOINT", "LOOM_API_KEY"]
+            .iter()
+            .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
+    }
+
+    #[test]
+    fn the_providers_choice_defaults_to_configured_and_parses_the_two_words() {
+        assert_eq!(
+            ProviderRegistryChoice::default(),
+            ProviderRegistryChoice::Configured
+        );
+        assert_eq!(
+            ProviderRegistryChoice::parse("configured").unwrap(),
+            ProviderRegistryChoice::Configured
+        );
+        assert_eq!(
+            ProviderRegistryChoice::parse("demo").unwrap(),
+            ProviderRegistryChoice::Demo
+        );
+        // The accessor returns the words the parser accepts.
+        for choice in [
+            ProviderRegistryChoice::Configured,
+            ProviderRegistryChoice::Demo,
+        ] {
+            assert_eq!(
+                ProviderRegistryChoice::parse(choice.as_str()).unwrap(),
+                choice
+            );
+        }
+
+        for rejected in ["", "Demo", "demo ", "everything provider"] {
+            let error = ProviderRegistryChoice::parse(rejected).unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+            assert!(!error.retryable);
+            assert!(error.message.contains("--providers"), "{error}");
+            assert!(error.message.contains("configured"), "{error}");
+            assert!(error.message.contains("demo"), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_demo_choice_serves_the_deterministic_and_local_demo_models() {
+        let backend =
+            open_backend_named_with(ProviderRegistryChoice::Demo, None, Some("demo-worker"))
+                .unwrap();
+        assert_eq!(backend.node_name(), "demo-worker");
+        let registry = backend.provider_registry();
+        let models = registry.list_models().unwrap();
+        assert!(
+            models
+                .iter()
+                .any(|model| model.id.as_str() == "deterministic/demo"),
+            "the demo profile must serve the deterministic model: {models:?}"
+        );
+        assert!(
+            models
+                .iter()
+                .any(|model| model.id.as_str() == "openai-compatible/demo"),
+            "the demo profile must serve the local OpenAI-compatible model: {models:?}"
+        );
+        // `ProviderRegistry::demo` gains no GitHub Copilot entry.
+        let providers = registry.list_providers().unwrap();
+        assert!(
+            !providers
+                .iter()
+                .any(|provider| provider.id.as_str() == GITHUB_COPILOT_PROVIDER_ID),
+            "{providers:?}"
+        );
+        backend.shutdown().unwrap();
+    }
+
+    #[test]
+    fn the_configured_default_registers_no_gateway_without_its_variables() {
+        assert_eq!(
+            ProviderRegistryChoice::default(),
+            ProviderRegistryChoice::Configured,
+            "the default registry the worker serves is the configured one"
+        );
+        if gateway_exported() {
+            // An exported gateway is registered instead, and an endpoint without
+            // a key refuses the start; neither is this test's subject.
+            return;
+        }
+        let backend =
+            open_backend_named_with(ProviderRegistryChoice::Configured, None, None).unwrap();
+        let registry = backend.provider_registry();
+        let providers = registry.list_providers().unwrap();
+        assert!(
+            !providers
+                .iter()
+                .any(|provider| provider.id.as_str() == "openai-compatible"),
+            "nothing exported must register no gateway: {providers:?}"
+        );
+        assert!(
+            providers
+                .iter()
+                .any(|provider| provider.id.as_str() == OPENAI_PROVIDER_ID),
+            "the configured registry keeps its OpenAI entry: {providers:?}"
+        );
+        backend.shutdown().unwrap();
+    }
+
+    #[test]
+    fn the_demo_choice_opens_a_temporary_database_and_shuts_down() {
+        let path = temporary_database();
+        let backend =
+            open_backend_named_with(ProviderRegistryChoice::Demo, Some(&path), None).unwrap();
+        assert!(path.exists(), "the demo choice must open {path:?}");
+        let models = backend.provider_registry().list_models().unwrap();
+        assert!(
+            models
+                .iter()
+                .any(|model| model.id.as_str() == "deterministic/demo")
+        );
+        backend.shutdown().unwrap();
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("credentials.json")).ok();
+        std::fs::remove_dir_all(path.with_extension("session-roots")).ok();
+    }
 }

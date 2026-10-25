@@ -187,6 +187,37 @@ worker that clones or pushes to GitHub needs no new exception. A deployment that
 blocks either endpoint keeps working for operator bearer tokens; only interactive
 sign-in fails, with the reason surfaced as a failed sign-in status.
 
+## Providers on a headless worker
+
+A worker without a client to open the Providers dialog serves the configured
+registry by default: OpenAI, DeepSeek, and GitHub Copilot, with the model names
+`LOOM_OPENAI_MODEL` and `LOOM_DEEPSEEK_MODEL` overriding the defaults, plus the
+Ollama runtime when `LOOM_OLLAMA_ENDPOINT` is set. The hosted providers appear in
+provider listings for setup and only serve requests once a credential is stored.
+
+An OpenAI-compatible gateway is registered from the environment instead:
+
+- `LOOM_OPENAI_ENDPOINT` — the gateway's chat-completions URL. The gateway is
+  registered as the `openai-compatible` provider.
+- `LOOM_API_KEY` — the gateway's key. It is stored in the credential file beside
+  the database, and only the credential reference reaches a provider summary, a
+  protocol response, or a log line.
+- `LOOM_MODEL` — the one model the gateway advertises, defaulting to `gpt-6-luna`.
+
+Setting `LOOM_OPENAI_ENDPOINT` without a non-blank `LOOM_API_KEY` refuses the
+start with a configuration error that names the missing variable, rather than
+running a provider that cannot authenticate. `LOOM_API_KEY` or `LOOM_MODEL`
+alone registers nothing. Startup logging and the `/health` endpoint never print
+the key; provider summaries carry only the credential reference.
+
+`--providers configured|demo` selects the registry a start serves:
+
+- `configured` (the default) is the registry described above.
+- `demo` serves `deterministic/demo` and the local OpenAI-compatible demo model.
+  It needs no credential and no network access, which is what makes it useful
+  for tests and local automation. It is not intended for an exposed production
+  worker, because its models return scripted output instead of model responses.
+
 ## Where agent commands execute
 
 Loom has no separate command sandbox. An agent command runs as a child process
@@ -227,6 +258,9 @@ spawned process may reach through the filesystem it inherits. See the
   credential-bearing variable the operator exported for the backend, such as
   `LOOM_API_KEY`, `LOOM_OPENAI_ENDPOINT`, or a repository token placed in the
   environment. Anything visible to the backend process is visible to a command.
+  Leaving those variables in place is what keeps an agent command that talks to
+  the same gateway working, so a deployment that configures a gateway expects
+  its commands to inherit it.
 - Loom does not drop privileges per command. There is no per-command user,
   group, capability set, or environment filter. Treat the backend account and
   its environment as the privilege of the agent.
