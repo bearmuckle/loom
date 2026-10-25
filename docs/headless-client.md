@@ -104,9 +104,9 @@ by default; `--max-bytes` changes that cap.
 
 `replayed` is `true` when the worker answered this call's mutating request
 from its idempotency cache instead of acting again, which happens only when the
-caller repeats a `--request-id`; a repeated archive, deletion, or cleanup is
-recognised that way. A failure uses the same envelope with `ok: false` and an
-`error` object carrying `code`, `message`, `retryable`, and `exit_code`.
+caller repeats a `--request-id`; a repeated archive, deletion, integration, or
+cleanup is recognised that way. A failure uses the same envelope with `ok: false`
+and an `error` object carrying `code`, `message`, `retryable`, and `exit_code`.
 `events` adds `gap { after, before, missing }` to `data` when a snapshot could
 not carry every event after the cursor, and `null` otherwise.
 
