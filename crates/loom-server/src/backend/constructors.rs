@@ -30,6 +30,31 @@ impl InProcessBackend {
         )
     }
 
+    /// The in-memory backend that serves the demo registry: `deterministic/demo`
+    /// plus the local OpenAI-compatible demo model, with no GitHub Copilot entry
+    /// so a headless worker's tests and local automation need no credential at
+    /// all. `node_name` follows the same rule as
+    /// [`InProcessBackend::new_with_github_copilot_named`].
+    pub fn new_with_demo_named(node_name: Option<&str>) -> Result<Arc<Self>> {
+        Self::with_provider_registry_and_persistence_named(
+            ProviderRegistry::demo(),
+            None,
+            node_name,
+        )
+    }
+
+    /// [`InProcessBackend::new_with_demo_named`] with durable state at `path`.
+    pub fn new_persistent_with_demo_named(
+        path: impl Into<PathBuf>,
+        node_name: Option<&str>,
+    ) -> Result<Arc<Self>> {
+        Self::with_provider_registry_persistent_credentials_named(
+            ProviderRegistry::demo(),
+            Some(path.into()),
+            node_name,
+        )
+    }
+
     pub fn with_models(models: Vec<ModelDescriptor>) -> Arc<Self> {
         let credentials = Arc::new(loom_providers::InMemoryCredentialStore::default());
         let providers = ProviderRegistry::with_credentials(credentials);

@@ -168,8 +168,9 @@ pub use retention::{
     run_archive_retention_sweeps, sweep_archive_retention_at_startup,
 };
 pub use serve::{
-    ServingBackend, bind_exposure_warning, ensure_state_database, ensure_state_database_with,
-    open_backend, open_backend_named, report_github_sign_in, start_remote_server,
+    ProviderRegistryChoice, ServingBackend, bind_exposure_warning, ensure_state_database,
+    ensure_state_database_with, open_backend, open_backend_named, open_backend_named_with,
+    report_github_sign_in, start_remote_server,
 };
 pub use util::{MAX_NODE_NAME_BYTES, NODE_NAME_ENV, NODE_NAME_FLAG, resolve_node_name};
 

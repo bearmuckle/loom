@@ -22,9 +22,9 @@ use loom_server::{
     ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FORCE_DISCARD_ENV, ARCHIVE_RETENTION_SUB_AGENT_ENV,
     ARCHIVE_RETENTION_SWEEP_INTERVAL, DEFAULT_MAX_FRAME_BYTES, DiagnosticsSettings,
     GitHubSignInConfig, InProcessBackend, Instance, InstanceLayout, InstanceOptions,
-    MAX_FRAME_BYTES_ENV, NODE_NAME_ENV, ProcessContext, RemoteServerConfig, ReopenBackoff,
-    ServerTlsConfig, ServingBackend, TlsState, apply_startup_archive_retention, diagnostics_lines,
-    fail_stop_record_path, open_backend_named, reopen_after_fail_stop,
+    MAX_FRAME_BYTES_ENV, NODE_NAME_ENV, ProcessContext, ProviderRegistryChoice, RemoteServerConfig,
+    ReopenBackoff, ServerTlsConfig, ServingBackend, TlsState, apply_startup_archive_retention,
+    diagnostics_lines, fail_stop_record_path, open_backend_named_with, reopen_after_fail_stop,
     resolve_archive_retention_with_sub_agent, resolve_max_frame_bytes, resolve_node_name,
     run_archive_retention_sweeps, start_remote_server, startup_summary,
     sweep_archive_retention_at_startup,
@@ -104,6 +104,8 @@ struct ServerOptions {
     /// OAuth app client id for the sign-in device flow; `None` uses the
     /// embedded GitHub CLI public client.
     github_oauth_client_id: Option<String>,
+    /// Which provider registry this worker serves, from `--providers`.
+    providers: ProviderRegistryChoice,
 }
 
 impl Default for ServerOptions {
@@ -126,6 +128,7 @@ impl Default for ServerOptions {
             allow_github_login: Vec::new(),
             no_github_sign_in: false,
             github_oauth_client_id: None,
+            providers: ProviderRegistryChoice::Configured,
         }
     }
 }
@@ -283,6 +286,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
                 options.github_oauth_client_id =
                     Some(required_value(&mut args, "--github-oauth-client-id")?);
             }
+            "--providers" => {
+                options.providers =
+                    ProviderRegistryChoice::parse(&required_value(&mut args, "--providers")?)?;
+            }
             "--help" | "-h" => return Ok(ParsedArgs::Help),
             "--version" | "-V" => return Ok(ParsedArgs::Version),
             value if value.starts_with("--bind=") => {
@@ -331,6 +338,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
             value if value.starts_with("--github-oauth-client-id=") => {
                 options.github_oauth_client_id =
                     Some(value["--github-oauth-client-id=".len()..].to_owned());
+            }
+            value if value.starts_with("--providers=") => {
+                options.providers = ProviderRegistryChoice::parse(&value["--providers=".len()..])?;
             }
             unknown => {
                 return Err(LoomError::invalid_request(format!(
@@ -389,7 +399,7 @@ fn help_text() -> String {
          [--tls-cert <pem> --tls-key <pem>] \
          [--allow-insecure-remote] [--diagnostics] \
          [--allow-github-login <login> ...] [--no-github-sign-in] \
-         [--github-oauth-client-id <id>]\n\
+         [--github-oauth-client-id <id>] [--providers configured|demo]\n\
          \n\
          A standalone Loom backend that serves the remote WebSocket protocol.\n\
          \n\
@@ -429,6 +439,9 @@ fn help_text() -> String {
          \x20 --github-oauth-client-id <id>\n\
          \x20                        OAuth app client id for the sign-in device flow \
          (default: the embedded GitHub CLI public client id)\n\
+         \x20 --providers configured|demo\n\
+         \x20                        serve this provider registry: configured (default) or \
+         the deterministic demo for tests and local automation\n\
          \x20 --diagnostics         print the resolved deployment context and exit\n\
          \x20 -h, --help            print this help and exit\n\
          \x20 -V, --version         print the version and exit\n\
@@ -618,7 +631,8 @@ async fn serve_in(
         state_directory,
     );
     log::info!("{}", startup_summary(&ProcessContext::detect(), &settings));
-    let backend = open_backend_named(instance.state_db(), node_name.as_deref())?;
+    let backend =
+        open_backend_named_with(options.providers, instance.state_db(), node_name.as_deref())?;
     // An explicit flag or variable wins over the persisted policy and is
     // persisted in turn; otherwise the policy loaded when the durable state was
     // opened applies; otherwise retention stays disabled. Either way the
@@ -728,9 +742,9 @@ mod tests {
     };
 
     use super::{
-        FailStopReopen, ParsedArgs, ServerOptions, build_version, diagnostics_report_in,
-        fail_stop_record_path, fail_stop_reopen, help_text, parse_args, prepare_instance,
-        resolve_tls, run, serve_in, start, version_label, version_text,
+        FailStopReopen, ParsedArgs, ProviderRegistryChoice, ServerOptions, build_version,
+        diagnostics_report_in, fail_stop_record_path, fail_stop_reopen, help_text, parse_args,
+        prepare_instance, resolve_tls, run, serve_in, start, version_label, version_text,
     };
     use loom_server::resolve_archive_retention;
 
@@ -799,6 +813,9 @@ mod tests {
         assert!(defaults.allow_github_login.is_empty());
         assert!(!defaults.no_github_sign_in);
         assert_eq!(defaults.github_oauth_client_id, None);
+        // The worker serves the configured registry unless --providers says
+        // otherwise.
+        assert_eq!(defaults.providers, ProviderRegistryChoice::Configured);
         let open = defaults.github_sign_in_config();
         assert!(open.is_enabled());
         assert_eq!(open.allowlist_size(), 0);
@@ -838,6 +855,8 @@ mod tests {
             "octocat",
             "--github-oauth-client-id",
             "own-client-id",
+            "--providers",
+            "demo",
         ]);
         assert_eq!(spaced.bind.to_string(), "127.0.0.1:9000");
         assert_eq!(spaced.instance_name.as_deref(), Some("worker"));
@@ -860,6 +879,7 @@ mod tests {
         assert!(sign_in.is_enabled());
         assert_eq!(sign_in.allowlist_size(), 2);
         assert_eq!(sign_in.client_id.as_deref(), Some("own-client-id"));
+        assert_eq!(spaced.providers, ProviderRegistryChoice::Demo);
 
         let equals = serve_options(&[
             "--bind=0.0.0.0:9",
@@ -873,6 +893,7 @@ mod tests {
             "--tls-key=/tmp/other-key.pem",
             "--allow-github-login=bjornharrtell",
             "--github-oauth-client-id=other-client-id",
+            "--providers=configured",
         ]);
         assert_eq!(equals.bind.to_string(), "0.0.0.0:9");
         assert_eq!(equals.instance_name.as_deref(), Some("pinned"));
@@ -899,6 +920,25 @@ mod tests {
             equals.github_sign_in_config().client_id.as_deref(),
             Some("other-client-id")
         );
+        assert_eq!(equals.providers, ProviderRegistryChoice::Configured);
+    }
+
+    #[test]
+    fn the_help_text_documents_the_providers_choice() {
+        let help = help_text();
+        assert!(help.contains("Usage: loom-server"), "{help}");
+        assert!(
+            help.contains("[--providers configured|demo]"),
+            "the usage line names the flag: {help}"
+        );
+        assert!(
+            help.contains("--providers configured|demo"),
+            "the option list names the flag: {help}"
+        );
+        assert!(
+            help.contains("configured (default)"),
+            "the option list names the default: {help}"
+        );
     }
 
     #[test]
@@ -916,6 +956,7 @@ mod tests {
             "--tls-key",
             "--allow-github-login",
             "--github-oauth-client-id",
+            "--providers",
         ] {
             let error = parse_error(&[flag]);
             assert!(
@@ -929,6 +970,18 @@ mod tests {
         ] {
             let error = parse_error(&values);
             assert!(error.message.contains("socket address"), "{error}");
+        }
+        // A rejected --providers value names the flag and both accepted words.
+        for values in [
+            vec!["--providers", "everything"],
+            vec!["--providers=everything"],
+        ] {
+            let error = parse_error(&values);
+            assert_eq!(error.code, loom_core::ErrorCode::InvalidRequest);
+            assert!(!error.retryable);
+            assert!(error.message.contains("--providers"), "{error}");
+            assert!(error.message.contains("configured"), "{error}");
+            assert!(error.message.contains("demo"), "{error}");
         }
         assert!(
             parse_error(&["--mystery"])

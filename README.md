@@ -89,11 +89,26 @@ contract, exit codes, resume behaviour, and cursor file.
 
 Configure OpenAI, DeepSeek, or GitHub Copilot in the Providers dialog; the
 default models are `gpt-6-luna` and `deepseek-flash`, overridable with
-`LOOM_OPENAI_MODEL` and `LOOM_DEEPSEEK_MODEL`. For an OpenAI-compatible gateway,
-set `LOOM_OPENAI_ENDPOINT`, `LOOM_API_KEY`, and `LOOM_MODEL`. API keys are stored
-in a credential file beside the backend's SQLite database and are used by the
-backend; treat them as sensitive and note that state storage is not an encrypted
-vault.
+`LOOM_OPENAI_MODEL` and `LOOM_DEEPSEEK_MODEL`.
+
+A headless worker has no Providers dialog, so it can be given an
+OpenAI-compatible gateway through the environment: `LOOM_OPENAI_ENDPOINT` is the
+gateway's chat-completions URL, `LOOM_API_KEY` its key, and the optional
+`LOOM_MODEL` the one model it advertises (default `gpt-6-luna`). The gateway is
+registered as the `openai-compatible` provider. A set `LOOM_OPENAI_ENDPOINT`
+without a non-blank `LOOM_API_KEY` is refused at startup instead of starting a
+provider that cannot authenticate, and `LOOM_API_KEY` or `LOOM_MODEL` alone
+change nothing.
+
+API keys are stored in a credential file beside the backend's SQLite database and
+used by the backend; provider listings carry only the credential reference, never
+the key, and no log line prints it. Treat the key as sensitive and note that
+state storage is not an encrypted vault.
+
+`loom-server --providers demo` serves the `deterministic/demo` model and the local
+OpenAI-compatible demo model instead of the configured registry, so tests and
+local automation can drive a run without any provider credential or network
+access.
 
 ## Documentation
 
