@@ -10,8 +10,8 @@
 use std::{future::Future, pin::Pin};
 
 use loom_core::LoomError;
+use loom_local::WebSocketConnection;
 use loom_protocol::{RequestEnvelope, ResponseEnvelope};
-use loom_server::WebSocketConnection;
 
 /// One request/response exchange with a worker.
 pub trait Client {

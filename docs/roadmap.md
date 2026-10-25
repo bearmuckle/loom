@@ -108,7 +108,7 @@ M4 implementation notes:
 - Heartbeats, request deadlines, cancellation frames, malformed-payload
   responses, and bounded outbound queues are transport protections; runtime
   and journal state remain backend-owned after disconnect.
-- `cargo run -p loom-cli -- --m4-demo` demonstrates a second client
+- `cargo run -p loom-shell -- --m4-demo` demonstrates a second client
   reconnecting, observing steps, approving both deterministic tool actions,
   and retrieving the completed result.
 
@@ -287,7 +287,7 @@ existing persisted or protocol identities:
   session-repository operations. `--root <path>` points a one-shot CLI session
   at that directory, creating it when missing, and attaches it as a repository
   when it contains `.git`; `--serve` rejects the flag and lets each server
-  session manage its own repositories (`crates/loom-cli/src/main.rs`).
+  session manage its own repositories (`crates/loom-shell/src/main.rs`).
 
 Before implementation, settle repository attachment lifecycle and checkout
 choices (clone versus worktree) at the service boundary. Those choices must

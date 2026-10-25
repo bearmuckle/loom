@@ -2,8 +2,9 @@
 
 `loom-cli` is the headless binary of the `crates/loom-cli` package and a pure
 client of the versioned protocol: it embeds no backend, opens no SQLite
-database, and manages no worker. The package ships it beside the `loom` demo
-shell:
+database, and manages no worker, and the package does not depend on the
+backend crates. The `loom` demo shell lives in the separate `loom-shell`
+package:
 
 ```sh
 cargo run -p loom-cli --bin loom-cli -- doctor

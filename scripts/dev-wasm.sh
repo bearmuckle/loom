@@ -52,7 +52,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "Starting Loom backend on ${BACKEND_BIND}..."
-cargo run --quiet -p loom-cli -- \
+cargo run --quiet -p loom-shell -- \
     --serve \
     --bind "$BACKEND_BIND" \
     --token "$TOKEN" &

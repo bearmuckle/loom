@@ -4537,16 +4537,11 @@ version = "0.1.0"
 name = "loom-cli"
 version = "0.1.0"
 dependencies = [
- "env_logger",
- "loom-agent",
  "loom-core",
+ "loom-local",
  "loom-model",
- "loom-persistence",
- "loom-process",
  "loom-protocol",
- "loom-providers",
  "loom-server",
- "loom-vcs",
  "serde_json",
  "tokio",
 ]
@@ -4714,6 +4709,24 @@ dependencies = [
  "serde",
  "sha2 0.11.1",
  "similar 3.2.0",
+]
+
+[[package]]
+name = "loom-shell"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "loom-agent",
+ "loom-core",
+ "loom-model",
+ "loom-persistence",
+ "loom-process",
+ "loom-protocol",
+ "loom-providers",
+ "loom-server",
+ "loom-vcs",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

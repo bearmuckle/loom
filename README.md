@@ -79,8 +79,8 @@ duration syntax and the sweep.
 
 ## Headless client
 
-`loom-cli` is the headless client of the versioned protocol, shipped as a
-second binary by the `loom-cli` package. It reads a worker and, with `run`,
+`loom-cli` is the headless client of the versioned protocol, built by the
+`loom-cli` package. It reads a worker and, with `run`,
 starts one agent run; it embeds no backend and opens no database. See
 [the headless client guide](docs/headless-client.md) for its verbs, output
 contract, exit codes, resume behaviour, and cursor file.

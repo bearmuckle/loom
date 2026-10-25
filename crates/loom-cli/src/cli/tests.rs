@@ -870,9 +870,8 @@ fn a_read_only_scoped_token_can_read_but_cannot_start_a_run() {
     // A token scoped to one workspace and only the capabilities a read needs is
     // the read-only credential the contract promises to support. The same
     // client code runs the read verbs and is refused the one mutation.
-    use loom_server::{
-        AuthTokenStore, AuthorizationScope, RemoteServer, RemoteServerConfig, WebSocketTransport,
-    };
+    use loom_local::WebSocketTransport;
+    use loom_server::{AuthTokenStore, AuthorizationScope, RemoteServer, RemoteServerConfig};
 
     let backend = InProcessBackend::new();
     let control = backend.connect();

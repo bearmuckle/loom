@@ -31,6 +31,7 @@ pub use connection::{DEFAULT_REQUEST_TIMEOUT, RemoteConnection, RemoteConnection
 pub use transport::{
     DEFAULT_MAX_FRAME_BYTES, MAX_FRAME_BYTES_ENV, WEBSOCKET_TLS_SUPPORTED, resolve_max_frame_bytes,
 };
+pub use transport::{WebSocketConnection, WebSocketTransport};
 pub use worker::{ManagedWorker, ManagedWorkerOptions};
 
 const PEER_CREDENTIAL_SERVICE: &str = "com.bearmuckle.loom.worker-peer";

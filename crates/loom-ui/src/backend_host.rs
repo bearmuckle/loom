@@ -59,7 +59,8 @@ pub(crate) struct BackendWorker {
 }
 
 #[cfg(not(target_family = "wasm"))]
-#[allow(dead_code)]
+// Test builds queue jobs without a worker thread, so nothing reads the fields.
+#[cfg_attr(test, allow(dead_code))]
 pub(crate) struct Job {
     pub(crate) request: RequestEnvelope,
     pub(crate) reply: oneshot::Sender<ResponseEnvelope>,

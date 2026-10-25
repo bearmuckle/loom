@@ -15,6 +15,7 @@ members = [
     "crates/loom-persistence",
     "crates/loom-server",
     "crates/loom-cli",
+    "crates/loom-shell",
     "crates/loom-ui",
     "crates/loom-local",
 ]

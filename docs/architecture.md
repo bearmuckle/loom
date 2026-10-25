@@ -162,7 +162,8 @@ Suggested backend boundaries:
   transport, and the managed local worker (binary resolution, checksum-verified
   download and cache, process start, health wait, and shutdown). It has no
   normal dependency on any backend crate.
-- `loom-cli`: local server startup, diagnostics, and administration.
+- `loom-shell`: local server startup, diagnostics, and administration (the `loom` binary).
+- `loom-cli`: the headless protocol client; it embeds no backend.
 
 The backend should expose domain services rather than exposing raw model APIs,
 filesystem, and process primitives directly. This keeps provider
@@ -380,6 +381,7 @@ crates/
   loom-server/
   loom-local/
   loom-cli/
+  loom-shell/
   loom-ui/
 ```
 

@@ -266,7 +266,7 @@ pub fn main(arguments: Vec<String>) -> i32 {
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
     let code = runtime.block_on(async {
-        let mut transport = loom_server::WebSocketTransport::new(url, token)
+        let mut transport = loom_local::WebSocketTransport::new(url, token)
             .with_insecure_remote_allowed(settings.allow_insecure_remote);
         if let Some(max_frame_bytes) = settings.max_frame_bytes {
             transport = match transport.with_max_frame_bytes(max_frame_bytes) {
