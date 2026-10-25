@@ -26,6 +26,11 @@
 //! | `result` | `Repository/ListSessionRepositories`, `Repository/GetSessionVcsStatus`, `Repository/GetSessionVcsDiff`, `Task/GetSessionTaskEvidence` |
 //! | `retention get` | `Control/GetArchiveRetentionPolicy` |
 //! | `retention set` | `Control/GetArchiveRetentionPolicy`, `Control/SetArchiveRetentionPolicy` |
+//! | `project get`, `project tree`, `project tasks` | `Project/GetProjectSnapshotForSession` |
+//! | `project children` | `Project/GetProjectSnapshotForSession`, one `Session/GetAgentSessionSnapshotMetadata` per child |
+//! | `project messages` | `Project/GetProjectSnapshotForSession`, `Project/ListProjectAgentMessages` |
+//! | `project send` | `Project/GetProjectSnapshotForSession`, `Session/GetAgentSessionSnapshotMetadata`, `Collaboration/GetRunRevision`, `Collaboration/DirectAgent` |
+//! | `project child <action>` | `Project/GetProjectSnapshotForSession`, `Project/ControlProjectChild` |
 //! | `delete` | `Project/GetProjectSnapshotForSession`, `Session/DeleteAgentSession` |
 //! | `session archive` | `Project/GetProjectSnapshotForSession`, `Session/ArchiveAgentSession` |
 //! | `session delete` | `Project/GetProjectSnapshotForSession`, `Session/DeleteAgentSession` |
@@ -36,7 +41,8 @@
 //! Every verb first sends `Control/Negotiate` with the version this build
 //! speaks and with only the capabilities it uses, because a worker refuses an
 //! unnegotiated connection. `node`, `whoami`, `ls`, `get`, `events`, `peek`,
-//! and `retention get` are the read-only verbs: they send nothing that mutates
+//! `retention get`, and `project get`, `tree`, `tasks`, `children`, and
+//! `messages` are the read-only verbs: they send nothing that mutates
 //! and negotiate only the capabilities their reads need, so a read-only-scoped
 //! token can run them. `retention set` and `delete` are operator-level
 //! mutations: a token without `configure_archive_retention` or
@@ -88,6 +94,45 @@
 //! sent. The worker remains the authority on which session states may be
 //! deleted: a non-archived session that is not a project root is refused with
 //! `invalid_state` (exit `5`) and nothing changes.
+//!
+//! # Project and child agents
+//!
+//! Project coordination is backend-authoritative. Every `project` sub-verb
+//! takes one project member session id (a project id is also accepted, because
+//! a project id is its root session id), resolves it with exactly one
+//! `Project/GetProjectSnapshotForSession`, and prints what that projection
+//! says: this client never builds a tree, keeps a cache, or infers a lifecycle
+//! the worker could contradict.
+//!
+//! `project get` prints the project id, its root session, its parent project
+//! (or `none`), and its agent, task, and worktree counts. `project tree`
+//! indents each agent by two spaces per level below the root and reports its
+//! session state and task summary. `project tasks` prints each delegated task's
+//! status, its requester and target sessions, its model, its dependencies, and
+//! its intent. `project children` follows the snapshot with one
+//! `Session/GetAgentSessionSnapshotMetadata` (`ActivityDetail::Replies`) per
+//! delegated child and adds the decision a child's active run waits on. All
+//! four are read-only and never negotiate a mutating capability.
+//!
+//! `project messages` reads the durable parent-child log through
+//! `Project/ListProjectAgentMessages`, ordered by `project_sequence` and paged
+//! by `--after`/`--limit` (`1..=512`, 100 by default); the log itself is
+//! read-only here.
+//!
+//! `project send` does **not** send `Project/SendProjectAgentMessage`: the
+//! worker refuses that request for every client connection, because only a
+//! server-bound agent run may send one. A direction is therefore delivered to
+//! the child session's active run through `Collaboration/DirectAgent`, with the
+//! revision read and single conflict retry the `send` verb uses. The verb first
+//! requires the id to be the target of a delegation, then reads the child's
+//! metadata; a child with no active run is `invalid_state` (exit `5`) with the
+//! advice to resume it.
+//!
+//! `project child pause|resume|interrupt|cancel` finds the delegation that
+//! targets the id and sends `Project/ControlProjectChild` with the task's
+//! requester as the manager. No lifecycle rule is decided here: the worker owns
+//! them, and its refusal is reported through the same exit-code mapping as
+//! every other worker error.
 //!
 //! `run` starts a run, and it is described here because its requests are the
 //! longest sequence the client sends:

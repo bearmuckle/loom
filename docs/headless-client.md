@@ -50,18 +50,27 @@ The examples below use the installed binary name. In a checkout, replace
 | `delete <session-id> [--force] [--yes]` | Permanently delete an archived session, or a project root with its descendants; the same operation as `session delete`. |
 | `session archive <session-id> [--yes]` | Archive one session, and the live descendants of a project root that cascades; every checkout is kept. |
 | `session delete <session-id> [--force] [--yes]` | Permanently delete an archived session, or a project root with its descendants. |
+| `project get <id>` | One project's project id, root session, parent project, and agent, task, and worktree counts. |
+| `project tree <id>` | One line per project agent, indented by its depth, with its session state and task summary. |
+| `project tasks <id>` | One line per delegated task: status, requester, target, model, dependencies, and intent. |
+| `project children <id>` | One line per delegated child, with its task status, run state, and pending approval or question. |
+| `project messages <id> [--after <seq>] [--limit <n>] [--max-bytes <n>]` | The project's durable parent-child log, oldest first; 100 messages by default. |
+| `project send <id> (--text <text> \| --text-file <path>)` | Direct the child session's active run. |
+| `project child pause\|resume\|interrupt\|cancel <id>` | Control the delegated child task that targets `<id>`. |
 | `project archive <session-id>` | Archive a project root with its idle members; the id must name such a root. |
 | `project delete <session-id> [--force] [--yes]` | Delete a project root and its tree; the id must name such a root. |
 | `project worktree cleanup <session-id> --task <task-id> (--keep \| --remove \| --discard) [--yes]` | Keep or remove the checkout recorded for one delegated task. |
 
-`node`, `whoami`, `ls`, `get`, `events`, `peek`, and `retention get` are
+`node`, `whoami`, `ls`, `get`, `events`, `peek`, `retention get`, and the
+`project get`, `tree`, `tasks`, `children`, and `messages` verbs are
 read-only, issue no mutation, and work with a read-only-scoped token. `run`
-starts a run; `send`, `answer`, `approve`, `deny`, and `stop` control one;
+starts a run; `send`, `answer`, `approve`, `deny`, `stop`, and `project send`
+control one;
 `wait`, `status`, `liveness`, and `result` read one. `retention set`,
 `session archive`, `session delete` (and its `delete` alias), `project
-archive`, `project delete`, and `project worktree cleanup` are operator-level
-mutations. No verb waits for a run except `wait`, which is always bounded by
-`--timeout`.
+archive`, `project delete`, `project child`, and `project worktree cleanup`
+are operator-level mutations. No verb waits for a run except `wait`, which is
+always bounded by `--timeout`.
 
 Every verb negotiates only the capabilities its own requests need. `doctor`
 reports the intersection the worker granted, so its capability list is the
@@ -259,6 +268,59 @@ added, removed), and changed paths, plus the evidence links of `--task` when it
 is given. A session with no repository and no evidence prints
 `nothing to report` and sets `empty` in the `--json` envelope.
 
+## Project and child agents
+
+Project coordination is backend-authoritative: every `project` verb takes one
+project member session id (a project id is accepted too, because a project id
+is its root session id), reads the worker's own
+`Project/GetProjectSnapshotForSession` projection once, and prints it. The
+client builds no tree and keeps no cache, so it cannot report a hierarchy the
+worker does not hold.
+
+- `project get <id>` prints `project`, `root`, `parent-project` (`none` for a
+  project that was not branched out of another), `agents`, `tasks`, and
+  `worktrees`. `--json` carries the whole `ProjectSnapshot` in `data`.
+- `project tree <id>` prints one line per agent in snapshot order,
+  `<two spaces per level below the root><session-id> <session-state>
+  <task-summary|->`, with the summary escaped so it never spans a line.
+- `project tasks <id>` prints one line per delegated task: `<task-id> <status>
+  <requester-session-id> <target-session-id> <model-id> <dependencies|->
+  <intent>`, with dependencies comma-separated ascending.
+- `project children <id>` reads each delegated child's metadata
+  (`ActivityDetail::Replies`) and prints `<session-id> <session-state>
+  <task-status|none> <run-state|none>`, followed by ` approval <tool-call-id>`
+  or ` question <prompt>` when the child's active run waits on one.
+- `project messages <id>` prints the durable parent-child log, one line per
+  message as `<project-sequence> <kind> <sender-session-id> <body>`, oldest
+  first. `--after` resumes from a sequence, `--limit` takes 1 to 512 (100 by
+  default; anything else is a usage error), and `--max-bytes` bounds each body
+  the way `events` bounds tool payloads. `--json` adds
+  `next_after_project_sequence`, which is `null` when the page was the last one.
+
+The log is read-only here. `project send` does **not** use
+`Project/SendProjectAgentMessage`, because the worker refuses that request for
+every client connection: only a server-bound agent run may send one. A
+direction is delivered to the child session's active run instead, through
+`Collaboration/DirectAgent`, with the same revision read and single conflict
+retry as `send`. The verb first requires the id to be the target of a
+delegation, then reads the child's metadata; a child with no active run is
+reported as `invalid_state` (exit `5`) with the advice to resume it first. A
+successful send prints `sent <child-session-id> <run-id> <run-state>`.
+
+`project child pause|resume|interrupt|cancel <id>` finds the delegation whose
+target is `<id>` and sends `Project/ControlProjectChild` with the task's
+requester as the manager session. This client decides no lifecycle rule: the
+worker is the authority, so its refusal is reported with the protocol's error
+code through the usual exit-code mapping. A success prints
+`<paused|resumed|interrupted|cancelled> <task-id> <task-status>`, followed by
+`run <run-id> <run-state>` when the response carries a run.
+
+The `--json` payloads are `{"project_id","agents"}` for `tree`,
+`{"project_id","tasks"}` for `tasks`, `{"project_id","children"}` for
+`children`, `{"project_id","messages","next_after_project_sequence"}` for
+`messages`, `{"action","child_session_id","run","revision"}` for `send`, and
+`{"action","task","run"}` for `project child`.
+
 ## Worker status and retention
 
 `node` reports the worker node's id, name, online flag, capabilities, and the
@@ -428,4 +490,14 @@ loom-cli delete <project-root-id> --yes
 loom-cli project archive <project-root-id>
 loom-cli project worktree cleanup <project-root-id> --task <task-id> --keep
 loom-cli project worktree cleanup <project-root-id> --task <task-id> --remove
+
+# Inspect a project and direct or control one of its children.
+loom-cli project get <session-id>
+loom-cli project tree <session-id>
+loom-cli project tasks <session-id>
+loom-cli project children <session-id>
+loom-cli project messages <session-id> --after 40 --limit 20
+loom-cli project send <child-session-id> --text-file direction.md
+loom-cli project child pause <child-session-id>
+loom-cli project child resume <child-session-id>
 ```

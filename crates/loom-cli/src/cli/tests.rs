@@ -9,17 +9,20 @@
 use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 
 use loom_core::{
-    AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, Author, Capability,
-    CapabilitySet, CollaborationEntryKind, DelegatedTaskRecord, DelegatedTaskStatus, EventSequence,
+    AgentMessageId, AgentMessageKind, AgentMessageRecord, AgentSessionId, AgentSessionSnapshot,
+    AgentSessionState, ApprovalPolicy, Author, Capability, CapabilitySet, CollaborationEntryKind,
+    DelegatedTaskRecord, DelegatedTaskStatus, ErrorCode, EventSequence, LoomError,
     ProjectAgentPermissions, ProjectAgentRecord, ProjectId, ProjectSnapshot,
     ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord, ProjectWorktreeStatus,
-    ProtocolVersion, RepositoryId, RequestId, RunId, TaskId, Timestamp, ToolCallId, WorkspaceId,
+    ProtocolVersion, RepositoryId, RequestId, RunAttemptId, RunId, RunRevision, TaskId, Timestamp,
+    ToolCallId, WorkspaceId,
 };
-use loom_model::ModelId;
+use loom_model::{ModelId, ToolCall};
 use loom_protocol::{
-    ActivityDetail, AgentEvent, AgentRunSnapshot, AgentRunState, AgentSessionSnapshotProjection,
-    CURRENT_PROTOCOL_VERSION, ClientRequest, CollaborationRequest, ControlRequest, ControlResponse,
-    EventsRequest, EventsResponse, FilesystemRequest, FilesystemResponse, ProjectRequest,
+    ActivityDetail, AgentEvent, AgentRunSnapshot, AgentRunSnapshotProjection, AgentRunState,
+    AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION, ClientRequest, CollaborationRequest,
+    CollaborationResponse, ControlRequest, ControlResponse, EventsRequest, EventsResponse,
+    FilesystemRequest, FilesystemResponse, ProjectChildControlAction, ProjectRequest,
     ProjectResponse, RepositoryRequest, RepositoryResponse, RequestEnvelope, ResponseEnvelope,
     RunRequest, RunResponse, ServerEvent, ServerEventEnvelope, ServerResponse, SessionDirectory,
     SessionRepository, SessionRequest, SessionResponse, WorkspaceRequest, WorkspaceResponse,
@@ -1207,6 +1210,52 @@ fn each_verb_negotiates_only_the_capabilities_its_requests_need() {
                 Capability::JsonProtocol,
                 Capability::ReadProject,
                 Capability::CleanupProjectChildWorktree,
+            ],
+        ),
+        (
+            vec!["project", "get", &session],
+            vec![Capability::JsonProtocol, Capability::ReadProject],
+        ),
+        (
+            vec!["project", "tree", &session],
+            vec![Capability::JsonProtocol, Capability::ReadProject],
+        ),
+        (
+            vec!["project", "tasks", &session],
+            vec![Capability::JsonProtocol, Capability::ReadProject],
+        ),
+        (
+            vec!["project", "children", &session],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadProject,
+                Capability::ReadAgentSession,
+            ],
+        ),
+        (
+            vec!["project", "messages", &session],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadProject,
+                Capability::ReadProjectAgentMessages,
+            ],
+        ),
+        (
+            vec!["project", "send", &session, "--text", "go"],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadProject,
+                Capability::ReadAgentSession,
+                Capability::ReadAgentRun,
+                Capability::ControlAgentRun,
+            ],
+        ),
+        (
+            vec!["project", "child", "pause", &session],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadProject,
+                Capability::ControlProjectChild,
             ],
         ),
         (
@@ -4795,8 +4844,10 @@ fn the_parser_covers_the_lifecycle_verbs() {
     assert!(
         parse_error(&["project", "delete", &session, "--force"]).contains("pass --yes to confirm")
     );
-    assert!(parse_error(&["project"]).contains("requires 'archive', 'delete', or 'worktree'"));
-    assert!(parse_error(&["project", "nope"]).contains("use archive, delete, or worktree"));
+    assert!(parse_error(&["project"]).contains("requires a sub-verb"));
+    assert!(parse_error(&["project", "nope"]).contains(
+        "use get, tree, tasks, children, messages, send, child, archive, delete, or worktree"
+    ));
     assert!(parse_error(&["project", "worktree"]).contains("requires 'cleanup'"));
     assert!(parse_error(&["project", "worktree", "nope"]).contains("use cleanup"));
     assert!(
@@ -5377,4 +5428,1068 @@ fn project_worktree_cleanup_states_every_status_in_text() {
         assert_eq!(outcome.stdout, expected);
     }
     close_persistent_fixture(fixture, directory);
+}
+
+// 11. The project verbs: the backend-authoritative project and child lifecycle.
+
+fn fake_agent(
+    project_id: ProjectId,
+    session_id: AgentSessionId,
+    parent: Option<AgentSessionId>,
+    depth: u8,
+    state: AgentSessionState,
+    task_summary: Option<&str>,
+) -> ProjectAgentRecord {
+    ProjectAgentRecord {
+        session_id,
+        project_id,
+        parent_session_id: parent,
+        depth,
+        state,
+        task_summary: task_summary.map(str::to_owned),
+        output_cursor: EventSequence::default(),
+        updated_at: Timestamp::now(),
+    }
+}
+
+fn fake_delegated_task(
+    project_id: ProjectId,
+    requester: AgentSessionId,
+    target: AgentSessionId,
+    status: DelegatedTaskStatus,
+    intent: &str,
+) -> DelegatedTaskRecord {
+    DelegatedTaskRecord {
+        task_id: TaskId::new(),
+        project_id,
+        requester_session_id: requester,
+        target_session_id: target,
+        child_name: "child".to_owned(),
+        intent: intent.to_owned(),
+        model_id: "deterministic/demo".to_owned(),
+        context_references: Vec::new(),
+        dependencies: Vec::new(),
+        code_change: false,
+        permissions: ProjectAgentPermissions::default(),
+        status,
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
+    }
+}
+
+fn fake_run(session_id: AgentSessionId, state: AgentRunState) -> AgentRunSnapshot {
+    AgentRunSnapshot {
+        id: RunId::new(),
+        attempt_id: RunAttemptId::new(),
+        control_revision: 0,
+        session_id,
+        task: "child work".to_owned(),
+        model: ModelId::new("deterministic/demo"),
+        state,
+        started_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
+        completed_at: None,
+        summary: None,
+        evidence: Vec::new(),
+        approval_policy: None,
+    }
+}
+
+fn project_projection(
+    project_id: ProjectId,
+    root: AgentSessionId,
+    agents: Vec<ProjectAgentRecord>,
+    tasks: Vec<DelegatedTaskRecord>,
+) -> ProjectSnapshot {
+    ProjectSnapshot {
+        project_id,
+        root_session_id: root,
+        parent_project_id: None,
+        agents,
+        tasks,
+        worktrees: Vec::new(),
+    }
+}
+
+fn revision_of(connection: &InProcessConnection, run_id: RunId) -> RunRevision {
+    match connection
+        .request(RequestEnvelope::new(ClientRequest::Collaboration(
+            CollaborationRequest::GetRunRevision { run_id },
+        )))
+        .result
+    {
+        Ok(ServerResponse::Collaboration(CollaborationResponse::RunRevision {
+            revision, ..
+        })) => revision,
+        other => panic!("unexpected run revision response: {other:?}"),
+    }
+}
+
+#[test]
+fn project_get_tree_and_tasks_projection_the_snapshot() {
+    let fixture = fixture();
+    let root = fixture.session.id;
+    let child = AgentSessionId::new();
+    let grandchild = AgentSessionId::new();
+    let project_id = ProjectId::from_uuid(*root.as_uuid());
+    let parent_project = ProjectId::new();
+    let first_task = TaskId::new();
+    let second_task = TaskId::new();
+    let mut first = fake_delegated_task(
+        project_id,
+        root,
+        child,
+        DelegatedTaskStatus::Running,
+        "Review the migration boundary",
+    );
+    first.task_id = first_task;
+    first.dependencies = vec![second_task, first_task];
+    let mut second = fake_delegated_task(
+        project_id,
+        child,
+        grandchild,
+        DelegatedTaskStatus::Queued,
+        "Nested task",
+    );
+    second.task_id = second_task;
+    second.model_id = "provider/child".to_owned();
+    let mut snapshot = project_projection(
+        project_id,
+        root,
+        vec![
+            fake_agent(
+                project_id,
+                root,
+                None,
+                1,
+                AgentSessionState::Executing,
+                None,
+            ),
+            fake_agent(
+                project_id,
+                child,
+                Some(root),
+                2,
+                AgentSessionState::AwaitingApproval,
+                Some("review the migration\nboundary"),
+            ),
+            fake_agent(
+                project_id,
+                grandchild,
+                Some(child),
+                3,
+                AgentSessionState::Idle,
+                Some(""),
+            ),
+        ],
+        vec![first, second],
+    );
+    snapshot.parent_project_id = Some(parent_project);
+    let mut client = with_project_snapshot(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        root,
+        snapshot.clone(),
+    );
+    let root_text = root.to_string();
+
+    let get = run(&mut client, &["project", "get", &root_text]);
+    assert_eq!(get.code, exit::OK, "{}", get.stderr);
+    assert_eq!(get.stderr, "");
+    assert_eq!(
+        get.stdout,
+        format!(
+            "project {project_id}\nroot {root}\nparent-project {parent_project}\nagents 3\n\
+             tasks 2\nworktrees 0\n"
+        )
+    );
+    let envelope = json_envelope(&run(&mut client, &["project", "get", &root_text, "--json"]));
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["verb"], "project get");
+    assert_eq!(envelope["data"], serde_json::to_value(&snapshot).unwrap());
+
+    let tree = run(&mut client, &["project", "tree", &root_text]);
+    assert_eq!(tree.code, exit::OK, "{}", tree.stderr);
+    assert_eq!(
+        tree.stdout,
+        format!(
+            "{root} executing -\n  {child} awaiting_approval review the migration\\nboundary\n\
+             \x20\x20\x20\x20{grandchild} idle -\n"
+        )
+    );
+    let envelope = json_envelope(&run(
+        &mut client,
+        &["project", "tree", &root_text, "--json"],
+    ));
+    assert_eq!(envelope["verb"], "project tree");
+    assert_eq!(envelope["data"]["project_id"], project_id.to_string());
+    assert_eq!(envelope["data"]["agents"].as_array().map(Vec::len), Some(3));
+    assert_eq!(envelope["data"]["agents"][1]["depth"], 2);
+
+    let tasks = run(&mut client, &["project", "tasks", &root_text]);
+    assert_eq!(tasks.code, exit::OK, "{}", tasks.stderr);
+    let mut dependencies = [first_task.to_string(), second_task.to_string()];
+    dependencies.sort();
+    assert_eq!(
+        tasks.stdout,
+        format!(
+            "{first_task} running {root} {child} deterministic/demo {} Review the migration \
+             boundary\n{second_task} queued {child} {grandchild} provider/child - Nested task\n",
+            dependencies.join(",")
+        )
+    );
+    let envelope = json_envelope(&run(
+        &mut client,
+        &["project", "tasks", &root_text, "--json"],
+    ));
+    assert_eq!(envelope["verb"], "project tasks");
+    assert_eq!(envelope["data"]["tasks"].as_array().map(Vec::len), Some(2));
+    assert_eq!(envelope["data"]["tasks"][1]["status"], "queued");
+}
+
+#[test]
+fn project_children_reports_the_decision_a_child_waits_on() {
+    let fixture = fixture();
+    let root = fixture.session.id;
+    let approving = create_session(&fixture.control, fixture.workspace.id, "approving child");
+    let asking = create_session(&fixture.control, fixture.workspace.id, "asking child");
+    let idle_child = create_session(&fixture.control, fixture.workspace.id, "idle child");
+    let project_id = ProjectId::from_uuid(*root.as_uuid());
+    let snapshot = project_projection(
+        project_id,
+        root,
+        vec![
+            fake_agent(
+                project_id,
+                root,
+                None,
+                1,
+                AgentSessionState::Executing,
+                None,
+            ),
+            fake_agent(
+                project_id,
+                approving.id,
+                Some(root),
+                2,
+                AgentSessionState::AwaitingApproval,
+                Some("write the notes"),
+            ),
+            fake_agent(
+                project_id,
+                asking.id,
+                Some(root),
+                2,
+                AgentSessionState::NeedsInput,
+                Some("choose a branch"),
+            ),
+            fake_agent(
+                project_id,
+                idle_child.id,
+                Some(root),
+                2,
+                AgentSessionState::Idle,
+                None,
+            ),
+        ],
+        vec![
+            fake_delegated_task(
+                project_id,
+                root,
+                approving.id,
+                DelegatedTaskStatus::Running,
+                "write the notes",
+            ),
+            fake_delegated_task(
+                project_id,
+                root,
+                asking.id,
+                DelegatedTaskStatus::Blocked,
+                "choose a branch",
+            ),
+        ],
+    );
+    let tool_call = ToolCallId::new();
+    let question = "which branch?";
+    let mut client =
+        Wrapped::new(InProcessClient::new(&fixture.backend)).after(move |request, response| {
+            match request {
+                ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession {
+                    session_id,
+                }) if *session_id == root => {
+                    response.result = Ok(ServerResponse::Project(
+                        ProjectResponse::ProjectSnapshot(snapshot.clone()),
+                    ));
+                }
+                ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata {
+                    session_id,
+                    activity_detail,
+                }) => {
+                    assert_eq!(*activity_detail, ActivityDetail::Replies);
+                    let Ok(ServerResponse::Session(SessionResponse::AgentSessionSnapshot(
+                        projection,
+                    ))) = &mut response.result
+                    else {
+                        return;
+                    };
+                    if *session_id == approving.id {
+                        projection.active_run = Some(AgentRunSnapshotProjection {
+                            run: fake_run(approving.id, AgentRunState::AwaitingApproval),
+                            plan: Vec::new(),
+                            plan_progress: Default::default(),
+                            messages: Vec::new(),
+                            pending_approval: Some(ToolCall {
+                                id: tool_call,
+                                name: "fs_write".to_owned(),
+                                arguments: serde_json::json!({"path": "notes.md"}),
+                            }),
+                            pending_input: None,
+                            usage: Default::default(),
+                            activities: Vec::new(),
+                            message_timeline_ordinals: Vec::new(),
+                        });
+                    } else if *session_id == asking.id {
+                        projection.active_run = Some(AgentRunSnapshotProjection {
+                            run: fake_run(asking.id, AgentRunState::NeedsInput),
+                            plan: Vec::new(),
+                            plan_progress: Default::default(),
+                            messages: Vec::new(),
+                            pending_approval: None,
+                            pending_input: Some(question.to_owned()),
+                            usage: Default::default(),
+                            activities: Vec::new(),
+                            message_timeline_ordinals: Vec::new(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        });
+    let root_text = root.to_string();
+    let children = run(&mut client, &["project", "children", &root_text]);
+    assert_eq!(children.code, exit::OK, "{}", children.stderr);
+    assert_eq!(
+        children.stdout,
+        format!(
+            "{} idle running awaiting_approval approval {tool_call}\n\
+             {} idle blocked needs_input question {question}\n\
+             {} idle none none\n",
+            approving.id, asking.id, idle_child.id
+        )
+    );
+
+    let envelope = json_envelope(&run(
+        &mut client,
+        &["project", "children", &root_text, "--json"],
+    ));
+    assert_eq!(envelope["verb"], "project children");
+    assert_eq!(envelope["data"]["project_id"], project_id.to_string());
+    let entries = envelope["data"]["children"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0]["session_id"], approving.id.to_string());
+    assert_eq!(entries[0]["state"], "idle");
+    assert_eq!(entries[0]["task"], "running");
+    assert_eq!(entries[0]["run"], "awaiting_approval");
+    assert_eq!(entries[0]["pending_approval"], tool_call.to_string());
+    assert_eq!(entries[0]["pending_input"], serde_json::Value::Null);
+    assert_eq!(entries[1]["pending_input"], question);
+    assert_eq!(entries[2]["task"], serde_json::Value::Null);
+    assert_eq!(entries[2]["run"], serde_json::Value::Null);
+}
+
+#[test]
+fn project_messages_pages_the_durable_log_in_sequence_order() {
+    let (fixture, directory) = persistent_fixture("project-messages");
+    let root = fixture.session.id;
+    let project_id = ProjectId::from_uuid(*root.as_uuid());
+    let sender = AgentSessionId::new();
+    let other_sender = AgentSessionId::new();
+    let long_body = "z".repeat(90);
+    let message = |sequence: u64, kind: AgentMessageKind, sender: AgentSessionId, body: &str| {
+        AgentMessageRecord {
+            message_id: AgentMessageId::new(),
+            project_id,
+            task_id: None,
+            sender_session_id: sender,
+            target_session_id: root,
+            kind,
+            project_sequence: sequence,
+            accepted_at: Timestamp::now(),
+            body: body.to_owned(),
+        }
+    };
+    let first = message(
+        7,
+        AgentMessageKind::Progress,
+        sender,
+        "first line\nsecond line",
+    );
+    let second = message(9, AgentMessageKind::Result, other_sender, &long_body);
+    // The page arrives out of order, so the ascending projection is what orders
+    // the lines.
+    let page = vec![second.clone(), first.clone()];
+    let snapshot = project_projection(
+        project_id,
+        root,
+        vec![fake_agent(
+            project_id,
+            root,
+            None,
+            1,
+            AgentSessionState::Idle,
+            None,
+        )],
+        Vec::new(),
+    );
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captured = std::rc::Rc::clone(&seen);
+    let mut client =
+        Wrapped::new(InProcessClient::new(&fixture.backend)).after(move |request, response| {
+            match request {
+                ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession {
+                    session_id,
+                }) if *session_id == root => {
+                    response.result = Ok(ServerResponse::Project(
+                        ProjectResponse::ProjectSnapshot(snapshot.clone()),
+                    ));
+                }
+                ClientRequest::Project(ProjectRequest::ListProjectAgentMessages {
+                    project_id,
+                    session_id,
+                    after_project_sequence,
+                    limit,
+                }) => {
+                    captured.borrow_mut().push((
+                        *project_id,
+                        *session_id,
+                        *after_project_sequence,
+                        *limit,
+                    ));
+                    response.result = Ok(ServerResponse::Project(
+                        ProjectResponse::ProjectAgentMessages {
+                            messages: page.clone(),
+                            next_after_project_sequence: Some(9),
+                        },
+                    ));
+                }
+                _ => {}
+            }
+        });
+    let root_text = root.to_string();
+    let messages = run(
+        &mut client,
+        &[
+            "project",
+            "messages",
+            &root_text,
+            "--after",
+            "3",
+            "--limit",
+            "2",
+            "--max-bytes",
+            "64",
+        ],
+    );
+    assert_eq!(messages.code, exit::OK, "{}", messages.stderr);
+    let bounded = format!(
+        "{}[... 26 bytes omitted ...]{}",
+        "z".repeat(32),
+        "z".repeat(32)
+    );
+    assert_eq!(
+        messages.stdout,
+        format!(
+            "7 progress {sender} first line\\nsecond line\n9 result {other_sender} {bounded}\n"
+        )
+    );
+
+    let envelope = json_envelope(&run(
+        &mut client,
+        &["project", "messages", &root_text, "--json"],
+    ));
+    assert_eq!(envelope["verb"], "project messages");
+    assert_eq!(envelope["data"]["project_id"], project_id.to_string());
+    assert_eq!(
+        envelope["data"]["messages"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(envelope["data"]["messages"][0]["project_sequence"], 7);
+    assert_eq!(envelope["data"]["messages"][1]["kind"], "result");
+    assert_eq!(envelope["data"]["next_after_project_sequence"], 9);
+
+    // The default page size is 100, and the requested cursor reaches the worker.
+    assert_eq!(
+        *seen.borrow(),
+        vec![
+            (project_id, root, Some(3), 2),
+            (project_id, root, None, 100)
+        ]
+    );
+    drop(client);
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn project_send_directs_the_child_run_and_retries_a_conflict() {
+    let fixture = fixture();
+    let root = fixture.session.id;
+    let child = create_session(&fixture.control, fixture.workspace.id, "send child");
+    let without_run = create_session(&fixture.control, fixture.workspace.id, "idle child");
+    let retried = create_session(&fixture.control, fixture.workspace.id, "retried child");
+    // The shipped default policy parks the deterministic run on its first
+    // write, and a run parked on an approval refuses a direction, so both
+    // children run to completion under the auto policy and are directed then.
+    pin_auto_policy(&fixture.control, child.id);
+    pin_auto_policy(&fixture.control, retried.id);
+    let run_id = start_run(&fixture.control, child.id);
+    await_run_state(&fixture.control, child.id, AgentRunState::Completed);
+    start_run(&fixture.control, retried.id);
+    await_run_state(&fixture.control, retried.id, AgentRunState::Completed);
+    let project_id = ProjectId::from_uuid(*root.as_uuid());
+    let snapshot = project_projection(
+        project_id,
+        root,
+        vec![
+            fake_agent(
+                project_id,
+                root,
+                None,
+                1,
+                AgentSessionState::Executing,
+                None,
+            ),
+            fake_agent(
+                project_id,
+                child.id,
+                Some(root),
+                2,
+                AgentSessionState::AwaitingApproval,
+                Some("child work"),
+            ),
+            fake_agent(
+                project_id,
+                without_run.id,
+                Some(root),
+                2,
+                AgentSessionState::Idle,
+                Some("queued work"),
+            ),
+            fake_agent(
+                project_id,
+                retried.id,
+                Some(root),
+                2,
+                AgentSessionState::Executing,
+                Some("retried work"),
+            ),
+        ],
+        vec![
+            fake_delegated_task(
+                project_id,
+                root,
+                child.id,
+                DelegatedTaskStatus::Running,
+                "child work",
+            ),
+            fake_delegated_task(
+                project_id,
+                root,
+                without_run.id,
+                DelegatedTaskStatus::Queued,
+                "queued work",
+            ),
+            fake_delegated_task(
+                project_id,
+                root,
+                retried.id,
+                DelegatedTaskStatus::Running,
+                "retried work",
+            ),
+        ],
+    );
+    let current = revision_of(&fixture.control, run_id);
+    let retried_snapshot = snapshot.clone();
+    let directed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captured = std::rc::Rc::clone(&directed);
+    let mut client = Wrapped::new(InProcessClient::new(&fixture.backend))
+        .before(move |envelope| {
+            if let ClientRequest::Collaboration(CollaborationRequest::DirectAgent {
+                run_id,
+                expected,
+                text,
+            }) = &envelope.request
+            {
+                captured
+                    .borrow_mut()
+                    .push((*run_id, *expected, text.clone()));
+            }
+        })
+        .after(move |request, response| {
+            if let ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession { .. }) =
+                request
+            {
+                response.result = Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(
+                    snapshot.clone(),
+                )));
+            }
+        });
+    let child_text = child.id.to_string();
+
+    let sent = run(
+        &mut client,
+        &["project", "send", &child_text, "--text", "please continue"],
+    );
+    assert_eq!(sent.code, exit::OK, "{}", sent.stderr);
+    // The state is the one the worker answered with, which may already have
+    // continued; the ids are the fixed part of the line.
+    assert!(
+        sent.stdout
+            .starts_with(&format!("sent {} {run_id} ", child.id)),
+        "{}",
+        sent.stdout
+    );
+    assert_eq!(
+        *directed.borrow(),
+        vec![(run_id, current, "please continue".to_owned())],
+        "the direction carries the run revision the client read"
+    );
+
+    let envelope = json_envelope(&run(
+        &mut client,
+        &["project", "send", &child_text, "--text", "again", "--json"],
+    ));
+    assert_eq!(envelope["verb"], "project send");
+    assert_eq!(envelope["data"]["action"], "send");
+    assert_eq!(envelope["data"]["child_session_id"], child.id.to_string());
+    assert_eq!(envelope["data"]["run"]["id"], run_id.to_string());
+    assert!(envelope["data"]["revision"]["control_revision"].is_number());
+
+    // A delegated child that has no run is told to resume it first, as exit 5.
+    let idle = run(
+        &mut client,
+        &[
+            "project",
+            "send",
+            &without_run.id.to_string(),
+            "--text",
+            "go",
+        ],
+    );
+    assert_eq!(idle.code, exit::GONE, "{}", idle.stderr);
+    assert_eq!(idle.stdout, "");
+    assert!(idle.stderr.contains("invalid_state"), "{}", idle.stderr);
+    assert!(idle.stderr.contains("resume"), "{}", idle.stderr);
+
+    // The root session is not a delegated child of its own project.
+    let not_a_child = run(
+        &mut client,
+        &["project", "send", &root.to_string(), "--text", "go"],
+    );
+    assert_eq!(not_a_child.code, exit::USAGE, "{}", not_a_child.stderr);
+    assert!(
+        not_a_child.stderr.contains("project children"),
+        "{}",
+        not_a_child.stderr
+    );
+    drop(client);
+
+    // A first stale direction is re-read and retried once, and the file form
+    // drops exactly one trailing line ending.
+    let path = temporary_path("project-send-text");
+    std::fs::write(&path, "second direction\n").unwrap();
+    let retried_child_text = retried.id.to_string();
+    let attempts = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let texts = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let counter = std::rc::Rc::clone(&attempts);
+    let captured = std::rc::Rc::clone(&texts);
+    let mut retried = Wrapped::new(InProcessClient::new(&fixture.backend))
+        .before(move |envelope| {
+            if let ClientRequest::Collaboration(CollaborationRequest::DirectAgent {
+                expected,
+                text,
+                ..
+            }) = &mut envelope.request
+            {
+                counter.set(counter.get() + 1);
+                captured.borrow_mut().push(text.clone());
+                if counter.get() == 1 {
+                    expected.control_revision += 1;
+                }
+            }
+        })
+        .after(move |request, response| {
+            if let ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession { .. }) =
+                request
+            {
+                response.result = Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(
+                    retried_snapshot.clone(),
+                )));
+            }
+        });
+    let retried_outcome = run(
+        &mut retried,
+        &[
+            "project",
+            "send",
+            &retried_child_text,
+            "--text-file",
+            path.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(retried_outcome.code, exit::OK, "{}", retried_outcome.stderr);
+    assert_eq!(attempts.get(), 2, "one stale direction and one retry");
+    assert_eq!(*texts.borrow(), vec!["second direction".to_owned(); 2]);
+    let _ = std::fs::remove_file(&path);
+    drop(retried);
+}
+
+#[test]
+fn project_child_controls_the_delegated_task_and_reports_a_refusal() {
+    let (fixture, directory) = persistent_fixture("project-child");
+    let root = fixture.session.id;
+    let child = AgentSessionId::new();
+    let stranger = AgentSessionId::new();
+    let project_id = ProjectId::from_uuid(*root.as_uuid());
+    let task_id = TaskId::new();
+    let mut task = fake_delegated_task(
+        project_id,
+        root,
+        child,
+        DelegatedTaskStatus::Running,
+        "child work",
+    );
+    task.task_id = task_id;
+    let snapshot = project_projection(
+        project_id,
+        root,
+        vec![
+            fake_agent(
+                project_id,
+                root,
+                None,
+                1,
+                AgentSessionState::Executing,
+                None,
+            ),
+            fake_agent(
+                project_id,
+                child,
+                Some(root),
+                2,
+                AgentSessionState::Paused,
+                Some("child work"),
+            ),
+            fake_agent(
+                project_id,
+                stranger,
+                Some(root),
+                2,
+                AgentSessionState::Idle,
+                None,
+            ),
+        ],
+        vec![task.clone()],
+    );
+    let paused = fake_run(child, AgentRunState::Paused);
+    let executing = fake_run(child, AgentRunState::Executing);
+    let cancelled = fake_run(child, AgentRunState::Cancelled);
+    let (paused_run, executing_run, cancelled_run) =
+        (paused.clone(), executing.clone(), cancelled.clone());
+    let template = task.clone();
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captured = std::rc::Rc::clone(&seen);
+    let mut client =
+        Wrapped::new(InProcessClient::new(&fixture.backend)).after(move |request, response| {
+            match request {
+                ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession { .. }) => {
+                    response.result = Ok(ServerResponse::Project(
+                        ProjectResponse::ProjectSnapshot(snapshot.clone()),
+                    ));
+                }
+                ClientRequest::Project(ProjectRequest::ControlProjectChild {
+                    project_id,
+                    manager_session_id,
+                    task_id,
+                    action,
+                }) => {
+                    captured.borrow_mut().push((
+                        *project_id,
+                        *manager_session_id,
+                        *task_id,
+                        *action,
+                    ));
+                    let (status, run) = match action {
+                        ProjectChildControlAction::Pause => {
+                            (DelegatedTaskStatus::Running, Some(paused_run.clone()))
+                        }
+                        ProjectChildControlAction::Continue => {
+                            (DelegatedTaskStatus::Running, Some(executing_run.clone()))
+                        }
+                        ProjectChildControlAction::Interrupt => {
+                            (DelegatedTaskStatus::Running, Some(cancelled_run.clone()))
+                        }
+                        ProjectChildControlAction::Cancel => (DelegatedTaskStatus::Cancelled, None),
+                        other => panic!("unexpected child control action: {other:?}"),
+                    };
+                    let mut controlled = template.clone();
+                    controlled.status = status;
+                    response.result = Ok(ServerResponse::Project(
+                        ProjectResponse::ProjectChildControlled {
+                            task: Box::new(controlled),
+                            run: run.map(Box::new),
+                        },
+                    ));
+                }
+                _ => {}
+            }
+        });
+    for (verb, word, expected_action, expected_run) in [
+        (
+            "pause",
+            "paused",
+            ProjectChildControlAction::Pause,
+            Some((paused.id, "paused")),
+        ),
+        (
+            "resume",
+            "resumed",
+            ProjectChildControlAction::Continue,
+            Some((executing.id, "executing")),
+        ),
+        (
+            "interrupt",
+            "interrupted",
+            ProjectChildControlAction::Interrupt,
+            Some((cancelled.id, "cancelled")),
+        ),
+        (
+            "cancel",
+            "cancelled",
+            ProjectChildControlAction::Cancel,
+            None,
+        ),
+    ] {
+        let outcome = run(&mut client, &["project", "child", verb, &child.to_string()]);
+        assert_eq!(outcome.code, exit::OK, "{verb}: {}", outcome.stderr);
+        let status = if expected_action == ProjectChildControlAction::Cancel {
+            "cancelled"
+        } else {
+            "running"
+        };
+        let mut expected = format!("{word} {task_id} {status}\n");
+        if let Some((run_id, state)) = expected_run {
+            expected.push_str(&format!("run {run_id} {state}\n"));
+        }
+        assert_eq!(outcome.stdout, expected, "{verb}");
+    }
+    assert_eq!(
+        *seen.borrow(),
+        vec![
+            (project_id, root, task_id, ProjectChildControlAction::Pause),
+            (
+                project_id,
+                root,
+                task_id,
+                ProjectChildControlAction::Continue
+            ),
+            (
+                project_id,
+                root,
+                task_id,
+                ProjectChildControlAction::Interrupt
+            ),
+            (project_id, root, task_id, ProjectChildControlAction::Cancel),
+        ]
+    );
+
+    let envelope = json_envelope(&run(
+        &mut client,
+        &["project", "child", "pause", &child.to_string(), "--json"],
+    ));
+    assert_eq!(envelope["verb"], "project child pause");
+    assert_eq!(envelope["data"]["action"], "pause");
+    assert_eq!(envelope["data"]["task"]["task_id"], task_id.to_string());
+    assert_eq!(envelope["data"]["task"]["status"], "running");
+    assert_eq!(envelope["data"]["run"]["state"], "paused");
+
+    // A session that no delegation targets is refused before any control
+    // request is sent.
+    let stranger_outcome = run(
+        &mut client,
+        &["project", "child", "pause", &stranger.to_string()],
+    );
+    assert_eq!(stranger_outcome.code, exit::USAGE);
+    assert_eq!(stranger_outcome.stdout, "");
+    assert!(
+        stranger_outcome.stderr.contains("project children"),
+        "{}",
+        stranger_outcome.stderr
+    );
+    assert_eq!(seen.borrow().len(), 5, "no control request for a stranger");
+    drop(client);
+
+    // A worker refusal is reported with its own code: `invalid_state` is exit 5.
+    let refusing_snapshot = project_projection(
+        project_id,
+        root,
+        vec![fake_agent(
+            project_id,
+            root,
+            None,
+            1,
+            AgentSessionState::Executing,
+            None,
+        )],
+        vec![task.clone()],
+    );
+    let mut refusing =
+        Wrapped::new(InProcessClient::new(&fixture.backend)).after(move |request, response| {
+            match request {
+                ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession { .. }) => {
+                    response.result = Ok(ServerResponse::Project(
+                        ProjectResponse::ProjectSnapshot(refusing_snapshot.clone()),
+                    ));
+                }
+                ClientRequest::Project(ProjectRequest::ControlProjectChild { .. }) => {
+                    response.result = Err(LoomError::new(
+                        ErrorCode::InvalidState,
+                        "the child run is already finished",
+                        false,
+                    ));
+                }
+                _ => {}
+            }
+        });
+    let refused = run(
+        &mut refusing,
+        &["project", "child", "interrupt", &child.to_string()],
+    );
+    assert_eq!(refused.code, exit::GONE, "{}", refused.stderr);
+    assert_eq!(refused.stdout, "");
+    assert!(
+        refused.stderr.contains("invalid_state"),
+        "{}",
+        refused.stderr
+    );
+    assert!(
+        refused.stderr.contains("already finished"),
+        "{}",
+        refused.stderr
+    );
+    drop(refusing);
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn the_parser_covers_the_project_verbs() {
+    let session = AgentSessionId::new().to_string();
+
+    let Verb::Project(verb) = invocation(&["project", "get", &session]).verb else {
+        panic!("project get parses as the project verb");
+    };
+    assert_eq!(verb.name(), "project get");
+    let Verb::Project(verb) = invocation(&[
+        "project",
+        "messages",
+        &session,
+        "--after=5",
+        "--limit",
+        "20",
+        "--max-bytes=128",
+    ])
+    .verb
+    else {
+        panic!("project messages parses as the project verb");
+    };
+    let args::ProjectVerb::Messages(messages) = *verb else {
+        panic!("project messages parses as messages");
+    };
+    assert_eq!(messages.session.to_string(), session);
+    assert_eq!(messages.after, Some(5));
+    assert_eq!(messages.limit, 20);
+    assert_eq!(messages.max_bytes, 128);
+
+    let Verb::Project(verb) = invocation(&["project", "messages", &session]).verb else {
+        panic!("project messages parses as the project verb");
+    };
+    let args::ProjectVerb::Messages(messages) = *verb else {
+        panic!("project messages parses as messages");
+    };
+    assert_eq!(messages.after, None);
+    assert_eq!(messages.limit, 100);
+    assert_eq!(messages.max_bytes, args::DEFAULT_MAX_BYTES);
+
+    assert_eq!(
+        args::verb_name(&invocation(&["project", "child", "cancel", &session]).verb),
+        "project child cancel"
+    );
+    assert!(matches!(
+        invocation(&["project", "send", &session, "--text", "go"]).verb,
+        Verb::Project(_)
+    ));
+    assert_eq!(args::named_verb(&["project".to_owned()]), "project");
+
+    assert!(parse_error(&["project"]).contains("requires a sub-verb"));
+    assert!(parse_error(&["project", "nope"]).contains("unknown project sub-verb"));
+    assert!(parse_error(&["project", "get"]).contains("requires a <session-id>"));
+    assert!(parse_error(&["project", "tree", &session, &session]).contains("one session id"));
+    assert!(
+        parse_error(&["project", "child"]).contains("requires pause, resume, interrupt, or cancel")
+    );
+    assert!(
+        parse_error(&["project", "child", "restart", &session])
+            .contains("unknown project child action")
+    );
+    assert!(parse_error(&["project", "child", "resume"]).contains("requires a <session-id>"));
+    assert!(
+        parse_error(&["project", "send", &session])
+            .contains("requires --text <text> or --text-file")
+    );
+    assert!(
+        parse_error(&[
+            "project",
+            "send",
+            &session,
+            "--text",
+            "a",
+            "--text-file",
+            "/tmp/loom-cli-definitely-absent-text-file",
+        ])
+        .contains("not both")
+    );
+    assert!(
+        parse_error(&[
+            "project",
+            "send",
+            &session,
+            "--text-file",
+            "/tmp/loom-cli-definitely-absent-text-file",
+        ])
+        .contains("could not read the text file")
+    );
+    for limit in ["0", "513"] {
+        assert!(
+            parse_error(&["project", "messages", &session, "--limit", limit])
+                .contains("between 1 and 512")
+        );
+    }
+    assert!(
+        parse_error(&["project", "messages", &session, "--limit", "soon"])
+            .contains("must be a message count")
+    );
+    assert!(
+        parse_error(&["project", "messages", &session, "--after", "later"])
+            .contains("must be a project sequence")
+    );
+    assert!(
+        parse_error(&["project", "get", &session, "--limit", "2"])
+            .contains("does not apply to 'project get'")
+    );
+    assert!(
+        parse_error(&["project", "tree", &session, "--text", "a"])
+            .contains("does not apply to 'project tree'")
+    );
+    assert!(
+        parse_error(&["project", "child", "pause", &session, "--max-bytes", "64"])
+            .contains("does not apply to 'project child pause'")
+    );
 }

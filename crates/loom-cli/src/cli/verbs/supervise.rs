@@ -236,8 +236,9 @@ async fn revision<C: Client>(
 }
 
 /// Reads the revision, sends one run action, and retries once after a conflict
-/// when `retry` allows it.
-async fn act<C: Client, F>(
+/// when `retry` allows it. The `project send` verb reuses it so a direction to a
+/// child run is revision-checked exactly like a direction to a run.
+pub(super) async fn act<C: Client, F>(
     caller: &mut Caller<'_, C>,
     run_id: RunId,
     retry: bool,
@@ -326,7 +327,7 @@ fn finish_action(
 }
 
 /// The run fields every control verb reports.
-fn run_value(run: &AgentRunSnapshot) -> Value {
+pub(super) fn run_value(run: &AgentRunSnapshot) -> Value {
     json!({
         "id": run.id.to_string(),
         "session_id": run.session_id.to_string(),

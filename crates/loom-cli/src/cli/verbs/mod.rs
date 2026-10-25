@@ -15,6 +15,7 @@
 
 mod events;
 mod operator;
+mod project;
 mod query;
 mod run;
 mod supervise;
@@ -28,7 +29,7 @@ use loom_protocol::{
 };
 use serde_json::Value;
 
-use crate::cli::args::{Invocation, Verb};
+use crate::cli::args::{Invocation, ProjectVerb, Verb};
 use crate::cli::{client::Client, exit};
 
 /// Why a verb produced no success payload.
@@ -257,6 +258,20 @@ pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
                 Capability::CleanupProjectChildWorktree,
             ]);
         }
+        Verb::Project(project) => {
+            capabilities.push(Capability::ReadProject);
+            match project.as_ref() {
+                ProjectVerb::Get { .. } | ProjectVerb::Tree { .. } | ProjectVerb::Tasks { .. } => {}
+                ProjectVerb::Children { .. } => capabilities.push(Capability::ReadAgentSession),
+                ProjectVerb::Messages(_) => capabilities.push(Capability::ReadProjectAgentMessages),
+                ProjectVerb::Send { .. } => capabilities.extend([
+                    Capability::ReadAgentSession,
+                    Capability::ReadAgentRun,
+                    Capability::ControlAgentRun,
+                ]),
+                ProjectVerb::Child { .. } => capabilities.push(Capability::ControlProjectChild),
+            }
+        }
     }
     CapabilitySet::new(capabilities)
 }
@@ -416,6 +431,7 @@ pub(crate) async fn run<C: Client>(
             force,
             yes,
         } => operator::delete(client, invocation, *session, *force, *yes, false, out).await,
+        Verb::Project(verb) => project::project(client, invocation, verb, out).await,
     }
 }
 
