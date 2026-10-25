@@ -59,7 +59,18 @@ attached to when this invocation created it, so replaying a command with the
 same --request-id neither duplicates an attachment nor fails on one that
 exists. --request-id is the idempotency key of the run start alone: the same id
 is answered from the worker's durable cache with the same run, while the other
-mutations of the verb use fresh ids.
+mutations of the verb use fresh ids. On a session this invocation creates,
+--approval-policy (default when absent) is pinned before the run starts; on a
+reused session it is only changed when the flag is given, so a plain run does
+not overwrite a policy a person set.
+
+`events` never reprints an event at or below its cursor. A snapshot that cannot
+carry every event between the cursor and its window (the worker bounds it to
+the newest side) prints the window, reports the missing range as `gap` on
+stderr and in the --json envelope, and resumes at the head; those older events
+are no longer retrievable through this verb. --json with --follow collects
+every followed event in one envelope, so prefer --format jsonl for a long
+follow.
 
 Global flags, accepted anywhere as --flag value or --flag=value:
   --connect <url>             worker WebSocket URL (fallback LOOM_URL)
@@ -149,7 +160,10 @@ pub(crate) struct RunArgs {
     pub repository: Option<Attach>,
     /// `--as-directory`, attached only when this invocation creates the session.
     pub directory: Option<Attach>,
-    pub approval: ApprovalPreset,
+    /// `--approval-policy`, or `None` when the flag was absent. A created
+    /// session gets the default preset when it is absent; a reused session is
+    /// only changed when the flag was given.
+    pub approval: Option<ApprovalPreset>,
     /// The run start's idempotency key, or `None` when the caller left it open.
     pub request_id: Option<RequestId>,
 }
@@ -312,11 +326,6 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
             _ => verb_flags.push(flag),
         }
     }
-
-    // `--connect` wins over the environment, which is only consulted when the
-    // flag is absent. Resolving it here, rather than in `main`, keeps the URL a
-    // cursor file is scoped to identical in both code paths.
-    globals.connect = resolve_connect(globals.connect.take(), std::env::var("LOOM_URL").ok());
 
     let Some(name) = positionals.first() else {
         return Err("missing verb; try --help".to_owned());
@@ -526,8 +535,9 @@ fn parse_run(flags: &mut FlagSet) -> Result<RunArgs, String> {
     let directory = directory.map(|source| attach(source, None)).transpose()?;
 
     let approval = match flags.value("--approval-policy").as_deref() {
-        None | Some("default") => ApprovalPreset::Default,
-        Some("auto") => ApprovalPreset::Auto,
+        None => None,
+        Some("default") => Some(ApprovalPreset::Default),
+        Some("auto") => Some(ApprovalPreset::Auto),
         Some(other) => {
             return Err(format!(
                 "--approval-policy must be default or auto, got '{other}'"
@@ -614,9 +624,14 @@ fn no_positionals(verb: &str, rest: &[String]) -> Result<(), String> {
     }
 }
 
-/// The worker URL, with the flag winning over the environment. An empty or
-/// whitespace-only environment value is treated as unset, so it fails the
-/// "a worker URL is required" check instead of producing an unusable link.
+/// The worker URL, with the flag winning over the environment.
+///
+/// `parse` deliberately leaves the environment alone so parsing is a pure
+/// function of its arguments; the binary applies this once, beside the token
+/// file fallback, and stores the result in the invocation before the verb runs,
+/// so the URL a cursor file is scoped to is the one that was connected to. An
+/// empty or whitespace-only environment value is treated as unset, so it fails
+/// the "a worker URL is required" check instead of producing an unusable link.
 pub(crate) fn resolve_connect(flag: Option<String>, environment: Option<String>) -> Option<String> {
     flag.or_else(|| environment.filter(|url| !url.trim().is_empty()))
 }

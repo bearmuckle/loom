@@ -125,7 +125,8 @@ delivered as three reviewable slices:
 - **M4.5.1:** read-only verbs (`doctor`, `whoami`, `ls`, `get`, `events`,
   `peek`) plus `run` (start one run in a new or idle session, never waits),
   with the byte-stable `loom-text/1` output projection, `jsonl` resume fields,
-  the JSON envelope, the exit-code contract, and the client-side cursor file.
+  the JSON envelope, the exit-code contract, and the client-side cursor file
+  that reports a truncated snapshot as an explicit gap.
   Issue 331 is the first deliverable and the only one implemented by this
   milestone's first change.
 - **M4.5.2:** control verbs (`send`, `answer`, `approve`, `deny`, `stop`,

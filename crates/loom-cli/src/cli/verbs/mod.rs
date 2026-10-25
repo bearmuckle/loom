@@ -28,6 +28,9 @@ pub(crate) enum Failure {
     Usage(String),
     /// Local input or output failed, such as an unreadable cursor file.
     Internal(String),
+    /// The reader closed stdout, as in `loom-cli events | head`. That is not an
+    /// error: the verb stops quietly and exits 0.
+    BrokenPipe,
     /// The request never reached the worker, or its answer never arrived.
     Transport {
         request_id: Option<RequestId>,
@@ -45,6 +48,7 @@ impl Failure {
         match self {
             Self::Usage(_) => exit::USAGE,
             Self::Internal(_) => exit::INTERNAL,
+            Self::BrokenPipe => exit::OK,
             Self::Transport { .. } => exit::UNREACHABLE,
             Self::Server { error, .. } => exit::for_code(error.code),
         }
@@ -56,6 +60,7 @@ impl Failure {
         match self {
             Self::Usage(_) => ErrorCode::InvalidRequest.to_string(),
             Self::Internal(_) => ErrorCode::Internal.to_string(),
+            Self::BrokenPipe => "broken_pipe".to_owned(),
             Self::Transport { error, .. } | Self::Server { error, .. } => error.code.to_string(),
         }
     }
@@ -63,20 +68,21 @@ impl Failure {
     pub(crate) fn message(&self) -> &str {
         match self {
             Self::Usage(message) | Self::Internal(message) => message,
+            Self::BrokenPipe => "the output stream was closed",
             Self::Transport { error, .. } | Self::Server { error, .. } => &error.message,
         }
     }
 
     fn retryable(&self) -> bool {
         match self {
-            Self::Usage(_) | Self::Internal(_) => false,
+            Self::Usage(_) | Self::Internal(_) | Self::BrokenPipe => false,
             Self::Transport { error, .. } | Self::Server { error, .. } => error.retryable,
         }
     }
 
     fn request_id(&self) -> Option<RequestId> {
         match self {
-            Self::Usage(_) | Self::Internal(_) => None,
+            Self::Usage(_) | Self::Internal(_) | Self::BrokenPipe => None,
             Self::Transport { request_id, .. } => *request_id,
             Self::Server { request_id, .. } => Some(*request_id),
         }
@@ -115,28 +121,32 @@ impl Failure {
     }
 }
 
-/// The capabilities a verb negotiates: the set every verb shares, plus the ones
-/// `run` adds for the mutations only it performs.
+/// The capabilities a verb negotiates, which are exactly the ones its requests
+/// need, plus `JsonProtocol` because every response is JSON.
 ///
-/// A verb negotiates exactly the capabilities its own requests need, so a
-/// read-only verb keeps asking for the shared set alone: its handshake stays
-/// byte-identical, and a worker that does not offer session creation can still
-/// be inspected. Only `run` mutates, so only `run` asks for what its mutations
-/// require.
+/// A read-only verb therefore never asks for a mutating capability: `ls` asks
+/// for the session-read capability its two listing requests need, `get` for the
+/// same read, and `events`/`peek` for event subscription. Only `run` requests
+/// what its mutations require, so a worker that does not offer session creation
+/// can still be inspected and a scoped token sees the smallest negotiable set.
 pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
-    let mut capabilities = vec![
-        Capability::SubscribeSessionEvents,
-        Capability::ReadAgentSession,
-        Capability::ManageWorkspaces,
-        Capability::ManageSessionRepositories,
-        Capability::WriteSessionFilesystem,
-        Capability::ReadWorkerNodeStatus,
-        Capability::JsonProtocol,
-        Capability::StartAgentRun,
-    ];
-    if matches!(verb, Verb::Run(_)) {
-        capabilities.push(Capability::CreateAgentSession);
-        capabilities.push(Capability::ConfigureApprovalPolicy);
+    let mut capabilities = vec![Capability::JsonProtocol];
+    match verb {
+        Verb::Doctor => capabilities.push(Capability::ReadWorkerNodeStatus),
+        Verb::WhoAmI => {}
+        Verb::Ls { .. } => capabilities.push(Capability::ReadAgentSession),
+        Verb::Get { .. } => capabilities.push(Capability::ReadAgentSession),
+        Verb::Events(_) | Verb::Peek(_) => {
+            capabilities.push(Capability::SubscribeSessionEvents);
+        }
+        Verb::Run(_) => capabilities.extend([
+            Capability::ReadAgentSession,
+            Capability::CreateAgentSession,
+            Capability::ManageSessionRepositories,
+            Capability::WriteSessionFilesystem,
+            Capability::ConfigureApprovalPolicy,
+            Capability::StartAgentRun,
+        ]),
     }
     CapabilitySet::new(capabilities)
 }
@@ -221,6 +231,7 @@ pub(crate) async fn run<C: Client>(
     client: &mut C,
     invocation: &Invocation,
     out: &mut dyn Write,
+    err: &mut dyn Write,
 ) -> Result<(Value, Option<RequestId>), Failure> {
     match &invocation.verb {
         Verb::Doctor => query::doctor(client, invocation, out).await,
@@ -232,15 +243,21 @@ pub(crate) async fn run<C: Client>(
         Verb::Get { session, metadata } => {
             query::get(client, invocation, *session, *metadata, out).await
         }
-        Verb::Events(args) => events::events(client, invocation, args, out).await,
-        Verb::Peek(args) => events::peek(client, invocation, args, out).await,
+        Verb::Events(args) => events::events(client, invocation, args, out, err).await,
+        Verb::Peek(args) => events::peek(client, invocation, args, out, err).await,
         Verb::Run(args) => run::run(client, invocation, args, out).await,
     }
 }
 
-/// Writes one preformatted line, reporting a broken output stream as a local
-/// failure rather than panicking.
+/// Writes one preformatted line. A reader that closed the pipe is a clean stop,
+/// and any other write failure is reported as a local failure instead of a
+/// panic.
 fn emit(out: &mut dyn Write, line: &str) -> Result<(), Failure> {
-    out.write_all(line.as_bytes())
-        .map_err(|error| Failure::Internal(format!("could not write output: {error}")))
+    out.write_all(line.as_bytes()).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::BrokenPipe {
+            Failure::BrokenPipe
+        } else {
+            Failure::Internal(format!("could not write output: {error}"))
+        }
+    })
 }

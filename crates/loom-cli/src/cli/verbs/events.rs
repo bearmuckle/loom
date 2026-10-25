@@ -6,6 +6,14 @@
 //! event is printed. Every printed event advances a floor sequence that is
 //! persisted to the `--cursor-file`, so a resumed run prints exactly the suffix
 //! it has not printed before.
+//!
+//! A snapshot cannot page: the worker bounds it to its newest events, so a
+//! cursor older than that window loses the events between the two. The verb
+//! does not pretend otherwise - it prints the window, reports the missing range
+//! as a `gap` on stderr and in the `--json` envelope, and resumes at the head,
+//! because a later snapshot would carry the same window again. Only a fresh
+//! start without a cursor has no gap: starting from the current window is the
+//! documented behaviour of a first read.
 
 use std::{io::Write, path::Path, time::Duration};
 
@@ -34,6 +42,7 @@ pub(super) async fn events<C: Client>(
     invocation: &Invocation,
     args: &EventsArgs,
     out: &mut dyn Write,
+    err: &mut dyn Write,
 ) -> Result<(Value, Option<RequestId>), Failure> {
     let mut caller = Caller::new(client);
     handshake(&mut caller, &invocation.verb).await?;
@@ -54,9 +63,11 @@ pub(super) async fn events<C: Client>(
     let mut after = floor.map(EventSequence::new);
 
     let mut rendered = Vec::new();
+    let mut gap: Option<Gap> = None;
     let mut followed_run_completed = false;
     let mut delay = FOLLOW_MIN_DELAY;
     loop {
+        let requested_after = after;
         let (request_id, response) = caller
             .call(ClientRequest::Events(EventsRequest::GetSessionEvents {
                 activity_detail: ActivityDetail::Full,
@@ -76,29 +87,64 @@ pub(super) async fn events<C: Client>(
                 stream_epoch,
                 next: next_after_sequence,
                 latest: None,
+                oldest: None,
             },
             ServerResponse::Events(EventsResponse::SessionEventsSnapshot {
+                session: _,
                 events,
+                oldest_sequence,
                 latest_sequence,
                 stream_epoch,
-                ..
             }) => Page {
                 events,
                 stream_epoch,
                 next: None,
                 latest: Some(latest_sequence),
+                oldest: Some(oldest_sequence),
             },
             _ => return Err(Failure::unexpected(request_id, "session events")),
         };
 
         // A new stream epoch means the sequence numbers no longer name the same
         // events, so the stored position is discarded before anything prints.
-        if let (Some(previous), Some(current)) = (epoch.as_deref(), page.stream_epoch.as_deref())
-            && previous != current
-        {
+        let epoch_changed = match (epoch.as_deref(), page.stream_epoch.as_deref()) {
+            (Some(previous), Some(current)) => previous != current,
+            _ => false,
+        };
+        if epoch_changed {
             floor = None;
         }
         epoch = page.stream_epoch.clone();
+
+        // A snapshot is bounded to its newest events. When its window starts
+        // above the cursor, the events in between are not in the response and a
+        // later snapshot cannot page them back, so say so instead of resuming
+        // silently past them. A fresh start has no cursor to compare against,
+        // and a new epoch makes the old sequence meaningless.
+        if let (Some(oldest), Some(cursor), false) = (
+            page.oldest.map(EventSequence::value),
+            requested_after.map(EventSequence::value),
+            epoch_changed,
+        ) && oldest > cursor.saturating_add(1)
+        {
+            let found = Gap {
+                after: cursor,
+                before: oldest,
+            };
+            gap = Some(match gap {
+                Some(previous) => previous.merge(found),
+                None => found,
+            });
+            writeln!(
+                err,
+                "warning gap {}..{}: {} event(s) between the cursor and the snapshot window are \
+                 no longer available; the cursor resumes at the head of the window",
+                cursor.saturating_add(1),
+                oldest.saturating_sub(1),
+                found.missing()
+            )
+            .map_err(|error| Failure::Internal(format!("could not write a warning: {error}")))?;
+        }
 
         let mut printed = 0usize;
         for envelope in &page.events {
@@ -156,7 +202,14 @@ pub(super) async fn events<C: Client>(
         }
     }
 
-    Ok((json!({ "events": rendered }), caller.primary))
+    let gap = gap.map(|gap| {
+        json!({
+            "after": gap.after,
+            "before": gap.before,
+            "missing": gap.missing(),
+        })
+    });
+    Ok((json!({ "events": rendered, "gap": gap }), caller.primary))
 }
 
 /// `peek`: the newest events of a session, bounded by `--lines`.
@@ -165,6 +218,7 @@ pub(super) async fn peek<C: Client>(
     invocation: &Invocation,
     args: &PeekArgs,
     out: &mut dyn Write,
+    _err: &mut dyn Write,
 ) -> Result<(Value, Option<RequestId>), Failure> {
     let mut caller = Caller::new(client);
     handshake(&mut caller, &invocation.verb).await?;
@@ -206,7 +260,34 @@ struct Page {
     events: Vec<ServerEventEnvelope>,
     stream_epoch: Option<String>,
     next: Option<EventSequence>,
+    /// The head a snapshot resumes at; absent for a pageable batch.
     latest: Option<EventSequence>,
+    /// The first sequence a snapshot actually carried; absent for a batch,
+    /// whose oldest event was requested explicitly.
+    oldest: Option<EventSequence>,
+}
+
+/// The range a truncated snapshot could not carry: `after` is the cursor the
+/// request resumed from and `before` is the first sequence the window carried,
+/// so the missing sequences are `after + 1 .. before`. Merging keeps the widest
+/// range when a follow loop resynchronises more than once.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Gap {
+    after: u64,
+    before: u64,
+}
+
+impl Gap {
+    fn missing(self) -> u64 {
+        self.before.saturating_sub(self.after).saturating_sub(1)
+    }
+
+    fn merge(self, other: Self) -> Self {
+        Self {
+            after: self.after.min(other.after),
+            before: self.before.max(other.before),
+        }
+    }
 }
 
 /// Prints one event as its text line or its JSON line, and records the JSON form
@@ -221,21 +302,31 @@ fn emit_event(
     stream_epoch: Option<&str>,
     projected: &Rendered,
 ) -> Result<(), Failure> {
-    let session_id = envelope.session_id.to_string();
-    let object = text::json_line(
-        envelope.sequence,
-        stream_epoch,
-        &session_id,
-        projected,
-        &envelope.event,
-    );
     if json_output {
-        rendered.push(object);
+        rendered.push(text::json_line(
+            envelope.sequence,
+            stream_epoch,
+            &envelope.session_id.to_string(),
+            projected,
+            &envelope.event,
+        ));
         return Ok(());
     }
     match format {
         Format::Text => emit(out, &text::line(envelope.sequence, projected)),
-        Format::Jsonl => emit(out, &format!("{object}\n")),
+        Format::Jsonl => emit(
+            out,
+            &format!(
+                "{}\n",
+                text::json_line(
+                    envelope.sequence,
+                    stream_epoch,
+                    &envelope.session_id.to_string(),
+                    projected,
+                    &envelope.event,
+                )
+            ),
+        ),
     }
 }
 

@@ -12,7 +12,9 @@
 //!   attachment nor fails on one that already exists.
 //! - The approval policy is pinned with `Session/SetSessionApprovalPolicy`
 //!   before the run starts, because a run resolves its policy once, when it is
-//!   created.
+//!   created. A session this invocation creates gets the requested preset (or
+//!   the default one), while a reused session is only changed when the flag was
+//!   given, so a plain run does not overwrite a policy a person set.
 //! - The run start (`Run/StartSessionAgentRunWithOptions`) carries
 //!   `--request-id` as its request id, so the same id is answered from the
 //!   worker's durable idempotency cache with the same run instead of starting a
@@ -96,24 +98,34 @@ pub(super) async fn run<C: Client>(
         }
     }
 
-    // A run resolves its approval policy when it is created, so the policy has
-    // to be stored before the run start rather than after it.
-    let (policy, auto_approve_actions) = match args.approval {
-        ApprovalPreset::Default => (ApprovalPolicy::default(), false),
-        ApprovalPreset::Auto => (ApprovalPolicy::auto_approve(), true),
+    // A run resolves its approval policy when it is created, so a policy change
+    // has to be stored before the run start. A session this invocation creates
+    // starts with the requested preset or the default one; a reused session
+    // keeps whatever policy a person set unless `--approval-policy` named one,
+    // so a plain `run` against an existing session never overwrites it.
+    let preset = if created {
+        Some(args.approval.unwrap_or(ApprovalPreset::Default))
+    } else {
+        args.approval
     };
-    let (request_id, response) = caller
-        .call(ClientRequest::Session(
-            SessionRequest::SetSessionApprovalPolicy {
-                session_id,
-                policy,
-                auto_approve_actions: Some(auto_approve_actions),
-            },
-        ))
-        .await?;
-    match response {
-        ServerResponse::Session(SessionResponse::ApprovalPolicy(_)) => {}
-        _ => return Err(Failure::unexpected(request_id, "session approval policy")),
+    if let Some(preset) = preset {
+        let (policy, auto_approve_actions) = match preset {
+            ApprovalPreset::Default => (ApprovalPolicy::default(), false),
+            ApprovalPreset::Auto => (ApprovalPolicy::auto_approve(), true),
+        };
+        let (request_id, response) = caller
+            .call(ClientRequest::Session(
+                SessionRequest::SetSessionApprovalPolicy {
+                    session_id,
+                    policy,
+                    auto_approve_actions: Some(auto_approve_actions),
+                },
+            ))
+            .await?;
+        match response {
+            ServerResponse::Session(SessionResponse::ApprovalPolicy(_)) => {}
+            _ => return Err(Failure::unexpected(request_id, "session approval policy")),
+        }
     }
 
     // The caller's id, when it named one, is the idempotency key of this run

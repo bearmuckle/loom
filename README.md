@@ -98,8 +98,8 @@ needs the explicit `--allow-insecure-remote` opt-in.
 | --- | --- |
 | `doctor` | Negotiated protocol, capability intersection, participant, and worker node. |
 | `whoami` | The participant bound to the token. |
-| `ls [--workspace <id>]` | Workspaces, or the sessions of one workspace. |
-| `get <session-id> [--metadata]` | One session snapshot, or only its metadata. |
+| `ls [--workspace <id>] [--archived]` | Workspaces, or the sessions of one workspace. |
+| `get <session-id> [--metadata]` | One session snapshot, or that snapshot with its active run metadata. |
 | `events --session <id> [--after <seq>] [--cursor-file <path>] [--follow] [--format text\|jsonl] [--max-bytes <n>]` | Session events, followed until the run completes or the caller interrupts. |
 | `peek --session <id> [--lines <n>] [--format text\|jsonl] [--max-bytes <n>]` | The tail of the session's current output; 200 lines by default. |
 | `run --workspace <id> (--task <text> \| --task-file <path>) [--name <name>] [--model <id>] [--repo <source> [--revision <rev>] [--path <path>]] [--as-directory <path>] [--approval-policy default\|auto] [--request-id <uuid>]` | Reuse or create the session named `--name`, attach the inputs, set the approval policy, and start one run. |
@@ -116,7 +116,17 @@ same cursor produces identical bytes.
 
 `--format jsonl` writes one JSON object per line that carries `seq` and
 `stream_epoch`, so a caller can resume. `--json` prints one envelope containing
-the request id the call used.
+the request id the call used. `--json` with `--follow` keeps every followed
+event in that envelope, so prefer `--format jsonl` for a long follow.
+
+A `SessionEventsSnapshot` cannot page: it carries only the newest part of the
+retained window. When the cursor sits below the first sequence that window
+carries, the events in between are gone from the response and cannot be fetched
+again by this verb. `events` prints the window, reports the missing range as
+`warning gap <first>..<last>` on stderr and as a `gap` field in its `--json`
+envelope, and resumes at the head of the window rather than claiming a complete
+suffix. A first read without a cursor has no gap; starting from the current
+window is its documented behaviour.
 
 | Exit code | Meaning |
 | --- | --- |
@@ -135,8 +145,11 @@ slice waits for a run to finish.
 
 `run` is the one mutation. It reuses the workspace session whose name matches
 `--name` (or a name derived from the task) and otherwise creates it, attaches
-`--repo` or `--as-directory` only when it created the session, and pins
-`--approval-policy` before the run starts. `--request-id` is the idempotency key
+`--repo` or `--as-directory` only when it created the session, and sets the
+approval policy before the run starts. A created session is pinned to
+`--approval-policy` (the `default` preset when the flag is absent); a reused
+session is only changed when the flag is given, so a plain run never overwrites
+a policy a person set. `--request-id` is the idempotency key
 of the run start, so repeating the same command returns the same run. A worker
 accepts a run only in an idle session, so reusing a session that already ran
 reports `invalid_state` (exit `5`) and creates nothing.

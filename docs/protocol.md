@@ -778,13 +778,22 @@ for unsolicited server events.
   journaled event.
 - **Snapshot replaces the cursor.** A `SessionEventsSnapshot` answer means the
   requested cursor is no longer retained. The client replaces its local
-  projection state, renders only events newer than the highest sequence it has
-  already rendered, and resumes from `latest_sequence` in that response. It
-  never reprints an event it already emitted and never skips one between the
-  snapshot's `oldest_sequence` and `latest_sequence`.
-- **Epoch.** `stream_epoch` names one backend instance. A change of epoch
-  invalidates the cursor: the client discards its cursor and treats the next
-  response as a snapshot.
+  projection state and renders only events newer than the highest sequence it
+  has already rendered. A snapshot cannot page: it carries a window bounded to
+  its newest events, and `oldest_sequence` names the first sequence the response
+  actually carries. Events between the cursor and that window are not in the
+  response and cannot be requested again through this verb, so the client
+  reports them as a gap, resumes from `latest_sequence`, and never reprints an
+  event it already emitted.
+- **Gap reporting.** When a truncated snapshot leaves a range the client cannot
+  obtain, `loom-cli` prints `warning gap <first>..<last>: <n> event(s) ...` on
+  stderr and adds `gap { after, before, missing }` to its `--json` envelope,
+  then resumes at the head of the window. A fresh read with no cursor has no
+  gap: starting from the current window is its documented behaviour.
+- **Epoch.** `stream_epoch` names one backend instance. A response that reports
+  a different epoch invalidates the cursor: the client discards it and treats
+  that same response as a snapshot, because the old sequence numbers no longer
+  name the same events.
 - **Cursor persistence.** An optional local cursor file records the URL, the
   session, the last rendered sequence, and the epoch. It is written atomically,
   through a temporary file plus a rename, after each rendered batch. The cursor

@@ -37,7 +37,10 @@
 //!    therefore neither duplicates an attachment nor fails on one that already
 //!    exists.
 //! 3. `Session/SetSessionApprovalPolicy` pins `--approval-policy` before the run
-//!    starts, because a run resolves its policy once, when it is created.
+//!    starts, because a run resolves its policy once, when it is created. A
+//!    session this invocation creates is pinned to the requested preset, or the
+//!    default one when the flag is absent; a reused session is only changed when
+//!    the flag was given, so a plain run never overwrites a person's choice.
 //! 4. `Run/StartSessionAgentRunWithOptions` starts the run under the caller's
 //!    `--request-id` (or a freshly generated id), so repeating the same id is
 //!    answered from the worker's durable idempotency cache with the same run
@@ -87,7 +90,8 @@
 //! `request_id` is the id of the verb's primary request (its first request, or
 //! its handshake), or `null` when no request was sent. `run` reports its run
 //! start instead, because that is the id its caller chose and the key a replay
-//! reuses.
+//! reuses. `events` adds `gap` (`after`, `before`, `missing`) when a snapshot
+//! could not carry every event after the cursor, and `null` otherwise.
 //!
 //! `events --format jsonl` and `peek --format jsonl` are a different shape:
 //! without `--json` they print one object per event,
@@ -113,10 +117,12 @@
 //! different URL or session is ignored. The file is replaced atomically (a
 //! temporary file in the same directory, then a rename) after every fully
 //! rendered batch. An event whose sequence is at or below the persisted cursor
-//! is never printed; a `SessionEventsSnapshot` response prints only events
-//! above it and then persists `latest_sequence`; and a changed `stream_epoch`
-//! discards the stored cursor first, because a new epoch means the sequences no
-//! longer name the same events.
+//! is never printed; a `SessionEventsSnapshot` response prints the window it
+//! carries, reports any range between the cursor and that window as `gap` (on
+//! stderr and in the `--json` envelope) because a snapshot cannot page it back,
+//! and then persists `latest_sequence` so a later run resumes at the head; and a
+//! changed `stream_epoch` discards the stored cursor first, because a new epoch
+//! means the sequences no longer name the same events.
 //!
 //! # Token handling
 //!
@@ -146,11 +152,19 @@ use args::{Invocation, Parsed};
 /// panics on user input.
 pub fn main(arguments: Vec<String>) -> i32 {
     let json = args::wants_json(&arguments);
-    let invocation = match args::parse(&arguments) {
+    let mut invocation = match args::parse(&arguments) {
         Ok(Parsed::Help) => return print_help(),
         Ok(Parsed::Run(invocation)) => invocation,
         Err(message) => return report_usage_stdio(&message, json, args::named_verb(&arguments)),
     };
+    // The environment is consulted exactly once, here, beside the token file
+    // fallback, and the result is stored on the invocation so the URL a cursor
+    // file is scoped to is the one the connection uses. Parsing itself stays a
+    // pure function of its arguments.
+    invocation.globals.connect = args::resolve_connect(
+        invocation.globals.connect.take(),
+        std::env::var("LOOM_URL").ok(),
+    );
     let settings = &invocation.globals;
     let Some(url) = settings.connect.clone() else {
         return report_usage_stdio(
@@ -243,8 +257,9 @@ pub fn main(arguments: Vec<String>) -> i32 {
             Ok(connection) => {
                 let mut client = RemoteClient::new(connection);
                 // The verb runs through the same entry point the tests use, so
-                // there is one execution path for both.
-                run_command(&mut client, &arguments, &mut out, &mut err).await
+                // there is one execution path for both, and the arguments were
+                // parsed once, so a task file is read once.
+                run_parsed(&mut client, &invocation, &mut out, &mut err).await
             }
             // The worker was never reached: an authentication refusal is a
             // protocol or auth mismatch, and anything else is unreachable.
@@ -268,8 +283,8 @@ pub fn main(arguments: Vec<String>) -> i32 {
 
 /// Runs one verb against an already connected client, returning its exit code
 /// without ever exiting the process. This is the seam the tests drive with an
-/// in-process backend; the binary itself calls the same runner after it
-/// connects.
+/// in-process backend; the binary parses once and calls [`run_parsed`].
+#[cfg(test)]
 pub async fn run_command<C: Client>(
     client: &mut C,
     arguments: &[String],
@@ -282,9 +297,20 @@ pub async fn run_command<C: Client>(
             let _ = out.write_all(args::HELP.as_bytes());
             exit::OK
         }
-        Ok(Parsed::Run(invocation)) => run_invocation(client, &invocation, out, err).await,
+        Ok(Parsed::Run(invocation)) => run_parsed(client, &invocation, out, err).await,
         Err(message) => report_usage(&message, json, args::named_verb(arguments), out, err),
     }
+}
+
+/// Runs an already parsed invocation, so a caller that needed the parsed flags
+/// before connecting does not parse (and read a task file) twice.
+pub async fn run_parsed<C: Client>(
+    client: &mut C,
+    invocation: &Invocation,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    run_invocation(client, invocation, out, err).await
 }
 
 async fn run_invocation<C: Client>(
@@ -295,7 +321,7 @@ async fn run_invocation<C: Client>(
 ) -> i32 {
     let json = invocation.globals.json;
     let verb = args::verb_name(&invocation.verb);
-    match verbs::run(client, invocation, out).await {
+    match verbs::run(client, invocation, out, err).await {
         Ok((data, request_id)) => {
             if json {
                 let envelope = serde_json::json!({
@@ -354,6 +380,11 @@ fn report_failure(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
+    // A reader that closed the pipe is not a failure and has nowhere to read a
+    // report, so stop quietly with the successful code.
+    if matches!(failure, verbs::Failure::BrokenPipe) {
+        return exit::OK;
+    }
     let code = failure.exit_code();
     if json {
         write_json(out, &failure.envelope(verb));

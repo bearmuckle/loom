@@ -75,8 +75,13 @@ pub(crate) fn write(
         "after": cursor.after,
         "stream_epoch": cursor.stream_epoch,
     });
-    let mut temporary = path.to_path_buf();
-    temporary.set_extension("cursor.tmp");
+    // A unique sibling name, so two writers sharing one cursor file cannot
+    // clobber each other's temporary file.
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "cursor".to_owned());
+    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -94,10 +99,28 @@ pub(crate) fn write(
             temporary.display()
         )
     })?;
-    std::fs::rename(&temporary, path).map_err(|error| {
-        format!(
+    match std::fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        // Windows refuses to replace an existing destination with `rename`, so
+        // fall back to removing it first. That is not atomic, which is why it
+        // is only taken when the one-step replacement failed.
+        Err(_first) if path.exists() => {
+            std::fs::remove_file(path).map_err(|error| {
+                format!(
+                    "could not replace the cursor file '{}': {error}",
+                    path.display()
+                )
+            })?;
+            std::fs::rename(&temporary, path).map_err(|error| {
+                format!(
+                    "could not replace the cursor file '{}': {error}",
+                    path.display()
+                )
+            })
+        }
+        Err(error) => Err(format!(
             "could not replace the cursor file '{}': {error}",
             path.display()
-        )
-    })
+        )),
+    }
 }
