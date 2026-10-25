@@ -11,7 +11,8 @@ use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, Author, Capability,
     CapabilitySet, CollaborationEntryKind, DelegatedTaskRecord, DelegatedTaskStatus, EventSequence,
-    ProjectAgentPermissions, ProjectAgentRecord, ProjectId, ProjectSnapshot,
+    GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus, GitFileStatusKind,
+    GitRepositoryStatus, ProjectAgentPermissions, ProjectAgentRecord, ProjectId, ProjectSnapshot,
     ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord, ProjectWorktreeStatus,
     ProtocolVersion, RepositoryId, RequestId, RunId, TaskId, Timestamp, ToolCallId, WorkspaceId,
 };
@@ -1207,6 +1208,37 @@ fn each_verb_negotiates_only_the_capabilities_its_requests_need() {
                 Capability::JsonProtocol,
                 Capability::ReadProject,
                 Capability::CleanupProjectChildWorktree,
+            ],
+        ),
+        (
+            vec!["project", "worktrees", &session],
+            vec![Capability::JsonProtocol, Capability::ReadProject],
+        ),
+        (
+            vec!["project", "worktree", "get", &session, "--task", &task],
+            vec![Capability::JsonProtocol, Capability::ReadProject],
+        ),
+        (
+            vec!["project", "worktree", "diff", &session, "--task", &task],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadProject,
+                Capability::ReadProjectChildReview,
+            ],
+        ),
+        (
+            vec![
+                "project",
+                "worktree",
+                "integrate",
+                &session,
+                "--task",
+                &task,
+            ],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadProject,
+                Capability::IntegrateProjectChild,
             ],
         ),
         (
@@ -4795,10 +4827,21 @@ fn the_parser_covers_the_lifecycle_verbs() {
     assert!(
         parse_error(&["project", "delete", &session, "--force"]).contains("pass --yes to confirm")
     );
-    assert!(parse_error(&["project"]).contains("requires 'archive', 'delete', or 'worktree'"));
-    assert!(parse_error(&["project", "nope"]).contains("use archive, delete, or worktree"));
-    assert!(parse_error(&["project", "worktree"]).contains("requires 'cleanup'"));
-    assert!(parse_error(&["project", "worktree", "nope"]).contains("use cleanup"));
+    assert!(
+        parse_error(&["project"])
+            .contains("requires 'archive', 'delete', 'worktree', or 'worktrees'")
+    );
+    assert!(
+        parse_error(&["project", "nope"]).contains("use archive, delete, worktree, or worktrees")
+    );
+    assert!(
+        parse_error(&["project", "worktree"])
+            .contains("requires 'get', 'diff', 'integrate', or 'cleanup'")
+    );
+    assert!(
+        parse_error(&["project", "worktree", "nope"])
+            .contains("use get, diff, integrate, or cleanup")
+    );
     assert!(
         parse_error(&["project", "worktree", "cleanup", &session, "--keep"])
             .contains("requires --task")
@@ -4829,6 +4872,134 @@ fn the_parser_covers_the_lifecycle_verbs() {
     assert!(
         parse_error(&[
             "project", "worktree", "cleanup", &session, "--task", "nope", "--keep"
+        ])
+        .contains("not a valid task id")
+    );
+}
+
+#[test]
+fn the_parser_covers_worktree_inspection_and_integration() {
+    let session = AgentSessionId::new().to_string();
+    let task = TaskId::new().to_string();
+    let revision = "a".repeat(40);
+
+    let Verb::ProjectWorktrees {
+        session: parsed_session,
+    } = invocation(&["project", "worktrees", &session]).verb
+    else {
+        panic!("'project worktrees' parses as its own verb");
+    };
+    assert_eq!(parsed_session.to_string(), session);
+
+    for sub_verb in ["get", "diff"] {
+        let verb = invocation(&["project", "worktree", sub_verb, &session, "--task", &task]).verb;
+        match (sub_verb, verb) {
+            (
+                "get",
+                Verb::ProjectWorktreeGet {
+                    session: parsed_session,
+                    task: parsed_task,
+                },
+            )
+            | (
+                "diff",
+                Verb::ProjectWorktreeDiff {
+                    session: parsed_session,
+                    task: parsed_task,
+                },
+            ) => {
+                assert_eq!(parsed_session.to_string(), session);
+                assert_eq!(parsed_task.to_string(), task);
+            }
+            (_, other) => panic!("'{sub_verb}' parses as {other:?}"),
+        }
+    }
+
+    // The expected parent revision is absent when the flag is, so the verb
+    // falls back to the revision the record itself names.
+    let Verb::ProjectWorktreeIntegrate {
+        task: parsed_task,
+        expected_parent_revision,
+        ..
+    } = invocation(&[
+        "project",
+        "worktree",
+        "integrate",
+        &session,
+        "--task",
+        &task,
+    ])
+    .verb
+    else {
+        panic!("'project worktree integrate' parses as its own verb");
+    };
+    assert_eq!(parsed_task.to_string(), task);
+    assert_eq!(expected_parent_revision, None);
+    let Verb::ProjectWorktreeIntegrate {
+        expected_parent_revision,
+        ..
+    } = invocation(&[
+        "project",
+        "worktree",
+        "integrate",
+        &session,
+        "--task",
+        &task,
+        "--expected-parent-revision",
+        &revision,
+    ])
+    .verb
+    else {
+        panic!("'project worktree integrate' parses as its own verb");
+    };
+    assert_eq!(expected_parent_revision, Some(revision.clone()));
+
+    // A missing session id, an extra positional word, and a flag the sub-verb
+    // does not use are all usage errors.
+    assert!(parse_error(&["project", "worktrees"]).contains("requires a <session-id>"));
+    assert!(parse_error(&["project", "worktrees", &session, &session]).contains("one session id"));
+    assert!(
+        parse_error(&["project", "worktrees", &session, "--task", &task])
+            .contains("does not apply")
+    );
+    for sub_verb in ["get", "diff", "integrate"] {
+        assert!(
+            parse_error(&["project", "worktree", sub_verb]).contains("requires a <session-id>"),
+            "{sub_verb}"
+        );
+        assert!(
+            parse_error(&["project", "worktree", sub_verb, &session]).contains("requires --task"),
+            "{sub_verb}"
+        );
+        assert!(
+            parse_error(&[
+                "project", "worktree", sub_verb, &session, &session, "--task", &task
+            ])
+            .contains("one session id"),
+            "{sub_verb}"
+        );
+    }
+    assert!(
+        parse_error(&[
+            "project",
+            "worktree",
+            "get",
+            &session,
+            "--task",
+            &task,
+            "--expected-parent-revision",
+            &revision,
+        ])
+        .contains("does not apply")
+    );
+    assert!(
+        parse_error(&[
+            "project",
+            "worktree",
+            "integrate",
+            &session,
+            "--task",
+            "nope"
         ])
         .contains("not a valid task id")
     );
@@ -5322,6 +5493,194 @@ fn project_worktree_cleanup_reports_what_it_kept_or_removed() {
     close_persistent_fixture(fixture, directory);
 }
 
+/// What a test decides the review or integration answer is.
+enum ProjectAnswer {
+    /// The review of one checkout, as the worker reports it.
+    Review {
+        worktree: Box<ProjectWorktreeRecord>,
+        status: Box<GitRepositoryStatus>,
+        diff: Box<GitDiff>,
+    },
+    /// The updated record an integration reports.
+    Updated(Box<ProjectWorktreeRecord>),
+    /// The error the worker answers the verb with.
+    Refused(loom_core::LoomError),
+}
+
+fn review_answer(
+    worktree: &ProjectWorktreeRecord,
+    status: &GitRepositoryStatus,
+    diff: &GitDiff,
+) -> ProjectAnswer {
+    ProjectAnswer::Review {
+        worktree: Box::new(worktree.clone()),
+        status: Box::new(status.clone()),
+        diff: Box::new(diff.clone()),
+    }
+}
+
+/// A client whose project snapshot and review or integration answer are decided
+/// by the test, recording every request it sent.
+fn worktree_client(
+    backend: &Arc<InProcessBackend>,
+    session: AgentSessionId,
+    project: ProjectSnapshot,
+    answer: ProjectAnswer,
+    sent: Rc<RefCell<Vec<ClientRequest>>>,
+) -> Wrapped<InProcessClient> {
+    Wrapped::new(InProcessClient::new(backend))
+        .before(move |envelope| sent.borrow_mut().push(envelope.request.clone()))
+        .after(move |request, response| match request {
+            ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession { session_id })
+                if *session_id == session =>
+            {
+                response.result = Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(
+                    project.clone(),
+                )));
+            }
+            ClientRequest::Project(ProjectRequest::GetProjectChildReview { .. }) => {
+                if let ProjectAnswer::Review {
+                    worktree,
+                    status,
+                    diff,
+                } = &answer
+                {
+                    response.result = Ok(ServerResponse::Project(
+                        ProjectResponse::ProjectChildReview {
+                            worktree: worktree.clone(),
+                            status: (**status).clone(),
+                            diff: (**diff).clone(),
+                        },
+                    ));
+                }
+            }
+            ClientRequest::Project(ProjectRequest::IntegrateProjectChild { .. }) => match &answer {
+                ProjectAnswer::Updated(worktree) => {
+                    response.result = Ok(ServerResponse::Project(
+                        ProjectResponse::ProjectChildWorktreeUpdated(worktree.clone()),
+                    ));
+                }
+                ProjectAnswer::Refused(error) => response.result = Err(error.clone()),
+                _ => {}
+            },
+            _ => {}
+        })
+}
+
+/// The review requests a test client sent, as their project, manager, and task.
+fn review_requests(
+    sent: &Rc<RefCell<Vec<ClientRequest>>>,
+) -> Vec<(ProjectId, AgentSessionId, TaskId)> {
+    sent.borrow()
+        .iter()
+        .filter_map(|request| match request {
+            ClientRequest::Project(ProjectRequest::GetProjectChildReview {
+                project_id,
+                manager_session_id,
+                task_id,
+            }) => Some((*project_id, *manager_session_id, *task_id)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The integration requests a test client sent, with the revision each expected.
+fn integrate_requests(
+    sent: &Rc<RefCell<Vec<ClientRequest>>>,
+) -> Vec<(ProjectId, AgentSessionId, TaskId, String)> {
+    sent.borrow()
+        .iter()
+        .filter_map(|request| match request {
+            ClientRequest::Project(ProjectRequest::IntegrateProjectChild {
+                project_id,
+                manager_session_id,
+                task_id,
+                expected_parent_revision,
+            }) => Some((
+                *project_id,
+                *manager_session_id,
+                *task_id,
+                expected_parent_revision.clone(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// One changed file of a review.
+fn fake_file(path: &str, status: GitFileStatusKind, conflicted: bool) -> GitFileStatus {
+    GitFileStatus {
+        path: path.to_owned(),
+        original_path: None,
+        index: status,
+        worktree: status,
+        conflicted,
+        index_additions: 0,
+        index_deletions: 0,
+        worktree_additions: 0,
+        worktree_deletions: 0,
+    }
+}
+
+/// The status of a review: two changed paths, the second one conflicted.
+fn fake_status() -> GitRepositoryStatus {
+    GitRepositoryStatus {
+        root: "repo".to_owned(),
+        branch: Some("loom/test".to_owned()),
+        head: Some("c".repeat(40)),
+        files: vec![
+            fake_file("src/lib.rs", GitFileStatusKind::Modified, false),
+            fake_file("README.md", GitFileStatusKind::Deleted, true),
+        ],
+        conflicts: Vec::new(),
+        clean: false,
+        captured_at: Timestamp::now(),
+    }
+}
+
+/// A diff with one hunk holding a context, two added, and one removed line.
+fn fake_diff() -> GitDiff {
+    GitDiff {
+        path: None,
+        staged: false,
+        patch: String::new(),
+        binary: false,
+        hunks: vec![GitDiffHunk {
+            old_start: 1,
+            old_lines: 2,
+            new_start: 1,
+            new_lines: 3,
+            lines: vec![
+                GitDiffLine {
+                    kind: GitDiffLineKind::Context,
+                    old_line: Some(1),
+                    new_line: Some(1),
+                    content: "fn main() {".to_owned(),
+                },
+                GitDiffLine {
+                    kind: GitDiffLineKind::Added,
+                    old_line: None,
+                    new_line: Some(2),
+                    content: "\tprintln!(\"hi\");".to_owned(),
+                },
+                GitDiffLine {
+                    kind: GitDiffLineKind::Added,
+                    old_line: None,
+                    new_line: Some(3),
+                    content: "let value = 1;".to_owned(),
+                },
+                GitDiffLine {
+                    kind: GitDiffLineKind::Removed,
+                    old_line: Some(2),
+                    new_line: None,
+                    content: "old();".to_owned(),
+                },
+            ],
+        }],
+        truncated: false,
+    }
+}
+
 #[test]
 fn project_worktree_cleanup_states_every_status_in_text() {
     let (fixture, directory) = persistent_fixture("worktree-status");
@@ -5376,5 +5735,595 @@ fn project_worktree_cleanup_states_every_status_in_text() {
         };
         assert_eq!(outcome.stdout, expected);
     }
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn project_worktrees_lists_the_snapshot_records() {
+    let (fixture, directory) = persistent_fixture("worktrees-list");
+    let session = fixture.session.id;
+    let child = AgentSessionId::new();
+    let first = fake_worktree(session, child, "wt-1", "repo");
+    let mut second = fake_worktree(session, child, "wt-2", "repo-b");
+    second.status = ProjectWorktreeStatus::Stale;
+    let project = fake_project(session, &[session], vec![first.clone(), second.clone()]);
+    let session_text = session.to_string();
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let mut client = worktree_client(
+        &fixture.backend,
+        session,
+        project.clone(),
+        ProjectAnswer::Updated(Box::new(first.clone())),
+        Rc::clone(&sent),
+    );
+
+    let listed = run(&mut client, &["project", "worktrees", &session_text]);
+    assert_eq!(listed.code, exit::OK, "{}", listed.stderr);
+    assert_eq!(
+        listed.stdout,
+        format!(
+            "project {}\nworktrees 2\nworktree {} ready wt-1 repo\nworktree {} stale wt-2 repo-b\n",
+            project.project_id, first.task_id, second.task_id
+        )
+    );
+
+    let payload = run(
+        &mut client,
+        &["project", "worktrees", &session_text, "--json"],
+    );
+    assert_eq!(payload.code, exit::OK, "{}", payload.stderr);
+    let envelope = json_envelope(&payload);
+    assert_eq!(envelope["verb"], "project worktrees");
+    assert_eq!(envelope["data"]["session_id"], session_text);
+    assert_eq!(
+        envelope["data"]["project_id"],
+        project.project_id.to_string()
+    );
+    assert_eq!(envelope["data"]["root_session_id"], session_text);
+    assert_eq!(envelope["data"]["worktrees"][0]["worktree_name"], "wt-1");
+    assert_eq!(envelope["data"]["worktrees"][1]["status"], "stale");
+    assert_eq!(envelope["data"]["worktrees"][1]["branch_name"], "loom/test");
+    // Listing is one read per run: the handshake and the snapshot alone.
+    assert_eq!(sent.borrow().len(), 4, "two runs of one read each");
+    drop(client);
+
+    // A project with no checkout says so explicitly.
+    let empty = fake_project(session, &[session], Vec::new());
+    let mut empty_client = worktree_client(
+        &fixture.backend,
+        session,
+        empty.clone(),
+        ProjectAnswer::Updated(Box::new(first.clone())),
+        Rc::new(RefCell::new(Vec::new())),
+    );
+    let none = run(&mut empty_client, &["project", "worktrees", &session_text]);
+    assert_eq!(none.code, exit::OK, "{}", none.stderr);
+    assert_eq!(
+        none.stdout,
+        format!("project {}\nworktrees 0\n", empty.project_id)
+    );
+    drop(empty_client);
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn project_worktree_get_reports_the_durable_record() {
+    let (fixture, directory) = persistent_fixture("worktree-get");
+    let session = fixture.session.id;
+    let child = AgentSessionId::new();
+    let task = TaskId::new();
+    let result_revision = "a".repeat(40);
+    let integrated_revision = "b".repeat(40);
+    let mut worktree = fake_worktree(session, child, "wt-1", "repo");
+    worktree.task_id = task;
+    worktree.result_revision = Some(result_revision.clone());
+    worktree.integrated_revision = Some(integrated_revision.clone());
+    worktree.conflict_paths = vec!["src/lib.rs".to_owned(), "README.md".to_owned()];
+    worktree.cleanup_disposition = Some(ProjectWorktreeCleanupDisposition::DiscardChanges);
+    worktree.error = Some("the manager discarded this checkout".to_owned());
+    let project = fake_project(session, &[session], vec![worktree.clone()]);
+    let session_text = session.to_string();
+    let task_text = task.to_string();
+
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let mut client = worktree_client(
+        &fixture.backend,
+        session,
+        project.clone(),
+        ProjectAnswer::Updated(Box::new(worktree.clone())),
+        Rc::clone(&sent),
+    );
+    let reported = run(
+        &mut client,
+        &[
+            "project",
+            "worktree",
+            "get",
+            &session_text,
+            "--task",
+            &task_text,
+        ],
+    );
+    assert_eq!(reported.code, exit::OK, "{}", reported.stderr);
+    assert_eq!(
+        reported.stdout,
+        format!(
+            "worktree wt-1 repo\n\
+             task {task}\n\
+             project {project}\n\
+             owner {owner}\n\
+             child {child}\n\
+             parent-repository {parent_repository}\n\
+             child-repository {child_repository}\n\
+             branch loom/test\n\
+             parent-revision {base}\n\
+             child-revision {result_revision}\n\
+             integrated-revision {integrated_revision}\n\
+             status ready\n\
+             conflict src/lib.rs\n\
+             conflict README.md\n\
+             cleanup discard_changes\n\
+             note {note}\n",
+            task = worktree.task_id,
+            project = worktree.project_id,
+            owner = worktree.parent_session_id,
+            child = worktree.child_session_id,
+            parent_repository = worktree.parent_repository_id,
+            child_repository = worktree.child_repository_id,
+            base = worktree.base_revision,
+            note = worktree.error.clone().unwrap_or_default(),
+        )
+    );
+
+    // The record is reported from the snapshot alone, so nothing opens the
+    // checkout.
+    assert!(review_requests(&sent).is_empty());
+    assert!(integrate_requests(&sent).is_empty());
+
+    let payload = run(
+        &mut client,
+        &[
+            "project",
+            "worktree",
+            "get",
+            &session_text,
+            "--task",
+            &task_text,
+            "--json",
+        ],
+    );
+    assert_eq!(payload.code, exit::OK, "{}", payload.stderr);
+    let envelope = json_envelope(&payload);
+    assert_eq!(envelope["verb"], "project worktree get");
+    assert_eq!(envelope["data"]["session_id"], session_text);
+    assert_eq!(envelope["data"]["task_id"], task_text);
+    assert_eq!(envelope["data"]["worktree"]["status"], "ready");
+    assert_eq!(
+        envelope["data"]["worktree"]["conflict_paths"][1],
+        "README.md"
+    );
+    assert_eq!(
+        envelope["data"]["worktree"]["cleanup_disposition"],
+        "discard_changes"
+    );
+    drop(client);
+
+    // A bare record states the absent revisions and disposition as `-`.
+    let mut bare = fake_worktree(session, child, "wt-1", "repo");
+    bare.task_id = task;
+    let mut bare_client = worktree_client(
+        &fixture.backend,
+        session,
+        fake_project(session, &[session], vec![bare.clone()]),
+        ProjectAnswer::Updated(Box::new(bare.clone())),
+        Rc::new(RefCell::new(Vec::new())),
+    );
+    let bare_outcome = run(
+        &mut bare_client,
+        &[
+            "project",
+            "worktree",
+            "get",
+            &session_text,
+            "--task",
+            &task_text,
+        ],
+    );
+    assert_eq!(bare_outcome.code, exit::OK, "{}", bare_outcome.stderr);
+    assert_eq!(
+        bare_outcome.stdout,
+        format!(
+            "worktree wt-1 repo\n\
+             task {task}\n\
+             project {project}\n\
+             owner {owner}\n\
+             child {child}\n\
+             parent-repository {parent_repository}\n\
+             child-repository {child_repository}\n\
+             branch loom/test\n\
+             parent-revision {base}\n\
+             child-revision -\n\
+             integrated-revision -\n\
+             status ready\n\
+             cleanup -\n",
+            task = bare.task_id,
+            project = bare.project_id,
+            owner = bare.parent_session_id,
+            child = bare.child_session_id,
+            parent_repository = bare.parent_repository_id,
+            child_repository = bare.child_repository_id,
+            base = bare.base_revision,
+        )
+    );
+    drop(bare_client);
+
+    // A task without a record is a usage error after the snapshot, before any
+    // other request.
+    let missing_sent = Rc::new(RefCell::new(Vec::new()));
+    let mut missing = worktree_client(
+        &fixture.backend,
+        session,
+        fake_project(session, &[session], Vec::new()),
+        ProjectAnswer::Updated(Box::new(worktree.clone())),
+        Rc::clone(&missing_sent),
+    );
+    let refused = run(
+        &mut missing,
+        &[
+            "project",
+            "worktree",
+            "get",
+            &session_text,
+            "--task",
+            &task_text,
+        ],
+    );
+    assert_eq!(refused.code, exit::USAGE, "{}", refused.stderr);
+    assert!(
+        refused.stderr.contains("no project worktree is recorded"),
+        "{}",
+        refused.stderr
+    );
+    assert_eq!(
+        missing_sent.borrow().len(),
+        2,
+        "a refused get stops after the snapshot"
+    );
+    drop(missing);
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn project_worktree_diff_reports_the_worker_review() {
+    let (fixture, directory) = persistent_fixture("worktree-diff");
+    let session = fixture.session.id;
+    let child = AgentSessionId::new();
+    let task = TaskId::new();
+    let mut worktree = fake_worktree(session, child, "wt-1", "repo");
+    worktree.task_id = task;
+    let project = fake_project(session, &[session], vec![worktree.clone()]);
+    let status = fake_status();
+    let diff = fake_diff();
+    let session_text = session.to_string();
+    let task_text = task.to_string();
+
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let mut client = worktree_client(
+        &fixture.backend,
+        session,
+        project.clone(),
+        review_answer(&worktree, &status, &diff),
+        Rc::clone(&sent),
+    );
+    let reviewed = run(
+        &mut client,
+        &[
+            "project",
+            "worktree",
+            "diff",
+            &session_text,
+            "--task",
+            &task_text,
+        ],
+    );
+    assert_eq!(reviewed.code, exit::OK, "{}", reviewed.stderr);
+    assert_eq!(
+        reviewed.stdout,
+        format!(
+            "worktree wt-1 repo\n\
+             branch loom/test\n\
+             head {head}\n\
+             parent-revision {base}\n\
+             status ready\n\
+             diffstat 2 2 1\n\
+             changed modified src/lib.rs\n\
+             changed deleted README.md\n\
+             diff context fn main() {{\n\
+             diff added \\tprintln!(\"hi\");\n\
+             diff added let value = 1;\n\
+             diff removed old();\n",
+            head = status.head.clone().unwrap_or_default(),
+            base = worktree.base_revision,
+        )
+    );
+
+    // The review request carries the record's own project and manager.
+    assert_eq!(
+        review_requests(&sent),
+        vec![(worktree.project_id, session, task)]
+    );
+
+    let payload = run(
+        &mut client,
+        &[
+            "project",
+            "worktree",
+            "diff",
+            &session_text,
+            "--task",
+            &task_text,
+            "--json",
+        ],
+    );
+    assert_eq!(payload.code, exit::OK, "{}", payload.stderr);
+    let envelope = json_envelope(&payload);
+    assert_eq!(envelope["verb"], "project worktree diff");
+    assert_eq!(envelope["data"]["task_id"], task_text);
+    assert_eq!(envelope["data"]["worktree"]["worktree_name"], "wt-1");
+    assert_eq!(envelope["data"]["status"]["branch"], "loom/test");
+    assert_eq!(
+        envelope["data"]["diffstat"],
+        serde_json::json!({"files": 2, "added": 2, "removed": 1})
+    );
+    assert_eq!(envelope["data"]["changed_paths"][0]["path"], "src/lib.rs");
+    assert_eq!(envelope["data"]["changed_paths"][0]["status"], "modified");
+    assert_eq!(envelope["data"]["changed_paths"][1]["status"], "deleted");
+    assert_eq!(envelope["data"]["changed_paths"][1]["conflicted"], true);
+    assert_eq!(
+        envelope["data"]["diff"]["hunks"][0]["lines"]
+            .as_array()
+            .map(Vec::len),
+        Some(4)
+    );
+    drop(client);
+
+    // The markers say what the worker's bound did, each reachable on its own.
+    for (case, marker) in [
+        (
+            GitDiff {
+                binary: true,
+                hunks: Vec::new(),
+                ..fake_diff()
+            },
+            "diff binary\n",
+        ),
+        (
+            GitDiff {
+                truncated: true,
+                ..fake_diff()
+            },
+            "diff truncated\n",
+        ),
+        (
+            GitDiff {
+                hunks: Vec::new(),
+                ..fake_diff()
+            },
+            "diff none\n",
+        ),
+    ] {
+        let mut bounded = worktree_client(
+            &fixture.backend,
+            session,
+            project.clone(),
+            review_answer(&worktree, &status, &case),
+            Rc::new(RefCell::new(Vec::new())),
+        );
+        let outcome = run(
+            &mut bounded,
+            &[
+                "project",
+                "worktree",
+                "diff",
+                &session_text,
+                "--task",
+                &task_text,
+            ],
+        );
+        assert_eq!(outcome.code, exit::OK, "{}", outcome.stderr);
+        assert!(outcome.stdout.contains(marker), "{}", outcome.stdout);
+    }
+
+    // A task without a record is refused before the review request.
+    let missing_sent = Rc::new(RefCell::new(Vec::new()));
+    let mut missing = worktree_client(
+        &fixture.backend,
+        session,
+        fake_project(session, &[session], Vec::new()),
+        review_answer(&worktree, &status, &diff),
+        Rc::clone(&missing_sent),
+    );
+    let refused = run(
+        &mut missing,
+        &[
+            "project",
+            "worktree",
+            "diff",
+            &session_text,
+            "--task",
+            &task_text,
+        ],
+    );
+    assert_eq!(refused.code, exit::USAGE, "{}", refused.stderr);
+    assert!(
+        refused.stderr.contains("no project worktree is recorded"),
+        "{}",
+        refused.stderr
+    );
+    assert!(review_requests(&missing_sent).is_empty());
+    drop(missing);
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn project_worktree_integrate_sends_one_request_and_never_retries_a_conflict() {
+    let (fixture, directory) = persistent_fixture("worktree-integrate");
+    let session = fixture.session.id;
+    let child = AgentSessionId::new();
+    let task = TaskId::new();
+    let result_revision = "a".repeat(40);
+    let mut worktree = fake_worktree(session, child, "wt-1", "repo");
+    worktree.task_id = task;
+    let project = fake_project(session, &[session], vec![worktree.clone()]);
+    let mut integrated = worktree.clone();
+    integrated.status = ProjectWorktreeStatus::Integrated;
+    integrated.result_revision = Some(result_revision.clone());
+    integrated.integrated_revision = Some(result_revision.clone());
+    let session_text = session.to_string();
+    let task_text = task.to_string();
+
+    // Without the flag the request expects the revision the checkout and the
+    // review were created from.
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let mut client = worktree_client(
+        &fixture.backend,
+        session,
+        project.clone(),
+        ProjectAnswer::Updated(Box::new(integrated.clone())),
+        Rc::clone(&sent),
+    );
+    let outcome = run(
+        &mut client,
+        &[
+            "project",
+            "worktree",
+            "integrate",
+            &session_text,
+            "--task",
+            &task_text,
+        ],
+    );
+    assert_eq!(outcome.code, exit::OK, "{}", outcome.stderr);
+    assert_eq!(
+        outcome.stdout,
+        format!(
+            "integrated worktree wt-1 repo\n\
+             child-revision {result_revision}\n\
+             integrated-revision {result_revision}\n"
+        )
+    );
+    assert_eq!(
+        integrate_requests(&sent),
+        vec![(
+            worktree.project_id,
+            session,
+            task,
+            worktree.base_revision.clone(),
+        )]
+    );
+    drop(client);
+
+    // The flag replaces the record's base revision, and the payload reports the
+    // revision it was accepted against.
+    let expected = "d".repeat(40);
+    let flagged_sent = Rc::new(RefCell::new(Vec::new()));
+    let mut flagged = worktree_client(
+        &fixture.backend,
+        session,
+        project.clone(),
+        ProjectAnswer::Updated(Box::new(integrated.clone())),
+        Rc::clone(&flagged_sent),
+    );
+    let payload = run(
+        &mut flagged,
+        &[
+            "project",
+            "worktree",
+            "integrate",
+            &session_text,
+            "--task",
+            &task_text,
+            "--expected-parent-revision",
+            &expected,
+            "--json",
+        ],
+    );
+    assert_eq!(payload.code, exit::OK, "{}", payload.stderr);
+    let envelope = json_envelope(&payload);
+    assert_eq!(envelope["verb"], "project worktree integrate");
+    assert_eq!(envelope["data"]["expected_parent_revision"], expected);
+    assert_eq!(envelope["data"]["worktree"]["status"], "integrated");
+    assert_eq!(
+        integrate_requests(&flagged_sent),
+        vec![(worktree.project_id, session, task, expected.clone())]
+    );
+    drop(flagged);
+
+    // A conflict is reported as the failure it is, after exactly one request.
+    let conflict_sent = Rc::new(RefCell::new(Vec::new()));
+    let mut conflict = worktree_client(
+        &fixture.backend,
+        session,
+        project.clone(),
+        ProjectAnswer::Refused(loom_core::LoomError::new(
+            loom_core::ErrorCode::Conflict,
+            "the parent moved past the expected revision; conflicting paths: src/lib.rs",
+            false,
+        )),
+        Rc::clone(&conflict_sent),
+    );
+    let refused = run(
+        &mut conflict,
+        &[
+            "project",
+            "worktree",
+            "integrate",
+            &session_text,
+            "--task",
+            &task_text,
+        ],
+    );
+    assert_eq!(refused.code, exit::INTERNAL, "{}", refused.stderr);
+    assert!(refused.stderr.contains("conflict"), "{}", refused.stderr);
+    assert!(
+        refused.stderr.contains("conflicting paths: src/lib.rs"),
+        "{}",
+        refused.stderr
+    );
+    assert_eq!(
+        integrate_requests(&conflict_sent).len(),
+        1,
+        "a conflict is never retried"
+    );
+    drop(conflict);
+
+    // A task without a record is refused before the integration request.
+    let missing_sent = Rc::new(RefCell::new(Vec::new()));
+    let mut missing = worktree_client(
+        &fixture.backend,
+        session,
+        fake_project(session, &[session], Vec::new()),
+        ProjectAnswer::Updated(Box::new(integrated.clone())),
+        Rc::clone(&missing_sent),
+    );
+    let refused = run(
+        &mut missing,
+        &[
+            "project",
+            "worktree",
+            "integrate",
+            &session_text,
+            "--task",
+            &task_text,
+        ],
+    );
+    assert_eq!(refused.code, exit::USAGE, "{}", refused.stderr);
+    assert!(
+        refused.stderr.contains("no project worktree is recorded"),
+        "{}",
+        refused.stderr
+    );
+    assert!(integrate_requests(&missing_sent).is_empty());
+    drop(missing);
     close_persistent_fixture(fixture, directory);
 }

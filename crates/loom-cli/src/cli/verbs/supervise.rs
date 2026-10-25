@@ -1092,7 +1092,9 @@ async fn repository_result<C: Client>(
     }))
 }
 
-fn file_status_name(kind: GitFileStatusKind) -> &'static str {
+/// The status word of one changed file, which `result` and the worktree review
+/// report the same way.
+pub(super) fn file_status_name(kind: GitFileStatusKind) -> &'static str {
     match kind {
         GitFileStatusKind::Added => "added",
         GitFileStatusKind::Modified => "modified",

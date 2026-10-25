@@ -257,6 +257,15 @@ pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
                 Capability::CleanupProjectChildWorktree,
             ]);
         }
+        Verb::ProjectWorktrees { .. } | Verb::ProjectWorktreeGet { .. } => {
+            capabilities.push(Capability::ReadProject);
+        }
+        Verb::ProjectWorktreeDiff { .. } => {
+            capabilities.extend([Capability::ReadProject, Capability::ReadProjectChildReview]);
+        }
+        Verb::ProjectWorktreeIntegrate { .. } => {
+            capabilities.extend([Capability::ReadProject, Capability::IntegrateProjectChild]);
+        }
     }
     CapabilitySet::new(capabilities)
 }
@@ -404,6 +413,30 @@ pub(crate) async fn run<C: Client>(
             force,
             yes,
         } => operator::delete(client, invocation, *session, *force, *yes, true, out).await,
+        Verb::ProjectWorktrees { session } => {
+            operator::worktrees(client, invocation, *session, out).await
+        }
+        Verb::ProjectWorktreeGet { session, task } => {
+            operator::worktree_get(client, invocation, *session, *task, out).await
+        }
+        Verb::ProjectWorktreeDiff { session, task } => {
+            operator::worktree_diff(client, invocation, *session, *task, out).await
+        }
+        Verb::ProjectWorktreeIntegrate {
+            session,
+            task,
+            expected_parent_revision,
+        } => {
+            operator::worktree_integrate(
+                client,
+                invocation,
+                *session,
+                *task,
+                expected_parent_revision.as_deref(),
+                out,
+            )
+            .await
+        }
         Verb::ProjectWorktreeCleanup {
             session,
             task,
