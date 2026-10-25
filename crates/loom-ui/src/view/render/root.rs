@@ -1,4 +1,5 @@
 use super::*;
+use gpui_kit::component::link::Link;
 
 impl Render for LoomView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -415,6 +416,46 @@ impl Render for LoomView {
                                     .when_some(
                                         session_header_goal(self.active_session.goal.as_deref()),
                                         |element, goal| element.child(goal),
+                                    )
+                                    // The session's related issue or pull request,
+                                    // derived from its own GitHub calls. It stays
+                                    // inside the truncating title column, so it
+                                    // cannot push the header actions at phone width.
+                                    .when_some(
+                                        self.header_session_reference().cloned(),
+                                        |element, reference| {
+                                            let label = reference.label();
+                                            let chip_label = label.clone();
+                                            let kind = reference.kind.label();
+                                            let url = reference.url();
+                                            element.child(
+                                                div()
+                                                    .id("session-header-reference")
+                                                    .test_support()
+                                                    .truncate()
+                                                    .child(header_tooltip(
+                                                        "session-header-reference-tooltip",
+                                                        format!("Open {kind} {label}"),
+                                                        Link::new("session-header-reference-link")
+                                                            .text_xs()
+                                                            .text_color(rgb(0x8f98a6))
+                                                            .truncate()
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    if let Err(error) =
+                                                                        open_external_url(&url)
+                                                                    {
+                                                                        this.record_status(format!(
+                                                                            "Could not open {kind} {label} ({url}): {error}. The link text is shown here and can be copied."
+                                                                        ));
+                                                                    }
+                                                                    cx.notify();
+                                                                },
+                                                            ))
+                                                            .child(chip_label),
+                                                    )),
+                                            )
+                                        },
                                     )
                                     .when(!layout.phone, |element| {
                                         element.child(

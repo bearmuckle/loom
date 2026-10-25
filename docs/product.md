@@ -37,6 +37,15 @@ against it until the agent calls `claim_goal_reached` with evidence that the
 goal is reached, so setting a goal changes what the agent does instead of only
 labelling the session.
 
+The session header also shows one link to the issue or pull request the session
+works on. The reference is derived on the client from the session's own GitHub
+tool calls, from live events and from the durable transcript, so the backend
+carries no field for it and no request is made to look it up. The most recent
+write (a create or an update) outranks the most recent read, and the link is
+built from the repository and number, so it never carries anything else from a
+tool payload. Either kind can be switched off in the agents settings, which
+hides the link without discarding the derived reference.
+
 A **workspace** is a durable container for project roots and workspace-level
 settings. It is not a directory, repository, clone, filesystem root, or
 security boundary, and can exist before any project or repository has been

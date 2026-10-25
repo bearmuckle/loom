@@ -1084,6 +1084,29 @@ impl LoomView {
         cx.notify();
     }
 
+    /// Shows or hides the session header's related issue link.
+    ///
+    /// The reference is derived already, so this changes only what the header
+    /// renders; a disabled kind loses nothing but the chip.
+    pub(crate) fn set_show_issue_references(&mut self, show: bool, cx: &mut Context<Self>) {
+        let changed = self.show_issue_references != show;
+        self.show_issue_references = show;
+        if changed {
+            self.persist_ui_preferences();
+        }
+        cx.notify();
+    }
+
+    /// Shows or hides the session header's related pull request link.
+    pub(crate) fn set_show_pull_request_references(&mut self, show: bool, cx: &mut Context<Self>) {
+        let changed = self.show_pull_request_references != show;
+        self.show_pull_request_references = show;
+        if changed {
+            self.persist_ui_preferences();
+        }
+        cx.notify();
+    }
+
     /// Sets how much agent activity the transcript shows.
     ///
     /// The level decides the projection the client asks for, so a level that
@@ -1130,6 +1153,8 @@ impl LoomView {
             output_detail: self.output_detail,
             theme_choice: self.theme_choice,
             font_scale_percent: self.font_scale_percent,
+            show_issue_references: self.show_issue_references,
+            show_pull_request_references: self.show_pull_request_references,
         }
         .save();
     }

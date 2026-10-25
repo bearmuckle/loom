@@ -46,6 +46,7 @@ mod session_follow_tests;
 mod session_header_render_tests;
 mod session_load_tests;
 mod session_name_tests;
+mod session_reference_tests;
 mod session_run_action_tests;
 mod sidebar_navigation_tests;
 mod startup_tests;

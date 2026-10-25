@@ -18,6 +18,7 @@ mod identity_store;
 #[cfg(not(target_family = "wasm"))]
 mod local_backend;
 mod preferences;
+mod session_reference;
 mod state;
 mod syntax;
 mod theme;

@@ -1541,6 +1541,42 @@ impl LoomView {
                             phone,
                         ))
                         .child(settings_row(
+                            "Session issue links",
+                            "Link the related issue above the conversation in the session header",
+                            Switch::new("show-issue-references-toggle")
+                                .checked(self.show_issue_references)
+                                .accessibility_label("Session issue links")
+                                .on_change({
+                                    let view = cx.entity();
+                                    move |checked, _window, cx| {
+                                        let show = *checked;
+                                        view.update(cx, |view, cx| {
+                                            view.set_show_issue_references(show, cx);
+                                        });
+                                    }
+                                }),
+                            false,
+                            phone,
+                        ))
+                        .child(settings_row(
+                            "Session pull request links",
+                            "Link the related pull request above the conversation in the session header",
+                            Switch::new("show-pull-request-references-toggle")
+                                .checked(self.show_pull_request_references)
+                                .accessibility_label("Session pull request links")
+                                .on_change({
+                                    let view = cx.entity();
+                                    move |checked, _window, cx| {
+                                        let show = *checked;
+                                        view.update(cx, |view, cx| {
+                                            view.set_show_pull_request_references(show, cx);
+                                        });
+                                    }
+                                }),
+                            false,
+                            phone,
+                        ))
+                        .child(settings_row(
                             "Output detail",
                             self.output_detail.description(),
                             settings_choice_container(

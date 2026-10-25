@@ -295,15 +295,21 @@ pub(crate) fn empty_session_snapshot(workspace_id: WorkspaceId) -> AgentSessionS
     }
 }
 
+/// Wraps `child` in a header tooltip. `text` is owned because a chip names the
+/// object it opens, and a tooltip may carry that name.
 pub(crate) fn header_tooltip(
     id: &'static str,
-    text: &'static str,
+    text: impl Into<String>,
     child: impl IntoElement,
 ) -> impl IntoElement {
+    let text = text.into();
     div()
         .id(id)
         .test_support()
-        .tooltip(move |_, cx| cx.new(|_| LoomTooltip { text: text.into() }).into())
+        .tooltip(move |_, cx| {
+            let text = text.clone();
+            cx.new(|_| LoomTooltip { text }).into()
+        })
         .child(child)
 }
 

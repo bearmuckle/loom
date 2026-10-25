@@ -58,7 +58,7 @@ use loom_protocol::{
     ProjectRequest, ProjectResponse, ProviderRequest, ProviderResponse, RepositoryRequest,
     RepositoryResponse, RequestEnvelope, ResponseEnvelope, RunRequest, RunResponse, ServerEvent,
     ServerResponse, SessionDirectory, SessionRepository, SessionRequest, SessionResponse,
-    TaskRequest, TerminalRequest, UsageRequest, UsageResponse, WorkerNodeConfig,
+    TaskRequest, TerminalRequest, ToolResult, UsageRequest, UsageResponse, WorkerNodeConfig,
     WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, WorkspaceFeedEvent, WorkspaceRequest,
     WorkspaceResponse,
 };
@@ -71,6 +71,9 @@ use crate::{
     MAX_REVIEW_CHANGES, MAX_REVIEW_DIFF,
     connection::{BackendWorker, ClientConnection, ConnectionCleanupGuard},
     preferences::UiPreferences,
+    session_reference::{
+        ReferenceCandidate, SessionReference, preferred_reference, references_from_messages,
+    },
     state::{
         ASK_USER_TOOL, AgentQuestion, AssistantPart, AssistantTurn, EvidenceText, GitHubLoginKind,
         GitHubLoginState, InspectorTab, MAX_QUESTION_CHOICE_BYTES, MAX_QUESTION_CHOICES,
@@ -652,6 +655,31 @@ pub(crate) struct LoomView {
     /// a display preference, and it also decides the projection a read asks for,
     /// so a level never downloads content it would not render.
     pub(crate) output_detail: OutputDetail,
+    /// Whether the session header links to the session's related issue.
+    ///
+    /// The reference is derived from the session's own GitHub tool calls; the
+    /// preference only decides whether the header shows it, so switching it
+    /// off keeps the derived reference.
+    pub(crate) show_issue_references: bool,
+    /// Whether the session header links to the session's related pull request.
+    /// The same client-local display preference as [`Self::show_issue_references`].
+    pub(crate) show_pull_request_references: bool,
+    /// The most recent successful GitHub write (a create or an update) that
+    /// named one issue or pull request.
+    ///
+    /// A write outranks a read in the header: a session that read many issues
+    /// still shows the pull request it opened.
+    pub(crate) latest_write_reference: Option<SessionReference>,
+    /// The most recent successful GitHub read that named one issue or pull
+    /// request, shown only while no write has one.
+    pub(crate) latest_read_reference: Option<SessionReference>,
+    /// GitHub calls seen but not completed, keyed by call.
+    ///
+    /// A candidate is captured when the call is first seen and promoted from
+    /// here on completion, so a failed or abandoned call never reaches the
+    /// header. A create call keeps its candidate here because its number only
+    /// arrives with the result.
+    pending_reference_calls: BTreeMap<ToolCallId, ReferenceCandidate>,
     appearance_subscription: Option<Subscription>,
     /// App-wide keystroke interceptor for shortcuts that must work regardless
     /// of which element (if any) holds focus.
@@ -2134,6 +2162,11 @@ impl LoomView {
             font_scale_percent: DEFAULT_FONT_SCALE_PERCENT,
             show_reasoning: false,
             output_detail: OutputDetail::default(),
+            show_issue_references: true,
+            show_pull_request_references: true,
+            latest_write_reference: None,
+            latest_read_reference: None,
+            pending_reference_calls: BTreeMap::new(),
             appearance_subscription: None,
             shortcut_interceptor: None,
             after_sequence: None,

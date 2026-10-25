@@ -23,6 +23,10 @@ pub(crate) struct UiPreferences {
     pub(crate) output_detail: OutputDetail,
     pub(crate) theme_choice: ThemeChoice,
     pub(crate) font_scale_percent: u16,
+    /// Whether the session header links to the session's related issue.
+    pub(crate) show_issue_references: bool,
+    /// Whether the session header links to the session's related pull request.
+    pub(crate) show_pull_request_references: bool,
 }
 
 impl Default for UiPreferences {
@@ -32,6 +36,9 @@ impl Default for UiPreferences {
             output_detail: OutputDetail::default(),
             theme_choice: ThemeChoice::default(),
             font_scale_percent: DEFAULT_FONT_SCALE_PERCENT,
+            // Both kinds show by default; switching both off is "off".
+            show_issue_references: true,
+            show_pull_request_references: true,
         }
     }
 }
@@ -265,6 +272,9 @@ mod tests {
             UiPreferences::load_from(&path).unwrap(),
             UiPreferences::default()
         );
+        let defaults = UiPreferences::default();
+        assert!(defaults.show_issue_references);
+        assert!(defaults.show_pull_request_references);
     }
 
     #[test]
@@ -275,6 +285,8 @@ mod tests {
             output_detail: OutputDetail::High,
             theme_choice: ThemeChoice::Dark,
             font_scale_percent: 120,
+            show_issue_references: false,
+            show_pull_request_references: true,
         };
 
         UiPreferences::save_to(&path, preferences).unwrap();
@@ -282,6 +294,7 @@ mod tests {
         let serialized = fs::read_to_string(&path).unwrap();
         assert!(serialized.contains("\"output_detail\": \"high\""));
         assert!(serialized.contains("\"theme_choice\": \"dark\""));
+        assert!(serialized.contains("\"show_issue_references\": false"));
         assert_eq!(UiPreferences::load_from(&path).unwrap(), preferences);
         assert!(!path.with_extension("json.tmp").exists());
         remove_parent(&path);

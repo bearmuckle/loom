@@ -421,6 +421,7 @@ impl LoomView {
                 }));
             }
             AgentEvent::ToolCallRequested { call, .. } => {
+                self.capture_session_reference(call);
                 upsert_tool_part(
                     &mut self.timeline,
                     tool_part_from_call(call, ToolPartStatus::Queued),
@@ -435,6 +436,7 @@ impl LoomView {
             } => {
                 self.update_active_run_control(*run_id, *attempt_id, *control_revision);
                 self.pending_approval = Some(call.clone());
+                self.capture_session_reference(call);
                 upsert_tool_part(
                     &mut self.timeline,
                     tool_part_from_call(call, ToolPartStatus::AwaitingApproval),
@@ -447,6 +449,7 @@ impl LoomView {
                 // arrives: a denial is then already a policy decision while the
                 // run is still completing the call, and the failed result the
                 // backend sends for it cannot present the refusal as a failure.
+                self.capture_session_reference(call);
                 upsert_tool_part(&mut self.timeline, tool_part_from_policy(call, evaluation));
             }
             AgentEvent::ToolApprovalDecided {
@@ -481,6 +484,10 @@ impl LoomView {
                 );
             }
             AgentEvent::ToolCallStarted { call, .. } => {
+                // Re-stating the same call is harmless: the candidate insert is
+                // keyed by the call id, so a client that joined mid-run records
+                // the candidate it missed no earlier event for.
+                self.capture_session_reference(call);
                 upsert_tool_part(
                     &mut self.timeline,
                     tool_part_from_call(call, ToolPartStatus::Running),
@@ -507,6 +514,7 @@ impl LoomView {
                 );
             }
             AgentEvent::ToolCallCompleted { result, .. } => {
+                self.complete_session_reference(result);
                 let status = if result.success {
                     ToolPartStatus::Completed
                 } else {
@@ -607,6 +615,57 @@ impl LoomView {
         }
     }
 
+    /// Captures the reference a GitHub call names, when it is first seen.
+    ///
+    /// Nothing is promoted here: only a completed call counts, so a failed or
+    /// abandoned one never reaches the header. A create call keeps its
+    /// candidate pending because its number only arrives with the result.
+    fn capture_session_reference(&mut self, call: &ToolCall) {
+        if let Some(candidate) = ReferenceCandidate::from_call(call) {
+            self.pending_reference_calls.insert(call.id, candidate);
+        }
+    }
+
+    /// Promotes a completed GitHub call, and drops it either way.
+    ///
+    /// A failed call leaves the slots alone. A create whose result is truncated
+    /// or unparseable resolves to nothing, which is intended: the header shows
+    /// no reference rather than a wrong one.
+    fn complete_session_reference(&mut self, result: &ToolResult) {
+        let Some(candidate) = self.pending_reference_calls.remove(&result.tool_call_id) else {
+            return;
+        };
+        if !result.success {
+            return;
+        }
+        let Some(reference) = candidate.resolved(&result.output) else {
+            return;
+        };
+        if candidate.is_write() {
+            self.latest_write_reference = Some(reference);
+        } else {
+            self.latest_read_reference = Some(reference);
+        }
+    }
+
+    /// The reference the session header links to, if any.
+    ///
+    /// The write slot outranks the read slot, and the kind filter is applied
+    /// here rather than at derivation so flipping a preference takes effect
+    /// without re-deriving. A disabled kind renders no chip, not a placeholder.
+    pub(crate) fn header_session_reference(&self) -> Option<&SessionReference> {
+        preferred_reference(
+            self.latest_write_reference.as_ref(),
+            self.latest_read_reference.as_ref(),
+        )
+        .filter(|reference| {
+            reference.kind.enabled(
+                self.show_issue_references,
+                self.show_pull_request_references,
+            )
+        })
+    }
+
     pub(crate) fn update_active_run_control(
         &mut self,
         run_id: RunId,
@@ -662,6 +721,17 @@ impl LoomView {
         let activity_records = projection.activities;
         for activity in &activity_records {
             self.activity_records.insert(activity.id, activity.clone());
+        }
+        // The session's reference is derived before the messages are consumed.
+        // This projection is applied after the event batch because it is the
+        // durable, more complete page, so it wins for the same session. A page
+        // of older transcript messages is loaded later and splices rows without
+        // re-deriving, so it cannot change the reference. An empty projection
+        // keeps what the events derived, because it carries no page to win with.
+        let derived_references = references_from_messages(&projection.messages);
+        if !projection.messages.is_empty() {
+            self.latest_write_reference = derived_references.write;
+            self.latest_read_reference = derived_references.read;
         }
         let message_timeline_ordinals = projection.message_timeline_ordinals;
         self.transcript_messages.clear();

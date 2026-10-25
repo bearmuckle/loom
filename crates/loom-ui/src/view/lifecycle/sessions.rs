@@ -183,6 +183,11 @@ impl LoomView {
         self.transcript_loading = false;
         self.transcript_prepend_count = 0;
         self.activity_records.clear();
+        // The reference belongs to the session, so another session's GitHub
+        // calls must not supply it. It is re-derived from the run projection.
+        self.latest_write_reference = None;
+        self.latest_read_reference = None;
+        self.pending_reference_calls.clear();
         self.expanded_tools.clear();
         self.expanded_tool_usage.clear();
         self.expanded_reasoning.clear();

@@ -1,6 +1,6 @@
 use super::*;
 use gpui_kit::test::TestWindowExt;
-use gpui_kit::{TestAppContext, px, size};
+use gpui_kit::{ScrollDelta, TestAppContext, point, px, size};
 
 #[test]
 fn model_choice_labels_preserve_overlapping_provider_models_and_fallbacks() {
@@ -327,6 +327,13 @@ fn output_detail_choices_round_trip(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
+        // The Agents card carries the display preferences above the output
+        // detail row, so the row is below the fold at this window size.
+        window.scroll(
+            "settings-content",
+            ScrollDelta::Pixels(point(px(0.), px(-160.))),
+            cx,
+        );
         window
             .within("settings-dialog")
             .click(("output-detail", 0usize), cx);
