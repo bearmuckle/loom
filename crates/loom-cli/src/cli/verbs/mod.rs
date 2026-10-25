@@ -6,6 +6,7 @@
 //! is set, and never writes a line before the request it prints succeeded.
 
 mod events;
+mod operator;
 mod query;
 mod run;
 mod supervise;
@@ -166,15 +167,17 @@ impl Outcome {
 /// The capabilities a verb negotiates, which are exactly the ones its requests
 /// need, plus `JsonProtocol` because every response is JSON.
 ///
-/// A read-only verb therefore never asks for a mutating capability: `ls` asks
-/// for the session-read capability its two listing requests need, `get` for the
-/// same read, and `events`/`peek` for event subscription. Only `run` requests
-/// what its mutations require, so a worker that does not offer session creation
-/// can still be inspected and a scoped token sees the smallest negotiable set.
+/// A read-only verb therefore never asks for a mutating capability: `node` and
+/// `retention get` ask for the worker-status read, `ls` and `get` for the
+/// session read, and `events`/`peek` for event subscription. Only `run`,
+/// `retention set`, and `delete` request what their mutations require, so a
+/// worker that does not offer session creation can still be inspected and a
+/// scoped token sees the smallest negotiable set.
 pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
     let mut capabilities = vec![Capability::JsonProtocol];
     match verb {
         Verb::Doctor => capabilities.push(Capability::ReadWorkerNodeStatus),
+        Verb::Node => capabilities.push(Capability::ReadWorkerNodeStatus),
         Verb::WhoAmI => {}
         Verb::Ls { .. } => capabilities.push(Capability::ReadAgentSession),
         Verb::Get { .. } => capabilities.push(Capability::ReadAgentSession),
@@ -220,6 +223,16 @@ pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
                 Capability::ReadVcsDiff,
                 Capability::ReadSessionTaskEvidence,
             ]);
+        }
+        Verb::RetentionGet => capabilities.push(Capability::ReadWorkerNodeStatus),
+        Verb::RetentionSet(_) => {
+            capabilities.extend([
+                Capability::ReadWorkerNodeStatus,
+                Capability::ConfigureArchiveRetention,
+            ]);
+        }
+        Verb::Delete { .. } => {
+            capabilities.extend([Capability::ReadProject, Capability::DeleteAgentSession]);
         }
     }
     CapabilitySet::new(capabilities)
@@ -309,6 +322,7 @@ pub(crate) async fn run<C: Client>(
 ) -> Result<Outcome, Failure> {
     match &invocation.verb {
         Verb::Doctor => query::doctor(client, invocation, out).await,
+        Verb::Node => operator::node(client, invocation, out).await,
         Verb::WhoAmI => query::whoami(client, invocation, out).await,
         Verb::Ls {
             workspace,
@@ -347,7 +361,28 @@ pub(crate) async fn run<C: Client>(
         Verb::Result { session, task } => {
             supervise::result(client, invocation, *session, *task, out).await
         }
+        Verb::RetentionGet => operator::retention_get(client, invocation, out).await,
+        Verb::RetentionSet(args) => operator::retention_set(client, invocation, args, out).await,
+        Verb::Delete {
+            session,
+            force,
+            yes,
+        } => operator::delete(client, invocation, *session, *force, *yes, out).await,
     }
+}
+
+/// The negotiated capabilities as their snake_case protocol names, in the
+/// order the protocol's own set orders them.
+pub(crate) fn capability_names(capabilities: &CapabilitySet) -> Vec<String> {
+    capabilities
+        .iter()
+        .map(|capability| {
+            serde_json::to_value(capability)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
 /// Writes one preformatted line. A reader that closed the pipe is a clean stop,

@@ -16,6 +16,11 @@ use std::{sync::Arc, time::Duration};
 use loom_core::{AgentSessionId, ErrorCode, LoomError, Result};
 use loom_protocol::{ArchiveRetentionPolicy, DEFAULT_SUB_AGENT_RETENTION_MS};
 
+/// The duration and force-discard grammars live in `loom-core` so the server
+/// flags and the CLI share one parser; this module re-exports them for the
+/// server's public surface.
+pub use loom_core::{parse_force_discard, parse_retention_window};
+
 use crate::InProcessBackend;
 
 /// Environment variable holding the archived sub-agent retention window.
@@ -56,56 +61,6 @@ impl ArchiveSweepReport {
     /// Whether the sweep found nothing to delete and nothing to report.
     pub fn is_empty(&self) -> bool {
         self.deleted_sessions.is_empty() && self.skipped.is_empty()
-    }
-}
-
-/// Parses a retention window.
-///
-/// The accepted syntax is `<n><unit>` with unit `ms`, `s`, `m`, `h`, `d`, or
-/// `w`; a bare integer means seconds; `off` and `never` mean retention stays
-/// disabled. `source` names the flag or environment variable for the error, so
-/// an operator is told which input to fix.
-pub fn parse_retention_window(value: &str, source: &str) -> Result<Option<u64>> {
-    let value = value.trim();
-    if value.is_empty() || value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("never")
-    {
-        return Ok(None);
-    }
-    let normalized = value.to_ascii_lowercase();
-    let (number, multiplier_ms) = if let Some(number) = normalized.strip_suffix("ms") {
-        (number, 1_u64)
-    } else if let Some(number) = normalized.strip_suffix('s') {
-        (number, 1_000)
-    } else if let Some(number) = normalized.strip_suffix('m') {
-        (number, 60_000)
-    } else if let Some(number) = normalized.strip_suffix('h') {
-        (number, 3_600_000)
-    } else if let Some(number) = normalized.strip_suffix('d') {
-        (number, 86_400_000)
-    } else if let Some(number) = normalized.strip_suffix('w') {
-        (number, 604_800_000)
-    } else {
-        (normalized.as_str(), 1_000)
-    };
-    let number = number.parse::<u64>().map_err(|_| {
-        LoomError::invalid_request(format!(
-            "{source} must be a duration such as 30s, 5m, 12h, 14d, or 2w, a plain number of \
-             seconds, or off; got '{value}'"
-        ))
-    })?;
-    Ok(Some(number.saturating_mul(multiplier_ms)))
-}
-
-/// Parses the force-discard switch: `1`/`true`/`yes` and `0`/`false`/`no`,
-/// case-insensitively. `source` names the flag or environment variable for the
-/// error.
-pub fn parse_force_discard(value: &str, source: &str) -> Result<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" => Ok(true),
-        "0" | "false" | "no" => Ok(false),
-        _ => Err(LoomError::invalid_request(format!(
-            "{source} must be 1/true/yes or 0/false/no; got '{value}'"
-        ))),
     }
 }
 

@@ -3,6 +3,7 @@ mod collaboration;
 mod command_env;
 mod context;
 mod credential;
+mod duration;
 mod error;
 mod filesystem;
 mod id;
@@ -33,6 +34,7 @@ pub use context::{
     ContextSummary,
 };
 pub use credential::{ProviderCredentialMetadata, RunCredentialPin, SessionCredentialSelection};
+pub use duration::{parse_force_discard, parse_retention_window};
 pub use error::{ErrorCode, LoomError, Result};
 pub use filesystem::{
     Checkpoint, CheckpointFile, ClonedRepository, ContextFileKind, ContextFileReference,
