@@ -115,6 +115,33 @@ M4 implementation notes:
 **Exit condition:** a second native client can securely reconnect to a running
 agent, observe its current step, approve an action, and retrieve its result.
 
+### M4.5 - Headless operator client
+
+A scriptable, headless client of the existing versioned protocol for operators
+and automation, with no embedded backend and no second orchestration model. The
+working binary name is `loom-ctl`, the decision recorded from #330. M4.5 is
+delivered as three reviewable slices:
+
+- **M4.5.1:** read-only verbs (`doctor`, `whoami`, `ls`, `get`, `events`,
+  `peek`) plus `run` (start only, never waits), with the byte-stable
+  `loom-text/1` output projection, `jsonl` resume fields, the JSON envelope,
+  the exit-code contract, and the client-side cursor file. Issue 331 is the
+  first deliverable and the only one implemented by this milestone's first
+  change.
+- **M4.5.2:** control verbs (`send`, `answer`, `approve`, `deny`, `stop`,
+  `wait`, `status`, `liveness`, `result`).
+- **M4.5.3:** operator verbs (node status, archive retention, archived
+  deletion).
+
+Out of scope for M4.5: server push events, a Unix-domain-socket transport, and
+scoped-token issuance, which remain in #330 and #51; interactive terminals, MCP,
+ACP, and delegation.
+
+**Exit condition:** an operator can run the whole read path and start a run from
+a script against a standalone worker, resume an event stream from a persisted
+cursor across process restarts, and gets the documented exit code instead of
+parsing prose on failure.
+
 ### M5 - Agent workspace and orchestration surface
 
 M5 is the first focused native client for the product's primary object: a
