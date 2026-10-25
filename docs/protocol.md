@@ -458,7 +458,7 @@ without it, such a project is refused, and the caller decides whether to force
 it.
 
 `RestoreAgentSession { session_id }` returns
-`agent_session_restored { snapshot }` and journals
+`agent_session_restored(snapshot)` and journals
 `AgentSessionRestored { session_id }`, mirrored as the
 `ServerEvent::AgentSessionRestored { session_id }` event. It is a retryable
 mutation that requires the `control_agent_session` capability and at least the
