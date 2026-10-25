@@ -4,11 +4,14 @@
 #[allow(unused_imports)]
 use super::support::*;
 use super::*;
+use loom_agent::{AgentRuntime, AgentTask};
 use loom_core::{
     Author, CollaborationEntry, CollaborationEntryKind, ParticipantId, ParticipantIdentity,
     Recipient, RunControlAction, RunRevision, SessionRole,
 };
+use loom_model::ModelId;
 use loom_protocol::{AccessRequest, CollaborationRequest, CollaborationResponse, RunActionOutcome};
+use loom_tools::ToolExecutor;
 
 fn person(name: &str) -> ParticipantIdentity {
     ParticipantIdentity {
@@ -152,6 +155,73 @@ fn promote(
         }),
     )
     .unwrap();
+}
+
+#[test]
+fn an_answer_clears_a_waiting_question_and_the_run_continues() {
+    let backend = InProcessBackend::new();
+    let operator = backend.connect();
+    negotiate(&operator);
+    let session_id = create_session(&operator);
+    let root = std::env::temp_dir().join(format!("loom-answer-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let runtime = AgentRuntime::new(
+        session_id,
+        AgentTask::new("ask a question", ModelId::new("deterministic/demo")).unwrap(),
+        Box::new(loom_providers::DeterministicProvider::demo()),
+        ToolExecutor::new(&root).unwrap(),
+    );
+    let handle = backend.register_runtime(runtime);
+    let run_id = handle.run_id;
+    backend.runs().unwrap().insert(run_id, Arc::clone(&handle));
+    {
+        let mut runtime = handle.try_runtime().unwrap();
+        runtime
+            .request_input("Which validation should I run?")
+            .unwrap();
+        handle.refresh(&runtime);
+    }
+    assert_eq!(
+        handle.state().run.state,
+        loom_model::AgentRunState::NeedsInput
+    );
+    assert!(handle.state().pending_input.is_some());
+
+    let expected = revision(&operator, run_id);
+    let CollaborationResponse::RunAction(outcome) = collaborate(
+        &operator,
+        CollaborationRequest::AnswerAgentQuestion {
+            run_id,
+            expected,
+            text: "the standard one".to_owned(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected a run action");
+    };
+    let RunActionOutcome::Accepted { entry, run, .. } = *outcome else {
+        panic!("expected an accepted answer");
+    };
+    assert_eq!(entry.author, Author::Operator);
+    assert!(matches!(
+        entry.kind,
+        CollaborationEntryKind::AgentAnswer {
+            interaction_id: Some(_),
+            ref text,
+        } if text == "the standard one"
+    ));
+    assert_ne!(run.state, loom_model::AgentRunState::NeedsInput);
+    let state = handle.state();
+    assert!(state.pending_input.is_none(), "the question was cleared");
+    assert!(
+        state.interactions.iter().any(|interaction| {
+            interaction.status == loom_model::AgentInteractionStatus::Answered
+        }),
+        "the question interaction is answered"
+    );
+
+    backend.shutdown().unwrap();
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

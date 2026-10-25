@@ -33,11 +33,22 @@ The examples below use the installed binary name. In a checkout, replace
 | `get <session-id> [--metadata]` | One session snapshot, or that snapshot with its active run metadata. |
 | `events --session <id> [--after <seq>] [--cursor-file <path>] [--follow] [--format text\|jsonl] [--max-bytes <n>]` | Session events, followed until the run completes or the caller interrupts. |
 | `peek --session <id> [--lines <n>] [--format text\|jsonl] [--max-bytes <n>]` | The tail of the session's current output; 200 lines by default. |
-| `run --workspace <id> (--task <text> \| --task-file <path>) [--name <name>] [--model <id>] [--repo <source> [--revision <rev>] [--path <path>]] [--as-directory <path>] [--approval-policy default\|auto] [--request-id <uuid>]` | Reuse or create the session named `--name`, attach the inputs, and start one run. |
+| `run --workspace <id> (--task <text> \| --task-file <path>) [--name <name>] [--model <id>] [--repo <source> [--revision <rev>] [--path <path>]] [--as-directory <path>] [--approval-policy default\|auto] [--request-id <uuid>] [--new]` | Reuse or create the session named `--name`, attach the inputs, and start one run. `--new` always creates a session. |
+| `send --run <id> --text <text>` | Follow-up direction to the active run. |
+| `answer --run <id> --text <text>` | Answer the question the run is waiting on. |
+| `approve --run <id> --tool-call <id>` | Approve the tool call that blocked the run. |
+| `deny --run <id> --tool-call <id> [--reason <text>]` | Deny the blocked tool call. |
+| `stop --run <id> [--session <id> --archive] [--retry-on-conflict]` | Interrupt the run, optionally archiving its session afterwards. |
+| `wait --session <id> [--until blocked\|terminal] [--timeout <seconds>]` | Poll until the run blocks or reaches a terminal state; 60 seconds by default. |
+| `status --session <id> [--format text\|verb]` | The session and its latest run; `--format verb` prints one declaration line. |
+| `liveness --session <id>` | `alive`, `dead`, `gone`, or `unknown`. |
+| `result --session <id> [--task <id>]` | Branch, head, diffstat, changed paths, and task evidence. |
 
 `ls`, `get`, `events`, and `peek` are read-only, issue no mutation, and work
-with a read-only-scoped token. `run` is the only verb in this slice that changes
-worker state, and no verb waits for a run to finish.
+with a read-only-scoped token. `run` starts a run; `send`, `answer`,
+`approve`, `deny`, and `stop` control one; `wait`, `status`, `liveness`, and
+`result` read one. No verb waits for a run except `wait`, which is always
+bounded by `--timeout`.
 
 Every verb negotiates only the capabilities its own requests need. `doctor`
 reports the intersection the worker granted, so its capability list is the
@@ -122,6 +133,63 @@ command returns the same run instead of starting a second one. A worker accepts
 a run only in an idle session, so reusing a session that already ran reports
 `invalid_state` (exit `5`) and creates nothing.
 
+### `run --new`
+
+`--new` creates a session unconditionally. It never lists the workspace and
+never matches a session by name, so a retrigger after a completed run does not
+reach `invalid_state`. A session name is a label, not an identity: `--new` may
+produce a second session with an existing name, and the printed session id and
+the `created` flag are the identity. Pass a unique `--name` when the name is
+meant to be a handle.
+
+A `--new` command with `--request-id <base>` derives every mutation from that
+base so the whole command is replayable: `<base>` starts the run and the
+session creation and the input attachments use deterministic ids derived from
+it. Repeating the command returns the same session and the same run, with
+exactly one of each. The `--json` envelope reports both ids under
+`data.request_ids` (`session` and `run`).
+
+## Supervising a run
+
+The control verbs act on a run id, and the tool call id they need comes from
+the `pending_approval` event or from `wait`/`status`. They read
+`GetRunRevision` first and send that revision with the request.
+
+- `send`, `answer`, `approve`, and `deny` re-read once and retry when the
+  worker answers `Conflict`, because their intent is idempotent. A conflict
+  that survives the retry is reported with the protocol's `conflict` code
+  (exit `1`).
+- `stop` refuses a conflict by default, so a stale revision cannot interrupt a
+  run whose state the caller has not seen. `--retry-on-conflict` allows the
+  same single retry. A run that already finished is `invalid_state` (exit `5`)
+  and nothing is archived.
+- `stop --archive` archives the session only after the interrupt succeeded,
+  and prints `archived <session-id>` after `stopped <run-id> <state>`.
+
+`wait --until blocked` returns exit `3` as soon as the run is
+`awaiting_approval` or `needs_input`, with the attempt id and, for an approval,
+the tool call id in the `--json` envelope. It does not wait for a person to
+decide. The timeout covers only a run that is still working, and a run parked
+on a question or approval is likewise reported at once by `--until terminal`,
+because it cannot reach a terminal state without a decision. `--until terminal`
+exits `0` for `completed` and non-zero for `failed` and `cancelled`; the
+envelope's `state` distinguishes them.
+
+`status --format verb` prints the declaration grammar the rest of the ecosystem
+uses: `working: …`, `blocked: …`, `paused: …`, `done: …`, or `failed: …`, each
+followed by the run state and the run id. The word is derived by this client
+from the run state; no worker writes it. A session with no run is
+`done: idle -`.
+
+`liveness` never guesses. A session that is archived or in a terminal session
+state is `dead` (exit `0`), an id the worker does not know is `gone` (exit
+`5`), and a transport failure is `unknown` (exit `7`), never `gone`.
+
+`result` reports each attached repository's branch, head, diffstat (files,
+added, removed), and changed paths, plus the evidence links of `--task` when it
+is given. A session with no repository and no evidence prints
+`nothing to report` and sets `empty` in the `--json` envelope.
+
 ## Exit codes
 
 | Exit code | Meaning |
@@ -158,4 +226,14 @@ loom-cli peek --session <session-id> --lines 40
 loom-cli run --workspace <workspace-id> --name release-check \
   --repo https://github.com/acme/widgets.git --task-file task.md \
   --request-id 0199f0f4-0000-7000-8000-000000000000
+
+# Retrigger CI without colliding with the completed session of the same name.
+loom-cli run --workspace <workspace-id> --task-file task.md --new \
+  --request-id 0199f0f4-0000-7000-8000-000000000001
+
+# Supervise a run: wait for the approval, decide it, wait for the end.
+loom-cli wait --session <session-id> --until blocked --timeout 30
+loom-cli approve --run <run-id> --tool-call <tool-call-id>
+loom-cli wait --session <session-id> --until terminal --timeout 600
+loom-cli result --session <session-id>
 ```

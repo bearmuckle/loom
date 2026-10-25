@@ -742,6 +742,19 @@ should keep the user's draft, adopt `current`, show the new run state, and let
 the user decide again. Legacy `RunRequest` variants pass through the same gate
 without a revision check, so they are ordered and attributed too.
 
+A headless supervisor re-reads `GetRunRevision` and retries once after a
+`Conflict` for `DirectAgent`, `AnswerAgentQuestion`, and the Approve/Reject
+control actions, because those intents are idempotent. It does not retry
+`Interrupt` by default: a stale revision must not stop a run whose state the
+caller has not seen, so `loom-cli stop` reports the `conflict` code and changes
+nothing unless the caller opts in. `loom-cli wait` and `loom-cli status` derive
+their report from `GetAgentSessionSnapshotMetadata`; a run parked on an
+approval or a question is reported as blocked with exit `3` instead of waiting
+for a person. `loom-cli liveness` reads the same metadata and treats an
+archived or terminal session as `dead`, an unknown id as `gone`, and a
+transport failure as `unknown`, so it never mistakes an unreachable worker for
+a missing session.
+
 ### Events
 
 - `ServerEvent::Collaboration { entry }`: a `CollaborationEntry` with
@@ -800,6 +813,17 @@ for unsolicited server events.
   file is client-local; the backend stores no per-client cursor.
 - **Read-only verbs.** `ls`, `get`, `events`, and `peek` issue no mutation, so a
   read-only-scoped token can run them.
+- **Control verbs.** `send`, `answer`, `approve`, `deny`, and `stop` send
+  `GetRunRevision` and then one revision-guarded `Collaboration` request.
+  `wait` polls `GetAgentSessionSnapshotMetadata` under a bound and reads the
+  revision once it has a state to report; `status` and `liveness` read the
+  metadata; `result` reads the session repositories, VCS status and diff, and
+  the named task's evidence.
+- **One run start id.** `run --new` with `--request-id <base>` derives the
+  session creation and input attachment ids from `<base>` and uses `<base>`
+  itself for the run start, because the idempotency cache is keyed by
+  `RequestId` alone. One id for both mutations would replay the first
+  response.
 - **Anchoring.** The durable journal and `RequestId` idempotency remain the only
   authorities for resume and retries. `loom-cli run` starts a run and returns its
   ids without waiting, so waiting for completion stays a client concern.

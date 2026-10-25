@@ -9,7 +9,7 @@
 
 use std::{path::PathBuf, str::FromStr};
 
-use loom_core::{AgentSessionId, RequestId, WorkspaceId};
+use loom_core::{AgentSessionId, RequestId, RunId, TaskId, ToolCallId, WorkspaceId};
 use loom_model::ModelId;
 
 /// The budget `--max-bytes` defaults to.
@@ -26,6 +26,8 @@ const NAME_WORDS: usize = 6;
 const NAME_MAX_CHARS: usize = 48;
 /// The name `run` uses when the task has no words at all.
 const NAME_FALLBACK: &str = "loom-cli run";
+/// How long `wait` polls before it reports `deadline_exceeded`.
+pub(crate) const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 60;
 
 pub(crate) const HELP: &str = r#"Usage: loom-cli <verb> [flags]
 
@@ -45,11 +47,30 @@ Verbs:
   run --workspace <id> (--task <text> | --task-file <path>) [--name <name>]
       [--model <id>] [--repo <source> [--revision <rev>] [--path <path>]]
       [--as-directory <path> [--path <path>]]
-      [--approval-policy default|auto] [--request-id <uuid>]
+      [--approval-policy default|auto] [--request-id <uuid>] [--new]
                                     reuse the workspace's session named
                                     --name, or create it, attach the inputs
                                     to a session this run created, and start
                                     one agent run without waiting for it
+  send --run <id> --text <text>     direct the active run and print its state
+  answer --run <id> --text <text>   answer the question the run waits on
+  approve --run <id> --tool-call <id>
+                                    approve the blocked tool call
+  deny --run <id> --tool-call <id> [--reason <text>]
+                                    deny the blocked tool call
+  stop --run <id> [--session <id> --archive] [--retry-on-conflict]
+                                    interrupt a run, and optionally archive
+                                    its session afterwards
+  wait --session <id> [--until blocked|terminal] [--timeout <seconds>]
+                                    poll until the run blocks or reaches a
+                                    terminal state; always time-bounded
+  status --session <id> [--format text|verb]
+                                    report the session and its latest run;
+                                    --format verb prints one declaration line
+  liveness --session <id>           report alive, dead, gone, or unknown
+  result --session <id> [--task <id>]
+                                    report branch, head, diffstat, changed
+                                    paths, and task evidence
 
 `run` never prints more than `session <id> <name>` and `run <id> <state>`: it
 returns as soon as the worker accepts the run. --repo and --as-directory are
@@ -63,6 +84,16 @@ mutations of the verb use fresh ids. On a session this invocation creates,
 --approval-policy (default when absent) is pinned before the run starts; on a
 reused session it is only changed when the flag is given, so a plain run does
 not overwrite a policy a person set.
+
+`send`, `answer`, `approve`, and `deny` read the run revision, act against
+it, and retry once after a conflict, because their intent is idempotent.
+`stop` refuses a conflict unless --retry-on-conflict is given, so a stale
+revision cannot interrupt a run whose state the caller has not seen.
+
+`run --new` always creates a session and never lists or matches one by name.
+A session name is a label, not an identity: a repeated --new can produce a
+second session with an existing name, so pass a unique --name when the name is
+meant to be a handle.
 
 `events` never reprints an event at or below its cursor. A snapshot that cannot
 carry every event between the cursor and its window (the worker bounds it to
@@ -147,6 +178,23 @@ pub(crate) struct Attach {
     pub revision: Option<String>,
 }
 
+/// What `wait` waits for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WaitUntil {
+    /// A pending approval or question, which is exit `3` at once.
+    Blocked,
+    /// A completed, failed, or cancelled run.
+    Terminal,
+}
+
+/// How `status` renders its answer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StatusFormat {
+    Text,
+    /// One declaration line: `working: …`, `blocked: …`, and so on.
+    Verb,
+}
+
 /// The flags of `run`.
 #[derive(Clone, Debug)]
 pub(crate) struct RunArgs {
@@ -166,6 +214,9 @@ pub(crate) struct RunArgs {
     pub approval: Option<ApprovalPreset>,
     /// The run start's idempotency key, or `None` when the caller left it open.
     pub request_id: Option<RequestId>,
+    /// `--new`: create a session unconditionally instead of reusing one by
+    /// name.
+    pub new: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -185,6 +236,44 @@ pub(crate) enum Verb {
     /// Boxed because the box keeps every variant small: a `Verb` is carried by
     /// one `Invocation` for the life of a command line.
     Run(Box<RunArgs>),
+    Send {
+        run: RunId,
+        text: String,
+    },
+    Answer {
+        run: RunId,
+        text: String,
+    },
+    Approve {
+        run: RunId,
+        tool_call: ToolCallId,
+    },
+    Deny {
+        run: RunId,
+        tool_call: ToolCallId,
+        reason: Option<String>,
+    },
+    Stop {
+        run: RunId,
+        archive: Option<AgentSessionId>,
+        retry_on_conflict: bool,
+    },
+    Wait {
+        session: AgentSessionId,
+        until: WaitUntil,
+        timeout_secs: u64,
+    },
+    Status {
+        session: AgentSessionId,
+        format: StatusFormat,
+    },
+    Liveness {
+        session: AgentSessionId,
+    },
+    Result {
+        session: AgentSessionId,
+        task: Option<TaskId>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -208,6 +297,15 @@ pub(crate) fn verb_name(verb: &Verb) -> &'static str {
         Verb::Events(_) => "events",
         Verb::Peek(_) => "peek",
         Verb::Run(_) => "run",
+        Verb::Send { .. } => "send",
+        Verb::Answer { .. } => "answer",
+        Verb::Approve { .. } => "approve",
+        Verb::Deny { .. } => "deny",
+        Verb::Stop { .. } => "stop",
+        Verb::Wait { .. } => "wait",
+        Verb::Status { .. } => "status",
+        Verb::Liveness { .. } => "liveness",
+        Verb::Result { .. } => "result",
     }
 }
 
@@ -231,6 +329,15 @@ pub(crate) fn named_verb(arguments: &[String]) -> &'static str {
             "events" => "events",
             "peek" => "peek",
             "run" => "run",
+            "send" => "send",
+            "answer" => "answer",
+            "approve" => "approve",
+            "deny" => "deny",
+            "stop" => "stop",
+            "wait" => "wait",
+            "status" => "status",
+            "liveness" => "liveness",
+            "result" => "result",
             _ => "",
         })
         .unwrap_or("")
@@ -246,6 +353,8 @@ fn arity(name: &str) -> Option<bool> {
         "--archived" | "--metadata" | "--follow" => false,
         "--task" | "--task-file" | "--name" | "--model" | "--repo" | "--revision" | "--path"
         | "--as-directory" | "--approval-policy" | "--request-id" => true,
+        "--run" | "--text" | "--tool-call" | "--reason" | "--until" | "--timeout" => true,
+        "--new" | "--archive" | "--retry-on-conflict" => false,
         _ => return None,
     })
 }
@@ -408,6 +517,117 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
             no_positionals(&flags.verb, rest)?;
             Verb::Run(Box::new(parse_run(&mut flags)?))
         }
+        "send" => {
+            no_positionals(&flags.verb, rest)?;
+            Verb::Send {
+                run: parse_id("run id", &flags.required("--run")?)?,
+                text: flags.required("--text")?,
+            }
+        }
+        "answer" => {
+            no_positionals(&flags.verb, rest)?;
+            Verb::Answer {
+                run: parse_id("run id", &flags.required("--run")?)?,
+                text: flags.required("--text")?,
+            }
+        }
+        "approve" => {
+            no_positionals(&flags.verb, rest)?;
+            Verb::Approve {
+                run: parse_id("run id", &flags.required("--run")?)?,
+                tool_call: parse_id("tool call id", &flags.required("--tool-call")?)?,
+            }
+        }
+        "deny" => {
+            no_positionals(&flags.verb, rest)?;
+            Verb::Deny {
+                run: parse_id("run id", &flags.required("--run")?)?,
+                tool_call: parse_id("tool call id", &flags.required("--tool-call")?)?,
+                reason: flags.value("--reason"),
+            }
+        }
+        "stop" => {
+            no_positionals(&flags.verb, rest)?;
+            let archive = flags.value("--session");
+            let archive = match (flags.flag("--archive"), archive) {
+                (true, Some(session)) => Some(parse_id("session id", &session)?),
+                (true, None) => {
+                    return Err("stop --archive requires --session <session-id>".to_owned());
+                }
+                (false, Some(_)) => {
+                    return Err("--session only applies to stop with --archive".to_owned());
+                }
+                (false, None) => None,
+            };
+            Verb::Stop {
+                run: parse_id("run id", &flags.required("--run")?)?,
+                archive,
+                retry_on_conflict: flags.flag("--retry-on-conflict"),
+            }
+        }
+        "wait" => {
+            no_positionals(&flags.verb, rest)?;
+            let session = flags.required("--session")?;
+            let until = match flags.value("--until").as_deref() {
+                None | Some("blocked") => WaitUntil::Blocked,
+                Some("terminal") => WaitUntil::Terminal,
+                Some(other) => {
+                    return Err(format!(
+                        "--until must be blocked or terminal, got '{other}'"
+                    ));
+                }
+            };
+            let timeout_secs = match flags.value("--timeout") {
+                None => DEFAULT_WAIT_TIMEOUT_SECS,
+                Some(value) => {
+                    let seconds = value
+                        .parse::<u64>()
+                        .map_err(|_| format!("--timeout must be a second count, got '{value}'"))?;
+                    if seconds == 0 {
+                        return Err("--timeout must be greater than zero".to_owned());
+                    }
+                    seconds
+                }
+            };
+            Verb::Wait {
+                session: parse_id("session id", &session)?,
+                until,
+                timeout_secs,
+            }
+        }
+        "status" => {
+            no_positionals(&flags.verb, rest)?;
+            let session = flags.required("--session")?;
+            let format = match flags.value("--format").as_deref() {
+                None | Some("text") => StatusFormat::Text,
+                Some("verb") => StatusFormat::Verb,
+                Some(other) => {
+                    return Err(format!("--format must be text or verb, got '{other}'"));
+                }
+            };
+            Verb::Status {
+                session: parse_id("session id", &session)?,
+                format,
+            }
+        }
+        "liveness" => {
+            no_positionals(&flags.verb, rest)?;
+            Verb::Liveness {
+                session: parse_id("session id", &flags.required("--session")?)?,
+            }
+        }
+        "result" => {
+            no_positionals(&flags.verb, rest)?;
+            let session = flags.required("--session")?;
+            let task = match flags.value("--task") {
+                Some(value) => Some(parse_id("task id", &value)?),
+                None => None,
+            };
+            Verb::Result {
+                session: parse_id("session id", &session)?,
+                task,
+            }
+        }
         other => return Err(format!("unknown verb '{other}'; try --help")),
     };
     flags.finish()?;
@@ -559,6 +779,7 @@ fn parse_run(flags: &mut FlagSet) -> Result<RunArgs, String> {
         directory,
         approval,
         request_id,
+        new: flags.flag("--new"),
     })
 }
 

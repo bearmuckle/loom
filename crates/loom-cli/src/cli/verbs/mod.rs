@@ -8,6 +8,7 @@
 mod events;
 mod query;
 mod run;
+mod supervise;
 
 use std::io::Write;
 
@@ -36,6 +37,11 @@ pub(crate) enum Failure {
         request_id: Option<RequestId>,
         error: LoomError,
     },
+    /// A bounded poll reached its deadline without the state it waited for.
+    Timeout {
+        request_id: Option<RequestId>,
+        message: String,
+    },
     /// The worker answered with an error.
     Server {
         request_id: RequestId,
@@ -50,6 +56,7 @@ impl Failure {
             Self::Internal(_) => exit::INTERNAL,
             Self::BrokenPipe => exit::OK,
             Self::Transport { .. } => exit::UNREACHABLE,
+            Self::Timeout { .. } => exit::TIMEOUT,
             Self::Server { error, .. } => exit::for_code(error.code),
         }
     }
@@ -61,6 +68,7 @@ impl Failure {
             Self::Usage(_) => ErrorCode::InvalidRequest.to_string(),
             Self::Internal(_) => ErrorCode::Internal.to_string(),
             Self::BrokenPipe => "broken_pipe".to_owned(),
+            Self::Timeout { .. } => ErrorCode::DeadlineExceeded.to_string(),
             Self::Transport { error, .. } | Self::Server { error, .. } => error.code.to_string(),
         }
     }
@@ -69,13 +77,14 @@ impl Failure {
         match self {
             Self::Usage(message) | Self::Internal(message) => message,
             Self::BrokenPipe => "the output stream was closed",
+            Self::Timeout { message, .. } => message,
             Self::Transport { error, .. } | Self::Server { error, .. } => &error.message,
         }
     }
 
     fn retryable(&self) -> bool {
         match self {
-            Self::Usage(_) | Self::Internal(_) | Self::BrokenPipe => false,
+            Self::Usage(_) | Self::Internal(_) | Self::BrokenPipe | Self::Timeout { .. } => false,
             Self::Transport { error, .. } | Self::Server { error, .. } => error.retryable,
         }
     }
@@ -83,7 +92,7 @@ impl Failure {
     fn request_id(&self) -> Option<RequestId> {
         match self {
             Self::Usage(_) | Self::Internal(_) | Self::BrokenPipe => None,
-            Self::Transport { request_id, .. } => *request_id,
+            Self::Transport { request_id, .. } | Self::Timeout { request_id, .. } => *request_id,
             Self::Server { request_id, .. } => Some(*request_id),
         }
     }
@@ -107,6 +116,14 @@ impl Failure {
         })
     }
 
+    /// A conflict that survived the retry the caller allowed.
+    fn conflict(request_id: RequestId, message: String) -> Self {
+        Self::Server {
+            request_id,
+            error: LoomError::new(ErrorCode::Conflict, message, true),
+        }
+    }
+
     /// A worker answered a request with a response of another kind, which means
     /// the two sides do not agree on the protocol after all.
     fn unexpected(request_id: RequestId, family: &str) -> Self {
@@ -118,6 +135,31 @@ impl Failure {
                 false,
             ),
         }
+    }
+}
+
+/// The successful result of one verb: the payload a `--json` envelope carries,
+/// the id of its primary request, and the exit code it reports. A blocked
+/// `wait` and a `liveness` verdict that is `gone` or `unknown` are successful
+/// determinations that still report the documented non-zero code.
+pub(crate) struct Outcome {
+    pub data: Value,
+    pub request_id: Option<RequestId>,
+    pub exit_code: i32,
+}
+
+impl Outcome {
+    pub(crate) fn new(data: Value, request_id: Option<RequestId>) -> Self {
+        Self {
+            data,
+            request_id,
+            exit_code: exit::OK,
+        }
+    }
+
+    pub(crate) fn with_code(mut self, exit_code: i32) -> Self {
+        self.exit_code = exit_code;
+        self
     }
 }
 
@@ -139,14 +181,46 @@ pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
         Verb::Events(_) | Verb::Peek(_) => {
             capabilities.push(Capability::SubscribeSessionEvents);
         }
-        Verb::Run(_) => capabilities.extend([
-            Capability::ReadAgentSession,
-            Capability::CreateAgentSession,
-            Capability::ManageSessionRepositories,
-            Capability::WriteSessionFilesystem,
-            Capability::ConfigureApprovalPolicy,
-            Capability::StartAgentRun,
-        ]),
+        Verb::Run(args) => {
+            capabilities.extend([
+                Capability::CreateAgentSession,
+                Capability::ManageSessionRepositories,
+                Capability::WriteSessionFilesystem,
+                Capability::ConfigureApprovalPolicy,
+                Capability::StartAgentRun,
+            ]);
+            // `--new` never lists sessions, so it also never negotiates the
+            // read that listing would need.
+            if !args.new {
+                capabilities.push(Capability::ReadAgentSession);
+            }
+        }
+        Verb::Send { .. } | Verb::Answer { .. } => {
+            capabilities.extend([Capability::ControlAgentRun, Capability::ReadAgentRun]);
+        }
+        Verb::Approve { .. } | Verb::Deny { .. } => {
+            capabilities.extend([Capability::ApproveAgentAction, Capability::ReadAgentRun]);
+        }
+        Verb::Stop { archive, .. } => {
+            capabilities.extend([Capability::ControlAgentRun, Capability::ReadAgentRun]);
+            if archive.is_some() {
+                capabilities.push(Capability::ControlAgentSession);
+            }
+        }
+        Verb::Wait { .. } => {
+            capabilities.extend([Capability::ReadAgentSession, Capability::ReadAgentRun]);
+        }
+        Verb::Status { .. } | Verb::Liveness { .. } => {
+            capabilities.push(Capability::ReadAgentSession);
+        }
+        Verb::Result { .. } => {
+            capabilities.extend([
+                Capability::ReadSessionFilesystem,
+                Capability::ReadVcsStatus,
+                Capability::ReadVcsDiff,
+                Capability::ReadSessionTaskEvidence,
+            ]);
+        }
     }
     CapabilitySet::new(capabilities)
 }
@@ -232,7 +306,7 @@ pub(crate) async fn run<C: Client>(
     invocation: &Invocation,
     out: &mut dyn Write,
     err: &mut dyn Write,
-) -> Result<(Value, Option<RequestId>), Failure> {
+) -> Result<Outcome, Failure> {
     match &invocation.verb {
         Verb::Doctor => query::doctor(client, invocation, out).await,
         Verb::WhoAmI => query::whoami(client, invocation, out).await,
@@ -246,6 +320,33 @@ pub(crate) async fn run<C: Client>(
         Verb::Events(args) => events::events(client, invocation, args, out, err).await,
         Verb::Peek(args) => events::peek(client, invocation, args, out, err).await,
         Verb::Run(args) => run::run(client, invocation, args, out).await,
+        Verb::Send { run, text } => supervise::send(client, invocation, *run, text, out).await,
+        Verb::Answer { run, text } => supervise::answer(client, invocation, *run, text, out).await,
+        Verb::Approve { run, tool_call } => {
+            supervise::approve(client, invocation, *run, *tool_call, out).await
+        }
+        Verb::Deny {
+            run,
+            tool_call,
+            reason,
+        } => supervise::deny(client, invocation, *run, *tool_call, reason.as_deref(), out).await,
+        Verb::Stop {
+            run,
+            archive,
+            retry_on_conflict,
+        } => supervise::stop(client, invocation, *run, *archive, *retry_on_conflict, out).await,
+        Verb::Wait {
+            session,
+            until,
+            timeout_secs,
+        } => supervise::wait(client, invocation, *session, *until, *timeout_secs, out).await,
+        Verb::Status { session, format } => {
+            supervise::status(client, invocation, *session, *format, out).await
+        }
+        Verb::Liveness { session } => supervise::liveness(client, invocation, *session, out).await,
+        Verb::Result { session, task } => {
+            supervise::result(client, invocation, *session, *task, out).await
+        }
     }
 }
 

@@ -77,6 +77,8 @@ pub(crate) mod testing {
     pub(crate) type Before = Box<dyn FnMut(&mut RequestEnvelope)>;
     /// A test hook that rewrites an answer after it arrives.
     pub(crate) type After = Box<dyn FnMut(&ClientRequest, &mut ResponseEnvelope)>;
+    /// A test hook that fails a request before it reaches the inner client.
+    pub(crate) type Fail = Box<dyn FnMut(&ClientRequest) -> Option<LoomError>>;
 
     /// A client that lets a test rewrite the request and the answer around an
     /// inner client, which is how a protocol mismatch and a stale-cursor
@@ -85,6 +87,7 @@ pub(crate) mod testing {
         inner: C,
         before: Option<Before>,
         after: Option<After>,
+        fail: Option<Fail>,
     }
 
     impl<C> Wrapped<C> {
@@ -93,6 +96,7 @@ pub(crate) mod testing {
                 inner,
                 before: None,
                 after: None,
+                fail: None,
             }
         }
 
@@ -111,6 +115,16 @@ pub(crate) mod testing {
             self.after = Some(Box::new(hook));
             self
         }
+
+        /// Fails the requests `hook` names, which is how a transport failure
+        /// is produced without a second worker.
+        pub(crate) fn fail_on<F>(mut self, hook: F) -> Self
+        where
+            F: FnMut(&ClientRequest) -> Option<LoomError> + 'static,
+        {
+            self.fail = Some(Box::new(hook));
+            self
+        }
     }
 
     impl<C: Client> Client for Wrapped<C> {
@@ -122,9 +136,13 @@ pub(crate) mod testing {
                 before(&mut envelope);
             }
             let request = envelope.request.clone();
+            let failure = self.fail.as_mut().and_then(|fail| fail(&request));
             let inner = &mut self.inner;
             let after = self.after.as_mut();
             Box::pin(async move {
+                if let Some(error) = failure {
+                    return Err(error);
+                }
                 let mut response = inner.request(envelope).await?;
                 if let Some(after) = after {
                     after(&request, &mut response);
