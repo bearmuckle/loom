@@ -47,14 +47,21 @@ The examples below use the installed binary name. In a checkout, replace
 | `result --session <id> [--task <id>]` | Branch, head, diffstat, changed paths, and task evidence. |
 | `retention get` | The worker-wide archive-retention policy, with a disabled window as `off`. |
 | `retention set [--window <duration>] [--force-discard <bool>] [--sub-agent <duration>]` | Merge the given fields into the stored worker-wide archive-retention policy. |
-| `delete <session-id> [--force] [--yes]` | Permanently delete an archived session, or a project root with its descendants. |
+| `delete <session-id> [--force] [--yes]` | Permanently delete an archived session, or a project root with its descendants; the same operation as `session delete`. |
+| `session archive <session-id> [--yes]` | Archive one session, and the live descendants of a project root that cascades; every checkout is kept. |
+| `session delete <session-id> [--force] [--yes]` | Permanently delete an archived session, or a project root with its descendants. |
+| `project archive <session-id>` | Archive a project root with its idle members; the id must name such a root. |
+| `project delete <session-id> [--force] [--yes]` | Delete a project root and its tree; the id must name such a root. |
+| `project worktree cleanup <session-id> --task <task-id> (--keep \| --remove \| --discard) [--yes]` | Keep or remove the checkout recorded for one delegated task. |
 
 `node`, `whoami`, `ls`, `get`, `events`, `peek`, and `retention get` are
 read-only, issue no mutation, and work with a read-only-scoped token. `run`
 starts a run; `send`, `answer`, `approve`, `deny`, and `stop` control one;
-`wait`, `status`, `liveness`, and `result` read one. `retention set` and
-`delete` are operator-level mutations. No verb waits for a run except `wait`,
-which is always bounded by `--timeout`.
+`wait`, `status`, `liveness`, and `result` read one. `retention set`,
+`session archive`, `session delete` (and its `delete` alias), `project
+archive`, `project delete`, and `project worktree cleanup` are operator-level
+mutations. No verb waits for a run except `wait`, which is always bounded by
+`--timeout`.
 
 Every verb negotiates only the capabilities its own requests need. `doctor`
 reports the intersection the worker granted, so its capability list is the
@@ -225,29 +232,85 @@ stored policy plus `applies_from: "next_sweep"`.
 `node` and `retention get` are reads. `retention set` needs
 `configure_archive_retention`; a token without it exits `3`.
 
-## Destructive operations
+## Session and project lifecycle
 
-`delete <session-id>` permanently removes an archived session. There is no
-interactive prompt in a headless client, so the id is the confirmation, and
-archiving is terminal: neither the protocol nor this client offers a restore or
-unarchive.
+Archiving, deletion, and worktree cleanup are separate operations, and every
+lifecycle command reads `Project/GetProjectSnapshotForSession` before it mutates
+anything, because an id alone does not say whether it names a project root whose
+operation reaches other sessions.
 
-The client reads `Project/GetProjectSnapshotForSession` first, because an id
-alone does not say whether it names a project root. A root with another member
-or a delegated task removes its whole tree, and `--yes` is required whenever
-that would remove more than one session; `--yes` is also required with
-`--force`. Without the confirmation the command exits `2` after the read and
-before the delete request, so nothing is removed. `--force` carries the
-protocol's meaning: it discards dirty or locked linked worktrees that would
-otherwise refuse the deletion, and the command reports each worktree it
-discarded as `discarded worktree <name> <path>` (`discarded 0 worktrees` when
-there was nothing to discard). `--json` reports `deleted_sessions` and
-`discarded_worktrees`.
+### Archive
+
+`session archive <session-id>` moves a session to the archived state and keeps
+its transcript, checkpoints, files, and every checkout. It prints
+`archived <session-id>` for the session and for each live member the worker also
+archives, then `retained worktree <name> <path>` for every checkout in that set,
+or `retained 0 worktrees` when there is none. `--json` reports
+`archived_sessions`, `retained_worktrees`, and `cascade`.
+
+The worker cascades an archive when the id names a project root that owns a live
+member or a delegated task. `session archive` accepts that only with `--yes`,
+which names the number of sessions the archive would reach; without it the
+command exits `2` after the read and before the archive request. The worker
+refuses to archive a root while a child task is unfinished or a child session is
+active, and refuses to archive a session that is already archived, as
+`invalid_state` (exit `5`). `session archive` needs `control_agent_session`.
+
+`project archive <session-id>` is the same request with the scope stated by the
+verb: the id must name such a root, otherwise it exits `2` and points at
+`session archive`. It needs no `--yes`, because the command already names the
+tree.
+
+Archiving keeps the record and its worktrees, so it is not a deletion and frees
+no checkout. This client exposes no restore verb; the protocol's
+`Session/RestoreAgentSession` is the only path back.
+
+### Deletion
+
+`session delete <session-id>` (and `delete`, its original name) permanently
+removes an archived session. There is no interactive prompt in a headless
+client, so the id is the confirmation. A project root cascades to its whole
+tree, and `--yes` is required whenever that would remove more than one session;
+`--yes` is also required with `--force`. Without the confirmation the command
+exits `2` after the read and before the delete request, so nothing is removed.
+`--force` carries the protocol's meaning: it discards dirty or locked linked
+worktrees that would otherwise refuse the deletion, and the command reports each
+worktree it discarded as `discarded worktree <name> <path>` (`discarded 0
+worktrees` when there was nothing to discard). `--json` reports
+`deleted_sessions` and `discarded_worktrees`.
+
+`project delete <session-id> [--force] --yes` is the same request with the scope
+stated by the verb: the id must name such a root, otherwise it exits `2` and
+points at `session delete`, and `--yes` is always required because deleting a
+project is irreversible.
 
 A session that is not archived and is not a project root is refused by the
-worker as `invalid_state` (exit `5`) and nothing changes. `delete` needs the
-`delete_agent_session` capability, and a read-only-scoped token is refused with
-exit `3`.
+worker as `invalid_state` (exit `5`) and nothing changes; the worker also
+cancels the live work of a project tree before removing it. Both spellings need
+the `delete_agent_session` capability, and a read-only-scoped token is refused
+with exit `3`.
+
+### Worktree cleanup
+
+`project worktree cleanup <session-id> --task <task-id> --keep|--remove|--discard`
+acts on the checkout recorded for one delegated task of the project that
+`<session-id>` belongs to. The command reads that record from the snapshot, so
+the project id and the manager session come from the worker rather than the
+command line. Exactly one disposition is required:
+
+- `--keep` retains the checkout and records it as retained.
+- `--remove` removes it. The worker refuses a checkout that still holds changes,
+  so nothing is thrown away by a removal that did not ask for it.
+- `--discard` removes it together with its uncommitted changes, so it also
+  requires `--yes`. The command prints the worker's note about what was
+  discarded as `note <text>`, because that loss has nowhere else to be seen.
+
+The text is `retained worktree <name> <path>`, `removed worktree <name> <path>`,
+or `worktree <name> <path> <status>` when the record ends in another state, and
+`--json` carries `disposition` plus the full worktree record. A task without a
+recorded worktree exits `2` after the read, and the worker refuses a task that is
+not terminal as `invalid_state` (exit `5`). The command needs the
+`cleanup_project_child_worktree` capability.
 
 ## Exit codes
 
@@ -304,4 +367,9 @@ loom-cli retention set --window 14d --force-discard true --sub-agent 10m
 # Delete an archived session, then a whole archived project with confirmation.
 loom-cli delete <session-id>
 loom-cli delete <project-root-id> --yes
+
+# Keep a project's checkouts while archiving it, then tidy one child worktree.
+loom-cli project archive <project-root-id>
+loom-cli project worktree cleanup <project-root-id> --task <task-id> --keep
+loom-cli project worktree cleanup <project-root-id> --task <task-id> --remove
 ```

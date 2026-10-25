@@ -79,10 +79,31 @@ Verbs:
                 [--sub-agent <duration>]
                                     store a worker-wide archive-retention
                                     policy; the next sweep applies it
-  delete <session-id> [--force] [--yes]
+  session archive <session-id> [--yes]
+                                    archive one session, keeping its
+                                    transcript, checkpoints, and every
+                                    worktree; --yes is required when the id
+                                    is a project root whose archive also
+                                    reaches its descendants
+  session delete <session-id> [--force] [--yes]
                                     delete an archived session, or a project
                                     root with its descendants; --yes is
                                     required for a cascade or with --force
+  project archive <session-id>      archive a project root with its idle
+                                    members; the id must name such a root
+  project delete <session-id> [--force] [--yes]
+                                    delete a project root and its tree; the
+                                    id must name such a root, and --yes is
+                                    required
+  project worktree cleanup <session-id> --task <task-id>
+      (--keep | --remove | --discard) [--yes]
+                                    keep or remove the checkout of one
+                                    delegated task; --discard throws away
+                                    uncommitted changes and needs --yes
+  delete <session-id> [--force] [--yes]
+                                    delete an archived session, or a project
+                                    root with its descendants; the same
+                                    operation as 'session delete'
 
 `run` never prints more than `session <id> <name>` and `run <id> <state>`: it
 returns as soon as the worker accepts the run. --repo and --as-directory are
@@ -121,7 +142,21 @@ session that is not archived unless it is a project root, and archiving is
 terminal, so nothing restores a deleted session. --yes is required when the
 command would remove more than one session (a project root cascades) and
 whenever --force is given: --force discards dirty or locked worktrees that
-would otherwise refuse the deletion.
+would otherwise refuse the deletion. `delete` and `session delete` are the same
+operation; `session archive`, `session delete`, and `project worktree cleanup`
+are separate: archiving keeps every checkout, and only an explicit cleanup
+disposition removes one.
+
+`project archive` and `project delete` are the project-scoped spellings of the
+same requests. Their id must name a project root that owns another live member
+or a delegated task, so a mistyped or plain session id is refused as a usage
+error instead of quietly acting on one session. `session archive` accepts any
+session, and asks for --yes when the id is a project root whose archive reaches
+its descendants, so the blast radius of every command is one explicit decision.
+`project worktree cleanup` keeps (--keep) or removes (--remove, --discard) the
+checkout recorded for one delegated task, resolving its project and manager
+from the worker's project snapshot. --remove refuses a checkout that holds
+changes; only --discard, with --yes, throws them away.
 
 Global flags, accepted anywhere as --flag value or --flag=value:
   --connect <url>             worker WebSocket URL (fallback LOOM_URL)
@@ -309,6 +344,35 @@ pub(crate) enum Verb {
     },
     RetentionGet,
     RetentionSet(RetentionSetArgs),
+    /// `session archive`: archive one session, and its descendants when the id
+    /// is a project root that cascades. `yes` acknowledges that cascade.
+    SessionArchive {
+        session: AgentSessionId,
+        yes: bool,
+    },
+    /// `session delete`: the explicit spelling of `delete`.
+    SessionDelete {
+        session: AgentSessionId,
+        force: bool,
+        yes: bool,
+    },
+    /// `project archive`: archive a project root with its idle members.
+    ProjectArchive {
+        session: AgentSessionId,
+    },
+    /// `project delete`: delete a project root with its tree.
+    ProjectDelete {
+        session: AgentSessionId,
+        force: bool,
+        yes: bool,
+    },
+    /// `project worktree cleanup`: keep or remove one delegated task's
+    /// checkout.
+    ProjectWorktreeCleanup {
+        session: AgentSessionId,
+        task: TaskId,
+        disposition: WorktreeDisposition,
+    },
     /// `delete`: the id is the confirmation. `force` discards dirty or locked
     /// worktrees; `yes` acknowledges a cascade or a force discard.
     Delete {
@@ -316,6 +380,28 @@ pub(crate) enum Verb {
         force: bool,
         yes: bool,
     },
+}
+
+/// The disposition `project worktree cleanup` asks the worker for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorktreeDisposition {
+    /// Keep the checkout and record it as retained.
+    Keep,
+    /// Remove the checkout, which the worker refuses while it holds changes.
+    Remove,
+    /// Remove the checkout together with the uncommitted changes it holds.
+    Discard,
+}
+
+impl WorktreeDisposition {
+    /// The flag spelling, which text and `--json` output report.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Keep => "keep",
+            Self::Remove => "remove",
+            Self::Discard => "discard",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -351,6 +437,11 @@ pub(crate) fn verb_name(verb: &Verb) -> &'static str {
         Verb::Result { .. } => "result",
         Verb::RetentionGet => "retention get",
         Verb::RetentionSet(_) => "retention set",
+        Verb::SessionArchive { .. } => "session archive",
+        Verb::SessionDelete { .. } => "session delete",
+        Verb::ProjectArchive { .. } => "project archive",
+        Verb::ProjectDelete { .. } => "project delete",
+        Verb::ProjectWorktreeCleanup { .. } => "project worktree cleanup",
         Verb::Delete { .. } => "delete",
     }
 }
@@ -387,6 +478,8 @@ pub(crate) fn named_verb(arguments: &[String]) -> &'static str {
             "result" => "result",
             "retention" => "retention",
             "delete" => "delete",
+            "session" => "session",
+            "project" => "project",
             _ => "",
         })
         .unwrap_or("")
@@ -405,6 +498,7 @@ fn arity(name: &str) -> Option<bool> {
         "--run" | "--text" | "--tool-call" | "--reason" | "--until" | "--timeout" => true,
         "--window" | "--force-discard" | "--sub-agent" => true,
         "--new" | "--archive" | "--retry-on-conflict" | "--force" | "--yes" => false,
+        "--keep" | "--remove" | "--discard" => false,
         _ => return None,
     })
 }
@@ -683,6 +777,8 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
             }
         }
         "retention" => parse_retention(&mut flags, rest)?,
+        "session" => parse_session(&mut flags, rest)?,
+        "project" => parse_project(&mut flags, rest)?,
         "delete" => {
             let Some(session) = rest.first() else {
                 return Err("delete requires a <session-id>".to_owned());
@@ -820,6 +916,141 @@ fn parse_retention(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String>
             "unknown retention sub-verb '{other}'; use get or set"
         )),
     }
+}
+
+/// The `session` sub-verbs: `archive` keeps a session and its checkouts,
+/// `delete` removes it permanently.
+fn parse_session(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
+    let Some(sub_verb) = rest.first() else {
+        return Err("session requires 'archive' or 'delete'".to_owned());
+    };
+    flags.verb = format!("session {sub_verb}");
+    match sub_verb.as_str() {
+        "archive" => {
+            let session = one_session_id(flags, rest)?;
+            Ok(Verb::SessionArchive {
+                session,
+                yes: flags.flag("--yes"),
+            })
+        }
+        "delete" => {
+            let session = one_session_id(flags, rest)?;
+            let force = flags.flag("--force");
+            let yes = flags.flag("--yes");
+            if force && !yes {
+                return Err(
+                    "session delete --force discards dirty or locked worktrees; pass --yes to \
+                     confirm"
+                        .to_owned(),
+                );
+            }
+            Ok(Verb::SessionDelete {
+                session,
+                force,
+                yes,
+            })
+        }
+        other => Err(format!(
+            "unknown session sub-verb '{other}'; use archive or delete"
+        )),
+    }
+}
+
+/// The `project` sub-verbs: the project-scoped `archive` and `delete`, which
+/// require the id to name a project root, and `worktree cleanup`, which acts on
+/// one delegated task's checkout.
+fn parse_project(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
+    let Some(sub_verb) = rest.first() else {
+        return Err("project requires 'archive', 'delete', or 'worktree'".to_owned());
+    };
+    flags.verb = format!("project {sub_verb}");
+    match sub_verb.as_str() {
+        "archive" => Ok(Verb::ProjectArchive {
+            session: one_session_id(flags, rest)?,
+        }),
+        "delete" => {
+            let session = one_session_id(flags, rest)?;
+            let force = flags.flag("--force");
+            let yes = flags.flag("--yes");
+            if force && !yes {
+                return Err(
+                    "project delete --force discards dirty or locked worktrees; pass --yes to \
+                     confirm"
+                        .to_owned(),
+                );
+            }
+            Ok(Verb::ProjectDelete {
+                session,
+                force,
+                yes,
+            })
+        }
+        "worktree" => parse_project_worktree(flags, rest),
+        other => Err(format!(
+            "unknown project sub-verb '{other}'; use archive, delete, or worktree"
+        )),
+    }
+}
+
+/// The `project worktree` sub-verbs, of which only `cleanup` is exposed.
+fn parse_project_worktree(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
+    let Some(sub_verb) = rest.get(1) else {
+        return Err("project worktree requires 'cleanup'".to_owned());
+    };
+    if sub_verb != "cleanup" {
+        return Err(format!(
+            "unknown project worktree sub-verb '{sub_verb}'; use cleanup"
+        ));
+    }
+    flags.verb = "project worktree cleanup".to_owned();
+    let session = one_session_id(flags, rest)?;
+    let task = flags.required("--task")?;
+    let keep = flags.flag("--keep");
+    let remove = flags.flag("--remove");
+    let discard = flags.flag("--discard");
+    let disposition = match (keep, remove, discard) {
+        (true, false, false) => WorktreeDisposition::Keep,
+        (false, true, false) => WorktreeDisposition::Remove,
+        (false, false, true) => WorktreeDisposition::Discard,
+        (false, false, false) => {
+            return Err(
+                "project worktree cleanup requires --keep, --remove, or --discard".to_owned(),
+            );
+        }
+        _ => {
+            return Err(
+                "project worktree cleanup accepts one of --keep, --remove, or --discard".to_owned(),
+            );
+        }
+    };
+    if disposition == WorktreeDisposition::Discard && !flags.flag("--yes") {
+        return Err(
+            "project worktree cleanup --discard throws away uncommitted changes; pass --yes to \
+             confirm"
+                .to_owned(),
+        );
+    }
+    Ok(Verb::ProjectWorktreeCleanup {
+        session,
+        task: parse_id("task id", &task)?,
+        disposition,
+    })
+}
+
+/// The single positional id a sub-verb takes, after the words its own name
+/// already spells.
+fn one_session_id(flags: &FlagSet, rest: &[String]) -> Result<AgentSessionId, String> {
+    let words = flags.verb.split(' ').count();
+    let Some(session) = rest.get(words - 1) else {
+        return Err(format!("{} requires a <session-id>", flags.verb));
+    };
+    if rest.len() > words {
+        return Err(format!(
+            "{} takes one session id, got '{}'",
+            flags.verb, rest[words]
+        ));
+    }
+    parse_id("session id", session)
 }
 
 /// The flags of `run`, which is the one verb whose flags interact: the task and
