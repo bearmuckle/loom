@@ -1,0 +1,8 @@
+# The browser client is shipped over the network, so its build trades raw speed
+# for size. `opt-level=s` is the first lever (37,735,319 -> 36,884,384 raw
+# bytes); `codegen-units=1` is what the measurement showed as the second lever
+# (-> 34,580,129 raw bytes). Scoping this to the target table leaves host build
+# scripts and proc macros, which build for the host, on their current codegen,
+# and leaves the native client and server release profiles untouched.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "opt-level=s", "-C", "codegen-units=1"]

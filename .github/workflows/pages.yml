@@ -44,6 +44,12 @@ jobs:
         with:
           tool: trunk
 
+      - name: Cache Rust dependencies
+        # The GPUI/wgpu tree takes minutes to compile; caching it keeps a deploy
+        # from paying that cost on every push. Same pin as the `wasm` job in
+        # `ci.yml` so both jobs share the action version.
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
       - name: Build browser client
         working-directory: crates/loom-ui
         env:
