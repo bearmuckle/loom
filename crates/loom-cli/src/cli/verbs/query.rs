@@ -3,7 +3,7 @@
 
 use std::io::Write;
 
-use loom_core::{AgentSessionId, AgentSessionSnapshot, RequestId, WorkspaceId};
+use loom_core::{AgentSessionId, AgentSessionSnapshot, WorkspaceId};
 use loom_protocol::{
     AccessRequest, AccessResponse, ActivityDetail, AgentSessionSnapshotProjection, ClientRequest,
     ControlRequest, ControlResponse, ParticipantIdentity, ServerResponse, SessionRequest,
@@ -16,14 +16,14 @@ use crate::cli::client::Client;
 use crate::cli::text::{run_state_name, session_state_name};
 
 use super::Caller;
-use super::{Failure, emit, handshake};
+use super::{Failure, Outcome, emit, handshake};
 
 /// `doctor`: discovery, negotiation, the participant, and the worker node.
 pub(super) async fn doctor<C: Client>(
     client: &mut C,
     invocation: &Invocation,
     out: &mut dyn Write,
-) -> Result<(Value, Option<RequestId>), Failure> {
+) -> Result<Outcome, Failure> {
     let mut caller = Caller::new(client);
     // Discovery first, so a worker that does not answer capability discovery at
     // all fails before anything is negotiated against it.
@@ -81,7 +81,7 @@ pub(super) async fn doctor<C: Client>(
         "node": serde_json::to_value(&node).unwrap_or(Value::Null),
         "discovered": capability_names(&discovered.capabilities),
     });
-    Ok((data, caller.primary))
+    Ok(Outcome::new(data, caller.primary))
 }
 
 /// `whoami`: the participant this connection acts as.
@@ -89,7 +89,7 @@ pub(super) async fn whoami<C: Client>(
     client: &mut C,
     invocation: &Invocation,
     out: &mut dyn Write,
-) -> Result<(Value, Option<RequestId>), Failure> {
+) -> Result<Outcome, Failure> {
     let mut caller = Caller::new(client);
     handshake(&mut caller, &invocation.verb).await?;
     let (request_id, response) = caller
@@ -102,7 +102,7 @@ pub(super) async fn whoami<C: Client>(
     if !invocation.globals.json {
         emit(out, &participant_line(participant.as_ref()))?;
     }
-    Ok((
+    Ok(Outcome::new(
         json!({ "participant": participant_value(participant.as_ref()) }),
         caller.primary,
     ))
@@ -115,7 +115,7 @@ pub(super) async fn ls<C: Client>(
     workspace: Option<WorkspaceId>,
     archived: bool,
     out: &mut dyn Write,
-) -> Result<(Value, Option<RequestId>), Failure> {
+) -> Result<Outcome, Failure> {
     let mut caller = Caller::new(client);
     handshake(&mut caller, &invocation.verb).await?;
     let data = match workspace {
@@ -168,7 +168,7 @@ pub(super) async fn ls<C: Client>(
             })
         }
     };
-    Ok((data, caller.primary))
+    Ok(Outcome::new(data, caller.primary))
 }
 
 /// `get`: one session, and with `--metadata` its active run.
@@ -178,7 +178,7 @@ pub(super) async fn get<C: Client>(
     session: AgentSessionId,
     metadata: bool,
     out: &mut dyn Write,
-) -> Result<(Value, Option<RequestId>), Failure> {
+) -> Result<Outcome, Failure> {
     let mut caller = Caller::new(client);
     handshake(&mut caller, &invocation.verb).await?;
     let (request_id, response) = caller
@@ -202,7 +202,7 @@ pub(super) async fn get<C: Client>(
         )?;
     }
     if !metadata {
-        return Ok((
+        return Ok(Outcome::new(
             serde_json::to_value(&snapshot).unwrap_or(Value::Null),
             caller.primary,
         ));
@@ -231,7 +231,7 @@ pub(super) async fn get<C: Client>(
             ),
         )?;
     }
-    Ok((
+    Ok(Outcome::new(
         serde_json::to_value(&projection).unwrap_or(Value::Null),
         caller.primary,
     ))

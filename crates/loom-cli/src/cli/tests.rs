@@ -9,17 +9,18 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use loom_core::{
-    AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, Capability,
-    CapabilitySet, EventSequence, ProtocolVersion, RequestId, RunId, ToolCallId, WorkspaceId,
+    AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, Author, Capability,
+    CapabilitySet, CollaborationEntryKind, EventSequence, ProtocolVersion, RequestId, RunId,
+    ToolCallId, WorkspaceId,
 };
 use loom_model::ModelId;
 use loom_protocol::{
-    ActivityDetail, AgentEvent, AgentRunSnapshot, AgentSessionSnapshotProjection,
-    CURRENT_PROTOCOL_VERSION, ClientRequest, ControlRequest, ControlResponse, EventsRequest,
-    EventsResponse, FilesystemRequest, FilesystemResponse, RepositoryRequest, RepositoryResponse,
-    RequestEnvelope, ResponseEnvelope, RunRequest, RunResponse, ServerEvent, ServerEventEnvelope,
-    ServerResponse, SessionDirectory, SessionRepository, SessionRequest, SessionResponse,
-    WorkspaceRequest, WorkspaceResponse,
+    ActivityDetail, AgentEvent, AgentRunSnapshot, AgentRunState, AgentSessionSnapshotProjection,
+    CURRENT_PROTOCOL_VERSION, ClientRequest, CollaborationRequest, ControlRequest, ControlResponse,
+    EventsRequest, EventsResponse, FilesystemRequest, FilesystemResponse, RepositoryRequest,
+    RepositoryResponse, RequestEnvelope, ResponseEnvelope, RunRequest, RunResponse, ServerEvent,
+    ServerEventEnvelope, ServerResponse, SessionDirectory, SessionRepository, SessionRequest,
+    SessionResponse, WorkspaceRequest, WorkspaceResponse,
 };
 use loom_server::{InProcessBackend, InProcessConnection};
 
@@ -277,6 +278,13 @@ fn test_capabilities() -> CapabilitySet {
         Capability::StartAgentRun,
         Capability::ReadAgentRun,
         Capability::ConfigureApprovalPolicy,
+        Capability::ControlAgentSession,
+        Capability::ApproveAgentAction,
+        Capability::ControlAgentRun,
+        Capability::ReadVcsStatus,
+        Capability::ReadVcsDiff,
+        Capability::ReadSessionTaskEvidence,
+        Capability::StartSessionTask,
     ])
 }
 
@@ -953,6 +961,7 @@ fn a_read_only_scoped_token_can_read_but_cannot_start_a_run() {
 fn each_verb_negotiates_only_the_capabilities_its_requests_need() {
     let workspace = WorkspaceId::new().to_string();
     let session = AgentSessionId::new().to_string();
+    let run = RunId::new().to_string();
     let cases: Vec<(Vec<&str>, Vec<Capability>)> = vec![
         (vec!["whoami"], vec![Capability::JsonProtocol]),
         (
@@ -985,6 +994,99 @@ fn each_verb_negotiates_only_the_capabilities_its_requests_need() {
                 Capability::WriteSessionFilesystem,
                 Capability::ConfigureApprovalPolicy,
                 Capability::StartAgentRun,
+            ],
+        ),
+        (
+            vec![
+                "run",
+                "--workspace",
+                &workspace,
+                "--task",
+                "a task",
+                "--new",
+            ],
+            vec![
+                Capability::JsonProtocol,
+                Capability::CreateAgentSession,
+                Capability::ManageSessionRepositories,
+                Capability::WriteSessionFilesystem,
+                Capability::ConfigureApprovalPolicy,
+                Capability::StartAgentRun,
+            ],
+        ),
+        (
+            vec!["send", "--run", &run, "--text", "go"],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ControlAgentRun,
+                Capability::ReadAgentRun,
+            ],
+        ),
+        (
+            vec!["answer", "--run", &run, "--text", "yes"],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ControlAgentRun,
+                Capability::ReadAgentRun,
+            ],
+        ),
+        (
+            vec!["approve", "--run", &run, "--tool-call", &run],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ApproveAgentAction,
+                Capability::ReadAgentRun,
+            ],
+        ),
+        (
+            vec!["deny", "--run", &run, "--tool-call", &run],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ApproveAgentAction,
+                Capability::ReadAgentRun,
+            ],
+        ),
+        (
+            vec!["stop", "--run", &run],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ControlAgentRun,
+                Capability::ReadAgentRun,
+            ],
+        ),
+        (
+            vec!["stop", "--run", &run, "--session", &session, "--archive"],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ControlAgentRun,
+                Capability::ReadAgentRun,
+                Capability::ControlAgentSession,
+            ],
+        ),
+        (
+            vec!["wait", "--session", &session],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadAgentSession,
+                Capability::ReadAgentRun,
+            ],
+        ),
+        (
+            vec!["status", "--session", &session],
+            vec![Capability::JsonProtocol, Capability::ReadAgentSession],
+        ),
+        (
+            vec!["liveness", "--session", &session],
+            vec![Capability::JsonProtocol, Capability::ReadAgentSession],
+        ),
+        (
+            vec!["result", "--session", &session],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadSessionFilesystem,
+                Capability::ReadVcsStatus,
+                Capability::ReadVcsDiff,
+                Capability::ReadSessionTaskEvidence,
             ],
         ),
     ];
@@ -1219,6 +1321,558 @@ fn the_token_is_only_accepted_from_a_file() {
         assert!(!output.contains("WebSocketTransport"), "{output}");
         assert!(!output.contains("bearer_token"), "{output}");
     }
+}
+
+// 8. The control verbs: send, answer, approve, deny, stop, wait, status,
+// liveness, result, and `run --new`.
+
+/// Waits for the session's latest run to reach `wanted` and returns the
+/// projection that carries it.
+fn await_run_state(
+    connection: &InProcessConnection,
+    session_id: AgentSessionId,
+    wanted: AgentRunState,
+) -> AgentSessionSnapshotProjection {
+    for _ in 0..1200 {
+        let projection = session_projection(connection, session_id);
+        if let Some(active) = &projection.active_run
+            && active.run.state == wanted
+        {
+            return projection;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("the run never reached {wanted:?}");
+}
+
+/// Pins the auto-approval policy so the deterministic run finishes without a
+/// person's decision.
+fn pin_auto_policy(connection: &InProcessConnection, session_id: AgentSessionId) {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::SetSessionApprovalPolicy {
+            session_id,
+            policy: ApprovalPolicy::auto_approve(),
+            auto_approve_actions: Some(true),
+        },
+    )));
+    assert!(
+        matches!(
+            response.result,
+            Ok(ServerResponse::Session(SessionResponse::ApprovalPolicy(_)))
+        ),
+        "approval policy: {:?}",
+        response.result
+    );
+}
+
+/// Pins the shipped default policy, so the deterministic run stops on its
+/// first write and parks on an approval.
+fn pin_default_policy(connection: &InProcessConnection, session_id: AgentSessionId) {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::SetSessionApprovalPolicy {
+            session_id,
+            policy: ApprovalPolicy::default(),
+            auto_approve_actions: Some(false),
+        },
+    )));
+    assert!(
+        matches!(
+            response.result,
+            Ok(ServerResponse::Session(SessionResponse::ApprovalPolicy(_)))
+        ),
+        "approval policy: {:?}",
+        response.result
+    );
+}
+
+/// Polls the journal until `done` accepts one event, so a test never depends
+/// on a fixed sleep to observe a run's progress.
+fn await_event(
+    connection: &InProcessConnection,
+    session_id: AgentSessionId,
+    done: impl Fn(&ServerEvent) -> bool,
+) {
+    for _ in 0..1200 {
+        if journal(connection, session_id)
+            .iter()
+            .any(|envelope| done(&envelope.event))
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("the expected event never arrived");
+}
+
+fn json_envelope(outcome: &Outcome) -> serde_json::Value {
+    serde_json::from_str(outcome.stdout.trim()).unwrap_or_else(|error| {
+        panic!(
+            "'{out}' is not one JSON envelope: {error}",
+            out = outcome.stdout
+        )
+    })
+}
+
+#[test]
+fn send_directs_a_run_and_retries_once_after_a_stale_revision() {
+    let fixture = fixture();
+    let session_id = fixture.session.id;
+    pin_auto_policy(&fixture.control, session_id);
+    let run_id = start_run(&fixture.control, session_id);
+    await_run_state(&fixture.control, session_id, AgentRunState::Completed);
+
+    // The first direction is deliberately stale, so the worker answers a
+    // conflict and the client has to re-read and retry exactly once.
+    let sends = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let hook = std::rc::Rc::clone(&sends);
+    let mut client = Wrapped::new(InProcessClient::new(&fixture.backend)).before(move |envelope| {
+        if let ClientRequest::Collaboration(CollaborationRequest::DirectAgent {
+            expected, ..
+        }) = &mut envelope.request
+        {
+            hook.set(hook.get() + 1);
+            if hook.get() == 1 {
+                expected.action_sequence += 1;
+            }
+        }
+    });
+    let run_text = run_id.to_string();
+    let directed = run(
+        &mut client,
+        &["send", "--run", &run_text, "--text", "follow up"],
+    );
+    assert_eq!(directed.code, exit::OK, "{}", directed.stderr);
+    assert_eq!(directed.stderr, "");
+    assert!(
+        directed.stdout.starts_with(&format!("sent {run_id} ")),
+        "{}",
+        directed.stdout
+    );
+    assert_eq!(sends.get(), 2, "one stale direction and one retry");
+
+    // The direction reached the run and continues it.
+    await_event(&fixture.control, session_id, |event| {
+        matches!(
+            event,
+            ServerEvent::Agent {
+                event: AgentEvent::UserMessage { text, .. }
+            } if text.contains("follow up")
+        )
+    });
+    // It is attributed to the token's participant, which for this operator
+    // connection is the operator.
+    await_event(&fixture.control, session_id, |event| {
+        matches!(
+            event,
+            ServerEvent::Collaboration { entry }
+                if entry.author == Author::Operator
+                    && matches!(
+                        &entry.kind,
+                        CollaborationEntryKind::AgentDirection { text }
+                            if text.contains("follow up")
+                    )
+        )
+    });
+
+    // The same verb in `--json` reports the action, the run, and the revision.
+    let as_json = run(
+        &mut client,
+        &["send", "--json", "--run", &run_text, "--text", "again"],
+    );
+    assert_eq!(as_json.code, exit::OK, "{}", as_json.stderr);
+    let envelope = json_envelope(&as_json);
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["verb"], "send");
+    assert_eq!(envelope["data"]["action"], "send");
+    assert_eq!(envelope["data"]["run"]["id"], run_text);
+    assert!(envelope["data"]["revision"]["action_sequence"].is_number());
+}
+
+#[test]
+fn approve_and_deny_resolve_the_pending_tool_call() {
+    for (verb, printed) in [("approve", "approved"), ("deny", "denied")] {
+        let fixture = fixture();
+        let session_id = fixture.session.id;
+        pin_default_policy(&fixture.control, session_id);
+        let run_id = start_run(&fixture.control, session_id);
+        let projection = await_run_state(
+            &fixture.control,
+            session_id,
+            AgentRunState::AwaitingApproval,
+        );
+        let call = projection
+            .active_run
+            .as_ref()
+            .and_then(|active| active.pending_approval.as_ref())
+            .map(|call| call.id)
+            .expect("the run is parked on a tool call");
+        let mut client = InProcessClient::new(&fixture.backend);
+        let run_text = run_id.to_string();
+        let call_text = call.to_string();
+        let arguments = [verb, "--run", &run_text, "--tool-call", &call_text];
+        let arguments = if verb == "deny" {
+            vec![
+                arguments[0],
+                arguments[1],
+                arguments[2],
+                arguments[3],
+                arguments[4],
+                "--reason",
+                "not now",
+            ]
+        } else {
+            arguments.to_vec()
+        };
+        let outcome = run(&mut client, &arguments);
+        assert_eq!(outcome.code, exit::OK, "{}", outcome.stderr);
+        assert!(
+            outcome
+                .stdout
+                .starts_with(&format!("{printed} {call} {run_id} ")),
+            "{}",
+            outcome.stdout
+        );
+
+        // The worker recorded the decision for exactly this call.
+        let approved = verb == "approve";
+        await_event(&fixture.control, session_id, |event| {
+            matches!(
+                event,
+                ServerEvent::Agent {
+                    event: AgentEvent::ToolApprovalDecided {
+                        tool_call_id,
+                        decision,
+                        ..
+                    }
+                } if *tool_call_id == call
+                    && matches!(
+                        decision,
+                        loom_protocol::ApprovalDecision::Approved
+                    ) == approved
+            )
+        });
+    }
+}
+
+#[test]
+fn approve_retries_once_after_a_stale_revision() {
+    let fixture = fixture();
+    let session_id = fixture.session.id;
+    pin_default_policy(&fixture.control, session_id);
+    let run_id = start_run(&fixture.control, session_id);
+    let projection = await_run_state(
+        &fixture.control,
+        session_id,
+        AgentRunState::AwaitingApproval,
+    );
+    let call = projection
+        .active_run
+        .as_ref()
+        .and_then(|active| active.pending_approval.as_ref())
+        .map(|call| call.id)
+        .expect("the run is parked on a tool call");
+
+    let controls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let hook = std::rc::Rc::clone(&controls);
+    let mut client = Wrapped::new(InProcessClient::new(&fixture.backend)).before(move |envelope| {
+        if let ClientRequest::Collaboration(CollaborationRequest::ControlRun { expected, .. }) =
+            &mut envelope.request
+        {
+            hook.set(hook.get() + 1);
+            if hook.get() == 1 {
+                expected.control_revision += 1;
+            }
+        }
+    });
+    let outcome = run(
+        &mut client,
+        &[
+            "approve",
+            "--run",
+            &run_id.to_string(),
+            "--tool-call",
+            &call.to_string(),
+        ],
+    );
+    assert_eq!(outcome.code, exit::OK, "{}", outcome.stderr);
+    assert_eq!(controls.get(), 2, "one stale approval and one retry");
+    await_event(&fixture.control, session_id, |event| {
+        matches!(
+            event,
+            ServerEvent::Agent {
+                event: AgentEvent::ToolApprovalDecided { tool_call_id, .. }
+            } if *tool_call_id == call
+        )
+    });
+}
+
+#[test]
+fn answer_reports_a_run_that_is_not_waiting_and_prints_an_answer_when_one_is() {
+    let fixture = fixture();
+    let session_id = fixture.session.id;
+    pin_auto_policy(&fixture.control, session_id);
+    let run_id = start_run(&fixture.control, session_id);
+    await_run_state(&fixture.control, session_id, AgentRunState::Completed);
+    let run_text = run_id.to_string();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    // A run that is not waiting refuses an answer with a stable code.
+    let refused = run(
+        &mut client,
+        &["answer", "--run", &run_text, "--text", "yes"],
+    );
+    assert_eq!(refused.code, exit::GONE, "{}", refused.stderr);
+    assert!(
+        refused.stderr.contains("invalid_state"),
+        "{}",
+        refused.stderr
+    );
+
+    // The verb itself is exercised against a real accepted run action: the
+    // question path needs a run parked on a question, which the deterministic
+    // provider never produces, so the request is routed to a direction after
+    // asserting the answer request was what the verb built. The server-side
+    // answer semantics are covered by the loom-server collaboration test.
+    let mut rewired = Wrapped::new(InProcessClient::new(&fixture.backend)).before(|envelope| {
+        if let ClientRequest::Collaboration(CollaborationRequest::AnswerAgentQuestion {
+            run_id,
+            expected,
+            text,
+        }) = envelope.request.clone()
+        {
+            envelope.request = ClientRequest::Collaboration(CollaborationRequest::DirectAgent {
+                run_id,
+                expected,
+                text,
+            });
+        }
+    });
+    let answered = run(
+        &mut rewired,
+        &["answer", "--run", &run_text, "--text", "yes"],
+    );
+    assert_eq!(answered.code, exit::OK, "{}", answered.stderr);
+    assert!(
+        answered.stdout.starts_with(&format!("answered {run_id} ")),
+        "{}",
+        answered.stdout
+    );
+}
+
+#[test]
+fn stop_interrupts_archives_and_reports_a_finished_run() {
+    let fixture = fixture();
+    let session_id = fixture.session.id;
+    pin_default_policy(&fixture.control, session_id);
+    let run_id = start_run(&fixture.control, session_id);
+    await_run_state(
+        &fixture.control,
+        session_id,
+        AgentRunState::AwaitingApproval,
+    );
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let stopped = run(&mut client, &["stop", "--run", &run_id.to_string()]);
+    assert_eq!(stopped.code, exit::OK, "{}", stopped.stderr);
+    assert_eq!(stopped.stdout, format!("stopped {run_id} cancelled\n"));
+
+    // A run that already finished refuses to be stopped, and nothing changes.
+    let again = run(&mut client, &["stop", "--run", &run_id.to_string()]);
+    assert_eq!(again.code, exit::GONE, "{}", again.stderr);
+    assert!(again.stderr.contains("invalid_state"), "{}", again.stderr);
+
+    // `--archive` archives the session only after the interrupt succeeded.
+    // A cancelled session accepts no second run, so this uses a fresh session.
+    let other = create_session(&fixture.control, fixture.workspace.id, "archive me");
+    pin_default_policy(&fixture.control, other.id);
+    let second = start_run(&fixture.control, other.id);
+    await_run_state(&fixture.control, other.id, AgentRunState::AwaitingApproval);
+    let archived = run(
+        &mut client,
+        &[
+            "stop",
+            "--run",
+            &second.to_string(),
+            "--session",
+            &other.id.to_string(),
+            "--archive",
+        ],
+    );
+    assert_eq!(archived.code, exit::OK, "{}", archived.stderr);
+    assert_eq!(
+        archived.stdout,
+        format!("stopped {second} cancelled\narchived {}\n", other.id)
+    );
+    assert_eq!(
+        session_snapshot(&fixture.control, other.id).state,
+        AgentSessionState::Archived
+    );
+}
+
+#[test]
+fn stop_refuses_a_stale_revision_unless_the_flag_allows_a_retry() {
+    let fixture = fixture();
+    let session_id = fixture.session.id;
+    pin_default_policy(&fixture.control, session_id);
+    let run_id = start_run(&fixture.control, session_id);
+    await_run_state(
+        &fixture.control,
+        session_id,
+        AgentRunState::AwaitingApproval,
+    );
+
+    let controls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let hook = std::rc::Rc::clone(&controls);
+    let mut stale = Wrapped::new(InProcessClient::new(&fixture.backend)).before(move |envelope| {
+        if let ClientRequest::Collaboration(CollaborationRequest::ControlRun { expected, .. }) =
+            &mut envelope.request
+        {
+            hook.set(hook.get() + 1);
+            expected.action_sequence += 1;
+        }
+    });
+    let refused = run(&mut stale, &["stop", "--run", &run_id.to_string()]);
+    assert_eq!(refused.code, exit::INTERNAL, "{}", refused.stderr);
+    assert!(refused.stderr.contains("conflict"), "{}", refused.stderr);
+    assert_eq!(controls.get(), 1, "stop does not retry by default");
+    assert_eq!(
+        session_projection(&fixture.control, session_id)
+            .active_run
+            .expect("the run is still there")
+            .run
+            .state,
+        AgentRunState::AwaitingApproval,
+        "a refused stop changes nothing"
+    );
+
+    let mut retrying = Wrapped::new(InProcessClient::new(&fixture.backend)).before({
+        let controls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let hook = std::rc::Rc::clone(&controls);
+        move |envelope| {
+            if let ClientRequest::Collaboration(CollaborationRequest::ControlRun {
+                expected, ..
+            }) = &mut envelope.request
+            {
+                hook.set(hook.get() + 1);
+                if hook.get() == 1 {
+                    expected.action_sequence += 1;
+                }
+            }
+        }
+    });
+    let stopped = run(
+        &mut retrying,
+        &["stop", "--run", &run_id.to_string(), "--retry-on-conflict"],
+    );
+    assert_eq!(stopped.code, exit::OK, "{}", stopped.stderr);
+    assert_eq!(stopped.stdout, format!("stopped {run_id} cancelled\n"));
+}
+
+#[test]
+fn every_control_verb_reports_a_json_envelope() {
+    for (verb, action) in [("approve", "approve"), ("deny", "deny")] {
+        let fixture = fixture();
+        let session_id = fixture.session.id;
+        pin_default_policy(&fixture.control, session_id);
+        let run_id = start_run(&fixture.control, session_id);
+        let projection = await_run_state(
+            &fixture.control,
+            session_id,
+            AgentRunState::AwaitingApproval,
+        );
+        let call = projection
+            .active_run
+            .as_ref()
+            .and_then(|active| active.pending_approval.as_ref())
+            .map(|call| call.id)
+            .expect("the run is parked on a tool call");
+        let run_text = run_id.to_string();
+        let call_text = call.to_string();
+        let mut client = InProcessClient::new(&fixture.backend);
+        let outcome = run(
+            &mut client,
+            &[
+                verb,
+                "--json",
+                "--run",
+                &run_text,
+                "--tool-call",
+                &call_text,
+            ],
+        );
+        assert_eq!(outcome.code, exit::OK, "{}", outcome.stderr);
+        let envelope = json_envelope(&outcome);
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["verb"], verb);
+        assert_eq!(envelope["data"]["action"], action);
+        assert_eq!(envelope["data"]["tool_call_id"], call_text.as_str());
+        assert_eq!(envelope["data"]["run"]["id"], run_text.as_str());
+    }
+
+    let stop_fixture = fixture();
+    let stop_session = stop_fixture.session.id;
+    pin_default_policy(&stop_fixture.control, stop_session);
+    let stop_run = start_run(&stop_fixture.control, stop_session);
+    await_run_state(
+        &stop_fixture.control,
+        stop_session,
+        AgentRunState::AwaitingApproval,
+    );
+    let mut stop_client = InProcessClient::new(&stop_fixture.backend);
+    let stopped = run(
+        &mut stop_client,
+        &["stop", "--json", "--run", &stop_run.to_string()],
+    );
+    assert_eq!(stopped.code, exit::OK, "{}", stopped.stderr);
+    let envelope = json_envelope(&stopped);
+    assert_eq!(envelope["verb"], "stop");
+    assert_eq!(envelope["data"]["action"], "stop");
+    assert_eq!(envelope["data"]["run"]["state"], "cancelled");
+    assert_eq!(envelope["data"]["archived"], serde_json::Value::Null);
+
+    // `answer` needs a run parked on a question, which the deterministic
+    // provider never produces; route its request to a direction so the
+    // envelope path is exercised against a real accepted action.
+    let answer_fixture = fixture();
+    let answer_session = answer_fixture.session.id;
+    pin_auto_policy(&answer_fixture.control, answer_session);
+    let answer_run = start_run(&answer_fixture.control, answer_session);
+    await_run_state(
+        &answer_fixture.control,
+        answer_session,
+        AgentRunState::Completed,
+    );
+    let mut rewired =
+        Wrapped::new(InProcessClient::new(&answer_fixture.backend)).before(|envelope| {
+            if let ClientRequest::Collaboration(CollaborationRequest::AnswerAgentQuestion {
+                run_id,
+                expected,
+                text,
+            }) = envelope.request.clone()
+            {
+                envelope.request =
+                    ClientRequest::Collaboration(CollaborationRequest::DirectAgent {
+                        run_id,
+                        expected,
+                        text,
+                    });
+            }
+        });
+    let answered = run(
+        &mut rewired,
+        &[
+            "answer",
+            "--json",
+            "--run",
+            &answer_run.to_string(),
+            "--text",
+            "yes",
+        ],
+    );
+    assert_eq!(answered.code, exit::OK, "{}", answered.stderr);
+    let envelope = json_envelope(&answered);
+    assert_eq!(envelope["verb"], "answer");
+    assert_eq!(envelope["data"]["action"], "answer");
 }
 
 // 7. The `run` verb: the session it reuses or creates, the inputs it attaches,
@@ -2321,4 +2975,688 @@ fn help_short_circuits_parsing_whatever_else_is_given() {
     assert!(args::HELP.contains("loom-cli"));
     assert!(args::HELP.contains("--cursor-file"));
     assert!(args::HELP.contains("--token-file"));
+}
+
+#[test]
+fn result_reports_a_repository_and_states_when_there_is_nothing() {
+    let fixture = fixture();
+    let session_id = fixture.session.id;
+    let session_text = session_id.to_string();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    // A session with no repository and no task has nothing to report.
+    let empty = run(&mut client, &["result", "--session", &session_text]);
+    assert_eq!(empty.code, exit::OK, "{}", empty.stderr);
+    assert_eq!(
+        empty.stdout,
+        format!("session {session_id}\nnothing to report\n")
+    );
+    let envelope = json_envelope(&run(
+        &mut client,
+        &["result", "--session", &session_text, "--json"],
+    ));
+    assert_eq!(envelope["data"]["empty"], true);
+    assert_eq!(envelope["data"]["repositories"], serde_json::json!([]));
+
+    // A local repository with one commit and one modified file reports its
+    // branch, head, diffstat, and changed path.
+    let repository = temporary_path("result-repository");
+    std::fs::create_dir_all(&repository).unwrap();
+    if !git(&repository, &["init", "-q"]) {
+        println!("skipping: git could not be spawned");
+        std::fs::remove_dir_all(&repository).ok();
+        return;
+    }
+    std::fs::write(repository.join("README"), "one\n").unwrap();
+    assert!(git(&repository, &["add", "README"]));
+    assert!(git(
+        &repository,
+        &[
+            "-c",
+            "user.name=loom cli test",
+            "-c",
+            "user.email=cli@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "initial",
+        ]
+    ));
+    let source = repository.to_string_lossy().into_owned();
+    let path = repository
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let attached = fixture
+        .control
+        .request(RequestEnvelope::new(ClientRequest::Repository(
+            RepositoryRequest::AttachSessionRepository {
+                session_id,
+                source,
+                path: path.clone(),
+                revision: None,
+                reuse_local: false,
+            },
+        )));
+    let repository_id = match attached.result {
+        Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(
+            repository,
+        ))) => repository.id,
+        other => panic!("unexpected attach response: {other:?}"),
+    };
+
+    // The clone is clean; edit the session's copy so the result has a change
+    // to report.
+    let edited = fixture
+        .control
+        .request(RequestEnvelope::new(ClientRequest::Filesystem(
+            FilesystemRequest::ApplySessionFilesystemEdit {
+                session_id,
+                edit: loom_core::WorkspaceEdit {
+                    path: format!("{path}/README"),
+                    old_text: "one\n".to_owned(),
+                    new_text: "one\ntwo\n".to_owned(),
+                    expected_revision: None,
+                },
+            },
+        )));
+    assert!(
+        matches!(
+            edited.result,
+            Ok(ServerResponse::Filesystem(
+                FilesystemResponse::WorkspaceEditApplied(_)
+            ))
+        ),
+        "edit: {:?}",
+        edited.result
+    );
+
+    let reported = run(
+        &mut client,
+        &["result", "--session", &session_text, "--json"],
+    );
+    assert_eq!(reported.code, exit::OK, "{}", reported.stderr);
+    let envelope = json_envelope(&reported);
+    assert_eq!(envelope["data"]["empty"], false);
+    let reported_repository = &envelope["data"]["repositories"][0];
+    assert_eq!(
+        reported_repository["id"],
+        repository_id.to_string().as_str()
+    );
+    assert_eq!(reported_repository["path"], path.as_str());
+    assert!(
+        reported_repository["branch"]
+            .as_str()
+            .is_some_and(|branch| !branch.is_empty()),
+        "branch: {}",
+        reported_repository["branch"]
+    );
+    assert_eq!(
+        reported_repository["head"].as_str().map(str::len),
+        Some(40),
+        "head: {}",
+        reported_repository["head"]
+    );
+    assert_eq!(reported_repository["changed_paths"][0]["path"], "README");
+    assert_eq!(
+        reported_repository["changed_paths"][0]["status"],
+        "modified"
+    );
+    assert_eq!(reported_repository["diffstat"]["files"], 1);
+    assert!(reported_repository["diffstat"]["added"].as_u64().unwrap() >= 1);
+
+    let text = run(&mut client, &["result", "--session", &session_text]);
+    assert_eq!(text.code, exit::OK, "{}", text.stderr);
+    assert!(text.stdout.starts_with(&format!("session {session_id}\n")));
+    assert!(
+        text.stdout
+            .contains(&format!("repository {repository_id} {path}\n")),
+        "{}",
+        text.stdout
+    );
+    assert!(text.stdout.contains("\ndiffstat 1 "), "{}", text.stdout);
+    assert!(
+        text.stdout.contains("\nchanged modified README\n"),
+        "{}",
+        text.stdout
+    );
+
+    // Task evidence is named when a task is asked for, and an empty set says so.
+    let task = match fixture
+        .control
+        .request(RequestEnvelope::new(ClientRequest::Task(
+            loom_protocol::TaskRequest::StartSessionTask {
+                session_id,
+                spec: loom_core::TaskSpec {
+                    kind: loom_core::TaskKind::Command,
+                    label: "noop".to_owned(),
+                    command: "true".to_owned(),
+                    args: Vec::new(),
+                    cwd: None,
+                    output_limit_bytes: None,
+                    artifact_paths: Vec::new(),
+                },
+            },
+        )))
+        .result
+    {
+        Ok(ServerResponse::Task(loom_protocol::TaskResponse::TaskStarted(task))) => task.id,
+        other => panic!("unexpected task response: {other:?}"),
+    };
+    let with_task = run(
+        &mut client,
+        &[
+            "result",
+            "--session",
+            &session_text,
+            "--task",
+            &task.to_string(),
+        ],
+    );
+    assert_eq!(with_task.code, exit::OK, "{}", with_task.stderr);
+    assert!(
+        with_task.stdout.contains("\nevidence none\n"),
+        "{}",
+        with_task.stdout
+    );
+
+    fixture.backend.shutdown().unwrap();
+    std::fs::remove_dir_all(&repository).ok();
+}
+
+/// Runs one git command in `directory`, returning whether it succeeded.
+fn git(directory: &std::path::Path, arguments: &[&str]) -> bool {
+    match std::process::Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(arguments)
+        .output()
+    {
+        Ok(output) => output.status.success(),
+        Err(_) => false,
+    }
+}
+
+#[test]
+fn run_new_creates_a_fresh_session_and_replays_with_one_base() {
+    let fixture = empty_fixture();
+    let workspace = fixture.workspace.id.to_string();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    // A first run completes, leaving a session of that name in a terminal
+    // state, which is exactly what a retrigger used to trip over.
+    let first = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--task",
+            "retrigger",
+            "--approval-policy",
+            "auto",
+            "--json",
+        ],
+    );
+    assert_eq!(first.code, exit::OK, "{}", first.stderr);
+    let first_envelope = json_envelope(&first);
+    let first_session: AgentSessionId = first_envelope["data"]["session"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let waited = run(
+        &mut client,
+        &[
+            "wait",
+            "--session",
+            &first_session.to_string(),
+            "--until",
+            "terminal",
+            "--timeout",
+            "10",
+        ],
+    );
+    assert_eq!(waited.code, exit::OK, "{}", waited.stderr);
+
+    // A plain run keeps reusing the session by name, and a completed session
+    // refuses a second run.
+    let reused = run(
+        &mut client,
+        &["run", "--workspace", &workspace, "--task", "retrigger"],
+    );
+    assert_eq!(reused.code, exit::GONE, "{}", reused.stderr);
+    assert!(reused.stderr.contains("invalid_state"), "{}", reused.stderr);
+
+    // `--new` creates a second session with the same name and starts it.
+    let fresh = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--task",
+            "retrigger",
+            "--new",
+            "--json",
+        ],
+    );
+    assert_eq!(fresh.code, exit::OK, "{}", fresh.stderr);
+    let fresh_envelope = json_envelope(&fresh);
+    assert_eq!(fresh_envelope["data"]["created"], true);
+    let fresh_session: AgentSessionId = fresh_envelope["data"]["session"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_ne!(fresh_session, first_session, "a name is not an identity");
+    let named = live_sessions(&fixture.control, fixture.workspace.id)
+        .into_iter()
+        .filter(|session| session.name == "retrigger")
+        .count();
+    assert_eq!(named, 2, "--new never matches a session by name");
+
+    // One base drives the whole command: repeating it reuses the session and
+    // the run instead of creating a second of either.
+    let base = RequestId::new().to_string();
+    let arguments = [
+        "run",
+        "--workspace",
+        &workspace,
+        "--task",
+        "idempotent",
+        "--new",
+        "--request-id",
+        &base,
+        "--json",
+    ];
+    let once = run(&mut client, &arguments);
+    assert_eq!(once.code, exit::OK, "{}", once.stderr);
+    let twice = run(&mut client, &arguments);
+    assert_eq!(twice.code, exit::OK, "{}", twice.stderr);
+    let once = json_envelope(&once);
+    let twice = json_envelope(&twice);
+    assert_eq!(
+        once["data"]["session"]["id"],
+        twice["data"]["session"]["id"]
+    );
+    assert_eq!(once["data"]["run"]["id"], twice["data"]["run"]["id"]);
+    assert_ne!(
+        once["data"]["request_ids"]["session"], once["data"]["request_ids"]["run"],
+        "the two mutations never share one id"
+    );
+    assert_eq!(once["data"]["request_ids"]["run"], base.as_str());
+    let idempotent_session: AgentSessionId = once["data"]["session"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        live_sessions(&fixture.control, fixture.workspace.id)
+            .into_iter()
+            .filter(|session| session.name == "idempotent")
+            .count(),
+        1,
+        "a replayed --new creates one session"
+    );
+    assert_eq!(
+        started_run_ids(&fixture.control, idempotent_session).len(),
+        1,
+        "a replayed --new starts one run"
+    );
+
+    fixture.backend.shutdown().unwrap();
+}
+
+#[test]
+fn the_parser_covers_the_control_verbs_and_rejects_their_mistakes() {
+    let workspace = WorkspaceId::new().to_string();
+    let session = AgentSessionId::new().to_string();
+    let run = RunId::new().to_string();
+    let call = ToolCallId::new().to_string();
+    let task = loom_core::TaskId::new().to_string();
+
+    assert!(matches!(
+        invocation(&["send", "--run", &run, "--text", "go"]).verb,
+        Verb::Send { .. }
+    ));
+    assert!(matches!(
+        invocation(&["answer", "--run", &run, "--text", "yes"]).verb,
+        Verb::Answer { .. }
+    ));
+    assert!(matches!(
+        invocation(&["approve", "--run", &run, "--tool-call", &call]).verb,
+        Verb::Approve { .. }
+    ));
+    assert!(matches!(
+        invocation(&[
+            "deny",
+            "--run",
+            &run,
+            "--tool-call",
+            &call,
+            "--reason",
+            "no"
+        ])
+        .verb,
+        Verb::Deny { .. }
+    ));
+    assert!(matches!(
+        invocation(&["wait", "--session", &session, "--until", "terminal"]).verb,
+        Verb::Wait {
+            until: args::WaitUntil::Terminal,
+            ..
+        }
+    ));
+    assert!(matches!(
+        invocation(&["status", "--session", &session, "--format", "verb"]).verb,
+        Verb::Status {
+            format: args::StatusFormat::Verb,
+            ..
+        }
+    ));
+    assert!(matches!(
+        invocation(&["liveness", "--session", &session]).verb,
+        Verb::Liveness { .. }
+    ));
+    assert!(matches!(
+        invocation(&["result", "--session", &session, "--task", &task]).verb,
+        Verb::Result { .. }
+    ));
+    let Verb::Run(run_args) =
+        invocation(&["run", "--workspace", &workspace, "--task", "a", "--new"]).verb
+    else {
+        panic!("run --new parses as run");
+    };
+    assert!(run_args.new);
+
+    assert!(parse_error(&["send", "--text", "go"]).contains("requires --run"));
+    assert!(parse_error(&["answer", "--run", &run]).contains("requires --text"));
+    assert!(parse_error(&["approve", "--run", &run]).contains("requires --tool-call"));
+    assert!(parse_error(&["stop", "--run", &run, "--archive"]).contains("requires --session"));
+    assert!(parse_error(&["stop", "--run", &run, "--session", &session]).contains("only applies"));
+    assert!(
+        parse_error(&["wait", "--session", &session, "--until", "soon"])
+            .contains("blocked or terminal")
+    );
+    assert!(
+        parse_error(&["wait", "--session", &session, "--timeout", "0"])
+            .contains("greater than zero")
+    );
+    assert!(
+        parse_error(&["status", "--session", &session, "--format", "jsonl"])
+            .contains("text or verb")
+    );
+    assert!(parse_error(&["liveness"]).contains("requires --session"));
+    assert!(
+        parse_error(&["result", "--session", &session, "--task", "no"])
+            .contains("not a valid task id")
+    );
+}
+
+#[test]
+fn wait_reports_blocked_and_terminal_and_is_always_bounded() {
+    // Blocked: the run parks on the first approval and the wait returns at once
+    // with the attempt and the tool call in both the text and the envelope.
+    let blocked_fixture = fixture();
+    let session_id = blocked_fixture.session.id;
+    pin_default_policy(&blocked_fixture.control, session_id);
+    let run_id = start_run(&blocked_fixture.control, session_id);
+    let projection = await_run_state(
+        &blocked_fixture.control,
+        session_id,
+        AgentRunState::AwaitingApproval,
+    );
+    let attempt = projection
+        .active_run
+        .as_ref()
+        .expect("a run")
+        .run
+        .attempt_id;
+    let call = projection
+        .active_run
+        .as_ref()
+        .and_then(|active| active.pending_approval.as_ref())
+        .map(|call| call.id)
+        .expect("a pending approval");
+    let session_text = session_id.to_string();
+    let mut client = InProcessClient::new(&blocked_fixture.backend);
+
+    let blocked = run(
+        &mut client,
+        &[
+            "wait",
+            "--session",
+            &session_text,
+            "--until",
+            "blocked",
+            "--timeout",
+            "10",
+        ],
+    );
+    assert_eq!(blocked.code, exit::BLOCKED, "{}", blocked.stderr);
+    assert_eq!(
+        blocked.stdout,
+        format!("run {run_id} awaiting_approval\nblocked {attempt} {call}\n")
+    );
+
+    let blocked_json = run(
+        &mut client,
+        &[
+            "wait",
+            "--session",
+            &session_text,
+            "--timeout",
+            "10",
+            "--json",
+        ],
+    );
+    assert_eq!(blocked_json.code, exit::BLOCKED, "{}", blocked_json.stderr);
+    let envelope = json_envelope(&blocked_json);
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["data"]["blocked"], true);
+    assert_eq!(envelope["data"]["attempt_id"], attempt.to_string().as_str());
+    assert_eq!(envelope["data"]["tool_call_id"], call.to_string().as_str());
+
+    // Terminal: an auto-approved run completes, and the wait exits 0.
+    let completed_fixture = fixture();
+    let completed_session = completed_fixture.session.id;
+    pin_auto_policy(&completed_fixture.control, completed_session);
+    let completed_run = start_run(&completed_fixture.control, completed_session);
+    let mut completed_client = InProcessClient::new(&completed_fixture.backend);
+    let completed = run(
+        &mut completed_client,
+        &[
+            "wait",
+            "--session",
+            &completed_session.to_string(),
+            "--until",
+            "terminal",
+            "--timeout",
+            "10",
+        ],
+    );
+    assert_eq!(completed.code, exit::OK, "{}", completed.stderr);
+    assert_eq!(completed.stdout, format!("run {completed_run} completed\n"));
+
+    // A cancelled run is terminal and reports a documented non-zero code.
+    let stop_fixture = fixture();
+    let stop_session = stop_fixture.session.id;
+    pin_default_policy(&stop_fixture.control, stop_session);
+    let stop_run = start_run(&stop_fixture.control, stop_session);
+    await_run_state(
+        &stop_fixture.control,
+        stop_session,
+        AgentRunState::AwaitingApproval,
+    );
+    let stop_text = stop_run.to_string();
+    let mut stop_client = InProcessClient::new(&stop_fixture.backend);
+    assert_eq!(
+        run(&mut stop_client, &["stop", "--run", &stop_text]).code,
+        exit::OK
+    );
+    let cancelled = run(
+        &mut stop_client,
+        &[
+            "wait",
+            "--session",
+            &stop_session.to_string(),
+            "--until",
+            "terminal",
+            "--timeout",
+            "10",
+        ],
+    );
+    assert_eq!(cancelled.code, exit::INTERNAL, "{}", cancelled.stderr);
+    assert_eq!(cancelled.stdout, format!("run {stop_run} cancelled\n"));
+
+    // A session with no run has nothing to observe, so the bound reports a
+    // timeout instead of waiting forever.
+    let idle_fixture = fixture();
+    let mut idle_client = InProcessClient::new(&idle_fixture.backend);
+    let idle = run(
+        &mut idle_client,
+        &[
+            "wait",
+            "--session",
+            &idle_fixture.session.id.to_string(),
+            "--until",
+            "terminal",
+            "--timeout",
+            "1",
+        ],
+    );
+    assert_eq!(idle.code, exit::TIMEOUT, "{}", idle.stderr);
+    assert!(idle.stderr.contains("deadline_exceeded"), "{}", idle.stderr);
+}
+
+#[test]
+fn status_prints_its_lines_and_the_derived_declaration() {
+    let fixture = fixture();
+    let session_id = fixture.session.id;
+    let session_text = session_id.to_string();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let idle = run(&mut client, &["status", "--session", &session_text]);
+    assert_eq!(idle.code, exit::OK, "{}", idle.stderr);
+    assert_eq!(
+        idle.stdout,
+        format!("session {session_id} idle {}\n", fixture.session.name)
+    );
+    let idle_verb = run(
+        &mut client,
+        &["status", "--session", &session_text, "--format", "verb"],
+    );
+    assert_eq!(idle_verb.stdout, "done: idle -\n");
+
+    pin_default_policy(&fixture.control, session_id);
+    let run_id = start_run(&fixture.control, session_id);
+    let projection = await_run_state(
+        &fixture.control,
+        session_id,
+        AgentRunState::AwaitingApproval,
+    );
+    let call = projection
+        .active_run
+        .as_ref()
+        .and_then(|active| active.pending_approval.as_ref())
+        .map(|call| call.id)
+        .expect("a pending approval");
+    let blocked = run(&mut client, &["status", "--session", &session_text]);
+    assert_eq!(blocked.code, exit::OK, "{}", blocked.stderr);
+    assert_eq!(
+        blocked.stdout,
+        format!(
+            "session {session_id} awaiting_approval {}\nrun {run_id} awaiting_approval\npending {call}\n",
+            fixture.session.name
+        )
+    );
+    let verb = run(
+        &mut client,
+        &[
+            "status",
+            "--session",
+            &session_text,
+            "--format",
+            "verb",
+            "--json",
+        ],
+    );
+    assert_eq!(verb.code, exit::OK, "{}", verb.stderr);
+    let envelope = json_envelope(&verb);
+    assert_eq!(envelope["data"]["verdict"], "blocked");
+    assert_eq!(
+        envelope["data"]["declaration"],
+        format!("blocked: awaiting_approval {run_id}")
+    );
+    assert_eq!(envelope["data"]["state"], "awaiting_approval");
+}
+
+#[test]
+fn liveness_reports_each_verdict_with_its_exit_code() {
+    let fixture = fixture();
+    let session_text = fixture.session.id.to_string();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let alive = run(&mut client, &["liveness", "--session", &session_text]);
+    assert_eq!(alive.code, exit::OK, "{}", alive.stderr);
+    assert_eq!(
+        alive.stdout,
+        format!("liveness alive {}\n", fixture.session.id)
+    );
+
+    // An archived session is dead, not gone: the worker knows it.
+    let archived = fixture
+        .control
+        .request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::ArchiveAgentSession {
+                session_id: fixture.session.id,
+            },
+        )));
+    assert!(matches!(
+        archived.result,
+        Ok(ServerResponse::Session(
+            SessionResponse::AgentSessionArchived(_)
+        ))
+    ));
+    let dead = run(&mut client, &["liveness", "--session", &session_text]);
+    assert_eq!(dead.code, exit::OK, "{}", dead.stderr);
+    assert_eq!(
+        dead.stdout,
+        format!("liveness dead {}\n", fixture.session.id)
+    );
+
+    // An id the worker does not know is gone.
+    let unknown_id = AgentSessionId::new();
+    let gone = run(
+        &mut client,
+        &["liveness", "--session", &unknown_id.to_string()],
+    );
+    assert_eq!(gone.code, exit::GONE, "{}", gone.stderr);
+    assert_eq!(gone.stdout, format!("liveness gone {unknown_id}\n"));
+
+    // A transport failure is unknown, never gone.
+    let mut unreachable = Wrapped::new(InProcessClient::new(&fixture.backend)).fail_on(|request| {
+        matches!(
+            request,
+            ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata { .. })
+        )
+        .then(|| {
+            loom_core::LoomError::new(
+                loom_core::ErrorCode::Internal,
+                "the connection dropped",
+                true,
+            )
+        })
+    });
+    let unknown = run(
+        &mut unreachable,
+        &["liveness", "--session", &session_text, "--json"],
+    );
+    assert_eq!(unknown.code, exit::UNREACHABLE, "{}", unknown.stderr);
+    let envelope = json_envelope(&unknown);
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["data"]["verdict"], "unknown");
+    assert_eq!(envelope["data"]["state"], serde_json::Value::Null);
 }

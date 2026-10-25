@@ -17,7 +17,7 @@
 
 use std::{io::Write, path::Path, time::Duration};
 
-use loom_core::{EventSequence, RequestId};
+use loom_core::EventSequence;
 use loom_protocol::{
     ActivityDetail, ClientRequest, EventsRequest, EventsResponse, ServerEvent, ServerEventEnvelope,
     ServerResponse,
@@ -29,7 +29,7 @@ use crate::cli::client::Client;
 use crate::cli::cursor::{self, Cursor};
 use crate::cli::text::{self, Rendered};
 
-use super::{Caller, Failure, emit, handshake};
+use super::{Caller, Failure, Outcome, emit, handshake};
 
 /// How long `--follow` waits before asking again when nothing new arrived.
 const FOLLOW_MIN_DELAY: Duration = Duration::from_millis(250);
@@ -43,7 +43,7 @@ pub(super) async fn events<C: Client>(
     args: &EventsArgs,
     out: &mut dyn Write,
     err: &mut dyn Write,
-) -> Result<(Value, Option<RequestId>), Failure> {
+) -> Result<Outcome, Failure> {
     let mut caller = Caller::new(client);
     handshake(&mut caller, &invocation.verb).await?;
     let url = invocation.globals.connect.clone().unwrap_or_default();
@@ -209,7 +209,10 @@ pub(super) async fn events<C: Client>(
             "missing": gap.missing(),
         })
     });
-    Ok((json!({ "events": rendered, "gap": gap }), caller.primary))
+    Ok(Outcome::new(
+        json!({ "events": rendered, "gap": gap }),
+        caller.primary,
+    ))
 }
 
 /// `peek`: the newest events of a session, bounded by `--lines`.
@@ -219,7 +222,7 @@ pub(super) async fn peek<C: Client>(
     args: &PeekArgs,
     out: &mut dyn Write,
     _err: &mut dyn Write,
-) -> Result<(Value, Option<RequestId>), Failure> {
+) -> Result<Outcome, Failure> {
     let mut caller = Caller::new(client);
     handshake(&mut caller, &invocation.verb).await?;
     let (request_id, response) = caller
@@ -252,7 +255,7 @@ pub(super) async fn peek<C: Client>(
             &projected,
         )?;
     }
-    Ok((json!({ "events": rendered }), caller.primary))
+    Ok(Outcome::new(json!({ "events": rendered }), caller.primary))
 }
 
 /// One response's worth of events, normalised over both batch shapes.

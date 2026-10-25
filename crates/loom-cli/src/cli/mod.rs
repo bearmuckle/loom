@@ -15,22 +15,32 @@
 //! | `events` | `Events/GetSessionEvents` |
 //! | `peek` | `Events/GetRecentSessionEvents` |
 //! | `run` | `Control/Negotiate`, `Workspace/ListWorkspaceSessions`, `Workspace/CreateAgentSessionInWorkspace`, `Repository/AttachSessionRepository`, `Filesystem/AttachSessionDirectory`, `Session/SetSessionApprovalPolicy`, `Run/StartSessionAgentRunWithOptions` |
+//! | `send` | `Collaboration/GetRunRevision`, `Collaboration/DirectAgent` |
+//! | `answer` | `Collaboration/GetRunRevision`, `Collaboration/AnswerAgentQuestion` |
+//! | `approve`, `deny` | `Collaboration/GetRunRevision`, `Collaboration/ControlRun` with `Approve`/`Reject` |
+//! | `stop` | `Collaboration/GetRunRevision`, `Collaboration/ControlRun` with `Interrupt`, plus `Session/ArchiveAgentSession` with `--archive` |
+//! | `wait` | `Collaboration/GetRunRevision`, `Session/GetAgentSessionSnapshotMetadata` polling |
+//! | `status` | `Session/GetAgentSessionSnapshotMetadata` |
+//! | `liveness` | `Session/GetAgentSessionSnapshotMetadata` |
+//! | `result` | `Repository/ListSessionRepositories`, `Repository/GetSessionVcsStatus`, `Repository/GetSessionVcsDiff`, `Task/GetSessionTaskEvidence` |
 //!
 //! Every verb first sends `Control/Negotiate` with the version this build
 //! speaks and with only the capabilities it uses, because a worker refuses an
-//! unnegotiated connection. `ls`, `get`, `events`, and `peek` send nothing else,
-//! so they issue no mutation and leave the worker's journal and session
-//! snapshots untouched; they also negotiate only the read-only capabilities they
-//! use, so their handshake is unchanged by the mutating verb beside them.
+//! unnegotiated connection. `ls`, `get`, `events`, and `peek` are the read-only
+//! verbs: they send nothing else, so they issue no mutation and leave the
+//! worker's journal and session snapshots untouched, and they negotiate only
+//! the read-only capabilities they use.
 //!
-//! `run` is the one mutating verb, and it is the only verb whose requests change
-//! worker state:
+//! `run` starts a run, and it is described here because its requests are the
+//! longest sequence the client sends:
 //!
 //! 1. `Workspace/ListWorkspaceSessions { include_archived: false }` resolves the
 //!    workspace's live sessions. The first session whose name equals the
 //!    resolved name (`--name`, or one derived from the task) is reused;
 //!    otherwise the session is created with
-//!    `Workspace/CreateAgentSessionInWorkspace`.
+//!    `Workspace/CreateAgentSessionInWorkspace`. `--new` skips the listing
+//!    entirely and always creates a session, so a name is a label rather than
+//!    an identity.
 //! 2. The inputs are attached **only when this invocation created the session**:
 //!    `--repo` sends `Repository/AttachSessionRepository` and `--as-directory`
 //!    sends `Filesystem/AttachSessionDirectory`. A replay of the same command
@@ -53,6 +63,33 @@
 //! Its text output is exactly two lines, `session <session-id> <session-name>`
 //! and `run <run-id> <run-state>`, and it prints neither when the run did not
 //! start.
+//!
+//! # Control verbs
+//!
+//! `send`, `answer`, `approve`, and `deny` read `Collaboration/GetRunRevision`,
+//! send their collaboration request with that revision, and on `Conflict`
+//! re-read once and retry, because their intent is idempotent. `stop` sends
+//! `Interrupt` and refuses the same conflict unless `--retry-on-conflict` is
+//! given, so a stale revision cannot interrupt a run the caller has not seen.
+//! A conflict that survives the allowed retry is reported with the protocol's
+//! `conflict` code, which maps to exit `1` because it is neither a usage error
+//! nor a missing resource.
+//!
+//! `wait` polls `Session/GetAgentSessionSnapshotMetadata`, and reads
+//! `Collaboration/GetRunRevision` once it has something to report. It is always
+//! time-bounded: `--timeout` (60 seconds by default) ends the poll with
+//! `deadline_exceeded` and exit `4`. A run parked on an approval or a question
+//! is reported at once with exit `3`, and the `--json` envelope carries the
+//! attempt id and, for an approval, the tool call id. The timeout therefore
+//! covers only a run that is still working, never a person's decision.
+//!
+//! `status` derives its declaration from the run state: `working` for planning,
+//! executing, and evaluating, `blocked` for awaiting approval and needs input,
+//! `paused`, `done` for completed, and `failed` for failed and cancelled. The
+//! line is derived by this client from the run state; no worker writes it.
+//! `liveness` never guesses: an archived or terminal session is `dead`, a
+//! session the worker does not know is `gone` with exit `5`, a transport
+//! failure is `unknown` with exit `7`, and anything else is `alive`.
 //!
 //! # `loom-text/1`
 //!
@@ -97,6 +134,12 @@
 //! without `--json` they print one object per event,
 //! `{"seq":...,"stream_epoch":...,"session_id":...,"kind":...,"text":...,"event":...}`,
 //! where `kind` and `text` are exactly the text projection of that event.
+//!
+//! A verb whose documented exit code reports something other than success is
+//! still a successful determination: a blocked `wait` is `ok:true` with exit
+//! `3`, and a `liveness` verdict of `gone` or `unknown` is `ok:true` with exit
+//! `5` or `7`. The `data` payload carries the verdict, state, attempt id, and
+//! tool call id, so a caller never has to parse the message.
 //!
 //! # Exit codes
 //!
@@ -322,17 +365,17 @@ async fn run_invocation<C: Client>(
     let json = invocation.globals.json;
     let verb = args::verb_name(&invocation.verb);
     match verbs::run(client, invocation, out, err).await {
-        Ok((data, request_id)) => {
+        Ok(outcome) => {
             if json {
                 let envelope = serde_json::json!({
                     "ok": true,
                     "verb": verb,
-                    "request_id": request_id.map(|id| id.to_string()),
-                    "data": data,
+                    "request_id": outcome.request_id.map(|id| id.to_string()),
+                    "data": outcome.data,
                 });
                 write_json(out, &envelope);
             }
-            exit::OK
+            outcome.exit_code
         }
         Err(failure) => report_failure(&failure, json, verb, out, err),
     }
