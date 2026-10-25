@@ -330,11 +330,11 @@ fn whoami_ls_get_and_doctor_print_exact_lines() {
     assert_eq!(
         normalised,
         format!(
-            "protocol 11.11\ncapabilities 8 read_agent_session,subscribe_session_events,\
+            "protocol {}.{}\ncapabilities 8 read_agent_session,subscribe_session_events,\
              start_agent_run,read_worker_node_status,json_protocol,manage_workspaces,\
              manage_session_repositories,write_session_filesystem\nparticipant operator\n\
              node {} NODE\n",
-            node.name
+            CURRENT_PROTOCOL_VERSION.major, CURRENT_PROTOCOL_VERSION.minor, node.name
         )
     );
 }
