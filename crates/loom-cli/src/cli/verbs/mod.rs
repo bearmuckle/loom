@@ -155,6 +155,9 @@ pub(crate) struct Outcome {
     pub data: Value,
     pub request_id: Option<RequestId>,
     pub exit_code: i32,
+    /// Whether the worker answered a mutating request of this invocation from
+    /// its idempotency cache instead of acting again.
+    pub replayed: bool,
 }
 
 impl Outcome {
@@ -163,11 +166,17 @@ impl Outcome {
             data,
             request_id,
             exit_code: exit::OK,
+            replayed: false,
         }
     }
 
     pub(crate) fn with_code(mut self, exit_code: i32) -> Self {
         self.exit_code = exit_code;
+        self
+    }
+
+    pub(crate) fn with_replayed(mut self, replayed: bool) -> Self {
+        self.replayed = replayed;
         self
     }
 }
@@ -270,10 +279,12 @@ pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
     CapabilitySet::new(capabilities)
 }
 
-/// One connection's requests, remembering the id of the first one.
+/// One connection's requests, remembering the id of the first one and whether
+/// any answer was an idempotent replay.
 struct Caller<'a, C: Client> {
     client: &'a mut C,
     primary: Option<RequestId>,
+    replayed: bool,
 }
 
 impl<'a, C: Client> Caller<'a, C> {
@@ -281,7 +292,15 @@ impl<'a, C: Client> Caller<'a, C> {
         Self {
             client,
             primary: None,
+            replayed: false,
         }
+    }
+
+    /// Whether the worker served any request of this invocation from its
+    /// idempotency cache, which happens only when a mutating request repeated a
+    /// request id it had already answered.
+    fn replayed(&self) -> bool {
+        self.replayed
     }
 
     async fn call(
@@ -318,6 +337,9 @@ impl<'a, C: Client> Caller<'a, C> {
                 request_id: Some(request_id),
                 error,
             })?;
+        if response.replayed {
+            self.replayed = true;
+        }
         let result = response
             .result
             .map_err(|error| Failure::Server { request_id, error })?;
@@ -366,21 +388,55 @@ pub(crate) async fn run<C: Client>(
         Verb::Events(args) => events::events(client, invocation, args, out, err).await,
         Verb::Peek(args) => events::peek(client, invocation, args, out, err).await,
         Verb::Run(args) => run::run(client, invocation, args, out).await,
-        Verb::Send { run, text } => supervise::send(client, invocation, *run, text, out).await,
-        Verb::Answer { run, text } => supervise::answer(client, invocation, *run, text, out).await,
-        Verb::Approve { run, tool_call } => {
-            supervise::approve(client, invocation, *run, *tool_call, out).await
-        }
+        Verb::Send {
+            run,
+            text,
+            request_id,
+        } => supervise::send(client, invocation, *run, text, *request_id, out).await,
+        Verb::Answer {
+            run,
+            text,
+            request_id,
+        } => supervise::answer(client, invocation, *run, text, *request_id, out).await,
+        Verb::Approve {
+            run,
+            tool_call,
+            request_id,
+        } => supervise::approve(client, invocation, *run, *tool_call, *request_id, out).await,
         Verb::Deny {
             run,
             tool_call,
             reason,
-        } => supervise::deny(client, invocation, *run, *tool_call, reason.as_deref(), out).await,
+            request_id,
+        } => {
+            supervise::deny(
+                client,
+                invocation,
+                *run,
+                *tool_call,
+                reason.as_deref(),
+                *request_id,
+                out,
+            )
+            .await
+        }
         Verb::Stop {
             run,
             archive,
             retry_on_conflict,
-        } => supervise::stop(client, invocation, *run, *archive, *retry_on_conflict, out).await,
+            request_id,
+        } => {
+            supervise::stop(
+                client,
+                invocation,
+                *run,
+                *archive,
+                *retry_on_conflict,
+                *request_id,
+                out,
+            )
+            .await
+        }
         Verb::Wait {
             session,
             until,
@@ -404,7 +460,7 @@ pub(crate) async fn run<C: Client>(
             session,
             force,
             yes,
-        } => operator::delete(client, invocation, *session, *force, *yes, false, out).await,
+        } => operator::delete(client, invocation, *session, *force, *yes, false, None, out).await,
         Verb::ProjectArchive { session } => {
             operator::archive(client, invocation, *session, true, false, out).await
         }
@@ -412,7 +468,7 @@ pub(crate) async fn run<C: Client>(
             session,
             force,
             yes,
-        } => operator::delete(client, invocation, *session, *force, *yes, true, out).await,
+        } => operator::delete(client, invocation, *session, *force, *yes, true, None, out).await,
         Verb::ProjectWorktrees { session } => {
             operator::worktrees(client, invocation, *session, out).await
         }
@@ -448,7 +504,20 @@ pub(crate) async fn run<C: Client>(
             session,
             force,
             yes,
-        } => operator::delete(client, invocation, *session, *force, *yes, false, out).await,
+            request_id,
+        } => {
+            operator::delete(
+                client,
+                invocation,
+                *session,
+                *force,
+                *yes,
+                false,
+                *request_id,
+                out,
+            )
+            .await
+        }
     }
 }
 
@@ -477,4 +546,49 @@ fn emit(out: &mut dyn Write, line: &str) -> Result<(), Failure> {
             Failure::Internal(format!("could not write output: {error}"))
         }
     })
+}
+
+/// A deterministic id derived from `base` and `purpose`.
+///
+/// The protocol's `RequestId` is a UUID, so the pair is hashed into a valid
+/// version-4-shaped UUID. The derivation only has to be stable for the retry
+/// horizon of the worker's idempotency cache, which is what makes a repeated
+/// command with one base idempotent: `run --new` derives its session creation
+/// and its input attachments from one base, and `stop --archive` derives the
+/// archive from the interrupt's key, so no two mutations of one command share
+/// an id and a replay performs neither twice. `None` has no base to derive
+/// from and answers a fresh id, which is the behaviour of a command without
+/// `--request-id`.
+pub(super) fn derived_id(base: Option<RequestId>, purpose: &str) -> RequestId {
+    let Some(base) = base else {
+        return RequestId::new();
+    };
+    let label = format!("{base}/{purpose}");
+    let first = fnv1a(label.as_bytes(), 0xcbf2_9ce4_8422_2325);
+    let second = fnv1a(label.as_bytes(), 0x8422_2325_cbf2_9ce4);
+    let mut digits: Vec<char> = format!("{first:016x}{second:016x}").chars().collect();
+    // Version 4 and the RFC 4122 variant, so the value is a well-formed UUID
+    // that an older worker's request-id handling accepts.
+    digits[12] = '4';
+    digits[16] = '8';
+    let text: String = digits.into_iter().collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &text[0..8],
+        &text[8..12],
+        &text[12..16],
+        &text[16..20],
+        &text[20..32]
+    )
+    .parse()
+    .expect("a derived id is a well-formed UUID")
+}
+
+fn fnv1a(bytes: &[u8], seed: u64) -> u64 {
+    let mut hash = seed;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }

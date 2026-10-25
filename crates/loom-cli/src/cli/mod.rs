@@ -37,6 +37,21 @@
 //! | `project worktree integrate` | `Project/GetProjectSnapshotForSession`, `Project/IntegrateProjectChild` |
 //! | `project worktree cleanup` | `Project/GetProjectSnapshotForSession`, `Project/CleanupProjectChildWorktree` |
 //!
+//! The mutating requests of `run`, `send`, `answer`, `approve`, `deny`, `stop`,
+//! and `delete` are the ones `--request-id` keys. Everything else a verb sends,
+//! such as `Collaboration/GetRunRevision` and
+//! `Project/GetProjectSnapshotForSession`, is a read with a fresh id, and only
+//! the verb's own mutation carries the caller's key:
+//!
+//! | verb | keyed request | derived request |
+//! | --- | --- | --- |
+//! | `run` | `Run/StartSessionAgentRunWithOptions` | `--new` also derives the session creation, the input attachments, and the policy change |
+//! | `send` | `Collaboration/DirectAgent` | — |
+//! | `answer` | `Collaboration/AnswerAgentQuestion` | — |
+//! | `approve`, `deny` | `Collaboration/ControlRun` | — |
+//! | `stop` | `Collaboration/ControlRun` | `Session/ArchiveAgentSession` with `--archive` |
+//! | `delete` | `Session/DeleteAgentSession` | — |
+//!
 //! Every verb first sends `Control/Negotiate` with the version this build
 //! speaks and with only the capabilities it uses, because a worker refuses an
 //! unnegotiated connection. `node`, `whoami`, `ls`, `get`, `events`, `peek`,
@@ -147,7 +162,11 @@
 //! given, so a stale revision cannot interrupt a run the caller has not seen.
 //! A conflict that survives the allowed retry is reported with the protocol's
 //! `conflict` code, which maps to exit `1` because it is neither a usage error
-//! nor a missing resource.
+//! nor a missing resource. A key never turns a conflict into a success: the
+//! re-read revision makes the retry a different request, so it is sent as a new
+//! one, a command the worker already answered under that key is refused as a
+//! key conflict rather than replayed, and the run still refuses what it would
+//! refuse without a key.
 //!
 //! `wait` polls `Session/GetAgentSessionSnapshotMetadata`, and reads
 //! `Collaboration/GetRunRevision` once it has something to report. It is always
@@ -207,13 +226,17 @@
 //! # `--json`
 //!
 //! `--json` prints exactly one envelope on stdout. Success is
-//! `{"ok":true,"verb":...,"request_id":...,"data":...}` with the requested
-//! payload in `data`; failure is
+//! `{"ok":true,"verb":...,"request_id":...,"replayed":...,"data":...}` with
+//! the requested payload in `data`; failure is
 //! `{"ok":false,"verb":...,"request_id":...,"error":{"code":...,"message":...,"retryable":...,"exit_code":...}}`.
 //! `request_id` is the id of the verb's primary request (its first request, or
 //! its handshake), or `null` when no request was sent. `run` reports its run
 //! start instead, because that is the id its caller chose and the key a replay
-//! reuses. `events` adds `gap` (`after`, `before`, `missing`) when a snapshot
+//! reuses. `replayed` is `true` only when the worker answered a mutating
+//! request of this invocation from its idempotency cache instead of acting
+//! again, which happens only when the caller repeated a `--request-id`; every
+//! other success reports `false`, and a failure envelope has no such field.
+//! `events` adds `gap` (`after`, `before`, `missing`) when a snapshot
 //! could not carry every event after the cursor, and `null` otherwise.
 //!
 //! `events --format jsonl` and `peek --format jsonl` are a different shape:
@@ -457,6 +480,7 @@ async fn run_invocation<C: Client>(
                     "ok": true,
                     "verb": verb,
                     "request_id": outcome.request_id.map(|id| id.to_string()),
+                    "replayed": outcome.replayed,
                     "data": outcome.data,
                 });
                 write_json(out, &envelope);
