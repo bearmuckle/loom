@@ -6,6 +6,13 @@
 //! `Conflict` because their intent is idempotent; `stop` refuses the conflict
 //! unless `--retry-on-conflict` is given, so a stale revision cannot interrupt
 //! a run whose state the caller has not seen.
+//!
+//! `--request-id` names the id of the verb's own mutation, and only of that
+//! mutation: the revision reads before it are ordinary fresh-id reads. A
+//! repeated key is answered from the worker's idempotency cache, and the
+//! `--json` envelope then reports `replayed: true`. `stop --archive` keys its
+//! archive under an id derived from the same key, so a replay neither
+//! interrupts nor archives twice.
 
 use std::{
     io::Write,
@@ -30,7 +37,7 @@ use crate::cli::client::Client;
 use crate::cli::exit;
 use crate::cli::text::{escape, run_state_name, session_state_name};
 
-use super::{Caller, Failure, Outcome, emit, handshake};
+use super::{Caller, Failure, Outcome, derived_id, emit, handshake};
 
 /// How long `wait` waits before its first poll returns nothing new.
 const WAIT_MIN_DELAY: Duration = Duration::from_millis(250);
@@ -43,27 +50,7 @@ pub(super) async fn send<C: Client>(
     invocation: &Invocation,
     run_id: RunId,
     text: &str,
-    out: &mut dyn Write,
-) -> Result<Outcome, Failure> {
-    let mut caller = Caller::new(client);
-    handshake(&mut caller, &invocation.verb).await?;
-    let outcome = act(&mut caller, run_id, true, "direct the agent", |expected| {
-        ClientRequest::Collaboration(CollaborationRequest::DirectAgent {
-            run_id,
-            expected,
-            text: text.to_owned(),
-        })
-    })
-    .await?;
-    finish_action(invocation, "send", None, &outcome, caller.primary, out)
-}
-
-/// `answer`: the answer to the question the run waits on.
-pub(super) async fn answer<C: Client>(
-    client: &mut C,
-    invocation: &Invocation,
-    run_id: RunId,
-    text: &str,
+    request_id: Option<RequestId>,
     out: &mut dyn Write,
 ) -> Result<Outcome, Failure> {
     let mut caller = Caller::new(client);
@@ -72,6 +59,44 @@ pub(super) async fn answer<C: Client>(
         &mut caller,
         run_id,
         true,
+        request_id,
+        "direct the agent",
+        |expected| {
+            ClientRequest::Collaboration(CollaborationRequest::DirectAgent {
+                run_id,
+                expected,
+                text: text.to_owned(),
+            })
+        },
+    )
+    .await?;
+    finish_action(
+        invocation,
+        "send",
+        None,
+        &outcome,
+        caller.primary,
+        caller.replayed(),
+        out,
+    )
+}
+
+/// `answer`: the answer to the question the run waits on.
+pub(super) async fn answer<C: Client>(
+    client: &mut C,
+    invocation: &Invocation,
+    run_id: RunId,
+    text: &str,
+    request_id: Option<RequestId>,
+    out: &mut dyn Write,
+) -> Result<Outcome, Failure> {
+    let mut caller = Caller::new(client);
+    handshake(&mut caller, &invocation.verb).await?;
+    let outcome = act(
+        &mut caller,
+        run_id,
+        true,
+        request_id,
         "answer the agent question",
         |expected| {
             ClientRequest::Collaboration(CollaborationRequest::AnswerAgentQuestion {
@@ -82,7 +107,15 @@ pub(super) async fn answer<C: Client>(
         },
     )
     .await?;
-    finish_action(invocation, "answer", None, &outcome, caller.primary, out)
+    finish_action(
+        invocation,
+        "answer",
+        None,
+        &outcome,
+        caller.primary,
+        caller.replayed(),
+        out,
+    )
 }
 
 /// `approve`: approve the blocked tool call.
@@ -91,6 +124,7 @@ pub(super) async fn approve<C: Client>(
     invocation: &Invocation,
     run_id: RunId,
     tool_call_id: ToolCallId,
+    request_id: Option<RequestId>,
     out: &mut dyn Write,
 ) -> Result<Outcome, Failure> {
     let mut caller = Caller::new(client);
@@ -99,6 +133,7 @@ pub(super) async fn approve<C: Client>(
         &mut caller,
         run_id,
         true,
+        request_id,
         "approve the tool call",
         |expected| {
             ClientRequest::Collaboration(CollaborationRequest::ControlRun {
@@ -115,6 +150,7 @@ pub(super) async fn approve<C: Client>(
         Some(tool_call_id),
         &outcome,
         caller.primary,
+        caller.replayed(),
         out,
     )
 }
@@ -126,6 +162,7 @@ pub(super) async fn deny<C: Client>(
     run_id: RunId,
     tool_call_id: ToolCallId,
     reason: Option<&str>,
+    request_id: Option<RequestId>,
     out: &mut dyn Write,
 ) -> Result<Outcome, Failure> {
     let mut caller = Caller::new(client);
@@ -134,6 +171,7 @@ pub(super) async fn deny<C: Client>(
         &mut caller,
         run_id,
         true,
+        request_id,
         "deny the tool call",
         |expected| {
             ClientRequest::Collaboration(CollaborationRequest::ControlRun {
@@ -153,6 +191,7 @@ pub(super) async fn deny<C: Client>(
         Some(tool_call_id),
         &outcome,
         caller.primary,
+        caller.replayed(),
         out,
     )
 }
@@ -165,6 +204,7 @@ pub(super) async fn stop<C: Client>(
     run_id: RunId,
     archive: Option<AgentSessionId>,
     retry_on_conflict: bool,
+    request_id: Option<RequestId>,
     out: &mut dyn Write,
 ) -> Result<Outcome, Failure> {
     let mut caller = Caller::new(client);
@@ -173,6 +213,7 @@ pub(super) async fn stop<C: Client>(
         &mut caller,
         run_id,
         retry_on_conflict,
+        request_id,
         "stop the run",
         |expected| {
             ClientRequest::Collaboration(CollaborationRequest::ControlRun {
@@ -188,10 +229,15 @@ pub(super) async fn stop<C: Client>(
     };
     let mut archived = false;
     if let Some(session_id) = archive {
+        // The archive is keyed by an id derived from the interrupt's key, so a
+        // repeated `stop --archive` replays both mutations instead of
+        // interrupting and archiving a second time. Without a key the
+        // derivation answers a fresh id, as an unkeyed command always did.
         let (request_id, response) = caller
-            .call(ClientRequest::Session(
-                SessionRequest::ArchiveAgentSession { session_id },
-            ))
+            .call_with_id(
+                derived_id(request_id, "archive"),
+                ClientRequest::Session(SessionRequest::ArchiveAgentSession { session_id }),
+            )
             .await?;
         match response {
             ServerResponse::Session(SessionResponse::AgentSessionArchived(_)) => archived = true,
@@ -214,7 +260,7 @@ pub(super) async fn stop<C: Client>(
         "revision": revision,
         "archived": archive.filter(|_| archived).map(|id| id.to_string()),
     });
-    Ok(Outcome::new(data, caller.primary))
+    Ok(Outcome::new(data, caller.primary).with_replayed(caller.replayed()))
 }
 
 /// Reads the run's current revision.
@@ -241,14 +287,18 @@ async fn act<C: Client, F>(
     caller: &mut Caller<'_, C>,
     run_id: RunId,
     retry: bool,
+    request_id: Option<RequestId>,
     what: &str,
     make: F,
 ) -> Result<RunActionOutcome, Failure>
 where
     F: Fn(RunRevision) -> ClientRequest,
 {
+    // The caller's key, when it named one, is the id of this mutation; without
+    // a key every attempt is a new request.
+    let key = request_id.unwrap_or_default();
     let expected = revision(caller, run_id).await?;
-    let (request_id, response) = caller.call(make(expected)).await?;
+    let (request_id, response) = caller.call_with_id(key, make(expected)).await?;
     let outcome = run_action(request_id, response)?;
     if matches!(outcome, RunActionOutcome::Conflict { .. }) {
         if !retry {
@@ -260,7 +310,12 @@ where
                 ),
             ));
         }
-        // The caller's intent is idempotent, so re-read once and act again.
+        // The caller's intent is idempotent, so re-read once and act again. The
+        // retry is a new request: the worker caches the answer it gave the
+        // first attempt under that key, and a retry carrying a re-read revision
+        // is a different request, so reusing the key would only be refused as a
+        // key reused for another mutation. A conflict applied nothing, so a
+        // fresh id is safe.
         let refreshed = revision(caller, run_id).await?;
         let (request_id, response) = caller.call(make(refreshed)).await?;
         let outcome = run_action(request_id, response)?;
@@ -292,6 +347,7 @@ fn finish_action(
     tool_call_id: Option<ToolCallId>,
     outcome: &RunActionOutcome,
     request_id: Option<RequestId>,
+    replayed: bool,
     out: &mut dyn Write,
 ) -> Result<Outcome, Failure> {
     let RunActionOutcome::Accepted { run, revision, .. } = outcome else {
@@ -322,7 +378,7 @@ fn finish_action(
     if let Some(tool_call_id) = tool_call_id {
         data["tool_call_id"] = json!(tool_call_id.to_string());
     }
-    Ok(Outcome::new(data, request_id))
+    Ok(Outcome::new(data, request_id).with_replayed(replayed))
 }
 
 /// The run fields every control verb reports.

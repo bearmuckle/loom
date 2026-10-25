@@ -14,16 +14,18 @@ use loom_core::{
     GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus, GitFileStatusKind,
     GitRepositoryStatus, ProjectAgentPermissions, ProjectAgentRecord, ProjectId, ProjectSnapshot,
     ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord, ProjectWorktreeStatus,
-    ProtocolVersion, RepositoryId, RequestId, RunId, TaskId, Timestamp, ToolCallId, WorkspaceId,
+    ProtocolVersion, RepositoryId, RequestId, RunId, RunRevision, TaskId, Timestamp, ToolCallId,
+    WorkspaceId,
 };
 use loom_model::ModelId;
 use loom_protocol::{
     ActivityDetail, AgentEvent, AgentRunSnapshot, AgentRunState, AgentSessionSnapshotProjection,
-    CURRENT_PROTOCOL_VERSION, ClientRequest, CollaborationRequest, ControlRequest, ControlResponse,
-    EventsRequest, EventsResponse, FilesystemRequest, FilesystemResponse, ProjectRequest,
-    ProjectResponse, RepositoryRequest, RepositoryResponse, RequestEnvelope, ResponseEnvelope,
-    RunRequest, RunResponse, ServerEvent, ServerEventEnvelope, ServerResponse, SessionDirectory,
-    SessionRepository, SessionRequest, SessionResponse, WorkspaceRequest, WorkspaceResponse,
+    CURRENT_PROTOCOL_VERSION, ClientRequest, CollaborationRequest, CollaborationResponse,
+    ControlRequest, ControlResponse, EventsRequest, EventsResponse, FilesystemRequest,
+    FilesystemResponse, ProjectRequest, ProjectResponse, RepositoryRequest, RepositoryResponse,
+    RequestEnvelope, ResponseEnvelope, RunRequest, RunResponse, ServerEvent, ServerEventEnvelope,
+    ServerResponse, SessionDirectory, SessionRepository, SessionRequest, SessionResponse,
+    WorkspaceRequest, WorkspaceResponse,
 };
 use loom_server::{InProcessBackend, InProcessConnection};
 
@@ -2040,6 +2042,423 @@ fn every_control_verb_reports_a_json_envelope() {
     assert_eq!(envelope["data"]["action"], "answer");
 }
 
+// 6b. Idempotency keys on the mutating control verbs. A `--request-id` names
+// the verb's own mutation, so a repeated key is answered from the worker's
+// cache and the envelope says so, while a key never makes the run accept what
+// it would refuse without one.
+
+/// The revision the worker reports for one run, which is what a mutating
+/// control request names as its expected revision.
+fn run_revision(connection: &InProcessConnection, run_id: RunId) -> RunRevision {
+    match connection
+        .request(RequestEnvelope::new(ClientRequest::Collaboration(
+            CollaborationRequest::GetRunRevision { run_id },
+        )))
+        .result
+    {
+        Ok(ServerResponse::Collaboration(CollaborationResponse::RunRevision {
+            revision, ..
+        })) => revision,
+        other => panic!("unexpected run revision response: {other:?}"),
+    }
+}
+
+/// A client that answers `Collaboration/GetRunRevision` with `revision`.
+///
+/// The worker replays only the request it already answered, and a control
+/// request carries the revision it was built from, so repeating one means
+/// repeating that revision too. Pinning the read is how a test repeats the
+/// same mutation after the first copy moved the run, which is the state a
+/// transport-level retry of that envelope is in.
+fn pinned_revision_client(
+    backend: &Arc<InProcessBackend>,
+    run_id: RunId,
+    revision: RunRevision,
+) -> Wrapped<InProcessClient> {
+    Wrapped::new(InProcessClient::new(backend)).after(move |request, response| {
+        if matches!(
+            request,
+            ClientRequest::Collaboration(CollaborationRequest::GetRunRevision { run_id: asked })
+                if *asked == run_id
+        ) {
+            response.result = Ok(ServerResponse::Collaboration(
+                CollaborationResponse::RunRevision { run_id, revision },
+            ));
+        }
+    })
+}
+
+#[test]
+fn a_repeated_control_request_id_replays_instead_of_acting_twice() {
+    let fixture = fixture();
+    let session_id = fixture.session.id;
+    pin_default_policy(&fixture.control, session_id);
+    let run_id = start_run(&fixture.control, session_id);
+    let projection = await_run_state(
+        &fixture.control,
+        session_id,
+        AgentRunState::AwaitingApproval,
+    );
+    let call = projection
+        .active_run
+        .as_ref()
+        .and_then(|active| active.pending_approval.as_ref())
+        .map(|call| call.id)
+        .expect("the run is parked on a tool call");
+    let mut client = pinned_revision_client(
+        &fixture.backend,
+        run_id,
+        run_revision(&fixture.control, run_id),
+    );
+    let run_text = run_id.to_string();
+    let call_text = call.to_string();
+    let request_id = RequestId::new().to_string();
+    let arguments = [
+        "approve",
+        "--json",
+        "--run",
+        &run_text,
+        "--tool-call",
+        &call_text,
+        "--request-id",
+        &request_id,
+    ];
+
+    let first = run(&mut client, &arguments);
+    assert_eq!(first.code, exit::OK, "{}", first.stderr);
+    let first_envelope = json_envelope(&first);
+    assert_eq!(first_envelope["verb"], "approve");
+    assert_eq!(
+        first_envelope["request_id"].as_str().map(str::len),
+        Some(36),
+        "the envelope still reports the verb's primary request"
+    );
+    assert_eq!(first_envelope["replayed"], false);
+    let after_first = session_projection(&fixture.control, session_id)
+        .active_run
+        .expect("the run is still there")
+        .run
+        .control_revision;
+
+    let replay = run(&mut client, &arguments);
+    assert_eq!(replay.code, exit::OK, "{}", replay.stderr);
+    let replay_envelope = json_envelope(&replay);
+    assert_eq!(
+        replay_envelope["replayed"], true,
+        "the answer is served from the worker's cache"
+    );
+    assert_eq!(
+        replay_envelope["data"], first_envelope["data"],
+        "the replay repeats the first answer"
+    );
+    assert_eq!(
+        session_projection(&fixture.control, session_id)
+            .active_run
+            .expect("the run is still there")
+            .run
+            .control_revision,
+        after_first,
+        "the replay applied nothing, so the control revision did not advance"
+    );
+
+    // Text output does not change shape for a replay: a repeated command prints
+    // exactly what the previous one printed.
+    let text_arguments = [
+        "approve",
+        "--run",
+        &run_text,
+        "--tool-call",
+        &call_text,
+        "--request-id",
+        &request_id,
+    ];
+    let printed = run(&mut client, &text_arguments);
+    let printed_again = run(&mut client, &text_arguments);
+    assert_eq!(printed.code, exit::OK, "{}", printed.stderr);
+    assert_eq!(printed_again.code, exit::OK, "{}", printed_again.stderr);
+    assert_eq!(printed.stdout, printed_again.stdout);
+    assert_eq!(
+        printed.stdout,
+        format!("approved {call} {run_id} executing\n")
+    );
+}
+
+#[test]
+fn a_request_id_names_one_mutation_and_a_different_one_is_a_conflict() {
+    let fixture = fixture();
+    let session_id = fixture.session.id;
+    pin_auto_policy(&fixture.control, session_id);
+    let run_id = start_run(&fixture.control, session_id);
+    await_run_state(&fixture.control, session_id, AgentRunState::Completed);
+    let mut client = pinned_revision_client(
+        &fixture.backend,
+        run_id,
+        run_revision(&fixture.control, run_id),
+    );
+    let run_text = run_id.to_string();
+    let request_id = RequestId::new().to_string();
+
+    let first = run(
+        &mut client,
+        &[
+            "send",
+            "--json",
+            "--run",
+            &run_text,
+            "--text",
+            "first direction",
+            "--request-id",
+            &request_id,
+        ],
+    );
+    assert_eq!(first.code, exit::OK, "{}", first.stderr);
+    assert_eq!(json_envelope(&first)["replayed"], false);
+    await_event(&fixture.control, session_id, |event| {
+        matches!(
+            event,
+            ServerEvent::Agent {
+                event: AgentEvent::UserMessage { text, .. }
+            } if text.contains("first direction")
+        )
+    });
+
+    // The same key with other text is refused as a key conflict and the second
+    // direction is never delivered.
+    let second = run(
+        &mut client,
+        &[
+            "send",
+            "--json",
+            "--run",
+            &run_text,
+            "--text",
+            "second direction",
+            "--request-id",
+            &request_id,
+        ],
+    );
+    assert_eq!(second.code, exit::INTERNAL, "{}", second.stderr);
+    let envelope = json_envelope(&second);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "conflict");
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&request_id),
+        "the refusal names the key: {envelope}"
+    );
+    assert!(
+        journal(&fixture.control, session_id)
+            .iter()
+            .all(|envelope| match &envelope.event {
+                ServerEvent::Agent {
+                    event: AgentEvent::UserMessage { text, .. },
+                } => !text.contains("second direction"),
+                _ => true,
+            }),
+        "a refused key delivers nothing"
+    );
+}
+
+#[test]
+fn stop_with_archive_replays_both_mutations_under_one_key() {
+    let fixture = fixture();
+    let session_id = fixture.session.id;
+    pin_default_policy(&fixture.control, session_id);
+    let run_id = start_run(&fixture.control, session_id);
+    await_run_state(
+        &fixture.control,
+        session_id,
+        AgentRunState::AwaitingApproval,
+    );
+    let mut client = pinned_revision_client(
+        &fixture.backend,
+        run_id,
+        run_revision(&fixture.control, run_id),
+    );
+    let run_text = run_id.to_string();
+    let session_text = session_id.to_string();
+    let request_id = RequestId::new().to_string();
+    let arguments = [
+        "stop",
+        "--json",
+        "--run",
+        &run_text,
+        "--session",
+        &session_text,
+        "--archive",
+        "--request-id",
+        &request_id,
+    ];
+
+    let first = run(&mut client, &arguments);
+    assert_eq!(first.code, exit::OK, "{}", first.stderr);
+    let first_envelope = json_envelope(&first);
+    assert_eq!(first_envelope["data"]["archived"], session_text.as_str());
+    assert_eq!(first_envelope["replayed"], false);
+    assert_eq!(
+        session_snapshot(&fixture.control, session_id).state,
+        AgentSessionState::Archived
+    );
+
+    let replay = run(&mut client, &arguments);
+    assert_eq!(replay.code, exit::OK, "{}", replay.stderr);
+    let replay_envelope = json_envelope(&replay);
+    assert_eq!(replay_envelope["replayed"], true);
+    assert_eq!(replay_envelope["data"], first_envelope["data"]);
+    assert_eq!(
+        session_snapshot(&fixture.control, session_id).state,
+        AgentSessionState::Archived
+    );
+    // The derived archive id is what keeps the session from being archived a
+    // second time under the same key.
+    let archives = journal(&fixture.control, session_id)
+        .iter()
+        .filter(|envelope| {
+            matches!(
+                envelope.event,
+                ServerEvent::AgentSessionArchived { session_id: archived } if archived == session_id
+            )
+        })
+        .count();
+    assert_eq!(archives, 1, "the session is archived exactly once");
+}
+
+#[test]
+fn two_request_ids_are_two_operations() {
+    let fixture = fixture();
+    let session_id = fixture.session.id;
+    pin_auto_policy(&fixture.control, session_id);
+    let run_id = start_run(&fixture.control, session_id);
+    await_run_state(&fixture.control, session_id, AgentRunState::Completed);
+    let mut client = InProcessClient::new(&fixture.backend);
+    let run_text = run_id.to_string();
+
+    for text in ["one", "two"] {
+        let request_id = RequestId::new().to_string();
+        let outcome = run(
+            &mut client,
+            &[
+                "send",
+                "--json",
+                "--run",
+                &run_text,
+                "--text",
+                text,
+                "--request-id",
+                &request_id,
+            ],
+        );
+        assert_eq!(outcome.code, exit::OK, "{}", outcome.stderr);
+        let envelope = json_envelope(&outcome);
+        assert_eq!(
+            envelope["replayed"], false,
+            "{text} is a new operation, because its own key is unused"
+        );
+        let delivered = text.to_owned();
+        await_event(&fixture.control, session_id, |event| {
+            matches!(
+                event,
+                ServerEvent::Agent {
+                    event: AgentEvent::UserMessage { text, .. }
+                } if *text == delivered
+            )
+        });
+    }
+}
+
+#[test]
+fn a_request_id_never_turns_a_stale_revision_into_a_success() {
+    // `stop` refuses a stale revision, and a key does not change that.
+    let stopping = fixture();
+    let session_id = stopping.session.id;
+    pin_default_policy(&stopping.control, session_id);
+    let run_id = start_run(&stopping.control, session_id);
+    await_run_state(
+        &stopping.control,
+        session_id,
+        AgentRunState::AwaitingApproval,
+    );
+    let request_id = RequestId::new().to_string();
+    let mut stale = Wrapped::new(InProcessClient::new(&stopping.backend)).before(|envelope| {
+        if let ClientRequest::Collaboration(CollaborationRequest::ControlRun { expected, .. }) =
+            &mut envelope.request
+        {
+            expected.action_sequence += 1;
+        }
+    });
+    let refused = run(
+        &mut stale,
+        &[
+            "stop",
+            "--run",
+            &run_id.to_string(),
+            "--request-id",
+            &request_id,
+        ],
+    );
+    assert_eq!(refused.code, exit::INTERNAL, "{}", refused.stderr);
+    assert!(refused.stderr.contains("conflict"), "{}", refused.stderr);
+    assert_eq!(
+        session_projection(&stopping.control, session_id)
+            .active_run
+            .expect("the run is still there")
+            .run
+            .state,
+        AgentRunState::AwaitingApproval,
+        "a refused action changes nothing"
+    );
+    drop(stale);
+
+    // The retry `send` allows after a conflict is a new request: the conflict
+    // applied nothing, and the worker keeps the answer it gave the key.
+    let second = fixture();
+    let session_id = second.session.id;
+    pin_auto_policy(&second.control, session_id);
+    let run_id = start_run(&second.control, session_id);
+    await_run_state(&second.control, session_id, AgentRunState::Completed);
+    let sent = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let hook = std::rc::Rc::clone(&sent);
+    let mut retrying =
+        Wrapped::new(InProcessClient::new(&second.backend)).before(move |envelope| {
+            if let ClientRequest::Collaboration(CollaborationRequest::DirectAgent {
+                expected,
+                ..
+            }) = &mut envelope.request
+            {
+                let attempt = envelope.request_id;
+                hook.borrow_mut().push(attempt);
+                if hook.borrow().len() == 1 {
+                    expected.action_sequence += 1;
+                }
+            }
+        });
+    let request_id = RequestId::new().to_string();
+    let outcome = run(
+        &mut retrying,
+        &[
+            "send",
+            "--json",
+            "--run",
+            &run_id.to_string(),
+            "--text",
+            "after a conflict",
+            "--request-id",
+            &request_id,
+        ],
+    );
+    assert_eq!(outcome.code, exit::OK, "{}", outcome.stderr);
+    assert_eq!(json_envelope(&outcome)["replayed"], false);
+    let attempts = sent.borrow();
+    assert_eq!(attempts.len(), 2, "one stale direction and one retry");
+    assert_eq!(attempts[0], request_id.parse::<RequestId>().unwrap());
+    assert_ne!(
+        attempts[0], attempts[1],
+        "the retry is a new request, not the used key again"
+    );
+}
+
 // 7. The `run` verb: the session it reuses or creates, the inputs it attaches,
 // the policy it pins, and the run start it makes replayable.
 
@@ -3580,6 +3999,123 @@ fn the_parser_covers_the_control_verbs_and_rejects_their_mistakes() {
 }
 
 #[test]
+fn the_parser_accepts_a_request_id_on_every_mutating_verb() {
+    let run_text = RunId::new().to_string();
+    let session = AgentSessionId::new().to_string();
+    let call = ToolCallId::new().to_string();
+    let request_id = RequestId::new();
+    let key = request_id.to_string();
+
+    // Every mutating verb takes the flag, with and without it present.
+    for arguments in [
+        vec!["send", "--run", &run_text, "--text", "go"],
+        vec!["answer", "--run", &run_text, "--text", "yes"],
+        vec!["approve", "--run", &run_text, "--tool-call", &call],
+        vec!["deny", "--run", &run_text, "--tool-call", &call],
+        vec!["stop", "--run", &run_text],
+        vec!["delete", &session],
+    ] {
+        assert_eq!(
+            verb_request_id(&invocation(&arguments).verb),
+            None,
+            "{arguments:?}"
+        );
+        let mut keyed = arguments.clone();
+        keyed.extend(["--request-id", &key]);
+        assert_eq!(
+            verb_request_id(&invocation(&keyed).verb),
+            Some(request_id),
+            "{keyed:?}"
+        );
+    }
+    let equals = format!("--request-id={key}");
+    assert_eq!(
+        verb_request_id(&invocation(&["send", "--run", &run_text, "--text", "go", &equals]).verb),
+        Some(request_id),
+        "the equals form reaches the same place"
+    );
+
+    // A verb whose mutation the flag does not key rejects it as a usage error.
+    let mut offline = OfflineClient;
+    for arguments in [
+        vec!["wait", "--session", &session, "--request-id", &key],
+        vec!["ls", "--request-id", &key],
+        vec!["status", "--session", &session, "--request-id", &key],
+        vec!["liveness", "--session", &session, "--request-id", &key],
+    ] {
+        let refused = run_owned(&mut offline, &owned(&arguments));
+        assert_eq!(refused.code, exit::USAGE, "{arguments:?}");
+        assert_eq!(refused.stdout, "", "{arguments:?}");
+        assert!(
+            refused.stderr.contains("does not apply"),
+            "{arguments:?}: {}",
+            refused.stderr
+        );
+    }
+
+    // A value that is not a UUID is a usage error with one wording.
+    let message = "'not-a-uuid' is not a valid request id; --request-id takes a UUID";
+    assert_eq!(
+        parse_error(&[
+            "send",
+            "--run",
+            &run_text,
+            "--text",
+            "go",
+            "--request-id",
+            "not-a-uuid"
+        ]),
+        message
+    );
+    assert_eq!(
+        parse_error(&["delete", &session, "--request-id", "not-a-uuid"]),
+        message
+    );
+    assert_eq!(
+        parse_error(&[
+            "run",
+            "--workspace",
+            &WorkspaceId::new().to_string(),
+            "--task",
+            "a task",
+            "--request-id",
+            "not-a-uuid"
+        ]),
+        message,
+        "run shares the same helper and the same wording"
+    );
+    let refused = run(
+        &mut offline,
+        &[
+            "approve",
+            "--run",
+            &run_text,
+            "--tool-call",
+            &call,
+            "--request-id",
+            "not-a-uuid",
+        ],
+    );
+    assert_eq!(refused.code, exit::USAGE, "{}", refused.stderr);
+    assert_eq!(refused.stdout, "");
+    assert!(refused.stderr.contains(message), "{}", refused.stderr);
+}
+
+/// The idempotency key a parsed verb carries, for the verbs that take one.
+fn verb_request_id(verb: &Verb) -> Option<RequestId> {
+    match verb {
+        Verb::Run(args) => args.request_id,
+        Verb::Send { request_id, .. }
+        | Verb::Answer { request_id, .. }
+        | Verb::Approve { request_id, .. }
+        | Verb::Deny { request_id, .. }
+        | Verb::Stop { request_id, .. }
+        | Verb::Delete { request_id, .. } => *request_id,
+        _ => None,
+    }
+}
+
+#[test]
 fn wait_reports_blocked_and_terminal_and_is_always_bounded() {
     // Blocked: the run parks on the first approval and the wait returns at once
     // with the attempt and the tool call in both the text and the envelope.
@@ -4674,6 +5210,52 @@ fn delete_force_reports_the_worktrees_it_discards() {
         &["delete", &session.to_string(), "--force", "--yes", "--json"],
     );
     assert_eq!(again.code, exit::GONE, "{}", again.stderr);
+    drop(client);
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn delete_replays_its_answer_under_the_same_key() {
+    let (fixture, directory) = persistent_fixture("delete-replay");
+    let session = fixture.session.id;
+    archive_session(&fixture.control, session);
+    // The pre-read is a lookup, not the keyed mutation: a deleted session has no
+    // snapshot left to read, so the wrapper answers it for both invocations and
+    // the second one reaches the keyed deletion.
+    let mut client = with_project_snapshot(
+        Wrapped::new(InProcessClient::new(&fixture.backend)),
+        session,
+        fake_project(session, &[session], Vec::new()),
+    );
+    let session_text = session.to_string();
+    let request_id = RequestId::new().to_string();
+    let arguments = [
+        "delete",
+        "--json",
+        &session_text,
+        "--request-id",
+        &request_id,
+    ];
+
+    let first = run(&mut client, &arguments);
+    assert_eq!(first.code, exit::OK, "{}", first.stderr);
+    let first_envelope = json_envelope(&first);
+    assert_eq!(first_envelope["replayed"], false);
+    assert_eq!(
+        first_envelope["data"]["deleted_sessions"],
+        serde_json::json!([session_text.clone()])
+    );
+    let gone = run(&mut client, &["get", &session_text]);
+    assert_eq!(gone.code, exit::GONE, "{}", gone.stderr);
+
+    // The session no longer exists to delete again, so the answer can only come
+    // from the worker's cache, and it says so.
+    let replay = run(&mut client, &arguments);
+    assert_eq!(replay.code, exit::OK, "{}", replay.stderr);
+    let replay_envelope = json_envelope(&replay);
+    assert_eq!(replay_envelope["replayed"], true);
+    assert_eq!(replay_envelope["data"], first_envelope["data"]);
+
     drop(client);
     close_persistent_fixture(fixture, directory);
 }

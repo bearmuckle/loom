@@ -20,7 +20,8 @@
 //!   worker's durable idempotency cache with the same run instead of starting a
 //!   second one. The idempotency key is the run start alone: session creation,
 //!   the attachments, and the policy change use fresh ids, which is why they are
-//!   safe to repeat.
+//!   safe to repeat. An answer served from that cache is reported as
+//!   `replayed: true` in the `--json` envelope.
 //!
 //! The verb returns as soon as `AgentRunStarted` arrives. It never polls and
 //! never waits for the run: `loom-cli events --follow` is the verb that watches
@@ -39,7 +40,7 @@ use crate::cli::args::{ApprovalPreset, Invocation, RunArgs};
 use crate::cli::client::Client;
 use crate::cli::text::run_state_name;
 
-use super::{Caller, Failure, Outcome, emit, handshake};
+use super::{Caller, Failure, Outcome, derived_id, emit, handshake};
 
 /// `run`: resolve the session, attach the inputs to a session this invocation
 /// created, pin the approval policy, and start the run.
@@ -175,7 +176,7 @@ pub(super) async fn run<C: Client>(
             "run": request_id.to_string(),
         },
     });
-    Ok(Outcome::new(data, Some(request_id)))
+    Ok(Outcome::new(data, Some(request_id)).with_replayed(caller.replayed()))
 }
 
 /// The session `run` starts in: the first of the workspace's live sessions with
@@ -259,45 +260,4 @@ fn auxiliary_id(args: &RunArgs, purpose: &str) -> RequestId {
     } else {
         RequestId::new()
     }
-}
-
-/// A deterministic id derived from `base` and `purpose`.
-///
-/// The protocol's `RequestId` is a UUID, so the pair is hashed into a valid
-/// version-4-shaped UUID. The derivation only has to be stable for the retry
-/// horizon of the worker's idempotency cache, which is what makes `run --new`
-/// repeatable with one base: the session creation and the run start never
-/// share an id.
-fn derived_id(base: Option<RequestId>, purpose: &str) -> RequestId {
-    let Some(base) = base else {
-        return RequestId::new();
-    };
-    let label = format!("{base}/{purpose}");
-    let first = fnv1a(label.as_bytes(), 0xcbf2_9ce4_8422_2325);
-    let second = fnv1a(label.as_bytes(), 0x8422_2325_cbf2_9ce4);
-    let mut digits: Vec<char> = format!("{first:016x}{second:016x}").chars().collect();
-    // Version 4 and the RFC 4122 variant, so the value is a well-formed UUID
-    // that an older worker's request-id handling accepts.
-    digits[12] = '4';
-    digits[16] = '8';
-    let text: String = digits.into_iter().collect();
-    format!(
-        "{}-{}-{}-{}-{}",
-        &text[0..8],
-        &text[8..12],
-        &text[12..16],
-        &text[16..20],
-        &text[20..32]
-    )
-    .parse()
-    .expect("a derived id is a well-formed UUID")
-}
-
-fn fnv1a(bytes: &[u8], seed: u64) -> u64 {
-    let mut hash = seed;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }

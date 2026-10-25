@@ -15,7 +15,7 @@ use std::io::Write;
 use loom_core::{
     AgentSessionId, AgentSessionState, GitDiff, GitDiffLineKind, GitRepositoryStatus,
     ProjectSnapshot, ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord,
-    ProjectWorktreeStatus, TaskId,
+    ProjectWorktreeStatus, RequestId, TaskId,
 };
 use loom_protocol::{
     ArchiveRetentionPolicy, ClientRequest, ControlRequest, ControlResponse, ProjectRequest,
@@ -826,8 +826,9 @@ fn worktree_status_name(status: ProjectWorktreeStatus) -> &'static str {
 ///
 /// The project snapshot is read first so the command can require `--yes` for a
 /// cascade and report the worktrees a force deletion discards before it sends
-/// the irreversible request. A non-archived session is still refused by the
-/// worker, which is the authority on which sessions may be deleted.
+/// the irreversible request. The pre-read keeps a fresh id: it is a lookup, not
+/// the mutation `--request-id` keys. A non-archived session is still refused by
+/// the worker, which is the authority on which sessions may be deleted.
 /// `project delete` additionally requires the id to name a project root, so a
 /// mistyped id is refused instead of quietly deleting one session.
 pub(super) async fn delete<C: Client>(
@@ -837,10 +838,16 @@ pub(super) async fn delete<C: Client>(
     force: bool,
     yes: bool,
     require_project_root: bool,
+    request_id: Option<RequestId>,
     out: &mut dyn Write,
 ) -> Result<Outcome, Failure> {
     let mut caller = Caller::new(client);
     handshake(&mut caller, &invocation.verb).await?;
+    // The caller's key, when it named one, is the deletion's id: a repeated
+    // command is answered from the worker's cache with the same payload, even
+    // though the session no longer exists to delete again. The pre-read below
+    // keeps a fresh id.
+    let key = request_id.unwrap_or_default();
     let project: ProjectSnapshot = load_project(&mut caller, session_id).await?;
     // Only a project root cascades, and the worker applies the same rule: a
     // root owns another member or at least one delegated task.
@@ -879,11 +886,14 @@ pub(super) async fn delete<C: Client>(
     } else {
         Vec::new()
     };
+    // The caller's key, when it named one, is the deletion's id: a repeated
+    // command is answered from the worker's cache with the same payload, even
+    // though the session no longer exists to delete again.
     let (request_id, response) = caller
-        .call(ClientRequest::Session(SessionRequest::DeleteAgentSession {
-            session_id,
-            force,
-        }))
+        .call_with_id(
+            key,
+            ClientRequest::Session(SessionRequest::DeleteAgentSession { session_id, force }),
+        )
         .await?;
     match response {
         ServerResponse::Session(SessionResponse::AgentSessionDeleted {
@@ -923,7 +933,7 @@ pub(super) async fn delete<C: Client>(
             }))
             .collect::<Vec<_>>(),
     });
-    Ok(Outcome::new(data, caller.primary))
+    Ok(Outcome::new(data, caller.primary).with_replayed(caller.replayed()))
 }
 
 /// A compact duration for the text projection: `off` when the window is

@@ -54,13 +54,16 @@ Verbs:
                                     --name, or create it, attach the inputs
                                     to a session this run created, and start
                                     one agent run without waiting for it
-  send --run <id> --text <text>     direct the active run and print its state
-  answer --run <id> --text <text>   answer the question the run waits on
-  approve --run <id> --tool-call <id>
+  send --run <id> --text <text> [--request-id <uuid>]
+                                    direct the active run and print its state
+  answer --run <id> --text <text> [--request-id <uuid>]
+                                    answer the question the run waits on
+  approve --run <id> --tool-call <id> [--request-id <uuid>]
                                     approve the blocked tool call
-  deny --run <id> --tool-call <id> [--reason <text>]
+  deny --run <id> --tool-call <id> [--reason <text>] [--request-id <uuid>]
                                     deny the blocked tool call
   stop --run <id> [--session <id> --archive] [--retry-on-conflict]
+       [--request-id <uuid>]
                                     interrupt a run, and optionally archive
                                     its session afterwards
   wait --session <id> [--until blocked|terminal] [--timeout <seconds>]
@@ -114,7 +117,7 @@ Verbs:
                                     keep or remove the checkout of one
                                     delegated task; --discard throws away
                                     uncommitted changes and needs --yes
-  delete <session-id> [--force] [--yes]
+  delete <session-id> [--force] [--yes] [--request-id <uuid>]
                                     delete an archived session, or a project
                                     root with its descendants; the same
                                     operation as 'session delete'
@@ -145,6 +148,21 @@ text lines, so it refuses `--format verb`.
 it, and retry once after a conflict, because their intent is idempotent.
 `stop` refuses a conflict unless --retry-on-conflict is given, so a stale
 revision cannot interrupt a run whose state the caller has not seen.
+
+`--request-id` on `run`, `send`, `answer`, `approve`, `deny`, `stop`, and
+`delete` is the idempotency key of that verb's own mutation: a request the
+worker has already answered under that id is answered from its durable cache
+instead of acting a second time, and the --json envelope then reports
+`replayed: true`. The key covers the mutation alone. Reads are never keyed:
+`send`, `answer`, `approve`, `deny`, and `stop` read the run revision first and
+keep a fresh id for that read, so a repeated command whose run has since moved
+is refused as a conflict that names the key rather than replayed, and the
+mutation is still never applied twice. `stop --archive` archives the session
+under an id derived from the key, so a replay does not archive twice, and
+`delete` keys the deletion while its project pre-read keeps a fresh id.
+Reusing one key for a different mutation is refused the same way. A verb
+without the flag, and any verb that does not take it such as `wait` or `ls`,
+behaves exactly as before.
 
 `run --new` always creates a session and never lists or matches one by name.
 A session name is a label, not an identity: a repeated --new can produce a
@@ -330,24 +348,39 @@ pub(crate) enum Verb {
     Send {
         run: RunId,
         text: String,
+        /// The collaboration mutation's idempotency key, or `None` when the
+        /// caller left it open.
+        request_id: Option<RequestId>,
     },
     Answer {
         run: RunId,
         text: String,
+        /// The collaboration mutation's idempotency key, or `None` when the
+        /// caller left it open.
+        request_id: Option<RequestId>,
     },
     Approve {
         run: RunId,
         tool_call: ToolCallId,
+        /// The control mutation's idempotency key, or `None` when the caller
+        /// left it open.
+        request_id: Option<RequestId>,
     },
     Deny {
         run: RunId,
         tool_call: ToolCallId,
         reason: Option<String>,
+        /// The control mutation's idempotency key, or `None` when the caller
+        /// left it open.
+        request_id: Option<RequestId>,
     },
     Stop {
         run: RunId,
         archive: Option<AgentSessionId>,
         retry_on_conflict: bool,
+        /// The interrupt's idempotency key, or `None` when the caller left it
+        /// open. An archive is keyed by an id derived from it.
+        request_id: Option<RequestId>,
     },
     Wait {
         session: AgentSessionId,
@@ -426,6 +459,9 @@ pub(crate) enum Verb {
         session: AgentSessionId,
         force: bool,
         yes: bool,
+        /// The deletion's idempotency key, or `None` when the caller left it
+        /// open.
+        request_id: Option<RequestId>,
     },
 }
 
@@ -719,35 +755,44 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
         }
         "send" => {
             no_positionals(&flags.verb, rest)?;
+            let request_id = parse_request_id(&mut flags)?;
             Verb::Send {
                 run: parse_id("run id", &flags.required("--run")?)?,
                 text: flags.required("--text")?,
+                request_id,
             }
         }
         "answer" => {
             no_positionals(&flags.verb, rest)?;
+            let request_id = parse_request_id(&mut flags)?;
             Verb::Answer {
                 run: parse_id("run id", &flags.required("--run")?)?,
                 text: flags.required("--text")?,
+                request_id,
             }
         }
         "approve" => {
             no_positionals(&flags.verb, rest)?;
+            let request_id = parse_request_id(&mut flags)?;
             Verb::Approve {
                 run: parse_id("run id", &flags.required("--run")?)?,
                 tool_call: parse_id("tool call id", &flags.required("--tool-call")?)?,
+                request_id,
             }
         }
         "deny" => {
             no_positionals(&flags.verb, rest)?;
+            let request_id = parse_request_id(&mut flags)?;
             Verb::Deny {
                 run: parse_id("run id", &flags.required("--run")?)?,
                 tool_call: parse_id("tool call id", &flags.required("--tool-call")?)?,
                 reason: flags.value("--reason"),
+                request_id,
             }
         }
         "stop" => {
             no_positionals(&flags.verb, rest)?;
+            let request_id = parse_request_id(&mut flags)?;
             let archive = flags.value("--session");
             let archive = match (flags.flag("--archive"), archive) {
                 (true, Some(session)) => Some(parse_id("session id", &session)?),
@@ -763,6 +808,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
                 run: parse_id("run id", &flags.required("--run")?)?,
                 archive,
                 retry_on_conflict: flags.flag("--retry-on-conflict"),
+                request_id,
             }
         }
         "wait" => {
@@ -857,6 +903,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
                 session: parse_id("session id", session)?,
                 force,
                 yes,
+                request_id: parse_request_id(&mut flags)?,
             }
         }
         other => return Err(format!("unknown verb '{other}'; try --help")),
@@ -924,6 +971,17 @@ fn parse_id<T: FromStr>(what: &str, value: &str) -> Result<T, String> {
     value
         .parse::<T>()
         .map_err(|_| format!("'{value}' is not a valid {what}"))
+}
+
+/// The idempotency key `--request-id` names, or `None` when the flag was
+/// absent, in which case the mutation uses a fresh id and is a new operation.
+fn parse_request_id(flags: &mut FlagSet) -> Result<Option<RequestId>, String> {
+    match flags.value("--request-id") {
+        Some(value) => Ok(Some(value.parse::<RequestId>().map_err(|_| {
+            format!("'{value}' is not a valid request id; --request-id takes a UUID")
+        })?)),
+        None => Ok(None),
+    }
 }
 
 /// The `retention` sub-verbs: `get` reads the policy, `set` merges the given
@@ -1215,12 +1273,7 @@ fn parse_run(flags: &mut FlagSet) -> Result<RunArgs, String> {
             ));
         }
     };
-    let request_id = match flags.value("--request-id") {
-        Some(value) => Some(value.parse::<RequestId>().map_err(|_| {
-            format!("'{value}' is not a valid request id; --request-id takes a UUID")
-        })?),
-        None => None,
-    };
+    let request_id = parse_request_id(flags)?;
     Ok(RunArgs {
         workspace: parse_id("workspace id", &workspace)?,
         task,
