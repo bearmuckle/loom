@@ -413,6 +413,7 @@ The existing M1-M4 mutations remain the control surface:
 
 ```text
 CreateAgentSession / RenameAgentSession / ArchiveAgentSession
+RestoreAgentSession
 SetAgentSessionTitleSource
 DeleteAgentSession
 StartAgentRun / SendAgentMessage
@@ -448,13 +449,27 @@ archiving it, so clients do not need to issue a separate interrupt request.
 `DeleteAgentSession { session_id, force }` deletes an archived session and
 returns `agent_session_deleted { session_id }`. It is a retryable mutation and
 requires the separate `delete_agent_session` capability. Only archived sessions
-can be deleted, and `Archived` is terminal: there is no restore or unarchive,
-so an archived session is immutable until it is deleted. Deleting a project
-root deletes every descendant session of that project in one operation, using
-the same project snapshot and cascade order as archiving. The `force` flag
-allows discarding a dirty or locked linked worktree that would otherwise
-refuse the deletion; without it, such a project is refused, and the caller
-decides whether to force it.
+can be deleted. Deletion is terminal: a deleted session cannot be restored, and
+a restore request for it is `not_found`. Deleting a project root deletes every
+descendant session of that project in one operation, using the same project
+snapshot and cascade order as archiving. The `force` flag allows discarding a
+dirty or locked linked worktree that would otherwise refuse the deletion;
+without it, such a project is refused, and the caller decides whether to force
+it.
+
+`RestoreAgentSession { session_id }` returns
+`agent_session_restored { snapshot }` and journals
+`AgentSessionRestored { session_id }`, mirrored as the
+`ServerEvent::AgentSessionRestored { session_id }` event. It is a retryable
+mutation that requires the `control_agent_session` capability and at least the
+owner session role. Only an archived session can be restored: it returns to
+`Idle` and keeps its transcript, checkpoints, files, and checkouts, so a new run
+can start and the retention sweep no longer considers it. Restoring a project
+root restores every descendant that was archived with it; if a recorded member
+was deleted since, the request is refused, names the missing session ids, and
+changes nothing. An individual archived descendant can be restored on its own,
+and a session is restorable whenever its row still exists, not only before its
+deletion deadline.
 
 Session and run snapshots must be sufficient to render the active
 conversation, plan, step state, tool calls, approvals, bounded output,
@@ -536,7 +551,8 @@ resuming a remembered GitHub identity. 11.10 adds creating a sub project from
 the project it branches out of. 11.11 adds automatic project titles,
 `SetAgentSessionTitleSource`, and the title source a rename reports. 11.12 adds
 the session goal field, request, response, and event; 11.13 adds clearing it.
-11.14 adds the one-time sign-in credential. Every addition is a new enum
+11.14 adds the one-time sign-in credential; 11.15 adds `RestoreAgentSession`
+with its response and `AgentSessionRestored` event. Every addition is a new enum
 variant, a capability, or a field with a compatible default (an omitted field
 keeps the older behavior), so clients of an older 11.x minor keep working; they
 simply never send the new requests, negotiate the new capability, or ask for
