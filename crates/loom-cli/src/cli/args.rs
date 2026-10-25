@@ -28,6 +28,10 @@ const NAME_MAX_CHARS: usize = 48;
 const NAME_FALLBACK: &str = "loom-cli run";
 /// How long `wait` polls before it reports `deadline_exceeded`.
 pub(crate) const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 60;
+/// How many project messages `project messages` asks for by default.
+pub(crate) const DEFAULT_MESSAGE_LIMIT: u32 = 100;
+/// The largest page `project messages --limit` accepts.
+pub(crate) const MAX_MESSAGE_LIMIT: u32 = 512;
 
 pub(crate) const HELP: &str = r#"Usage: loom-cli <verb> [flags]
 
@@ -93,6 +97,18 @@ Verbs:
                                     delete an archived session, or a project
                                     root with its descendants; --yes is
                                     required for a cascade or with --force
+  project get <session-id>          report one project's members and parent
+                                    project
+  project tree <session-id>         print the project hierarchy as an
+                                    indented tree
+  project tasks <session-id>        list the project's delegated tasks
+  project children <session-id>     list the direct child agents with their
+                                    task, run, and blocking state
+  project messages <session-id> [--after <seq>] [--limit <n>]
+                                    print a page of the project's agent
+                                    messages; --limit is 1..512, default 100
+  project child pause|resume|interrupt|cancel <task-id> --session <id>
+                                    control one delegated child task
   project archive <session-id> [--request-id <uuid>]
                                     archive a project root with its idle
                                     members; the id must name such a root
@@ -205,6 +221,16 @@ its descendants, so the blast radius of every command is one explicit decision.
 checkout recorded for one delegated task, resolving its project and manager
 from the worker's project snapshot. --remove refuses a checkout that holds
 changes; only --discard, with --yes, throws them away.
+
+Every `project` read is addressed by the id of any project member session; a
+project root's session id is also its project id. All of them are reads and
+negotiate no mutating capability, so a read-only-scoped token can run them.
+Message history is read-only as well: there is no send verb, because an
+agent-attributed message is reserved for the server-bound agent tool and a
+person redirects a live child with `send --run`. `project child` names the task
+id the project snapshot reports and sends the server-owned task's requester as
+the manager, so no flag can supply one. An unknown session is `not_found`
+(exit 5), and so is a task id the project does not name.
 
 Global flags, accepted anywhere as --flag value or --flag=value:
   --connect <url>             worker WebSocket URL (fallback LOOM_URL)
@@ -332,6 +358,28 @@ pub(crate) struct RetentionSetArgs {
     pub window_ms: Option<Option<u64>>,
     pub force_discard_worktrees: Option<bool>,
     pub sub_agent_ms: Option<Option<u64>>,
+}
+
+/// The action a `project child` sub-verb sends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectChildAction {
+    Pause,
+    Resume,
+    Interrupt,
+    Cancel,
+}
+
+impl ProjectChildAction {
+    /// The word the sub-verb is spelled with, which is also printed and
+    /// reported in the `--json` payload.
+    pub(crate) const fn word(self) -> &'static str {
+        match self {
+            Self::Pause => "pause",
+            Self::Resume => "resume",
+            Self::Interrupt => "interrupt",
+            Self::Cancel => "cancel",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -488,6 +536,34 @@ pub(crate) enum Verb {
         /// open.
         request_id: Option<RequestId>,
     },
+    /// `project get`: the hierarchy and parent project of one member.
+    ProjectGet {
+        session: AgentSessionId,
+    },
+    /// `project tree`: the same hierarchy as an indented pre-order tree.
+    ProjectTree {
+        session: AgentSessionId,
+    },
+    /// `project tasks`: the project's delegated tasks.
+    ProjectTasks {
+        session: AgentSessionId,
+    },
+    /// `project children`: the direct children of the addressed session.
+    ProjectChildren {
+        session: AgentSessionId,
+    },
+    /// `project messages`: one page of the project's agent message history.
+    ProjectMessages {
+        session: AgentSessionId,
+        after: Option<u64>,
+        limit: u32,
+    },
+    /// `project child`: one control action on a delegated task.
+    ProjectChild {
+        session: AgentSessionId,
+        task: TaskId,
+        action: ProjectChildAction,
+    },
 }
 
 /// The disposition `project worktree cleanup` asks the worker for.
@@ -555,6 +631,17 @@ pub(crate) fn verb_name(verb: &Verb) -> &'static str {
         Verb::ProjectWorktreeIntegrate { .. } => "project worktree integrate",
         Verb::ProjectWorktreeCleanup { .. } => "project worktree cleanup",
         Verb::Delete { .. } => "delete",
+        Verb::ProjectGet { .. } => "project get",
+        Verb::ProjectTree { .. } => "project tree",
+        Verb::ProjectTasks { .. } => "project tasks",
+        Verb::ProjectChildren { .. } => "project children",
+        Verb::ProjectMessages { .. } => "project messages",
+        Verb::ProjectChild { action, .. } => match action {
+            ProjectChildAction::Pause => "project child pause",
+            ProjectChildAction::Resume => "project child resume",
+            ProjectChildAction::Interrupt => "project child interrupt",
+            ProjectChildAction::Cancel => "project child cancel",
+        },
     }
 }
 
@@ -603,7 +690,7 @@ fn arity(name: &str) -> Option<bool> {
         "--connect" | "--token-file" | "--token" | "--ca-file" | "--max-frame-bytes" => true,
         "--allow-insecure-remote" | "--json" | "--help" | "-h" => false,
         "--workspace" | "--session" | "--after" | "--cursor-file" | "--format" | "--max-bytes"
-        | "--lines" => true,
+        | "--lines" | "--limit" => true,
         "--archived" | "--metadata" | "--follow" => false,
         "--task" | "--task-file" | "--name" | "--model" | "--repo" | "--revision" | "--path"
         | "--as-directory" | "--approval-policy" | "--request-id" => true,
@@ -1102,16 +1189,89 @@ fn parse_session(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
     }
 }
 
-/// The `project` sub-verbs: the project-scoped `archive` and `delete`, which
-/// require the id to name a project root, `worktrees` and `worktree`, which read
-/// and act on the checkouts the snapshot records, and `worktree cleanup`, which
-/// acts on one delegated task's checkout.
+/// The `project` sub-verbs: the reads addressed by any project member session,
+/// the child control addressed by a task id the snapshot names, the
+/// project-scoped `archive` and `delete`, and the `worktrees`/`worktree` verbs
+/// that read and act on the checkouts the snapshot records.
 fn parse_project(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
     let Some(sub_verb) = rest.first() else {
-        return Err("project requires 'archive', 'delete', 'worktree', or 'worktrees'".to_owned());
+        return Err(
+            "project requires 'get', 'tree', 'tasks', 'children', 'messages', 'child', \
+             'archive', 'delete', 'worktrees', or 'worktree'"
+                .to_owned(),
+        );
     };
     flags.verb = format!("project {sub_verb}");
     match sub_verb.as_str() {
+        "get" | "tree" | "tasks" | "children" => {
+            let session = one_session_id(flags, rest)?;
+            match sub_verb.as_str() {
+                "get" => Ok(Verb::ProjectGet { session }),
+                "tree" => Ok(Verb::ProjectTree { session }),
+                "tasks" => Ok(Verb::ProjectTasks { session }),
+                _ => Ok(Verb::ProjectChildren { session }),
+            }
+        }
+        "messages" => {
+            let session = one_session_id(flags, rest)?;
+            let after = match flags.value("--after") {
+                Some(value) => Some(value.parse::<u64>().map_err(|_| {
+                    format!("--after must be a project message sequence, got '{value}'")
+                })?),
+                None => None,
+            };
+            let limit = match flags.value("--limit") {
+                None => DEFAULT_MESSAGE_LIMIT,
+                Some(value) => {
+                    let limit = value
+                        .parse::<u32>()
+                        .map_err(|_| format!("--limit must be a message count, got '{value}'"))?;
+                    if !(1..=MAX_MESSAGE_LIMIT).contains(&limit) {
+                        return Err(format!(
+                            "--limit must be between 1 and {MAX_MESSAGE_LIMIT}, got {limit}"
+                        ));
+                    }
+                    limit
+                }
+            };
+            Ok(Verb::ProjectMessages {
+                session,
+                after,
+                limit,
+            })
+        }
+        "child" => {
+            let Some(action_word) = rest.get(1) else {
+                return Err("project child requires pause, resume, interrupt, or cancel".to_owned());
+            };
+            let action = match action_word.as_str() {
+                "pause" => ProjectChildAction::Pause,
+                "resume" => ProjectChildAction::Resume,
+                "interrupt" => ProjectChildAction::Interrupt,
+                "cancel" => ProjectChildAction::Cancel,
+                other => {
+                    return Err(format!(
+                        "unknown project child action '{other}'; use pause, resume, interrupt, or \
+                         cancel"
+                    ));
+                }
+            };
+            flags.verb = format!("project child {}", action.word());
+            let Some(task) = rest.get(2) else {
+                return Err(format!("{} requires a <task-id>", flags.verb));
+            };
+            if rest.len() > 3 {
+                return Err(format!(
+                    "{} takes one task id, got '{}'",
+                    flags.verb, rest[3]
+                ));
+            }
+            Ok(Verb::ProjectChild {
+                session: parse_id("session id", &flags.required("--session")?)?,
+                task: parse_id("task id", task)?,
+                action,
+            })
+        }
         "archive" => Ok(Verb::ProjectArchive {
             session: one_session_id(flags, rest)?,
             request_id: parse_request_id(flags)?,
@@ -1140,7 +1300,8 @@ fn parse_project(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
         }),
         "worktree" => parse_project_worktree(flags, rest),
         other => Err(format!(
-            "unknown project sub-verb '{other}'; use archive, delete, worktree, or worktrees"
+            "unknown project sub-verb '{other}'; use get, tree, tasks, children, messages, \
+             child, archive, delete, worktrees, or worktree"
         )),
     }
 }
