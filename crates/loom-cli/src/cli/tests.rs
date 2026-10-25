@@ -6,7 +6,13 @@
 //! doubles rewrite a protocol answer that would otherwise need a pruned journal
 //! or a second worker.
 
-use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    path::PathBuf,
+    rc::Rc,
+    sync::Arc,
+    time::Duration,
+};
 
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, Author, Capability,
@@ -4007,8 +4013,8 @@ fn the_parser_accepts_a_request_id_on_every_mutating_verb() {
     let key = request_id.to_string();
 
     // Every mutating verb takes the flag, with and without it present. The
-    // operator lifecycle verbs key their own archive, deletion, or cleanup
-    // request the same way.
+    // operator lifecycle verbs key their own archive, deletion, integration,
+    // or cleanup request the same way.
     let task_text = TaskId::new().to_string();
     for arguments in [
         vec!["send", "--run", &run_text, "--text", "go"],
@@ -4021,6 +4027,14 @@ fn the_parser_accepts_a_request_id_on_every_mutating_verb() {
         vec!["session", "delete", &session],
         vec!["project", "archive", &session],
         vec!["project", "delete", &session],
+        vec![
+            "project",
+            "worktree",
+            "integrate",
+            &session,
+            "--task",
+            &task_text,
+        ],
         vec![
             "project", "worktree", "cleanup", &session, "--task", &task_text, "--remove",
         ],
@@ -4045,6 +4059,15 @@ fn the_parser_accepts_a_request_id_on_every_mutating_verb() {
         vec!["session", "delete", &session, &equals],
         vec!["project", "archive", &session, &equals],
         vec!["project", "delete", &session, &equals],
+        vec![
+            "project",
+            "worktree",
+            "integrate",
+            &session,
+            "--task",
+            &task_text,
+            &equals,
+        ],
         vec![
             "project", "worktree", "cleanup", &session, "--task", &task_text, "--keep", &equals,
         ],
@@ -4136,6 +4159,7 @@ fn verb_request_id(verb: &Verb) -> Option<RequestId> {
         | Verb::SessionDelete { request_id, .. }
         | Verb::ProjectArchive { request_id, .. }
         | Verb::ProjectDelete { request_id, .. }
+        | Verb::ProjectWorktreeIntegrate { request_id, .. }
         | Verb::ProjectWorktreeCleanup { request_id, .. } => *request_id,
         _ => None,
     }
@@ -7117,5 +7141,109 @@ fn project_worktree_integrate_sends_one_request_and_never_retries_a_conflict() {
     );
     assert!(integrate_requests(&missing_sent).is_empty());
     drop(missing);
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn project_worktree_integrate_answers_a_repeated_key_the_same_way() {
+    let (fixture, directory) = persistent_fixture("worktree-integrate-replay");
+    let session = fixture.session.id;
+    let task = TaskId::new();
+    let result_revision = "a".repeat(40);
+    let mut worktree = fake_worktree(session, AgentSessionId::new(), "wt-1", "repo");
+    worktree.task_id = task;
+    let project = fake_project(session, &[session], vec![worktree.clone()]);
+    let mut integrated = worktree.clone();
+    integrated.status = ProjectWorktreeStatus::Integrated;
+    integrated.result_revision = Some(result_revision.clone());
+    integrated.integrated_revision = Some(result_revision);
+    // Every integration request and snapshot pre-read the verb sent, by the id
+    // each was sent under.
+    let keys = Rc::new(RefCell::new(Vec::new()));
+    let reads = Rc::new(RefCell::new(Vec::new()));
+    let recorded = Rc::clone(&keys);
+    let recorded_reads = Rc::clone(&reads);
+    // A worker answers a repeated key from its cache and says so with
+    // `replayed`, which the test sets on the second integration answer.
+    let answered = Rc::new(Cell::new(0usize));
+    let mut client = Wrapped::new(InProcessClient::new(&fixture.backend))
+        .before(move |envelope| match &envelope.request {
+            ClientRequest::Project(ProjectRequest::IntegrateProjectChild { .. }) => {
+                recorded.borrow_mut().push(envelope.request_id);
+            }
+            ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession { .. }) => {
+                recorded_reads.borrow_mut().push(envelope.request_id);
+            }
+            _ => {}
+        })
+        .after(move |request, response| match request {
+            ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession { session_id })
+                if *session_id == session =>
+            {
+                response.result = Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(
+                    project.clone(),
+                )));
+            }
+            ClientRequest::Project(ProjectRequest::IntegrateProjectChild { .. }) => {
+                response.result = Ok(ServerResponse::Project(
+                    ProjectResponse::ProjectChildWorktreeUpdated(Box::new(integrated.clone())),
+                ));
+                let count = answered.get() + 1;
+                answered.set(count);
+                response.replayed = count > 1;
+            }
+            _ => {}
+        });
+    let session_text = session.to_string();
+    let task_text = task.to_string();
+    let request_id = RequestId::new().to_string();
+    let arguments = [
+        "project",
+        "worktree",
+        "integrate",
+        "--json",
+        &session_text,
+        "--task",
+        &task_text,
+        "--request-id",
+        &request_id,
+    ];
+
+    let first = run(&mut client, &arguments);
+    assert_eq!(first.code, exit::OK, "{}", first.stderr);
+    let first_envelope = json_envelope(&first);
+    assert_eq!(first_envelope["verb"], "project worktree integrate");
+    assert_eq!(first_envelope["data"]["worktree"]["status"], "integrated");
+    assert_eq!(first_envelope["replayed"], false);
+
+    // A repeated key sends the integration under the same id, so a worker that
+    // already answered it replays that answer instead of fast-forwarding the
+    // parent a second time. Both the snapshot and the integration answer are the
+    // test's own here, because a git-backed project with a terminal delegated
+    // task is what only the server's project tests build; the archive and delete
+    // replay tests cover the worker's cache itself.
+    let replay = run(&mut client, &arguments);
+    assert_eq!(replay.code, exit::OK, "{}", replay.stderr);
+    let replay_envelope = json_envelope(&replay);
+    assert_eq!(
+        replay_envelope["data"], first_envelope["data"],
+        "the replay repeats the first answer instead of integrating again"
+    );
+    assert_eq!(
+        replay_envelope["replayed"], true,
+        "a cache hit is reported as a replay"
+    );
+    let key = request_id.parse::<RequestId>().unwrap();
+    assert_eq!(
+        *keys.borrow(),
+        vec![key, key],
+        "both integration requests carry the caller's key"
+    );
+    assert!(
+        reads.borrow().iter().all(|read| *read != key),
+        "the snapshot pre-read never carries the key"
+    );
+
+    drop(client);
     close_persistent_fixture(fixture, directory);
 }

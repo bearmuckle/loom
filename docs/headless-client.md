@@ -55,7 +55,7 @@ The examples below use the installed binary name. In a checkout, replace
 | `project worktrees <session-id>` | The checkouts the project's snapshot records, in snapshot order. |
 | `project worktree get <session-id> --task <task-id>` | The durable worktree record of one delegated task; the checkout is not opened. |
 | `project worktree diff <session-id> --task <task-id>` | The worker's bounded review of one checkout: status, diffstat, changed paths, and hunks. |
-| `project worktree integrate <session-id> --task <task-id> [--expected-parent-revision <rev>]` | Fast-forward the parent with the task's result revision; a conflict is reported, never retried. |
+| `project worktree integrate <session-id> --task <task-id> [--expected-parent-revision <rev>] [--request-id <uuid>]` | Fast-forward the parent with the task's result revision; a conflict is reported, never retried. |
 | `project worktree cleanup <session-id> --task <task-id> (--keep \| --remove \| --discard) [--yes] [--request-id <uuid>]` | Keep or remove the checkout recorded for one delegated task. |
 
 `node`, `whoami`, `ls`, `get`, `events`, `peek`, and `retention get` are
@@ -497,6 +497,12 @@ integrated-revision <integrated-revision or ->
 `--json` reports `session_id`, `project_id`, `task_id`,
 `expected_parent_revision`, and the updated record as `worktree`. The verb needs
 `read_project` and `integrate_project_child`.
+
+`--request-id <uuid>` keys the integration request, so repeating the command
+with the same id is answered from the worker's durable cache with the same `data`
+and `replayed: true`, which means the parent was fast-forwarded once. The
+snapshot read before it always keeps a fresh id. Without the flag the
+integration uses a fresh id, so it is a new operation.
 
 ## Exit codes
 

@@ -601,12 +601,19 @@ pub(super) async fn worktree_diff<C: Client>(
 /// were created from. The worker keeps the ancestor check and answers a
 /// conflict when the parent moved; this verb sends exactly one request, so a
 /// conflict is reported as it is and the checkout is left untouched.
+///
+/// `--request-id` keys the integration request alone: the snapshot pre-read
+/// always keeps a fresh id, and a repeated key is answered from the worker's
+/// durable cache instead of integrating a second time, which the `--json`
+/// envelope reports as `replayed`. Without the flag the integration uses a
+/// fresh id, so it is a new operation.
 pub(super) async fn worktree_integrate<C: Client>(
     client: &mut C,
     invocation: &Invocation,
     session_id: AgentSessionId,
     task_id: TaskId,
     expected_parent_revision: Option<&str>,
+    request_id: Option<RequestId>,
     out: &mut dyn Write,
 ) -> Result<Outcome, Failure> {
     let mut caller = Caller::new(client);
@@ -615,14 +622,19 @@ pub(super) async fn worktree_integrate<C: Client>(
     let record = worktree_record(&project, task_id)?;
     let expected = expected_parent_revision.unwrap_or(&record.base_revision);
     let (request_id, response) = caller
-        .call(ClientRequest::Project(
-            ProjectRequest::IntegrateProjectChild {
+        .call_with_id(
+            // The caller's key, when it named one, is the integration's id, so
+            // a replay reports the same record and fast-forwards nothing
+            // twice. The pre-read above keeps a fresh id, and the key never
+            // turns a conflict into a retry.
+            request_id.unwrap_or_default(),
+            ClientRequest::Project(ProjectRequest::IntegrateProjectChild {
                 project_id: record.project_id,
                 manager_session_id: record.parent_session_id,
                 task_id,
                 expected_parent_revision: expected.to_owned(),
-            },
-        ))
+            }),
+        )
         .await?;
     let updated = match response {
         ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(worktree)) => {
@@ -662,7 +674,7 @@ pub(super) async fn worktree_integrate<C: Client>(
         "expected_parent_revision": expected,
         "worktree": &updated,
     });
-    Ok(Outcome::new(data, caller.primary))
+    Ok(Outcome::new(data, caller.primary).with_replayed(caller.replayed()))
 }
 
 /// The worktree record one delegated task owns, which every worktree verb

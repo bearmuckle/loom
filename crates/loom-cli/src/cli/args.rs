@@ -109,7 +109,7 @@ Verbs:
                                     report the worker's bounded review of one
                                     checkout
   project worktree integrate <session-id> --task <task-id>
-      [--expected-parent-revision <rev>]
+      [--expected-parent-revision <rev>] [--request-id <uuid>]
                                     fast-forward the parent with the task's
                                     result revision; a conflict is reported,
                                     never retried
@@ -152,19 +152,21 @@ revision cannot interrupt a run whose state the caller has not seen.
 
 `--request-id` on `run`, `send`, `answer`, `approve`, `deny`, `stop`,
 `delete`, `session archive`, `session delete`, `project archive`,
-`project delete`, and `project worktree cleanup` is the idempotency key of
-that verb's own mutation: a request the worker has already answered under that
-id is answered from its durable cache instead of acting a second time, so a
-repeated archive, deletion, or cleanup is applied once, and the --json
-envelope then reports `replayed: true`. The key covers the mutation alone.
+`project delete`, `project worktree integrate`, and `project worktree
+cleanup` is the idempotency key of that verb's own mutation: a request the
+worker has already answered under that id is answered from its durable cache
+instead of acting a second time, so a repeated archive, deletion, integration,
+or cleanup is applied once, and the --json envelope then reports
+`replayed: true`. The key covers the mutation alone.
 Reads are never keyed: `send`, `answer`, `approve`, `deny`, and `stop` read the
 run revision first and keep a fresh id for that read, so a repeated command
 whose run has since moved is refused as a conflict that names the key rather
 than replayed, and the mutation is still never applied twice. `stop --archive`
 archives the session under an id derived from the key, so a replay does not
-archive twice. The lifecycle verbs key the archive, deletion, or cleanup
-request while their project snapshot pre-read keeps a fresh id, so a repeated
-`session delete` is answered from the cache even though the session is gone.
+archive twice. The lifecycle verbs key the archive, deletion, integration, or
+cleanup request while their project snapshot pre-read keeps a fresh id, so a
+repeated `session delete` is answered from the cache even though the session is
+gone.
 Reusing one key for a different mutation is refused the same way. A verb
 without the flag, and any verb that does not take it such as `wait` or `ls`,
 behaves exactly as before.
@@ -462,6 +464,9 @@ pub(crate) enum Verb {
         session: AgentSessionId,
         task: TaskId,
         expected_parent_revision: Option<String>,
+        /// The integration request's idempotency key, or `None` when the
+        /// caller left it open. The project pre-read is never keyed.
+        request_id: Option<RequestId>,
     },
     /// `project worktree cleanup`: keep or remove one delegated task's
     /// checkout.
@@ -1164,12 +1169,14 @@ fn parse_project_worktree(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, 
             })
         }
         "integrate" => {
+            let request_id = parse_request_id(flags)?;
             let session = one_session_id(flags, rest)?;
             let task = flags.required("--task")?;
             Ok(Verb::ProjectWorktreeIntegrate {
                 session,
                 task: parse_id("task id", &task)?,
                 expected_parent_revision: flags.value("--expected-parent-revision"),
+                request_id,
             })
         }
         "cleanup" => parse_worktree_cleanup(flags, rest),

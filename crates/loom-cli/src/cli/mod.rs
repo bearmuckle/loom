@@ -39,8 +39,9 @@
 //!
 //! The mutating requests of `run`, `send`, `answer`, `approve`, `deny`, `stop`,
 //! `delete`, `session archive`, `session delete`, `project archive`,
-//! `project delete`, and `project worktree cleanup` are the ones `--request-id`
-//! keys. Everything else a verb sends, such as
+//! `project delete`, `project worktree integrate`, and `project worktree
+//! cleanup` are the ones `--request-id` keys. Everything else a verb sends,
+//! such as
 //! `Collaboration/GetRunRevision` and `Project/GetProjectSnapshotForSession`,
 //! is a read with a fresh id, and only the verb's own mutation carries the
 //! caller's key:
@@ -55,6 +56,7 @@
 //! | `delete`, `session delete` | `Session/DeleteAgentSession` | — |
 //! | `session archive`, `project archive` | `Session/ArchiveAgentSession` | — |
 //! | `project delete` | `Session/DeleteAgentSession` | — |
+//! | `project worktree integrate` | `Project/IntegrateProjectChild` | — |
 //! | `project worktree cleanup` | `Project/CleanupProjectChildWorktree` | — |
 //!
 //! Every verb first sends `Control/Negotiate` with the version this build
@@ -103,7 +105,9 @@
 //! task's result under the revision the checkout was created from (or
 //! `--expected-parent-revision`); the worker keeps its ancestor and conflict
 //! rules, and the client sends exactly one integration request, so a conflict is
-//! reported as the failure it is rather than retried. Every one of them resolves
+//! reported as the failure it is rather than retried, and repeating the command
+//! with the same `--request-id` is answered from the durable cache instead of
+//! integrating twice. Every one of them resolves
 //! the project and the manager session from the snapshot by `--task`.
 //!
 //! `node` prints one line per field of `WorkerNodeStatus`, with absent health
@@ -240,9 +244,9 @@
 //! reuses. `replayed` is `true` only when the worker answered a mutating
 //! request of this invocation from its idempotency cache instead of acting
 //! again, which happens only when the caller repeated a `--request-id`; it is
-//! how a repeated archive, deletion, or cleanup reports that the mutation was
-//! applied once. Every other success reports `false`, and a failure envelope
-//! has no such field.
+//! how a repeated archive, deletion, integration, or cleanup reports that the
+//! mutation was applied once. Every other success reports `false`, and a
+//! failure envelope has no such field.
 //! `events` adds `gap` (`after`, `before`, `missing`) when a snapshot
 //! could not carry every event after the cursor, and `null` otherwise.
 //!
