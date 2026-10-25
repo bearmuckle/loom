@@ -1,6 +1,110 @@
 use super::*;
 
 impl InProcessBackend {
+    /// Returns an archived session to `Idle`, together with the archived
+    /// descendants a project root recorded when it was archived.
+    ///
+    /// Nothing is removed: the transcript, checkpoints, files, and checkouts
+    /// stay in place, and the session becomes eligible for a new run instead of
+    /// the retention sweep. A tree whose recorded member was swept cannot be
+    /// restored whole, so the request is refused and names the missing ids
+    /// before any state changes. The archive gate keeps a restore mutually
+    /// exclusive with the sweep and a deletion.
+    pub(crate) fn restore_agent_session(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<ServerResponse> {
+        let _gate = self.archive_gate()?;
+        if self.sessions()?.get(session_id)?.state != AgentSessionState::Archived {
+            return Err(LoomError::invalid_state(
+                "only archived agent sessions can be restored",
+            ));
+        }
+        let project = match &self.persistence {
+            Some(persistence) => persistence.load_project_snapshot_for_session(session_id)?,
+            None => None,
+        };
+        let is_root = project
+            .as_ref()
+            .is_some_and(|project| project.root_session_id == session_id);
+        let mut members = match &self.persistence {
+            Some(persistence) => persistence.load_archived_project_members(session_id)?,
+            None => Vec::new(),
+        };
+        if members.is_empty()
+            && is_root
+            && let Some(project) = &project
+        {
+            // A tree archived before its membership was recorded restores the
+            // archived descendants the project snapshot still names.
+            let catalog = self.sessions()?;
+            members = project
+                .agents
+                .iter()
+                .filter(|agent| agent.session_id != session_id)
+                .filter(|agent| {
+                    catalog
+                        .get(agent.session_id)
+                        .is_ok_and(|session| session.state == AgentSessionState::Archived)
+                })
+                .map(|agent| (agent.session_id, agent.depth))
+                .collect();
+        }
+        let mut missing = Vec::new();
+        let mut restorable = Vec::new();
+        {
+            let catalog = self.sessions()?;
+            for (member_id, depth) in members {
+                match catalog.get(member_id) {
+                    Ok(member) if member.state == AgentSessionState::Archived => {
+                        restorable.push((member_id, depth));
+                    }
+                    // A member restored on its own is left as it is.
+                    Ok(_) => {}
+                    Err(error) if error.code == ErrorCode::NotFound => missing.push(member_id),
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            let ids = missing
+                .iter()
+                .map(AgentSessionId::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            log::warn!(
+                "[loom-server] refusing to restore session {session_id}: archived descendant session(s) {ids} no longer exist"
+            );
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                format!(
+                    "cannot restore session {session_id}: archived descendant session(s) {ids} were deleted"
+                ),
+                false,
+            ));
+        }
+        // Deepest first, like archiving, so a parent is never restored before a
+        // child that is still archived.
+        restorable.sort_by_key(|(member_id, depth)| (std::cmp::Reverse(*depth), *member_id));
+        for (member_id, depth) in restorable {
+            let (_, record) = self.sessions()?.restore_archived(member_id)?;
+            self.journal()?.append_session(record);
+            log::info!(
+                "[loom-server] restored descendant session {member_id} (depth {depth}) of project root {session_id}"
+            );
+        }
+        let (snapshot, record) = self.sessions()?.restore_archived(session_id)?;
+        self.journal()?.append_session(record);
+        if is_root && let Some(persistence) = &self.persistence {
+            persistence.clear_archived_project_members(session_id)?;
+        }
+        log::info!("[loom-server] restored session {session_id}");
+        Ok(ServerResponse::Session(
+            SessionResponse::AgentSessionRestored(snapshot),
+        ))
+    }
+
     /// Locks the archive gate, which serializes every deletion with the
     /// retention sweep so no caller observes a partially deleted session.
     fn archive_gate(&self) -> Result<MutexGuard<'_, ()>> {

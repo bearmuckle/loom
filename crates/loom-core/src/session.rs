@@ -109,6 +109,10 @@ pub enum SessionEvent {
     AgentSessionArchived {
         session_id: AgentSessionId,
     },
+    /// The session left the archive and returned to `Idle`.
+    AgentSessionRestored {
+        session_id: AgentSessionId,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

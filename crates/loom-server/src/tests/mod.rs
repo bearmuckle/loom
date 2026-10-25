@@ -56,6 +56,7 @@ mod retention;
 mod runs;
 mod session;
 mod session_deletion;
+mod session_restore;
 mod session_workspace;
 mod shutdown;
 mod support;

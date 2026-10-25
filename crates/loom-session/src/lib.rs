@@ -297,6 +297,36 @@ impl SessionManager {
         Ok((snapshot, record))
     }
 
+    /// Returns an archived session to `Idle`.
+    ///
+    /// Only an archived session can be restored, and the state it held before
+    /// archiving is not remembered: a restored session starts idle so a new run
+    /// can begin. Nothing else about the session changes, so its transcript,
+    /// checkpoints, files, and checkouts stay in place.
+    pub fn restore_archived(
+        &mut self,
+        session_id: AgentSessionId,
+    ) -> Result<(AgentSessionSnapshot, SessionEventRecord)> {
+        let snapshot = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| LoomError::not_found("agent session", session_id))?;
+        if snapshot.state != AgentSessionState::Archived {
+            return Err(LoomError::invalid_state(
+                "only archived agent sessions can be restored",
+            ));
+        }
+        snapshot.state = AgentSessionState::Idle;
+        snapshot.updated_at = Timestamp::now();
+        let snapshot = snapshot.clone();
+        let record = self.record(
+            session_id,
+            snapshot.updated_at,
+            SessionEvent::AgentSessionRestored { session_id },
+        );
+        Ok((snapshot, record))
+    }
+
     /// Removes a session from the catalog in any state and returns its final
     /// snapshot.
     ///

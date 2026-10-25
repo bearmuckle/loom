@@ -130,6 +130,7 @@ pub(crate) fn render(event: &ServerEvent, budget: usize) -> Rendered {
             body("session_title_source", [source_name(*source).to_owned()])
         }
         ServerEvent::AgentSessionArchived { .. } => body("session_archived", []),
+        ServerEvent::AgentSessionRestored { .. } => body("session_restored", []),
         ServerEvent::Agent { event } => render_agent(event, budget),
         other => name("event", server_event_name(other)),
     }
@@ -301,6 +302,7 @@ pub(crate) const fn server_event_name(event: &ServerEvent) -> &'static str {
         ServerEvent::AgentSessionGoalChanged { .. } => "agent_session_goal_changed",
         ServerEvent::AgentSessionTitleSourceChanged { .. } => "agent_session_title_source_changed",
         ServerEvent::AgentSessionArchived { .. } => "agent_session_archived",
+        ServerEvent::AgentSessionRestored { .. } => "agent_session_restored",
         ServerEvent::Agent { .. } => "agent",
         ServerEvent::SessionFilesystemChanged { .. } => "session_filesystem_changed",
         ServerEvent::Terminal { .. } => "terminal",

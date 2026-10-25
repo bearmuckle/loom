@@ -699,6 +699,9 @@ impl InProcessConnection {
             | ClientRequest::Session(SessionRequest::ArchiveAgentSession {
                 session_id: requested_session,
             })
+            | ClientRequest::Session(SessionRequest::RestoreAgentSession {
+                session_id: requested_session,
+            })
             | ClientRequest::Session(SessionRequest::DeleteAgentSession {
                 session_id: requested_session,
                 ..

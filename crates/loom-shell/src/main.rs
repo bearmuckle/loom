@@ -1451,6 +1451,9 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
         ServerEvent::AgentSessionArchived { .. } => {
             println!("session archived");
         }
+        ServerEvent::AgentSessionRestored { .. } => {
+            println!("session restored");
+        }
         ServerEvent::Agent { event } => match event {
             AgentEvent::RunStarted { snapshot } => {
                 println!("Run {} [{}]", snapshot.id, run_state_name(snapshot.state));

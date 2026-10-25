@@ -818,3 +818,59 @@ fn project_task_queries_and_cancellation_cover_lifecycle_paths() {
 
     let _ = fs::remove_file(&path);
 }
+
+#[test]
+fn archived_project_membership_survives_a_member_and_drops_with_its_root() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+    let store = FilePersistence::open(&path).unwrap();
+    let mut manager = SessionManager::default();
+    let workspace_id = WorkspaceId::new();
+    let (root, _) = manager
+        .create_in_workspace(workspace_id, "Archived root")
+        .unwrap();
+    let (child, _) = manager
+        .create_in_workspace(workspace_id, "Archived child")
+        .unwrap();
+    store
+        .save_state_with_sessions(&manager.export_state())
+        .unwrap();
+
+    // A member that no session row names is kept on purpose, so a restore can
+    // report it as missing instead of restoring half a tree.
+    let swept = AgentSessionId::new();
+    store
+        .replace_archived_project_members(root.id, &[(child.id, 2), (swept, 3)])
+        .unwrap();
+    assert_eq!(
+        store.load_archived_project_members(root.id).unwrap(),
+        vec![(swept, 3), (child.id, 2)]
+    );
+
+    // Deleting the member session leaves its record in place.
+    store.delete_sessions(&BTreeSet::from([child.id])).unwrap();
+    assert_eq!(
+        store.load_archived_project_members(root.id).unwrap(),
+        vec![(swept, 3), (child.id, 2)]
+    );
+
+    // Clearing replaces the whole record, and deleting the root drops it.
+    store.clear_archived_project_members(root.id).unwrap();
+    assert!(
+        store
+            .load_archived_project_members(root.id)
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .replace_archived_project_members(root.id, &[(swept, 3)])
+        .unwrap();
+    store.delete_sessions(&BTreeSet::from([root.id])).unwrap();
+    assert!(
+        store
+            .load_archived_project_members(root.id)
+            .unwrap()
+            .is_empty()
+    );
+
+    let _ = fs::remove_file(&path);
+}

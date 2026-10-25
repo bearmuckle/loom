@@ -273,6 +273,22 @@ impl LoomView {
                     self.update_session_list();
                 }
             }
+            ServerEvent::AgentSessionRestored { session_id } => {
+                // The event can refer to a descendant restored as part of a
+                // project cascade, so only apply it to the session it names.
+                if let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == *session_id)
+                {
+                    session.state = AgentSessionState::Idle;
+                }
+                if self.active_session.id == *session_id {
+                    self.session_state = AgentSessionState::Idle;
+                    self.active_session.state = AgentSessionState::Idle;
+                    self.update_session_list();
+                }
+            }
             ServerEvent::Agent { event } => self.consume_agent_event(event),
             ServerEvent::SessionFilesystemChanged { change } => {
                 self.record_status(format!("Workspace {:?}: {}", change.kind, change.path));

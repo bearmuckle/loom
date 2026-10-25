@@ -265,6 +265,13 @@ pub enum SessionRequest {
         session_id: AgentSessionId,
     },
 
+    /// Returns an archived session to `Idle` and keeps its transcript,
+    /// checkpoints, files, and checkouts. A project root restores the
+    /// descendants archived together with it.
+    RestoreAgentSession {
+        session_id: AgentSessionId,
+    },
+
     /// Permanently removes an archived session and its stored history.
     DeleteAgentSession {
         session_id: AgentSessionId,

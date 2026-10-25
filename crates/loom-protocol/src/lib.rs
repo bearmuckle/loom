@@ -481,7 +481,8 @@ impl ClientRequest {
             Self::Session(SessionRequest::RenameAgentSession { .. })
             | Self::Session(SessionRequest::SetAgentSessionGoal { .. })
             | Self::Session(SessionRequest::SetAgentSessionTitleSource { .. })
-            | Self::Session(SessionRequest::ArchiveAgentSession { .. }) => {
+            | Self::Session(SessionRequest::ArchiveAgentSession { .. })
+            | Self::Session(SessionRequest::RestoreAgentSession { .. }) => {
                 Some(Capability::ControlAgentSession)
             }
             Self::Session(SessionRequest::DeleteAgentSession { .. }) => {
@@ -720,6 +721,7 @@ impl ClientRequest {
             | Self::Session(SessionRequest::SetAgentSessionGoal { .. })
             | Self::Session(SessionRequest::SetAgentSessionTitleSource { .. })
             | Self::Session(SessionRequest::ArchiveAgentSession { .. })
+            | Self::Session(SessionRequest::RestoreAgentSession { .. })
             | Self::Session(SessionRequest::DeleteAgentSession { .. })
             | Self::Session(SessionRequest::SetSessionApprovalPolicy { .. })
             | Self::Repository(RepositoryRequest::AttachSessionRepository { .. })
@@ -766,6 +768,7 @@ impl ClientRequest {
             | Self::Session(SessionRequest::SetAgentSessionGoal { session_id, .. })
             | Self::Session(SessionRequest::SetAgentSessionTitleSource { session_id, .. })
             | Self::Session(SessionRequest::ArchiveAgentSession { session_id })
+            | Self::Session(SessionRequest::RestoreAgentSession { session_id })
             | Self::Session(SessionRequest::DeleteAgentSession { session_id, .. })
             | Self::Session(SessionRequest::ForkAgentSession { session_id, .. })
             | Self::Session(SessionRequest::SetSessionApprovalPolicy { session_id, .. })
@@ -916,6 +919,7 @@ impl ClientRequest {
                 | Self::Session(SessionRequest::SetAgentSessionGoal { .. })
                 | Self::Session(SessionRequest::SetAgentSessionTitleSource { .. })
                 | Self::Session(SessionRequest::ArchiveAgentSession { .. })
+                | Self::Session(SessionRequest::RestoreAgentSession { .. })
                 | Self::Session(SessionRequest::DeleteAgentSession { .. })
                 | Self::Control(ControlRequest::SetArchiveRetentionPolicy { .. })
                 | Self::Run(RunRequest::ApproveAgentAction { .. })
@@ -1314,7 +1318,7 @@ mod run_message_protocol_tests {
 
     #[test]
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 14));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 15));
         let project_id = ProjectId::new();
         let request = ClientRequest::Project(ProjectRequest::GetProjectSnapshot { project_id });
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));

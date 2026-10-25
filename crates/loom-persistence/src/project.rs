@@ -1498,6 +1498,123 @@ impl FilePersistence {
             .map(Option::flatten)
     }
 
+    /// Replaces the archived subtree recorded for a project root.
+    ///
+    /// The record names the descendants the root archived as one unit. A member
+    /// row deliberately outlives the member session, so a restore can detect a
+    /// member that was swept instead of restoring half a tree. An empty list
+    /// clears the record, which is what a restore leaves behind.
+    pub fn replace_archived_project_members(
+        &self,
+        root_session_id: AgentSessionId,
+        members: &[(AgentSessionId, u8)],
+    ) -> Result<()> {
+        if !self.path.exists() {
+            return Ok(());
+        }
+        let connection = self.connection_for_write()?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin archived project membership write: {error}"),
+                true,
+            )
+        })?;
+        transaction
+            .execute(
+                "DELETE FROM archived_project_members WHERE root_session_id=?1",
+                [root_session_id.as_uuid().as_bytes().as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not clear archived project membership: {error}"),
+                    true,
+                )
+            })?;
+        for (session_id, depth) in members {
+            transaction
+                .execute(
+                    "INSERT INTO archived_project_members(root_session_id, session_id, depth)
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        root_session_id.as_uuid().as_bytes().as_slice(),
+                        session_id.as_uuid().as_bytes().as_slice(),
+                        i64::from(*depth),
+                    ],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not record archived project membership: {error}"),
+                        true,
+                    )
+                })?;
+        }
+        transaction.commit().map_err(|error| {
+            persistence_error(
+                format!("could not commit archived project membership: {error}"),
+                true,
+            )
+        })
+    }
+
+    /// Loads the archived subtree recorded for a project root, deepest first.
+    pub fn load_archived_project_members(
+        &self,
+        root_session_id: AgentSessionId,
+    ) -> Result<Vec<(AgentSessionId, u8)>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT session_id, depth FROM archived_project_members
+                 WHERE root_session_id=?1
+                 ORDER BY depth DESC, session_id",
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prepare archived project membership read: {error}"),
+                    true,
+                )
+            })?;
+        let rows = statement
+            .query_map([root_session_id.as_uuid().as_bytes().as_slice()], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read archived project membership: {error}"),
+                    true,
+                )
+            })?;
+        let mut members = Vec::new();
+        for row in rows {
+            let (session_id, depth) = row.map_err(|error| {
+                persistence_error(
+                    format!("could not read archived project membership: {error}"),
+                    true,
+                )
+            })?;
+            let depth = u8::try_from(depth).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted archived project depth is outside the supported range",
+                    false,
+                )
+            })?;
+            members.push((
+                AgentSessionId::from_uuid(decode_uuid(&session_id, "session id")?),
+                depth,
+            ));
+        }
+        Ok(members)
+    }
+
+    /// Clears the archived subtree recorded for a project root.
+    pub fn clear_archived_project_members(&self, root_session_id: AgentSessionId) -> Result<()> {
+        self.replace_archived_project_members(root_session_id, &[])
+    }
+
     /// Loads the durable hierarchy and current session projections for a project.
     pub fn load_project_snapshot(&self, project_id: ProjectId) -> Result<Option<ProjectSnapshot>> {
         if !self.path.exists() {
