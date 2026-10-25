@@ -199,9 +199,11 @@ An OpenAI-compatible gateway is registered from the environment instead:
 
 - `LOOM_OPENAI_ENDPOINT` — the gateway's chat-completions URL. The gateway is
   registered as the `openai-compatible` provider.
-- `LOOM_API_KEY` — the gateway's key. It is stored in the credential file beside
-  the database, and only the credential reference reaches a provider summary, a
-  protocol response, or a log line.
+- `LOOM_API_KEY` — the gateway's key. It is stored in the worker's credential
+  store, `credentials.json` under the Loom config directory (`LOOM_CONFIG_DIR`,
+  otherwise `$XDG_CONFIG_HOME/loom` or `$HOME/.config/loom`), and only the
+  credential reference reaches a provider summary, a protocol response, or a log
+  line.
 - `LOOM_MODEL` — the one model the gateway advertises, defaulting to `gpt-6-luna`.
 
 Setting `LOOM_OPENAI_ENDPOINT` without a non-blank `LOOM_API_KEY` refuses the
@@ -214,9 +216,11 @@ the key; provider summaries carry only the credential reference.
 
 - `configured` (the default) is the registry described above.
 - `demo` serves `deterministic/demo` and the local OpenAI-compatible demo model.
-  It needs no credential and no network access, which is what makes it useful
-  for tests and local automation. It is not intended for an exposed production
-  worker, because its models return scripted output instead of model responses.
+  The deterministic model needs no credential and no network access, which is
+  what makes it useful for tests and local automation; the OpenAI-compatible
+  demo model expects a server on `127.0.0.1:8000`, and the demo registry keeps
+  the Ollama entry, which expects a local runtime. The profile is not intended
+  for an exposed production worker.
 
 ## Where agent commands execute
 

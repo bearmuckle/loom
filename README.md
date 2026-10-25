@@ -100,10 +100,13 @@ without a non-blank `LOOM_API_KEY` is refused at startup instead of starting a
 provider that cannot authenticate, and `LOOM_API_KEY` or `LOOM_MODEL` alone
 change nothing.
 
-API keys are stored in a credential file beside the backend's SQLite database and
-used by the backend; provider listings carry only the credential reference, never
-the key, and no log line prints it. Treat the key as sensitive and note that
-state storage is not an encrypted vault.
+API keys are stored in Loom's credential files, written with mode 0600: the
+environment gateway key in `credentials.json` under the Loom config directory
+(`LOOM_CONFIG_DIR`, otherwise `$XDG_CONFIG_HOME/loom` or `$HOME/.config/loom`); a key
+entered in the Providers dialog is stored beside a persistent state database.
+Provider listings carry only the credential reference, never the key, and no log
+line prints it. Treat keys as sensitive and note that state storage is not an
+encrypted vault.
 
 `loom-server --providers demo` serves the `deterministic/demo` model and the local
 OpenAI-compatible demo model instead of the configured registry, so tests and
