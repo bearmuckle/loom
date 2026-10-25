@@ -4,8 +4,8 @@
 //! Every read is addressed by the id of any project member session, so one
 //! verb works from the project root and from any child: the root session id is
 //! also the project id, and the worker resolves a child's id to its project.
-//! The reads negotiate no mutating capability; only `project send` mutates, and
-//! it keys its own mutation with `--request-id`.
+//! The reads negotiate no mutating capability; only `project send` and
+//! `project child` mutate, and each keys its own mutation with `--request-id`.
 //!
 //! There is deliberately no agent message verb: an agent-attributed message is
 //! reserved for the server-bound agent tool, so `Project/SendProjectAgentMessage`
@@ -355,12 +355,19 @@ pub(super) async fn send<C: Client>(
 /// The task is looked up in the authoritative project snapshot first: a task id
 /// that this project does not name is reported as not found without sending a
 /// control request, and a named task supplies the manager session id.
+///
+/// `--request-id` keys the control request alone: the snapshot pre-read always
+/// keeps a fresh id, and a repeated key is answered from the worker's durable
+/// cache instead of controlling the child a second time, which the `--json`
+/// envelope reports as `replayed`. There is no retry, so one key is never
+/// reused for a second request.
 pub(super) async fn child<C: Client>(
     client: &mut C,
     invocation: &Invocation,
     session_id: AgentSessionId,
     task_id: TaskId,
     action: ProjectChildAction,
+    request_id: Option<RequestId>,
     out: &mut dyn Write,
 ) -> Result<Outcome, Failure> {
     let mut caller = Caller::new(client);
@@ -373,14 +380,18 @@ pub(super) async fn child<C: Client>(
         });
     };
     let (request_id, response) = caller
-        .call(ClientRequest::Project(
-            ProjectRequest::ControlProjectChild {
+        .call_with_id(
+            // The caller's key, when it named one, is the control's id, so a
+            // repeated command is answered from the worker's cache. The
+            // pre-read above keeps a fresh id.
+            request_id.unwrap_or_default(),
+            ClientRequest::Project(ProjectRequest::ControlProjectChild {
                 project_id: project.project_id,
                 manager_session_id: task.requester_session_id,
                 task_id,
                 action: control_action(action),
-            },
-        ))
+            }),
+        )
         .await?;
     let (task, run) = match response {
         ServerResponse::Project(ProjectResponse::ProjectChildControlled { task, run }) => {
@@ -408,7 +419,7 @@ pub(super) async fn child<C: Client>(
             .as_deref()
             .map(|run| serde_json::to_value(run).unwrap_or(Value::Null)),
     });
-    Ok(Outcome::new(data, caller.primary))
+    Ok(Outcome::new(data, caller.primary).with_replayed(caller.replayed()))
 }
 
 /// Reads the project snapshot that any member session addresses, together with

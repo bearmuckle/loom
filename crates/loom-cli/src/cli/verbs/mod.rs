@@ -608,7 +608,19 @@ pub(crate) async fn run<C: Client>(
             session,
             task,
             action,
-        } => project::child(client, invocation, *session, *task, *action, out).await,
+            request_id,
+        } => {
+            project::child(
+                client,
+                invocation,
+                *session,
+                *task,
+                *action,
+                *request_id,
+                out,
+            )
+            .await
+        }
     }
 }
 

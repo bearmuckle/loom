@@ -4088,6 +4088,14 @@ fn the_parser_accepts_a_request_id_on_every_mutating_verb() {
         vec![
             "project", "worktree", "cleanup", &session, "--task", &task_text, "--remove",
         ],
+        vec![
+            "project",
+            "child",
+            "pause",
+            &task_text,
+            "--session",
+            &session,
+        ],
     ] {
         assert_eq!(
             verb_request_id(&invocation(&arguments).verb),
@@ -4211,6 +4219,7 @@ fn verb_request_id(verb: &Verb) -> Option<RequestId> {
         | Verb::ProjectArchive { request_id, .. }
         | Verb::ProjectDelete { request_id, .. }
         | Verb::ProjectSend { request_id, .. }
+        | Verb::ProjectChild { request_id, .. }
         | Verb::ProjectWorktreeIntegrate { request_id, .. }
         | Verb::ProjectWorktreeCleanup { request_id, .. } => *request_id,
         _ => None,
@@ -8221,27 +8230,6 @@ fn project_child_controls_send_the_snapshot_manager() {
     );
 }
 
-/// A real delegated child: a session with a started run, named as the target of
-/// a task in a synthetic snapshot.
-///
-/// `create_project_child` is `pub(crate)` in `loom-server`, so a test produces
-/// the hierarchy by rewriting the project read while the run itself stays real.
-fn real_delegated_child(fixture: &Fixture) -> (AgentSessionId, RunId, ProjectSnapshot) {
-    let child = create_session(&fixture.control, fixture.workspace.id, "delegated child").id;
-    pin_auto_policy(&fixture.control, child);
-    let run_id = start_run(&fixture.control, child);
-    await_run_state(&fixture.control, child, AgentRunState::Completed);
-    let root = fixture.session.id;
-    let mut project = fake_project(root, &[root, child], Vec::new());
-    project.tasks.push(fake_task(
-        project.project_id,
-        root,
-        child,
-        "delegated child",
-    ));
-    (child, run_id, project)
-}
-
 #[test]
 fn project_send_directs_a_delegated_childs_active_run() {
     let fixture = fixture();
@@ -8411,6 +8399,128 @@ fn project_send_refuses_a_child_without_an_active_run() {
 }
 
 #[test]
+fn project_child_keys_the_control_request_alone() {
+    let fixture = fixture();
+    let project = synthetic_project();
+    let (root, blocked, controlled_run) = (project.root, project.blocked, project.controlled_run);
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let sink = Rc::clone(&sent);
+    let client = Wrapped::new(InProcessClient::new(&fixture.backend)).before(move |envelope| {
+        sink.borrow_mut()
+            .push((envelope.request_id, envelope.request.clone()));
+    });
+    let mut client = with_synthetic_project(client, project);
+    let root_text = root.to_string();
+    let task_text = blocked.to_string();
+    let key = RequestId::new();
+
+    let keyed = run(
+        &mut client,
+        &[
+            "project",
+            "child",
+            "pause",
+            &task_text,
+            "--session",
+            &root_text,
+            "--request-id",
+            &key.to_string(),
+            "--json",
+        ],
+    );
+    assert_eq!(keyed.code, exit::OK, "{}", keyed.stderr);
+    let envelope = json_envelope(&keyed);
+    assert_eq!(envelope["verb"], "project child pause");
+    assert_eq!(envelope["data"]["run"]["id"], controlled_run.to_string());
+    assert_eq!(envelope["replayed"], false, "the control was applied");
+    {
+        let recorded = sent.borrow();
+        let (control_id, _) = recorded
+            .iter()
+            .rev()
+            .find(|(_, request)| {
+                matches!(
+                    request,
+                    ClientRequest::Project(ProjectRequest::ControlProjectChild { .. })
+                )
+            })
+            .expect("a control request");
+        assert_eq!(
+            *control_id, key,
+            "the control request carries the caller's key"
+        );
+        let (snapshot_id, _) = recorded
+            .iter()
+            .rev()
+            .find(|(_, request)| {
+                matches!(
+                    request,
+                    ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession { .. })
+                )
+            })
+            .expect("a snapshot pre-read");
+        assert_ne!(
+            *snapshot_id, key,
+            "the snapshot pre-read never carries the key"
+        );
+        let handshake = recorded.first().map(|(id, _)| *id).expect("a handshake");
+        assert_eq!(
+            envelope["request_id"],
+            handshake.to_string(),
+            "the envelope reports the verb's primary request"
+        );
+        assert_ne!(envelope["request_id"], key.to_string());
+    }
+
+    // The same command without the flag keeps a fresh id for the control.
+    let unkeyed = run(
+        &mut client,
+        &[
+            "project",
+            "child",
+            "pause",
+            &task_text,
+            "--session",
+            &root_text,
+        ],
+    );
+    assert_eq!(unkeyed.code, exit::OK, "{}", unkeyed.stderr);
+    let recorded = sent.borrow();
+    let (fresh_id, _) = recorded
+        .iter()
+        .rev()
+        .find(|(_, request)| {
+            matches!(
+                request,
+                ClientRequest::Project(ProjectRequest::ControlProjectChild { .. })
+            )
+        })
+        .expect("a control request");
+    assert_ne!(*fresh_id, key, "a command without the flag uses a fresh id");
+}
+
+/// A real delegated child: a session with a started run, named as the target of
+/// a task in a synthetic snapshot.
+///
+/// `create_project_child` is `pub(crate)` in `loom-server`, so a test produces
+/// the hierarchy by rewriting the project read while the run itself stays real.
+fn real_delegated_child(fixture: &Fixture) -> (AgentSessionId, RunId, ProjectSnapshot) {
+    let child = create_session(&fixture.control, fixture.workspace.id, "delegated child").id;
+    pin_auto_policy(&fixture.control, child);
+    let run_id = start_run(&fixture.control, child);
+    await_run_state(&fixture.control, child, AgentRunState::Completed);
+    let root = fixture.session.id;
+    let mut project = fake_project(root, &[root, child], Vec::new());
+    project.tasks.push(fake_task(
+        project.project_id,
+        root,
+        child,
+        "delegated child",
+    ));
+    (child, run_id, project)
+}
+
+#[test]
 fn project_reads_of_a_real_session_use_the_single_root_fallback() {
     let (fixture, directory) = persistent_fixture("project-fallback");
     let session = fixture.session.id;
@@ -8543,6 +8653,7 @@ fn the_parser_covers_the_project_verbs() {
             session: parsed,
             task: parsed_task,
             action,
+            request_id,
         } = invocation(&["project", "child", word, &task, "--session", &session]).verb
         else {
             panic!("project child parses as project child")
@@ -8550,7 +8661,27 @@ fn the_parser_covers_the_project_verbs() {
         assert_eq!(parsed, session_id);
         assert_eq!(parsed_task, task_id);
         assert_eq!(action, expected);
+        assert_eq!(request_id, None);
     }
+
+    // `project child` keys its control request with the same flag as every
+    // other mutation.
+    let key = RequestId::new();
+    let Verb::ProjectChild { request_id, .. } = invocation(&[
+        "project",
+        "child",
+        "pause",
+        &task,
+        "--session",
+        &session,
+        "--request-id",
+        &key.to_string(),
+    ])
+    .verb
+    else {
+        panic!("project child parses as project child")
+    };
+    assert_eq!(request_id, Some(key));
 
     // `project send` takes the direction inline or from a file, never both.
     let text_file = temporary_path("project-send-text.txt");
@@ -8575,7 +8706,6 @@ fn the_parser_covers_the_project_verbs() {
     assert_eq!(text, "prefer the smaller diff");
     assert_eq!(request_id, None);
 
-    let key = RequestId::new();
     let Verb::ProjectSend {
         text, request_id, ..
     } = invocation(&[
