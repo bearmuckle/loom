@@ -925,6 +925,7 @@ pub(crate) fn session_id_for_request(
         })
         | ClientRequest::Session(SessionRequest::RenameAgentSession { session_id, .. })
         | ClientRequest::Session(SessionRequest::ArchiveAgentSession { session_id })
+        | ClientRequest::Session(SessionRequest::RestoreAgentSession { session_id })
         | ClientRequest::Events(EventsRequest::GetRecentSessionEvents { session_id, .. })
         | ClientRequest::Run(RunRequest::StartSessionAgentRun { session_id, .. })
         | ClientRequest::Run(RunRequest::StartSessionAgentRunWithOptions { session_id, .. })

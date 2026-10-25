@@ -480,6 +480,18 @@ CREATE TABLE IF NOT EXISTS archive_retention_policy (
     sub_agent_retention_ms INTEGER DEFAULT 600000
         CHECK(sub_agent_retention_ms IS NULL OR sub_agent_retention_ms > 0)
 ) STRICT;
+-- The archived subtree a project root archived as one unit. A member row
+-- deliberately outlives the member session, so a later restore can refuse when
+-- a swept member is missing instead of restoring half a tree. Rows are cleared
+-- when the root is restored and removed with the root.
+CREATE TABLE IF NOT EXISTS archived_project_members (
+    root_session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+        CHECK(length(root_session_id) = 16),
+    session_id BLOB NOT NULL CHECK(length(session_id) = 16),
+    depth INTEGER NOT NULL CHECK(depth BETWEEN 2 AND 3),
+    PRIMARY KEY(root_session_id, session_id),
+    CHECK(root_session_id != session_id)
+) WITHOUT ROWID, STRICT;
 -- People the backend knows. Identity is derived by the server from the
 -- credential a connection authenticated with; the display name is the one the
 -- operator bound to that credential.
@@ -1293,6 +1305,13 @@ fn migrate_schema_transaction(connection: &Connection, from_version: u32) -> Res
             // baseline table.
             14 => {
                 version = 15;
+            }
+            // v16 adds the archived subtree a project root archived as one
+            // unit, so a restore can detect a member that was swept. The table
+            // is a new baseline object, created by the re-applied baseline
+            // below.
+            15 => {
+                version = 16;
             }
             other => return Err(unsupported_database_error(other)),
         }

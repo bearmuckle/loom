@@ -178,6 +178,8 @@ pub enum SessionResponse {
 
     AgentSessionArchived(AgentSessionSnapshot),
 
+    AgentSessionRestored(AgentSessionSnapshot),
+
     AgentSessionDeleted { session_id: AgentSessionId },
 
     ApprovalPolicy(SessionApprovalPolicyUpdate),

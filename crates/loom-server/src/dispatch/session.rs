@@ -71,6 +71,9 @@ impl InProcessConnection {
             ClientRequest::Session(SessionRequest::ArchiveAgentSession { session_id }) => {
                 self.archive_session(session_id)
             }
+            ClientRequest::Session(SessionRequest::RestoreAgentSession { session_id }) => {
+                self.backend.restore_agent_session(session_id)
+            }
             ClientRequest::Session(SessionRequest::DeleteAgentSession { session_id, force }) => {
                 self.delete_agent_session(session_id, force)
             }

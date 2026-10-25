@@ -217,14 +217,14 @@ impl InProcessConnection {
             }
         }
 
-        for (child_id, depth) in descendants {
+        for (child_id, depth) in &descendants {
             log::info!(
                 "[loom-server] archiving descendant session {child_id} (depth {depth}) of project root {session_id}"
             );
             let (_, record) = self
                 .backend
                 .sessions()?
-                .archive(child_id)
+                .archive(*child_id)
                 .inspect_err(|error| {
                     log::warn!(
                         "[loom-server] failed to archive descendant session {child_id} of project root {session_id}: {}",
@@ -233,7 +233,7 @@ impl InProcessConnection {
                 })?;
             self.backend.journal()?.append_session(record);
             // An archived session no longer runs, so its build output can go.
-            self.backend.remove_build_cache(child_id);
+            self.backend.remove_build_cache(*child_id);
         }
 
         let (snapshot, record) =
@@ -248,6 +248,27 @@ impl InProcessConnection {
                 })?;
         self.backend.journal()?.append_session(record);
         self.backend.remove_build_cache(session_id);
+        // Record the archived subtree so a root restore can tell a swept
+        // descendant from one that was never archived with it.
+        if let Some(project) = &project
+            && let Some(persistence) = &self.backend.persistence
+        {
+            let members = {
+                let catalog = self.backend.sessions()?;
+                project
+                    .agents
+                    .iter()
+                    .filter(|agent| agent.session_id != session_id)
+                    .filter(|agent| {
+                        catalog
+                            .get(agent.session_id)
+                            .is_ok_and(|session| session.state == AgentSessionState::Archived)
+                    })
+                    .map(|agent| (agent.session_id, agent.depth))
+                    .collect::<Vec<_>>()
+            };
+            persistence.replace_archived_project_members(session_id, &members)?;
+        }
         log::info!("[loom-server] archived session {session_id}");
         Ok(ServerResponse::Session(
             SessionResponse::AgentSessionArchived(snapshot),

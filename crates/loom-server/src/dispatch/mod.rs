@@ -222,6 +222,9 @@ impl InProcessConnection {
             ClientRequest::Session(SessionRequest::ArchiveAgentSession { .. }) => {
                 self.session_dispatch(request, request_id)
             }
+            ClientRequest::Session(SessionRequest::RestoreAgentSession { .. }) => {
+                self.session_dispatch(request, request_id)
+            }
             ClientRequest::Session(SessionRequest::DeleteAgentSession { .. }) => {
                 self.session_dispatch(request, request_id)
             }

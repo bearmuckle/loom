@@ -627,6 +627,61 @@ fn archived_session_deletion_and_retention_policy_contracts_round_trip() {
 }
 
 #[test]
+fn archived_session_restore_contract_round_trips() {
+    let session_id = AgentSessionId::new();
+    let request = RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::RestoreAgentSession { session_id },
+    ));
+    // Restoring is session control, so it is capability-gated and owner-only.
+    assert_eq!(
+        request.request.required_capability(),
+        Some(Capability::ControlAgentSession)
+    );
+    assert_eq!(
+        request.request.required_session_role(),
+        Some(loom_core::SessionRole::Owner)
+    );
+    assert_eq!(
+        request.request.access_target(),
+        Some(loom_protocol::AccessTarget::Session(session_id))
+    );
+    // A restore is journaled as a retryable mutation so a reconnect cannot
+    // apply the request twice.
+    assert!(request.request.is_retryable_mutation());
+    assert_eq!(
+        decode_request(&encode_request(&request).unwrap()).unwrap(),
+        request
+    );
+
+    let snapshot = AgentSessionSnapshot {
+        id: session_id,
+        workspace_id: WorkspaceId::new(),
+        name: "Restored session".to_owned(),
+        goal: None,
+        state: AgentSessionState::Idle,
+        created_at: Timestamp::from_unix_millis(1),
+        updated_at: Timestamp::from_unix_millis(2),
+        title_source: loom_core::SessionTitleSource::Auto,
+    };
+    let response = ResponseEnvelope::success(
+        loom_core::RequestId::new(),
+        ServerResponse::Session(SessionResponse::AgentSessionRestored(snapshot)),
+    );
+    assert_eq!(
+        decode_response(&encode_response(&response).unwrap()).unwrap(),
+        response
+    );
+
+    let event = ServerEventEnvelope {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        sequence: EventSequence::new(13),
+        session_id,
+        event: ServerEvent::AgentSessionRestored { session_id },
+    };
+    assert_eq!(decode_event(&encode_event(&event).unwrap()).unwrap(), event);
+}
+
+#[test]
 fn session_goal_contract_carries_a_durable_text_field() {
     let session_id = AgentSessionId::new();
     let request = RequestEnvelope::new(ClientRequest::Session(

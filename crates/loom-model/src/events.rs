@@ -103,6 +103,10 @@ pub enum ServerEvent {
     AgentSessionArchived {
         session_id: AgentSessionId,
     },
+    /// The session left the archive and returned to `Idle`. Protocol 11.15.
+    AgentSessionRestored {
+        session_id: AgentSessionId,
+    },
     Agent {
         event: AgentEvent,
     },
@@ -187,6 +191,9 @@ impl ServerEventEnvelope {
             }
             SessionEvent::AgentSessionArchived { session_id } => {
                 ServerEvent::AgentSessionArchived { session_id }
+            }
+            SessionEvent::AgentSessionRestored { session_id } => {
+                ServerEvent::AgentSessionRestored { session_id }
             }
         };
         Self {

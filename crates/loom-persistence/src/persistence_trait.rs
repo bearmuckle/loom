@@ -751,6 +751,16 @@ pub trait ProjectRepository: Send + Sync {
         &self,
         request_id: RequestId,
     ) -> Result<Option<loom_core::AgentMessageRecord>>;
+    fn replace_archived_project_members(
+        &self,
+        root_session_id: AgentSessionId,
+        members: &[(AgentSessionId, u8)],
+    ) -> Result<()>;
+    fn load_archived_project_members(
+        &self,
+        root_session_id: AgentSessionId,
+    ) -> Result<Vec<(AgentSessionId, u8)>>;
+    fn clear_archived_project_members(&self, root_session_id: AgentSessionId) -> Result<()>;
     fn load_project_child_by_request(
         &self,
         request_id: RequestId,
@@ -920,6 +930,22 @@ impl ProjectRepository for FilePersistence {
         request_id: RequestId,
     ) -> Result<Option<loom_core::AgentMessageRecord>> {
         FilePersistence::load_agent_message_by_request(self, request_id)
+    }
+    fn replace_archived_project_members(
+        &self,
+        root_session_id: AgentSessionId,
+        members: &[(AgentSessionId, u8)],
+    ) -> Result<()> {
+        FilePersistence::replace_archived_project_members(self, root_session_id, members)
+    }
+    fn load_archived_project_members(
+        &self,
+        root_session_id: AgentSessionId,
+    ) -> Result<Vec<(AgentSessionId, u8)>> {
+        FilePersistence::load_archived_project_members(self, root_session_id)
+    }
+    fn clear_archived_project_members(&self, root_session_id: AgentSessionId) -> Result<()> {
+        FilePersistence::clear_archived_project_members(self, root_session_id)
     }
     fn load_project_child_by_request(
         &self,
@@ -1114,6 +1140,22 @@ impl<T: ProjectRepository + ?Sized> ProjectRepository for Arc<T> {
         request_id: RequestId,
     ) -> Result<Option<loom_core::AgentMessageRecord>> {
         (**self).load_agent_message_by_request(request_id)
+    }
+    fn replace_archived_project_members(
+        &self,
+        root_session_id: AgentSessionId,
+        members: &[(AgentSessionId, u8)],
+    ) -> Result<()> {
+        (**self).replace_archived_project_members(root_session_id, members)
+    }
+    fn load_archived_project_members(
+        &self,
+        root_session_id: AgentSessionId,
+    ) -> Result<Vec<(AgentSessionId, u8)>> {
+        (**self).load_archived_project_members(root_session_id)
+    }
+    fn clear_archived_project_members(&self, root_session_id: AgentSessionId) -> Result<()> {
+        (**self).clear_archived_project_members(root_session_id)
     }
     fn load_project_child_by_request(
         &self,
