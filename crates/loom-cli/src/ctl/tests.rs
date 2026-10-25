@@ -60,6 +60,24 @@ fn run_owned<C: Client>(client: &mut C, arguments: &[String]) -> Outcome {
     }
 }
 
+/// The same run on a caller-owned runtime, for a test that is already inside
+/// one and therefore cannot block on a second.
+async fn run_async<C: Client>(client: &mut C, arguments: &[&str]) -> Outcome {
+    let arguments: Vec<String> = arguments.iter().map(|value| (*value).to_owned()).collect();
+    run_async_owned(client, &arguments).await
+}
+
+async fn run_async_owned<C: Client>(client: &mut C, arguments: &[String]) -> Outcome {
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = run_command(client, arguments, &mut out, &mut err).await;
+    Outcome {
+        code,
+        stdout: String::from_utf8(out).expect("UTF-8 stdout"),
+        stderr: String::from_utf8(err).expect("UTF-8 stderr"),
+    }
+}
+
 /// A backend with one workspace and one session, plus a direct connection the
 /// test can use to read the same state the CLI reads.
 struct Fixture {
@@ -726,6 +744,96 @@ fn ls_get_events_and_peek_issue_no_mutation() {
         before_session,
         session_snapshot(&fixture.control, fixture.session.id)
     );
+}
+
+#[test]
+fn a_read_only_scoped_token_can_read_but_cannot_start_a_run() {
+    // A token scoped to one workspace and only the capabilities a read needs is
+    // the read-only credential the contract promises to support. The same
+    // client code runs the read verbs and is refused the one mutation.
+    use loom_server::{
+        AuthTokenStore, AuthorizationScope, RemoteServer, RemoteServerConfig, WebSocketTransport,
+    };
+
+    let backend = InProcessBackend::new();
+    let control = backend.connect();
+    negotiate(&control);
+    let workspace = create_workspace(&control, "read only workspace");
+    let session = create_session(&control, workspace.id, "read only session");
+    let session_text = session.id.to_string();
+
+    let read_capabilities = CapabilitySet::new([
+        Capability::ReadAgentSession,
+        Capability::SubscribeSessionEvents,
+        Capability::ManageWorkspaces,
+        Capability::ReadWorkerNodeStatus,
+        Capability::JsonProtocol,
+    ]);
+    let auth = Arc::new(AuthTokenStore::new());
+    auth.insert(
+        "read-only-token",
+        AuthorizationScope::for_workspaces([workspace.id], read_capabilities),
+    )
+    .unwrap();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let server =
+            RemoteServer::new(backend.clone(), auth, RemoteServerConfig::local_ephemeral())
+                .bind()
+                .await
+                .unwrap();
+        let transport = WebSocketTransport::new(server.websocket_url(), "read-only-token");
+        let mut client = crate::ctl::client::RemoteClient::new(transport.connect().await.unwrap());
+
+        let ls = run_async(&mut client, &["ls"]).await;
+        assert_eq!(ls.code, exit::OK, "{}", ls.stderr);
+        assert_eq!(ls.stdout, format!("{} read only workspace\n", workspace.id));
+
+        for arguments in [
+            vec!["get".to_owned(), session_text.clone()],
+            vec![
+                "events".to_owned(),
+                "--session".to_owned(),
+                session_text.clone(),
+            ],
+            vec![
+                "peek".to_owned(),
+                "--session".to_owned(),
+                session_text.clone(),
+            ],
+        ] {
+            let outcome = run_async_owned(&mut client, &arguments).await;
+            assert_eq!(outcome.code, exit::OK, "{arguments:?}: {}", outcome.stderr);
+        }
+
+        // The token does not carry the capabilities a run needs, so the write
+        // side is refused and the read path above still worked.
+        let started = run_async(
+            &mut client,
+            &[
+                "run",
+                "--workspace",
+                &workspace.id.to_string(),
+                "--task",
+                "a task",
+            ],
+        )
+        .await;
+        assert_eq!(started.code, exit::BLOCKED);
+        assert_eq!(started.stdout, "");
+        assert!(
+            started.stderr.contains("authorization_denied"),
+            "{}",
+            started.stderr
+        );
+
+        server.stop().await.unwrap();
+    });
+    backend.shutdown().unwrap();
 }
 
 // 5. The `--json` envelopes and the exit-code classes.
