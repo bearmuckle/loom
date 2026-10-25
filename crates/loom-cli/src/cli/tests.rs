@@ -1405,7 +1405,9 @@ fn the_token_is_only_accepted_from_a_file() {
 // liveness, result, and `run --new`.
 
 /// Waits for the session's latest run to reach `wanted` and returns the
-/// projection that carries it.
+/// projection that carries it. A run that is awaiting approval also has to
+/// carry its pending tool call: the state and the call are written separately,
+/// so a projection can report the state one read before it carries the call.
 fn await_run_state(
     connection: &InProcessConnection,
     session_id: AgentSessionId,
@@ -1415,6 +1417,7 @@ fn await_run_state(
         let projection = session_projection(connection, session_id);
         if let Some(active) = &projection.active_run
             && active.run.state == wanted
+            && (wanted != AgentRunState::AwaitingApproval || active.pending_approval.is_some())
         {
             return projection;
         }
