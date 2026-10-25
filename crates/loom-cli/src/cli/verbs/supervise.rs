@@ -20,9 +20,8 @@ use std::{
 };
 
 use loom_core::{
-    AgentSessionId, AgentSessionState, DelegatedTaskStatus, ErrorCode, GitFileStatusKind,
-    ProjectSnapshot, RequestId, RunControlAction, RunId, RunRevision, SessionRepository,
-    ToolCallId,
+    AgentSessionId, AgentSessionState, ErrorCode, GitFileStatusKind, ProjectSnapshot, RequestId,
+    RunControlAction, RunId, RunRevision, SessionRepository, ToolCallId,
 };
 use loom_protocol::{
     ActivityDetail, AgentRunSnapshot, AgentSessionSnapshotProjection, ClientRequest,
@@ -35,7 +34,9 @@ use serde_json::{Value, json};
 use crate::cli::args::{Invocation, StatusFormat, WaitUntil};
 use crate::cli::client::Client;
 use crate::cli::exit;
-use crate::cli::text::{escape, run_state_name, session_state_name, worktree_line};
+use crate::cli::text::{
+    escape, run_state_name, session_state_name, task_status_name, worktree_line,
+};
 
 use super::{Caller, Failure, Outcome, derived_id, emit, handshake};
 
@@ -750,18 +751,6 @@ fn agent_verdict(state: AgentSessionState) -> &'static str {
     }
 }
 
-/// The status word of a delegated task: the protocol's serde spelling.
-fn task_status_name(status: DelegatedTaskStatus) -> &'static str {
-    match status {
-        DelegatedTaskStatus::Queued => "queued",
-        DelegatedTaskStatus::Running => "running",
-        DelegatedTaskStatus::Blocked => "blocked",
-        DelegatedTaskStatus::Completed => "completed",
-        DelegatedTaskStatus::Failed => "failed",
-        DelegatedTaskStatus::Cancelled => "cancelled",
-    }
-}
-
 /// The text lines of the project projection: the project, its root, one line
 /// per agent, task, and worktree with that worktree's conflict paths, then the
 /// decisions in agent order.
@@ -1162,9 +1151,9 @@ async fn session_projection<C: Client>(
 mod tests {
     use loom_core::{AgentSessionState, DelegatedTaskStatus, ProjectWorktreeStatus};
 
-    use crate::cli::text::worktree_status_name;
+    use crate::cli::text::{task_status_name, worktree_status_name};
 
-    use super::{agent_verdict, project_verdict, task_status_name};
+    use super::{agent_verdict, project_verdict};
 
     #[test]
     fn every_session_state_has_a_verdict_word() {
