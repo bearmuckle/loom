@@ -77,6 +77,60 @@ defaulting to 10 minutes, applied even when general retention is off.
 [deployment](docs/deployment.md) documents the
 duration syntax and the sweep.
 
+## Headless client
+
+`loom-ctl` is a second binary in `crates/loom-cli` and a pure client of the
+versioned protocol: it embeds no backend, opens no SQLite database, and manages
+no worker. The `loom-cli` crate ships it:
+
+```sh
+cargo run -p loom-cli --bin loom-ctl -- doctor
+```
+
+Point it at a worker with `--connect <url>` (or `LOOM_URL`). The bearer token
+comes only from `--token-file <path>` (or `LOOM_TOKEN_FILE`); there is
+deliberately no `--token` flag, so a token never appears on a command line.
+`--ca-file` adds TLS roots, and a plaintext `ws://` URL to a non-loopback host
+needs the explicit `--allow-insecure-remote` opt-in.
+
+| Verb | Purpose |
+| --- | --- |
+| `doctor` | Negotiated protocol, capability intersection, participant, and worker node. |
+| `whoami` | The participant bound to the token. |
+| `ls [--workspace <id>]` | Workspaces, or the sessions of one workspace. |
+| `get <session-id> [--metadata]` | One session snapshot, or only its metadata. |
+| `events --session <id> [--after <seq>] [--cursor-file <path>] [--follow] [--format text\|jsonl] [--max-bytes <n>]` | Session events, optionally followed until interrupted. |
+| `peek --session <id> [--lines <n>]` | The tail of the session's current output; 200 lines by default. |
+
+`events` renders at most 4096 bytes of each event body by default; `--max-bytes`
+changes that cap.
+
+`--format text` is the default and is the documented, byte-stable `loom-text/1`
+projection: one line per event as `<seq> <kind> <body>`, with the body escaped
+so it never contains a raw newline, both ends of oversized tool output kept with
+an exact `[... N bytes omitted ...]` marker, and explicit `pending_approval` and
+`question` markers for the states that block a run. The same journal plus the
+same cursor produces identical bytes.
+
+`--format jsonl` writes one JSON object per line that carries `seq` and
+`stream_epoch`, so a caller can resume. `--json` prints one envelope containing
+the request id the call used.
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | ok |
+| `1` | internal error |
+| `2` | usage error |
+| `3` | blocked by a pending approval or a missing capability |
+| `4` | timeout |
+| `5` | not found or gone |
+| `6` | protocol or auth mismatch |
+| `7` | transport unreachable |
+
+`ls`, `get`, `events`, and `peek` are read-only and work with a
+read-only-scoped token. `run` starts a run and prints its ids; no verb in this
+slice waits for a run to finish.
+
 ## Providers
 
 Configure OpenAI, DeepSeek, or GitHub Copilot in the Providers dialog; the
