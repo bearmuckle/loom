@@ -99,7 +99,7 @@ Verbs:
   project tree <id>                 one line per project agent, indented by
                                     its depth
   project tasks <id>                one line per delegated task of a project
-  project children <id>             one line per direct child, with its
+  project children <id>             one line per child agent, with its
                                     pending approval or question
   project messages <id> [--after <seq>] [--limit <n>] [--max-bytes <n>]
                                     the project's durable parent-child log

@@ -53,7 +53,7 @@ The examples below use the installed binary name. In a checkout, replace
 | `project get <id>` | One project's project id, root session, parent project, and agent, task, and worktree counts. |
 | `project tree <id>` | One line per project agent, indented by its depth, with its session state and task summary. |
 | `project tasks <id>` | One line per delegated task: status, requester, target, model, dependencies, and intent. |
-| `project children <id>` | One line per delegated child, with its task status, run state, and pending approval or question. |
+| `project children <id>` | One line per child agent, with its task status, run state, and pending approval or question. |
 | `project messages <id> [--after <seq>] [--limit <n>] [--max-bytes <n>]` | The project's durable parent-child log, oldest first; 100 messages by default. |
 | `project send <id> (--text <text> \| --text-file <path>)` | Direct the child session's active run. |
 | `project child pause\|resume\|interrupt\|cancel <id>` | Control the delegated child task that targets `<id>`. |
@@ -68,9 +68,11 @@ starts a run; `send`, `answer`, `approve`, `deny`, `stop`, and `project send`
 control one;
 `wait`, `status`, `liveness`, and `result` read one. `retention set`,
 `session archive`, `session delete` (and its `delete` alias), `project
-archive`, `project delete`, `project child`, and `project worktree cleanup`
-are operator-level mutations. No verb waits for a run except `wait`, which is
-always bounded by `--timeout`.
+archive`, `project delete`, and `project worktree cleanup` are operator-level
+mutations. `project child` is a project-scoped mutation instead: the worker
+requires the negotiated `control_project_child` capability and the manager
+session's own child-control grant. No verb waits for a run except `wait`,
+which is always bounded by `--timeout`.
 
 Every verb negotiates only the capabilities its own requests need. `doctor`
 reports the intersection the worker granted, so its capability list is the
@@ -286,7 +288,7 @@ worker does not hold.
 - `project tasks <id>` prints one line per delegated task: `<task-id> <status>
   <requester-session-id> <target-session-id> <model-id> <dependencies|->
   <intent>`, with dependencies comma-separated ascending.
-- `project children <id>` reads each delegated child's metadata
+- `project children <id>` reads the metadata of every member below the root
   (`ActivityDetail::Replies`) and prints `<session-id> <session-state>
   <task-status|none> <run-state|none>`, followed by ` approval <tool-call-id>`
   or ` question <prompt>` when the child's active run waits on one.
