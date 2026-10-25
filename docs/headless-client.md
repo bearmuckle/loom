@@ -56,7 +56,7 @@ The examples below use the installed binary name. In a checkout, replace
 | `project children <session-id>` | The direct child agents with their task, run, pending approval, and pending question. |
 | `project messages <session-id> [--after <seq>] [--limit <n>]` | One page of the project's agent message history; `--limit` is 1 to 512 and 100 by default. |
 | `project send <session-id> (--text <text> \| --text-file <path>) [--request-id <uuid>]` | A direction to a delegated child's active run, with the same rules as `send`. |
-| `project child pause\|resume\|interrupt\|cancel <task-id> --session <id>` | Control one delegated child task. |
+| `project child pause\|resume\|interrupt\|cancel <task-id> --session <id> [--request-id <uuid>]` | Control one delegated child task. |
 | `project archive <session-id> [--request-id <uuid>]` | Archive a project root with its idle members; the id must name such a root. |
 | `project delete <session-id> [--force] [--yes] [--request-id <uuid>]` | Delete a project root and its tree; the id must name such a root. |
 | `project worktrees <session-id>` | The checkouts the project's snapshot records, in snapshot order. |
@@ -109,7 +109,7 @@ by default; `--max-bytes` changes that cap.
 `replayed` is `true` when the worker answered this call's mutating request
 from its idempotency cache instead of acting again, which happens only when the
 caller repeats a `--request-id`; a repeated archive, deletion, integration,
-cleanup, or child direction is recognised that way. A failure
+cleanup, child control, or child direction is recognised that way. A failure
 uses the same envelope with `ok: false`
 and an `error` object carrying `code`, `message`, `retryable`, and `exit_code`.
 `events` adds `gap { after, before, missing }` to `data` when a snapshot could
@@ -337,6 +337,12 @@ child. A task id that no task in that project names is reported as `not_found`
 (exit `5`) from the snapshot, without a control request; an unknown session is
 also `not_found` (exit `5`), a denied capability is exit `3`, and a worker's
 `invalid_state` refusal is exit `5`.
+
+`--request-id <uuid>` on `project child` keys the control request alone, so a
+repeat is answered from the worker's durable cache with the same `data` and
+`replayed: true` instead of controlling the child twice. The snapshot pre-read
+always keeps a fresh id, and there is no retry, so one key never names a second
+request.
 
 Message history is read-only here, and there is deliberately no verb that sends
 an agent-attributed message: the worker refuses

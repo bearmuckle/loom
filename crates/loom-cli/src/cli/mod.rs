@@ -44,9 +44,9 @@
 //!
 //! The mutating requests of `run`, `send`, `project send`, `answer`, `approve`,
 //! `deny`, `stop`, `delete`, `session archive`, `session delete`, `project
-//! archive`, `project delete`, `project worktree integrate`, and `project
-//! worktree cleanup` are the ones `--request-id` keys. Everything else a verb
-//! sends, such as
+//! archive`, `project delete`, `project child`, `project worktree integrate`,
+//! and `project worktree cleanup` are the ones `--request-id` keys. Everything
+//! else a verb sends, such as
 //! `Collaboration/GetRunRevision` and `Project/GetProjectSnapshotForSession`,
 //! is a read with a fresh id, and only the verb's own mutation carries the
 //! caller's key:
@@ -62,6 +62,7 @@
 //! | `delete`, `session delete` | `Session/DeleteAgentSession` | — |
 //! | `session archive`, `project archive` | `Session/ArchiveAgentSession` | — |
 //! | `project delete` | `Session/DeleteAgentSession` | — |
+//! | `project child` | `Project/ControlProjectChild` | — |
 //! | `project worktree integrate` | `Project/IntegrateProjectChild` | — |
 //! | `project worktree cleanup` | `Project/CleanupProjectChildWorktree` | — |
 //!
@@ -184,7 +185,9 @@
 //! child. A task id the project does not name is reported as `not_found` (exit
 //! `5`) from the snapshot, without a control request. A worker refusal keeps its
 //! own mapping: a denied capability is exit `3` and an invalid child state is
-//! exit `5`.
+//! exit `5`. `--request-id` keys the control request alone while the snapshot
+//! pre-read keeps a fresh id; there is no retry, so one key never names a second
+//! request.
 //!
 //! `run` starts a run, and it is described here because its requests are the
 //! longest sequence the client sends:
@@ -303,9 +306,9 @@
 //! reuses. `replayed` is `true` only when the worker answered a mutating
 //! request of this invocation from its idempotency cache instead of acting
 //! again, which happens only when the caller repeated a `--request-id`; it is
-//! how a repeated archive, deletion, integration, cleanup, or child direction
-//! reports that the mutation was applied once. Every other success reports
-//! `false`, and a failure envelope has no such field.
+//! how a repeated archive, deletion, integration, cleanup, child control, or
+//! child direction reports that the mutation was applied once. Every other
+//! success reports `false`, and a failure envelope has no such field.
 //! `events` adds `gap` (`after`, `before`, `missing`) when a snapshot
 //! could not carry every event after the cursor, and `null` otherwise.
 //!

@@ -112,6 +112,7 @@ Verbs:
                                     direct the active run of a delegated
                                     child and print its state
   project child pause|resume|interrupt|cancel <task-id> --session <id>
+                [--request-id <uuid>]
                                     control one delegated child task
   project archive <session-id> [--request-id <uuid>]
                                     archive a project root with its idle
@@ -175,11 +176,11 @@ revision cannot interrupt a run whose state the caller has not seen.
 
 `--request-id` on `run`, `send`, `project send`, `answer`, `approve`, `deny`,
 `stop`, `delete`, `session archive`, `session delete`, `project archive`,
-`project delete`, `project worktree integrate`, and `project worktree
-cleanup` is the idempotency key of that verb's own mutation: a request the
-worker has already answered under that id is answered from its durable cache
-instead of acting a second time, so a repeated archive, deletion, integration,
-or cleanup is applied once, and the --json envelope then reports
+`project delete`, `project child`, `project worktree integrate`, and `project
+worktree cleanup` is the idempotency key of that verb's own mutation: a request
+the worker has already answered under that id is answered from its durable
+cache instead of acting a second time, so a repeated archive, deletion,
+integration, or cleanup is applied once, and the --json envelope then reports
 `replayed: true`. The key covers the mutation alone.
 Reads are never keyed: `send`, `answer`, `approve`, `deny`, and `stop` read the
 run revision first and keep a fresh id for that read, so a repeated command
@@ -243,11 +244,11 @@ no flag can supply one. An unknown session is `not_found` (exit 5), and so is a
 task id the project does not name. A child whose session carries no active run
 is `invalid_state` (exit 5) and no direction is sent.
 
-`--request-id` keys the mutation of `project send` and not the reads before it:
-a repeated id is answered from the worker's durable cache instead of directing
-the child twice, and the `--json` envelope then reports `replayed: true`. The
-project snapshot read, the session metadata read, and the run revision read
-always keep fresh ids.
+`--request-id` keys the mutation of `project send` and `project child` and not
+their pre-reads: a repeated id is answered from the worker's durable cache
+instead of directing or controlling twice, and the `--json` envelope then
+reports `replayed: true`. The project snapshot read, the session metadata read,
+and the run revision read always keep fresh ids.
 
 Global flags, accepted anywhere as --flag value or --flag=value:
   --connect <url>             worker WebSocket URL (fallback LOOM_URL)
@@ -588,6 +589,9 @@ pub(crate) enum Verb {
         session: AgentSessionId,
         task: TaskId,
         action: ProjectChildAction,
+        /// The control request's idempotency key, or `None` when the caller
+        /// left it open. The project pre-read is never keyed.
+        request_id: Option<RequestId>,
     },
 }
 
@@ -1318,6 +1322,7 @@ fn parse_project(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
                 session: parse_id("session id", &flags.required("--session")?)?,
                 task: parse_id("task id", task)?,
                 action,
+                request_id: parse_request_id(flags)?,
             })
         }
         "archive" => Ok(Verb::ProjectArchive {
