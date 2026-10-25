@@ -252,6 +252,32 @@ fn pane_header_actions_keep_a_touchable_square_on_a_desktop_layout(cx: &mut Test
     .unwrap();
 }
 
+/// Both pane headers draw bare icon actions, so the conversation header's
+/// actions must keep the projects pane's square. They called `small()` on a
+/// desktop layout instead, which shrank them to the text-row size and left the
+/// two headers visibly out of step.
+#[gpui_kit::test]
+fn conversation_header_actions_match_the_projects_pane_actions(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (handle, _) = open_view_window(cx, |_| {});
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let pane_action = window.find("new-session").bounds();
+        for action in ["session-sources", "toggle-review-sidebar"] {
+            let bounds = window.find(action).bounds();
+            assert_eq!(
+                bounds.size.width, pane_action.size.width,
+                "{action} is not the projects pane's width: {bounds:?} against {pane_action:?}"
+            );
+            assert_eq!(
+                bounds.size.height, pane_action.size.height,
+                "{action} is not the projects pane's height: {bounds:?} against {pane_action:?}"
+            );
+        }
+    })
+    .unwrap();
+}
+
 /// A project row is two lines: its name and the main source it was created
 /// from, so the list says where each project lives without opening it.
 #[gpui_kit::test]

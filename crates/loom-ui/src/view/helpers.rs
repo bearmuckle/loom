@@ -295,6 +295,21 @@ pub(crate) fn empty_session_snapshot(workspace_id: WorkspaceId) -> AgentSessionS
     }
 }
 
+/// Applies the projects pane's icon-action square to a session header action.
+///
+/// Both pane headers draw bare glyphs, so they share one square and one glyph
+/// size: the projects pane pins its actions to [`ResponsiveLayout::pane_action_size`]
+/// and leaves the button at the default size, which is also the glyph size. The
+/// session header used to call `small()` instead, which shrank its actions to
+/// the text-row size and left the two headers visibly out of step, so the
+/// shared sizing lives here rather than being repeated at each call site.
+pub(crate) fn header_icon_action(button: Button, layout: ResponsiveLayout) -> Button {
+    button
+        .when(layout.phone, |button| button.large())
+        .h(layout.pane_action_size())
+        .w(layout.pane_action_size())
+}
+
 /// Wraps `child` in a header tooltip. `text` is owned because a chip names the
 /// object it opens, and a tooltip may carry that name.
 pub(crate) fn header_tooltip(

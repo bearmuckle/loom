@@ -521,52 +521,40 @@ impl Render for LoomView {
                                         actions.child(header_tooltip(
                                             "new-sub-project-tooltip",
                                             "New sub project",
-                                            Button::new("new-sub-project")
-                                                .icon(Icon::new(AssetIconName::Plus))
-                                                .ghost()
-                                                .when(layout.phone, |button| {
-                                                    button
-                                                        .large()
-                                                        .h(layout.control_size())
-                                                        .w(layout.control_size())
-                                                })
-                                                .when(!layout.phone, |button| button.small())
-                                                .accessibility_label("New sub project")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.begin_sub_project_dialog(cx);
-                                                })),
+                                            header_icon_action(
+                                                Button::new("new-sub-project")
+                                                    .icon(Icon::new(AssetIconName::Plus))
+                                                    .ghost(),
+                                                layout,
+                                            )
+                                            .accessibility_label("New sub project")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.begin_sub_project_dialog(cx);
+                                            })),
                                         ))
                                     })
                                     .child(header_tooltip(
                                         "archive-project-tooltip",
                                         "Archive project",
-                                        Button::new("archive-project")
-                                            .icon(Icon::new(AssetIconName::Archive))
-                                            .ghost()
-                                            .when(layout.phone, |button| {
-                                                button
-                                                    .large()
-                                                    .h(layout.control_size())
-                                                    .w(layout.control_size())
-                                            })
-                                            .when(!layout.phone, |button| button.small())
-                                            .accessibility_label("Archive project")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.archive_header_project(cx);
-                                            })),
+                                        header_icon_action(
+                                            Button::new("archive-project")
+                                                .icon(Icon::new(AssetIconName::Archive))
+                                                .ghost(),
+                                            layout,
+                                        )
+                                        .accessibility_label("Archive project")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.archive_header_project(cx);
+                                        })),
                                     ))
                             })
                             .child(header_tooltip("session-sources-tooltip", "Session sources",
+                        header_icon_action(
                         Button::new("session-sources")
                             .icon(Icon::new(AssetIconName::ListTree))
-                            .ghost()
-                            .when(layout.phone, |button| {
-                                button
-                                    .large()
-                                    .h(layout.control_size())
-                                    .w(layout.control_size())
-                            })
-                            .when(!layout.phone, |button| button.small())
+                            .ghost(),
+                        layout,
+                        )
                             .accessibility_label("Session sources")
                             .dropdown_menu({
                                 let view = view.clone();
@@ -689,20 +677,16 @@ impl Render for LoomView {
                             }),
                             ))
                             .child({
-                                let toggle = Button::new("toggle-review-sidebar")
-                                    .icon(Icon::new(if self.review.open {
-                                        IconName::PanelRightClose
-                                    } else {
-                                        IconName::PanelRightOpen
-                                    }))
-                                    .ghost()
-                                    .when(layout.phone, |button| {
-                                        button
-                                            .large()
-                                            .h(layout.control_size())
-                                            .w(layout.control_size())
-                                    })
-                                    .when(!layout.phone, |button| button.small())
+                                let toggle = header_icon_action(
+                                    Button::new("toggle-review-sidebar")
+                                        .icon(Icon::new(if self.review.open {
+                                            IconName::PanelRightClose
+                                        } else {
+                                            IconName::PanelRightOpen
+                                        }))
+                                        .ghost(),
+                                    layout,
+                                )
                                     .accessibility_label("Toggle side panel")
                                     .when(self.review.open, |button| button.secondary())
                                     .on_click(cx.listener(|this, _, _, cx| {
