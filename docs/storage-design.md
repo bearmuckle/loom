@@ -119,10 +119,10 @@ cannot leak build output. Source and uncommitted work never live in the cache.
 
 ## Session deletion
 
-Archived sessions remain in durable state until they are deleted. `Archived` is
-terminal: there is no restore or unarchive, an archived session is immutable,
-and deletion or retention-based auto-delete is the only way to remove it. A
-session that is not a project root can only be deleted once it is archived.
+Archived sessions remain in durable state until they are deleted. An archived
+session is immutable except for restore and deletion, and deletion or
+retention-based auto-delete is the only way to remove it. A session that is not
+a project root can only be deleted once it is archived.
 
 A project root is deletable in any state. Its live work is cancelled first: the
 manager's own run is interrupted, then every non-terminal sub-agent subtree is
@@ -157,6 +157,18 @@ foreign keys cascade to runs, messages, activities, checkpoints, filesystem
 records, hierarchy, tasks, and worktrees. Content queued by the cascade
 triggers is reclaimed by the content garbage collector in the same
 transaction.
+
+Restoring an archived session returns it to `Idle` and keeps its rows,
+transcript, checkpoints, filesystem root, and worktrees, so deletion is the only
+terminal removal and the retention sweep stops considering it. The archived
+subtree membership of a project root is recorded durably in
+`archived_project_members`: a root row plus one member row per archived
+descendant. The root row's foreign key cascades with the root, while a member
+row deliberately outlives the member session, so a member the sweep deleted can
+still be detected. The rows are cleared when the root is restored or dropped
+with the root. A restore request that finds a recorded member without a session
+row is refused with the missing session ids and changes nothing. The table moves
+the schema from version 15 to 16.
 
 A linked worktree with changes or a lock refuses the deletion unless the caller
 forces it. The automatic retention sweep skips such a project, logs the reason,

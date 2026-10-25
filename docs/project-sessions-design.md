@@ -214,8 +214,21 @@ precondition for deleting a project: deleting a project root cancels the live
 work of its sub-agents first and then deletes the whole tree, so a live project
 does not have to be archived, and archiving stays rejected while any child task
 is queued, blocked, or running. Deleting a session that is not a project root
-still requires `Archived`, and `Archived` is terminal: there is no restore or
-unarchive, so an archived session is immutable until it is deleted.
+still requires `Archived`. An archived session is immutable except for restore
+and deletion: restoring it returns it to `Idle`, keeps its transcript,
+checkpoints, files, and checkouts, lets a new run start, and makes it no longer
+eligible for the retention sweep. Deletion stays terminal, so a deleted session
+cannot be restored.
+
+Restoring a project root restores the descendants that were archived with it.
+The backend records that archived tree membership durably, because a descendant
+swept after the root was archived is otherwise indistinguishable from one that
+was never part of the tree. If a recorded member has since been deleted, the
+request is refused, names the missing session ids, and changes nothing, so a
+root is never half-restored. A member row deliberately outlives its session and
+is cleared when the root is restored or dropped with the root. An individual
+archived descendant can also be restored on its own, and a session is restorable
+whenever its row still exists rather than only before its retention deadline.
 
 Cancelling a live project before its deletion reuses the child `cancel` control
 path. The manager's own run of the root session is interrupted first, so a
@@ -576,8 +589,10 @@ server validates the persisted grant before creating a child.
   archive then archives descendants deepest-first. A separate project-wide
   cancel operation is not exposed: the deletion path reuses the child cascade
   internally for a project root, as described above, after interrupting the
-  manager's own run. Deletion is exposed for an archived session or for a
-  project root, which is cancelled first.
+  manager's own run. Restore is exposed for an archived session or, through the
+  root, for the tree archived with it; a request that finds a recorded member
+  deleted is refused with the missing ids. Deletion is exposed for an archived
+  session or for a project root, which is cancelled first.
 - Child worktrees are not automatically removed when a task or project
   completes. The parent explicitly retains, removes a clean checkout, or
   discards changes. The only automatic cleanup is the retention-based deletion
