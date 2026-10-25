@@ -29,6 +29,7 @@ use crate::cli::client::testing::{InProcessClient, Wrapped};
 use crate::cli::exit;
 use crate::cli::run_command;
 use crate::cli::text;
+use crate::cli::verbs;
 
 /// The connection URL the cursor-file tests pretend to have connected to.
 const URL: &str = "ws://cli.test.invalid/control";
@@ -330,9 +331,7 @@ fn whoami_ls_get_and_doctor_print_exact_lines() {
     assert_eq!(
         normalised,
         format!(
-            "protocol {}.{}\ncapabilities 8 read_agent_session,subscribe_session_events,\
-             start_agent_run,read_worker_node_status,json_protocol,manage_workspaces,\
-             manage_session_repositories,write_session_filesystem\nparticipant operator\n\
+            "protocol {}.{}\ncapabilities 2 read_worker_node_status,json_protocol\nparticipant operator\n\
              node {} NODE\n",
             CURRENT_PROTOCOL_VERSION.major, CURRENT_PROTOCOL_VERSION.minor, node.name
         )
@@ -711,6 +710,118 @@ fn a_stale_cursor_resynchronises_without_reprinting_history() {
     std::fs::remove_file(&cursor).ok();
 }
 
+#[test]
+fn a_truncated_snapshot_reports_the_missing_range_instead_of_skipping_it() {
+    let fixture = fixture();
+    let captured = settled_lines(&fixture);
+    let session = fixture.session.id.to_string();
+    let events = journal(&fixture.control, fixture.session.id);
+    assert!(events.len() > 4, "the run journaled several events");
+
+    // The worker bounds a snapshot to its newest side, so this window starts
+    // well above the cursor: everything between them is absent from the
+    // response and cannot be paged back by a later snapshot.
+    let window = events[events.len() - 2..].to_vec();
+    let oldest = window[0].sequence;
+    let latest = window[1].sequence;
+    let resume_from = sequence_of(&captured[0]);
+    assert!(oldest.value() > resume_from.saturating_add(1));
+    let expected: Vec<&str> = captured
+        .iter()
+        .map(String::as_str)
+        .filter(|line| {
+            let sequence = sequence_of(line);
+            sequence == oldest.value() || sequence == latest.value()
+        })
+        .collect();
+    assert_eq!(expected.len(), 2, "the window carries exactly two events");
+
+    let snapshot = fixture.session.clone();
+    let scripted = window.clone();
+    let mut client =
+        Wrapped::new(InProcessClient::new(&fixture.backend)).after(move |request, response| {
+            if !matches!(
+                request,
+                ClientRequest::Events(EventsRequest::GetSessionEvents { .. })
+            ) {
+                return;
+            }
+            if let Ok(ServerResponse::Events(EventsResponse::SessionEvents {
+                stream_epoch, ..
+            })) = &response.result
+            {
+                response.result = Ok(ServerResponse::Events(
+                    EventsResponse::SessionEventsSnapshot {
+                        session: snapshot.clone(),
+                        events: scripted.clone(),
+                        oldest_sequence: oldest,
+                        latest_sequence: latest,
+                        stream_epoch: stream_epoch.clone(),
+                    },
+                ));
+            }
+        });
+
+    // Text mode prints the window, names the missing range on stderr, and moves
+    // the cursor to the head of the window rather than pretending completeness.
+    let cursor = temporary_path("truncated.json");
+    std::fs::write(&cursor, cursor_record(URL, &session, resume_from, None)).unwrap();
+    let cursor_text = cursor.to_string_lossy().into_owned();
+    let outcome = run(
+        &mut client,
+        &[
+            "events",
+            "--session",
+            &session,
+            "--cursor-file",
+            &cursor_text,
+            "--connect",
+            URL,
+        ],
+    );
+    assert_eq!(outcome.code, exit::OK, "{}", outcome.stderr);
+    assert_eq!(lines(&outcome.stdout), expected);
+    assert!(
+        outcome.stderr.contains(&format!(
+            "warning gap {}..{}",
+            resume_from + 1,
+            oldest.value() - 1
+        )),
+        "the warning names the missing range: {}",
+        outcome.stderr
+    );
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&cursor).unwrap()).unwrap();
+    assert_eq!(record["after"], latest.value());
+
+    // The `--json` envelope carries the same range as a field.
+    std::fs::write(&cursor, cursor_record(URL, &session, resume_from, None)).unwrap();
+    let envelope = run(
+        &mut client,
+        &[
+            "events",
+            "--session",
+            &session,
+            "--cursor-file",
+            &cursor_text,
+            "--json",
+            "--connect",
+            URL,
+        ],
+    );
+    assert_eq!(envelope.code, exit::OK, "{}", envelope.stderr);
+    let value: serde_json::Value = serde_json::from_str(envelope.stdout.trim()).unwrap();
+    assert_eq!(value["data"]["gap"]["after"], resume_from);
+    assert_eq!(value["data"]["gap"]["before"], oldest.value());
+    assert_eq!(
+        value["data"]["gap"]["missing"],
+        oldest.value() - resume_from - 1
+    );
+    assert_eq!(value["data"]["events"].as_array().unwrap().len(), 2);
+
+    std::fs::remove_file(&cursor).ok();
+}
+
 // 4. The read-only verbs change nothing.
 
 #[test]
@@ -837,6 +948,88 @@ fn a_read_only_scoped_token_can_read_but_cannot_start_a_run() {
 }
 
 // 5. The `--json` envelopes and the exit-code classes.
+
+#[test]
+fn each_verb_negotiates_only_the_capabilities_its_requests_need() {
+    let workspace = WorkspaceId::new().to_string();
+    let session = AgentSessionId::new().to_string();
+    let cases: Vec<(Vec<&str>, Vec<Capability>)> = vec![
+        (vec!["whoami"], vec![Capability::JsonProtocol]),
+        (
+            vec!["ls"],
+            vec![Capability::JsonProtocol, Capability::ReadAgentSession],
+        ),
+        (
+            vec!["get", &session],
+            vec![Capability::JsonProtocol, Capability::ReadAgentSession],
+        ),
+        (
+            vec!["events", "--session", &session],
+            vec![Capability::JsonProtocol, Capability::SubscribeSessionEvents],
+        ),
+        (
+            vec!["peek", "--session", &session],
+            vec![Capability::JsonProtocol, Capability::SubscribeSessionEvents],
+        ),
+        (
+            vec!["doctor"],
+            vec![Capability::JsonProtocol, Capability::ReadWorkerNodeStatus],
+        ),
+        (
+            vec!["run", "--workspace", &workspace, "--task", "a task"],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadAgentSession,
+                Capability::CreateAgentSession,
+                Capability::ManageSessionRepositories,
+                Capability::WriteSessionFilesystem,
+                Capability::ConfigureApprovalPolicy,
+                Capability::StartAgentRun,
+            ],
+        ),
+    ];
+    for (arguments, expected) in cases {
+        let invocation = invocation(&arguments);
+        assert_eq!(
+            verbs::used_capabilities(&invocation.verb),
+            CapabilitySet::new(expected),
+            "{arguments:?}"
+        );
+    }
+}
+
+/// A stdout whose reader went away, as when `events` is piped into `head`.
+struct ClosedPipe;
+
+impl std::io::Write for ClosedPipe {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_closed_stdout_is_a_clean_stop() {
+    let fixture = fixture();
+    let mut client = InProcessClient::new(&fixture.backend);
+    let arguments: Vec<String> = vec![
+        "events".to_owned(),
+        "--session".to_owned(),
+        fixture.session.id.to_string(),
+    ];
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut out = ClosedPipe;
+    let mut err = Vec::new();
+    let code = runtime.block_on(run_command(&mut client, &arguments, &mut out, &mut err));
+    assert_eq!(code, exit::OK, "a closed pipe is not an error");
+    assert!(err.is_empty(), "nothing is reported for a closed pipe");
+}
 
 #[test]
 fn json_envelopes_and_error_exit_codes_are_pinned() {
@@ -1481,6 +1674,109 @@ fn the_approval_policy_flag_pins_the_session_policy() {
     fixture.backend.shutdown().unwrap();
 }
 
+#[test]
+fn a_reused_session_keeps_its_approval_policy_unless_the_flag_is_given() {
+    let fixture = empty_fixture();
+    let workspace = fixture.workspace.id.to_string();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    // The first invocation creates the session with the auto preset but names a
+    // model the worker does not offer, so the start fails and the session stays
+    // idle with the policy it pinned.
+    let created = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--name",
+            "policy session",
+            "--task",
+            "first task",
+            "--approval-policy",
+            "auto",
+            "--model",
+            "deterministic/absent-model",
+        ],
+    );
+    assert_eq!(created.code, exit::INTERNAL, "{}", created.stderr);
+    let sessions = live_sessions(&fixture.control, fixture.workspace.id);
+    assert_eq!(sessions.len(), 1);
+    let session_id = sessions[0].id;
+    assert_eq!(
+        session_projection(&fixture.control, session_id).approval_policy,
+        ApprovalPolicy::auto_approve()
+    );
+
+    // A plain reuse must not reset the policy a person chose.
+    let reused = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--name",
+            "policy session",
+            "--task",
+            "second task",
+        ],
+    );
+    assert_eq!(reused.code, exit::OK, "{}", reused.stderr);
+    assert_eq!(
+        session_projection(&fixture.control, session_id).approval_policy,
+        ApprovalPolicy::auto_approve(),
+        "a plain reuse keeps the stored policy"
+    );
+
+    // An explicit reuse does change it: create an idle session with the default
+    // preset, then ask for auto while reusing it.
+    let created_default = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--name",
+            "default session",
+            "--task",
+            "first task",
+            "--model",
+            "deterministic/absent-model",
+        ],
+    );
+    assert_eq!(created_default.code, exit::INTERNAL);
+    let default_session = live_sessions(&fixture.control, fixture.workspace.id)
+        .into_iter()
+        .find(|session| session.name == "default session")
+        .expect("the default session was created");
+    assert_eq!(
+        session_projection(&fixture.control, default_session.id).approval_policy,
+        ApprovalPolicy::default()
+    );
+    let changed = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--name",
+            "default session",
+            "--task",
+            "second task",
+            "--approval-policy",
+            "auto",
+        ],
+    );
+    assert_eq!(changed.code, exit::OK, "{}", changed.stderr);
+    assert_eq!(
+        session_projection(&fixture.control, default_session.id).approval_policy,
+        ApprovalPolicy::auto_approve(),
+        "an explicit preset still applies to a reused session"
+    );
+
+    fixture.backend.shutdown().unwrap();
+}
+
 /// The session id the first line `run` prints names.
 fn printed_session(stdout: &str) -> AgentSessionId {
     let mut words = stdout
@@ -1833,7 +2129,7 @@ fn the_parser_applies_the_run_defaults_and_rejects_its_conflicts() {
     assert_eq!(args.task, "  keep   this workspace tidy  ");
     assert_eq!(args.name, "keep this workspace tidy");
     assert_eq!(args.model.as_str(), "deterministic/demo");
-    assert_eq!(args.approval, ApprovalPreset::Default);
+    assert_eq!(args.approval, None);
     assert_eq!(
         args.request_id.map(|id| id.to_string()).as_deref(),
         Some(pinned.as_str())
@@ -1882,7 +2178,7 @@ fn the_parser_applies_the_run_defaults_and_rejects_its_conflicts() {
     assert_eq!(attach.source, "https://github.com/acme/widgets.git");
     assert_eq!(attach.path, "vendor");
     assert_eq!(attach.revision.as_deref(), Some("main"));
-    assert_eq!(args.approval, ApprovalPreset::Auto);
+    assert_eq!(args.approval, Some(ApprovalPreset::Auto));
 
     let directory = invocation(&[
         "run",
