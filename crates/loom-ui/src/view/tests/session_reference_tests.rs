@@ -262,6 +262,70 @@ fn a_run_projection_restores_the_link(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui_kit::test]
+fn a_batch_write_survives_a_projection_without_a_github_call(cx: &mut TestAppContext) {
+    let view = cx.new(|cx| LoomView::new_for_test(cx.focus_handle()));
+    view.update(cx, |view, _cx| {
+        let session_id = view.active_session.id;
+        // The pull request is opened between the snapshot read and the events
+        // read, so the event batch carries it and the durable page predates it.
+        let call = create_call("github_create_pull_request", "owner/name");
+        complete_call(view, &call, "{\"number\": 41}");
+        assert_eq!(reference_label(view), Some("owner/name#41".to_owned()));
+
+        view.apply_run_projection(durable_projection(
+            session_id,
+            vec![ModelMessage::new(
+                MessageRole::User,
+                "open the pull request",
+            )],
+        ));
+
+        // The page names no GitHub call, so it is no source for this datum and
+        // the write the batch derived is still the header's reference.
+        assert_eq!(reference_label(view), Some("owner/name#41".to_owned()));
+        assert_eq!(
+            view.latest_write_reference.as_ref().map(|r| r.number),
+            Some(41)
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn a_batch_read_survives_a_projection_naming_an_older_write(cx: &mut TestAppContext) {
+    let view = cx.new(|cx| LoomView::new_for_test(cx.focus_handle()));
+    view.update(cx, |view, _cx| {
+        let session_id = view.active_session.id;
+        complete_call(
+            view,
+            &github_call("github_get_pull_request", "owner/name", 14),
+            "{\"number\": 14}",
+        );
+        assert_eq!(reference_label(view), Some("owner/name#14".to_owned()));
+
+        // The page names an earlier write, but it carries only the request: the
+        // result that would resolve it is not on the page, so the page derives
+        // no reference and the read from the batch stays in its slot.
+        let older_write = github_call("github_update_pull_request", "owner/name", 9);
+        let mut request = ModelMessage::new(MessageRole::Assistant, "updating");
+        request.tool_calls = vec![older_write];
+        view.apply_run_projection(durable_projection(
+            session_id,
+            vec![
+                ModelMessage::new(MessageRole::User, "track the issue"),
+                request,
+            ],
+        ));
+
+        assert_eq!(reference_label(view), Some("owner/name#14".to_owned()));
+        assert_eq!(
+            view.latest_read_reference.as_ref().map(|r| r.number),
+            Some(14)
+        );
+        assert!(view.latest_write_reference.is_none());
+    });
+}
+
 /// Opens a view with `reference` already derived, renders one frame, and
 /// reports whether the header chip is on screen.
 fn header_shows_reference(

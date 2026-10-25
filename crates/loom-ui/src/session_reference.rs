@@ -196,7 +196,8 @@ pub(crate) fn preferred_reference<'a>(
 /// Messages are in order, so a tool call is captured from the assistant message
 /// that carries it and promoted by the `role: Tool` message with the matching
 /// `tool_call_id` that follows. A call the page does not complete contributes
-/// nothing.
+/// nothing. Unlike the live path this cannot see a result's success flag, so a
+/// failed call still pins its slot here; that asymmetry is deliberate.
 pub(crate) fn references_from_messages(messages: &[ModelMessage]) -> SessionReferences {
     let mut pending: BTreeMap<ToolCallId, ReferenceCandidate> = BTreeMap::new();
     let mut references = SessionReferences::default();

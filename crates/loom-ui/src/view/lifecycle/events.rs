@@ -723,14 +723,20 @@ impl LoomView {
             self.activity_records.insert(activity.id, activity.clone());
         }
         // The session's reference is derived before the messages are consumed.
-        // This projection is applied after the event batch because it is the
-        // durable, more complete page, so it wins for the same session. A page
-        // of older transcript messages is loaded later and splices rows without
-        // re-deriving, so it cannot change the reference. An empty projection
-        // keeps what the events derived, because it carries no page to win with.
+        // The event batch is the newer source: it was requested from the cursor
+        // this projection was read at, so it covers what the session did after
+        // the page was taken. The projection is only the fallback for a page
+        // the window did not cover, so it fills a slot the batch left empty and
+        // never overwrites one it derived. The reset clears both slots before
+        // either source runs, so a slot that already holds a value came from
+        // this batch and from this session. A page of older transcript messages
+        // is loaded later and splices rows without re-deriving, so it cannot
+        // change the reference.
         let derived_references = references_from_messages(&projection.messages);
-        if !projection.messages.is_empty() {
+        if self.latest_write_reference.is_none() {
             self.latest_write_reference = derived_references.write;
+        }
+        if self.latest_read_reference.is_none() {
             self.latest_read_reference = derived_references.read;
         }
         let message_timeline_ordinals = projection.message_timeline_ordinals;
