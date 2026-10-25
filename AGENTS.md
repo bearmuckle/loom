@@ -1,14 +1,12 @@
 # Agent instructions
 
+- Be terse at all times
 - Do not open pull requests. Commit and push to `main` directly when you work in the repository checkout. In an isolated worktree or other standalone checkout, `main` is not yours to commit to: commit a local branch there and land it into `main` from the main checkout. Do not leave work only on a branch when you have the main checkout.
 - Follow [Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/) for every commit message: use `type(optional-scope)!: description`, for example `fix(ui): keep event polling single-flight`, with a type such as `feat`, `fix`, `refactor`, `perf`, `test`, `docs`, `build`, `ci`, or `chore`. Mark breaking changes with `!` or a `BREAKING CHANGE:` footer and explain them in the body.
 - Do not create merge commits. Keep history linear by rebasing your work onto the latest `main` and landing it with a fast-forward push, never with `git merge` or a merge commit. Prefer `git pull --rebase` and plain `git push`; use `git push --force-with-lease` only when rewriting your own unpublished commits.
-- Include a Verification section in the commit message body only when there are meaningful checks to report. List each relevant command once with a brief result; omit trivial hygiene checks and do not include verbose test output.
 - For UI work, prefer existing `gpui-kit` components when they fit the interaction; build custom controls only when the component library does not provide a suitable option.
-- Before pushing, run workspace coverage locally if useful and check patch coverage on changed lines; CI does not run coverage. For a targeted run use the relevant package or test selection with `cargo llvm-cov`, then `git fetch origin main` and `diff-cover lcov.info --compare-branch=origin/main --fail-under=75 --exclude 'crates/*/src/tests.rs' --exclude 'crates/*/src/tests/*' --exclude 'crates/*/src/*/tests.rs' --exclude 'crates/*/src/*/tests/*' --exclude 'crates/*/tests/*'`. New or changed non-test lines should meet the 75% patch threshold when a report is generated.
-- Before committing or pushing, run reasonable checks for the changed code, following `.github/workflows/ci.yml` and any relevant build workflow. For Rust changes, run formatting, Clippy, and tests for the affected scope; include relevant native or wasm builds when those targets are affected. Report checks that cannot be run.
-- Use `sccache` globally to speed up builds across worktrees; install and configure it if missing.
-- A command that reports `cargo`, `rustc`, `rustfmt`, or `clippy` as missing (`cargo: No such file or directory`) does not mean the node has no toolchain: it is usually installed below `$CARGO_HOME/bin` or `$HOME/.cargo/bin` with no `PATH` entry, which a non-login shell never picks up. Run `./scripts/agent-toolchain.sh` before concluding anything; it links the rustup proxies into a directory that is already on `PATH`, so a later bare `cargo` works without carrying an environment between commands. Add `--install` only when the node really has no toolchain.
+- New or changed non-test lines should meet 80% patch converage threshold.
+- Before committing or pushing, run reasonable checks for the changed code.
 - For Rust logging, use the existing `log` facade (`log::debug!`, `log::info!`, `log::warn!`, or `log::error!`) so output follows the configured native and wasm logger. Do not add direct `println!` or `eprintln!` logging.
 
 # Commit attribution
