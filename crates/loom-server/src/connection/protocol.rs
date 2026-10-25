@@ -146,7 +146,7 @@ impl InProcessConnection {
                 .idempotency_store
                 .cached_response(request_id, &request_for_cache)
             {
-                Ok(Some(response)) => return response,
+                Ok(Some(response)) => return response.into_replay(),
                 Ok(None) => {}
                 Err(error) => return ResponseEnvelope::failure(request_id, error),
             }

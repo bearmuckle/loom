@@ -973,7 +973,8 @@ fn retryable_mutation_idempotency_survives_backend_restart() {
         }),
     );
     let second = connection.request(request);
-    assert_eq!(first, second);
+    assert_eq!(first.result, second.result);
+    assert!(!first.replayed && second.replayed);
     assert!(matches!(
         first.result,
         Ok(ServerResponse::Session(

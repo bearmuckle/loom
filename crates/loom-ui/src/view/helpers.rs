@@ -486,6 +486,7 @@ pub(crate) fn merged_event_page(
         protocol_version,
         request_id,
         result,
+        replayed: _,
     } = page;
     match (collected.result, result) {
         (
@@ -509,12 +510,14 @@ pub(crate) fn merged_event_page(
                     stream_epoch: page_epoch.or(stream_epoch),
                     next_after_sequence,
                 })),
+                replayed: false,
             }
         }
         (_, result) => ResponseEnvelope {
             protocol_version,
             request_id,
             result,
+            replayed: false,
         },
     }
 }

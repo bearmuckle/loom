@@ -1560,7 +1560,9 @@ async fn duplicate_mutation_request_ids_are_idempotent() {
     let mut reconnected = transport.connect().await.unwrap();
     negotiate(&mut reconnected).await;
     let second = reconnected.request(request).await.unwrap();
-    assert_eq!(first, second);
+    assert_eq!(first.result, second.result);
+    assert!(!first.replayed, "the first answer is not a replay");
+    assert!(second.replayed, "the replayed answer is marked as one");
     let ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) =
         first.result.unwrap()
     else {

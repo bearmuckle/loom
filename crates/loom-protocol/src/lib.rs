@@ -333,6 +333,10 @@ pub struct ResponseEnvelope {
     pub protocol_version: ProtocolVersion,
     pub request_id: RequestId,
     pub result: std::result::Result<ServerResponse, LoomError>,
+    /// `true` only when the worker answered a repeated request id from its
+    /// idempotency cache instead of performing the operation again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replayed: bool,
 }
 
 mod requests;
@@ -957,6 +961,7 @@ impl ResponseEnvelope {
             protocol_version: CURRENT_PROTOCOL_VERSION,
             request_id,
             result: Ok(response),
+            replayed: false,
         }
     }
 
@@ -965,7 +970,16 @@ impl ResponseEnvelope {
             protocol_version: CURRENT_PROTOCOL_VERSION,
             request_id,
             result: Err(error),
+            replayed: false,
         }
+    }
+
+    /// Marks an idempotent replay: the answer is served from the idempotency
+    /// cache rather than by running the operation again. The flag is set on the
+    /// copy handed to the caller and is never stored back into the cache.
+    pub fn into_replay(mut self) -> Self {
+        self.replayed = true;
+        self
     }
 }
 
