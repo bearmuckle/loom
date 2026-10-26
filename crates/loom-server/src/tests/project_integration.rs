@@ -1050,6 +1050,58 @@ fn delegated_child_instructions_carry_the_recorded_base_freshness() {
 }
 
 #[test]
+fn delegated_code_child_is_told_its_commit_lands_through_integration() {
+    let mut fixture = pending_project_code_child_fixture();
+    create_project_code_child_checkout(&mut fixture);
+
+    let mut task = fixture
+        .backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .load_delegated_task(fixture.task_id)
+        .unwrap()
+        .expect("the child task should be durable");
+    fixture
+        .connection
+        .schedule_project_task_if_ready_under_admission(&mut task)
+        .unwrap();
+
+    let run_id = fixture
+        .backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .load_latest_run_summary_for_session(fixture.worktree.child_session_id)
+        .unwrap()
+        .expect("the scheduled child should have started a run")
+        .snapshot
+        .id;
+    let instructions = fixture
+        .backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .load_run_runtime_config(run_id)
+        .unwrap()
+        .expect("the child run should be persisted with its runtime config")
+        .system_instructions
+        .expect("the child run should carry system instructions");
+
+    // The child's commit is the deliverable; publishing it would bypass the
+    // reviewed integration path that lands it in the manager's checkout.
+    assert!(
+        instructions.contains("isolated Git worktree that lands through your parent"),
+        "the child should be told how its commit lands: {instructions}"
+    );
+    assert!(
+        instructions.contains("do not push branches or tags or open pull requests"),
+        "the child should be told not to publish its branch: {instructions}"
+    );
+    fixture.shutdown();
+}
+
+#[test]
 fn interrupted_project_child_integration_recovers_without_replay() {
     let fixture = project_code_child_fixture();
     commit_file(

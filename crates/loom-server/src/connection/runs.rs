@@ -654,6 +654,18 @@ impl InProcessConnection {
                 }
                 if let Some(task_id) = task_id {
                     instructions.push_str(&format!(" Your delegated task_id is {task_id}."));
+                    // A code child edits a linked worktree on its own branch, and
+                    // the manager lands that branch through `integrate_project_child`.
+                    // Nothing else tells the child that, and the shared tool guidance
+                    // names `github_push_branch` as how local commits are published,
+                    // so without this clause a child publishes its branch instead of
+                    // handing the commit back for review and integration.
+                    if persistence
+                        .load_project_worktree_by_task(task_id)?
+                        .is_some()
+                    {
+                        instructions.push_str(" Your checkout is an isolated Git worktree that lands through your parent: commit your changes there and report the commit, and do not push branches or tags or open pull requests, because your manager reviews and integrates your commit.");
+                    }
                 }
                 instructions
             };
