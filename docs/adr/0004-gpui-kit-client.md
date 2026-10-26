@@ -5,7 +5,7 @@
 ## Decision
 
 The native and browser clients are one GPUI application that builds on the
-published `gpui-kit` crate (workspace pin `0.8.0`) rather than on a
+published `gpui-kit` crate (workspace pin `0.8.1`) rather than on a
 Chromium-based desktop runtime or a Loom-maintained GPUI fork. `loom-ui` holds
 the protocol client, projections, and view, and shares them across targets;
 `crates/loom-ui/src/browser.rs` is compiled only for `wasm32` and supplies the
@@ -15,7 +15,7 @@ pin, so the repository carries no vendored GPUI revision of its own.
 
 ## References
 
-- `Cargo.toml`: `gpui-kit = "0.8.0"` in the workspace dependency table;
+- `Cargo.toml`: `gpui-kit = "0.8.1"` in the workspace dependency table;
   `Cargo.lock` resolves it from the crates.io registry.
 - `crates/loom-ui/Cargo.toml`: `gpui-kit.workspace = true`, the wasm-only
   dependencies, and the `visual-tests` feature.

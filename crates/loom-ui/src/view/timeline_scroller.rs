@@ -28,7 +28,7 @@ use gpui_kit::component::{
 use gpui_kit::{
     AnyElement, App, Context, ElementId, Entity, FollowMode, Hsla, InteractiveElement as _,
     IntoElement, ListAlignment, ListState, ParentElement as _, Pixels, RenderOnce, Role,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, Styled, Window, div,
+    ScrollEvent, SharedString, StatefulInteractiveElement as _, Styled, Window, div,
     linear_color_stop, linear_gradient, list, prelude::FluentBuilder as _, px, rems,
 };
 
@@ -307,7 +307,7 @@ impl RenderOnce for TimelineScroller {
                 // runs before the list's in the bubble phase, so Loom's bounded
                 // step can take the packet and stop the list from applying the
                 // platform's raw delta.
-                .on_scroll_wheel({
+                .on_scroll({
                     let state = row_state.clone();
                     move |event, _, cx| {
                         let Some(distance) = wheel_scroll_distance(event) else {
@@ -411,7 +411,7 @@ impl RenderOnce for TimelineScroller {
 ///
 /// A positive distance moves toward the newest row. A zoom gesture (control on
 /// Windows and Linux, command on macOS) is not a scroll and returns zero.
-fn wheel_scroll_distance(event: &ScrollWheelEvent) -> Option<Pixels> {
+fn wheel_scroll_distance(event: &ScrollEvent) -> Option<Pixels> {
     let vertical = event.delta.pixel_delta(WHEEL_LINE).y;
     if vertical == px(0.) {
         return None;
@@ -455,8 +455,8 @@ mod tests {
     const ROW_COUNT: usize = 40;
     const VIEWPORT_HEIGHT: f32 = 320.;
 
-    fn wheel(delta: Pixels, modifiers: Modifiers) -> ScrollWheelEvent {
-        ScrollWheelEvent {
+    fn wheel(delta: Pixels, modifiers: Modifiers) -> ScrollEvent {
+        ScrollEvent {
             position: point(px(210.), px(VIEWPORT_HEIGHT / 2.)),
             delta: ScrollDelta::Pixels(point(px(0.), delta)),
             modifiers,
@@ -497,7 +497,7 @@ mod tests {
         let back = wheel(px(120.), Modifiers::default());
         assert_eq!(wheel_scroll_distance(&back), Some(-WHEEL_STEP_LIMIT));
 
-        let lines = ScrollWheelEvent {
+        let lines = ScrollEvent {
             delta: ScrollDelta::Lines(point(0., -3.)),
             ..Default::default()
         };
@@ -518,7 +518,7 @@ mod tests {
         );
         assert_eq!(wheel_scroll_distance(&zoom), Some(px(0.)));
 
-        let horizontal = ScrollWheelEvent {
+        let horizontal = ScrollEvent {
             delta: ScrollDelta::Pixels(point(px(-60.), px(0.))),
             ..Default::default()
         };
