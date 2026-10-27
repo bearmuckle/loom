@@ -1583,21 +1583,16 @@ impl ToolExecutor {
         }
         let mut body = serde_json::Map::new();
         body.insert("title".to_owned(), serde_json::json!(arguments.title));
-        if let Some(text) = arguments.body {
+        if let Some(text) = optional_text(arguments.body) {
             body.insert("body".to_owned(), serde_json::json!(text));
         }
         if let Some(labels) = arguments.labels.filter(|labels| !labels.is_empty()) {
             body.insert("labels".to_owned(), serde_json::json!(labels));
         }
         let mut issue_type = None;
-        if let Some(requested) = arguments.issue_type {
-            match normalize_github_issue_type(&requested) {
-                Ok(normalized) => {
-                    body.insert("type".to_owned(), serde_json::json!(normalized));
-                    issue_type = Some(normalized);
-                }
-                Err(error) => return ToolResult::failure(call, error),
-            }
+        if let Some(requested) = optional_text(arguments.issue_type) {
+            body.insert("type".to_owned(), serde_json::json!(requested));
+            issue_type = Some(requested);
         }
         match self.github_api(
             "POST",
@@ -1630,10 +1625,10 @@ impl ToolExecutor {
             }
             body.insert("title".to_owned(), serde_json::json!(title));
         }
-        if let Some(text) = arguments.body {
+        if let Some(text) = optional_text(arguments.body) {
             body.insert("body".to_owned(), serde_json::json!(text));
         }
-        if let Some(state) = arguments.state {
+        if let Some(state) = optional_text(arguments.state) {
             if !matches!(state.as_str(), "open" | "closed") {
                 return ToolResult::failure(call, "state must be open or closed");
             }
@@ -1643,14 +1638,9 @@ impl ToolExecutor {
             body.insert("labels".to_owned(), serde_json::json!(labels));
         }
         let mut issue_type = None;
-        if let Some(requested) = arguments.issue_type {
-            match normalize_github_issue_type(&requested) {
-                Ok(normalized) => {
-                    body.insert("type".to_owned(), serde_json::json!(normalized));
-                    issue_type = Some(normalized);
-                }
-                Err(error) => return ToolResult::failure(call, error),
-            }
+        if let Some(requested) = optional_text(arguments.issue_type) {
+            body.insert("type".to_owned(), serde_json::json!(requested));
+            issue_type = Some(requested);
         }
         if body.is_empty() {
             return ToolResult::failure(
@@ -1916,26 +1906,11 @@ impl ToolExecutor {
         let delete = arguments.delete.unwrap_or(false);
         let tag = arguments.tag.unwrap_or(false);
         let dry_run = arguments.dry_run.unwrap_or(false);
-        let branch = match normalize_push_name(arguments.branch.as_deref(), "branch") {
-            Ok(branch) => branch,
-            Err(error) => return ToolResult::failure(call, error),
-        };
-        let remote_branch =
-            match normalize_push_name(arguments.remote_branch.as_deref(), "remote_branch") {
-                Ok(remote_branch) => remote_branch,
-                Err(error) => return ToolResult::failure(call, error),
-            };
+        let branch = optional_text(arguments.branch);
+        let remote_branch = optional_text(arguments.remote_branch);
         // A lease turns the push into a force-with-lease rewrite; without one the
         // push stays fast-forward-only, exactly as it was before a lease existed.
-        let lease = match arguments.lease.as_deref().map(str::trim) {
-            Some("") => {
-                return ToolResult::failure(
-                    call,
-                    "lease must name the remote revision a force push expects; omit it to push without rewriting history",
-                );
-            }
-            lease => lease.map(str::to_owned),
-        };
+        let lease = optional_text(arguments.lease);
         if let Err(error) = validate_push_arguments(
             tag,
             delete,
@@ -1949,8 +1924,9 @@ impl ToolExecutor {
             Some(token) => token,
             None => return ToolResult::failure(call, GITHUB_NOT_CONNECTED),
         };
+        let path = optional_text(arguments.path);
         let (service, target) =
-            match self.github_remote_target(&arguments.repository, arguments.path.as_deref()) {
+            match self.github_remote_target(&arguments.repository, path.as_deref()) {
                 Ok(target) => target,
                 Err(error) => return ToolResult::failure(call, error),
             };
@@ -2067,11 +2043,9 @@ impl ToolExecutor {
             Ok(arguments) => arguments,
             Err(error) => return ToolResult::failure(call, error),
         };
-        let branch = match normalize_push_name(arguments.branch.as_deref(), "branch") {
-            Ok(branch) => branch,
-            Err(error) => return ToolResult::failure(call, error),
-        };
-        let refs = match normalize_ref_prefix(arguments.refs.as_deref()) {
+        let branch = optional_text(arguments.branch);
+        let refs = optional_text(arguments.refs);
+        let refs = match normalize_ref_prefix(refs.as_deref()) {
             Ok(refs) => refs,
             Err(error) => return ToolResult::failure(call, error),
         };
@@ -2079,8 +2053,9 @@ impl ToolExecutor {
             Some(token) => token,
             None => return ToolResult::failure(call, GITHUB_NOT_CONNECTED),
         };
+        let path = optional_text(arguments.path);
         let (service, _target) =
-            match self.github_remote_target(&arguments.repository, arguments.path.as_deref()) {
+            match self.github_remote_target(&arguments.repository, path.as_deref()) {
                 Ok(target) => target,
                 Err(error) => return ToolResult::failure(call, error),
             };
@@ -2117,8 +2092,9 @@ impl ToolExecutor {
             Some(token) => token,
             None => return ToolResult::failure(call, GITHUB_NOT_CONNECTED),
         };
+        let path = optional_text(arguments.path);
         let (service, _target) =
-            match self.github_remote_target(&arguments.repository, arguments.path.as_deref()) {
+            match self.github_remote_target(&arguments.repository, path.as_deref()) {
                 Ok(target) => target,
                 Err(error) => return ToolResult::failure(call, error),
             };
@@ -2876,19 +2852,6 @@ fn github_issue_type_entry(issue_type: &serde_json::Value) -> serde_json::Value 
     })
 }
 
-/// Trims an issue type name and rejects an empty one, so a blank name never
-/// reaches the API as a silent no-op. Which names exist is the organization's
-/// decision, so the API stays the only authority on them: a name it rejects is
-/// reported from its own response, and [`ToolExecutor::github_list_issue_types`]
-/// lists the names it accepts.
-fn normalize_github_issue_type(value: &str) -> std::result::Result<String, String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err("type must not be empty".to_owned());
-    }
-    Ok(trimmed.to_owned())
-}
-
 /// The issue type a create or update response carries, flattened to its name.
 /// GitHub reports the type either as the name itself or as the type object with
 /// a `name`, and a caller needs one of them to confirm what is set.
@@ -3171,35 +3134,23 @@ fn encode_github_path_segment(segment: &str) -> String {
     encoded
 }
 
-/// Trims and rejects a blank ref name, so a caller that meant to omit an
-/// argument cannot silently push or delete the wrong ref.
-fn normalize_push_name(
-    value: Option<&str>,
-    label: &str,
-) -> std::result::Result<Option<String>, String> {
-    match value.map(str::trim) {
-        Some("") => Err(format!(
-            "{label} must name a ref; a blank {label} cannot be pushed or deleted"
-        )),
-        Some(value) => Ok(Some(value.to_owned())),
-        None => Ok(None),
-    }
+/// Turns a blank or whitespace-only optional string into `None` and trims a
+/// non-blank one, so a strict provider schema that forces a caller to send every
+/// property does not turn an omitted argument into a blank value the tool would
+/// otherwise refuse.
+fn optional_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
-/// Trims and validates the optional ref-name prefix of
-/// `github_list_remote_refs`. Only a full ref name is accepted, so a caller
-/// cannot ask for a short name such as `heads` that matches no advertised ref
-/// and reads like an empty remote.
+/// Validates the optional ref-name prefix of `github_list_remote_refs`. Only a
+/// full ref name is accepted, so a caller cannot ask for a short name such as
+/// `heads` that matches no advertised ref and reads like an empty remote.
 fn normalize_ref_prefix(value: Option<&str>) -> std::result::Result<Option<String>, String> {
-    let Some(value) = value.map(str::trim) else {
+    let Some(value) = value else {
         return Ok(None);
     };
-    if value.is_empty() {
-        return Err(
-            "refs must name a ref namespace such as 'refs/heads/' or 'refs/tags/', not a blank value"
-                .to_owned(),
-        );
-    }
     if !value.starts_with("refs/") {
         return Err(format!(
             "refs must be a full ref name such as 'refs/heads/' or 'refs/tags/', not '{value}'"
@@ -3801,7 +3752,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolKind::GitHubPushBranch.name().to_owned(),
-            description: "Push a local branch in the workspace to the GitHub repository's origin remote using the connected account, so a pull request can be opened, and report the remote ref's previous revision, its new revision, and the commit range landed. `remote_branch` targets a remote branch name distinct from the local one; `tag` pushes the local tag named by `branch` to refs/tags/<branch>; `delete` removes the remote ref named by `remote_branch`, `branch`, or the current branch instead of pushing it; and `dry_run` performs the reads and reports what would change without writing to the remote. The result also states how far the checkout's base has drifted from origin. Supplying `lease` asks for a force-with-lease rewrite instead of a fast-forward-only push: a force push rewrites published history, and it is safe only because the tool refuses the push unless the remote branch still holds exactly the lease revision, and because a rewrite from a base that is behind origin is refused with the remote untouched, so refresh with `github_fetch` and rebase onto the refreshed base before retrying. This is a destructive action: it requires enabled GitHub write access and an approval policy that permits destructive actions; the default policy and automatic approvals allow it, and a user who gates destructive actions is prompted for each call.".to_owned(),
+            description: "Push a local branch in the workspace to the GitHub repository's origin remote using the connected account, so a pull request can be opened, and report the remote ref's previous revision, its new revision, and the commit range landed. `remote_branch` targets a remote branch name distinct from the local one; `tag` pushes the local tag named by `branch` to refs/tags/<branch>; `delete` removes the remote ref named by `remote_branch`, `branch`, or the current branch instead of pushing it; and `dry_run` performs the reads and reports what would change without writing to the remote. The result also states how far the checkout's base has drifted from origin. Supplying `lease` asks for a force-with-lease rewrite instead of a fast-forward-only push: a force push rewrites published history, and it is safe only because the tool refuses the push unless the remote branch still holds exactly the lease revision, and because a rewrite from a base that is behind origin is refused with the remote untouched, so refresh with `github_fetch` and rebase onto the refreshed base before retrying. A blank optional value is treated as omitted. This is a destructive action: it requires enabled GitHub write access and an approval policy that permits destructive actions; the default policy and automatic approvals allow it, and a user who gates destructive actions is prompted for each call.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -3820,7 +3771,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolKind::GitHubListRemoteRefs.name().to_owned(),
-            description: "Read the refs the origin remote advertises for a GitHub repository: its heads and tags, plus the ahead/behind state of a named local branch, so the lease revision for github_push_branch and the branch's tracking state can be read without a checkpoint fetch. `refs` limits the listed refs to a full ref-name prefix such as refs/heads/ or refs/tags/. Requires a connected GitHub account and approval for network access.".to_owned(),
+            description: "Read the refs the origin remote advertises for a GitHub repository: its heads and tags, plus the ahead/behind state of a named local branch, so the lease revision for github_push_branch and the branch's tracking state can be read without a checkpoint fetch. `refs` limits the listed refs to a full ref-name prefix such as refs/heads/ or refs/tags/. A blank optional value is treated as omitted. Requires a connected GitHub account and approval for network access.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -3835,7 +3786,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolKind::GitHubFetch.name().to_owned(),
-            description: "Refresh the checkout's remote-tracking refs (refs/remotes/origin/*) from the origin remote using the connected GitHub account's credentials, so agent git commands see the real remote state instead of a stale origin. Reports the default branch the fetch resolved, the checked-out revision, and how far it is behind origin, and writes only local refs. A private repository needs a connected account with access to it, because the checkout itself carries no git credentials. Requires a connected GitHub account and approval for network access.".to_owned(),
+            description: "Refresh the checkout's remote-tracking refs (refs/remotes/origin/*) from the origin remote using the connected GitHub account's credentials, so agent git commands see the real remote state instead of a stale origin. Reports the default branch the fetch resolved, the checked-out revision, and how far it is behind origin, and writes only local refs. A private repository needs a connected account with access to it, because the checkout itself carries no git credentials. A blank optional value is treated as omitted. Requires a connected GitHub account and approval for network access.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -3900,7 +3851,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolKind::GitHubCreateIssue.name().to_owned(),
-            description: "Create an issue in a GitHub repository, optionally with labels and an organization issue type. Returns the created issue, including its number, URL, and type. Requires explicit write approval.".to_owned(),
+            description: "Create an issue in a GitHub repository, optionally with labels and an organization issue type. Returns the created issue, including its number, URL, and type. A blank optional value is treated as omitted. Requires explicit write approval.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -3916,7 +3867,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolKind::GitHubUpdateIssue.name().to_owned(),
-            description: "Update an issue's title, body, state, labels, or organization issue type by number. Provide at least one field; when both title and body are given they are applied in a single request. The result reports the issue's type. Requires explicit write approval.".to_owned(),
+            description: "Update an issue's title, body, state, labels, or organization issue type by number. Provide at least one field; when both title and body are given they are applied in a single request. The result reports the issue's type. A blank optional value is treated as omitted. Requires explicit write approval.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -5042,6 +4993,63 @@ mod tests {
         );
     }
 
+    /// An optional tool argument stays optional in the exported schema: a strict
+    /// provider that reads `required` must not force a caller to send a value the
+    /// tool treats as omitted.
+    #[test]
+    fn optional_tool_arguments_stay_optional_in_their_schema() {
+        let definitions = tool_definitions();
+        let definition = |name: &str| {
+            definitions
+                .iter()
+                .find(|definition| definition.name == name)
+                .expect("advertised tool")
+        };
+        assert_eq!(
+            definition("github_push_branch").input_schema["required"],
+            serde_json::json!(["repository"])
+        );
+        assert_eq!(
+            definition("github_create_issue").input_schema["required"],
+            serde_json::json!(["repository", "title"])
+        );
+        let optional_fields: [(&str, &[&str]); 5] = [
+            (
+                "github_push_branch",
+                &[
+                    "branch",
+                    "remote_branch",
+                    "delete",
+                    "tag",
+                    "dry_run",
+                    "path",
+                    "lease",
+                ],
+            ),
+            ("github_list_remote_refs", &["path", "branch", "refs"]),
+            ("github_fetch", &["path"]),
+            ("github_create_issue", &["body", "labels", "type"]),
+            (
+                "github_update_issue",
+                &["title", "body", "state", "labels", "type"],
+            ),
+        ];
+        for (name, optional) in optional_fields {
+            let schema = &definition(name).input_schema;
+            let required = schema["required"].as_array().expect("a required list");
+            for field in optional {
+                assert!(
+                    schema["properties"].get(*field).is_some(),
+                    "{name} declares {field}"
+                );
+                assert!(
+                    !required.iter().any(|required| required == field),
+                    "{name} does not require {field}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn github_tools_are_advertised_only_when_usable() {
         let root = workspace();
@@ -5535,14 +5543,6 @@ mod tests {
                 "tag and lease cannot be combined",
             ),
             (
-                serde_json::json!({"repository": "owner/name", "branch": "  "}),
-                "blank branch cannot",
-            ),
-            (
-                serde_json::json!({"repository": "owner/name", "remote_branch": ""}),
-                "blank remote_branch cannot",
-            ),
-            (
                 serde_json::json!({"repository": "owner/name", "tag": true}),
                 "pushing a tag needs branch",
             ),
@@ -5550,12 +5550,85 @@ mod tests {
                 serde_json::json!({"repository": "owner/name", "tag": true, "delete": true}),
                 "deleting a tag needs branch",
             ),
+            (
+                // A tag request whose branch is blank has named no tag to push.
+                serde_json::json!({"repository": "owner/name", "tag": true, "branch": "  "}),
+                "pushing a tag needs branch",
+            ),
         ] {
             let refused = executor.execute(&call("github_push_branch", arguments));
             assert!(!refused.success, "{}", refused.output);
             assert!(refused.output.contains(expected), "{}", refused.output);
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A strict provider schema can force a caller to send every property, so an
+    /// optional string it means to omit arrives blank; a blank optional value is
+    /// the omitted argument rather than a refusal.
+    #[test]
+    fn github_push_branch_treats_blank_optional_arguments_as_omitted() {
+        let root = std::env::temp_dir().join(format!("loom-push-{}", AgentSessionId::new()));
+        let branch = init_git_repository(&root);
+        let bare = origin_remote(&root, &branch);
+        run_git(&root, &["tag", "v1"]);
+        let tag_revision = revision(&root, "refs/tags/v1");
+        let executor = github_executor(&root, &MockGitHub::start(Vec::new()));
+
+        let tagged = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({
+                "repository": "owner/name",
+                "tag": true,
+                "branch": "v1",
+                "lease": "",
+                "remote_branch": "  "
+            }),
+        ));
+        assert!(tagged.success, "{}", tagged.output);
+        assert!(
+            tagged.output.contains("Pushed tag 'v1' to"),
+            "{}",
+            tagged.output
+        );
+        assert_eq!(remote_ref_revision(&bare, "refs/tags/v1"), tag_revision);
+
+        fs::write(root.join("README.md"), "second\n").unwrap();
+        run_git(&root, &["add", "--", "README.md"]);
+        run_git(&root, &["commit", "-qm", "second"]);
+        let landed = revision(&root, "HEAD");
+        // A blank branch falls back to the current branch, a blank lease keeps
+        // the push fast-forward-only, and a blank path names the workspace root.
+        let pushed = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name", "branch": " ", "lease": "", "path": ""}),
+        ));
+        assert!(pushed.success, "{}", pushed.output);
+        assert!(
+            pushed.output.contains(&format!("Pushed branch '{branch}'")),
+            "{}",
+            pushed.output
+        );
+        assert_eq!(remote_revision(&bare, &branch), landed);
+
+        // A blank remote_branch names no distinct remote branch, and a delete may
+        // carry a blank lease without being refused as a conflict.
+        let deleted = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name", "delete": true, "remote_branch": "", "lease": ""}),
+        ));
+        assert!(deleted.success, "{}", deleted.output);
+        assert!(
+            deleted
+                .output
+                .contains(&format!("Deleted refs/heads/{branch} from")),
+            "{}",
+            deleted.output
+        );
+        assert!(remote_revision(&bare, &branch).is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(bare).unwrap();
     }
 
     /// The refs read exists so the lease a force push needs can be read from the
@@ -5854,7 +5927,7 @@ mod tests {
 
         let unfiltered = executor.execute(&call(
             "github_list_remote_refs",
-            serde_json::json!({"repository": "owner/name", "branch": branch}),
+            serde_json::json!({"repository": "owner/name", "branch": branch, "path": ""}),
         ));
         assert!(unfiltered.success, "{}", unfiltered.output);
         assert!(
@@ -5879,7 +5952,22 @@ mod tests {
         // would have hidden had it been read from the filtered advertisement.
         assert!(heads.output.contains("Tracking"), "{}", heads.output);
 
-        for invalid in ["heads", "refs", "  ", ""] {
+        // A strict schema can force a blank prefix on a caller that wants every
+        // ref, so a blank refs lists every head and tag instead of being refused.
+        let blank = executor.execute(&call(
+            "github_list_remote_refs",
+            serde_json::json!({"repository": "owner/name", "branch": branch, "refs": "  ", "path": " "}),
+        ));
+        assert!(blank.success, "{}", blank.output);
+        assert!(
+            blank.output.contains(&format!("refs/heads/{branch} ")),
+            "{}",
+            blank.output
+        );
+        assert!(blank.output.contains("refs/tags/v1"), "{}", blank.output);
+
+        // A short name matches no advertised ref, so it stays refused.
+        for invalid in ["heads", "refs"] {
             let refused = executor.execute(&call(
                 "github_list_remote_refs",
                 serde_json::json!({"repository": "owner/name", "refs": invalid}),
@@ -6096,8 +6184,7 @@ mod tests {
         );
         assert_eq!(remote_revision(&bare, "loom/topic"), previous);
 
-        // A lease cannot create a ref the remote does not advertise, and an empty
-        // lease names no revision at all.
+        // A lease cannot create a ref the remote does not advertise.
         run_git(&root, &["checkout", "-q", "-b", "loom/new"]);
         let absent = executor.execute(&call(
             "github_push_branch",
@@ -6110,16 +6197,19 @@ mod tests {
             absent.output
         );
         assert!(remote_revision(&bare, "loom/new").is_empty());
-        let empty = executor.execute(&call(
+        // A blank lease names no revision, so it is the omitted lease: the push
+        // stays fast-forward-only instead of becoming a rewrite.
+        let unleased = executor.execute(&call(
             "github_push_branch",
             serde_json::json!({"repository": "owner/name", "lease": "  "}),
         ));
-        assert!(!empty.success, "{}", empty.output);
+        assert!(unleased.success, "{}", unleased.output);
         assert!(
-            empty.output.contains("lease must name the remote revision"),
+            !unleased.output.contains("force-with-lease"),
             "{}",
-            empty.output
+            unleased.output
         );
+        assert_eq!(remote_revision(&bare, "loom/new"), rewritten);
 
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(bare).unwrap();
@@ -6877,30 +6967,70 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A strict provider schema can force a caller to send `type`, `body`, and
+    /// `state` on every call, so a blank one is the field it meant to omit: the
+    /// request leaves it out instead of being refused.
     #[test]
-    fn github_issue_type_must_not_be_blank() {
+    fn github_optional_issue_fields_are_omitted_when_blank() {
         let root = workspace();
-        let mock = MockGitHub::start(Vec::new());
+        let mock = MockGitHub::start(vec![
+            MockResponse::json(serde_json::json!({"number": 5, "state": "open"})),
+            MockResponse::body(201, r#"{"number": 7}"#),
+        ]);
         let executor = github_executor(&root, &mock);
-        for (name, arguments) in [
-            (
-                "github_update_issue",
-                serde_json::json!({"repository": "owner/name", "number": 5, "type": "  "}),
-            ),
-            (
-                "github_create_issue",
-                serde_json::json!({"repository": "owner/name", "title": "Gap", "type": ""}),
-            ),
-        ] {
-            let result = executor.execute(&call(name, arguments));
-            assert!(!result.success, "{}", result.output);
-            assert!(
-                result.output.contains("type must not be empty"),
-                "{}",
-                result.output
-            );
-        }
-        assert!(mock.requests().is_empty());
+
+        let updated = executor.execute(&call(
+            "github_update_issue",
+            serde_json::json!({
+                "repository": "owner/name",
+                "number": 5,
+                "title": "Corrected",
+                "body": "  ",
+                "state": "",
+                "type": "  "
+            }),
+        ));
+        assert!(updated.success, "{}", updated.output);
+
+        let created = executor.execute(&call(
+            "github_create_issue",
+            serde_json::json!({"repository": "owner/name", "title": "Gap", "body": " ", "type": ""}),
+        ));
+        assert!(created.success, "{}", created.output);
+
+        // A required title stays required: a blank one is not an omitted one.
+        let blank_title = executor.execute(&call(
+            "github_create_issue",
+            serde_json::json!({"repository": "owner/name", "title": "  "}),
+        ));
+        assert!(!blank_title.success, "{}", blank_title.output);
+        assert!(
+            blank_title.output.contains("title must not be empty"),
+            "{}",
+            blank_title.output
+        );
+        let blank_repository = executor.execute(&call(
+            "github_create_issue",
+            serde_json::json!({"repository": "  ", "title": "Gap"}),
+        ));
+        assert!(!blank_repository.success, "{}", blank_repository.output);
+        assert!(
+            blank_repository.output.contains("owner/name format"),
+            "{}",
+            blank_repository.output
+        );
+
+        let requests = mock.requests();
+        assert_eq!(requests.len(), 2);
+        let patched: serde_json::Value = serde_json::from_str(&requests[0].2).unwrap();
+        assert_eq!(patched["title"], "Corrected");
+        assert!(patched.get("body").is_none(), "{patched}");
+        assert!(patched.get("state").is_none(), "{patched}");
+        assert!(patched.get("type").is_none(), "{patched}");
+        let posted: serde_json::Value = serde_json::from_str(&requests[1].2).unwrap();
+        assert_eq!(posted["title"], "Gap");
+        assert!(posted.get("body").is_none(), "{posted}");
+        assert!(posted.get("type").is_none(), "{posted}");
         fs::remove_dir_all(root).unwrap();
     }
 
