@@ -510,7 +510,8 @@ impl ClientRequest {
             }
             Self::Run(RunRequest::InterruptAgentRun { .. })
             | Self::Run(RunRequest::RetryAgentStep { .. }) => Some(Capability::ControlAgentRun),
-            Self::Run(RunRequest::SendAgentMessage { .. }) => Some(Capability::ControlAgentRun),
+            Self::Run(RunRequest::SendAgentMessage { .. })
+            | Self::Run(RunRequest::SetAgentRunModel { .. }) => Some(Capability::ControlAgentRun),
             Self::Run(RunRequest::PauseAgentRun { .. }) => Some(Capability::PauseAgentRun),
             Self::Run(RunRequest::ResumeAgentRun { .. }) => Some(Capability::ResumeAgentRun),
             Self::Run(RunRequest::RetryAgentFromCheckpoint { .. }) => {
@@ -695,6 +696,7 @@ impl ClientRequest {
             | Self::Run(RunRequest::ApproveAgentAction { .. })
             | Self::Run(RunRequest::RejectAgentAction { .. })
             | Self::Run(RunRequest::SendAgentMessage { .. })
+            | Self::Run(RunRequest::SetAgentRunModel { .. })
             | Self::Run(RunRequest::InterruptAgentRun { .. })
             | Self::Run(RunRequest::RetryAgentStep { .. })
             | Self::Run(RunRequest::PauseAgentRun { .. })
@@ -859,6 +861,7 @@ impl ClientRequest {
             }) => Some(Session(*parent_session_id)),
             Self::Access(AccessRequest::GetRunCredential { run_id })
             | Self::Run(RunRequest::GetAgentRun { run_id })
+            | Self::Run(RunRequest::SetAgentRunModel { run_id, .. })
             | Self::Run(RunRequest::GetAgentRunMessagePage { run_id, .. })
             | Self::Run(RunRequest::GetAgentRunTranscriptPage { run_id, .. })
             | Self::Run(RunRequest::GetAgentRunMessageContentRange { run_id, .. })
@@ -929,6 +932,7 @@ impl ClientRequest {
                 | Self::Run(RunRequest::ApproveAgentAction { .. })
                 | Self::Run(RunRequest::RejectAgentAction { .. })
                 | Self::Run(RunRequest::SendAgentMessage { .. })
+                | Self::Run(RunRequest::SetAgentRunModel { .. })
                 | Self::Project(ProjectRequest::SendProjectAgentMessage { .. })
                 | Self::Run(RunRequest::InterruptAgentRun { .. })
                 | Self::Run(RunRequest::RetryAgentStep { .. })
@@ -1332,7 +1336,7 @@ mod run_message_protocol_tests {
 
     #[test]
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 15));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 16));
         let project_id = ProjectId::new();
         let request = ClientRequest::Project(ProjectRequest::GetProjectSnapshot { project_id });
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));

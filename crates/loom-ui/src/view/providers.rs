@@ -538,9 +538,53 @@ impl LoomView {
             return;
         }
         let model = resolve_model_choice(&self.models, &model).unwrap_or(model);
-        self.session_models
-            .insert(self.active_session.id, model.clone());
-        self.model = model;
+        let previous_model = self.model.clone();
+        let session_id = self.active_session.id;
+        let run_id = self.active_run_id.filter(|run_id| {
+            self.active_run
+                .as_ref()
+                .is_some_and(|run| run.id == *run_id && run.model != model)
+        });
+        self.session_models.insert(session_id, model.clone());
+        self.model = model.clone();
+        if let Some(run_id) = run_id {
+            // A run keeps one model until it is told to switch. A switch asked
+            // for while a turn is in flight is queued by the backend and applied
+            // before the next turn, so the selection stays as requested here and
+            // the run's `ModelChanged` event confirms it.
+            let requested = model;
+            self.dispatch(
+                cx,
+                ClientRequest::Run(RunRequest::SetAgentRunModel {
+                    run_id,
+                    model: requested.clone(),
+                }),
+                move |view, response, _| {
+                    match response.result {
+                        Ok(ServerResponse::Run(RunResponse::AgentRun(snapshot))) => {
+                            if view.active_run_id == Some(run_id) && snapshot.model == requested {
+                                view.active_run = Some(snapshot);
+                            }
+                        }
+                        Err(error) => {
+                            // Only a still-current selection reverts: another
+                            // choice made while this request was in flight owns
+                            // the visible model.
+                            if view.active_session.id == session_id && view.model == requested {
+                                view.model = previous_model.clone();
+                                view.session_models
+                                    .insert(session_id, previous_model.clone());
+                            }
+                            view.record_backend_error("switch model", error);
+                        }
+                        Ok(response) => view.record_backend_error(
+                            "switch model",
+                            unexpected_response("switch model", response),
+                        ),
+                    }
+                },
+            );
+        }
         cx.notify();
     }
 

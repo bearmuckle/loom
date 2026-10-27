@@ -337,6 +337,13 @@ pub enum RunRequest {
         run_id: RunId,
     },
 
+    /// Continues `run_id` with `model` from its next turn. A switch asked for
+    /// while a turn is in flight applies at the turn boundary.
+    SetAgentRunModel {
+        run_id: RunId,
+        model: ModelId,
+    },
+
     GetAgentRunMessagePage {
         run_id: RunId,
         before_ordinal: Option<u64>,

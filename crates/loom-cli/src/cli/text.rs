@@ -209,6 +209,9 @@ fn render_agent(event: &AgentEvent, budget: usize) -> Rendered {
                 run_state_name(snapshot.state).to_owned(),
             ],
         ),
+        AgentEvent::ModelChanged { model, .. } => {
+            body("model_changed", [model.as_str().to_owned()])
+        }
         AgentEvent::PlanProposed { plan, .. } => body("plan", [plan.steps.len().to_string()]),
         AgentEvent::StepStarted { run_id, index, .. } => {
             body("step_started", [run_id.to_string(), index.to_string()])
@@ -524,6 +527,7 @@ pub(crate) const fn server_event_name(event: &ServerEvent) -> &'static str {
 pub(crate) const fn agent_event_name(event: &AgentEvent) -> &'static str {
     match event {
         AgentEvent::RunStarted { .. } => "run_started",
+        AgentEvent::ModelChanged { .. } => "model_changed",
         AgentEvent::PlanProposed { .. } => "plan_proposed",
         AgentEvent::StepStarted { .. } => "step_started",
         AgentEvent::StepCompleted { .. } => "step_completed",

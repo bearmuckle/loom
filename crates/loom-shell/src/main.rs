@@ -1458,6 +1458,9 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
             AgentEvent::RunStarted { snapshot } => {
                 println!("Run {} [{}]", snapshot.id, run_state_name(snapshot.state));
             }
+            AgentEvent::ModelChanged { model, .. } => {
+                println!("Model changed: {}", model.as_str());
+            }
             AgentEvent::PlanProposed { plan, .. } => {
                 println!("Plan:");
                 for (index, step) in plan.steps.iter().enumerate() {

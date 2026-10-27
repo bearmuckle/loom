@@ -154,6 +154,50 @@ impl InProcessBackend {
         Ok((pin, provider))
     }
 
+    /// The provider authenticated with the run's pinned credential, or the
+    /// worker-wide provider when the run pinned none, for a model switch.
+    ///
+    /// A model change inside the same provider keeps the pinned credential
+    /// version, so switching models cannot silently adopt a newer sign-in. A
+    /// switch to another provider cannot use the pinned credential: it resolves
+    /// the session's current selection for that provider, and a selection for a
+    /// different provider is still an error.
+    pub(crate) fn provider_for_model_switch(
+        &self,
+        run_id: loom_core::RunId,
+        session_id: AgentSessionId,
+        model: &ModelId,
+    ) -> Result<(
+        loom_core::RunCredentialPin,
+        Box<dyn ModelProvider>,
+        u64,
+        u64,
+    )> {
+        let provider_id = self.providers.provider_id_for_model(model)?;
+        let (pin, provider) = match self.provider_credentials.run_pin(run_id) {
+            Some(pin) if pin.provider == provider_id.as_str() => {
+                let provider = match pin.credential_id {
+                    Some(_) => self.pinned_provider(&pin, model, 0)?,
+                    None => self.provider(model)?,
+                };
+                let pin = loom_core::RunCredentialPin {
+                    model: model.as_str().to_owned(),
+                    ..pin
+                };
+                (pin, provider)
+            }
+            _ => self.provider_for_new_run(session_id, model)?,
+        };
+        let (input_cost_micros_per_1k, output_cost_micros_per_1k) =
+            self.providers.pricing(model)?;
+        Ok((
+            pin,
+            provider,
+            input_cost_micros_per_1k,
+            output_cost_micros_per_1k,
+        ))
+    }
+
     /// The provider for a run, authenticated with the credential version the
     /// run pinned. Runs without a pinned credential use the worker-wide
     /// provider configuration.

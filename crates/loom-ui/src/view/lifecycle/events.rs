@@ -366,6 +366,16 @@ impl LoomView {
                 // frames.
                 self.conversation_opening = false;
             }
+            AgentEvent::ModelChanged { run_id, model } => {
+                if let Some(run) = self.active_run.as_mut().filter(|run| run.id == *run_id) {
+                    run.model = model.clone();
+                }
+                if self.active_run_id == Some(*run_id) {
+                    self.model = model.clone();
+                    self.session_models
+                        .insert(self.active_session.id, model.clone());
+                }
+            }
             AgentEvent::PlanProposed { plan, .. } => {
                 let steps = plan
                     .steps

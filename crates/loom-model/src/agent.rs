@@ -197,6 +197,12 @@ pub enum AgentEvent {
     RunStarted {
         snapshot: AgentRunSnapshot,
     },
+    /// The run continues with a different model from its next turn. A switch
+    /// asked for while a turn is in flight is applied at the turn boundary.
+    ModelChanged {
+        run_id: RunId,
+        model: ModelId,
+    },
     PlanProposed {
         run_id: RunId,
         plan: AgentPlan,

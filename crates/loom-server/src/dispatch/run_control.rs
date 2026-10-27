@@ -44,6 +44,9 @@ impl InProcessConnection {
                     ..Default::default()
                 },
             }),
+            ClientRequest::Run(RunRequest::SetAgentRunModel { run_id, model }) => {
+                self.set_run_model(run_id, model)
+            }
             ClientRequest::Run(RunRequest::ApproveAgentAction {
                 run_id,
                 attempt_id,

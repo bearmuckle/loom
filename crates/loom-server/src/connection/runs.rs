@@ -772,6 +772,69 @@ impl InProcessConnection {
         )))
     }
 
+    /// Continues a run with a different model from its next turn.
+    ///
+    /// An idle run switches immediately so the next message already sees the
+    /// new provider. A run with a turn in flight accepts the switch and the run
+    /// worker applies it before its next turn, because replacing the provider
+    /// under a streaming call would not change the call already in flight.
+    pub(crate) fn set_run_model(
+        &self,
+        run_id: loom_core::RunId,
+        model: ModelId,
+    ) -> Result<ServerResponse> {
+        let handle = self.run_handle(run_id)?;
+        let current_model = handle.state().run.model;
+        if current_model == model {
+            // A queued switch back to the current model must not apply after a
+            // later request made it stale.
+            handle.clear_model_switch();
+            return Ok(ServerResponse::Run(RunResponse::AgentRun(
+                handle.snapshot(),
+            )));
+        }
+        let switch = {
+            let (pin, provider, input_cost_micros_per_1k, output_cost_micros_per_1k) = self
+                .backend
+                .provider_for_model_switch(run_id, handle.session_id, &model)?;
+            PendingModelSwitch {
+                model: model.clone(),
+                provider,
+                pin,
+                input_cost_micros_per_1k,
+                output_cost_micros_per_1k,
+            }
+        };
+        if handle.is_running() {
+            handle.queue_model_switch(switch);
+            return Ok(ServerResponse::Run(RunResponse::AgentRun(
+                handle.snapshot(),
+            )));
+        }
+        let changed = {
+            let mut runtime = handle.runtime_for_entry()?;
+            let changed = runtime.set_model(
+                switch.model.clone(),
+                switch.provider,
+                switch.input_cost_micros_per_1k,
+                switch.output_cost_micros_per_1k,
+            )?;
+            handle.refresh(&runtime);
+            changed
+        };
+        if changed {
+            self.backend.pin_run_credential(run_id, switch.pin)?;
+            self.backend.record_agent_event(
+                handle.session_id,
+                AgentEvent::ModelChanged { run_id, model },
+            )?;
+            self.backend.persist_state()?;
+        }
+        Ok(ServerResponse::Run(RunResponse::AgentRun(
+            handle.snapshot(),
+        )))
+    }
+
     pub(crate) fn resume_agent_run(&self, run_id: loom_core::RunId) -> Result<ServerResponse> {
         let handle = self.run_handle(run_id)?;
         if handle.state().pending_project_join.as_ref().is_some() {

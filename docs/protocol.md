@@ -309,9 +309,9 @@ with no person the worker binds that account too: the provider sign-in doubles
 as the worker sign-in for an operator token.
 
 Important event families include `AgentMessageDelta`,
-`AgentPlanProposed`, `AgentStepStarted`, `ToolCallRequested`,
-`ToolApprovalRequired`, `ToolCallStarted`, `ToolOutputChunk`,
-`AgentStepCompleted`, `AgentNeedsInput`, `AgentRunUsage`,
+`AgentPlanProposed`, `ModelChanged`, `AgentStepStarted`,
+`ToolCallRequested`, `ToolApprovalRequired`, `ToolCallStarted`,
+`ToolOutputChunk`, `AgentStepCompleted`, `AgentNeedsInput`, `AgentRunUsage`,
 `SessionFilesystemChanged`, and `AgentRunCompleted`. Events must identify the
 session, run, step, tool call, and sequence number so a client can render
 partial progress and recover a consistent view.
@@ -416,7 +416,7 @@ CreateAgentSession / RenameAgentSession / ArchiveAgentSession
 RestoreAgentSession
 SetAgentSessionTitleSource
 DeleteAgentSession
-StartAgentRun / SendAgentMessage
+StartAgentRun / SendAgentMessage / SetAgentRunModel
 PauseAgentRun / ResumeAgentRun / InterruptAgentRun
 ApproveAgentAction / RejectAgentAction / RetryAgentStep
 ```
@@ -506,6 +506,17 @@ a model call is open. Requests that need exclusive access to a busy run
 (`ApproveAgentAction`, `SendAgentMessage`, `RetryAgentStep`, and the
 checkpoint retry) return a retryable `conflict` instead of blocking.
 
+`SetAgentRunModel { run_id, model }` continues an existing run with another
+model from its next turn instead of starting a new run. An idle run switches
+immediately, so its next message already uses the new model. A run with a turn
+in flight accepts the switch and applies it at the turn boundary, because a
+model call already streaming cannot change provider. The request returns the
+run snapshot; a queued switch still reports the current model until it is
+applied, and the run then journals `ModelChanged { run_id, model }`. Selecting
+the model the run already uses is a no-op. A switch within one provider keeps
+the credential version the run pinned, while a switch to another provider
+resolves the session's current selection for that provider.
+
 Run projections (`GetAgentRunSnapshot`, `GetRunUsage`, `InspectAgentContext`)
 are served from the backend's cached run state. Run state, usage, pending
 approval, and pending input are updated from events as they are journaled; the
@@ -552,7 +563,8 @@ the project it branches out of. 11.11 adds automatic project titles,
 `SetAgentSessionTitleSource`, and the title source a rename reports. 11.12 adds
 the session goal field, request, response, and event; 11.13 adds clearing it.
 11.14 adds the one-time sign-in credential; 11.15 adds `RestoreAgentSession`
-with its response and `AgentSessionRestored` event. Every addition is a new enum
+with its response and `AgentSessionRestored` event; 11.16 adds `SetAgentRunModel`
+and the `ModelChanged` run event. Every addition is a new enum
 variant, a capability, or a field with a compatible default (an omitted field
 keeps the older behavior), so clients of an older 11.x minor keep working; they
 simply never send the new requests, negotiate the new capability, or ask for

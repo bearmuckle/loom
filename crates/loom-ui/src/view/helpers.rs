@@ -1044,6 +1044,7 @@ pub(crate) fn session_id_for_request(
         | ClientRequest::Run(RunRequest::ApproveAgentAction { .. })
         | ClientRequest::Run(RunRequest::RejectAgentAction { .. })
         | ClientRequest::Run(RunRequest::SendAgentMessage { .. })
+        | ClientRequest::Run(RunRequest::SetAgentRunModel { .. })
         | ClientRequest::Run(RunRequest::InterruptAgentRun { .. })
         | ClientRequest::Run(RunRequest::RetryAgentStep { .. })
         | ClientRequest::Run(RunRequest::PauseAgentRun { .. })

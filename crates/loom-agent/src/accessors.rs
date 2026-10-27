@@ -52,6 +52,45 @@ impl AgentRuntime {
         self.usage.clone()
     }
 
+    /// Continues this run with `model` from its next turn.
+    ///
+    /// The provider is replaced together with the task and run model so the
+    /// next request is assembled and priced for the model it actually calls.
+    /// Returns whether the model changed, so the caller journals only a real
+    /// switch.
+    pub fn set_model(
+        &mut self,
+        model: ModelId,
+        provider: Box<dyn ModelProvider>,
+        input_cost_micros_per_1k: u64,
+        output_cost_micros_per_1k: u64,
+    ) -> Result<bool> {
+        if model == self.task.model {
+            return Ok(false);
+        }
+        if provider.descriptor().id != model {
+            return Err(LoomError::invalid_request(format!(
+                "provider model '{}' does not match requested model '{}'",
+                provider.descriptor().id.as_str(),
+                model.as_str()
+            )));
+        }
+        log::info!(
+            "run {} switches from model {} to {}",
+            self.run.id,
+            self.task.model.as_str(),
+            model.as_str()
+        );
+        self.task.model = model.clone();
+        self.run.model = model;
+        self.run.updated_at = Timestamp::now();
+        self.options.input_cost_micros_per_1k = input_cost_micros_per_1k;
+        self.options.output_cost_micros_per_1k = output_cost_micros_per_1k;
+        self.provider = Some(provider);
+        self.provider_cursor = 0;
+        Ok(true)
+    }
+
     /// The session goal this run works against, or `None` when the session has
     /// none. The server refreshes it from the durable session record before each
     /// model turn, so a goal change reaches an active run.

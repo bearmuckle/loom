@@ -1238,3 +1238,267 @@ fn reduced_activity_detail_empties_tool_content_without_dropping_records() {
     );
     fs::remove_dir_all(&backend.session_root_base).unwrap();
 }
+
+/// A registry exposing two models through the same scripted endpoint, so a
+/// model switch can be observed in the next request without changing provider.
+fn scripted_two_model_registry(
+    endpoint: &str,
+    first: ModelId,
+    second: ModelId,
+) -> ProviderRegistry {
+    let provider_id = ProviderId::new("scripted-project");
+    let descriptor = |id: ModelId| ModelDescriptor {
+        id,
+        provider: provider_id.clone(),
+        display_name: "Scripted switch model".to_owned(),
+        context_window: Some(16_384),
+        max_input_tokens: None,
+        max_output_tokens: None,
+        capabilities: ModelCapabilities {
+            streaming: false,
+            tool_calling: true,
+            vision: false,
+            json_mode: false,
+        },
+    };
+    let mut config = ProviderConfig::openai_compatible(
+        provider_id.clone(),
+        "Scripted switch model",
+        endpoint,
+        descriptor(first),
+        None,
+    );
+    config.models.push(descriptor(second));
+    let providers = ProviderRegistry::new();
+    providers.register(config).unwrap();
+    providers
+}
+
+fn create_model_switch_session(connection: &InProcessConnection) -> (WorkspaceId, AgentSessionId) {
+    let workspace = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Model switch".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let session = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Model switch".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    (workspace.id, session.id)
+}
+
+fn model_changed_events(
+    connection: &InProcessConnection,
+    session_id: AgentSessionId,
+    run_id: loom_core::RunId,
+) -> usize {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
+            session_id: Some(session_id),
+            workspace_id: None,
+            after_sequence: None,
+            stream_epoch: None,
+        },
+    )));
+    let ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) =
+        response.result.unwrap()
+    else {
+        panic!("unexpected session events response");
+    };
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.event,
+                ServerEvent::Agent {
+                    event: AgentEvent::ModelChanged {
+                        run_id: changed_run,
+                        ..
+                    }
+                } if *changed_run == run_id
+            )
+        })
+        .count()
+}
+
+#[test]
+fn model_switch_while_a_turn_is_in_flight_applies_to_the_next_turn() {
+    let model = ScriptedOpenAiEndpoint::start();
+    let first_model = ModelId::new("fixture/switch-before");
+    let second_model = ModelId::new("fixture/switch-after");
+    let backend = InProcessBackend::with_provider_registry(scripted_two_model_registry(
+        &model.endpoint,
+        first_model.clone(),
+        second_model.clone(),
+    ));
+    let connection = backend.connect();
+    negotiate(&connection);
+    let (_, session_id) = create_model_switch_session(&connection);
+
+    let run_id = match connection
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::StartSessionAgentRun {
+                session_id,
+                task: "Inspect the workspace.".to_owned(),
+                model: first_model.clone(),
+                system_instructions: None,
+                repository_instructions: None,
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
+        response => panic!("unexpected run response: {response:?}"),
+    };
+
+    // The first request holds the turn open, so the switch is accepted and
+    // queued instead of replacing the provider underneath the call.
+    let first_turn = model
+        .requests
+        .recv_timeout(Duration::from_secs(15))
+        .expect("first scripted model request did not arrive");
+    assert_eq!(first_turn.request["model"], first_model.as_str());
+    let queued = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::SetAgentRunModel {
+            run_id,
+            model: second_model.clone(),
+        },
+    )));
+    assert!(matches!(
+        queued.result,
+        Ok(ServerResponse::Run(RunResponse::AgentRun(snapshot)))
+            if snapshot.model == first_model
+    ));
+
+    model.respond_with_tool(first_turn, "list_files", serde_json::json!({}));
+    let next_turn = model
+        .requests
+        .recv_timeout(Duration::from_secs(15))
+        .expect("the next scripted model request did not arrive");
+    assert_eq!(next_turn.request["model"], second_model.as_str());
+    model.respond_with_text(next_turn, "Workspace inspected.");
+
+    let settled = await_settled_run(&connection, run_id);
+    assert_eq!(settled.state, AgentRunState::Completed);
+    assert_eq!(settled.model, second_model);
+    assert_eq!(model_changed_events(&connection, session_id, run_id), 1);
+}
+
+#[test]
+fn a_completed_run_continues_with_the_switched_model_and_rejects_an_unknown_one() {
+    let model = ScriptedOpenAiEndpoint::start();
+    let first_model = ModelId::new("fixture/switch-idle-before");
+    let second_model = ModelId::new("fixture/switch-idle-after");
+    let backend = InProcessBackend::with_provider_registry(scripted_two_model_registry(
+        &model.endpoint,
+        first_model.clone(),
+        second_model.clone(),
+    ));
+    let connection = backend.connect();
+    negotiate(&connection);
+    let (_, session_id) = create_model_switch_session(&connection);
+
+    let run_id = match connection
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::StartSessionAgentRun {
+                session_id,
+                task: "Say hello.".to_owned(),
+                model: first_model.clone(),
+                system_instructions: None,
+                repository_instructions: None,
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
+        response => panic!("unexpected run response: {response:?}"),
+    };
+    let first_turn = model
+        .requests
+        .recv_timeout(Duration::from_secs(15))
+        .expect("first scripted model request did not arrive");
+    model.respond_with_text(first_turn, "Hello.");
+    let completed = await_settled_run(&connection, run_id);
+    assert_eq!(completed.state, AgentRunState::Completed);
+    assert_eq!(completed.model, first_model);
+    assert_eq!(model_changed_events(&connection, session_id, run_id), 0);
+
+    // An idle run switches at once, so the next message is already assembled
+    // for the new model.
+    let switched = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::SetAgentRunModel {
+            run_id,
+            model: second_model.clone(),
+        },
+    )));
+    let Ok(ServerResponse::Run(RunResponse::AgentRun(switched))) = switched.result else {
+        panic!("unexpected switch response");
+    };
+    assert_eq!(switched.model, second_model);
+    assert_eq!(model_changed_events(&connection, session_id, run_id), 1);
+
+    // Asking for the model the run already uses changes nothing and journals
+    // no second event.
+    let same = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::SetAgentRunModel {
+            run_id,
+            model: second_model.clone(),
+        },
+    )));
+    assert!(matches!(
+        same.result,
+        Ok(ServerResponse::Run(RunResponse::AgentRun(snapshot)))
+            if snapshot.model == second_model
+    ));
+    assert_eq!(model_changed_events(&connection, session_id, run_id), 1);
+
+    let unknown = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::SetAgentRunModel {
+            run_id,
+            model: ModelId::new("fixture/unknown-model"),
+        },
+    )));
+    assert!(unknown.result.is_err());
+
+    let continued = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::SendAgentMessage {
+            run_id,
+            attempt_id: switched.attempt_id,
+            expected_control_revision: switched.control_revision,
+            message: "Say goodbye.".to_owned(),
+        },
+    )));
+    assert!(matches!(
+        continued.result,
+        Ok(ServerResponse::Run(RunResponse::AgentRun(snapshot)))
+            if snapshot.model == second_model
+    ));
+    let next_turn = model
+        .requests
+        .recv_timeout(Duration::from_secs(15))
+        .expect("the follow-up scripted model request did not arrive");
+    assert_eq!(next_turn.request["model"], second_model.as_str());
+    model.respond_with_text(next_turn, "Goodbye.");
+    let completed = await_settled_run(&connection, run_id);
+    assert_eq!(completed.state, AgentRunState::Completed);
+    assert_eq!(completed.model, second_model);
+}

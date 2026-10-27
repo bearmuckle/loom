@@ -237,6 +237,9 @@ impl InProcessConnection {
             ClientRequest::Run(RunRequest::GetAgentRun { .. }) => {
                 self.run_query_dispatch(request, request_id)
             }
+            ClientRequest::Run(RunRequest::SetAgentRunModel { .. }) => {
+                self.run_control_dispatch(request, request_id)
+            }
             ClientRequest::Run(RunRequest::GetAgentRunMessagePage { .. }) => {
                 self.run_query_dispatch(request, request_id)
             }

@@ -919,6 +919,10 @@ impl InProcessConnection {
             ClientRequest::Run(RunRequest::GetAgentRun {
                 run_id: requested_run,
             })
+            | ClientRequest::Run(RunRequest::SetAgentRunModel {
+                run_id: requested_run,
+                ..
+            })
             | ClientRequest::Run(RunRequest::GetAgentRunMessagePage {
                 run_id: requested_run,
                 ..

@@ -266,6 +266,18 @@ struct RunHandle {
     idle: Condvar,
     failure: Mutex<Option<LoomError>>,
     worker: Mutex<Option<run_executor::RunTask>>,
+    /// A model switch accepted while a turn was in flight, applied by the run
+    /// worker before its next turn.
+    pending_model: Mutex<Option<PendingModelSwitch>>,
+}
+
+/// A resolved model switch waiting for the run to reach its next turn.
+struct PendingModelSwitch {
+    model: ModelId,
+    provider: Box<dyn ModelProvider>,
+    pin: loom_core::RunCredentialPin,
+    input_cost_micros_per_1k: u64,
+    output_cost_micros_per_1k: u64,
 }
 
 struct MessageCheckpointCursor {

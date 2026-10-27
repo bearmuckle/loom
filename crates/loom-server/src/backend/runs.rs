@@ -201,6 +201,57 @@ impl InProcessBackend {
                         task_handle.record_failure(error);
                         break;
                     }
+                    // A model switch accepted while the previous turn was in
+                    // flight takes effect here, before the next request is
+                    // assembled from the provider.
+                    if let Some(switch) = task_handle.take_model_switch() {
+                        let PendingModelSwitch {
+                            model,
+                            provider,
+                            pin,
+                            input_cost_micros_per_1k,
+                            output_cost_micros_per_1k,
+                        } = switch;
+                        let applied = (|| -> Result<bool> {
+                            let mut runtime = task_handle
+                                .runtime
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner);
+                            let changed = runtime.set_model(
+                                model.clone(),
+                                provider,
+                                input_cost_micros_per_1k,
+                                output_cost_micros_per_1k,
+                            )?;
+                            task_handle.refresh(&runtime);
+                            Ok(changed)
+                        })();
+                        match applied {
+                            Ok(true) => {
+                                if let Err(error) =
+                                    backend.pin_run_credential(task_handle.run_id, pin)
+                                {
+                                    task_handle.record_failure(error);
+                                    break;
+                                }
+                                let event = AgentEvent::ModelChanged {
+                                    run_id: task_handle.run_id,
+                                    model,
+                                };
+                                if let Err(error) =
+                                    backend.record_agent_event(task_handle.session_id, event)
+                                {
+                                    task_handle.record_failure(error);
+                                    break;
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                task_handle.record_failure(error);
+                                break;
+                            }
+                        }
+                    }
                     let progress = {
                         let mut runtime = task_handle
                             .runtime

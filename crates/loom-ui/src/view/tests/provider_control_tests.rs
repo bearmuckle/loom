@@ -728,3 +728,112 @@ fn github_copilot_login_finishes_by_registering_the_provider(cx: &mut TestAppCon
     cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
         .unwrap();
 }
+
+#[gpui_kit::test]
+fn selecting_a_model_switches_the_active_run_and_reverts_a_refusal(cx: &mut TestAppContext) {
+    let (backend, requests) = crate::backend_host::BackendWorker::deferred_for_test();
+    let first = ModelId::new("provider/first");
+    let second = ModelId::new("provider/second");
+    let view = cx.new(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        let node_id = view.default_backend_node_id.clone();
+        view.backend = backend.clone();
+        view.node_backends.insert(node_id.clone(), backend);
+        view.session_node_ids
+            .insert(view.active_session.id, node_id.clone());
+        view.models = vec![first.clone(), second.clone()];
+        view.node_model_catalogs
+            .insert(node_id.clone(), view.models.clone());
+        view.model_catalog_node_id = Some(node_id);
+        view.model = first.clone();
+        let run = AgentRunSnapshot {
+            id: RunId::new(),
+            attempt_id: loom_core::RunAttemptId::new(),
+            control_revision: 1,
+            session_id: view.active_session.id,
+            task: "switch model".to_owned(),
+            model: first.clone(),
+            state: AgentRunState::Completed,
+            started_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+            completed_at: Some(Timestamp::now()),
+            summary: None,
+            evidence: Vec::new(),
+            approval_policy: None,
+        };
+        view.active_run_id = Some(run.id);
+        view.active_run = Some(run);
+        view
+    });
+
+    view.update(cx, |view, cx| view.select_model(second.clone(), cx));
+    let pending = requests
+        .try_recv()
+        .expect("switching a run's model asks the backend");
+    let ClientRequest::Run(RunRequest::SetAgentRunModel {
+        run_id,
+        model: requested,
+    }) = &pending.request.request
+    else {
+        panic!(
+            "unexpected model switch request: {:?}",
+            pending.request.request
+        );
+    };
+    assert_eq!(*requested, second);
+    let run_id = *run_id;
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.model, second, "the choice is shown while queued");
+        assert_eq!(view.session_models[&view.active_session.id], second);
+    });
+
+    // A queued switch answers with the model the run still uses. The selection
+    // stays as requested until the run's `ModelChanged` event confirms it.
+    let snapshot = view.read_with(cx, |view, _| view.active_run.clone().unwrap());
+    pending
+        .reply
+        .send(ResponseEnvelope::success(
+            pending.request.request_id,
+            ServerResponse::Run(RunResponse::AgentRun(snapshot)),
+        ))
+        .unwrap();
+    cx.run_until_parked();
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.model, second);
+        assert_eq!(view.active_run.as_ref().map(|run| &run.model), Some(&first));
+    });
+    view.update(cx, |view, _| {
+        view.consume_agent_event(&AgentEvent::ModelChanged {
+            run_id,
+            model: second.clone(),
+        });
+    });
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.active_run.as_ref().map(|run| &run.model),
+            Some(&second)
+        );
+        assert_eq!(view.model, second);
+    });
+
+    // A refusal restores the previous model and explains why.
+    view.update(cx, |view, cx| view.select_model(first.clone(), cx));
+    let pending = requests
+        .try_recv()
+        .expect("the second switch asks the backend");
+    pending
+        .reply
+        .send(ResponseEnvelope::failure(
+            pending.request.request_id,
+            LoomError::new(ErrorCode::InvalidRequest, "model is not available", false),
+        ))
+        .unwrap();
+    cx.run_until_parked();
+    view.update(cx, |view, cx| {
+        assert_eq!(view.model, second, "a refusal restores the run's model");
+        assert_eq!(view.session_models[&view.active_session.id], second);
+        assert!(view.status_banner.is_some());
+        view.active_run_id = None;
+        cx.notify();
+    });
+}

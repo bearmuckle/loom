@@ -25,6 +25,7 @@ impl RunHandle {
             idle: Condvar::new(),
             failure: Mutex::new(None),
             worker: Mutex::new(None),
+            pending_model: Mutex::new(None),
         }
     }
 
@@ -342,6 +343,11 @@ impl RunHandle {
                 state.run = snapshot.clone();
                 sync_cached_run_attempt(&mut state);
             }
+            AgentEvent::ModelChanged { model, .. } => {
+                state.task.model = model.clone();
+                state.run.model = model.clone();
+                state.run.updated_at = Timestamp::now();
+            }
             AgentEvent::RunStateChanged {
                 state: run_state, ..
             } => {
@@ -439,6 +445,27 @@ impl RunHandle {
 
     pub(crate) fn is_running(&self) -> bool {
         *self.running.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn queue_model_switch(&self, switch: PendingModelSwitch) {
+        *self
+            .pending_model
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(switch);
+    }
+
+    pub(crate) fn take_model_switch(&self) -> Option<PendingModelSwitch> {
+        self.pending_model
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    pub(crate) fn clear_model_switch(&self) {
+        self.pending_model
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
     }
 
     pub(crate) fn set_running(&self, running: bool) {
