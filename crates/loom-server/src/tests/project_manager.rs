@@ -26,6 +26,251 @@ fn delegated_child_current_model_alias_resolves_to_manager_model() {
     );
 }
 
+/// A provider registry that configures the fixture's captured and live models,
+/// so a delegated child's model passes creation-time validation. The endpoint
+/// refuses connections, so a child run started by the fixture fails at once
+/// instead of waiting on a model turn no test answers.
+fn delegation_model_registry(models: &[ModelId]) -> ProviderRegistry {
+    let providers = ProviderRegistry::new();
+    for (index, model_id) in models.iter().enumerate() {
+        let provider_id = ProviderId::new(format!("delegation-fixture-{index}"));
+        let descriptor = ModelDescriptor {
+            id: model_id.clone(),
+            provider: provider_id.clone(),
+            display_name: "Delegation fixture model".to_owned(),
+            context_window: Some(16_384),
+            max_input_tokens: None,
+            max_output_tokens: None,
+            capabilities: ModelCapabilities {
+                streaming: false,
+                tool_calling: true,
+                vision: false,
+                json_mode: false,
+            },
+        };
+        providers
+            .register(ProviderConfig::openai_compatible(
+                provider_id,
+                "Delegation fixture",
+                "http://127.0.0.1:1/v1/chat/completions",
+                descriptor,
+                None,
+            ))
+            .unwrap();
+    }
+    providers
+}
+
+/// A persistent backend with one manager session and the manager's project
+/// tools, whose captured model deliberately differs from any live run model so
+/// a test can tell which one a delegation resolved.
+struct DelegationModelSetup {
+    temp: PathBuf,
+    backend: Arc<InProcessBackend>,
+    connection: InProcessConnection,
+    root: AgentSessionId,
+    /// The model captured in the tools when the delegating run started.
+    captured_model: ModelId,
+    /// The model a live run for the manager session uses.
+    live_model: ModelId,
+    tools: ToolExecutor,
+}
+
+impl DelegationModelSetup {
+    fn new(prefix: &str) -> Self {
+        let temp = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp).unwrap();
+        let captured_model = ModelId::new(format!("fixture/{prefix}-captured"));
+        let live_model = ModelId::new(format!("fixture/{prefix}-live"));
+        let backend = InProcessBackend::with_provider_registry_persistent(
+            delegation_model_registry(&[captured_model.clone(), live_model.clone()]),
+            temp.join("state.sqlite"),
+        )
+        .unwrap();
+        let connection = backend.connect();
+        negotiate(&connection);
+        let workspace = match connection
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::CreateWorkspace {
+                    name: format!("{prefix} workspace"),
+                },
+            )))
+            .result
+            .unwrap()
+        {
+            ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+            response => panic!("unexpected workspace response: {response:?}"),
+        };
+        let root = match connection
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Manager".to_owned(),
+                },
+            )))
+            .result
+            .unwrap()
+        {
+            ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+            response => panic!("unexpected session response: {response:?}"),
+        };
+        let captured_model = ModelId::new(format!("fixture/{prefix}-captured"));
+        let extension = backend
+            .project_agent_tools(
+                root,
+                captured_model.clone(),
+                ProjectAgentToolGrants {
+                    delegation: true,
+                    inspection: true,
+                    ..ProjectAgentToolGrants::default()
+                },
+            )
+            .unwrap()
+            .expect("manager project tools");
+        let tools = ToolExecutor::new_with_workspace(connection.session_filesystem(root).unwrap())
+            .with_extension(extension);
+        Self {
+            temp,
+            backend,
+            connection,
+            root,
+            captured_model,
+            live_model,
+            tools,
+        }
+    }
+
+    /// Registers a run for the manager session with `model`, optionally marked
+    /// as executing, so the tool extension sees a live run to resolve against.
+    fn register_manager_run(&self, model: &ModelId, running: bool) -> Arc<RunHandle> {
+        let run_root =
+            std::env::temp_dir().join(format!("loom-delegation-run-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&run_root).unwrap();
+        let runtime = AgentRuntime::new(
+            self.root,
+            AgentTask::new("delegate with the current model", model.clone()).unwrap(),
+            Box::new(loom_providers::DeterministicProvider::demo()),
+            ToolExecutor::new(&run_root).unwrap(),
+        );
+        let handle = self.backend.register_runtime(runtime);
+        let run_id = handle.run_id;
+        self.backend
+            .runs()
+            .unwrap()
+            .insert(run_id, Arc::clone(&handle));
+        handle.set_running(running);
+        handle
+    }
+
+    /// Settles the fixture's runs before the backend shuts down, so shutdown
+    /// never waits on a run this test registered without a worker.
+    fn teardown(self) {
+        for handle in self.backend.runs().unwrap().values() {
+            handle.set_running(false);
+        }
+        drop(self.connection);
+        self.backend.shutdown().unwrap();
+        drop(self.backend);
+        fs::remove_dir_all(self.temp).unwrap();
+    }
+}
+
+/// Executes one manager delegation, omitting `model_id` when none is given.
+fn delegate_project_task_with_model(tools: &ToolExecutor, model_id: Option<&str>) -> ToolResult {
+    let mut arguments = serde_json::json!({
+        "child_name": "worker",
+        "intent": "Do one bounded piece of work and stop.",
+    });
+    if let Some(model_id) = model_id {
+        arguments["model_id"] = serde_json::json!(model_id);
+    }
+    tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "delegate_project_task".to_owned(),
+        arguments,
+    })
+}
+
+/// The project's delegated tasks, so a test can read the durable model a child
+/// was created with.
+fn project_tasks(setup: &DelegationModelSetup) -> Vec<loom_core::DelegatedTaskRecord> {
+    setup
+        .backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .list_project_tasks(ProjectId::from_uuid(*setup.root.as_uuid()))
+        .unwrap()
+}
+
+/// The listed child entry for one task, so a test can read the model id the
+/// manager listing reports.
+fn listed_model_id(setup: &DelegationModelSetup, task_id: loom_core::TaskId) -> serde_json::Value {
+    let listing = list_project_children_json(&setup.tools);
+    listed_child(&listing, task_id)["model_id"].clone()
+}
+
+#[test]
+fn a_current_model_delegation_uses_the_live_run_model() {
+    let setup = DelegationModelSetup::new("loom-delegation-live-model");
+    // The run switched to another model after the tools captured theirs, which
+    // is the state a delegation made after that switch must resolve.
+    setup.register_manager_run(&setup.live_model, true);
+
+    let delegation = delegate_project_task_with_model(&setup.tools, Some("current"));
+    assert!(delegation.success, "{}", delegation.output);
+    let output: serde_json::Value = serde_json::from_str(&delegation.output).unwrap();
+    assert_eq!(
+        output["model_id"].as_str(),
+        Some(setup.live_model.as_str()),
+        "the delegation result must report the model the child was created with"
+    );
+
+    let tasks = project_tasks(&setup);
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(
+        tasks[0].model_id,
+        setup.live_model.as_str(),
+        "the child task must use the model the live run uses now"
+    );
+    assert_ne!(tasks[0].model_id, setup.captured_model.as_str());
+    assert_eq!(
+        listed_model_id(&setup, tasks[0].task_id),
+        serde_json::json!(setup.live_model.as_str())
+    );
+    setup.teardown();
+}
+
+#[test]
+fn a_current_model_delegation_falls_back_to_the_captured_model_without_a_live_run() {
+    let setup = DelegationModelSetup::new("loom-delegation-captured-model");
+    // A registered run that is not executing is not live for this purpose, so
+    // the captured model is still what an alias resolves to.
+    setup.register_manager_run(&setup.live_model, false);
+
+    for requested in [None, Some("current")] {
+        let delegation = delegate_project_task_with_model(&setup.tools, requested);
+        assert!(delegation.success, "{}", delegation.output);
+        let output: serde_json::Value = serde_json::from_str(&delegation.output).unwrap();
+        assert_eq!(
+            output["model_id"].as_str(),
+            Some(setup.captured_model.as_str()),
+            "an alias without a live run must report the captured model"
+        );
+    }
+
+    let tasks = project_tasks(&setup);
+    assert_eq!(tasks.len(), 2);
+    for task in &tasks {
+        assert_eq!(task.model_id, setup.captured_model.as_str());
+        assert_eq!(
+            listed_model_id(&setup, task.task_id),
+            serde_json::json!(setup.captured_model.as_str())
+        );
+    }
+    setup.teardown();
+}
+
 #[test]
 fn delegated_children_and_direct_messages_are_durable_and_bounded() {
     let temp = std::env::temp_dir().join(format!("loom-project-agents-{}", uuid::Uuid::new_v4()));

@@ -711,6 +711,38 @@ impl ProjectAgentTools {
         })
     }
 
+    /// Resolves the model this agent uses at the time of the call.
+    ///
+    /// The captured model records what the run started or was restored with,
+    /// and a model switch during the run updates only the live run's state, so
+    /// an alias that reuses this agent's model has to read the running run
+    /// instead of the captured id. A session without a registered running run
+    /// (a direct tool call in a test, or a run that is not executing) keeps the
+    /// captured id.
+    pub(crate) fn current_model_id(&self) -> ModelId {
+        let Some(backend) = self.backend.upgrade() else {
+            return self.model_id.clone();
+        };
+        // Clone the candidate handles and release the run registry before any
+        // run lock is taken, so a run transition never waits behind this read.
+        let handles = match backend.runs() {
+            Ok(runs) => runs
+                .values()
+                .filter(|handle| handle.session_id == self.session_id)
+                .cloned()
+                .collect::<Vec<_>>(),
+            Err(_) => Vec::new(),
+        };
+        let live = handles
+            .into_iter()
+            .filter(|handle| handle.is_running())
+            .max_by_key(|handle| handle.run_id);
+        match live {
+            Some(handle) => handle.state().task.model,
+            None => self.model_id.clone(),
+        }
+    }
+
     pub(crate) fn execute_delegation(&self, call: &ToolCall) -> ToolResult {
         self.execute_delegation_with_kind(call, false)
     }
@@ -772,7 +804,7 @@ impl ProjectAgentTools {
         let request_id = RequestId::from_uuid(*call.id.as_uuid());
         let spec = DelegatedTaskSpec {
             intent: arguments.intent,
-            model_id: delegated_child_model_id(arguments.model_id, &self.model_id),
+            model_id: delegated_child_model_id(arguments.model_id, &self.current_model_id()),
             context_references: arguments.context_references,
             dependencies: arguments.dependencies,
             code_change,
@@ -795,6 +827,7 @@ impl ProjectAgentTools {
                         "status": task.status,
                         "child_name": task.child_name,
                         "intent": task.intent,
+                        "model_id": task.model_id,
                         "checkout_base": self.child_checkout_base(task.task_id),
                     }))
                     .unwrap_or_else(|error| format!("could not encode delegation result: {error}")),
@@ -1095,6 +1128,7 @@ impl ProjectAgentTools {
                 "task_summary": agent.task_summary.as_ref().map(|summary| summary.chars().take(256).collect::<String>()),
                 "task_id": task.map(|task| task.task_id),
                 "task_status": task.map(|task| task.status),
+                "model_id": task.map(|task| task.model_id.as_str()),
                 "run_state": run.as_ref().map(|summary| summary.snapshot.state),
                 "run_summary": run.as_ref().and_then(|summary| summary.snapshot.summary.as_ref()).map(|summary| summary.chars().take(256).collect::<String>()),
                 "worktree_status": worktree.as_ref().map(|worktree| worktree.status),
