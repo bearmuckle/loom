@@ -3704,7 +3704,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolKind::ApplyPatch.name().to_owned(),
-            description: "Edit a workspace file with one or more exact text replacements. Provide `edits` (each an old_text/new_text pair), or the single old_text/new_text pair. Each old_text must match exactly once. Returns a unified diff. Requires approval for workspace writes.".to_owned(),
+            description: "Edit a workspace file with one or more exact text replacements. Provide `edits` (each an old_text/new_text pair), or the single top-level old_text/new_text pair; the two forms are exclusive, so send only one and never combine them. Each old_text must match exactly once. Returns a unified diff. Requires approval for workspace writes.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -4160,22 +4160,32 @@ struct ApplyPatchEdit {
 
 impl ApplyPatchArguments {
     fn edits(&self) -> std::result::Result<Vec<(String, String)>, String> {
-        let legacy = self.old_text.is_some() || self.new_text.is_some();
-        if !self.edits.is_empty() && legacy {
-            return Err(
-                "apply_patch accepts either edits or old_text/new_text, not both".to_owned(),
-            );
+        if self.edits.is_empty() {
+            return match (&self.old_text, &self.new_text) {
+                (Some(old_text), Some(new_text)) => Ok(vec![(old_text.clone(), new_text.clone())]),
+                _ => Err("apply_patch requires edits, or both old_text and new_text".to_owned()),
+            };
         }
-        if !self.edits.is_empty() {
-            return Ok(self
-                .edits
-                .iter()
-                .map(|edit| (edit.old_text.clone(), edit.new_text.clone()))
-                .collect());
-        }
+        let edits = self
+            .edits
+            .iter()
+            .map(|edit| (edit.old_text.clone(), edit.new_text.clone()))
+            .collect::<Vec<_>>();
+        // Callers routinely repeat the same replacement in both forms, so a
+        // legacy pair that duplicates one edit is the same edit sent twice and
+        // is ignored rather than reported as a conflict.
         match (&self.old_text, &self.new_text) {
-            (Some(old_text), Some(new_text)) => Ok(vec![(old_text.clone(), new_text.clone())]),
-            _ => Err("apply_patch requires edits, or both old_text and new_text".to_owned()),
+            (None, None) => Ok(edits),
+            (Some(old_text), Some(new_text))
+                if edits
+                    .iter()
+                    .any(|(old, new)| old == old_text && new == new_text) =>
+            {
+                Ok(edits)
+            }
+            _ => Err(
+                "apply_patch accepts either edits or old_text/new_text; send only one form, because this old_text/new_text pair duplicates none of the edits".to_owned(),
+            ),
         }
     }
 }
@@ -4759,7 +4769,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_patch_supports_multiple_edits_and_rejects_mixed_forms() {
+    fn apply_patch_supports_multiple_edits_and_rejects_conflicting_forms() {
         let root = workspace();
         fs::write(root.join("src/main.rs"), "alpha\nbeta\ngamma\n").unwrap();
         let executor = ToolExecutor::new(&root).unwrap();
@@ -4790,7 +4800,16 @@ mod tests {
             }),
         ));
         assert!(!mixed.success);
-        assert!(mixed.output.contains("not both"));
+        assert!(
+            mixed.output.contains("send only one form"),
+            "{}",
+            mixed.output
+        );
+        assert!(
+            mixed.output.contains("duplicates none of the edits"),
+            "{}",
+            mixed.output
+        );
 
         let missing = executor.execute(&call(
             "apply_patch",
@@ -4798,6 +4817,69 @@ mod tests {
         ));
         assert!(!missing.success);
         assert!(missing.output.contains("requires edits"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Callers repeat the same replacement in both forms often enough that the
+    /// duplicate is the reported failure, so a legacy pair equal to an edit is
+    /// accepted and applied once instead of treated as a conflict.
+    #[test]
+    fn apply_patch_accepts_a_legacy_pair_duplicating_the_only_edit() {
+        let root = workspace();
+        fs::write(root.join("src/main.rs"), "alpha\nbeta\n").unwrap();
+        let executor = ToolExecutor::new(&root).unwrap();
+
+        let applied = executor.execute(&call(
+            "apply_patch",
+            serde_json::json!({
+                "path": "src/main.rs",
+                "old_text": "alpha",
+                "new_text": "ALPHA",
+                "edits": [{"old_text": "alpha", "new_text": "ALPHA"}]
+            }),
+        ));
+
+        assert!(applied.success, "{}", applied.output);
+        // A second application of the same replacement would no longer match,
+        // so the file changing once is what shows the duplicate was ignored.
+        assert_eq!(
+            fs::read_to_string(root.join("src/main.rs")).unwrap(),
+            "ALPHA\nbeta\n"
+        );
+        assert!(
+            applied.output.contains("updated src/main.rs"),
+            "{}",
+            applied.output
+        );
+        assert!(!applied.output.contains("(2 edits)"), "{}", applied.output);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn apply_patch_accepts_a_legacy_pair_duplicating_one_of_several_edits() {
+        let root = workspace();
+        fs::write(root.join("src/main.rs"), "alpha\nbeta\ngamma\n").unwrap();
+        let executor = ToolExecutor::new(&root).unwrap();
+
+        let applied = executor.execute(&call(
+            "apply_patch",
+            serde_json::json!({
+                "path": "src/main.rs",
+                "old_text": "gamma",
+                "new_text": "GAMMA",
+                "edits": [
+                    {"old_text": "alpha", "new_text": "ALPHA"},
+                    {"old_text": "gamma", "new_text": "GAMMA"}
+                ]
+            }),
+        ));
+
+        assert!(applied.success, "{}", applied.output);
+        assert_eq!(
+            fs::read_to_string(root.join("src/main.rs")).unwrap(),
+            "ALPHA\nbeta\nGAMMA\n"
+        );
+        assert!(applied.output.contains("(2 edits)"), "{}", applied.output);
         fs::remove_dir_all(root).unwrap();
     }
 
