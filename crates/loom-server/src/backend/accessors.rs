@@ -237,6 +237,65 @@ impl InProcessBackend {
         }))
     }
 
+    /// Re-authenticates every live run of this worker that calls
+    /// `provider_id` through the worker-wide configuration, so a replaced API
+    /// key reaches each run before its next model request.
+    ///
+    /// A run on another provider keeps its provider. A run whose credential pin
+    /// names an explicit credential keeps that credential: a participant-owned
+    /// credential is never silently replaced with the worker-wide key. Each
+    /// replacement is built from the run's current model and provider cursor, so
+    /// the run continues with the current configuration. A run with a turn in
+    /// flight queues the replacement for its worker; an idle run is updated at
+    /// once. Returns how many runs were updated.
+    ///
+    /// The run-registry lock is released before any run's state or runtime lock
+    /// is taken.
+    pub(crate) fn reauthenticate_provider_runs(&self, provider_id: &ProviderId) -> Result<usize> {
+        let handles = self.runs()?.values().cloned().collect::<Vec<_>>();
+        let mut updated = 0_usize;
+        for handle in handles {
+            let (model, cursor) = {
+                let state = handle.locked_state();
+                (state.run.model.clone(), state.provider_cursor)
+            };
+            let model_provider = match self.providers.provider_id_for_model(&model) {
+                Ok(model_provider) => model_provider,
+                Err(error) => {
+                    // A model this worker no longer registers cannot be the
+                    // configured provider, and its provider cannot be built
+                    // either, so the run keeps the one it holds.
+                    log::warn!(
+                        "run {} keeps its provider: its model '{}' is not registered: {}",
+                        handle.run_id,
+                        model.as_str(),
+                        error.message
+                    );
+                    continue;
+                }
+            };
+            if model_provider != *provider_id {
+                continue;
+            }
+            if self
+                .provider_credentials
+                .run_pin(handle.run_id)
+                .is_some_and(|pin| pin.credential_id.is_some())
+            {
+                continue;
+            }
+            let provider = self.provider_at(&model, cursor)?;
+            match handle.try_runtime() {
+                Ok(mut runtime) => runtime.replace_provider(provider)?,
+                // A turn is in flight, so the run worker applies the
+                // replacement before its next model request.
+                Err(_) => handle.queue_provider_replacement(provider),
+            }
+            updated = updated.saturating_add(1);
+        }
+        Ok(updated)
+    }
+
     /// Records the pin of a run that just started.
     pub(crate) fn pin_run_credential(
         &self,

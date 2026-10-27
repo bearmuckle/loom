@@ -1012,7 +1012,16 @@ pub(super) fn gated_model_endpoint(
 
 pub(super) struct ScriptedModelRequest {
     pub(super) request: serde_json::Value,
+    /// The request's `Authorization` header, so a test can tell which
+    /// credential a provider call authenticated with.
+    pub(super) authorization: Option<String>,
     pub(super) stream: TcpStream,
+}
+
+/// One scripted HTTP request: the headers a test inspects and the raw body.
+struct ScriptedHttpRequest {
+    authorization: Option<String>,
+    body: Vec<u8>,
 }
 
 pub(super) fn hold_scripted_model_stream_until_cancelled(
@@ -1065,13 +1074,17 @@ impl ScriptedOpenAiEndpoint {
                     Ok((mut stream, _)) => {
                         let sender = sender.clone();
                         thread::spawn(move || {
-                            let Ok(body) = read_scripted_http_request_body(&mut stream) else {
+                            let Ok(request) = read_scripted_http_request(&mut stream) else {
                                 return;
                             };
-                            let Ok(request) = serde_json::from_slice(&body) else {
+                            let Ok(body) = serde_json::from_slice(&request.body) else {
                                 return;
                             };
-                            let _ = sender.send(ScriptedModelRequest { request, stream });
+                            let _ = sender.send(ScriptedModelRequest {
+                                request: body,
+                                authorization: request.authorization,
+                                stream,
+                            });
                         });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1193,7 +1206,7 @@ impl Drop for ScriptedOpenAiEndpoint {
     }
 }
 
-pub(super) fn read_scripted_http_request_body(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+fn read_scripted_http_request(stream: &mut TcpStream) -> std::io::Result<ScriptedHttpRequest> {
     let mut headers = Vec::new();
     let mut byte = [0_u8; 1];
     loop {
@@ -1210,14 +1223,17 @@ pub(super) fn read_scripted_http_request_body(stream: &mut TcpStream) -> std::io
         }
     }
     let headers = String::from_utf8_lossy(&headers);
-    let content_length = headers
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())
-                .flatten()
+    let header_value = |name: &str| {
+        headers.lines().find_map(|line| {
+            let (header_name, value) = line.split_once(':')?;
+            header_name
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_owned())
         })
+    };
+    let authorization = header_value("authorization");
+    let content_length = header_value("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
         .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -1226,7 +1242,10 @@ pub(super) fn read_scripted_http_request_body(stream: &mut TcpStream) -> std::io
         })?;
     let mut body = vec![0; content_length];
     stream.read_exact(&mut body)?;
-    Ok(body)
+    Ok(ScriptedHttpRequest {
+        authorization,
+        body,
+    })
 }
 
 pub(super) fn write_scripted_http_response(mut stream: TcpStream, body: serde_json::Value) {

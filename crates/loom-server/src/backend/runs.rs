@@ -201,6 +201,35 @@ impl InProcessBackend {
                         task_handle.record_failure(error);
                         break;
                     }
+                    // A provider replacement accepted while a turn was in
+                    // flight takes effect here, before the next request is
+                    // assembled, so a replaced API key is used by this run.
+                    // It is applied before a queued model switch, which then
+                    // resolves its own provider from the current
+                    // configuration.
+                    if let Some(provider) = task_handle.take_provider_replacement() {
+                        let current_model = task_handle.snapshot().model;
+                        if provider.descriptor().id == current_model {
+                            let mut runtime = task_handle
+                                .runtime
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner);
+                            if let Err(error) = runtime.replace_provider(provider) {
+                                task_handle.record_failure(error);
+                                break;
+                            }
+                        } else {
+                            // The run moved to another model after the
+                            // replacement was queued, and that model's provider
+                            // is resolved from the current configuration when
+                            // the switch is applied.
+                            log::info!(
+                                "run {run_id} dropped a queued provider replacement for model {} because the run model is {}",
+                                provider.descriptor().id.as_str(),
+                                current_model.as_str()
+                            );
+                        }
+                    }
                     // A model switch accepted while the previous turn was in
                     // flight takes effect here, before the next request is
                     // assembled from the provider.

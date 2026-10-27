@@ -53,6 +53,34 @@ impl InProcessConnection {
                 // idempotency journal. Persist only the resulting provider
                 // config, which contains an opaque credential reference.
                 self.backend.persist_state()?;
+                // A registered run holds the provider it resolved when it
+                // started, so the replaced key only reaches its next request
+                // once the run is re-authenticated.
+                match self.backend.reauthenticate_provider_runs(&provider_id) {
+                    Ok(updated) => log::info!(
+                        "[loom-server] replaced the API key of provider '{}' and re-authenticated \
+                         {updated} registered run(s)",
+                        provider_id.as_str()
+                    ),
+                    Err(error) => {
+                        log::error!(
+                            "[loom-server] replaced the API key of provider '{}' but could not \
+                             re-authenticate its registered runs: {}",
+                            provider_id.as_str(),
+                            error.message
+                        );
+                        return Err(LoomError::new(
+                            ErrorCode::Internal,
+                            format!(
+                                "the API key of provider '{}' was replaced, but registered runs \
+                                 could not be re-authenticated: {}",
+                                provider_id.as_str(),
+                                error.message
+                            ),
+                            true,
+                        ));
+                    }
+                }
                 Ok(ServerResponse::Provider(
                     ProviderResponse::ProviderConfigured,
                 ))

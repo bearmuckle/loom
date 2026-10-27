@@ -91,6 +91,33 @@ impl AgentRuntime {
         Ok(true)
     }
 
+    /// Replaces the provider this run calls without changing its model.
+    ///
+    /// A replacement carries the same model and a newly resolved credential, so
+    /// a provider API key replaced on the worker reaches a registered run
+    /// before its next model request. Nothing else changes: the model, the
+    /// pricing, the journal, and the provider cursor stay as they are, because
+    /// only the credential the provider authenticates with is new. A provider
+    /// for another model is refused so a run never calls a model it did not
+    /// price.
+    pub fn replace_provider(&mut self, provider: Box<dyn ModelProvider>) -> Result<()> {
+        let provider_model = provider.descriptor().id.clone();
+        if provider_model != self.task.model {
+            return Err(LoomError::invalid_request(format!(
+                "provider model '{}' does not match run model '{}'",
+                provider_model.as_str(),
+                self.task.model.as_str()
+            )));
+        }
+        log::info!(
+            "run {} re-authenticates model {} with the current provider configuration",
+            self.run.id,
+            self.task.model.as_str()
+        );
+        self.provider = Some(provider);
+        Ok(())
+    }
+
     /// The session goal this run works against, or `None` when the session has
     /// none. The server refreshes it from the durable session record before each
     /// model turn, so a goal change reaches an active run.

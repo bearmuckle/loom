@@ -3604,3 +3604,56 @@ fn a_running_tool_is_published_as_executing_before_it_completes() {
     worker.join().unwrap().unwrap();
     fs::remove_dir_all(root).unwrap();
 }
+
+/// Replacing the provider changes only the credential the next request uses: the
+/// model, the pricing, and the provider cursor stay as they were, and a
+/// provider for another model is refused.
+#[test]
+fn replacing_the_provider_keeps_the_run_model_pricing_and_cursor() {
+    let root = workspace();
+    let task = AgentTask::new("call a model", ModelId::new("deterministic/demo")).unwrap();
+    let mut runtime = AgentRuntime::new(
+        AgentSessionId::new(),
+        task,
+        Box::new(DeterministicProvider::demo()),
+        ToolExecutor::new(&root).unwrap(),
+    );
+    runtime.provider_cursor = 2;
+    runtime.options.input_cost_micros_per_1k = 7;
+    runtime.options.output_cost_micros_per_1k = 11;
+    let model = runtime.snapshot().model.clone();
+
+    let mut foreign = loom_providers::deterministic_descriptor();
+    foreign.id = ModelId::new("deterministic/other");
+    let error = runtime
+        .replace_provider(Box::new(
+            loom_providers::OpenAiCompatibleProvider::with_descriptor(
+                "http://unused",
+                "unused key",
+                foreign,
+            ),
+        ))
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidRequest);
+    assert_eq!(runtime.provider().unwrap().descriptor().id, model);
+
+    let published: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let collected = published.clone();
+    runtime.set_event_observer(Arc::new(move |event: &AgentEvent| {
+        collected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(event.clone());
+    }));
+
+    runtime
+        .replace_provider(Box::new(DeterministicProvider::demo()))
+        .unwrap();
+    assert_eq!(runtime.provider().unwrap().descriptor().id, model);
+    assert_eq!(runtime.snapshot().model, model);
+    assert_eq!(runtime.provider_cursor, 2);
+    assert_eq!(runtime.options.input_cost_micros_per_1k, 7);
+    assert_eq!(runtime.options.output_cost_micros_per_1k, 11);
+    assert!(published.lock().unwrap().is_empty());
+    fs::remove_dir_all(root).unwrap();
+}

@@ -26,6 +26,7 @@ impl RunHandle {
             failure: Mutex::new(None),
             worker: Mutex::new(None),
             pending_model: Mutex::new(None),
+            pending_provider: Mutex::new(None),
         }
     }
 
@@ -466,6 +467,22 @@ impl RunHandle {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
+    }
+
+    /// Queues a provider replacement for the run worker to apply before its
+    /// next model request. A newer replacement supersedes a queued one.
+    pub(crate) fn queue_provider_replacement(&self, provider: Box<dyn ModelProvider>) {
+        *self
+            .pending_provider
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(provider);
+    }
+
+    pub(crate) fn take_provider_replacement(&self) -> Option<Box<dyn ModelProvider>> {
+        self.pending_provider
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     pub(crate) fn set_running(&self, running: bool) {

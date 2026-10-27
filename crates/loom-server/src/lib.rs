@@ -269,6 +269,10 @@ struct RunHandle {
     /// A model switch accepted while a turn was in flight, applied by the run
     /// worker before its next turn.
     pending_model: Mutex<Option<PendingModelSwitch>>,
+    /// A provider replacement accepted while a turn was in flight, applied by
+    /// the run worker before its next request so a replaced API key reaches a
+    /// registered run.
+    pending_provider: Mutex<Option<Box<dyn ModelProvider>>>,
 }
 
 /// A resolved model switch waiting for the run to reach its next turn.
