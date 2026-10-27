@@ -1583,7 +1583,7 @@ impl ToolExecutor {
         }
         let mut body = serde_json::Map::new();
         body.insert("title".to_owned(), serde_json::json!(arguments.title));
-        if let Some(text) = optional_text(arguments.body) {
+        if let Some(text) = non_blank_text(arguments.body) {
             body.insert("body".to_owned(), serde_json::json!(text));
         }
         if let Some(labels) = arguments.labels.filter(|labels| !labels.is_empty()) {
@@ -1625,7 +1625,7 @@ impl ToolExecutor {
             }
             body.insert("title".to_owned(), serde_json::json!(title));
         }
-        if let Some(text) = optional_text(arguments.body) {
+        if let Some(text) = non_blank_text(arguments.body) {
             body.insert("body".to_owned(), serde_json::json!(text));
         }
         if let Some(state) = optional_text(arguments.state) {
@@ -3144,6 +3144,14 @@ fn optional_text(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Maps a blank or whitespace-only optional string to `None` and returns every
+/// other value untouched. An issue body keeps its own indentation and trailing
+/// blank lines, unlike an identifier-like argument, while a blank value a strict
+/// provider schema forces the caller to send still means omitted.
+fn non_blank_text(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
 /// Validates the optional ref-name prefix of `github_list_remote_refs`. Only a
 /// full ref name is accepted, so a caller cannot ask for a short name such as
 /// `heads` that matches no advertised ref and reads like an empty remote.
@@ -4134,8 +4142,11 @@ impl ApplyPatchArguments {
             {
                 Ok(edits)
             }
-            _ => Err(
+            (Some(_), Some(_)) => Err(
                 "apply_patch accepts either edits or old_text/new_text; send only one form, because this old_text/new_text pair duplicates none of the edits".to_owned(),
+            ),
+            _ => Err(
+                "apply_patch accepts either edits or old_text/new_text; send only one form, because the old_text/new_text form needs both old_text and new_text".to_owned(),
             ),
         }
     }
@@ -4768,6 +4779,51 @@ mod tests {
         ));
         assert!(!missing.success);
         assert!(missing.output.contains("requires edits"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Half a legacy pair is not a duplicate of any edit, so it is reported as
+    /// an incomplete single-pair form instead.
+    #[test]
+    fn apply_patch_reports_a_partial_legacy_pair_as_incomplete() {
+        let root = workspace();
+        fs::write(root.join("src/main.rs"), "alpha\nbeta\n").unwrap();
+        let executor = ToolExecutor::new(&root).unwrap();
+
+        for arguments in [
+            serde_json::json!({
+                "path": "src/main.rs",
+                "old_text": "beta",
+                "edits": [{"old_text": "alpha", "new_text": "ALPHA"}]
+            }),
+            serde_json::json!({
+                "path": "src/main.rs",
+                "new_text": "BETA",
+                "edits": [{"old_text": "alpha", "new_text": "ALPHA"}]
+            }),
+        ] {
+            let result = executor.execute(&call("apply_patch", arguments));
+            assert!(!result.success, "{}", result.output);
+            assert!(
+                result.output.contains("send only one form"),
+                "{}",
+                result.output
+            );
+            assert!(
+                result.output.contains("needs both old_text and new_text"),
+                "{}",
+                result.output
+            );
+            assert!(
+                !result.output.contains("duplicates none of the edits"),
+                "{}",
+                result.output
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(root.join("src/main.rs")).unwrap(),
+            "alpha\nbeta\n"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6976,6 +7032,7 @@ mod tests {
         let mock = MockGitHub::start(vec![
             MockResponse::json(serde_json::json!({"number": 5, "state": "open"})),
             MockResponse::body(201, r#"{"number": 7}"#),
+            MockResponse::body(201, r#"{"number": 8}"#),
         ]);
         let executor = github_executor(&root, &mock);
 
@@ -7020,8 +7077,17 @@ mod tests {
             blank_repository.output
         );
 
+        // A non-blank body is not an identifier: blank still means omitted, but
+        // its own indentation and trailing blank lines reach the API unchanged.
+        let verbatim = "\n    code();\n\n";
+        let kept = executor.execute(&call(
+            "github_create_issue",
+            serde_json::json!({"repository": "owner/name", "title": "Gap", "body": verbatim}),
+        ));
+        assert!(kept.success, "{}", kept.output);
+
         let requests = mock.requests();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 3);
         let patched: serde_json::Value = serde_json::from_str(&requests[0].2).unwrap();
         assert_eq!(patched["title"], "Corrected");
         assert!(patched.get("body").is_none(), "{patched}");
@@ -7031,6 +7097,8 @@ mod tests {
         assert_eq!(posted["title"], "Gap");
         assert!(posted.get("body").is_none(), "{posted}");
         assert!(posted.get("type").is_none(), "{posted}");
+        let sent: serde_json::Value = serde_json::from_str(&requests[2].2).unwrap();
+        assert_eq!(sent["body"], "\n    code();\n\n");
         fs::remove_dir_all(root).unwrap();
     }
 
