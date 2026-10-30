@@ -97,7 +97,7 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 ignore = "0.4.33"
 globset = "0.4.20"
 regex = "1.13.1"
-scraper = { version = "0.27.0", default-features = false, features = ["errors"] }
+scraper = { version = "0.29.0", default-features = false, features = ["errors"] }
 url = "2.5.8"
 libc = "0.2"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
