@@ -86,10 +86,12 @@ async fn server_with_backend_and_frame_limit(
     .await
 }
 
-/// A short heartbeat keeps the tests that wait on one fast. The server drops a
-/// connection that is silent for three intervals, so a test that stops reading
-/// a socket for a while needs a longer one.
-const TEST_HEARTBEAT: Duration = Duration::from_millis(25);
+/// The server drops a connection that is silent for three heartbeat intervals,
+/// and a test client only answers a heartbeat while it is reading. Under a
+/// loaded CI runner a client can go quiet for far longer than a few dozen
+/// milliseconds, so the interval is long enough to ride that out. No test waits
+/// on a heartbeat: they all answer requests and events, not the heartbeat.
+const TEST_HEARTBEAT: Duration = Duration::from_millis(500);
 
 /// The standard test server with explicit per-connection in-flight limits.
 async fn server_with_limits(
@@ -317,7 +319,7 @@ async fn server_with_sign_in(
         InProcessBackend::new(),
         Arc::new(AuthTokenStore::new()),
         RemoteServerConfig {
-            heartbeat_interval: Duration::from_millis(25),
+            heartbeat_interval: TEST_HEARTBEAT,
             request_timeout: Duration::from_secs(5),
             github_sign_in: GitHubSignInConfig::new(
                 allowlist.iter().map(|login| (*login).to_owned()),
@@ -587,7 +589,7 @@ async fn sign_in_server(
         backend,
         auth,
         RemoteServerConfig {
-            heartbeat_interval: Duration::from_millis(25),
+            heartbeat_interval: TEST_HEARTBEAT,
             request_timeout: Duration::from_secs(5),
             github_sign_in: fixture.config(),
             ..RemoteServerConfig::local_ephemeral()
