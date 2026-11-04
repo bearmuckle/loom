@@ -31,8 +31,24 @@ test("publishes a matching manifest and unchanged stable loader", async (t) => {
   assert.equal(await readFile(join(dist, "loom-client.js"), "utf8"), loaderSource);
 });
 
+test("pairs a module and a binary whose hashes differ", async (t) => {
+  // Trunk renames the binary after wasm-opt, so its hash is not the module's.
+  const dist = await fixture(t, ["loom-ui-ee0f.js", "loom-ui-6a6c_bg.wasm"]);
+  build(dist);
+  assert.deepEqual(JSON.parse(await readFile(join(dist, "loom-client.json"), "utf8")), {
+    js: "loom-ui-ee0f.js",
+    wasm: "loom-ui-6a6c_bg.wasm",
+  });
+});
+
 test("rejects missing, ambiguous, and incomplete builds", async (t) => {
-  for (const names of [[], ["loom-ui-aaa.js", "loom-ui-bbb.js"], ["loom-ui-aaa.js"]]) {
+  for (const names of [
+    [],
+    ["loom-ui-aaa.js", "loom-ui-bbb.js"],
+    ["loom-ui-aaa.js"],
+    ["loom-ui-aaa.js", "loom-ui-aaa_bg.wasm", "loom-ui-bbb_bg.wasm"],
+    ["loom-ui-aaa_bg.wasm"],
+  ]) {
     const dist = await fixture(t, names);
     assert.throws(() => build(dist));
     await assert.rejects(readFile(join(dist, "loom-client.json")), { code: "ENOENT" });
