@@ -417,21 +417,21 @@ fn catppuccin_theme(name: &str, mode: ThemeMode, p: Catppuccin) -> Rc<ThemeConfi
     c.warning_foreground = Some(hex(p.on_accent));
     c.warning_hover = Some(hex(p.peach));
     c.window_border = Some(hex(p.overlay2));
-    Rc::new(ThemeConfig {
-        name: name.into(),
-        mode,
-        // Compact, Zed-like density: a smaller base and monospace size, a
-        // tight corner radius, and no drop shadows on controls. The view sets
-        // the window rem size from `BASE_FONT_SIZE`, so these sizes keep the
-        // component library and the hand-rolled chrome in step.
-        font_size: Some(BASE_FONT_SIZE),
-        mono_font_size: Some(MONO_FONT_SIZE),
-        radius: Some(4),
-        radius_lg: Some(6),
-        shadow: Some(false),
-        colors: c,
-        ..Default::default()
-    })
+    // `ThemeConfig` is non-exhaustive, so it is filled in field by field.
+    let mut theme = ThemeConfig::default();
+    theme.name = name.into();
+    theme.mode = mode;
+    // Compact, Zed-like density: a smaller base and monospace size, a
+    // tight corner radius, and no drop shadows on controls. The view sets
+    // the window rem size from `BASE_FONT_SIZE`, so these sizes keep the
+    // component library and the hand-rolled chrome in step.
+    theme.font_size = Some(BASE_FONT_SIZE);
+    theme.mono_font_size = Some(MONO_FONT_SIZE);
+    theme.radius = Some(4);
+    theme.radius_lg = Some(6);
+    theme.shadow = Some(false);
+    theme.colors = c;
+    Rc::new(theme)
 }
 
 fn mocha_theme() -> Rc<ThemeConfig> {
