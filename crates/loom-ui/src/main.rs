@@ -19,6 +19,8 @@ mod identity_store;
 mod local_backend;
 mod preferences;
 mod session_reference;
+#[cfg(not(target_family = "wasm"))]
+mod ssh_worker;
 mod state;
 mod syntax;
 mod theme;

@@ -519,6 +519,22 @@ pub(crate) fn connect_remote(
     options: &loom_local::RemoteConnectionOptions,
     identity_key: &str,
 ) -> Result<ClientConnection, LoomError> {
+    // An SSH worker is reached through a tunnel with the token its host
+    // issued, whatever token the caller passed.
+    if crate::ssh_worker::is_ssh_url(url) {
+        let (tunnel_url, token) = crate::ssh_worker::open(url)?;
+        return connect_remote_direct(&tunnel_url, &token, options, identity_key);
+    }
+    connect_remote_direct(url, operator_token, options, identity_key)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn connect_remote_direct(
+    url: &str,
+    operator_token: &str,
+    options: &loom_local::RemoteConnectionOptions,
+    identity_key: &str,
+) -> Result<ClientConnection, LoomError> {
     let stored = crate::credential_store::load(identity_key);
     let Some(credential) = crate::credential_store::replayable(operator_token, stored, url) else {
         return ClientConnection::remote(url.to_owned(), operator_token.to_owned(), options);

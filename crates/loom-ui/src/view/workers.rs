@@ -248,6 +248,8 @@ impl LoomView {
             self.remembered_identities.remove(&node.status.node_id);
         }
         if let Some(url) = &node.url {
+            #[cfg(not(target_family = "wasm"))]
+            crate::ssh_worker::close(url);
             let count = self.workspace_config.worker_nodes.len();
             self.workspace_config
                 .worker_nodes

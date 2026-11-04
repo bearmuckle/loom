@@ -38,6 +38,48 @@ A download reaches `api.github.com` and GitHub's release asset hosts. A client
 installed from an archive, AppImage, or `.deb` already has `loom-server` next
 to it and does not download.
 
+## Provisioning a worker over SSH
+
+Giving Loom SSH access to a machine is enough to turn it into a worker. In the
+desktop client, enter `ssh://user@host` (or `ssh://user@host:2222`) in
+Settings, Workers, and Connect. From a terminal:
+
+```sh
+loom --ssh-worker user@host            # install, start, tunnel; prints URL and token
+loom --ssh-remove user@host            # stop and uninstall (keeps the token and state)
+loom --ssh-remove user@host --delete-data
+```
+
+`--ssh-identity <path>` and `--ssh-jump <host>` map to `ssh -i` and `ssh -J`.
+
+What happens, using only the system `ssh` and no root on the host:
+
+1. `uname -sm` picks the release platform (Linux x86_64 or aarch64, or macOS).
+2. The client downloads the `loom-server` release that matches its own version,
+   checks it against `SHA256SUMS`, and uploads it over the connection to
+   `~/.loom/server/<tag>/`. The host needs no internet access.
+3. `~/.loom/token` (mode `0600`) is created when absent and read back; the
+   client keeps it in its credential store under the `ssh://` address.
+4. The worker starts bound to `127.0.0.1:8765` on the host, with its state in
+   `~/.loom/state.db`. It is a systemd user unit (`loom-server.service`, with
+   linger enabled so it survives logout and reboot) when the host has a user
+   systemd, and a detached process with a pidfile otherwise; a detached worker
+   does not survive a reboot.
+5. The client waits for `GET /health`, then forwards a local loopback port to
+   the worker with `ssh -N -L`. Nothing listens beyond loopback on either side,
+   so no TLS is needed.
+
+Running it again is safe: a host that already runs this version is left alone,
+and a different version is replaced while the token and the state database are
+kept. The client reopens a dropped tunnel, and re-provisions first, on every
+reconnect.
+
+`ssh` runs in `BatchMode` and never prompts. An unknown host key or a key that
+needs a passphrase fails with a message that says what to do: run `ssh host`
+once to trust the host key, and load the key into `ssh-agent`. Set
+`LOOM_SSH_BINARY` to use another `ssh`. Setting `LOOM_NO_SYSTEMD` in the
+remote environment forces the detached-process mode.
+
 ## Shared sessions and GitHub sign-in
 
 A worker can be shared by more than one person. People sign in with their own

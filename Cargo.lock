@@ -4637,8 +4637,10 @@ name = "loom-shell"
 version = "0.1.0"
 dependencies = [
  "env_logger",
+ "log",
  "loom-agent",
  "loom-core",
+ "loom-local",
  "loom-model",
  "loom-persistence",
  "loom-process",

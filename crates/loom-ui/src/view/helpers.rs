@@ -3159,7 +3159,8 @@ pub(crate) fn worker_url_embeds_credential(url: &str) -> bool {
         return false;
     };
     let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
-    if authority.contains('@') {
+    // The user in an `ssh://` URL is a login name, not a secret.
+    if authority.contains('@') && !url.starts_with("ssh://") {
         return true;
     }
     let Some(query) = url.split_once('?').map(|(_, query)| query) else {

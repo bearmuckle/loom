@@ -67,6 +67,9 @@ fn main() -> Result<(), LoomError> {
     if let Some(provider) = &options.login_provider {
         return run_login(provider);
     }
+    if options.ssh_worker.is_some() || options.ssh_remove.is_some() {
+        return run_ssh_worker(&options);
+    }
     if options.serve {
         return run_server(options);
     }
@@ -160,6 +163,14 @@ struct CliOptions {
     archive_retention_sub_agent: Option<String>,
     /// Raw `--max-frame-bytes` value, before it is resolved into a byte count.
     max_frame_bytes: Option<String>,
+    /// `--ssh-worker`: install and start a worker on this host, then tunnel to it.
+    ssh_worker: Option<String>,
+    /// `--ssh-remove`: stop and uninstall the worker on this host.
+    ssh_remove: Option<String>,
+    ssh_identity: Option<PathBuf>,
+    ssh_jump: Option<String>,
+    /// `--delete-data`: with `--ssh-remove`, also delete the token and state.
+    ssh_delete_data: bool,
 }
 
 impl CliOptions {
@@ -226,7 +237,9 @@ fn help_text() -> String {
          [--serve --bind <addr> --instance-name <name> --node-name <name> \
          [--token <token> | --token-file <path>] [--archive-retention <duration>] \
          [--archive-retention-force-discard <bool>]] [--m4-demo] [--login github-copilot] \
-         [--allow-insecure-remote] [--max-frame-bytes <bytes>]",
+         [--allow-insecure-remote] [--max-frame-bytes <bytes>] \
+         [--ssh-worker <[user@]host | ssh://user@host:port> [--ssh-identity <path>] \
+         [--ssh-jump <host>]] [--ssh-remove <host> [--delete-data]]",
         "Add --m2-demo to exercise workspace, terminal, and task APIs.",
         "Add --m3-demo to persist the run, list deterministic/Ollama providers, and reopen the \
          backend.",
@@ -245,6 +258,11 @@ fn help_text() -> String {
          the --m4-demo client; it defaults to 4194304 (4 MiB) and rejects any frame above \
          it as payload_too_large naming the request, the received size, and the limit.",
         "Use --login github-copilot to authenticate GitHub Copilot.",
+        "Use --ssh-worker <host> to install loom-server on a machine you can reach over SSH, \
+         start it there bound to loopback, and print a local tunnel URL and its token. It uses \
+         the system ssh without prompts, so load your key into ssh-agent and trust the host key \
+         first. Running it again upgrades the worker and keeps its token and state. \
+         --ssh-remove <host> stops and uninstalls it, and --delete-data also deletes its state.",
         "Use --reset-state to wipe an incompatible state database instead of being prompted.",
         "Use --archive-retention <duration> (or LOOM_ARCHIVE_RETENTION) to delete archived \
          projects once the archive time is older than <n><unit> with unit ms, s, m, h, d, or w, \
@@ -284,6 +302,11 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
         archive_retention_force_discard: None,
         archive_retention_sub_agent: None,
         max_frame_bytes: None,
+        ssh_worker: None,
+        ssh_remove: None,
+        ssh_identity: None,
+        ssh_jump: None,
+        ssh_delete_data: false,
     };
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -294,6 +317,18 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
             "--manual-approval" => options.manual_approval = true,
             "--m2-demo" => options.m2_demo = true,
             "--m3-demo" => options.m3_demo = true,
+            "--ssh-worker" => {
+                options.ssh_worker = Some(required_value(&mut args, "--ssh-worker")?);
+            }
+            "--ssh-remove" => {
+                options.ssh_remove = Some(required_value(&mut args, "--ssh-remove")?);
+            }
+            "--ssh-identity" => {
+                options.ssh_identity =
+                    Some(PathBuf::from(required_value(&mut args, "--ssh-identity")?));
+            }
+            "--ssh-jump" => options.ssh_jump = Some(required_value(&mut args, "--ssh-jump")?),
+            "--delete-data" => options.ssh_delete_data = true,
             "--serve" => options.serve = true,
             "--m4-demo" => options.m4_demo = true,
             "--reset-state" => options.reset_state = true,
@@ -344,6 +379,19 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
             "--help" | "-h" => {
                 println!("{}", help_text());
                 return Ok(None);
+            }
+            value if value.starts_with("--ssh-worker=") => {
+                options.ssh_worker = Some(value["--ssh-worker=".len()..].to_owned());
+            }
+            value if value.starts_with("--ssh-remove=") => {
+                options.ssh_remove = Some(value["--ssh-remove=".len()..].to_owned());
+            }
+            value if value.starts_with("--ssh-identity=") => {
+                options.ssh_identity =
+                    Some(PathBuf::from(value["--ssh-identity=".len()..].to_owned()));
+            }
+            value if value.starts_with("--ssh-jump=") => {
+                options.ssh_jump = Some(value["--ssh-jump=".len()..].to_owned());
             }
             value if value.starts_with("--name=") => {
                 options.name = value["--name=".len()..].to_owned();
@@ -411,6 +459,59 @@ fn required_value(
 ) -> Result<String, LoomError> {
     args.next()
         .ok_or_else(|| LoomError::invalid_request(format!("{flag} requires a value")))
+}
+
+/// The SSH target the `--ssh-*` flags describe.
+fn ssh_target(
+    options: &CliOptions,
+    destination: &str,
+) -> Result<loom_local::ssh::SshTarget, LoomError> {
+    let mut target = loom_local::ssh::SshTarget::parse(destination)?;
+    target.identity_file = options.ssh_identity.clone();
+    target.jump_host = options.ssh_jump.clone();
+    Ok(target)
+}
+
+/// `--ssh-worker` installs and starts a worker on a host and holds a tunnel to
+/// it open; `--ssh-remove` stops and uninstalls it.
+fn run_ssh_worker(options: &CliOptions) -> Result<(), LoomError> {
+    if let Some(destination) = &options.ssh_remove {
+        let target = ssh_target(options, destination)?;
+        loom_local::ssh::remove(
+            &loom_local::ssh::SystemSsh,
+            &target,
+            options.ssh_delete_data,
+        )?;
+        println!("Removed the worker on {}.", target.display());
+        return Ok(());
+    }
+    let destination = options.ssh_worker.as_deref().unwrap_or_default();
+    let target = ssh_target(options, destination)?;
+    let worker = loom_local::ssh::provision_with_system_ssh(&target, &mut |step| {
+        log::info!("{}: {}", target.display(), step.label());
+    })?;
+    let mut tunnel = loom_local::ssh::open_tunnel(&target, None)?;
+    println!(
+        "Worker on {} runs loom-server {} {}.",
+        target.display(),
+        worker.tag,
+        if worker.supervised {
+            "under systemd"
+        } else {
+            "as a detached process (it will not survive a reboot)"
+        }
+    );
+    println!("URL:   {}", tunnel.websocket_url());
+    println!("Token: {}", worker.token);
+    println!("Tunnel open; press Ctrl-C to close it.");
+    while tunnel.is_alive() {
+        thread::sleep(Duration::from_secs(1));
+    }
+    Err(LoomError::new(
+        ErrorCode::ProviderUnavailable,
+        "the SSH tunnel closed",
+        true,
+    ))
 }
 
 fn run_login(provider: &str) -> Result<(), LoomError> {
@@ -1727,6 +1828,13 @@ mod tests {
             "--m3-demo",
             "--m4-demo",
             "--serve",
+            "--ssh-worker",
+            "dev@box",
+            "--ssh-remove=old@box",
+            "--ssh-identity",
+            "/keys/id",
+            "--ssh-jump=jump",
+            "--delete-data",
         ]))
         .unwrap()
         .unwrap();
@@ -1740,6 +1848,63 @@ mod tests {
         assert_eq!(options.login_provider.as_deref(), Some("github-copilot"));
         assert!(options.manual_approval && options.m2_demo && options.m3_demo);
         assert!(options.m4_demo && options.serve);
+        assert_eq!(options.ssh_worker.as_deref(), Some("dev@box"));
+        assert_eq!(options.ssh_remove.as_deref(), Some("old@box"));
+        assert_eq!(options.ssh_identity.unwrap().to_str(), Some("/keys/id"));
+        assert_eq!(options.ssh_jump.as_deref(), Some("jump"));
+        assert!(options.ssh_delete_data);
+    }
+
+    #[test]
+    fn ssh_flags_accept_equals_forms() {
+        let options = parse_args(arguments(&[
+            "--ssh-worker=ssh://dev@box:22",
+            "--ssh-identity=/keys/id",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(options.ssh_worker.as_deref(), Some("ssh://dev@box:22"));
+        assert_eq!(options.ssh_identity.unwrap().to_str(), Some("/keys/id"));
+    }
+
+    #[test]
+    fn the_ssh_modes_run_through_the_system_ssh() {
+        let mut options = parse_args(arguments(&["--ssh-remove", "dev@box"]))
+            .unwrap()
+            .unwrap();
+        // SAFETY: this is the only test in this binary that sets the variable.
+        unsafe { std::env::set_var(loom_local::ssh::SSH_BINARY_ENV, "true") };
+        super::run_ssh_worker(&options).expect("a succeeding ssh removes the worker");
+        unsafe { std::env::set_var(loom_local::ssh::SSH_BINARY_ENV, "false") };
+        assert!(super::run_ssh_worker(&options).is_err());
+        options.ssh_remove = None;
+        options.ssh_worker = Some("dev@box".to_owned());
+        let error = super::run_ssh_worker(&options).unwrap_err();
+        assert!(
+            error.message.contains("Probing the host"),
+            "{}",
+            error.message
+        );
+        options.ssh_worker = Some("-oBad".to_owned());
+        assert!(super::run_ssh_worker(&options).is_err());
+        unsafe { std::env::remove_var(loom_local::ssh::SSH_BINARY_ENV) };
+    }
+
+    #[test]
+    fn ssh_target_applies_the_identity_and_jump_flags() {
+        let options = parse_args(arguments(&[
+            "--ssh-identity",
+            "/keys/id",
+            "--ssh-jump",
+            "jump",
+        ]))
+        .unwrap()
+        .unwrap();
+        let target = super::ssh_target(&options, "ssh://dev@box:2200").unwrap();
+        assert_eq!(target.port, Some(2200));
+        assert_eq!(target.identity_file.unwrap().to_str(), Some("/keys/id"));
+        assert_eq!(target.jump_host.as_deref(), Some("jump"));
+        assert!(super::ssh_target(&options, "-oBad").is_err());
     }
 
     #[test]
@@ -1890,6 +2055,7 @@ mod tests {
         assert!(help.contains("--max-frame-bytes <bytes>"));
         assert!(help.contains("LOOM_MAX_FRAME_BYTES"));
         assert!(help.contains("--serve"));
+        assert!(help.contains("--ssh-worker"));
     }
 
     #[test]
@@ -1956,6 +2122,11 @@ mod tests {
             archive_retention_force_discard: None,
             archive_retention_sub_agent: None,
             max_frame_bytes: None,
+            ssh_worker: None,
+            ssh_remove: None,
+            ssh_identity: None,
+            ssh_jump: None,
+            ssh_delete_data: false,
         };
         let run_id = start_run(&connection, session.id, &options).unwrap();
         stream_run(&connection, session.id, run_id, false).unwrap();
@@ -1991,6 +2162,11 @@ mod tests {
             archive_retention_force_discard: None,
             archive_retention_sub_agent: None,
             max_frame_bytes: None,
+            ssh_worker: None,
+            ssh_remove: None,
+            ssh_identity: None,
+            ssh_jump: None,
+            ssh_delete_data: false,
         };
 
         let result = run_m4_demo(options);
@@ -2029,6 +2205,11 @@ mod tests {
             archive_retention_force_discard: None,
             archive_retention_sub_agent: None,
             max_frame_bytes: None,
+            ssh_worker: None,
+            ssh_remove: None,
+            ssh_identity: None,
+            ssh_jump: None,
+            ssh_delete_data: false,
         };
         let run_id = start_run(&connection, session.id, &options).unwrap();
         stream_run(&connection, session.id, run_id, false).unwrap();

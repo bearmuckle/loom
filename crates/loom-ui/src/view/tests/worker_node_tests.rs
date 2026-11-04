@@ -238,6 +238,9 @@ fn duplicate_connection_attempts_are_blocked_and_url_labels_hide_credentials() {
     assert!(!worker_url_embeds_credential(
         "worker.example/ws?token=hidden"
     ));
+    // The user in an ssh URL is a login name; a token query still is a secret.
+    assert!(!worker_url_embeds_credential("ssh://dev@box.example:2222"));
+    assert!(worker_url_embeds_credential("ssh://box?token=hidden"));
     for key in [
         "token",
         "access_token",

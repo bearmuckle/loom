@@ -61,7 +61,7 @@ pub fn host_platform() -> Option<&'static str> {
     platform_label(env::consts::OS, env::consts::ARCH)
 }
 
-fn platform_label(os: &str, arch: &str) -> Option<&'static str> {
+pub fn platform_label(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
         ("linux", "x86_64") => Some("linux-x86_64"),
         ("linux", "aarch64") => Some("linux-aarch64"),
@@ -509,7 +509,7 @@ impl<'a> ServerResolver<'a> {
 
     /// Finds the release to install: the preferred tag when it has a release,
     /// otherwise the latest one.
-    fn release(&self) -> Result<ReleaseInfo> {
+    pub fn release(&self) -> Result<ReleaseInfo> {
         if let Some(tag) = self.preferred_tag.as_deref() {
             if let Some(release) = self.source.release(Some(tag))? {
                 return Ok(release);
@@ -543,6 +543,18 @@ impl<'a> ServerResolver<'a> {
             log::info!("using cached local worker binary '{}'", path.display());
             return Ok(path);
         }
+        let (archive, kind) = self.fetch_verified(&release, platform)?;
+        self.install(tag, &archive, kind)
+    }
+
+    /// Downloads the `loom-server` archive of `release` for `platform` and
+    /// checks it against the release's `SHA256SUMS`.
+    pub fn fetch_verified(
+        &self,
+        release: &ReleaseInfo,
+        platform: &str,
+    ) -> Result<(Vec<u8>, ArchiveKind)> {
+        let tag = release.tag_name.as_str();
         let (name, kind) = asset_name(tag, platform);
         let asset = release.asset(&name).ok_or_else(|| {
             LoomError::new(
@@ -563,7 +575,7 @@ impl<'a> ServerResolver<'a> {
         let sums = parse_sha256sums(&String::from_utf8_lossy(&sums));
         let archive = self.source.download(&asset.browser_download_url)?;
         verify_checksum(&sums, &name, &archive)?;
-        self.install(tag, &archive, kind)
+        Ok((archive, kind))
     }
 
     /// Extracts into a private staging directory and renames it into place, so
@@ -779,7 +791,7 @@ fn stop_with_parent(command: &mut Command) {
 #[cfg(not(target_os = "linux"))]
 fn stop_with_parent(_: &mut Command) {}
 
-fn free_loopback_port() -> Result<u16> {
+pub(crate) fn free_loopback_port() -> Result<u16> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .map_err(|error| internal(format!("could not reserve a loopback port: {error}")))?;
     listener

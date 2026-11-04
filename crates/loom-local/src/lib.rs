@@ -20,6 +20,7 @@ use loom_model::{CredentialRef, GITHUB_COPILOT_DEFAULT_MODEL, ModelId};
 use sha2::{Digest, Sha256};
 
 mod connection;
+pub mod ssh;
 mod transport;
 pub mod worker;
 

@@ -1884,7 +1884,8 @@ impl LoomView {
                     )
                     .child(div().text_xs().text_color(rgb(0x64748b)).child(
                         "Use: ws://host:port/ws [access token] · Leave the token empty to sign in \
-                         with GitHub. URLs are shared; access tokens are not",
+                         with GitHub. Or ssh://user@host to install and connect a worker over \
+                         SSH. URLs are shared; access tokens are not",
                     ))
                     .child(self.render_worker_sign_in_row(cx))
                     .into_any_element()
