@@ -1672,7 +1672,13 @@ impl LoomView {
                         &remote_options,
                         &identity_key,
                     )
-                    .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
+                    .map_err(|error| {
+                        (
+                            transport_failure_stage(&connect_url),
+                            error,
+                            false,
+                        )
+                    })?;
                     let negotiation = match negotiate(&connection) {
                         Ok(negotiation) => negotiation,
                         Err(error) => {

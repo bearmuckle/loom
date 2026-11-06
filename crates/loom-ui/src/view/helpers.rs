@@ -2973,12 +2973,39 @@ pub(crate) fn is_redundant_completion_summary(summary: &str) -> bool {
     summary.starts_with("Completed task:")
 }
 
+/// The stage a failed transport belongs to.
+///
+/// An SSH worker fails while Loom provisions the host or opens the tunnel, not
+/// while it opens a WebSocket, so the reason `ssh` gave is reported instead of
+/// the WebSocket-oriented wording.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn transport_failure_stage(url: &str) -> WorkerConnectionStage {
+    if crate::ssh_worker::is_ssh_url(url) {
+        WorkerConnectionStage::SshProvision
+    } else {
+        WorkerConnectionStage::Transport
+    }
+}
+
 pub(crate) fn worker_connection_failure_detail(
     stage: WorkerConnectionStage,
     error: &LoomError,
     secret: Option<&str>,
 ) -> String {
     let lower_message = error.message.to_ascii_lowercase();
+    if stage == WorkerConnectionStage::SshProvision {
+        // `loom-local` already says which step failed, why, and what to do
+        // about it; keep that instead of rewriting it as a WebSocket problem.
+        let detail = redact_secret(&error.message, secret.unwrap_or_default());
+        return format!(
+            "SSH worker setup failed: {}",
+            detail
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(240)
+                .collect::<String>()
+        );
+    }
     if stage == WorkerConnectionStage::CredentialSave {
         let detail = redact_secret(&error.message, secret.unwrap_or_default());
         return format!(
@@ -3071,7 +3098,9 @@ pub(crate) fn worker_connection_failure_detail(
             "Protocol negotiation succeeded, but the worker status request failed ({}). Check that a compatible Loom worker is running.",
             error.code
         ),
-        WorkerConnectionStage::CredentialRead | WorkerConnectionStage::InputValidation => unreachable!(),
+        WorkerConnectionStage::CredentialRead
+        | WorkerConnectionStage::InputValidation
+        | WorkerConnectionStage::SshProvision => unreachable!(),
         WorkerConnectionStage::CredentialSave | WorkerConnectionStage::BootstrapSave => {
             unreachable!()
         }

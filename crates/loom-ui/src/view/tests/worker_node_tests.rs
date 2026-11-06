@@ -1,3 +1,5 @@
+#[cfg(not(target_family = "wasm"))]
+use super::transport_failure_stage;
 use super::{
     ACTIVE_BACKEND_NODE_ENTRY_ID, SessionSourceChoice, SessionSourceDialogPurpose,
     WorkerConnectionStage, WorkerConnectionState, WorkerNodeEntry, adjusted_cpu_pulse_threshold,
@@ -169,6 +171,41 @@ fn connection_error_details_are_actionable_and_do_not_echo_tokens() {
         assert!(bootstrap_stage.contains("could not open its workspace"));
         assert!(!bootstrap_stage.contains("secret"));
     }
+}
+
+/// An SSH worker fails while Loom provisions the host or opens the tunnel, so
+/// the reason `ssh` printed reaches the settings pane instead of the
+/// WebSocket-oriented copy. `Connection refused` must not be rewritten as a
+/// worker that is not running: on this path it is an unreachable SSH host.
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn ssh_worker_failures_report_the_ssh_reason() {
+    assert_eq!(
+        transport_failure_stage("ssh://bjorn@localhost"),
+        WorkerConnectionStage::SshProvision
+    );
+    assert_eq!(
+        transport_failure_stage("wss://worker.example/ws"),
+        WorkerConnectionStage::Transport
+    );
+    let error = LoomError::new(
+        ErrorCode::ProviderUnavailable,
+        "Probing the host on bjorn@localhost failed: bjorn@localhost is not reachable over SSH \
+         (ssh: connect to host localhost port 22: Connection refused)",
+        false,
+    );
+    let detail = worker_connection_failure_detail(
+        transport_failure_stage("ssh://bjorn@localhost"),
+        &error,
+        None,
+    );
+    assert!(detail.contains("SSH worker setup failed"), "{detail}");
+    assert!(
+        detail.contains("bjorn@localhost is not reachable over SSH"),
+        "{detail}"
+    );
+    assert!(!detail.contains("server is running"), "{detail}");
+    assert!(!detail.contains("WebSocket"), "{detail}");
 }
 
 /// The status banner's connectivity copy is the worker-connection detail the

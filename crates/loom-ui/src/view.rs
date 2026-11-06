@@ -481,6 +481,8 @@ pub(crate) enum WorkerConnectionStage {
     Bootstrap,
     InputValidation,
     Transport,
+    /// Provisioning the host or opening the tunnel of an `ssh://` worker.
+    SshProvision,
     Negotiation,
     Status,
     CredentialRead,
