@@ -190,10 +190,9 @@ impl Outcome {
 /// `retention get` ask for the worker-status read, `providers list` and
 /// `models list` for the provider catalog, `ls` and `get` for the session read,
 /// and `events`/`peek` for event subscription. Only `run`, `retention set`,
-/// `providers set-key`,
-/// and `delete` request what their mutations require, so a worker that does
-/// not offer session creation can still be inspected and a scoped token sees
-/// the smallest negotiable set.
+/// `providers set-key`, and `delete` request what their mutations require, so a
+/// worker that does not offer session creation can still be inspected and a
+/// scoped token sees the smallest negotiable set.
 pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
     let mut capabilities = vec![Capability::JsonProtocol];
     match verb {

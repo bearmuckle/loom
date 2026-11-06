@@ -74,11 +74,11 @@
 //! unnegotiated connection. `node`, `whoami`, `ls`, `get`, `events`, `peek`,
 //! `retention get`, `providers list`, `models list`, and every `project` read
 //! are the read-only verbs: they send nothing that mutates and negotiate only
-//! the capabilities
-//! their reads need, so a read-only-scoped token can run them. `retention set`,
-//! `providers set-key`, and `delete` are operator-level mutations: a token
-//! without `configure_archive_retention`, `configure_providers`, or
-//! `delete_agent_session` is refused at negotiation with exit `3`.
+//! the capabilities their reads need, so a read-only-scoped token can run them.
+//! `retention set`, `providers set-key`, and `delete` are operator-level
+//! mutations: a token without `configure_archive_retention`,
+//! `configure_providers`, or `delete_agent_session` is refused at negotiation
+//! with exit `3`.
 //!
 //! `session archive`, `session delete` (and its `delete` alias), `project
 //! archive`, `project delete`, and `project worktree cleanup` are the
