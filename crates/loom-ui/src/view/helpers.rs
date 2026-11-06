@@ -366,13 +366,56 @@ pub(crate) fn format_worker_node_resources(resources: &WorkerNodeResources) -> S
     )
 }
 
-pub(crate) fn worker_node_display_name(node: &WorkerNodeEntry) -> String {
-    let role = if node.is_local {
-        "Local backend"
-    } else {
-        "External worker"
+/// The pane's one-line summary: live usage and free disk, without the core
+/// count and totals the settings pane already spells out.
+pub(crate) fn format_worker_node_resources_compact(resources: &WorkerNodeResources) -> String {
+    format!(
+        "CPU {} · RAM {} · {} free",
+        format_percentage(resources.cpu_usage_percent),
+        format_percentage(resources.memory_usage_percent),
+        format_bytes_compact(resources.disk_available_bytes),
+    )
+}
+
+/// Bytes rounded for a narrow summary line.
+fn format_bytes_compact(value: Option<u64>) -> String {
+    let Some(value) = value else {
+        return "n/a".to_owned();
     };
-    format!("{role} · {}", node.status.name)
+    let (value, suffix) = if value >= 1 << 30 {
+        (value as f64 / (1 << 30) as f64, "GiB")
+    } else if value >= 1 << 20 {
+        (value as f64 / (1 << 20) as f64, "MiB")
+    } else {
+        (value as f64 / (1 << 10) as f64, "KiB")
+    };
+    if value >= 10.0 {
+        format!("{value:.0} {suffix}")
+    } else {
+        format!("{value:.1} {suffix}")
+    }
+}
+
+pub(crate) fn worker_node_display_name(node: &WorkerNodeEntry) -> String {
+    if node.is_local {
+        // The worker on this machine needs no identity line: its address and
+        // node id are noise beside every project it owns.
+        return "This machine".to_owned();
+    }
+    short_worker_name(&node.status.name)
+}
+
+/// Drops the generated ` · <8 hex>` node id from a derived worker name, so a
+/// derived `hostname · 1a2b3c4d` reads as `hostname`. An operator-set name is
+/// returned unchanged.
+fn short_worker_name(name: &str) -> String {
+    if let Some((host, id)) = name.rsplit_once(" · ")
+        && id.len() == 8
+        && id.chars().all(|character| character.is_ascii_hexdigit())
+    {
+        return host.to_owned();
+    }
+    name.to_owned()
 }
 
 /// The workspace a worker creates projects in and stores settings in. A

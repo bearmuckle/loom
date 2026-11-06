@@ -1800,6 +1800,14 @@ impl LoomView {
                                         .text_color(rgb(0x8f98a6))
                                         .child(format_worker_node_resources(resources)),
                                 )
+                                .child(
+                                    div()
+                                        .id(format!("worker-node-identity-{id}"))
+                                        .test_support()
+                                        .text_xs()
+                                        .text_color(rgb(0x64748b))
+                                        .child(format!("Reported as {}", node.status.name)),
+                                )
                                 .when_some(node.connection_detail.as_deref(), |element, detail| {
                                     element.child(
                                         div()

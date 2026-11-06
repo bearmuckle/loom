@@ -777,7 +777,7 @@ impl LoomView {
         } else if let Some(node) = node {
             if online {
                 (
-                    format_worker_node_resources(&node.status.resources),
+                    format_worker_node_resources_compact(&node.status.resources),
                     rgb(0x64748b),
                 )
             } else {
