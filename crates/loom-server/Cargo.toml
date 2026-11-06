@@ -21,6 +21,7 @@ loom-build.workspace = true
 loom-agent.workspace = true
 loom-context.workspace = true
 loom-core.workspace = true
+loom-release.workspace = true
 loom-model.workspace = true
 loom-protocol.workspace = true
 loom-providers.workspace = true
@@ -48,3 +49,6 @@ subtle.workspace = true
 url.workspace = true
 reqwest.workspace = true
 sysinfo.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

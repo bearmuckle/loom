@@ -1,6 +1,14 @@
 use super::*;
 
 impl InProcessBackend {
+    /// How many agent runs are queued or executing right now.
+    ///
+    /// A self-update waits for this to reach zero, so a restart never
+    /// interrupts work that is still in flight.
+    pub fn active_runs(&self) -> usize {
+        self.run_executor.in_flight()
+    }
+
     pub fn connect(self: &Arc<Self>) -> InProcessConnection {
         InProcessConnection {
             backend: Arc::clone(self),

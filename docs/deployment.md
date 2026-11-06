@@ -36,6 +36,27 @@ environment.
 - The client remembers the worker it set up, including a remote worker's URL
   and token, and reconnects on later launches. `--remote` overrides that.
 
+## Worker auto-update
+
+A worker running from a Loom-managed install
+(`<state-dir>/server/<tag>/loom-server`) updates itself from stable releases:
+
+- It checks shortly after start and then every six hours. The intervals are
+  `LOOM_UPDATE_INITIAL_SECS` and `LOOM_UPDATE_INTERVAL_SECS` (the period has a
+  60 second floor).
+- Only a stable release newer than the running one is considered. The archive
+  is verified against the release's `SHA256SUMS` before it is installed beside
+  the running version.
+- The switch waits until no agent run is queued or executing for three
+  consecutive ten-second samples, so work is not interrupted.
+- Under a systemd user unit, `ExecStart` is rewritten to the new tag and the
+  unit is restarted with `--no-block`; the worker's SIGTERM path stops it
+  cleanly. A detached worker starts the new binary with `--restart-after
+  <pid>`, waits for the old process to exit, and is recorded in the pidfile.
+- `--no-auto-update` or `LOOM_NO_AUTO_UPDATE=1` disables all of it. A container,
+  a development build, and a server started from an arbitrary path never
+  replace themselves; update those through their image or package.
+
 A download reaches `api.github.com` and GitHub's release asset hosts. A client
 installed from an archive, AppImage, or `.deb` may ship `loom-server` next to
 itself, but the setup install still puts its own copy under the state

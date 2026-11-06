@@ -42,7 +42,9 @@ The first launch shows a worker setup screen. "Install a worker on this
 machine" downloads the latest `loom-server` release and runs it as a user
 service that also starts at boot; the same screen connects to an existing
 worker by URL or `ssh://user@host`. Later launches reconnect to the worker you
-chose, and `--remote URL` overrides it.
+chose, and `--remote URL` overrides it. An installed worker updates itself from
+a newer stable release when no agent run is active; `--no-auto-update` disables
+that.
 
 For browser development, run `./scripts/dev-wasm.sh`. It needs Trunk and the
 `wasm32-unknown-unknown` Rust target, serves both services on loopback, and puts

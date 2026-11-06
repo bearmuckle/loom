@@ -73,6 +73,12 @@ cannot be reached. `--remote` still overrides the remembered worker. A worker
 reached from the setup form is ordinary: `ssh://user@host` provisions one over
 SSH, and `ws://`/`wss://` reaches one that already runs.
 
+A worker running from that install layout updates itself: `loom-server` checks
+for a newer stable release, verifies and installs it beside the running version,
+and restarts into it once no agent run is active (rewriting its systemd user
+unit or starting a replacement after a detached process exits). Containers and
+servers started from arbitrary paths never replace themselves.
+
 Backend requests are submitted to a single connection worker thread and
 awaited on a background task, so no UI handler blocks on backend latency. The
 startup bootstrap (connect, negotiate, first session load) is deliberately
@@ -160,6 +166,9 @@ Suggested backend boundaries:
   transport, and the worker installer (release resolution, checksum-verified
   download, local service install, and the SSH provisioner). It has no normal
   dependency on any backend crate and never starts a backend itself.
+- `loom-release`: the published `loom-server` release plumbing shared by the
+  client installer and the worker's self-update: asset naming, release lookup,
+  `SHA256SUMS` verification, and archive extraction.
 - `loom-shell`: local server startup, diagnostics, and administration (the `loom` binary).
 - `loom-cli`: the headless protocol client; it embeds no backend.
 

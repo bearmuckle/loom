@@ -4669,6 +4669,7 @@ dependencies = [
  "loom-core",
  "loom-model",
  "loom-protocol",
+ "loom-release",
  "loom-server",
  "reqwest",
  "rustls",
@@ -4745,12 +4746,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-release"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "log",
+ "loom-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tar",
+ "tokio",
+ "uuid",
+ "zip",
+]
+
+[[package]]
 name = "loom-server"
 version = "0.1.0"
 dependencies = [
  "axum",
  "env_logger",
  "futures-util",
+ "libc",
  "log",
  "loom-agent",
  "loom-build",
@@ -4761,6 +4780,7 @@ dependencies = [
  "loom-process",
  "loom-protocol",
  "loom-providers",
+ "loom-release",
  "loom-session",
  "loom-sessionfs",
  "loom-tools",

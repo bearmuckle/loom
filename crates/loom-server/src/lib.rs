@@ -94,6 +94,7 @@ mod run_executor;
 mod run_handle;
 mod serve;
 mod services;
+pub mod update;
 mod util;
 
 use activity_detail::*;

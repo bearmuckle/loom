@@ -1,0 +1,22 @@
+[package]
+name = "loom-release"
+description = "Verified loom-server release lookup, download, and extraction."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+loom-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+sha2.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+flate2.workspace = true
+tar.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

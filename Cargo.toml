@@ -2,6 +2,7 @@
 members = [
     "crates/loom-build",
     "crates/loom-core",
+    "crates/loom-release",
     "crates/loom-tools",
     "crates/loom-sessionfs",
     "crates/loom-vcs",
@@ -39,6 +40,7 @@ version = "0.1.0"
 [workspace.dependencies]
 loom-build = { path = "crates/loom-build" }
 loom-core = { path = "crates/loom-core" }
+loom-release = { path = "crates/loom-release" }
 loom-tools = { path = "crates/loom-tools" }
 loom-sessionfs = { path = "crates/loom-sessionfs" }
 loom-vcs = { path = "crates/loom-vcs" }

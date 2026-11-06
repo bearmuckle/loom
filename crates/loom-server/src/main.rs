@@ -95,6 +95,11 @@ struct ServerOptions {
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     allow_insecure_remote: bool,
+    /// Whether this worker updates itself when a newer stable release exists.
+    auto_update: bool,
+    /// Internal: wait for this process id to exit before serving, so a
+    /// detached update starts its replacement without racing for the port.
+    restart_after: Option<u32>,
     /// GitHub logins allowed to sign in to this worker. Empty allows every
     /// GitHub account, which starts with no session grant.
     allow_github_login: Vec<String>,
@@ -125,6 +130,8 @@ impl Default for ServerOptions {
             tls_cert: None,
             tls_key: None,
             allow_insecure_remote: false,
+            auto_update: true,
+            restart_after: None,
             allow_github_login: Vec::new(),
             no_github_sign_in: false,
             github_oauth_client_id: None,
@@ -278,6 +285,11 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
                 options.tls_key = Some(PathBuf::from(required_value(&mut args, "--tls-key")?));
             }
             "--allow-insecure-remote" => options.allow_insecure_remote = true,
+            "--no-auto-update" => options.auto_update = false,
+            "--restart-after" => {
+                options.restart_after =
+                    Some(parse_pid(required_value(&mut args, "--restart-after")?)?);
+            }
             "--no-github-sign-in" => options.no_github_sign_in = true,
             "--allow-github-login" => options
                 .allow_github_login
@@ -330,6 +342,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
             value if value.starts_with("--tls-key=") => {
                 options.tls_key = Some(PathBuf::from(&value["--tls-key=".len()..]));
             }
+            value if value.starts_with("--restart-after=") => {
+                options.restart_after =
+                    Some(parse_pid(value["--restart-after=".len()..].to_owned())?);
+            }
             value if value.starts_with("--allow-github-login=") => {
                 options
                     .allow_github_login
@@ -370,6 +386,12 @@ fn parse_bind(value: String) -> Result<SocketAddr, LoomError> {
     })
 }
 
+fn parse_pid(value: String) -> Result<u32, LoomError> {
+    value.trim().parse().map_err(|error| {
+        LoomError::invalid_request(format!("--restart-after must be a process id: {error}"))
+    })
+}
+
 /// Resolves the optional TLS material. `--tls-cert` and `--tls-key` only mean
 /// something together, so supplying one without the other is an error rather
 /// than a silently plaintext listener.
@@ -397,7 +419,7 @@ fn help_text() -> String {
          [--archive-retention-force-discard <bool>] \
          [--max-frame-bytes <bytes>] \
          [--tls-cert <pem> --tls-key <pem>] \
-         [--allow-insecure-remote] [--diagnostics] \
+         [--allow-insecure-remote] [--no-auto-update] [--diagnostics] \
          [--allow-github-login <login> ...] [--no-github-sign-in] \
          [--github-oauth-client-id <id>] [--providers configured|demo]\n\
          \n\
@@ -431,6 +453,7 @@ fn help_text() -> String {
          \x20 --tls-key <pem>       PEM private key matching --tls-cert\n\
          \x20 --allow-insecure-remote\n\
          \x20                        allow a plaintext ws:// bind beyond loopback\n\
+         \x20 --no-auto-update      never replace this worker with a newer stable release\n\
          \x20 --allow-github-login <login>\n\
          \x20                        restrict sign-in to this GitHub login; repeat for each \
          person (default: any GitHub account may sign in, starting with no session access)\n\
@@ -470,6 +493,13 @@ fn help_text() -> String {
          \n\
          A bind address that is not loopback needs TLS; --allow-insecure-remote accepts \
          the risk of sending the bearer token and all traffic in plaintext instead.\n\
+         \n\
+         A worker running from a Loom-managed install \
+         (<state-dir>/server/<tag>/loom-server) checks for a newer stable release every six \
+         hours and, once it is downloaded and verified against its SHA256SUMS, waits until no \
+         agent run is active before restarting into it. --no-auto-update or \
+         LOOM_NO_AUTO_UPDATE disables that; a container, a development build, and a server \
+         started from an arbitrary path never update themselves.\n\
          \n\
          --diagnostics prints where agent commands would execute, as which account, which \
          state a start would use, and the intended egress policy, without printing the \
@@ -618,6 +648,13 @@ async fn serve_in(
     shutdown: impl Future<Output = Result<(), LoomError>>,
     reopen: impl FnOnce(Arc<InProcessBackend>, Option<PathBuf>) -> FailStopReopen,
 ) -> Result<(), LoomError> {
+    if let Some(pid) = options.restart_after {
+        // A detached update starts its replacement before this process exits.
+        // Waiting here keeps the replacement from racing for the database and
+        // the port.
+        log::info!("waiting for the previous worker process {pid} to exit");
+        loom_server::update::wait_for_pid_exit(pid);
+    }
     // The node name is validated before preparation, which can wipe an
     // incompatible database under `--reset-state` and generate a token file, so
     // a bad value fails the start without changing state.
@@ -641,6 +678,14 @@ async fn serve_in(
     apply_startup_archive_retention(&backend, instance_options.archive_retention)?;
     sweep_archive_retention_at_startup(&backend);
     let server = start(&options, Arc::clone(&backend), &instance).await?;
+    // Starts the periodic stable-release check when this process runs from a
+    // Loom-managed install. A dev build, a container, and a standalone path
+    // return immediately.
+    let _auto_update = loom_server::update::spawn(
+        Arc::clone(&backend),
+        options.auto_update,
+        loom_server::update::UpdateOptions::from_environment(),
+    );
     let sweeps =
         run_archive_retention_sweeps(Arc::clone(&backend), ARCHIVE_RETENTION_SWEEP_INTERVAL);
     // A latched persistence fail-stop never clears itself, and the process would
@@ -806,6 +851,14 @@ mod tests {
         assert_eq!(defaults.tls_cert, None);
         assert_eq!(defaults.tls_key, None);
         assert!(!defaults.allow_insecure_remote);
+        assert!(defaults.auto_update);
+        assert_eq!(defaults.restart_after, None);
+        let opted_out = serve_options(&["--no-auto-update"]);
+        assert!(!opted_out.auto_update);
+        let restarted = serve_options(&["--restart-after", "4242"]);
+        assert_eq!(restarted.restart_after, Some(4242));
+        let restarted_equals = serve_options(&["--restart-after=4243"]);
+        assert_eq!(restarted_equals.restart_after, Some(4243));
         assert_eq!(defaults.archive_retention, None);
         assert_eq!(defaults.archive_retention_force_discard, None);
         // GitHub sign-in is on by default and lets any GitHub account in; the
@@ -939,6 +992,10 @@ mod tests {
             help.contains("configured (default)"),
             "the option list names the default: {help}"
         );
+        assert!(
+            help.contains("--no-auto-update"),
+            "the help names how to opt out: {help}"
+        );
     }
 
     #[test]
@@ -957,6 +1014,7 @@ mod tests {
             "--allow-github-login",
             "--github-oauth-client-id",
             "--providers",
+            "--restart-after",
         ] {
             let error = parse_error(&[flag]);
             assert!(

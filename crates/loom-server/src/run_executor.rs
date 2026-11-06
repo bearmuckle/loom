@@ -125,6 +125,9 @@ impl RunTask {
 pub(crate) struct RunExecutor {
     handle: Handle,
     permits: std::sync::Arc<Semaphore>,
+    /// Runs that have been admitted or are queued, so a restart can wait for
+    /// an idle worker instead of interrupting one.
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RunExecutor {
@@ -136,7 +139,13 @@ impl RunExecutor {
         Self {
             handle: runtime_handle(),
             permits: std::sync::Arc::new(Semaphore::new(max_concurrent_runs.max(1))),
+            in_flight: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// How many runs are queued or executing right now.
+    pub(crate) fn in_flight(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Schedules a blocking run body once a concurrency slot is free.
@@ -158,6 +167,8 @@ impl RunExecutor {
         let permits = std::sync::Arc::clone(&self.permits);
         let completion = std::sync::Arc::new(RunCompletion::default());
         let task_completion = std::sync::Arc::clone(&completion);
+        let in_flight = std::sync::Arc::clone(&self.in_flight);
+        in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let name = name.into();
         let task_name = name.clone();
         self.handle.spawn(async move {
@@ -192,6 +203,7 @@ impl RunExecutor {
                 }
             }
             task_completion.finish();
+            in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         });
         RunTask { completion }
     }
