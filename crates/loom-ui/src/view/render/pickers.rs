@@ -316,7 +316,8 @@ impl LoomView {
                                 match &existing {
                                     Some(worker) => format!(
                                         "Loom could not reach the worker you set up at {}. It may \
-                                         still be starting; retry, or reinstall it.",
+                                         still be starting, so retry first; reinstalling restarts \
+                                         the worker and stops its current work.",
                                         worker.url
                                     ),
                                     None => "Loom's client needs a worker to run sessions. \
@@ -342,10 +343,11 @@ impl LoomView {
                             .child(
                                 Button::new("worker-setup-install")
                                     .label(if existing.is_some() {
-                                        "Reinstall or update the worker"
+                                        "Reinstall or update (restarts the worker)"
                                     } else {
                                         "Install a worker on this machine"
                                     })
+                                    .when(existing.is_some(), |button| button.ghost())
                                     .small()
                                     .disabled(busy)
                                     .when(layout.phone, |button| button.h(layout.control_size()))

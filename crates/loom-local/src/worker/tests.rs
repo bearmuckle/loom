@@ -157,7 +157,10 @@ fn platforms_and_asset_names_match_the_release_workflow() {
         )
     );
     assert_eq!(parse_tag("v0.11.0"), Some((0, 11, 0)));
-    assert_eq!(parse_tag("v1.2.3-rc.1"), Some((1, 2, 3)));
+    // A pre-release or build-suffixed tag is not a stable release, so it never
+    // becomes a self-update target.
+    assert_eq!(parse_tag("v1.2.3-rc.1"), None);
+    assert_eq!(parse_tag("v1.2.3+build"), None);
     assert_eq!(parse_tag("0.1.0"), None);
     assert_eq!(parse_tag("vmain"), None);
 }

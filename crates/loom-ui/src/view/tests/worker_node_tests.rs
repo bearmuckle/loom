@@ -230,28 +230,20 @@ fn ssh_worker_failures_report_the_ssh_reason() {
 /// places, and the internal code never reaches the headline.
 #[test]
 fn connectivity_copy_reuses_the_worker_connection_vocabulary_without_codes() {
-    for (code, message) in [
-        (
-            ErrorCode::DeadlineExceeded,
-            "worker did not answer within 60s; it may be stalled or unreachable",
-        ),
-        (ErrorCode::ProviderUnavailable, "connection refused"),
-    ] {
-        let error = LoomError::new(code, message, true);
-        let failure = classify_connectivity_failure(&error).expect("a transport failure");
-        let detail = failure.detail(&error);
-        assert!(
-            detail.starts_with(&worker_connection_failure_detail(
-                WorkerConnectionStage::Transport,
-                &error,
-                None
-            )),
-            "the banner invented its own wording: {detail}"
-        );
-        assert!(detail.ends_with("Loom is reconnecting automatically."));
-        assert!(!detail.contains(&code.to_string()));
-        assert!(!detail.contains(message));
-    }
+    let error = LoomError::new(ErrorCode::ProviderUnavailable, "connection refused", true);
+    let failure = classify_connectivity_failure(&error).expect("a transport failure");
+    let detail = failure.detail(&error);
+    assert!(
+        detail.starts_with(&worker_connection_failure_detail(
+            WorkerConnectionStage::Transport,
+            &error,
+            None
+        )),
+        "the banner invented its own wording: {detail}"
+    );
+    assert!(detail.ends_with("Loom is reconnecting automatically."));
+    assert!(!detail.contains(&error.code.to_string()));
+    assert!(!detail.contains("connection refused"));
 }
 
 #[test]

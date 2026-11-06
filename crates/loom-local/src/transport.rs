@@ -27,7 +27,7 @@ pub const MAX_FRAME_BYTES_FLAG: &str = "--max-frame-bytes";
 /// Environment variable that sets the frame-size limit when the flag is absent.
 pub const MAX_FRAME_BYTES_ENV: &str = "LOOM_MAX_FRAME_BYTES";
 /// How long the client waits for the next frame while awaiting a response.
-const CLIENT_FRAME_DEADLINE: Duration = Duration::from_secs(30);
+const CLIENT_FRAME_DEADLINE: Duration = Duration::from_secs(60);
 /// Most events buffered while a request is in flight.
 const CLIENT_EVENT_BUFFER_CAPACITY: usize = 1024;
 

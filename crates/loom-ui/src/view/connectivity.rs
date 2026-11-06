@@ -22,8 +22,6 @@ pub(crate) enum ConnectivityFailure {
     /// The transport is closed: a dropped socket, a reset, or a single-use
     /// connection that already failed.
     ConnectionLost,
-    /// The worker did not answer in time.
-    TimedOut,
     /// The worker refused or could not accept the connection.
     Unreachable,
 }
@@ -62,7 +60,10 @@ pub(crate) fn classify_connectivity_failure(error: &LoomError) -> Option<Connect
     let message = error.message.to_ascii_lowercase();
     let mentions = |hints: &[&str]| hints.iter().any(|hint| message.contains(hint));
     match error.code {
-        ErrorCode::DeadlineExceeded => Some(ConnectivityFailure::TimedOut),
+        // A request deadline is not a lost connection: the socket is still
+        // open, the worker is merely slow, and the next poll may answer. Treat
+        // only transport-level failures as connectivity, so one slow response
+        // cannot start a reconnect (or an install) cycle.
         ErrorCode::RequestCancelled if mentions(TRANSPORT_MESSAGE_HINTS) => {
             Some(ConnectivityFailure::ConnectionLost)
         }
@@ -78,7 +79,6 @@ impl ConnectivityFailure {
     pub(crate) fn headline(self) -> &'static str {
         match self {
             Self::ConnectionLost => "Worker connection lost",
-            Self::TimedOut => "Worker is not responding",
             Self::Unreachable => "Worker is unreachable",
         }
     }
@@ -86,15 +86,15 @@ impl ConnectivityFailure {
     /// The plain-language body: what happened and what the client is doing
     /// about it.
     ///
-    /// Timeouts and refused connections reuse the worker-connection vocabulary
-    /// the settings pane already shows, so the same failure reads the same way
-    /// wherever it appears.
+    /// Refused or unreachable connections reuse the worker-connection
+    /// vocabulary the settings pane already shows, so the same failure reads
+    /// the same way wherever it appears.
     pub(crate) fn detail(self, error: &LoomError) -> String {
         match self {
             Self::ConnectionLost => format!(
                 "{CONNECTION_LOST_COPY} Nothing needs to be done unless the worker has stopped."
             ),
-            Self::TimedOut | Self::Unreachable => format!(
+            Self::Unreachable => format!(
                 "{} Loom is reconnecting automatically.",
                 worker_connection_failure_detail(WorkerConnectionStage::Transport, error, None)
             ),

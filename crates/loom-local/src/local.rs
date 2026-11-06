@@ -223,7 +223,7 @@ fn install_and_start_at(
         log::info!("local worker {tag} is already running");
         true
     } else {
-        let supervised = start_service(paths, &binary, &tag, options.port)?;
+        let supervised = start_service(paths, &binary, &tag, options.port, true)?;
         progress(InstallStep::Health);
         wait_until_healthy(paths, options.port, HEALTH_TIMEOUT)?;
         supervised
@@ -276,7 +276,28 @@ pub fn ensure_running() -> Result<Option<InstalledWorker>> {
             supervised: true,
         }));
     }
-    let supervised = start_service(&paths, &binary, &tag, DEFAULT_PORT)?;
+    // A worker busy with a build can miss a health probe. Give it a few seconds
+    // instead of restarting a healthy worker, which would kill the work it is
+    // doing.
+    for _ in 0..3 {
+        thread::sleep(Duration::from_secs(2));
+        if worker_is_running(DEFAULT_PORT) {
+            return Ok(Some(InstalledWorker {
+                url: websocket_url(DEFAULT_PORT),
+                token,
+                tag,
+                supervised: true,
+            }));
+        }
+    }
+    if user_systemd_available() && unit_active() {
+        return Err(LoomError::new(
+            ErrorCode::ProviderUnavailable,
+            "the installed worker is running but is not answering yet; retry shortly".to_owned(),
+            true,
+        ));
+    }
+    let supervised = start_service(&paths, &binary, &tag, DEFAULT_PORT, false)?;
     wait_until_healthy(&paths, DEFAULT_PORT, HEALTH_TIMEOUT)?;
     Ok(Some(InstalledWorker {
         url: websocket_url(DEFAULT_PORT),
@@ -535,9 +556,27 @@ fn user_systemd_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the worker unit is active, even if it is too busy to answer health.
+fn unit_active() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", SERVICE_NAME])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 /// Starts the worker as a user service when the host has one, otherwise as a
 /// detached process. The result says which one supervised it.
-fn start_service(paths: &LocalWorkerPaths, binary: &Path, tag: &str, port: u16) -> Result<bool> {
+fn start_service(
+    paths: &LocalWorkerPaths,
+    binary: &Path,
+    tag: &str,
+    port: u16,
+    restart: bool,
+) -> Result<bool> {
     if env::var_os(NO_SYSTEMD_ENV).is_none() && user_systemd_available() {
         let unit = systemd_user_dir().join(SERVICE_NAME);
         write_unit(&unit, binary, &paths.token(), &paths.persistence(), port)?;
@@ -550,11 +589,17 @@ fn start_service(paths: &LocalWorkerPaths, binary: &Path, tag: &str, port: u16) 
                 "could not enable lingering for this user; the worker starts at login, not at boot"
             );
         }
-        run_systemctl(&["restart", SERVICE_NAME]).or_else(|restart_error| {
-            // A restart that stopped the unit but could not start it is worse
-            // than an older worker: try a plain start before reporting.
-            run_systemctl(&["start", SERVICE_NAME]).map_err(|_| restart_error)
-        })?;
+        if restart {
+            run_systemctl(&["restart", SERVICE_NAME]).or_else(|restart_error| {
+                // A restart that stopped the unit but could not start it is worse
+                // than an older worker: try a plain start before reporting.
+                run_systemctl(&["start", SERVICE_NAME]).map_err(|_| restart_error)
+            })?;
+        } else {
+            // A worker that is merely busy must not be restarted: `start` is a
+            // no-op when the unit is already active.
+            run_systemctl(&["start", SERVICE_NAME])?;
+        }
         log::info!("local worker {tag} runs as {SERVICE_NAME}");
         return Ok(true);
     }

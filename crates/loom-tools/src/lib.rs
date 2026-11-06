@@ -1163,6 +1163,18 @@ impl ToolExecutor {
         {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
+            // A build or test run must not starve the worker that serves
+            // clients on the same machine, or a slow response looks like a
+            // lost connection. The whole process tree inherits the lower CPU
+            // priority.
+            // SAFETY: the closure calls only the async-signal-safe
+            // `setpriority`.
+            unsafe {
+                command.pre_exec(|| {
+                    libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+                    Ok(())
+                });
+            }
         }
         let mut child = command
             .spawn()

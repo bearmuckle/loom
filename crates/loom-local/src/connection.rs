@@ -74,7 +74,7 @@ pub struct RemoteConnection {
 /// own default request timeout, so a healthy but slow request is still answered
 /// before the client gives up; a caller with a different bound uses
 /// [`RemoteConnection::request_with_timeout`].
-pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl RemoteConnection {
     /// Connects to `url`, limiting every WebSocket frame to the limit this

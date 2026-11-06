@@ -37,10 +37,11 @@ fn transport_failures_are_classified_apart_from_operation_errors(cx: &mut TestAp
         assert_eq!(
             classify_connectivity_failure(&LoomError::new(
                 ErrorCode::DeadlineExceeded,
-                "worker did not answer within 60s; it may be stalled or unreachable",
+                "worker did not answer within 120s; it may be stalled or unreachable",
                 true,
             )),
-            Some(ConnectivityFailure::TimedOut)
+            None,
+            "a slow request is not a lost connection"
         );
         assert_eq!(
             classify_connectivity_failure(&LoomError::new(
@@ -99,21 +100,8 @@ fn connectivity_copy_is_plain_language_and_keeps_the_raw_detail(cx: &mut TestApp
             );
         }
 
-        // The other shapes reuse the worker-connection vocabulary, which is
+        // The other shape reuses the worker-connection vocabulary, which is
         // already plain language.
-        assert_eq!(
-            ConnectivityFailure::TimedOut.headline(),
-            "Worker is not responding"
-        );
-        assert!(
-            ConnectivityFailure::TimedOut
-                .detail(&LoomError::new(
-                    ErrorCode::DeadlineExceeded,
-                    "worker did not answer within 60s",
-                    true,
-                ))
-                .contains("timed out")
-        );
         assert_eq!(
             ConnectivityFailure::Unreachable.headline(),
             "Worker is unreachable"
@@ -252,21 +240,16 @@ fn a_connectivity_failure_shows_one_plain_language_reconnecting_state(cx: &mut T
                 .is_some_and(|progress| progress.contains("Attempt 1 of 8"))
         );
 
-        // Repeated failures while the worker stays down update that one state
-        // instead of replacing it with another coded message.
+        // A later transport failure updates the same state and its counter.
         view.record_backend_error(
             "session event stream",
-            LoomError::new(
-                ErrorCode::DeadlineExceeded,
-                "worker request timed out",
-                true,
-            ),
+            LoomError::new(ErrorCode::ProviderUnavailable, "connection refused", true),
         );
         let banner = view
             .status_banner
             .as_ref()
             .expect("the notice is still shown");
-        assert_eq!(banner.heading.as_deref(), Some("Worker is not responding"));
+        assert_eq!(banner.heading.as_deref(), Some("Worker is unreachable"));
         let note_count = view
             .timeline
             .iter()
