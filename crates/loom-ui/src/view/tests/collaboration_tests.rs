@@ -851,8 +851,8 @@ fn a_remembered_identity_is_keyed_by_the_worker_not_by_its_instance_id(cx: &mut 
     let _handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
         let mut view = LoomView::new_for_test(cx.focus_handle());
         let startup_node_id = view.default_backend_node_id.clone();
-        // The startup connection stands for the managed local worker, which has
-        // no endpoint of its own.
+        // The startup connection in this test has no endpoint of its own, so
+        // the identity is keyed by the local worker's state database.
         let mut startup = connection_placeholder(
             0,
             "ws://unused".to_owned(),

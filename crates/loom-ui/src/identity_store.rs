@@ -18,8 +18,8 @@ use loom_core::ParticipantIdentity;
 ///
 /// [`loom_protocol::WorkerNodeStatus::node_id`] names one worker *process*, so
 /// it cannot key anything that has to outlive a restart. A worker is instead
-/// remembered by what a restart keeps: the address a remote worker is reached at
-/// (`Some`), or the state database the one managed local worker owns (`None`).
+/// remembered by what a restart keeps: the address it is reached at (`Some`),
+/// or the local worker's state database when a caller has no address (`None`).
 /// The address has to stay the same across restarts for the worker to keep its
 /// identity, which the stored access token already assumes.
 pub(crate) fn worker_key(endpoint: Option<&str>) -> String {
@@ -31,8 +31,8 @@ pub(crate) fn worker_key(endpoint: Option<&str>) -> String {
 
 #[cfg(not(target_family = "wasm"))]
 fn local_worker_key() -> String {
-    // Every managed worker a client starts keeps its state in this database, so
-    // the file names that worker across any number of process restarts.
+    // The local worker keeps its state in this database whatever process
+    // serves it, so the file names that worker across restarts.
     format!("local:{}", loom_local::backend_persistence_path().display())
 }
 
@@ -257,8 +257,8 @@ mod tests {
             worker_key(Some("ws://127.0.0.1:8766"))
         );
 
-        // The managed local worker is named by the state database it owns, which
-        // is never one of the remote workers' keys.
+        // A local worker with no address is named by the state database it
+        // serves, which is never one of the remote workers' keys.
         let local = worker_key(None);
         assert!(local.starts_with("local:"), "{local}");
         assert_ne!(local, worker_key(Some(address)));

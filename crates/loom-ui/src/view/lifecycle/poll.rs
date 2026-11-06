@@ -308,11 +308,11 @@ impl LoomView {
 
     /// Whether another client can add events to the open session.
     ///
-    /// Only a worker this client reached at an address serves anybody else: the
-    /// managed local worker is started for this client alone, and the demo
-    /// workspace has no worker at all. A connection waiting for a sign-in may
-    /// not read a session, and the placeholder this view holds before the first
-    /// session is listed has no stream to read, so neither is followed.
+    /// A worker reached at an address serves anybody who can reach that address,
+    /// including a worker installed on this machine, and the demo workspace has
+    /// no worker at all. A connection waiting for a sign-in may not read a
+    /// session, and the placeholder this view holds before the first session is
+    /// listed has no stream to read, so neither is followed.
     pub(crate) fn follows_shared_session(&self) -> bool {
         !self.demo_workspace
             && self.is_connected()
@@ -326,10 +326,10 @@ impl LoomView {
 
     /// Whether the active session's worker was reached at an address.
     ///
-    /// The startup worker of a native client is the managed local process, which
-    /// has no endpoint of its own, so nothing else can write to its journal. A
-    /// `--remote` endpoint and every configured worker node are servers, and
-    /// another person can act on a session there at any moment.
+    /// A worker installed on this machine is still a server: another client on
+    /// the same machine can reach it at its loopback address. A `--remote`
+    /// endpoint and every configured worker node are servers too, and another
+    /// person can act on a session there at any moment.
     pub(crate) fn active_worker_is_shared(&self) -> bool {
         let node_id = self.active_node_id();
         if node_id == self.default_backend_node_id.as_str() {

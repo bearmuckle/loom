@@ -42,38 +42,36 @@ browser support. `loom-ui` is organized into:
   `gpui-kit`'s window root, not by Loom.
 
 Native adapters (process arguments, workspace preparation, local credential
-storage, the WebSocket client transport, and the managed local worker) live in
+storage, the WebSocket client transport, and the worker installer) live in
 `loom-local`, not in the UI. Neither `loom-ui` nor `loom-local` has a normal
 dependency on a backend crate (`loom-server`, `loom-persistence`,
 `loom-providers`, `loom-vcs`, `loom-agent`, and the rest): the native client
-reaches every backend, including its own local one, through the versioned
-protocol over WebSocket. `loom-server` is only a dev-dependency, so tests can
-drive the view against an in-process backend.
+reaches every backend through the versioned protocol over WebSocket.
+`loom-server` is only a dev-dependency, so tests can drive the view against an
+in-process backend.
 
-Without `--remote`, the native client runs a **managed local worker**: a
-`loom-server` child process bound to `127.0.0.1` on a free port. `loom-local`
-resolves the executable in this order:
+The client does not start a backend of its own. On first run it shows a **setup
+wizard**; "Install a worker on this machine" uses the `loom-local` installer:
 
-1. `--server-binary` or `LOOM_SERVER_BINARY`.
-2. `loom-server` next to the client executable (release archives, the AppImage
-   and the `.deb` install it there), then on `PATH`.
-3. A cached download under `<cache>/loom/server/<tag>/`, where `<cache>` is
-   `LOOM_CACHE_DIR`, else the platform cache directory.
-4. A download from the `bearmuckle/loom` GitHub release whose tag equals the
-   client's build version, or the latest release for a development build. The
-   asset `loom-server-<tag>-<platform>.{tar.gz,zip}` is checked against the
-   release's `SHA256SUMS` and refused on a mismatch or a missing entry, then
-   extracted into a staging directory and renamed into the cache.
-5. Offline, the newest cached version.
+1. The latest `bearmuckle/loom` release is downloaded, its
+   `loom-server-<tag>-<platform>.{tar.gz,zip}` asset is checked against the
+   release's `SHA256SUMS`, and it is installed under
+   `<state-dir>/server/<tag>/`. `--server-binary`/`LOOM_SERVER_BINARY` names an
+   executable to run instead of downloading.
+2. `<state-dir>/local-worker/token` (mode `0600`) is created when absent.
+3. A systemd user unit, `loom-server.service`, starts the worker bound to
+   `127.0.0.1:8765` with `--persistence <state-dir>/state.db`, and linger is
+   enabled so it also starts at boot. Without a user systemd it runs as a
+   detached process with a pidfile, which does not survive a reboot.
+4. The client waits for `GET /health`, then connects over the same WebSocket
+   transport it uses for any other worker.
 
-The worker is started with `--bind 127.0.0.1:<port>`, a generated token passed
-through an owner-only `--token-file`, `--persistence <state-dir>/state.db` (the
-same database the client used when it embedded its backend), and
-`--reset-state` when the client was given it. The client waits for `GET
-/health`, connects over the same WebSocket transport it uses for a remote
-worker, and stops the child (SIGTERM, then a kill) when it exits. GitHub device
-login runs on the worker through the `StartGitHub*Login`/`Get*LoginStatus`
-protocol requests, the same path the browser client uses.
+The chosen worker is remembered in the client config directory: its URL, and
+for a remote worker its token in an owner-only file. Later launches connect to
+it directly, and fall back to the setup wizard with the failure shown when it
+cannot be reached. `--remote` still overrides the remembered worker. A worker
+reached from the setup form is ordinary: `ssh://user@host` provisions one over
+SSH, and `ws://`/`wss://` reaches one that already runs.
 
 Backend requests are submitted to a single connection worker thread and
 awaited on a background task, so no UI handler blocks on backend latency. The
@@ -159,9 +157,9 @@ Suggested backend boundaries:
   `services/`.
 - `loom-local`: the native launcher. It owns process arguments, workspace
   preparation, local credential storage, the native WebSocket client
-  transport, and the managed local worker (binary resolution, checksum-verified
-  download and cache, process start, health wait, and shutdown). It has no
-  normal dependency on any backend crate.
+  transport, and the worker installer (release resolution, checksum-verified
+  download, local service install, and the SSH provisioner). It has no normal
+  dependency on any backend crate and never starts a backend itself.
 - `loom-shell`: local server startup, diagnostics, and administration (the `loom` binary).
 - `loom-cli`: the headless protocol client; it embeds no backend.
 

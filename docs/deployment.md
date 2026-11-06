@@ -7,36 +7,36 @@ intended. It records what the backend and the published image do, not what a
 deployment could add on top of them. The trust boundary itself is in the
 [security and trust model](security.md).
 
-## The desktop client's local worker
+## A worker installed by the desktop client
 
-The native `loom-ui` client does not embed a backend. Without `--remote` it
-starts `loom-server` as a child process (the managed local worker), so the
-sections below apply to it too: agent commands run on the host as the desktop
-user, with the client's environment.
+The native `loom-ui` client does not embed or own a backend. On first run its
+setup wizard can install one on this machine, so the sections below apply to
+it too: agent commands run on the host as the desktop user, with the worker's
+environment.
 
-- The worker binds `127.0.0.1` on a free port; nothing listens beyond loopback.
-- Its bearer token is generated per start and written with mode `0600` to
-  `<state-dir>/local-worker/token-<client-pid>`; it is passed with
-  `--token-file`, never on the command line.
+- The worker runs from `<state-dir>/server/<tag>/loom-server`, installed from
+  the latest `bearmuckle/loom` release after its archive matches the release's
+  `SHA256SUMS`. `--server-binary`/`LOOM_SERVER_BINARY` names an executable to
+  run instead of downloading.
+- It binds `127.0.0.1:8765`; nothing listens beyond loopback.
+- Its bearer token lives in `<state-dir>/local-worker/token` (mode `0600`) and
+  is passed with `--token-file`, never on the command line.
 - Its state database is `<state-dir>/state.db` (`--persistence`), the same file
   the client used before it ran a separate worker, so existing sessions carry
-  over. `loom-ui --reset-state` is forwarded as `--reset-state`; without it an
+  over. `--reset-state` deletes it during the install; without it an
   incompatible database stops the worker and the client reports the failure.
-- The binary is, in order: `--server-binary`/`LOOM_SERVER_BINARY`; the
-  `loom-server` installed next to the client (release archives, AppImage,
-  `.deb`) or on `PATH`; a cached download under
-  `<cache>/loom/server/<tag>/` (`LOOM_CACHE_DIR` overrides `<cache>`); a
-  download from the `bearmuckle/loom` release matching the client's version, or
-  the latest release for a development build. A download is installed only
-  after its archive matches the release's `SHA256SUMS`. With no network the
-  newest cached version is used.
-- The client stops the worker with SIGTERM (then a kill after a grace period)
-  when it quits. On Linux the worker also receives SIGTERM if the client dies
-  without cleaning up.
+- On a host with a user systemd, `~/.config/systemd/user/loom-server.service`
+  supervises the worker and linger is enabled, so it starts at boot and
+  survives a reboot. The client only connects to it and never stops it.
+  Without a user systemd the worker runs as a detached process with a pidfile
+  under `<state-dir>/local-worker/`, which does not survive a reboot.
+- The client remembers the worker it set up, including a remote worker's URL
+  and token, and reconnects on later launches. `--remote` overrides that.
 
 A download reaches `api.github.com` and GitHub's release asset hosts. A client
-installed from an archive, AppImage, or `.deb` already has `loom-server` next
-to it and does not download.
+installed from an archive, AppImage, or `.deb` may ship `loom-server` next to
+itself, but the setup install still puts its own copy under the state
+directory so the service has a stable path.
 
 ## Provisioning a worker over SSH
 

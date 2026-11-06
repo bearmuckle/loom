@@ -178,6 +178,7 @@ fn reopening_a_session_with_a_concurrent_event_restores_durable_run_state(cx: &m
             false,
             Some(protocol_version),
             None,
+            true,
         )
         .unwrap();
         view.owned_backend = Some(backend);
@@ -440,6 +441,7 @@ pub(super) fn open_selected_session_view(
             false,
             Some(protocol_version),
             None,
+            true,
         )
         .unwrap();
         view.owned_backend = Some(backend);

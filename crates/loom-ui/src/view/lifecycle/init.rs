@@ -5,89 +5,123 @@ use crate::connection::resume_github_identity;
 use crate::connection::resume_github_identity_async;
 use crate::preferences::UiPreferences;
 
-/// Resolves and starts the managed `loom-server` worker that replaces the
-/// backend the client used to embed. It keeps the same shared state database,
-/// and `--reset-state` is forwarded so an incompatible database can be wiped.
+/// Resolves the workspace to open for a connection of the given kind.
+///
+/// A worker installed on this machine adopts the directory the client was
+/// started in, as the backend the client used to embed did. A worker elsewhere
+/// only adopts an explicit `--project`.
 #[cfg(not(target_family = "wasm"))]
-fn start_local_worker(options: &UiOptions) -> Result<loom_local::ManagedWorker, LoomError> {
-    let binary = loom_local::worker::resolve_server_binary(options.server_binary.clone())?;
-    let persistence = backend_persistence_path();
-    let token_file = loom_core::state_dir()
-        .join("local-worker")
-        .join(format!("token-{}", std::process::id()));
-    loom_local::ManagedWorker::start(&loom_local::ManagedWorkerOptions {
-        binary,
-        persistence,
-        reset_state: options.reset_state,
-        token_file,
-        port: None,
-    })
+fn workspace_root_for(options: &UiOptions, local_worker: bool) -> Result<PathBuf, LoomError> {
+    if local_worker {
+        return prepare_workspace(options);
+    }
+    options
+        .project
+        .clone()
+        .map(fs::canonicalize)
+        .transpose()
+        .map_err(|error| {
+            LoomError::new(
+                ErrorCode::WorkspaceAccessDenied,
+                format!("could not open repository source: {error}"),
+                false,
+            )
+        })
+        .map(|root| root.unwrap_or_default())
 }
 
 impl LoomView {
+    /// Opens the client: to `--remote`, to the worker the setup chose last
+    /// time, or on the first-run setup screen when there is neither.
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn try_new(
         options: &UiOptions,
         focus_handle: FocusHandle,
     ) -> Result<Self, LoomError> {
         info!("bootstrapping backend connection");
-        // A remote worker without a token is an unsigned connection: it is
-        // accepted as pre-login and signs in with GitHub instead.
-        let mut unsigned = false;
+        // A named workspace must exist whether or not a worker is connected
+        // yet, so the setup screen does not hide a typo in `--project`.
+        if let Some(project) = &options.project {
+            fs::canonicalize(project).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::WorkspaceAccessDenied,
+                    format!("could not open repository source: {error}"),
+                    false,
+                )
+            })?;
+        }
+        if let Some(remote_url) = &options.remote {
+            let token = options.token.clone().unwrap_or_default();
+            return Self::bootstrap(options, remote_url, &token, false, focus_handle);
+        }
+        if let Some(initial) = crate::worker_setup::load_initial_worker() {
+            info!("connecting to the initial worker '{}'", initial.url);
+            let token = crate::worker_setup::initial_worker_token(&initial);
+            match Self::bootstrap(
+                options,
+                &initial.url,
+                &token,
+                initial.local,
+                focus_handle.clone(),
+            ) {
+                Ok(view) => return Ok(view),
+                Err(error) => {
+                    log::warn!(
+                        "[loom-ui] could not reconnect to the initial worker '{}': {}",
+                        initial.url,
+                        error.message
+                    );
+                    return Ok(Self::new_setup(
+                        options,
+                        Some(worker_connection_failure_detail(
+                            transport_failure_stage(&initial.url),
+                            &error,
+                            None,
+                        )),
+                        focus_handle,
+                    ));
+                }
+            }
+        }
+        Ok(Self::new_setup(options, None, focus_handle))
+    }
+
+    /// Connects to `url`, negotiates, and builds the connected view.
+    ///
+    /// `local_worker` marks a worker installed on this machine, which adopts
+    /// the current directory and serves local folders; a worker elsewhere only
+    /// attaches an explicit `--project`.
+    #[cfg(not(target_family = "wasm"))]
+    fn bootstrap(
+        options: &UiOptions,
+        url: &str,
+        token: &str,
+        local_worker: bool,
+        focus_handle: FocusHandle,
+    ) -> Result<Self, LoomError> {
+        if worker_url_embeds_credential(url) {
+            return Err(LoomError::invalid_request(
+                "remote URL must not contain credentials; provide the access token separately",
+            ));
+        }
+        // A worker without a token is an unsigned connection: it is accepted as
+        // pre-login and signs in with GitHub instead.
+        let unsigned = token.trim().is_empty();
         // The identity is remembered under the worker's durable identity, not
         // `node_status.node_id`, which names this worker process only.
-        let identity_key = crate::identity_store::worker_key(options.remote.as_deref());
-        let (connection, workspace_root, owned_backend) = if let Some(remote_url) = &options.remote
-        {
-            info!("connecting to remote backend");
-            if worker_url_embeds_credential(remote_url) {
-                return Err(LoomError::invalid_request(
-                    "remote URL must not contain credentials; provide the access token separately",
-                ));
-            }
-            let token = options.token.clone().unwrap_or_default();
-            unsigned = token.trim().is_empty();
-            let connection = connect_remote(
-                remote_url,
-                &token,
-                &remote_connection_options(options),
-                &identity_key,
-            )?;
-            let workspace_root = options
-                .project
-                .clone()
-                .map(fs::canonicalize)
-                .transpose()
-                .map_err(|error| {
-                    LoomError::new(
-                        ErrorCode::WorkspaceAccessDenied,
-                        format!("could not open repository source: {error}"),
-                        false,
-                    )
-                })?
-                .unwrap_or_default();
-            (connection, workspace_root, None)
-        } else {
-            let workspace_root = prepare_workspace(options)?;
-            info!("using workspace '{}'", workspace_root.display());
-            let worker = start_local_worker(options)?;
-            let connection = ClientConnection::remote(
-                worker.websocket_url(),
-                worker.token().to_owned(),
-                &loom_local::RemoteConnectionOptions::default(),
-            )?;
-            (
-                connection,
-                workspace_root,
-                Some(crate::local_backend::OwnedBackend::managed(worker)),
-            )
-        };
+        let identity_key = crate::identity_store::worker_key(Some(url));
+        let workspace_root = workspace_root_for(options, local_worker)?;
+        let remote_options = remote_connection_options(options);
+        info!("connecting to worker '{url}'");
+        let connection = connect_remote(url, token, &remote_options, &identity_key)?;
         let mut remote_cleanup_guard = Some(ConnectionCleanupGuard::new(connection.clone()));
         info!("worker transport connected; negotiating protocol");
         let negotiation = negotiate(&connection)?;
         let server_protocol_version = Some(negotiation.protocol_version);
-        let backend_endpoint = options.remote.clone();
-        let remote_options = remote_connection_options(options);
+        let backend_endpoint = Some(url.to_owned());
+        let offers_sign_in = negotiation
+            .capabilities
+            .contains(loom_core::Capability::GitHubSignIn);
         let node_status = worker_node_status(&connection)?;
         let participant = current_participant(&connection)?;
         // A connection accepted without a credential cannot resume a person, so
@@ -126,10 +160,8 @@ impl LoomView {
                 WorkspaceConfig::default(),
                 server_protocol_version,
                 backend_endpoint,
-                negotiation
-                    .capabilities
-                    .contains(loom_core::Capability::GitHubSignIn),
-                options.remote.is_none(),
+                offers_sign_in,
+                local_worker,
                 false,
                 focus_handle,
             )
@@ -144,6 +176,7 @@ impl LoomView {
                 true,
                 server_protocol_version,
                 backend_endpoint,
+                local_worker,
             )?
         };
         if unsigned {
@@ -159,11 +192,239 @@ impl LoomView {
             guard.disarm();
         }
         view.remote_options = remote_options;
-        view.github_sign_in_available = negotiation
-            .capabilities
-            .contains(loom_core::Capability::GitHubSignIn);
-        view.owned_backend = owned_backend;
+        view.github_sign_in_available = offers_sign_in;
         Ok(view)
+    }
+
+    /// Installs the latest released worker on this machine and connects to it.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn install_local_worker(&mut self, cx: &mut Context<Self>) {
+        let Some(setup) = self.setup.as_mut() else {
+            return;
+        };
+        if setup.busy {
+            return;
+        }
+        setup.busy = true;
+        setup.error = None;
+        setup.progress = Some("Installing the loom-server worker…".to_owned());
+        let options = setup.options.clone();
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let install_options = loom_local::local::LocalInstallOptions {
+                explicit_binary: options.server_binary.clone(),
+                reset_state: options.reset_state,
+                port: loom_local::local::DEFAULT_PORT,
+            };
+            let result = cx
+                .background_spawn(async move {
+                    let source = loom_local::worker::GitHubReleases::default();
+                    loom_local::local::install_and_start(&source, &install_options, &mut |step| {
+                        log::info!("[loom-ui] {}", step.label());
+                    })
+                })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                match result {
+                    Ok(worker) => {
+                        if let Some(setup) = view.setup.as_mut() {
+                            // The connect below owns the rest of the progress.
+                            setup.busy = false;
+                            setup.progress =
+                                Some(format!("Installed loom-server {}. Connecting…", worker.tag));
+                        }
+                        view.connect_setup_target(worker.url, worker.token, true, cx);
+                    }
+                    Err(error) => {
+                        view.fail_setup(WorkerConnectionStage::LocalProvision, &error, cx)
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Connects to the worker named by the setup form.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn connect_setup_worker(&mut self, cx: &mut Context<Self>) {
+        let Some(setup) = self.setup.as_ref() else {
+            return;
+        };
+        let value = |input: &Option<Entity<InputState>>| {
+            input
+                .as_ref()
+                .map(|input| input.read(cx).value().to_string())
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        };
+        let url = value(&setup.url_input);
+        let token = value(&setup.token_input);
+        if url.is_empty() {
+            if let Some(setup) = self.setup.as_mut() {
+                setup.error =
+                    Some("Enter the worker URL, for example ws://127.0.0.1:8765/ws.".to_owned());
+            }
+            cx.notify();
+            return;
+        }
+        if worker_url_embeds_credential(&url) {
+            if let Some(setup) = self.setup.as_mut() {
+                setup.error = Some(
+                    "Do not include credentials in the URL. Enter the access token in its own \
+                     field."
+                        .to_owned(),
+                );
+            }
+            cx.notify();
+            return;
+        }
+        self.connect_setup_target(url, token, false, cx);
+    }
+
+    /// Connects to `url` from the setup screen and replaces the view with the
+    /// connected one when that succeeds.
+    #[cfg(not(target_family = "wasm"))]
+    fn connect_setup_target(
+        &mut self,
+        url: String,
+        token: String,
+        local: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(setup) = self.setup.as_mut() else {
+            return;
+        };
+        if setup.busy {
+            return;
+        }
+        setup.busy = true;
+        setup.error = None;
+        setup.progress = Some("Connecting to the worker…".to_owned());
+        let options = setup.options.clone();
+        let focus_handle = self.composer_focus_handle.clone();
+        let stage = transport_failure_stage(&url);
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let connect_url = url.clone();
+            let connect_token = token.clone();
+            let background_token = connect_token.clone();
+            let remote_options = remote_connection_options(&options);
+            let identity_key = crate::identity_store::worker_key(Some(&connect_url));
+            let result = cx
+                .background_spawn(async move {
+                    let unsigned = background_token.trim().is_empty();
+                    let connection = connect_remote(
+                        &connect_url,
+                        &background_token,
+                        &remote_options,
+                        &identity_key,
+                    )?;
+                    let negotiation = match negotiate(&connection) {
+                        Ok(negotiation) => negotiation,
+                        Err(error) => {
+                            let _ = connection.close();
+                            return Err(error);
+                        }
+                    };
+                    let node_status = match worker_node_status(&connection) {
+                        Ok(status) => status,
+                        Err(error) => {
+                            let _ = connection.close();
+                            return Err(error);
+                        }
+                    };
+                    let pre_login = unsigned
+                        && current_participant(&connection)
+                            .map(|participant| participant.is_none())
+                            .unwrap_or(false);
+                    Ok::<_, LoomError>((connection, negotiation, node_status, pre_login))
+                })
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                let Some(setup) = view.setup.as_ref() else {
+                    return;
+                };
+                let options = setup.options.clone();
+                match result {
+                    Ok((connection, negotiation, node_status, pre_login)) => {
+                        let offers_sign_in = negotiation
+                            .capabilities
+                            .contains(loom_core::Capability::GitHubSignIn);
+                        let node_id = node_status.node_id.clone();
+                        let mut built = if pre_login {
+                            Ok(LoomView::new_pre_login(
+                                connection,
+                                node_status,
+                                WorkspaceConfig::default(),
+                                Some(negotiation.protocol_version),
+                                Some(url.clone()),
+                                offers_sign_in,
+                                local,
+                                false,
+                                focus_handle.clone(),
+                            ))
+                        } else {
+                            workspace_root_for(&options, local).and_then(|workspace_root| {
+                                let guard = ConnectionCleanupGuard::new(connection.clone());
+                                let mut initialized = LoomView::initialize_from_connection(
+                                    &options,
+                                    connection,
+                                    workspace_root,
+                                    false,
+                                    Some(guard),
+                                    focus_handle.clone(),
+                                    true,
+                                    Some(negotiation.protocol_version),
+                                    Some(url.clone()),
+                                    local,
+                                )?;
+                                initialized.github_sign_in_available = offers_sign_in;
+                                Ok(initialized)
+                            })
+                        };
+                        match built.as_mut() {
+                            Ok(initialized) => {
+                                if connect_token.trim().is_empty() {
+                                    initialized.mark_node_unsigned(node_id);
+                                }
+                                crate::worker_setup::save_initial_worker(
+                                    &crate::worker_setup::InitialWorker {
+                                        url: url.clone(),
+                                        local,
+                                    },
+                                );
+                                if !local {
+                                    crate::worker_setup::save_initial_worker_token(&connect_token);
+                                }
+                                std::mem::swap(view, initialized);
+                            }
+                            Err(error) => view.fail_setup(stage, error, cx),
+                        }
+                    }
+                    Err(error) => view.fail_setup(stage, &error, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Shows why the setup screen could not reach or install a worker.
+    #[cfg(not(target_family = "wasm"))]
+    fn fail_setup(
+        &mut self,
+        stage: WorkerConnectionStage,
+        error: &LoomError,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(setup) = self.setup.as_mut() {
+            setup.busy = false;
+            setup.progress = None;
+            setup.error = Some(worker_connection_failure_detail(stage, error, None));
+        }
+        cx.notify();
     }
 
     /// The bootstrap constructor threads the negotiated backend metadata into
@@ -181,6 +442,7 @@ impl LoomView {
         discover_models: bool,
         server_protocol_version: Option<ProtocolVersion>,
         backend_endpoint: Option<String>,
+        local_worker: bool,
     ) -> Result<Self, LoomError> {
         let node_status = worker_node_status(&connection)?;
         let default_backend_node_id = node_status.node_id.clone();
@@ -199,7 +461,7 @@ impl LoomView {
             node_status,
             connection.clone(),
             &workspace_config,
-            options.remote.as_deref(),
+            backend_endpoint.as_deref(),
         );
         let sessions = list_workspace_sessions(&connection, workspace_id)?;
         info!("loaded {} session(s)", sessions.len());
@@ -229,7 +491,7 @@ impl LoomView {
         };
         let has_session = had_sessions || new_session;
         if new_session && !workspace_root.as_os_str().is_empty() {
-            if options.remote.is_none() {
+            if local_worker {
                 let response = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
                     FilesystemRequest::AttachSessionDirectory {
                         session_id: session.id,
@@ -287,6 +549,8 @@ impl LoomView {
             backend,
             connection: connection.clone(),
             #[cfg(not(target_family = "wasm"))]
+            setup: None,
+            #[cfg(all(test, not(target_family = "wasm")))]
             owned_backend: None,
             server_protocol_version,
             backend_endpoint,
@@ -299,13 +563,13 @@ impl LoomView {
             workspace_id,
             workspaces,
             node_workspaces: BTreeMap::new(),
-            local_directory_sources_available: options.remote.is_none(),
+            local_directory_sources_available: local_worker,
             unsigned_nodes: BTreeSet::new(),
             awaiting_sign_in_nodes: BTreeSet::new(),
             remembered_identities: BTreeMap::new(),
             github_sign_in_available: false,
             github_login_node_id: None,
-            local_current_directory: (options.remote.is_none()
+            local_current_directory: (local_worker
                 && !demo_workspace
                 && !workspace_root.as_os_str().is_empty())
             .then(|| workspace_root.clone()),
@@ -935,6 +1199,8 @@ impl LoomView {
             browser_demo_mode: false,
             connection: connection.clone(),
             #[cfg(not(target_family = "wasm"))]
+            setup: None,
+            #[cfg(all(test, not(target_family = "wasm")))]
             owned_backend: None,
             server_protocol_version,
             backend_endpoint,

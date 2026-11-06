@@ -313,6 +313,7 @@ fn connection_bootstrap_creates_and_attaches_a_local_workspace_session(cx: &mut 
             false,
             Some(negotiation.protocol_version),
             None,
+            true,
         )
         .unwrap();
         view.owned_backend = Some(local_backend);

@@ -27,11 +27,13 @@ ignored and missing keys default to disabled, so a new grant is a code change
 rather than a schema change. JSON is otherwise reserved for small bounded
 configuration or diagnostic payloads that are not used as query keys.
 
-Wiping is always opt-in. On startup the native client and CLI inspect the
-database without modifying it; an unknown or newer database is reported and
-wiped only when `--reset-state` is passed or the user confirms an interactive
-prompt on a terminal. The wipe removes the database and its SQLite sidecar files and
-refuses to run while another backend holds the writer lock.
+Wiping is always opt-in. A standalone `loom-server`, the CLI, and the desktop
+client's installer inspect the database without modifying it; an unknown or
+newer database is reported and wiped only when `--reset-state` is passed or the
+user confirms an interactive prompt on a terminal. The desktop installer stops
+the worker before it deletes the database. The wipe removes the database and
+its SQLite sidecar files and refuses to run while another backend holds the
+writer lock.
 
 ## Data model
 

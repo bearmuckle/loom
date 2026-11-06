@@ -10,7 +10,7 @@ Use a transport abstraction with these initial implementations:
 
 | Mode | Preferred transport | Fallback |
 | --- | --- | --- |
-| Native client and local backend | In-process channel or Unix domain socket / named pipe | Loopback TCP |
+| Native client and a worker | WebSocket over loopback TCP | None: the client never embeds a backend |
 | Browser client and local/remote backend | WebSocket over HTTP(S) | HTTP request/stream endpoints where required by a host |
 | Native client and remote backend | QUIC when deployment supports it | WebSocket or HTTP/2-compatible stream |
 
@@ -612,8 +612,8 @@ A sign-in is a GitHub device flow:
    is dropped from every roster they appear in, and a connection that was
    accepted without a credential returns to the pre-login state.
 5. A client remembers the participant id per worker, keyed by a durable worker
-   identity — a remote worker's address, or the state database the managed local
-   worker keeps — and never by `WorkerNodeStatus::node_id`, which names one
+   identity — the address a worker is reached at, or a local worker's state
+   database — and never by `WorkerNodeStatus::node_id`, which names one
    worker process and is regenerated whenever that process starts. A later
    connection with an unrestricted operator token may send
    `ResumeGitHubIdentity { participant_id }` → `GitHubIdentityResumed {

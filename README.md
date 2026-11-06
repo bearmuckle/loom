@@ -32,12 +32,17 @@ cargo run -p loom-ui
 ```
 
 Loom uses the directory you launch it from. Point it at another project with
-`--project PATH`, or start the provider-free demo with `--demo`:
+`--project PATH`:
 
 ```sh
 cargo run -p loom-ui -- --project /path/to/project
-cargo run -p loom-ui -- --demo
 ```
+
+The first launch shows a worker setup screen. "Install a worker on this
+machine" downloads the latest `loom-server` release and runs it as a user
+service that also starts at boot; the same screen connects to an existing
+worker by URL or `ssh://user@host`. Later launches reconnect to the worker you
+chose, and `--remote URL` overrides it.
 
 For browser development, run `./scripts/dev-wasm.sh`. It needs Trunk and the
 `wasm32-unknown-unknown` Rust target, serves both services on loopback, and puts
@@ -46,8 +51,8 @@ a development bearer token in the browser URL, so keep it local. Pushes to
 
 ## Standalone server
 
-Tagged releases and the container image also ship `loom-server`, the backend the
-client embeds, as a standalone process. It needs no `--persistence` path or
+Tagged releases and the container image also ship `loom-server`, the backend a
+worker runs, as a standalone process. It needs no `--persistence` path or
 token: it generates a bearer token in its instance directory and keeps durable
 state below the state root, so a stable bind address resumes where it left off.
 

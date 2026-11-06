@@ -249,3 +249,179 @@ impl LoomView {
             .into_any()
     }
 }
+
+#[cfg(not(target_family = "wasm"))]
+impl LoomView {
+    /// The first-run setup screen: install a worker on this machine, or reach a
+    /// worker that already runs.
+    pub(crate) fn render_worker_setup(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        self.ensure_setup_inputs(window, cx);
+        let layout = responsive_layout(window.bounds().size.width);
+        let Some(setup) = self.setup.as_ref() else {
+            return div().into_any();
+        };
+        let busy = setup.busy;
+        let progress = setup.progress.clone();
+        let error = setup.error.clone();
+        let url_input = setup
+            .url_input
+            .clone()
+            .expect("setup URL input initialized before rendering");
+        let token_input = setup
+            .token_input
+            .clone()
+            .expect("setup token input initialized before rendering");
+        div()
+            .size_full()
+            .relative()
+            .bg(rgb(0x111318))
+            .text_color(rgb(0xe5e7eb))
+            .child(
+                div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p_4()
+                    .child(
+                        div()
+                            .id("worker-setup-card")
+                            .test_support()
+                            .w_full()
+                            .max_w(px(560.))
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .p_6()
+                            .rounded_lg()
+                            .bg(rgb(0x171c25))
+                            .border_1()
+                            .border_color(rgb(0x293244))
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child("Set up a worker"),
+                            )
+                            .child(div().text_sm().text_color(rgb(0x8f98a6)).child(
+                                "Loom's client needs a worker to run sessions. Install one on \
+                                 this machine, or connect to a worker you already run.",
+                            ))
+                            .child(
+                                Button::new("worker-setup-install")
+                                    .label("Install a worker on this machine")
+                                    .small()
+                                    .disabled(busy)
+                                    .when(layout.phone, |button| button.h(layout.control_size()))
+                                    .on_click(
+                                        cx.listener(|view, _, _, cx| view.install_local_worker(cx)),
+                                    ),
+                            )
+                            .child(div().text_xs().text_color(rgb(0x64748b)).child(
+                                "Downloads the latest loom-server release and runs it as a user \
+                                 service that also starts at boot.",
+                            ))
+                            .child(div().h(px(1.)).w_full().bg(rgb(0x293244)))
+                            .child(div().text_sm().child("Or connect to an existing worker"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(KitInput::new(&url_input).id("worker-setup-url").small())
+                                    .child(
+                                        KitInput::new(&token_input)
+                                            .id("worker-setup-token")
+                                            .small(),
+                                    )
+                                    .child(
+                                        div().flex().justify_end().child(
+                                            Button::new("worker-setup-connect")
+                                                .label("Connect")
+                                                .small()
+                                                .disabled(busy)
+                                                .when(layout.phone, |button| {
+                                                    button.h(layout.control_size())
+                                                })
+                                                .on_click(cx.listener(|view, _, _, cx| {
+                                                    view.connect_setup_worker(cx)
+                                                })),
+                                        ),
+                                    ),
+                            )
+                            .child(div().text_xs().text_color(rgb(0x64748b)).child(
+                                "ws://host:port/ws with its access token, or ssh://user@host to \
+                                 install a worker over SSH.",
+                            ))
+                            .when_some(progress, |card, progress| {
+                                card.child(
+                                    div()
+                                        .id("worker-setup-progress")
+                                        .test_support()
+                                        .text_xs()
+                                        .text_color(rgb(0xfcd34d))
+                                        .child(progress),
+                                )
+                            })
+                            .when_some(error, |card, error| {
+                                card.child(
+                                    div()
+                                        .id("worker-setup-error")
+                                        .test_support()
+                                        .text_xs()
+                                        .text_color(rgb(0xfca5a5))
+                                        .child(error),
+                                )
+                            }),
+                    ),
+            )
+            .into_any()
+    }
+
+    fn ensure_setup_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .setup
+            .as_ref()
+            .is_some_and(|setup| setup.url_input.is_none())
+        {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx).placeholder("ws://127.0.0.1:8765/ws or ssh://user@host")
+            });
+            self.input_subscriptions.push(cx.subscribe(
+                &input,
+                |view, _, event: &InputEvent, cx| match event {
+                    InputEvent::Change => cx.notify(),
+                    InputEvent::PressEnter { .. } => view.connect_setup_worker(cx),
+                    _ => {}
+                },
+            ));
+            if let Some(setup) = self.setup.as_mut() {
+                setup.url_input = Some(input);
+            }
+        }
+        if self
+            .setup
+            .as_ref()
+            .is_some_and(|setup| setup.token_input.is_none())
+        {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Access token (optional)")
+                    .masked(true)
+            });
+            self.input_subscriptions
+                .push(cx.subscribe(&input, |_, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        cx.notify();
+                    }
+                }));
+            if let Some(setup) = self.setup.as_mut() {
+                setup.token_input = Some(input);
+            }
+        }
+    }
+}

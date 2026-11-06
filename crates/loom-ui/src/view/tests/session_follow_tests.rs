@@ -15,8 +15,7 @@ fn only_a_shared_worker_session_is_followed_while_idle(cx: &mut TestAppContext) 
     let _view = cx.new(|cx| {
         let mut view = LoomView::new_for_test(cx.focus_handle());
         view.sessions = vec![view.active_session.clone()];
-        // The startup worker is the managed local process, which serves this
-        // client alone.
+        // A view with no endpoint is not a shared worker.
         assert!(!view.active_worker_is_shared());
         assert!(!view.session_events_should_poll());
 
@@ -116,8 +115,8 @@ fn an_idle_shared_session_asks_for_its_events_once_per_cadence(cx: &mut TestAppC
         .unwrap();
     cx.run_until_parked();
 
-    // The managed local worker serves this client alone, so a session nobody
-    // else can write to is not followed.
+    // A worker with no endpoint is not shared, so a session nobody else can
+    // write to is not followed.
     view.update(cx, |view, _| {
         view.backend_endpoint = None;
         assert!(!view.session_events_should_poll());
@@ -174,6 +173,7 @@ fn an_idle_viewer_sees_a_run_another_person_started(cx: &mut TestAppContext) {
             // The viewer reached this worker at an address, so another person
             // can write to the session it is about to open.
             Some("ws://worker.example:8765".to_owned()),
+            true,
         )
         .unwrap();
         // The delayed worker-status poll is not part of this test.

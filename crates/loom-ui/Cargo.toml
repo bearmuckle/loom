@@ -39,13 +39,13 @@ depends = "libc6 (>= 2.35), libgcc-s1, libssl3, zlib1g, libxcb1, libxcb-xkb1, li
 recommends = "mesa-vulkan-drivers, fonts-dejavu-core"
 extended-description = """
  Loom is a remote-first coding-agent environment. This package installs the
- native desktop client and the loom-server backend it starts as a local
- worker process, and the client can also connect to a remote loom-server.
+ native desktop client and the loom-server backend it can install as a local
+ worker service; the client can also connect to a remote loom-server.
 """
 assets = [
   ["target/release/loom-ui", "usr/bin/", "755"],
-  # The managed local worker the client starts; installed next to it so the
-  # package works offline without downloading a server release.
+  # The worker the setup installs as a local service; shipping it next to the
+  # client lets that install run offline without downloading a release.
   ["target/release/loom-server", "usr/bin/", "755"],
   ["../../packaging/loom.desktop", "usr/share/applications/loom-ui.desktop", "644"],
   ["pwa/icon-512.png", "usr/share/icons/hicolor/512x512/apps/loom-ui.png", "644"],
@@ -95,7 +95,8 @@ ttf-parser.workspace = true
 env_logger.workspace = true
 open.workspace = true
 # The native launcher and WebSocket client. It has no backend dependency: the
-# local backend runs as a managed `loom-server` child process.
+# local worker is installed as a `loom-server` user service and reached over
+# the same transport as any other worker.
 loom-local.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dependencies]

@@ -171,6 +171,22 @@ fn connection_error_details_are_actionable_and_do_not_echo_tokens() {
         assert!(bootstrap_stage.contains("could not open its workspace"));
         assert!(!bootstrap_stage.contains("secret"));
     }
+
+    let local_install = worker_connection_failure_detail(
+        WorkerConnectionStage::LocalProvision,
+        &LoomError::new(
+            ErrorCode::ProviderUnavailable,
+            "download of 'https://example/loom-server' failed with HTTP 500",
+            true,
+        ),
+        None,
+    );
+    assert!(
+        local_install.contains("Installing a worker on this machine failed"),
+        "{local_install}"
+    );
+    assert!(local_install.contains("HTTP 500"), "{local_install}");
+    assert!(!local_install.contains("WebSocket"), "{local_install}");
 }
 
 /// An SSH worker fails while Loom provisions the host or opens the tunnel, so

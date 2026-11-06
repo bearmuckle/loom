@@ -5,10 +5,100 @@
 //! so the decisions it makes are pure helpers that are checked here.
 
 use super::*;
+#[cfg(not(target_family = "wasm"))]
+use gpui_kit::size;
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, EventSequence, ProjectAgentRecord,
     ProjectId, ProjectSnapshot, Timestamp, WorkspaceId,
 };
+
+/// A window host that paints nothing, so a test can inspect the view it holds.
+#[cfg(not(target_family = "wasm"))]
+struct ViewHost {
+    view: Entity<LoomView>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Render for ViewHost {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.view
+            .update(cx, |view, cx| view.render_worker_setup(window, cx))
+    }
+}
+
+/// With no `--remote` and no worker remembered from a previous setup, the
+/// native client opens the setup screen instead of starting a backend itself.
+#[cfg(not(target_family = "wasm"))]
+#[gpui_kit::test]
+fn a_native_client_without_a_worker_starts_on_the_setup_screen(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let options = UiOptions {
+        project: None,
+        task: "setup".to_owned(),
+        model: ModelId::new("deterministic/demo"),
+        remote: None,
+        token: None,
+        reset_state: false,
+        server_binary: None,
+        ca: None,
+        allow_insecure_remote: false,
+    };
+    let mut created = None;
+    let _handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let view = cx.new(|cx| LoomView::new_setup(&options, None, cx.focus_handle()));
+        created = Some(view.clone());
+        ViewHost { view }
+    });
+    let view = created.expect("the window created the setup view");
+    cx.update(|cx| {
+        let view = view.read(cx);
+        assert!(view.setup.is_some());
+        assert!(!view.is_connected());
+        assert!(view.worker_nodes.is_empty());
+        assert!(view.sessions.is_empty());
+    });
+}
+
+/// A setup screen that carries a startup failure shows it instead of hiding
+/// why the remembered worker could not be reached.
+#[cfg(not(target_family = "wasm"))]
+#[gpui_kit::test]
+fn a_setup_screen_keeps_the_reason_the_last_worker_failed(cx: &mut gpui_kit::TestAppContext) {
+    cx.update(gpui_kit::init);
+    let options = UiOptions {
+        project: None,
+        task: "setup".to_owned(),
+        model: ModelId::new("deterministic/demo"),
+        remote: None,
+        token: None,
+        reset_state: false,
+        server_binary: None,
+        ca: None,
+        allow_insecure_remote: false,
+    };
+    let mut created = None;
+    let _handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let view = cx.new(|cx| {
+            LoomView::new_setup(
+                &options,
+                Some("the worker is down".to_owned()),
+                cx.focus_handle(),
+            )
+        });
+        created = Some(view.clone());
+        ViewHost { view }
+    });
+    let view = created.expect("the window created the setup view");
+    cx.update(|cx| {
+        assert_eq!(
+            view.read(cx)
+                .setup
+                .as_ref()
+                .and_then(|setup| setup.error.as_deref()),
+            Some("the worker is down")
+        );
+    });
+}
 
 fn session(id: AgentSessionId, name: &str, updated_at: u64) -> AgentSessionSnapshot {
     AgentSessionSnapshot {

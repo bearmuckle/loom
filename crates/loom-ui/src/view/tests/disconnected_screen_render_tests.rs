@@ -265,3 +265,71 @@ fn a_startup_in_flight_shows_progress_and_offers_no_actions(cx: &mut TestAppCont
     })
     .unwrap();
 }
+
+/// A host that paints only the native first-run setup screen.
+#[cfg(not(target_family = "wasm"))]
+struct SetupHost {
+    view: Entity<LoomView>,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Render for SetupHost {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.view
+            .update(cx, |view, cx| view.render_worker_setup(window, cx))
+    }
+}
+
+/// The first-run screen offers the local install and a URL to reach a worker,
+/// and both fit one bounded card on a desktop and a phone.
+#[cfg(not(target_family = "wasm"))]
+#[gpui_kit::test]
+fn the_setup_screen_offers_a_local_install_and_a_worker_url(cx: &mut TestAppContext) {
+    for (width, height) in [(1280., 800.), (390., 844.)] {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(width), px(height)), |_, cx| {
+            let view = cx.new(|cx| {
+                let options = UiOptions {
+                    project: None,
+                    task: "setup".to_owned(),
+                    model: ModelId::new("deterministic/demo"),
+                    remote: None,
+                    token: None,
+                    reset_state: false,
+                    server_binary: None,
+                    ca: None,
+                    allow_insecure_remote: false,
+                };
+                LoomView::new_setup(&options, None, cx.focus_handle())
+            });
+            SetupHost { view }
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let viewport = window.viewport_size();
+            let card = window.find("worker-setup-card").bounds();
+            assert!(
+                card.size.width <= px(560.),
+                "the setup card is bounded: {card:?}"
+            );
+            assert!(
+                card.size.width <= viewport.width && card.size.height <= viewport.height,
+                "the setup card fits {viewport:?}: {card:?}"
+            );
+            for id in [
+                "worker-setup-install",
+                "worker-setup-url",
+                "worker-setup-token",
+                "worker-setup-connect",
+            ] {
+                let control = window.find(id).bounds();
+                assert!(inside(control, card), "{id} is painted inside the card");
+            }
+            assert!(
+                window.try_find("worker-setup-error").is_none(),
+                "no failure is reported before anything was tried"
+            );
+        })
+        .unwrap();
+    }
+}

@@ -2993,6 +2993,19 @@ pub(crate) fn worker_connection_failure_detail(
     secret: Option<&str>,
 ) -> String {
     let lower_message = error.message.to_ascii_lowercase();
+    if stage == WorkerConnectionStage::LocalProvision {
+        // The installer says which step failed and why; keep that instead of
+        // rewriting it as a WebSocket problem.
+        let detail = redact_secret(&error.message, secret.unwrap_or_default());
+        return format!(
+            "Installing a worker on this machine failed: {}",
+            detail
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(240)
+                .collect::<String>()
+        );
+    }
     if stage == WorkerConnectionStage::SshProvision {
         // `loom-local` already says which step failed, why, and what to do
         // about it; keep that instead of rewriting it as a WebSocket problem.
@@ -3100,7 +3113,8 @@ pub(crate) fn worker_connection_failure_detail(
         ),
         WorkerConnectionStage::CredentialRead
         | WorkerConnectionStage::InputValidation
-        | WorkerConnectionStage::SshProvision => unreachable!(),
+        | WorkerConnectionStage::SshProvision
+        | WorkerConnectionStage::LocalProvision => unreachable!(),
         WorkerConnectionStage::CredentialSave | WorkerConnectionStage::BootstrapSave => {
             unreachable!()
         }
@@ -3238,10 +3252,9 @@ pub(crate) fn update_worker_node_status(
 
 /// The durable key a worker's remembered GitHub identity is stored under.
 ///
-/// The startup connection is named by the endpoint the client was started with,
-/// which is `None` for the managed local worker; every other worker node is named
-/// by its address. A node with neither falls back to its instance id, so it can
-/// never alias another worker.
+/// The startup connection is named by the endpoint it was reached at; every
+/// other worker node is named by its address. A node with neither falls back to
+/// its instance id, so it can never alias another worker.
 pub(crate) fn worker_entry_identity_key(
     startup_endpoint: Option<&str>,
     node: &WorkerNodeEntry,

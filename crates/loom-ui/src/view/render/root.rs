@@ -7,6 +7,11 @@ impl Render for LoomView {
             BASE_FONT_SIZE * self.font_scale_percent as f32 / DEFAULT_FONT_SCALE_PERCENT as f32
         ));
         window.set_window_title(&format!("Loom - {}", self.active_session.name));
+        #[cfg(not(target_family = "wasm"))]
+        if self.setup.is_some() {
+            window.set_window_title("Loom - Set up a worker");
+            return self.render_worker_setup(window, cx);
+        }
         // The client-drawn strip below is this window's title bar, so full
         // screen removes it. Simple (borderless) full screen removes it too.
         let window_title_bar_visible = !cfg!(target_family = "wasm")

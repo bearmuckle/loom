@@ -612,6 +612,7 @@ fn session_event_snapshot_resync_keeps_the_conversation(cx: &mut TestAppContext)
             false,
             Some(protocol_version),
             None,
+            true,
         )
         .unwrap();
         view.owned_backend = Some(view_backend);
@@ -1084,6 +1085,7 @@ fn a_poll_drains_every_bounded_event_page(cx: &mut TestAppContext) {
             false,
             Some(protocol_version),
             None,
+            true,
         )
         .unwrap();
         view.owned_backend = Some(view_backend);

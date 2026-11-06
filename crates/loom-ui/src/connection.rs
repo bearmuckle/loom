@@ -171,12 +171,13 @@ use wasm_bindgen::{JsCast, closure::Closure};
 pub(crate) enum ClientConnection {
     /// An in-process backend; only tests use it, through the `loom-server`
     /// dev-dependency. The native client always reaches its backend over
-    /// WebSocket, including the managed local worker.
+    /// WebSocket, including a worker installed on this machine.
     #[cfg(all(not(target_family = "wasm"), test))]
     InProcess(Box<loom_server::InProcessConnection>),
     #[cfg(not(target_family = "wasm"))]
     Remote(loom_local::RemoteConnection),
-    #[cfg(target_family = "wasm")]
+    /// No worker is connected yet: the native setup screen, or a browser client
+    /// that has not been configured.
     Disconnected,
     #[cfg(target_family = "wasm")]
     Browser(BrowserConnection),
@@ -236,6 +237,7 @@ impl ClientConnection {
                 #[cfg(test)]
                 Self::InProcess(_) => Ok(()),
                 Self::Remote(connection) => connection.close(),
+                Self::Disconnected => Ok(()),
             }
         }
         #[cfg(target_family = "wasm")]
@@ -253,7 +255,6 @@ impl ClientConnection {
             Self::InProcess(_) => true,
             #[cfg(not(target_family = "wasm"))]
             Self::Remote(connection) => connection.secure_for_secrets(),
-            #[cfg(target_family = "wasm")]
             Self::Disconnected => false,
             #[cfg(target_family = "wasm")]
             Self::Browser(connection) => connection.secure_for_secrets(),
@@ -293,10 +294,15 @@ impl ClientConnection {
         request: RequestEnvelope,
         timeout: Duration,
     ) -> ResponseEnvelope {
+        let request_id = request.request_id;
         match self {
             #[cfg(test)]
             Self::InProcess(connection) => connection.request(request),
             Self::Remote(connection) => connection.request_with_timeout(request, timeout),
+            Self::Disconnected => ResponseEnvelope::failure(
+                request_id,
+                LoomError::new(ErrorCode::RequestCancelled, "no worker is connected", true),
+            ),
         }
     }
 

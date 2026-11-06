@@ -353,10 +353,7 @@ use connectivity::{
 };
 use helpers::*;
 #[cfg(not(target_family = "wasm"))]
-use loom_local::{
-    PeerCredentialStore, RemoteConnectionOptions, UiOptions, backend_persistence_path,
-    prepare_workspace,
-};
+use loom_local::{PeerCredentialStore, RemoteConnectionOptions, UiOptions, prepare_workspace};
 use mark::loom_mark;
 
 /// The native remote transport settings implied by the launcher options: the
@@ -483,6 +480,8 @@ pub(crate) enum WorkerConnectionStage {
     Transport,
     /// Provisioning the host or opening the tunnel of an `ssh://` worker.
     SshProvision,
+    /// Installing or starting a worker on this machine.
+    LocalProvision,
     Negotiation,
     Status,
     CredentialRead,
@@ -503,7 +502,11 @@ pub(crate) struct LoomView {
     browser_demo_mode: bool,
     /// Used for the synchronous bootstrap before the window exists.
     pub(crate) connection: ClientConnection,
+    /// The first-run worker setup, when no worker is connected yet.
     #[cfg(not(target_family = "wasm"))]
+    setup: Option<crate::worker_setup::WorkerSetup>,
+    /// Keeps an in-process test backend alive for the view's lifetime.
+    #[cfg(all(test, not(target_family = "wasm")))]
     owned_backend: Option<crate::local_backend::OwnedBackend>,
     /// The negotiated protocol version of the active backend, or `None` when no
     /// negotiation result is retained (for example a disconnected browser view).
@@ -2071,21 +2074,29 @@ pub(crate) struct TimelineView {
 }
 
 impl LoomView {
-    #[cfg(test)]
-    fn new_for_test(focus_handle: FocusHandle) -> Self {
-        let connection = ClientConnection::InProcess(Box::new(
-            crate::local_backend::OwnedBackend::new().connect(),
-        ));
-        let backend = BackendWorker::spawn(connection.clone());
-        let workspace_id = WorkspaceId::new();
+    /// A view with no worker content, used by the first-run setup screen and by
+    /// tests that drive the view without a live backend.
+    #[cfg(not(target_family = "wasm"))]
+    fn new_unconnected(
+        connection: ClientConnection,
+        backend: BackendWorker,
+        workspace_id: WorkspaceId,
+        node_id: String,
+        model: ModelId,
+        local_sources: bool,
+        focus_handle: FocusHandle,
+    ) -> Self {
         let active_session = empty_session_snapshot(workspace_id);
-        let model = ModelId::new("deterministic/demo");
-        let node_id = "test-node".to_owned();
-        let node_backends = BTreeMap::from([(node_id.clone(), backend.clone())]);
+        let node_backends = if node_id.is_empty() {
+            BTreeMap::new()
+        } else {
+            BTreeMap::from([(node_id.clone(), backend.clone())])
+        };
         Self {
             backend,
             connection,
-            #[cfg(not(target_family = "wasm"))]
+            setup: None,
+            #[cfg(all(test, not(target_family = "wasm")))]
             owned_backend: None,
             server_protocol_version: None,
             backend_endpoint: None,
@@ -2099,7 +2110,7 @@ impl LoomView {
             workspace_id,
             workspaces: Vec::new(),
             node_workspaces: BTreeMap::new(),
-            local_directory_sources_available: true,
+            local_directory_sources_available: local_sources,
             local_current_directory: None,
             sessions: Vec::new(),
             project_snapshot: None,
@@ -2140,9 +2151,13 @@ impl LoomView {
             model: model.clone(),
             models: vec![model.clone()],
             default_models: vec![model.clone()],
-            node_model_catalogs: BTreeMap::from([(node_id.clone(), vec![model])]),
+            node_model_catalogs: if node_id.is_empty() {
+                BTreeMap::new()
+            } else {
+                BTreeMap::from([(node_id.clone(), vec![model.clone()])])
+            },
             node_model_provider_names: BTreeMap::new(),
-            model_catalog_node_id: Some(node_id),
+            model_catalog_node_id: (!node_id.is_empty()).then_some(node_id),
             model_refreshes_in_flight: BTreeSet::new(),
             model_catalog_refreshed_at: BTreeMap::new(),
             model_select: None,
@@ -2273,7 +2288,7 @@ impl LoomView {
         }
         #[cfg(not(target_family = "wasm"))]
         {
-            true
+            !matches!(self.connection, ClientConnection::Disconnected)
         }
     }
 }
@@ -2312,27 +2327,56 @@ impl Focusable for LoomView {
 }
 
 #[cfg(not(target_family = "wasm"))]
-impl Drop for LoomView {
-    fn drop(&mut self) {
-        self.shutdown_owned_backend();
+impl LoomView {
+    /// A view that shows the first-run worker setup instead of a workspace.
+    pub(crate) fn new_setup(
+        options: &UiOptions,
+        startup_error: Option<String>,
+        focus_handle: FocusHandle,
+    ) -> Self {
+        let connection = ClientConnection::Disconnected;
+        let backend = BackendWorker::spawn(connection.clone());
+        let mut view = Self::new_unconnected(
+            connection,
+            backend,
+            WorkspaceId::new(),
+            String::new(),
+            ModelId::new("default"),
+            false,
+            focus_handle,
+        );
+        view.setup = Some(crate::worker_setup::WorkerSetup::new(
+            options.clone(),
+            startup_error,
+        ));
+        view
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(test)]
 impl LoomView {
-    /// The managed local worker this view started, if any.
-    pub(crate) fn managed_worker(&self) -> Option<std::sync::Arc<loom_local::ManagedWorker>> {
-        self.owned_backend
-            .as_ref()
-            .and_then(crate::local_backend::OwnedBackend::managed_worker)
-    }
-
     fn shutdown_owned_backend(&self) {
         if let Some(backend) = &self.owned_backend
             && let Err(error) = backend.shutdown()
         {
-            log::warn!("could not drain local backend during UI teardown: {error}");
+            log::warn!("could not drain the test backend: {error}");
         }
+    }
+
+    fn new_for_test(focus_handle: FocusHandle) -> Self {
+        let connection = ClientConnection::InProcess(Box::new(
+            crate::local_backend::OwnedBackend::new().connect(),
+        ));
+        let backend = BackendWorker::spawn(connection.clone());
+        Self::new_unconnected(
+            connection,
+            backend,
+            WorkspaceId::new(),
+            "test-node".to_owned(),
+            ModelId::new("deterministic/demo"),
+            true,
+            focus_handle,
+        )
     }
 }
 

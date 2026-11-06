@@ -15,7 +15,7 @@ mod collaboration;
 mod connection;
 mod credential_store;
 mod identity_store;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(not(target_family = "wasm"), test))]
 mod local_backend;
 mod preferences;
 mod session_reference;
@@ -25,6 +25,8 @@ mod state;
 mod syntax;
 mod theme;
 mod view;
+#[cfg(not(target_family = "wasm"))]
+mod worker_setup;
 
 #[cfg(target_family = "wasm")]
 use crate::{browser::BrowserOptions, view::LoomView};
@@ -77,9 +79,9 @@ fn main() {
     info!(
         "starting with {} backend, model '{}'",
         if options.remote.is_some() {
-            "remote"
+            "configured remote"
         } else {
-            "managed local"
+            "worker setup"
         },
         options.model.as_str()
     );
@@ -104,16 +106,6 @@ fn main() {
                 }
             };
             info!("Loom view initialized");
-            // GPUI may exit the process without dropping the view, so the
-            // managed local worker is also stopped from the quit hook.
-            let worker = view.managed_worker();
-            cx.on_app_quit(move |_| {
-                if let Some(worker) = &worker {
-                    worker.stop();
-                }
-                async {}
-            })
-            .detach();
 
             let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
             let window = match cx.open_window(
