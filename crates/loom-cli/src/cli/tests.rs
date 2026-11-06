@@ -37,7 +37,8 @@ use loom_protocol::{
 use loom_server::{InProcessBackend, InProcessConnection};
 
 use crate::cli::args::{
-    self, ApprovalPreset, Format, Parsed, ProjectChildAction, Verb, WorktreeDisposition,
+    self, ApprovalPreset, Format, Parsed, ProjectChildAction, ProviderKeySource, Verb,
+    WorktreeDisposition,
 };
 use crate::cli::client::Client;
 use crate::cli::client::testing::{InProcessClient, Wrapped};
@@ -1273,6 +1274,7 @@ fn a_read_only_scoped_token_can_read_but_cannot_start_a_run() {
         Capability::SubscribeSessionEvents,
         Capability::ManageWorkspaces,
         Capability::ReadWorkerNodeStatus,
+        Capability::ListProviders,
         Capability::JsonProtocol,
     ]);
     let auth = Arc::new(AuthTokenStore::new());
@@ -1313,13 +1315,18 @@ fn a_read_only_scoped_token_can_read_but_cannot_start_a_run() {
             ],
             vec!["node".to_owned()],
             vec!["retention".to_owned(), "get".to_owned()],
+            vec!["providers".to_owned(), "list".to_owned()],
         ] {
             let outcome = run_async_owned(&mut client, &arguments).await;
             assert_eq!(outcome.code, exit::OK, "{arguments:?}: {}", outcome.stderr);
         }
 
-        // The read-only token carries neither operator capability, so both
-        // writes are refused with exit 3 and change nothing.
+        // The read-only token carries none of the operator capabilities, so
+        // each write is refused with exit 3 and changes nothing. The key file
+        // exists so `set-key` gets past local usage checks and fails at
+        // negotiation, before the key is sent.
+        let key_file = temporary_path("readonly-provider-key");
+        std::fs::write(&key_file, "readonly-token-must-not-send-this\n").unwrap();
         for arguments in [
             vec![
                 "retention".to_owned(),
@@ -1328,6 +1335,14 @@ fn a_read_only_scoped_token_can_read_but_cannot_start_a_run() {
                 "14d".to_owned(),
             ],
             vec!["delete".to_owned(), session_text.clone()],
+            vec![
+                "providers".to_owned(),
+                "set-key".to_owned(),
+                "--provider".to_owned(),
+                "openai-compatible".to_owned(),
+                "--key-file".to_owned(),
+                key_file.display().to_string(),
+            ],
         ] {
             let outcome = run_async_owned(&mut client, &arguments).await;
             assert_eq!(
@@ -1337,7 +1352,14 @@ fn a_read_only_scoped_token_can_read_but_cannot_start_a_run() {
                 outcome.stderr
             );
             assert_eq!(outcome.stdout, "", "{arguments:?}");
+            assert!(
+                !outcome.stdout.contains("readonly-token-must-not-send-this")
+                    && !outcome.stderr.contains("readonly-token-must-not-send-this"),
+                "{arguments:?}: {}",
+                outcome.stderr
+            );
         }
+        let _ = std::fs::remove_file(key_file);
 
         // The token does not carry the capabilities a run needs, so the write
         // side is refused and the read path above still worked.
@@ -1513,6 +1535,21 @@ fn each_verb_negotiates_only_the_capabilities_its_requests_need() {
                 Capability::ReadWorkerNodeStatus,
                 Capability::ConfigureArchiveRetention,
             ],
+        ),
+        (
+            vec!["providers", "list"],
+            vec![Capability::JsonProtocol, Capability::ListProviders],
+        ),
+        (
+            vec![
+                "providers",
+                "set-key",
+                "--provider",
+                "openai",
+                "--from-env",
+                "OPENAI_API_KEY",
+            ],
+            vec![Capability::JsonProtocol, Capability::ConfigureProviders],
         ),
         (
             vec!["delete", &session],
@@ -5095,6 +5132,263 @@ fn retention_set_rejects_a_bad_duration_and_an_empty_update() {
     );
 }
 
+#[test]
+fn providers_list_prints_credentials_without_secrets_and_set_key_stores_them() {
+    let (fixture, directory) = persistent_fixture("providers");
+    let database = directory.join("state.sqlite");
+    fixture
+        .backend
+        .provider_registry()
+        .register(loom_providers::ProviderConfig::openai("gpt-test"))
+        .unwrap();
+    fixture
+        .backend
+        .provider_registry()
+        .register(loom_providers::ProviderConfig::deepseek("deepseek-test"))
+        .unwrap();
+
+    let openai_secret = "sk-openai-loom-cli-test-secret";
+    let deepseek_secret = "sk-deepseek-loom-cli-test-secret";
+    let compatible_secret = "sk-compatible-loom-cli-test-secret";
+    let key_file = directory.join("deepseek.key");
+    let compatible_file = directory.join("compatible.key");
+    std::fs::write(&key_file, format!("{deepseek_secret}\n")).unwrap();
+    std::fs::write(&compatible_file, compatible_secret).unwrap();
+    // SAFETY: this variable is named only by this test, and the value is a fixture.
+    unsafe { std::env::set_var("LOOM_CLI_PROVIDER_KEY_TEST", openai_secret) };
+
+    let mut client = InProcessClient::new(&fixture.backend);
+    let listed = run(&mut client, &["providers", "list"]);
+    assert_eq!(listed.code, exit::OK, "{}", listed.stderr);
+    assert_eq!(listed.stderr, "");
+    for secret in [openai_secret, deepseek_secret, compatible_secret] {
+        assert!(!listed.stdout.contains(secret), "{}", listed.stdout);
+    }
+    for line in [
+        "deepseek deepseek credential false api-key true\n",
+        "deterministic deterministic credential false api-key false\n",
+        "ollama ollama credential false api-key false\n",
+        "openai open_ai credential false api-key true\n",
+        "openai-compatible open_ai_compatible credential false api-key true\n",
+    ] {
+        assert!(
+            listed.stdout.contains(line),
+            "{}\nmissing {line}",
+            listed.stdout
+        );
+    }
+
+    let set_openai = run(
+        &mut client,
+        &[
+            "providers",
+            "set-key",
+            "--provider",
+            "openai",
+            "--from-env",
+            "LOOM_CLI_PROVIDER_KEY_TEST",
+        ],
+    );
+    assert_eq!(set_openai.code, exit::OK, "{}", set_openai.stderr);
+    assert_eq!(set_openai.stdout, "provider openai credential set\n");
+    assert!(!set_openai.stdout.contains(openai_secret));
+    assert!(!set_openai.stderr.contains(openai_secret));
+
+    let set_deepseek = run(
+        &mut client,
+        &[
+            "providers",
+            "set-key",
+            "--provider",
+            "deepseek",
+            "--key-file",
+            key_file.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(set_deepseek.code, exit::OK, "{}", set_deepseek.stderr);
+    assert_eq!(set_deepseek.stdout, "provider deepseek credential set\n");
+    assert!(!set_deepseek.stdout.contains(deepseek_secret));
+    assert!(!set_deepseek.stderr.contains(deepseek_secret));
+
+    let set_compatible = run(
+        &mut client,
+        &[
+            "providers",
+            "set-key",
+            "--provider",
+            "openai-compatible",
+            "--key-file",
+            compatible_file.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(set_compatible.code, exit::OK, "{}", set_compatible.stderr);
+    let envelope = json_envelope(&set_compatible);
+    assert_eq!(envelope["verb"], "providers set-key");
+    assert_eq!(envelope["data"]["provider"], "openai-compatible");
+    assert_eq!(envelope["data"]["has_credential"], true);
+    assert!(envelope["data"].get("api_key").is_none());
+    assert!(!set_compatible.stdout.contains(compatible_secret));
+
+    let after = run(&mut client, &["providers", "list", "--json"]);
+    assert_eq!(after.code, exit::OK, "{}", after.stderr);
+    let envelope = json_envelope(&after);
+    assert_eq!(envelope["verb"], "providers list");
+    let providers = envelope["data"]["providers"].as_array().unwrap();
+    for (id, expected) in [
+        ("openai", true),
+        ("deepseek", true),
+        ("openai-compatible", true),
+        ("deterministic", false),
+        ("ollama", false),
+    ] {
+        let provider = providers
+            .iter()
+            .find(|provider| provider["id"] == id)
+            .unwrap_or_else(|| panic!("missing {id}"));
+        assert_eq!(provider["has_credential"], expected, "{provider}");
+        assert!(provider.get("credential_id").is_none(), "{provider}");
+        assert!(provider.get("api_key").is_none(), "{provider}");
+    }
+    for secret in [openai_secret, deepseek_secret, compatible_secret] {
+        assert!(!after.stdout.contains(secret));
+    }
+
+    let refused = run(
+        &mut client,
+        &[
+            "providers",
+            "set-key",
+            "--provider",
+            "deterministic",
+            "--from-env",
+            "LOOM_CLI_PROVIDER_KEY_TEST",
+        ],
+    );
+    assert_eq!(refused.code, exit::INTERNAL, "{}", refused.stderr);
+    assert!(
+        refused.stderr.contains("API keys can only be configured"),
+        "{}",
+        refused.stderr
+    );
+    assert!(!refused.stderr.contains(openai_secret));
+
+    let missing = run(
+        &mut client,
+        &[
+            "providers",
+            "set-key",
+            "--provider",
+            "no-such-provider",
+            "--key-file",
+            key_file.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(missing.code, exit::GONE, "{}", missing.stderr);
+    assert!(!missing.stderr.contains(deepseek_secret));
+
+    drop(client);
+    fixture.backend.shutdown().unwrap();
+    drop(fixture);
+
+    let credential_bytes = std::fs::read(database.with_extension("credentials.json")).unwrap();
+    let database_bytes = std::fs::read(&database).unwrap();
+    for secret in [openai_secret, deepseek_secret, compatible_secret] {
+        let needle = secret.as_bytes();
+        assert!(
+            credential_bytes
+                .windows(needle.len())
+                .any(|window| window == needle),
+            "{secret} was not stored in the worker credential file"
+        );
+        assert!(
+            !database_bytes
+                .windows(needle.len())
+                .any(|window| window == needle),
+            "{secret} was written into the state database"
+        );
+    }
+
+    let reopened = InProcessBackend::new_persistent(&database).unwrap();
+    let mut client = InProcessClient::new(&reopened);
+    let persisted = run(&mut client, &["providers", "list"]);
+    assert_eq!(persisted.code, exit::OK, "{}", persisted.stderr);
+    assert!(
+        persisted
+            .stdout
+            .contains("openai open_ai credential true api-key true\n")
+    );
+    assert!(
+        persisted
+            .stdout
+            .contains("deepseek deepseek credential true api-key true\n")
+    );
+    assert!(
+        persisted
+            .stdout
+            .contains("openai-compatible open_ai_compatible credential true api-key true\n")
+    );
+    for secret in [openai_secret, deepseek_secret, compatible_secret] {
+        assert!(!persisted.stdout.contains(secret));
+    }
+    reopened.shutdown().unwrap();
+    // SAFETY: this variable is named only by this test.
+    unsafe { std::env::remove_var("LOOM_CLI_PROVIDER_KEY_TEST") };
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn providers_set_key_rejects_a_blank_key_before_sending_it() {
+    let fixture = fixture();
+    let saw_key = Rc::new(Cell::new(false));
+    let flag = Rc::clone(&saw_key);
+    let mut client = Wrapped::new(InProcessClient::new(&fixture.backend)).before(move |envelope| {
+        if matches!(
+            &envelope.request,
+            ClientRequest::Provider(loom_protocol::ProviderRequest::ConfigureApiKeyProvider { .. })
+        ) {
+            flag.set(true);
+        }
+    });
+    let blank = temporary_path("blank-key");
+    std::fs::write(&blank, " \n").unwrap();
+    let empty = run(
+        &mut client,
+        &[
+            "providers",
+            "set-key",
+            "--provider",
+            "openai-compatible",
+            "--key-file",
+            blank.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(empty.code, exit::USAGE, "{}", empty.stderr);
+    assert_eq!(empty.stdout, "");
+    assert!(
+        empty.stderr.contains("must not be empty"),
+        "{}",
+        empty.stderr
+    );
+    assert!(!saw_key.get());
+
+    let unset = run(
+        &mut client,
+        &[
+            "providers",
+            "set-key",
+            "--provider",
+            "openai-compatible",
+            "--from-env",
+            "LOOM_CLI_PROVIDER_KEY_UNSET",
+        ],
+    );
+    assert_eq!(unset.code, exit::USAGE, "{}", unset.stderr);
+    assert!(unset.stderr.contains("is not set"), "{}", unset.stderr);
+    assert!(!saw_key.get());
+    let _ = std::fs::remove_file(blank);
+}
+
 fn archive_session(connection: &InProcessConnection, session_id: AgentSessionId) {
     let archived = connection.request(RequestEnvelope::new(ClientRequest::Session(
         SessionRequest::ArchiveAgentSession { session_id },
@@ -5820,6 +6114,84 @@ fn the_parser_covers_the_operator_verbs() {
     assert!(parse_error(&["retention", "get", "set"]).contains("one sub-verb"));
     assert!(parse_error(&["retention", "set"]).contains("requires --window"));
     assert!(parse_error(&["retention", "get", "--window", "1d"]).contains("does not apply"));
+
+    assert!(matches!(
+        invocation(&["providers", "list"]).verb,
+        Verb::ProvidersList
+    ));
+    let Verb::ProvidersSetKey(from_env) = invocation(&[
+        "providers",
+        "set-key",
+        "--provider",
+        " openai ",
+        "--from-env",
+        "OPENAI_API_KEY",
+    ])
+    .verb
+    else {
+        panic!("providers set-key parses as providers set-key");
+    };
+    assert_eq!(from_env.provider, "openai");
+    assert!(matches!(
+        from_env.source,
+        ProviderKeySource::Env(name) if name == "OPENAI_API_KEY"
+    ));
+    let Verb::ProvidersSetKey(from_file) = invocation(&[
+        "providers",
+        "set-key",
+        "--provider=deepseek",
+        "--key-file",
+        "keys/deepseek",
+    ])
+    .verb
+    else {
+        panic!("providers set-key parses as providers set-key");
+    };
+    assert_eq!(from_file.provider, "deepseek");
+    assert!(matches!(from_file.source, ProviderKeySource::File(_)));
+
+    assert!(parse_error(&["providers"]).contains("requires 'list' or 'set-key'"));
+    assert!(parse_error(&["providers", "show"]).contains("list or set-key"));
+    assert!(parse_error(&["providers", "list", "extra"]).contains("one sub-verb"));
+    assert!(
+        parse_error(&["providers", "set-key", "--provider", "openai"])
+            .contains("requires --from-env <NAME> or --key-file <path>")
+    );
+    assert!(
+        parse_error(&[
+            "providers",
+            "set-key",
+            "--provider",
+            "openai",
+            "--from-env",
+            "OPENAI_API_KEY",
+            "--key-file",
+            "key.txt",
+        ])
+        .contains("not both")
+    );
+    assert!(
+        parse_error(&[
+            "providers",
+            "set-key",
+            "--provider",
+            "openai",
+            "--from-env",
+            "OPENAI-API-KEY",
+        ])
+        .contains("not an environment variable name")
+    );
+    assert!(
+        parse_error(&["providers", "set-key", "--provider", " "]).contains("must not be empty")
+    );
+    let leaked = "sk-this-must-not-appear";
+    let rejected = parse_error(&["providers", "set-key", "--key", leaked]);
+    assert!(rejected.contains("--from-env"), "{rejected}");
+    assert!(!rejected.contains(leaked), "{rejected}");
+    let rejected_inline = parse_error(&["providers", "set-key", &format!("--api-key={leaked}")]);
+    assert!(rejected_inline.contains("--from-env"), "{rejected_inline}");
+    assert!(!rejected_inline.contains(leaked), "{rejected_inline}");
+    assert!(parse_error(&["providers", "list", "--provider", "openai"]).contains("does not apply"));
     assert!(parse_error(&["retention", "set", "--window", "soon"]).contains("30s, 5m, 12h, 14d"));
     assert!(parse_error(&["delete"]).contains("requires a <session-id>"));
     assert!(parse_error(&["delete", &session, &session]).contains("one session id"));

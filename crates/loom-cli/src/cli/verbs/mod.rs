@@ -16,6 +16,7 @@
 mod events;
 mod operator;
 mod project;
+mod providers;
 mod query;
 mod run;
 mod supervise;
@@ -186,11 +187,12 @@ impl Outcome {
 /// need, plus `JsonProtocol` because every response is JSON.
 ///
 /// A read-only verb therefore never asks for a mutating capability: `node` and
-/// `retention get` ask for the worker-status read, `ls` and `get` for the
-/// session read, and `events`/`peek` for event subscription. Only `run`,
-/// `retention set`, and `delete` request what their mutations require, so a
-/// worker that does not offer session creation can still be inspected and a
-/// scoped token sees the smallest negotiable set.
+/// `retention get` ask for the worker-status read, `providers list` for the
+/// provider catalog, `ls` and `get` for the session read, and `events`/`peek`
+/// for event subscription. Only `run`, `retention set`, `providers set-key`,
+/// and `delete` request what their mutations require, so a worker that does
+/// not offer session creation can still be inspected and a scoped token sees
+/// the smallest negotiable set.
 pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
     let mut capabilities = vec![Capability::JsonProtocol];
     match verb {
@@ -255,6 +257,8 @@ pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
                 Capability::ConfigureArchiveRetention,
             ]);
         }
+        Verb::ProvidersList => capabilities.push(Capability::ListProviders),
+        Verb::ProvidersSetKey(_) => capabilities.push(Capability::ConfigureProviders),
         Verb::SessionArchive { .. } | Verb::ProjectArchive { .. } => {
             capabilities.extend([Capability::ReadProject, Capability::ControlAgentSession]);
         }
@@ -482,6 +486,8 @@ pub(crate) async fn run<C: Client>(
         }
         Verb::RetentionGet => operator::retention_get(client, invocation, out).await,
         Verb::RetentionSet(args) => operator::retention_set(client, invocation, args, out).await,
+        Verb::ProvidersList => providers::list(client, invocation, out).await,
+        Verb::ProvidersSetKey(args) => providers::set_key(client, invocation, args, out).await,
         Verb::SessionArchive {
             session,
             yes,
