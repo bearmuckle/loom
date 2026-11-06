@@ -1,7 +1,6 @@
-//! The managed local worker: a `loom-server` child process the native client
-//! starts on loopback instead of embedding the backend.
+//! Finding the `loom-server` executable a worker runs.
 //!
-//! [`resolve_server_binary`] finds the executable, in this order:
+//! [`ServerResolver`] looks for the executable, in this order:
 //!
 //! 1. an explicit path (`--server-binary` or `LOOM_SERVER_BINARY`);
 //! 2. `loom-server` next to the running executable, as release archives,
@@ -12,21 +11,16 @@
 //!    verified against the release's `SHA256SUMS` before it is extracted;
 //! 6. without network, the newest cached download.
 //!
-//! [`ManagedWorker::start`] then runs it bound to `127.0.0.1` with a generated
-//! token passed through an owner-only `--token-file`, the client's shared state
-//! database through `--persistence`, waits for `GET /health`, and stops the
-//! process when the worker is dropped.
+//! The [`crate::local`] installer and the SSH provisioner both build on the
+//! release lookup and verified download here; neither embeds a backend.
 
 use std::{
     collections::BTreeMap,
     env, fs,
     io::{self, Read, Write},
-    net::{Ipv4Addr, SocketAddr, TcpListener},
+    net::{Ipv4Addr, TcpListener},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::Mutex,
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use loom_core::{ErrorCode, LoomError, Result};
@@ -39,10 +33,6 @@ pub const RELEASE_REPOSITORY: &str = "bearmuckle/loom";
 pub const SERVER_BINARY_ENV: &str = "LOOM_SERVER_BINARY";
 /// Environment variable overriding the download cache root.
 pub const CACHE_DIR_ENV: &str = "LOOM_CACHE_DIR";
-/// How long a starting worker may take to answer `GET /health`.
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a stopping worker may take to exit after SIGTERM.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// The bound on one release API call or archive download.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -607,190 +597,6 @@ impl<'a> ServerResolver<'a> {
     }
 }
 
-/// Resolves the `loom-server` executable for this host from GitHub releases.
-pub fn resolve_server_binary(explicit: Option<PathBuf>) -> Result<PathBuf> {
-    let source = GitHubReleases::default();
-    ServerResolver::for_host(explicit, &source).resolve()
-}
-
-/// What a managed local worker is started with.
-#[derive(Clone, Debug)]
-pub struct ManagedWorkerOptions {
-    /// The `loom-server` executable.
-    pub binary: PathBuf,
-    /// The state database (`--persistence`).
-    pub persistence: PathBuf,
-    /// Wipe an incompatible database (`--reset-state`).
-    pub reset_state: bool,
-    /// Where the generated token is written (`--token-file`).
-    pub token_file: PathBuf,
-    /// Loopback port; `None` picks a free one.
-    pub port: Option<u16>,
-}
-
-/// A running `loom-server` child bound to loopback. Dropping it stops the
-/// process.
-pub struct ManagedWorker {
-    child: Mutex<Option<Child>>,
-    address: SocketAddr,
-    token: String,
-    token_file: PathBuf,
-}
-
-impl ManagedWorker {
-    /// Starts the worker and waits until it answers `GET /health`.
-    pub fn start(options: &ManagedWorkerOptions) -> Result<Self> {
-        let token = format!("loom-{}", uuid::Uuid::new_v4());
-        write_private_file(&options.token_file, &token)?;
-        let port = match options.port {
-            Some(port) => port,
-            None => free_loopback_port()?,
-        };
-        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-        let mut command = Command::new(&options.binary);
-        command
-            .arg("--bind")
-            .arg(address.to_string())
-            .arg("--token-file")
-            .arg(&options.token_file)
-            .arg("--persistence")
-            .arg(&options.persistence)
-            .stdin(Stdio::null());
-        if options.reset_state {
-            command.arg("--reset-state");
-        }
-        stop_with_parent(&mut command);
-        log::info!(
-            "starting local worker '{}' on {address}; state '{}'",
-            options.binary.display(),
-            options.persistence.display()
-        );
-        let child = command.spawn().map_err(|error| {
-            LoomError::new(
-                ErrorCode::ProviderUnavailable,
-                format!(
-                    "could not start the local worker '{}': {error}",
-                    options.binary.display()
-                ),
-                false,
-            )
-        })?;
-        let worker = Self {
-            child: Mutex::new(Some(child)),
-            address,
-            token,
-            token_file: options.token_file.clone(),
-        };
-        worker.wait_until_healthy(HEALTH_TIMEOUT)?;
-        log::info!("local worker is healthy on {address}");
-        Ok(worker)
-    }
-
-    /// The WebSocket endpoint of the worker.
-    pub fn websocket_url(&self) -> String {
-        format!("ws://{}/ws", self.address)
-    }
-
-    /// The bearer token the worker accepts.
-    pub fn token(&self) -> &str {
-        &self.token
-    }
-
-    pub fn address(&self) -> SocketAddr {
-        self.address
-    }
-
-    fn wait_until_healthy(&self, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(status) = self.exit_status() {
-                return Err(LoomError::new(
-                    ErrorCode::ProviderUnavailable,
-                    format!(
-                        "the local worker exited during startup ({status}); see its log above. \
-                         An incompatible state database needs --reset-state."
-                    ),
-                    false,
-                ));
-            }
-            if health_ok(self.address) {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                self.stop();
-                return Err(LoomError::new(
-                    ErrorCode::DeadlineExceeded,
-                    format!(
-                        "the local worker did not answer /health within {}s",
-                        timeout.as_secs()
-                    ),
-                    true,
-                ));
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    fn exit_status(&self) -> Option<std::process::ExitStatus> {
-        let mut child = self.child.lock().ok()?;
-        child.as_mut()?.try_wait().ok().flatten()
-    }
-
-    /// Stops the worker: SIGTERM and a grace period on unix so it closes its
-    /// database cleanly, then a hard kill.
-    pub fn stop(&self) {
-        let Ok(mut guard) = self.child.lock() else {
-            return;
-        };
-        let Some(mut child) = guard.take() else {
-            return;
-        };
-        let _ = fs::remove_file(&self.token_file);
-        #[cfg(unix)]
-        if let Ok(pid) = i32::try_from(child.id()) {
-            // SAFETY: `kill` only signals the child this worker spawned and
-            // has not yet reaped, so the pid cannot have been reused.
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
-            let deadline = Instant::now() + SHUTDOWN_GRACE;
-            while Instant::now() < deadline {
-                if let Ok(Some(_)) = child.try_wait() {
-                    log::info!("local worker stopped");
-                    return;
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-            log::warn!("local worker did not stop within {SHUTDOWN_GRACE:?}; killing it");
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-}
-
-impl Drop for ManagedWorker {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-/// On Linux the child also receives SIGTERM when the client dies without
-/// running its destructors, so a crash does not leave a worker behind.
-#[cfg(target_os = "linux")]
-fn stop_with_parent(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    // SAFETY: the closure only calls the async-signal-safe `prctl`.
-    unsafe {
-        command.pre_exec(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-            Ok(())
-        });
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn stop_with_parent(_: &mut Command) {}
-
 pub(crate) fn free_loopback_port() -> Result<u16> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .map_err(|error| internal(format!("could not reserve a loopback port: {error}")))?;
@@ -798,55 +604,6 @@ pub(crate) fn free_loopback_port() -> Result<u16> {
         .local_addr()
         .map(|address| address.port())
         .map_err(|error| internal(format!("could not reserve a loopback port: {error}")))
-}
-
-/// A plain HTTP/1.0 probe of `/health`; the worker is on loopback without TLS,
-/// so no HTTP client is needed.
-fn health_ok(address: SocketAddr) -> bool {
-    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(1))
-    else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    if stream
-        .write_all(b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
-        .is_err()
-    {
-        return false;
-    }
-    let mut response = Vec::new();
-    let _ = stream.take(4096).read_to_end(&mut response);
-    let response = String::from_utf8_lossy(&response);
-    response
-        .lines()
-        .next()
-        .is_some_and(|status| status.split_whitespace().nth(1) == Some("200"))
-}
-
-/// Writes `contents` to `path` readable only by the owner, creating the parent
-/// as a private directory.
-fn write_private_file(path: &Path, contents: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        loom_core::create_private_dir(parent).map_err(|error| io_error("create", parent, error))?;
-    }
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .map_err(|error| io_error("write", path, error))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .map_err(|error| io_error("restrict", path, error))?;
-    }
-    file.write_all(contents.as_bytes())
-        .map_err(|error| io_error("write", path, error))
 }
 
 #[cfg(test)]

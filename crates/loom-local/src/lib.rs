@@ -1,11 +1,11 @@
 //! Native platform adapters: process arguments, workspace preparation, local
-//! credential storage, the WebSocket client transport, and the managed local
-//! worker.
+//! credential storage, the WebSocket client transport, and the workers a native
+//! client installs.
 //!
 //! This crate deliberately has no normal dependency on any backend crate. A
-//! native client runs its backend as a separate `loom-server` process that
-//! [`worker::ManagedWorker`] resolves (bundled, on `PATH`, cached, or downloaded
-//! from the latest release), starts on loopback, and stops again.
+//! native client runs its backend as a separate `loom-server` process: one the
+//! [`local`] installer runs as a user service on this machine, one provisioned
+//! over SSH, or one the user reaches by URL.
 
 #[cfg(test)]
 use std::{collections::BTreeMap, sync::Mutex};
@@ -20,6 +20,7 @@ use loom_model::{CredentialRef, GITHUB_COPILOT_DEFAULT_MODEL, ModelId};
 use sha2::{Digest, Sha256};
 
 mod connection;
+pub mod local;
 pub mod ssh;
 mod transport;
 pub mod worker;
@@ -33,7 +34,6 @@ pub use transport::{
     DEFAULT_MAX_FRAME_BYTES, MAX_FRAME_BYTES_ENV, WEBSOCKET_TLS_SUPPORTED, resolve_max_frame_bytes,
 };
 pub use transport::{WebSocketConnection, WebSocketTransport};
-pub use worker::{ManagedWorker, ManagedWorkerOptions};
 
 const PEER_CREDENTIAL_SERVICE: &str = "com.bearmuckle.loom.worker-peer";
 
@@ -167,10 +167,10 @@ pub struct UiOptions {
     pub model: ModelId,
     pub remote: Option<String>,
     pub token: Option<String>,
-    /// Passed to the managed local worker as `--reset-state`.
+    /// Delete the local worker's database when the setup installs it.
     pub reset_state: bool,
     /// `--server-binary` or `LOOM_SERVER_BINARY`: the `loom-server` executable
-    /// the managed local worker runs, skipping discovery and download.
+    /// the local install runs instead of downloading a release.
     pub server_binary: Option<PathBuf>,
     /// PEM file whose certificates are trusted in addition to the OS roots for
     /// `wss://` workers. `--ca` overrides the `LOOM_TLS_CA` environment
@@ -209,19 +209,19 @@ fn usage_text() -> String {
      \x20 --project PATH        open this directory as the workspace\n\
      \x20 --task DESCRIPTION    initial task description\n\
      \x20 --model ID            model id to use\n\
-     \x20 --remote URL          connect to a Loom worker instead of a local backend\n\
+     \x20 --remote URL          connect to this worker instead of the setup screen\n\
      \x20 --ca PATH             PEM file of additional trusted CAs for wss:// workers\n\
      \x20 --allow-insecure-remote\n\
      \x20                       allow plaintext ws:// to a non-loopback worker\n\
-     \x20 --server-binary PATH  loom-server executable for the local worker\n\
-     \x20 --reset-state         wipe an incompatible local state database\n\
+     \x20 --server-binary PATH  loom-server executable the local install runs\n\
+     \x20 --reset-state         delete the local worker database during install\n\
      \x20 -h, --help            print this help and exit\n\
      \x20 -V, --version         print the version and exit\n\
      \n\
      LOOM_TLS_CA names the same PEM file as --ca when the flag is not given, and\n\
      LOOM_SERVER_BINARY names the same executable as --server-binary. Without\n\
-     --remote the client starts a local loom-server worker: a bundled or PATH\n\
-     binary, else a cached or downloaded release."
+     --remote the client connects to the worker it set up last time, or shows the\n\
+     setup screen to install a worker on this machine or reach an existing one."
         .to_owned()
 }
 
@@ -418,8 +418,8 @@ pub fn prepare_workspace(options: &UiOptions) -> Result<PathBuf, LoomError> {
     default_project_root(env::current_dir(), &canonical_state_directory())
 }
 
-/// The state database the managed local worker keeps, shared across
-/// workspaces and unchanged from when the client embedded its backend.
+/// The state database the local worker keeps, shared across workspaces and
+/// unchanged from when the client embedded its backend.
 pub fn backend_persistence_path() -> PathBuf {
     loom_core::state_dir().join("state.db")
 }

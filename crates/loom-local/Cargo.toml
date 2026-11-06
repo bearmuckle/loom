@@ -1,6 +1,6 @@
 [package]
 name = "loom-local"
-description = "Native launcher and local backend embedding for Loom clients."
+description = "Native adapters and worker installer for Loom clients."
 version.workspace = true
 edition.workspace = true
 license = "AGPL-3.0-only"
