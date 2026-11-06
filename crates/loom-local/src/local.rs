@@ -686,7 +686,7 @@ fn wait_until_healthy(paths: &LocalWorkerPaths, port: u16, timeout: Duration) ->
                 ErrorCode::DeadlineExceeded,
                 format!(
                     "the local worker did not answer /health on 127.0.0.1:{port} within {}s; \
-                     see '{}'",
+                     see '{}' or `journalctl --user -u {SERVICE_NAME}`",
                     timeout.as_secs(),
                     paths.log().display()
                 ),

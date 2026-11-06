@@ -29,7 +29,10 @@ environment.
   supervises the worker and linger is enabled, so it starts at boot and
   survives a reboot. The client only connects to it and never stops it.
   Without a user systemd the worker runs as a detached process with a pidfile
-  under `<state-dir>/local-worker/`, which does not survive a reboot.
+  under `<state-dir>/local-worker/`, which does not survive a reboot. The
+  service inherits the systemd user environment, not the shell that launched
+  the client: put `LOOM_*` provider variables in the unit or in
+  `systemctl --user set-environment`, or configure providers in the client.
 - The client remembers the worker it set up, including a remote worker's URL
   and token, and reconnects on later launches. `--remote` overrides that.
 
