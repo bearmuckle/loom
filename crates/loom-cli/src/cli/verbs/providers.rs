@@ -1,8 +1,12 @@
-//! Provider verbs: list the worker's providers, and store an API key.
+//! Provider verbs: list the worker's providers and their models, and store an
+//! API key.
 //!
-//! `providers list` is a read. It prints whether each provider has a credential
-//! and whether it accepts an API key, and it never prints a secret or the
-//! opaque credential reference. `providers set-key` sends
+//! `providers list` is a read. It prints each provider as
+//! `id=<id> kind=<kind> credential=<true|false> api-key-configurable=<true|false>`
+//! and never prints a secret or the opaque credential reference. `models list`
+//! is a read as well: it prints `provider=<id> model=<id> default=<true|false>`
+//! for every model of every configured provider, or of one `--provider`, and
+//! marks exactly one default per provider. `providers set-key` sends
 //! `Provider/ConfigureApiKeyProvider`, the same request the settings screen
 //! sends, and reads the key from an environment variable or a file so the key
 //! never appears on the command line. The worker stores the secret in its own
@@ -10,7 +14,10 @@
 
 use std::{env, fs, io::Write, path::Path};
 
-use loom_model::ProviderSummary;
+use loom_model::{
+    DEEPSEEK_DEFAULT_MODEL, GITHUB_COPILOT_DEFAULT_MODEL, ModelDescriptor, OPENAI_DEFAULT_MODEL,
+    ProviderKind, ProviderSummary,
+};
 use loom_protocol::{ClientRequest, ProviderRequest, ProviderResponse, ServerResponse};
 use serde_json::{Value, json};
 
@@ -42,6 +49,52 @@ pub(super) async fn list<C: Client>(
     }
     Ok(Outcome::new(
         json!({ "providers": providers.iter().map(provider_value).collect::<Vec<_>>() }),
+        caller.primary,
+    ))
+}
+
+/// `models list`: the models of the configured providers, or of one exact
+/// provider when `--provider` is given.
+///
+/// A provider id the worker does not have is not an error: the answer is an
+/// empty `models` array and exit `0`. Exactly one model per provider is marked
+/// `default`; the declared default of the provider kind wins when that model is
+/// present, otherwise the first model in sorted order is marked.
+pub(super) async fn models<C: Client>(
+    client: &mut C,
+    invocation: &Invocation,
+    filter: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<Outcome, Failure> {
+    let mut caller = Caller::new(client);
+    handshake(&mut caller, &invocation.verb).await?;
+    let (request_id, response) = caller
+        .call(ClientRequest::Provider(ProviderRequest::ListProviders))
+        .await?;
+    let providers = match response {
+        ServerResponse::Provider(ProviderResponse::Providers { providers }) => providers,
+        _ => return Err(Failure::unexpected(request_id, "provider list")),
+    };
+    let mut listed = providers
+        .iter()
+        .filter(|provider| filter.is_none_or(|id| provider.id.as_str() == id))
+        .collect::<Vec<_>>();
+    listed.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+    let mut payload = Vec::new();
+    for provider in listed {
+        let mut models = provider.models.iter().collect::<Vec<_>>();
+        models.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        let default = default_model(provider, &models);
+        for model in models {
+            let is_default = default == Some(model.id.as_str());
+            if !invocation.globals.json {
+                emit(out, &model_line(provider, model, is_default))?;
+            }
+            payload.push(model_value(provider, model, is_default));
+        }
+    }
+    Ok(Outcome::new(
+        json!({ "provider": filter, "models": payload }),
         caller.primary,
     ))
 }
@@ -87,12 +140,58 @@ pub(super) async fn set_key<C: Client>(
 
 fn provider_line(provider: &ProviderSummary) -> String {
     format!(
-        "{} {} credential {} api-key {}",
+        "id={} kind={} credential={} api-key-configurable={}",
         provider.id.as_str(),
         kind_name(provider),
         flag(provider.credential_id.is_some()),
         flag(provider.api_key_configurable),
     )
+}
+
+fn model_line(provider: &ProviderSummary, model: &ModelDescriptor, default: bool) -> String {
+    format!(
+        "provider={} model={} default={}\n",
+        provider.id.as_str(),
+        model.id.as_str(),
+        flag(default),
+    )
+}
+
+fn model_value(provider: &ProviderSummary, model: &ModelDescriptor, default: bool) -> Value {
+    json!({
+        "provider": provider.id.as_str(),
+        "id": model.id.as_str(),
+        "display_name": model.display_name,
+        "default": default,
+        "context_window": model.context_window,
+        "max_output_tokens": model.max_output_tokens,
+    })
+}
+
+/// The model id a provider marks as its default: the kind's declared default
+/// when that model is present, otherwise the first model of the sorted list.
+/// `None` when the provider lists no model, so no default is invented.
+fn default_model<'a>(
+    provider: &ProviderSummary,
+    models: &[&'a ModelDescriptor],
+) -> Option<&'a str> {
+    if let Some(declared) = declared_default(provider.kind)
+        && models.iter().any(|model| model.id.as_str() == declared)
+    {
+        return Some(declared);
+    }
+    models.first().map(|model| model.id.as_str())
+}
+
+/// The default model a provider kind declares. The local runtimes and the
+/// deterministic demo declare none, so their first model is marked instead.
+fn declared_default(kind: ProviderKind) -> Option<&'static str> {
+    match kind {
+        ProviderKind::DeepSeek => Some(DEEPSEEK_DEFAULT_MODEL),
+        ProviderKind::OpenAi | ProviderKind::OpenAiCompatible => Some(OPENAI_DEFAULT_MODEL),
+        ProviderKind::GitHubCopilot => Some(GITHUB_COPILOT_DEFAULT_MODEL),
+        ProviderKind::Deterministic | ProviderKind::Ollama => None,
+    }
 }
 
 fn provider_value(provider: &ProviderSummary) -> Value {
@@ -149,4 +248,30 @@ fn read_key_file(path: &Path) -> Result<String, Failure> {
         Some(trimmed) => trimmed.strip_suffix('\r').unwrap_or(trimmed).to_owned(),
         None => text,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use loom_model::{
+        DEEPSEEK_DEFAULT_MODEL, GITHUB_COPILOT_DEFAULT_MODEL, OPENAI_DEFAULT_MODEL, ProviderKind,
+    };
+
+    use super::declared_default;
+
+    #[test]
+    fn each_provider_kind_declares_its_default_model_or_none() {
+        for (kind, expected) in [
+            (ProviderKind::DeepSeek, Some(DEEPSEEK_DEFAULT_MODEL)),
+            (ProviderKind::OpenAi, Some(OPENAI_DEFAULT_MODEL)),
+            (ProviderKind::OpenAiCompatible, Some(OPENAI_DEFAULT_MODEL)),
+            (
+                ProviderKind::GitHubCopilot,
+                Some(GITHUB_COPILOT_DEFAULT_MODEL),
+            ),
+            (ProviderKind::Deterministic, None),
+            (ProviderKind::Ollama, None),
+        ] {
+            assert_eq!(declared_default(kind), expected, "{kind:?}");
+        }
+    }
 }

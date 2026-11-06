@@ -48,6 +48,7 @@ The examples below use the installed binary name. In a checkout, replace
 | `retention get` | The worker-wide archive-retention policy, with a disabled window as `off`. |
 | `retention set [--window <duration>] [--force-discard <bool>] [--sub-agent <duration>]` | Merge the given fields into the stored worker-wide archive-retention policy. |
 | `providers list` | Configured providers, and whether each has a credential. No secrets. |
+| `models list [--provider <id>]` | The models of the configured providers, one default per provider. No secrets. |
 | `providers set-key --provider <id> (--from-env <NAME> \| --key-file <path>)` | Store an API key for `openai`, `deepseek`, or an OpenAI-compatible provider. |
 | `delete <session-id> [--force] [--yes] [--request-id <uuid>]` | Permanently delete an archived session, or a project root with its descendants; the same operation as `session delete`. |
 | `session archive <session-id> [--yes] [--request-id <uuid>]` | Archive one session, and the live descendants of a project root that cascades; every checkout is kept. |
@@ -68,14 +69,14 @@ The examples below use the installed binary name. In a checkout, replace
 | `project worktree cleanup <session-id> --task <task-id> (--keep \| --remove \| --discard) [--yes] [--request-id <uuid>]` | Keep or remove the checkout recorded for one delegated task. |
 
 `node`, `whoami`, `ls`, `get`, `events`, `peek`, `retention get`, `providers
-list`, and every `project` read are read-only, issue no mutation, and work with
-a read-only-scoped token. `run` starts a run; `send`, `project send`, `answer`,
-`approve`, `deny`, and `stop` control one; `wait`, `status`, `liveness`, and
-`result` read one. `retention set`, `providers set-key`, `session archive`,
-`session delete` (and its `delete` alias), `project archive`, `project delete`,
-`project worktree integrate`, and `project worktree cleanup` are operator-level
-mutations. No verb waits for a run except `wait`, which is always bounded by
-`--timeout`.
+list`, `models list`, and every `project` read are read-only, issue no mutation,
+and work with a read-only-scoped token. `run` starts a run; `send`,
+`project send`, `answer`, `approve`, `deny`, and `stop` control one; `wait`,
+`status`, `liveness`, and `result` read one. `retention set`, `providers
+set-key`, `session archive`, `session delete` (and its `delete` alias), `project
+archive`, `project delete`, `project worktree integrate`, and `project worktree
+cleanup` are operator-level mutations. No verb waits for a run except `wait`,
+which is always bounded by `--timeout`.
 
 Every verb negotiates only the capabilities its own requests need. `doctor`
 reports the intersection the worker granted, so its capability list is the
@@ -264,8 +265,9 @@ the tool call id in the `--json` envelope. It does not wait for a person to
 decide. The timeout covers only a run that is still working, and a run parked
 on a question or approval is likewise reported at once by `--until terminal`,
 because it cannot reach a terminal state without a decision. `--until terminal`
-exits `0` for `completed` and non-zero for `failed` and `cancelled`; the
-envelope's `state` distinguishes them.
+exits `0` for every terminal state, whether the run `completed`, `failed`, or
+was `cancelled`; `data.state` and `terminal: true` distinguish them, so a
+caller reads the outcome from the envelope instead of the exit code.
 
 `status --format verb` prints the declaration grammar the rest of the ecosystem
 uses: `working: …`, `blocked: …`, `paused: …`, `done: …`, or `failed: …`, each
@@ -469,18 +471,51 @@ stored policy plus `applies_from: "next_sweep"`.
 
 ## Providers
 
-`providers list` prints one line per provider the worker has registered:
+`providers list` prints one line per provider the worker has registered, with
+labeled fields:
 
 ```text
-openai open_ai credential false api-key true
-deepseek deepseek credential false api-key true
-openai-compatible open_ai_compatible credential true api-key true
+id=openai kind=open_ai credential=false api-key-configurable=true
+id=deepseek kind=deepseek credential=false api-key-configurable=true
+id=openai-compatible kind=open_ai_compatible credential=true api-key-configurable=true
 ```
 
-`credential` is whether a credential reference is stored. `api-key` is whether
-`providers set-key` can attach a key. The line never includes the secret or the
-credential reference. `--json` is
+`credential` is whether a credential reference is stored.
+`api-key-configurable` is whether `providers set-key` can attach a key. The line
+never includes the secret or the credential reference. `--json` is
 `{"providers":[{"id","kind","display_name","has_credential","api_key_configurable"}]}`.
+A caller that needs a field without parsing this line should use `--json`.
+
+### `models list`
+
+`models list` reads the same `Provider/ListProviders` response and reports every
+model the configured providers expose, so it needs `list_providers` as well and
+works with a read-only-scoped token. The text line is:
+
+```text
+provider=<provider-id> model=<model-id> default=<true|false>
+```
+
+```text
+provider=deepseek model=deepseek-flash default=true
+provider=deepseek model=deepseek-test default=false
+provider=openai model=gpt-6-luna default=true
+```
+
+`--provider <id>` keeps only that exact provider id; an id the worker does not
+have is an empty list with exit `0`, not an error. `--json` is
+`{"provider":<filter-or-null>,"models":[{"provider","id","display_name","default","context_window","max_output_tokens"}]}`,
+where an undeclared window or output limit is `null`. Only the model catalog is
+reported: no secret, credential reference, or health record is part of the
+answer.
+
+Exactly one model per provider is marked `default`. The provider kind's declared
+default wins when that model is present (`deepseek-flash` for `deepseek`,
+`gpt-6-luna` for `openai`, `openai-compatible`, and `github-copilot`); otherwise
+the first model in sorted order is marked. The models are sorted by provider id
+and then by model id, and a provider that declares no default
+(`deterministic`, `ollama`) marks its first model, so two models are never
+marked.
 
 `providers set-key --provider <id>` stores a key for an API-key provider
 (`openai`, `deepseek`, or an OpenAI-compatible provider) by sending
@@ -502,8 +537,8 @@ record keeps only an opaque reference. `github-copilot` is not an API-key
 provider; `set-key` refuses it. A provider id the worker does not have is
 `not_found` (exit `5`).
 
-`providers list` needs `list_providers`. `providers set-key` needs
-`configure_providers`; a token without it exits `3`.
+`providers list` and `models list` need `list_providers`. `providers set-key`
+needs `configure_providers`; a token without it exits `3`.
 
 ## Session and project lifecycle
 

@@ -395,6 +395,10 @@ fn run_value(run: &AgentRunSnapshot) -> Value {
 }
 
 /// `wait`: poll until the run blocks or reaches a terminal state.
+///
+/// A blocked observation is exit `3`; any terminal state is exit `0`, whether
+/// the run completed, failed, or was cancelled, because `data.state` (and the
+/// text line) names the outcome. The deadline is exit `4`.
 pub(super) async fn wait<C: Client>(
     client: &mut C,
     invocation: &Invocation,
@@ -432,14 +436,7 @@ pub(super) async fn wait<C: Client>(
         if blocked || terminal {
             let revision = revision(&mut caller, active.run.id).await?;
             let tool_call_id = active.pending_approval.as_ref().map(|call| call.id);
-            let code = if terminal {
-                match state {
-                    loom_protocol::AgentRunState::Completed => exit::OK,
-                    _ => exit::INTERNAL,
-                }
-            } else {
-                exit::BLOCKED
-            };
+            let code = wait_exit_code(state);
             if !invocation.globals.json {
                 emit(
                     out,
@@ -495,6 +492,17 @@ fn wait_deadline<C: Client>(
             until_name(until)
         ),
     })
+}
+
+/// The exit code an observed run state reports: a pending approval or question
+/// is `3`, and every terminal state is `0` whatever the run outcome, because
+/// the reported state distinguishes completed, failed, and cancelled.
+fn wait_exit_code(state: loom_protocol::AgentRunState) -> i32 {
+    match state {
+        loom_protocol::AgentRunState::AwaitingApproval
+        | loom_protocol::AgentRunState::NeedsInput => exit::BLOCKED,
+        _ => exit::OK,
+    }
 }
 
 fn until_name(until: WaitUntil) -> &'static str {
@@ -1151,10 +1159,26 @@ async fn session_projection<C: Client>(
 #[cfg(test)]
 mod tests {
     use loom_core::{AgentSessionState, DelegatedTaskStatus, ProjectWorktreeStatus};
+    use loom_protocol::AgentRunState;
 
+    use crate::cli::exit;
     use crate::cli::text::{task_status_name, worktree_status_name};
 
-    use super::{agent_verdict, project_verdict};
+    use super::{agent_verdict, project_verdict, wait_exit_code};
+
+    #[test]
+    fn a_terminal_wait_is_success_and_a_blocked_wait_is_blocked() {
+        for state in [
+            AgentRunState::Completed,
+            AgentRunState::Failed,
+            AgentRunState::Cancelled,
+        ] {
+            assert_eq!(wait_exit_code(state), exit::OK, "{state:?}");
+        }
+        for state in [AgentRunState::AwaitingApproval, AgentRunState::NeedsInput] {
+            assert_eq!(wait_exit_code(state), exit::BLOCKED, "{state:?}");
+        }
+    }
 
     #[test]
     fn every_session_state_has_a_verdict_word() {

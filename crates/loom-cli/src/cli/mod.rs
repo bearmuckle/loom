@@ -28,6 +28,7 @@
 //! | `retention get` | `Control/GetArchiveRetentionPolicy` |
 //! | `retention set` | `Control/GetArchiveRetentionPolicy`, `Control/SetArchiveRetentionPolicy` |
 //! | `providers list` | `Provider/ListProviders` |
+//! | `models list` | `Provider/ListProviders` |
 //! | `providers set-key` | `Provider/ConfigureApiKeyProvider` |
 //! | `delete` | `Project/GetProjectSnapshotForSession`, `Session/DeleteAgentSession` |
 //! | `session archive` | `Project/GetProjectSnapshotForSession`, `Session/ArchiveAgentSession` |
@@ -71,8 +72,9 @@
 //! Every verb first sends `Control/Negotiate` with the version this build
 //! speaks and with only the capabilities it uses, because a worker refuses an
 //! unnegotiated connection. `node`, `whoami`, `ls`, `get`, `events`, `peek`,
-//! `retention get`, `providers list`, and every `project` read are the read-only
-//! verbs: they send nothing that mutates and negotiate only the capabilities
+//! `retention get`, `providers list`, `models list`, and every `project` read
+//! are the read-only verbs: they send nothing that mutates and negotiate only
+//! the capabilities
 //! their reads need, so a read-only-scoped token can run them. `retention set`,
 //! `providers set-key`, and `delete` are operator-level mutations: a token
 //! without `configure_archive_retention`, `configure_providers`, or
@@ -121,9 +123,19 @@
 //! the project and the manager session from the snapshot by `--task`.
 //!
 //! `node` prints one line per field of `WorkerNodeStatus`, with absent health
-//! samples as `unknown`. `providers list` prints one line per provider (`id`,
-//! `kind`, `credential`, `api-key`) and never a secret or a credential
-//! reference. `providers set-key` reads the key from `--from-env` or
+//! samples as `unknown`. `providers list` prints one line per provider with the
+//! labeled fields `id`, `kind`, `credential`, and `api-key-configurable`, and
+//! never a secret or a credential reference. `models list` prints one line per
+//! model as `provider=<provider-id> model=<model-id> default=<true|false>` for
+//! every configured provider, or for the one `--provider` id, and marks exactly
+//! one default per provider: the provider kind's declared default when that
+//! model is present, otherwise the first model in sorted order. A `--provider`
+//! id the worker does not have is an empty list with exit `0`, not an error.
+//! Its `--json` payload is `provider` (the filter or `null`) and `models`, whose
+//! entries carry `provider`, `id`, `display_name`, `default`, `context_window`,
+//! and `max_output_tokens`.
+//!
+//! `providers set-key` reads the key from `--from-env` or
 //! `--key-file` and sends `Provider/ConfigureApiKeyProvider`; the worker stores
 //! the secret, and the command prints only `provider <id> credential set`.
 //! `retention get` prints `window`, `force-discard`, and
@@ -252,8 +264,10 @@
 //! time-bounded: `--timeout` (60 seconds by default) ends the poll with
 //! `deadline_exceeded` and exit `4`. A run parked on an approval or a question
 //! is reported at once with exit `3`, and the `--json` envelope carries the
-//! attempt id and, for an approval, the tool call id. The timeout therefore
-//! covers only a run that is still working, never a person's decision.
+//! attempt id and, for an approval, the tool call id. Any terminal state is
+//! reported at once with exit `0`, whether the run completed, failed, or was
+//! cancelled: `data.state` and `terminal: true` name the outcome. The timeout
+//! therefore covers only a run that is still working, never a person's decision.
 //!
 //! `status` derives its declaration from the run state: `working` for planning,
 //! executing, and evaluating, `blocked` for awaiting approval and needs input,
@@ -327,9 +341,10 @@
 //!
 //! A verb whose documented exit code reports something other than success is
 //! still a successful determination: a blocked `wait` is `ok:true` with exit
-//! `3`, and a `liveness` verdict of `gone` or `unknown` is `ok:true` with exit
-//! `5` or `7`. The `data` payload carries the verdict, state, attempt id, and
-//! tool call id, so a caller never has to parse the message.
+//! `3`, a terminal `wait` is `ok:true` with exit `0` whatever the run outcome,
+//! and a `liveness` verdict of `gone` or `unknown` is `ok:true` with exit `5` or
+//! `7`. The `data` payload carries the verdict, state, attempt id, and tool call
+//! id, so a caller never has to parse the message.
 //!
 //! # Exit codes
 //!
