@@ -171,9 +171,42 @@ impl LoomView {
 
     #[cfg(not(target_family = "wasm"))]
     fn restore_worker_connection(&mut self, cx: &mut Context<Self>) {
+        // A native client restores the connection it started with: the worker
+        // installed on this machine, or the `--remote` endpoint. Without this,
+        // losing that connection left only a client restart, which then asked
+        // to install a worker that was already there.
+        if let Some(startup) = self.startup.clone() {
+            if startup.local
+                && let Err(error) = loom_local::local::ensure_running()
+            {
+                log::warn!(
+                    "[loom-ui] could not start the installed local worker: {}",
+                    error.message
+                );
+            }
+            match LoomView::bootstrap(
+                &startup.options,
+                &startup.url,
+                &startup.token,
+                startup.local,
+                self.composer_focus_handle.clone(),
+            ) {
+                Ok(mut rebuilt) => {
+                    rebuilt.startup = Some(startup);
+                    std::mem::swap(self, &mut rebuilt);
+                }
+                Err(error) => {
+                    if let Some(failure) = classify_connectivity_failure(&error) {
+                        self.record_connectivity_failure("reconnect", failure, &error);
+                    } else {
+                        self.record_backend_error("Reconnect", error);
+                    }
+                }
+            }
+            return;
+        }
         // The native client re-establishes its saved worker-node connections;
-        // the in-process backend needs no reconnect, and a stalled `--remote`
-        // main connection is reopened by restarting the client.
+        // the in-process backend needs no reconnect.
         self.reconnect_configured_worker_nodes(cx);
         self.reload_sessions(cx);
     }

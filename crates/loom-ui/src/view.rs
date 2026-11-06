@@ -505,6 +505,9 @@ pub(crate) struct LoomView {
     /// The first-run worker setup, when no worker is connected yet.
     #[cfg(not(target_family = "wasm"))]
     setup: Option<crate::worker_setup::WorkerSetup>,
+    /// The connection to restore when the worker connection is lost.
+    #[cfg(not(target_family = "wasm"))]
+    startup: Option<crate::worker_setup::StartupConnection>,
     /// Keeps an in-process test backend alive for the view's lifetime.
     #[cfg(all(test, not(target_family = "wasm")))]
     owned_backend: Option<crate::local_backend::OwnedBackend>,
@@ -2096,6 +2099,7 @@ impl LoomView {
             backend,
             connection,
             setup: None,
+            startup: None,
             #[cfg(all(test, not(target_family = "wasm")))]
             owned_backend: None,
             server_protocol_version: None,
@@ -2331,6 +2335,7 @@ impl LoomView {
     /// A view that shows the first-run worker setup instead of a workspace.
     pub(crate) fn new_setup(
         options: &UiOptions,
+        existing: Option<crate::worker_setup::InitialWorker>,
         startup_error: Option<String>,
         focus_handle: FocusHandle,
     ) -> Self {
@@ -2347,6 +2352,7 @@ impl LoomView {
         );
         view.setup = Some(crate::worker_setup::WorkerSetup::new(
             options.clone(),
+            existing,
             startup_error,
         ));
         view

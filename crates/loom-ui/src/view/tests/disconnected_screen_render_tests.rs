@@ -300,7 +300,7 @@ fn the_setup_screen_offers_a_local_install_and_a_worker_url(cx: &mut TestAppCont
                     ca: None,
                     allow_insecure_remote: false,
                 };
-                LoomView::new_setup(&options, None, cx.focus_handle())
+                LoomView::new_setup(&options, None, None, cx.focus_handle())
             });
             SetupHost { view }
         });

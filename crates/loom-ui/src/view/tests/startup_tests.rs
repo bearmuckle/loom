@@ -45,7 +45,7 @@ fn a_native_client_without_a_worker_starts_on_the_setup_screen(cx: &mut gpui_kit
     };
     let mut created = None;
     let _handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
-        let view = cx.new(|cx| LoomView::new_setup(&options, None, cx.focus_handle()));
+        let view = cx.new(|cx| LoomView::new_setup(&options, None, None, cx.focus_handle()));
         created = Some(view.clone());
         ViewHost { view }
     });
@@ -81,6 +81,7 @@ fn a_setup_screen_keeps_the_reason_the_last_worker_failed(cx: &mut gpui_kit::Tes
         let view = cx.new(|cx| {
             LoomView::new_setup(
                 &options,
+                None,
                 Some("the worker is down".to_owned()),
                 cx.focus_handle(),
             )

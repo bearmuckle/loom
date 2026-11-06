@@ -367,7 +367,7 @@ pub fn cache_root() -> PathBuf {
 }
 
 /// Parses a release tag such as `v0.11.0` into a sortable triple.
-fn parse_tag(tag: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn parse_tag(tag: &str) -> Option<(u64, u64, u64)> {
     let mut parts = tag.strip_prefix('v')?.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;

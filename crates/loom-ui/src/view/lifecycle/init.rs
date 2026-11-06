@@ -56,6 +56,14 @@ impl LoomView {
         }
         if let Some(initial) = crate::worker_setup::load_initial_worker() {
             info!("connecting to the initial worker '{}'", initial.url);
+            if initial.local
+                && let Err(error) = loom_local::local::ensure_running()
+            {
+                log::warn!(
+                    "[loom-ui] could not start the installed local worker: {}",
+                    error.message
+                );
+            }
             let token = crate::worker_setup::initial_worker_token(&initial);
             match Self::bootstrap(
                 options,
@@ -73,6 +81,7 @@ impl LoomView {
                     );
                     return Ok(Self::new_setup(
                         options,
+                        Some(initial.clone()),
                         Some(worker_connection_failure_detail(
                             transport_failure_stage(&initial.url),
                             &error,
@@ -83,7 +92,7 @@ impl LoomView {
                 }
             }
         }
-        Ok(Self::new_setup(options, None, focus_handle))
+        Ok(Self::new_setup(options, None, None, focus_handle))
     }
 
     /// Connects to `url`, negotiates, and builds the connected view.
@@ -92,7 +101,7 @@ impl LoomView {
     /// the current directory and serves local folders; a worker elsewhere only
     /// attaches an explicit `--project`.
     #[cfg(not(target_family = "wasm"))]
-    fn bootstrap(
+    pub(crate) fn bootstrap(
         options: &UiOptions,
         url: &str,
         token: &str,
@@ -193,6 +202,12 @@ impl LoomView {
         }
         view.remote_options = remote_options;
         view.github_sign_in_available = offers_sign_in;
+        view.startup = Some(crate::worker_setup::StartupConnection {
+            url: url.to_owned(),
+            token: token.to_owned(),
+            local: local_worker,
+            options: options.clone(),
+        });
         Ok(view)
     }
 
@@ -281,6 +296,24 @@ impl LoomView {
             return;
         }
         self.connect_setup_target(url, token, false, cx);
+    }
+
+    /// Retries the worker this client was set up with.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn retry_initial_worker(&mut self, cx: &mut Context<Self>) {
+        let Some(existing) = self.setup.as_ref().and_then(|setup| setup.existing.clone()) else {
+            return;
+        };
+        if existing.local
+            && let Err(error) = loom_local::local::ensure_running()
+        {
+            log::warn!(
+                "[loom-ui] could not start the installed local worker: {}",
+                error.message
+            );
+        }
+        let token = crate::worker_setup::initial_worker_token(&existing);
+        self.connect_setup_target(existing.url, token, existing.local, cx);
     }
 
     /// Connects to `url` from the setup screen and replaces the view with the
@@ -398,6 +431,13 @@ impl LoomView {
                                 if !local {
                                     crate::worker_setup::save_initial_worker_token(&connect_token);
                                 }
+                                initialized.startup =
+                                    Some(crate::worker_setup::StartupConnection {
+                                        url: url.clone(),
+                                        token: connect_token.clone(),
+                                        local,
+                                        options: options.clone(),
+                                    });
                                 std::mem::swap(view, initialized);
                             }
                             Err(error) => view.fail_setup(stage, error, cx),
@@ -550,6 +590,8 @@ impl LoomView {
             connection: connection.clone(),
             #[cfg(not(target_family = "wasm"))]
             setup: None,
+            #[cfg(not(target_family = "wasm"))]
+            startup: None,
             #[cfg(all(test, not(target_family = "wasm")))]
             owned_backend: None,
             server_protocol_version,
@@ -1200,6 +1242,8 @@ impl LoomView {
             connection: connection.clone(),
             #[cfg(not(target_family = "wasm"))]
             setup: None,
+            #[cfg(not(target_family = "wasm"))]
+            startup: None,
             #[cfg(all(test, not(target_family = "wasm")))]
             owned_backend: None,
             server_protocol_version,

@@ -267,6 +267,7 @@ impl LoomView {
         let busy = setup.busy;
         let progress = setup.progress.clone();
         let error = setup.error.clone();
+        let existing = setup.existing.clone();
         let url_input = setup
             .url_input
             .clone()
@@ -305,15 +306,46 @@ impl LoomView {
                                 div()
                                     .text_lg()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Set up a worker"),
+                                    .child(if existing.is_some() {
+                                        "Worker not reachable"
+                                    } else {
+                                        "Set up a worker"
+                                    }),
                             )
                             .child(div().text_sm().text_color(rgb(0x8f98a6)).child(
-                                "Loom's client needs a worker to run sessions. Install one on \
-                                 this machine, or connect to a worker you already run.",
+                                match &existing {
+                                    Some(worker) => format!(
+                                        "Loom could not reach the worker you set up at {}. It may \
+                                         still be starting; retry, or reinstall it.",
+                                        worker.url
+                                    ),
+                                    None => "Loom's client needs a worker to run sessions. \
+                                             Install one on this machine, or connect to a worker \
+                                             you already run."
+                                        .to_owned(),
+                                },
                             ))
+                            .when_some(existing.clone(), |card, _| {
+                                card.child(
+                                    Button::new("worker-setup-retry")
+                                        .label("Retry")
+                                        .small()
+                                        .disabled(busy)
+                                        .when(layout.phone, |button| {
+                                            button.h(layout.control_size())
+                                        })
+                                        .on_click(cx.listener(|view, _, _, cx| {
+                                            view.retry_initial_worker(cx)
+                                        })),
+                                )
+                            })
                             .child(
                                 Button::new("worker-setup-install")
-                                    .label("Install a worker on this machine")
+                                    .label(if existing.is_some() {
+                                        "Reinstall or update the worker"
+                                    } else {
+                                        "Install a worker on this machine"
+                                    })
                                     .small()
                                     .disabled(busy)
                                     .when(layout.phone, |button| button.h(layout.control_size()))

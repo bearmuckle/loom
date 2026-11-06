@@ -21,6 +21,9 @@ use loom_local::UiOptions;
 pub(crate) struct WorkerSetup {
     /// The startup options the connected view is built from.
     pub(crate) options: UiOptions,
+    /// The worker this client was set up with, when startup could not reach it.
+    /// The screen then offers to retry that worker rather than to install one.
+    pub(crate) existing: Option<InitialWorker>,
     pub(crate) url_input: Option<Entity<InputState>>,
     pub(crate) token_input: Option<Entity<InputState>>,
     pub(crate) busy: bool,
@@ -29,9 +32,14 @@ pub(crate) struct WorkerSetup {
 }
 
 impl WorkerSetup {
-    pub(crate) fn new(options: UiOptions, startup_error: Option<String>) -> Self {
+    pub(crate) fn new(
+        options: UiOptions,
+        existing: Option<InitialWorker>,
+        startup_error: Option<String>,
+    ) -> Self {
         Self {
             options,
+            existing,
             url_input: None,
             token_input: None,
             busy: false,
@@ -39,6 +47,15 @@ impl WorkerSetup {
             error: startup_error,
         }
     }
+}
+
+/// The connection a native view restores when its worker connection is lost.
+#[derive(Clone)]
+pub(crate) struct StartupConnection {
+    pub(crate) url: String,
+    pub(crate) token: String,
+    pub(crate) local: bool,
+    pub(crate) options: UiOptions,
 }
 
 /// The worker this client connects to when `--remote` is not given.

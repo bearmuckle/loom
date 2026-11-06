@@ -217,9 +217,17 @@ fn install_and_start_at(
     }
 
     progress(InstallStep::Start);
-    let supervised = start_service(paths, &binary, &tag, options.port)?;
-    progress(InstallStep::Health);
-    wait_until_healthy(paths, options.port, HEALTH_TIMEOUT)?;
+    let supervised = if worker_is_running(options.port) && running_this_version(&binary) {
+        // The same release already serves this port: an install click is a
+        // reconnect, not a reason to drop every connection for a restart.
+        log::info!("local worker {tag} is already running");
+        true
+    } else {
+        let supervised = start_service(paths, &binary, &tag, options.port)?;
+        progress(InstallStep::Health);
+        wait_until_healthy(paths, options.port, HEALTH_TIMEOUT)?;
+        supervised
+    };
     log::info!(
         "local worker {tag} is running on 127.0.0.1:{} ({})",
         options.port,
@@ -245,6 +253,59 @@ pub fn worker_is_running(port: u16) -> bool {
 /// The token of an installed worker, when it can still be read.
 pub fn installed_token() -> Option<String> {
     read_token(&LocalWorkerPaths::for_state().token())
+}
+
+/// Starts the worker already installed on this machine, when one is installed.
+///
+/// `None` means no installed executable was found, so a first run still shows
+/// the setup screen; `Some` means the worker now answers `/health` with the
+/// token the client will present.
+pub fn ensure_running() -> Result<Option<InstalledWorker>> {
+    let paths = LocalWorkerPaths::for_state();
+    let Some(token) = read_token(&paths.token()) else {
+        return Ok(None);
+    };
+    let Some((binary, tag)) = installed_binary(&paths) else {
+        return Ok(None);
+    };
+    if worker_is_running(DEFAULT_PORT) {
+        return Ok(Some(InstalledWorker {
+            url: websocket_url(DEFAULT_PORT),
+            token,
+            tag,
+            supervised: true,
+        }));
+    }
+    let supervised = start_service(&paths, &binary, &tag, DEFAULT_PORT)?;
+    wait_until_healthy(&paths, DEFAULT_PORT, HEALTH_TIMEOUT)?;
+    Ok(Some(InstalledWorker {
+        url: websocket_url(DEFAULT_PORT),
+        token,
+        tag,
+        supervised,
+    }))
+}
+
+/// The newest executable installed below `<state>/server`.
+fn installed_binary(paths: &LocalWorkerPaths) -> Option<(PathBuf, String)> {
+    let entries = fs::read_dir(paths.state.join("server")).ok()?;
+    entries
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter_map(|tag| {
+            let version = crate::worker::parse_tag(&tag)?;
+            let binary = paths.binary(&tag);
+            binary.is_file().then_some((version, tag, binary))
+        })
+        .max_by_key(|(version, _, _)| *version)
+        .map(|(_, tag, binary)| (binary, tag))
+}
+
+/// Whether the running worker is this exact installed version, so an install
+/// of the same release can connect instead of restarting it.
+fn running_this_version(binary: &Path) -> bool {
+    fs::read_to_string(systemd_user_dir().join(SERVICE_NAME))
+        .map(|unit| unit.contains(&binary.display().to_string()))
+        .unwrap_or(false)
 }
 
 /// Stops a worker installed on this machine, if one is running.
@@ -477,9 +538,6 @@ fn user_systemd_available() -> bool {
 /// Starts the worker as a user service when the host has one, otherwise as a
 /// detached process. The result says which one supervised it.
 fn start_service(paths: &LocalWorkerPaths, binary: &Path, tag: &str, port: u16) -> Result<bool> {
-    // Stop whatever a previous install left running, so the port is free and
-    // the new binary is the one that answers.
-    stop_service(paths);
     if env::var_os(NO_SYSTEMD_ENV).is_none() && user_systemd_available() {
         let unit = systemd_user_dir().join(SERVICE_NAME);
         write_unit(&unit, binary, &paths.token(), &paths.persistence(), port)?;
@@ -492,7 +550,11 @@ fn start_service(paths: &LocalWorkerPaths, binary: &Path, tag: &str, port: u16) 
                 "could not enable lingering for this user; the worker starts at login, not at boot"
             );
         }
-        run_systemctl(&["restart", SERVICE_NAME])?;
+        run_systemctl(&["restart", SERVICE_NAME]).or_else(|restart_error| {
+            // A restart that stopped the unit but could not start it is worse
+            // than an older worker: try a plain start before reporting.
+            run_systemctl(&["start", SERVICE_NAME]).map_err(|_| restart_error)
+        })?;
         log::info!("local worker {tag} runs as {SERVICE_NAME}");
         return Ok(true);
     }
