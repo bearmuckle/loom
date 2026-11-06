@@ -87,6 +87,12 @@ Verbs:
                 [--sub-agent <duration>]
                                     store a worker-wide archive-retention
                                     policy; the next sweep applies it
+  providers list                    list configured providers and whether
+                                    each has a credential; prints no secrets
+  providers set-key --provider <id>
+            (--from-env <NAME> | --key-file <path>)
+                                    store an API key for openai, deepseek, or
+                                    an openai-compatible provider
   session archive <session-id> [--yes] [--request-id <uuid>]
                                     archive one session, keeping its
                                     transcript, checkpoints, and every
@@ -261,7 +267,9 @@ Global flags, accepted anywhere as --flag value or --flag=value:
   --help, -h                  print this help
 
 The token is read from a file only: --token is rejected, because a token on a
-command line is visible to every process on the node.
+command line is visible to every process on the node. A provider API key is
+read from the environment or a file only: --key is rejected for the same
+reason.
 
 Exit codes: 0 ok, 1 internal, 2 usage, 3 blocked, 4 timeout, 5 not found or
 gone, 6 protocol or auth mismatch, 7 transport unreachable.
@@ -364,6 +372,22 @@ pub(crate) struct RunArgs {
     /// `--new`: create a session unconditionally instead of reusing one by
     /// name.
     pub new: bool,
+}
+
+/// Where `providers set-key` reads the API key. The secret itself is not stored
+/// here: the verb reads it when it runs, so a debug print of the parsed command
+/// cannot contain the key.
+#[derive(Clone, Debug)]
+pub(crate) enum ProviderKeySource {
+    Env(String),
+    File(PathBuf),
+}
+
+/// The flags of `providers set-key`.
+#[derive(Clone, Debug)]
+pub(crate) struct ProviderSetKeyArgs {
+    pub provider: String,
+    pub source: ProviderKeySource,
 }
 
 /// The flags of `retention set`.
@@ -475,6 +499,8 @@ pub(crate) enum Verb {
     },
     RetentionGet,
     RetentionSet(RetentionSetArgs),
+    ProvidersList,
+    ProvidersSetKey(ProviderSetKeyArgs),
     /// `session archive`: archive one session, and its descendants when the id
     /// is a project root that cascades. `yes` acknowledges that cascade.
     SessionArchive {
@@ -650,6 +676,8 @@ pub(crate) fn verb_name(verb: &Verb) -> &'static str {
         Verb::Result { .. } => "result",
         Verb::RetentionGet => "retention get",
         Verb::RetentionSet(_) => "retention set",
+        Verb::ProvidersList => "providers list",
+        Verb::ProvidersSetKey(_) => "providers set-key",
         Verb::SessionArchive { .. } => "session archive",
         Verb::SessionDelete { .. } => "session delete",
         Verb::ProjectArchive { .. } => "project archive",
@@ -706,6 +734,7 @@ pub(crate) fn named_verb(arguments: &[String]) -> &'static str {
             "liveness" => "liveness",
             "result" => "result",
             "retention" => "retention",
+            "providers" => "providers",
             "delete" => "delete",
             "session" => "session",
             "project" => "project",
@@ -726,6 +755,7 @@ fn arity(name: &str) -> Option<bool> {
         | "--as-directory" | "--approval-policy" | "--request-id" | "--text-file" => true,
         "--run" | "--text" | "--tool-call" | "--reason" | "--until" | "--timeout" => true,
         "--window" | "--force-discard" | "--sub-agent" => true,
+        "--provider" | "--from-env" | "--key-file" | "--key" | "--api-key" => true,
         "--expected-parent-revision" => true,
         "--new" | "--archive" | "--retry-on-conflict" | "--force" | "--yes" | "--tree" => false,
         "--keep" | "--remove" | "--discard" => false,
@@ -1024,6 +1054,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
             }
         }
         "retention" => parse_retention(&mut flags, rest)?,
+        "providers" => parse_providers(&mut flags, rest)?,
         "session" => parse_session(&mut flags, rest)?,
         "project" => parse_project(&mut flags, rest)?,
         "delete" => {
@@ -1080,6 +1111,13 @@ fn split(arguments: &[String]) -> Result<(Vec<Flag>, Vec<String>), String> {
             return Err(
                 "the token must come from a file: --token is not accepted, use \
                  --token-file <path> or LOOM_TOKEN_FILE"
+                    .to_owned(),
+            );
+        }
+        if name == "--key" || name == "--api-key" {
+            return Err(
+                "a provider API key must not be passed on the command line; use \
+                 --from-env <NAME> or --key-file <path>"
                     .to_owned(),
             );
         }
@@ -1175,6 +1213,82 @@ fn parse_retention(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String>
             "unknown retention sub-verb '{other}'; use get or set"
         )),
     }
+}
+
+/// The `providers` sub-verbs. `list` takes no flags. `set-key` takes the
+/// provider id and exactly one of `--from-env` or `--key-file`.
+fn parse_providers(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
+    let Some(sub_verb) = rest.first() else {
+        return Err("providers requires 'list' or 'set-key'".to_owned());
+    };
+    if rest.len() > 1 {
+        return Err(format!("providers takes one sub-verb, got '{}'", rest[1]));
+    }
+    flags.verb = format!("providers {sub_verb}");
+    match sub_verb.as_str() {
+        "list" => Ok(Verb::ProvidersList),
+        "set-key" => {
+            let provider = provider_id(&flags.required("--provider")?)?;
+            let from_env = flags.value("--from-env");
+            let key_file = flags.value("--key-file");
+            let source = match (from_env, key_file) {
+                (Some(name), None) => ProviderKeySource::Env(env_var_name(&name)?),
+                (None, Some(path)) => {
+                    if path.trim().is_empty() {
+                        return Err("--key-file requires a path".to_owned());
+                    }
+                    ProviderKeySource::File(PathBuf::from(path))
+                }
+                (Some(_), Some(_)) => {
+                    return Err(
+                        "providers set-key accepts --from-env or --key-file, not both".to_owned(),
+                    );
+                }
+                (None, None) => {
+                    return Err(
+                        "providers set-key requires --from-env <NAME> or --key-file <path>"
+                            .to_owned(),
+                    );
+                }
+            };
+            Ok(Verb::ProvidersSetKey(ProviderSetKeyArgs {
+                provider,
+                source,
+            }))
+        }
+        other => Err(format!(
+            "unknown providers sub-verb '{other}'; use list or set-key"
+        )),
+    }
+}
+
+/// A provider id is the worker's id, such as `openai`. Blank is a usage error;
+/// the worker decides whether the id names an API-key provider.
+fn provider_id(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("--provider must not be empty".to_owned());
+    }
+    Ok(value.to_owned())
+}
+
+/// `--from-env` names a variable. The name is checked here so a typo fails
+/// before the process environment is read, and the value is never parsed as
+/// part of the command line.
+fn env_var_name(value: &str) -> Result<String, String> {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return Err("--from-env requires a variable name".to_owned());
+    };
+    if !(first.is_ascii_alphabetic() || first == '_')
+        || chars.any(|character| !(character.is_ascii_alphanumeric() || character == '_'))
+    {
+        return Err(format!(
+            "'{value}' is not an environment variable name; --from-env takes a name such as \
+             OPENAI_API_KEY"
+        ));
+    }
+    Ok(value.to_owned())
 }
 
 /// The `session` sub-verbs: `archive` keeps a session and its checkouts,

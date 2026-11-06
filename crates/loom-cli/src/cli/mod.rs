@@ -27,6 +27,8 @@
 //! | `result` | `Repository/ListSessionRepositories`, `Repository/GetSessionVcsStatus`, `Repository/GetSessionVcsDiff`, `Task/GetSessionTaskEvidence` |
 //! | `retention get` | `Control/GetArchiveRetentionPolicy` |
 //! | `retention set` | `Control/GetArchiveRetentionPolicy`, `Control/SetArchiveRetentionPolicy` |
+//! | `providers list` | `Provider/ListProviders` |
+//! | `providers set-key` | `Provider/ConfigureApiKeyProvider` |
 //! | `delete` | `Project/GetProjectSnapshotForSession`, `Session/DeleteAgentSession` |
 //! | `session archive` | `Project/GetProjectSnapshotForSession`, `Session/ArchiveAgentSession` |
 //! | `session delete` | `Project/GetProjectSnapshotForSession`, `Session/DeleteAgentSession` |
@@ -69,10 +71,11 @@
 //! Every verb first sends `Control/Negotiate` with the version this build
 //! speaks and with only the capabilities it uses, because a worker refuses an
 //! unnegotiated connection. `node`, `whoami`, `ls`, `get`, `events`, `peek`,
-//! `retention get`, and every `project` read are the read-only verbs: they send
-//! nothing that mutates and negotiate only the capabilities their reads need, so
-//! a read-only-scoped token can run them. `retention set` and `delete` are
-//! operator-level mutations: a token without `configure_archive_retention` or
+//! `retention get`, `providers list`, and every `project` read are the read-only
+//! verbs: they send nothing that mutates and negotiate only the capabilities
+//! their reads need, so a read-only-scoped token can run them. `retention set`,
+//! `providers set-key`, and `delete` are operator-level mutations: a token
+//! without `configure_archive_retention`, `configure_providers`, or
 //! `delete_agent_session` is refused at negotiation with exit `3`.
 //!
 //! `session archive`, `session delete` (and its `delete` alias), `project
@@ -118,7 +121,12 @@
 //! the project and the manager session from the snapshot by `--task`.
 //!
 //! `node` prints one line per field of `WorkerNodeStatus`, with absent health
-//! samples as `unknown`. `retention get` prints `window`, `force-discard`, and
+//! samples as `unknown`. `providers list` prints one line per provider (`id`,
+//! `kind`, `credential`, `api-key`) and never a secret or a credential
+//! reference. `providers set-key` reads the key from `--from-env` or
+//! `--key-file` and sends `Provider/ConfigureApiKeyProvider`; the worker stores
+//! the secret, and the command prints only `provider <id> credential set`.
+//! `retention get` prints `window`, `force-discard`, and
 //! `sub-agent`, with a disabled window as `off`. `retention set` merges the
 //! flags it was given into the policy the worker already stores (a flag that is
 //! absent keeps its stored value), and reports the stored result followed by

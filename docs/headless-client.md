@@ -47,6 +47,8 @@ The examples below use the installed binary name. In a checkout, replace
 | `result --session <id> [--task <id>]` | Branch, head, diffstat, changed paths, and task evidence. |
 | `retention get` | The worker-wide archive-retention policy, with a disabled window as `off`. |
 | `retention set [--window <duration>] [--force-discard <bool>] [--sub-agent <duration>]` | Merge the given fields into the stored worker-wide archive-retention policy. |
+| `providers list` | Configured providers, and whether each has a credential. No secrets. |
+| `providers set-key --provider <id> (--from-env <NAME> \| --key-file <path>)` | Store an API key for `openai`, `deepseek`, or an OpenAI-compatible provider. |
 | `delete <session-id> [--force] [--yes] [--request-id <uuid>]` | Permanently delete an archived session, or a project root with its descendants; the same operation as `session delete`. |
 | `session archive <session-id> [--yes] [--request-id <uuid>]` | Archive one session, and the live descendants of a project root that cascades; every checkout is kept. |
 | `session delete <session-id> [--force] [--yes] [--request-id <uuid>]` | Permanently delete an archived session, or a project root with its descendants. |
@@ -65,14 +67,15 @@ The examples below use the installed binary name. In a checkout, replace
 | `project worktree integrate <session-id> --task <task-id> [--expected-parent-revision <rev>] [--request-id <uuid>]` | Fast-forward the parent with the task's result revision; a conflict is reported, never retried. |
 | `project worktree cleanup <session-id> --task <task-id> (--keep \| --remove \| --discard) [--yes] [--request-id <uuid>]` | Keep or remove the checkout recorded for one delegated task. |
 
-`node`, `whoami`, `ls`, `get`, `events`, `peek`, `retention get`, and every
-`project` read are read-only, issue no mutation, and work with a read-only-scoped
-token. `run` starts a run; `send`, `project send`, `answer`, `approve`, `deny`,
-and `stop` control one; `wait`, `status`, `liveness`, and `result` read one.
-`retention set`, `session archive`, `session delete` (and its `delete` alias),
-`project archive`, `project delete`, `project worktree integrate`, and
-`project worktree cleanup` are operator-level mutations. No verb waits for a run
-except `wait`, which is always bounded by `--timeout`.
+`node`, `whoami`, `ls`, `get`, `events`, `peek`, `retention get`, `providers
+list`, and every `project` read are read-only, issue no mutation, and work with
+a read-only-scoped token. `run` starts a run; `send`, `project send`, `answer`,
+`approve`, `deny`, and `stop` control one; `wait`, `status`, `liveness`, and
+`result` read one. `retention set`, `providers set-key`, `session archive`,
+`session delete` (and its `delete` alias), `project archive`, `project delete`,
+`project worktree integrate`, and `project worktree cleanup` are operator-level
+mutations. No verb waits for a run except `wait`, which is always bounded by
+`--timeout`.
 
 Every verb negotiates only the capabilities its own requests need. `doctor`
 reports the intersection the worker granted, so its capability list is the
@@ -464,6 +467,44 @@ stored policy plus `applies_from: "next_sweep"`.
 `node` and `retention get` are reads. `retention set` needs
 `configure_archive_retention`; a token without it exits `3`.
 
+## Providers
+
+`providers list` prints one line per provider the worker has registered:
+
+```text
+openai open_ai credential false api-key true
+deepseek deepseek credential false api-key true
+openai-compatible open_ai_compatible credential true api-key true
+```
+
+`credential` is whether a credential reference is stored. `api-key` is whether
+`providers set-key` can attach a key. The line never includes the secret or the
+credential reference. `--json` is
+`{"providers":[{"id","kind","display_name","has_credential","api_key_configurable"}]}`.
+
+`providers set-key --provider <id>` stores a key for an API-key provider
+(`openai`, `deepseek`, or an OpenAI-compatible provider) by sending
+`Provider/ConfigureApiKeyProvider`, the same request Settings → Providers sends.
+The key comes from exactly one of:
+
+```sh
+loom-cli providers set-key --provider openai --from-env OPENAI_API_KEY
+loom-cli providers set-key --provider openai --key-file ~/.config/loom/openai.key
+```
+
+`--from-env` names a variable; it does not take the key. `--key-file` is read as
+UTF-8 and one trailing newline is dropped, then surrounding whitespace is
+trimmed. `--key` is rejected. A missing variable, an unreadable file, and a
+blank key exit `2` and send no request. The command prints
+`provider <id> credential set` and nothing else. The worker stores the secret in
+its instance credential store, next to the state database, and the provider
+record keeps only an opaque reference. `github-copilot` is not an API-key
+provider; `set-key` refuses it. A provider id the worker does not have is
+`not_found` (exit `5`).
+
+`providers list` needs `list_providers`. `providers set-key` needs
+`configure_providers`; a token without it exits `3`.
+
 ## Session and project lifecycle
 
 Archiving, deletion, and worktree cleanup are separate operations, and every
@@ -694,6 +735,10 @@ with exit `0` rather than an error.
 ```sh
 # Check the worker and the negotiated contract.
 loom-cli doctor
+
+# See which providers have a credential, then store an OpenAI key from the environment.
+loom-cli providers list
+loom-cli providers set-key --provider openai --from-env OPENAI_API_KEY
 
 # List workspaces, then the sessions of one.
 loom-cli ls

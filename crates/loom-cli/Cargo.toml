@@ -20,4 +20,5 @@ tokio.workspace = true
 
 # The tests drive the verbs against a real in-process backend.
 [dev-dependencies]
+loom-providers.workspace = true
 loom-server.workspace = true
