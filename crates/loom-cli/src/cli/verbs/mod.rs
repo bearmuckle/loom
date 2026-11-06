@@ -187,9 +187,10 @@ impl Outcome {
 /// need, plus `JsonProtocol` because every response is JSON.
 ///
 /// A read-only verb therefore never asks for a mutating capability: `node` and
-/// `retention get` ask for the worker-status read, `providers list` for the
-/// provider catalog, `ls` and `get` for the session read, and `events`/`peek`
-/// for event subscription. Only `run`, `retention set`, `providers set-key`,
+/// `retention get` ask for the worker-status read, `providers list` and
+/// `models list` for the provider catalog, `ls` and `get` for the session read,
+/// and `events`/`peek` for event subscription. Only `run`, `retention set`,
+/// `providers set-key`,
 /// and `delete` request what their mutations require, so a worker that does
 /// not offer session creation can still be inspected and a scoped token sees
 /// the smallest negotiable set.
@@ -257,7 +258,9 @@ pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
                 Capability::ConfigureArchiveRetention,
             ]);
         }
-        Verb::ProvidersList => capabilities.push(Capability::ListProviders),
+        Verb::ProvidersList | Verb::ModelsList { .. } => {
+            capabilities.push(Capability::ListProviders);
+        }
         Verb::ProvidersSetKey(_) => capabilities.push(Capability::ConfigureProviders),
         Verb::SessionArchive { .. } | Verb::ProjectArchive { .. } => {
             capabilities.extend([Capability::ReadProject, Capability::ControlAgentSession]);
@@ -488,6 +491,9 @@ pub(crate) async fn run<C: Client>(
         Verb::RetentionSet(args) => operator::retention_set(client, invocation, args, out).await,
         Verb::ProvidersList => providers::list(client, invocation, out).await,
         Verb::ProvidersSetKey(args) => providers::set_key(client, invocation, args, out).await,
+        Verb::ModelsList { provider } => {
+            providers::models(client, invocation, provider.as_deref(), out).await
+        }
         Verb::SessionArchive {
             session,
             yes,

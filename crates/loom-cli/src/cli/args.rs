@@ -72,7 +72,9 @@ Verbs:
                                     its session afterwards
   wait --session <id> [--until blocked|terminal] [--timeout <seconds>]
                                     poll until the run blocks or reaches a
-                                    terminal state; always time-bounded
+                                    terminal state; always time-bounded, and
+                                    a terminal state is exit 0 whatever the
+                                    run outcome
   status --session <id> [--format text|verb] [--tree]
                                     report the session and its latest run;
                                     --format verb prints one declaration line
@@ -89,6 +91,9 @@ Verbs:
                                     policy; the next sweep applies it
   providers list                    list configured providers and whether
                                     each has a credential; prints no secrets
+  models list [--provider <id>]     list the models of the configured
+                                    providers and mark one default per
+                                    provider; prints no secrets
   providers set-key --provider <id>
             (--from-env <NAME> | --key-file <path>)
                                     store an API key for openai, deepseek, or
@@ -501,6 +506,11 @@ pub(crate) enum Verb {
     RetentionSet(RetentionSetArgs),
     ProvidersList,
     ProvidersSetKey(ProviderSetKeyArgs),
+    /// `models list`: the models of the configured providers, optionally of one
+    /// exact provider.
+    ModelsList {
+        provider: Option<String>,
+    },
     /// `session archive`: archive one session, and its descendants when the id
     /// is a project root that cascades. `yes` acknowledges that cascade.
     SessionArchive {
@@ -678,6 +688,7 @@ pub(crate) fn verb_name(verb: &Verb) -> &'static str {
         Verb::RetentionSet(_) => "retention set",
         Verb::ProvidersList => "providers list",
         Verb::ProvidersSetKey(_) => "providers set-key",
+        Verb::ModelsList { .. } => "models list",
         Verb::SessionArchive { .. } => "session archive",
         Verb::SessionDelete { .. } => "session delete",
         Verb::ProjectArchive { .. } => "project archive",
@@ -735,6 +746,7 @@ pub(crate) fn named_verb(arguments: &[String]) -> &'static str {
             "result" => "result",
             "retention" => "retention",
             "providers" => "providers",
+            "models" => "models",
             "delete" => "delete",
             "session" => "session",
             "project" => "project",
@@ -1055,6 +1067,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
         }
         "retention" => parse_retention(&mut flags, rest)?,
         "providers" => parse_providers(&mut flags, rest)?,
+        "models" => parse_models(&mut flags, rest)?,
         "session" => parse_session(&mut flags, rest)?,
         "project" => parse_project(&mut flags, rest)?,
         "delete" => {
@@ -1259,6 +1272,27 @@ fn parse_providers(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String>
         other => Err(format!(
             "unknown providers sub-verb '{other}'; use list or set-key"
         )),
+    }
+}
+
+/// The `models` sub-verbs. `list` takes the optional exact provider id.
+fn parse_models(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
+    let Some(sub_verb) = rest.first() else {
+        return Err("models requires 'list'".to_owned());
+    };
+    if rest.len() > 1 {
+        return Err(format!("models takes one sub-verb, got '{}'", rest[1]));
+    }
+    flags.verb = format!("models {sub_verb}");
+    match sub_verb.as_str() {
+        "list" => {
+            let provider = flags
+                .value("--provider")
+                .map(|value| provider_id(&value))
+                .transpose()?;
+            Ok(Verb::ModelsList { provider })
+        }
+        other => Err(format!("unknown models sub-verb '{other}'; use list")),
     }
 }
 

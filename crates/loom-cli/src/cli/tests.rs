@@ -24,7 +24,7 @@ use loom_core::{
     ProtocolVersion, RepositoryId, RequestId, RunAttemptId, RunId, RunRevision, TaskId, Timestamp,
     ToolCallId, WorkspaceId,
 };
-use loom_model::{ModelId, ToolCall};
+use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ProviderId, ToolCall};
 use loom_protocol::{
     ActivityDetail, AgentEvent, AgentRunSnapshot, AgentRunSnapshotProjection, AgentRunState,
     AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION, ClientRequest, CollaborationRequest,
@@ -1538,6 +1538,10 @@ fn each_verb_negotiates_only_the_capabilities_its_requests_need() {
         ),
         (
             vec!["providers", "list"],
+            vec![Capability::JsonProtocol, Capability::ListProviders],
+        ),
+        (
+            vec!["models", "list"],
             vec![Capability::JsonProtocol, Capability::ListProviders],
         ),
         (
@@ -3994,6 +3998,7 @@ fn help_short_circuits_parsing_whatever_else_is_given() {
     assert!(args::HELP.contains("loom-cli"));
     assert!(args::HELP.contains("--cursor-file"));
     assert!(args::HELP.contains("--token-file"));
+    assert!(args::HELP.contains("models list"));
 }
 
 #[test]
@@ -4691,7 +4696,8 @@ fn wait_reports_blocked_and_terminal_and_is_always_bounded() {
     assert_eq!(completed.code, exit::OK, "{}", completed.stderr);
     assert_eq!(completed.stdout, format!("run {completed_run} completed\n"));
 
-    // A cancelled run is terminal and reports a documented non-zero code.
+    // A cancelled run is terminal as well, and a terminal state is exit 0; the
+    // envelope's state and terminal fields carry the outcome.
     let stop_fixture = fixture();
     let stop_session = stop_fixture.session.id;
     pin_default_policy(&stop_fixture.control, stop_session);
@@ -4719,8 +4725,27 @@ fn wait_reports_blocked_and_terminal_and_is_always_bounded() {
             "10",
         ],
     );
-    assert_eq!(cancelled.code, exit::INTERNAL, "{}", cancelled.stderr);
+    assert_eq!(cancelled.code, exit::OK, "{}", cancelled.stderr);
     assert_eq!(cancelled.stdout, format!("run {stop_run} cancelled\n"));
+    let cancelled_json = run(
+        &mut stop_client,
+        &[
+            "wait",
+            "--session",
+            &stop_session.to_string(),
+            "--until",
+            "terminal",
+            "--timeout",
+            "10",
+            "--json",
+        ],
+    );
+    assert_eq!(cancelled_json.code, exit::OK, "{}", cancelled_json.stderr);
+    let envelope = json_envelope(&cancelled_json);
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["data"]["state"], "cancelled");
+    assert_eq!(envelope["data"]["terminal"], true);
+    assert_eq!(envelope["data"]["blocked"], false);
 
     // A session with no run has nothing to observe, so the bound reports a
     // timeout instead of waiting forever.
@@ -5165,11 +5190,11 @@ fn providers_list_prints_credentials_without_secrets_and_set_key_stores_them() {
         assert!(!listed.stdout.contains(secret), "{}", listed.stdout);
     }
     for line in [
-        "deepseek deepseek credential false api-key true\n",
-        "deterministic deterministic credential false api-key false\n",
-        "ollama ollama credential false api-key false\n",
-        "openai open_ai credential false api-key true\n",
-        "openai-compatible open_ai_compatible credential false api-key true\n",
+        "id=deepseek kind=deepseek credential=false api-key-configurable=true\n",
+        "id=deterministic kind=deterministic credential=false api-key-configurable=false\n",
+        "id=ollama kind=ollama credential=false api-key-configurable=false\n",
+        "id=openai kind=open_ai credential=false api-key-configurable=true\n",
+        "id=openai-compatible kind=open_ai_compatible credential=false api-key-configurable=true\n",
     ] {
         assert!(
             listed.stdout.contains(line),
@@ -5316,18 +5341,17 @@ fn providers_list_prints_credentials_without_secrets_and_set_key_stores_them() {
     assert!(
         persisted
             .stdout
-            .contains("openai open_ai credential true api-key true\n")
+            .contains("id=openai kind=open_ai credential=true api-key-configurable=true\n")
     );
     assert!(
         persisted
             .stdout
-            .contains("deepseek deepseek credential true api-key true\n")
+            .contains("id=deepseek kind=deepseek credential=true api-key-configurable=true\n")
     );
-    assert!(
-        persisted
-            .stdout
-            .contains("openai-compatible open_ai_compatible credential true api-key true\n")
-    );
+    assert!(persisted.stdout.contains(
+        "id=openai-compatible kind=open_ai_compatible credential=true \
+         api-key-configurable=true\n"
+    ));
     for secret in [openai_secret, deepseek_secret, compatible_secret] {
         assert!(!persisted.stdout.contains(secret));
     }
@@ -5387,6 +5411,146 @@ fn providers_set_key_rejects_a_blank_key_before_sending_it() {
     assert!(unset.stderr.contains("is not set"), "{}", unset.stderr);
     assert!(!saw_key.get());
     let _ = std::fs::remove_file(blank);
+}
+
+#[test]
+fn models_list_marks_one_default_per_provider_and_filters_by_provider() {
+    let fixture = fixture();
+    fixture
+        .backend
+        .provider_registry()
+        .register(loom_providers::ProviderConfig::openai("gpt-test"))
+        .unwrap();
+    fixture
+        .backend
+        .provider_registry()
+        .register(loom_providers::ProviderConfig::deepseek("deepseek-test"))
+        .unwrap();
+    // The declared DeepSeek default, added beside the test model so the
+    // declared-default rule and the fallback rule can both be read from one run.
+    fixture
+        .backend
+        .provider_registry()
+        .add_model(
+            &ProviderId::new("deepseek"),
+            ModelDescriptor {
+                id: ModelId::new("deepseek-flash"),
+                provider: ProviderId::new("deepseek"),
+                display_name: "DeepSeek Flash".to_owned(),
+                context_window: Some(1_000_000),
+                max_input_tokens: None,
+                max_output_tokens: Some(8_192),
+                capabilities: ModelCapabilities {
+                    streaming: true,
+                    tool_calling: true,
+                    vision: false,
+                    json_mode: true,
+                },
+            },
+        )
+        .unwrap();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let listed = run(&mut client, &["models", "list"]);
+    assert_eq!(listed.code, exit::OK, "{}", listed.stderr);
+    assert_eq!(listed.stderr, "");
+    assert_eq!(
+        listed.stdout,
+        [
+            "provider=deepseek model=deepseek-flash default=true\n",
+            "provider=deepseek model=deepseek-test default=false\n",
+            "provider=deterministic model=deterministic/demo default=true\n",
+            "provider=ollama model=llama3.2 default=true\n",
+            "provider=openai model=gpt-test default=true\n",
+            "provider=openai-compatible model=openai-compatible/demo default=true\n",
+        ]
+        .concat(),
+        "sorted by provider id, then by model id"
+    );
+
+    // Exactly one model of every provider is the default.
+    let mut defaults: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+    for line in listed.stdout.lines() {
+        let mut provider = None;
+        let mut default = None;
+        for field in line.split(' ') {
+            if let Some(value) = field.strip_prefix("provider=") {
+                provider = Some(value);
+            }
+            if let Some(value) = field.strip_prefix("default=") {
+                default = Some(value);
+            }
+        }
+        if default == Some("true") {
+            *defaults
+                .entry(provider.expect("a provider field"))
+                .or_default() += 1;
+        }
+    }
+    assert_eq!(defaults.len(), 5, "{defaults:?}");
+    for (provider, count) in &defaults {
+        assert_eq!(*count, 1, "{provider} marks {count} defaults");
+    }
+
+    let filtered = run(&mut client, &["models", "list", "--provider", "deepseek"]);
+    assert_eq!(filtered.code, exit::OK, "{}", filtered.stderr);
+    assert_eq!(
+        filtered.stdout,
+        "provider=deepseek model=deepseek-flash default=true\n\
+         provider=deepseek model=deepseek-test default=false\n"
+    );
+
+    let envelope = json_envelope(&run(&mut client, &["models", "list", "--json"]));
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["verb"], "models list");
+    assert_eq!(envelope["data"]["provider"], serde_json::Value::Null);
+    let models = envelope["data"]["models"].as_array().unwrap();
+    assert_eq!(models.len(), 6);
+    fn row<'a>(models: &'a [serde_json::Value], provider: &str, id: &str) -> &'a serde_json::Value {
+        models
+            .iter()
+            .find(|model| model["provider"] == provider && model["id"] == id)
+            .unwrap_or_else(|| panic!("missing {provider}/{id}"))
+    }
+    let flash = row(models, "deepseek", "deepseek-flash");
+    assert_eq!(flash["default"], true);
+    assert_eq!(flash["display_name"], "DeepSeek Flash");
+    assert_eq!(flash["context_window"], 1_000_000);
+    assert_eq!(flash["max_output_tokens"], 8_192);
+    assert_eq!(
+        row(models, "deepseek", "deepseek-test")["default"],
+        false,
+        "the declared default wins over the fallback"
+    );
+    // The declared OpenAI default is absent here, so the only model is marked.
+    let openai = row(models, "openai", "gpt-test");
+    assert_eq!(openai["default"], true);
+    assert_eq!(openai["context_window"], serde_json::Value::Null);
+    assert_eq!(openai["max_output_tokens"], serde_json::Value::Null);
+    // A model catalog carries no credential, secret, or opaque reference.
+    for model in models {
+        for field in ["credential", "credential_id", "api_key", "has_credential"] {
+            assert!(model.get(field).is_none(), "{model}");
+        }
+    }
+
+    // A provider the worker does not have is an empty list, not an error.
+    for json in [false, true] {
+        let arguments: Vec<&str> = if json {
+            vec!["models", "list", "--provider", "no-such-provider", "--json"]
+        } else {
+            vec!["models", "list", "--provider", "no-such-provider"]
+        };
+        let unknown = run(&mut client, &arguments);
+        assert_eq!(unknown.code, exit::OK, "{}", unknown.stderr);
+        if json {
+            let envelope = json_envelope(&unknown);
+            assert_eq!(envelope["data"]["provider"], "no-such-provider");
+            assert_eq!(envelope["data"]["models"], serde_json::json!([]));
+        } else {
+            assert_eq!(unknown.stdout, "");
+        }
+    }
 }
 
 fn archive_session(connection: &InProcessConnection, session_id: AgentSessionId) {
@@ -6196,6 +6360,29 @@ fn the_parser_covers_the_operator_verbs() {
     assert!(parse_error(&["delete"]).contains("requires a <session-id>"));
     assert!(parse_error(&["delete", &session, &session]).contains("one session id"));
     assert!(parse_error(&["delete", &session, "--force"]).contains("pass --yes to confirm"));
+}
+
+#[test]
+fn the_parser_covers_the_models_verb() {
+    assert!(matches!(
+        invocation(&["models", "list"]).verb,
+        Verb::ModelsList { provider: None }
+    ));
+    let Verb::ModelsList { provider } =
+        invocation(&["models", "list", "--provider", "deepseek", "--json"]).verb
+    else {
+        panic!("models list parses as models list");
+    };
+    assert_eq!(provider.as_deref(), Some("deepseek"));
+    let spaced = invocation(&["models", "list", "--provider= openai "]);
+    assert!(
+        matches!(spaced.verb, Verb::ModelsList { provider: Some(id) } if id == "openai"),
+        "a provider id is trimmed"
+    );
+    assert!(parse_error(&["models"]).contains("requires 'list'"));
+    assert!(parse_error(&["models", "show"]).contains("list"));
+    assert!(parse_error(&["models", "list", "extra"]).contains("one sub-verb"));
+    assert!(parse_error(&["models", "list", "--provider", " "]).contains("must not be empty"));
 }
 
 #[test]
