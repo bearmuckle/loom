@@ -99,9 +99,9 @@ jobs:
             deb_variant: aarch64
             archive: tar.gz
           # macOS ships one universal binary per package: both slices are built
-          # on macos-14 (itself arm64) and combined with `lipo`.
+          # on macos-15 (itself arm64) and combined with `lipo`.
           - name: macos-universal
-            os: macos-14
+            os: macos-15
             rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
             target: ""
             bin_dir: target/universal/release
