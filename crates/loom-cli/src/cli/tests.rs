@@ -8956,6 +8956,7 @@ impl SyntheticProject {
             summary: None,
             evidence: Vec::new(),
             approval_policy: None,
+            jev: None,
         }
     }
 

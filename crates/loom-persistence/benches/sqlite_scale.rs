@@ -79,6 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             control_revision: 0,
             session_id,
             task: format!("Representative run {index}"),
+            jev: None,
             model: ModelId::new("scale-benchmark"),
             state,
             started_at: now,

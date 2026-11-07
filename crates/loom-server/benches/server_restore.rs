@@ -72,6 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             summary: Some("terminal history remains lazy during restore".to_owned()),
             evidence: Vec::new(),
             approval_policy: None,
+            jev: None,
         };
         run_summaries.insert(
             run_id,

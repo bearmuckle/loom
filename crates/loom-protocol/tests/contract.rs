@@ -356,6 +356,7 @@ fn agent_event_json_round_trip_preserves_run_identity() {
         control_revision: 0,
         session_id: AgentSessionId::new(),
         task: "inspect the workspace".to_owned(),
+        jev: None,
         model: ModelId::new("deterministic/demo"),
         state: AgentRunState::Executing,
         started_at: Timestamp::from_unix_millis(2),
@@ -888,6 +889,7 @@ fn m5_session_run_review_and_evidence_contracts_round_trip() {
         control_revision: 0,
         session_id: AgentSessionId::new(),
         task: "review".to_owned(),
+        jev: None,
         model: ModelId::new("deterministic/demo"),
         state: AgentRunState::Completed,
         started_at: Timestamp::from_unix_millis(6),
@@ -935,8 +937,8 @@ fn m5_session_run_review_and_evidence_contracts_round_trip() {
     );
 }
 
-/// A run snapshot written before it recorded a policy stays loadable and
-/// reports no known policy instead of failing to decode.
+/// A run snapshot written before it recorded a policy or the Jev switches
+/// stays loadable and reports neither instead of failing to decode.
 #[test]
 fn a_run_snapshot_without_an_approval_policy_still_decodes() {
     let snapshot = AgentRunSnapshot {
@@ -945,6 +947,7 @@ fn a_run_snapshot_without_an_approval_policy_still_decodes() {
         control_revision: 0,
         session_id: AgentSessionId::new(),
         task: "older snapshot".to_owned(),
+        jev: None,
         model: ModelId::new("deterministic/demo"),
         state: AgentRunState::Executing,
         started_at: Timestamp::from_unix_millis(1),
@@ -954,16 +957,19 @@ fn a_run_snapshot_without_an_approval_policy_still_decodes() {
         evidence: Vec::new(),
         approval_policy: Some(loom_core::ApprovalPolicy::auto_approve()),
     };
-    let mut older = serde_json::to_value(&snapshot).unwrap();
-    older
-        .as_object_mut()
+    let serialized = serde_json::to_value(&snapshot).unwrap();
+    let mut older = serialized
+        .as_object()
         .expect("a run snapshot encodes as an object")
-        .remove("approval_policy");
+        .clone();
+    older.remove("approval_policy");
+    older.remove("jev");
 
-    let decoded: AgentRunSnapshot =
-        serde_json::from_value(older).expect("a snapshot without the field stays loadable");
+    let decoded: AgentRunSnapshot = serde_json::from_value(serde_json::Value::Object(older))
+        .expect("a snapshot without the fields stays loadable");
 
     assert_eq!(decoded.approval_policy, None);
+    assert_eq!(decoded.jev, None);
     assert_eq!(decoded.state, snapshot.state);
 }
 

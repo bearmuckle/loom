@@ -1,7 +1,7 @@
 use loom_core::{
     AgentSessionId, ApprovalPolicy, CheckpointId, ContextInspection, EvidenceLink, InteractionId,
-    LimitStatus, LoomError, PolicyEvaluation, RunAttemptId, RunId, StepId, Timestamp, ToolCallId,
-    UsageSnapshot,
+    JevPolicy, LimitStatus, LoomError, PolicyEvaluation, RunAttemptId, RunId, StepId, Timestamp,
+    ToolCallId, UsageSnapshot,
 };
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +50,13 @@ pub struct AgentRunSnapshot {
     /// before the field existed, which stays loadable.
     #[serde(default)]
     pub approval_policy: Option<ApprovalPolicy>,
+    /// The Jev switches this run pinned when it was created, or `None` when Jev
+    /// is absent for it: no decider credential resolves on this worker, the
+    /// master switch is off, or the snapshot was written before the field
+    /// existed. A run resolves the switches once, like its approval policy, so a
+    /// later session or project change applies from the next run.
+    #[serde(default)]
+    pub jev: Option<JevPolicy>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

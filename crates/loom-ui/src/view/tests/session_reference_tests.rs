@@ -217,6 +217,7 @@ fn durable_projection(
             control_revision: 0,
             session_id,
             task: "track the issue".to_owned(),
+            jev: None,
             model: ModelId::new("deterministic/demo"),
             state: AgentRunState::Completed,
             started_at: Timestamp::from_unix_millis(1),

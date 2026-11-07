@@ -187,6 +187,7 @@ impl ProjectCodeChildFixture {
                 control_revision: 0,
                 session_id: self.worktree.child_session_id,
                 task: "Make a committed code change".to_owned(),
+                jev: None,
                 model: ModelId::new("deterministic/demo"),
                 state,
                 started_at: Timestamp::from_unix_millis(1000),

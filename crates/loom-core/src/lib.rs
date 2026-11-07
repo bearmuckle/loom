@@ -8,6 +8,7 @@ mod duration;
 mod error;
 mod filesystem;
 mod id;
+mod jev;
 mod limits;
 mod participant;
 #[cfg(not(target_family = "wasm"))]
@@ -56,6 +57,7 @@ pub use id::{
     EventSequence, InteractionId, ParticipantId, ProjectId, ProjectManagerWaitId, RepositoryId,
     RequestId, RunAttemptId, RunId, StepId, TaskId, TerminalId, ToolCallId, WorkspaceId,
 };
+pub use jev::{JevPolicy, JevSettings, ProjectJevPolicy, SessionJevPolicy};
 pub use limits::{LimitKind, LimitStatus, SessionLimits, UsageSnapshot};
 pub use participant::{
     AccessRequestDecision, GitHubSignInStatus, MAX_ACCESS_REQUEST_NOTE_BYTES,

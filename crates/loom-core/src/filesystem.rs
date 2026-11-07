@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::{AgentSessionId, CheckpointId, EventSequence, RepositoryId, Timestamp};
+use crate::{AgentSessionId, CheckpointId, EventSequence, JevSettings, RepositoryId, Timestamp};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -34,6 +34,11 @@ pub struct WorkspaceConfig {
     /// default, so an upgraded workspace titles itself.
     #[serde(default = "default_auto_title_projects")]
     pub auto_title_projects: bool,
+    /// Jev decision-model switches. Static defaults: whether the decider
+    /// credential resolves is applied as a gate when a run resolves these
+    /// switches, so the default never has to know about secrets.
+    #[serde(default)]
+    pub jev: JevSettings,
 }
 
 pub const MIN_PROJECT_AGENT_CONCURRENCY: u8 = 1;
@@ -74,6 +79,7 @@ impl Default for WorkspaceConfig {
             auto_archive_completed_agents: false,
             run_admission_timeout_secs: default_run_admission_timeout_secs(),
             auto_title_projects: default_auto_title_projects(),
+            jev: JevSettings::default(),
         }
     }
 }
@@ -248,6 +254,7 @@ pub struct ContextFileReference {
 #[cfg(test)]
 mod tests {
     use super::{DEFAULT_RUN_ADMISSION_TIMEOUT_SECS, WorkspaceConfig};
+    use crate::JevSettings;
 
     #[test]
     fn older_workspace_config_defaults_project_agent_concurrency() {
@@ -267,5 +274,26 @@ mod tests {
         // A workspace that predates automatic titles gets them, so an upgraded
         // workspace titles new projects without an operator action.
         assert!(config.auto_title_projects);
+    }
+
+    #[test]
+    fn a_workspace_config_saved_before_the_jev_switches_still_decodes() {
+        let config: WorkspaceConfig =
+            serde_json::from_str(r#"{"revision":1,"worker_nodes":[],"auto_title_projects":false}"#)
+                .unwrap();
+
+        assert!(!config.auto_title_projects);
+        assert_eq!(config.jev, JevSettings::default());
+    }
+
+    #[test]
+    fn a_partial_jev_object_keeps_the_defaults_it_does_not_name() {
+        let config: WorkspaceConfig =
+            serde_json::from_str(r#"{"jev":{"decide_tool":false}}"#).unwrap();
+
+        assert!(config.jev.enabled);
+        // Automatic model selection stays opt-in when a client omits it.
+        assert!(!config.jev.auto_model);
+        assert!(!config.jev.decide_tool);
     }
 }

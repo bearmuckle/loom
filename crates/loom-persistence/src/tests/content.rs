@@ -365,6 +365,7 @@ fn run_checkpoint_collects_content_orphaned_by_its_own_transcript_reset() {
             control_revision: 0,
             session_id: session.id,
             task: "collect orphaned content".to_owned(),
+            jev: None,
             model: ModelId::new("deterministic-model"),
             state: AgentRunState::Executing,
             started_at: Timestamp::from_unix_millis(1),

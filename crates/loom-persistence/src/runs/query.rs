@@ -505,6 +505,8 @@ impl FilePersistence {
                 // The run's pinned approval policy is stored in its runtime
                 // configuration, not in the run summary columns.
                 approval_policy: None,
+                // The same holds for the Jev switches it pinned.
+                jev: None,
             };
             let usage = UsageSnapshot {
                 input_tokens: decode_counter(input_tokens, "input tokens")?,

@@ -29,6 +29,49 @@ pub const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-flash";
 /// unknown-model fallback, which is too small for thinking models.
 pub const DEEPSEEK_MAX_OUTPUT_TOKENS: u32 = 8_192;
 pub const GITHUB_COPILOT_API_ENDPOINT: &str = "https://api.githubcopilot.com";
+/// The one provider entry a Jev decision model uses.
+///
+/// It is not a chat provider: the registry keeps its models out of the catalog,
+/// so no run can select one, and it is usable only once its credential resolves.
+/// Raw keys stay in the credential store; the entry holds a reference.
+pub const DECIDER_PROVIDER_ID: &str = "decider";
+pub const DECIDER_DISPLAY_NAME: &str = "Jev (decision model)";
+/// OpenCode (Go/Zen) inference. It serves the pinned `jev-1.13` and the free
+/// `jev-1.13-free`; the paid alias needs account credit.
+pub const OPENCODE_DECIDER_ENDPOINT: &str = "https://opencode.ai/inference/systemone/v1/systemone";
+pub const OPENCODE_DECIDER_MODEL: &str = "jev-1.13";
+/// TypeSafe's own host. `jev-latest` is an alias the service resolves per
+/// request, so an answer may name a version (`jev-1.14.0`) instead.
+pub const TYPESAFE_DECIDER_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
+pub const TYPESAFE_DECIDER_MODEL: &str = "jev-latest";
+
+/// Where a Jev decision model is served from, and the model that host answers
+/// under by default.
+///
+/// Both hosts accept the same request and answer shapes, so the source is only
+/// an endpoint, a model and the key the operator supplies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeciderSource {
+    OpenCode,
+    TypeSafe,
+}
+
+impl DeciderSource {
+    pub fn endpoint(self) -> &'static str {
+        match self {
+            DeciderSource::OpenCode => OPENCODE_DECIDER_ENDPOINT,
+            DeciderSource::TypeSafe => TYPESAFE_DECIDER_ENDPOINT,
+        }
+    }
+
+    /// The model this source answers under unless the operator picks another.
+    pub fn model(self) -> &'static str {
+        match self {
+            DeciderSource::OpenCode => OPENCODE_DECIDER_MODEL,
+            DeciderSource::TypeSafe => TYPESAFE_DECIDER_MODEL,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -200,6 +243,54 @@ impl ProviderConfig {
             input_cost_micros_per_1k: 0,
             output_cost_micros_per_1k: 0,
         }
+    }
+
+    /// The Jev decision model, as one provider entry beside the model providers.
+    ///
+    /// The entry holds the endpoint and the model; nothing reaches it as a chat
+    /// model. Its single descriptor exists because the registry refuses an entry
+    /// with no models, and it stays out of the model catalog so `models` never
+    /// lists a model that cannot answer a chat request.
+    ///
+    /// The entry is created without a credential because it has to exist before
+    /// an operator can store a key for it (`configure_api_key_provider` requires
+    /// the provider). A keyless decider is unusable, so it refuses every use
+    /// until a key resolves: `ProviderRegistry::decider_available` gates every
+    /// Jev surface on exactly that.
+    ///
+    /// It keeps the OpenAI-compatible kind rather than a decider kind of its own:
+    /// `ProviderSummary.kind` is serialized, so a new variant would stop an older
+    /// client from decoding the provider list. The reserved id identifies it.
+    pub fn decider(source: DeciderSource) -> Self {
+        let id = ProviderId::new(DECIDER_PROVIDER_ID);
+        Self {
+            id: id.clone(),
+            kind: ProviderKind::OpenAiCompatible,
+            display_name: DECIDER_DISPLAY_NAME.to_owned(),
+            endpoint: Some(source.endpoint().to_owned()),
+            models: vec![ModelDescriptor {
+                id: ModelId::new(source.model()),
+                provider: id,
+                display_name: "Jev decision model".to_owned(),
+                context_window: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
+                capabilities: ModelCapabilities {
+                    streaming: false,
+                    tool_calling: false,
+                    vision: false,
+                    json_mode: true,
+                },
+            }],
+            credential: None,
+            input_cost_micros_per_1k: 0,
+            output_cost_micros_per_1k: 0,
+        }
+    }
+
+    /// Whether this entry is the Jev decision model rather than a chat provider.
+    pub fn is_decider(&self) -> bool {
+        self.id.as_str() == DECIDER_PROVIDER_ID
     }
 
     pub fn with_pricing(
@@ -411,7 +502,38 @@ pub fn deterministic_descriptor() -> ModelDescriptor {
 
 #[cfg(test)]
 mod tests {
-    use super::{DECLARED_CONTEXT_WINDOWS, declared_context_window_entry};
+    use super::{
+        DECLARED_CONTEXT_WINDOWS, DeciderSource, OPENCODE_DECIDER_ENDPOINT, OPENCODE_DECIDER_MODEL,
+        ProviderConfig, TYPESAFE_DECIDER_ENDPOINT, TYPESAFE_DECIDER_MODEL,
+        declared_context_window_entry,
+    };
+
+    #[test]
+    fn each_decider_source_reports_its_host_and_model() {
+        assert_eq!(
+            DeciderSource::OpenCode.endpoint(),
+            OPENCODE_DECIDER_ENDPOINT
+        );
+        assert_eq!(DeciderSource::OpenCode.model(), OPENCODE_DECIDER_MODEL);
+        assert_eq!(
+            DeciderSource::TypeSafe.endpoint(),
+            TYPESAFE_DECIDER_ENDPOINT
+        );
+        assert_eq!(DeciderSource::TypeSafe.model(), TYPESAFE_DECIDER_MODEL);
+    }
+
+    #[test]
+    fn a_decider_entry_is_a_keyless_offer_that_no_run_can_select() {
+        let config = ProviderConfig::decider(DeciderSource::TypeSafe);
+
+        assert!(config.is_decider());
+        assert_eq!(config.endpoint.as_deref(), Some(TYPESAFE_DECIDER_ENDPOINT));
+        assert_eq!(config.models.len(), 1);
+        assert_eq!(config.models[0].id.as_str(), TYPESAFE_DECIDER_MODEL);
+        assert_eq!(config.credential, None);
+        assert!(config.models[0].capabilities.json_mode);
+        assert!(!config.models[0].capabilities.tool_calling);
+    }
 
     #[test]
     fn a_variant_entry_is_not_shadowed_by_its_family_prefix() {
