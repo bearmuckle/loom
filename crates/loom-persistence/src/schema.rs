@@ -492,6 +492,22 @@ CREATE TABLE IF NOT EXISTS archived_project_members (
     PRIMARY KEY(root_session_id, session_id),
     CHECK(root_session_id != session_id)
 ) WITHOUT ROWID, STRICT;
+-- The models a project's delegated children run on unless the delegating
+-- agent names one: one row per kind of work, and the row with the empty kind
+-- holds the project's default child model. Rows are removed with the project
+-- root.
+CREATE TABLE IF NOT EXISTS project_child_models (
+    project_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+        CHECK(length(project_id) = 16),
+    kind TEXT NOT NULL CHECK(
+        kind = ''
+        OR (length(kind) BETWEEN 1 AND 32 AND kind NOT GLOB '*[^a-z0-9_-]*')
+    ),
+    model_id TEXT NOT NULL CHECK(
+        length(trim(model_id)) > 0 AND length(CAST(model_id AS BLOB)) <= 4096
+    ),
+    PRIMARY KEY(project_id, kind)
+) WITHOUT ROWID, STRICT;
 -- People the backend knows. Identity is derived by the server from the
 -- credential a connection authenticated with; the display name is the one the
 -- operator bound to that credential.
@@ -1312,6 +1328,12 @@ fn migrate_schema_transaction(connection: &Connection, from_version: u32) -> Res
             // below.
             15 => {
                 version = 16;
+            }
+            // v17 adds the per-project child model policy, a new baseline
+            // table. A database written before it exists has no policy, so
+            // every delegated child keeps reusing its parent's model.
+            16 => {
+                version = 17;
             }
             other => return Err(unsupported_database_error(other)),
         }

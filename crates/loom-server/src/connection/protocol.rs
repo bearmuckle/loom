@@ -273,6 +273,8 @@ impl InProcessConnection {
             && matches!(
                 &request,
                 ClientRequest::Project(ProjectRequest::CreateSubProject { .. })
+                    | ClientRequest::Project(ProjectRequest::GetProjectChildModels { .. })
+                    | ClientRequest::Project(ProjectRequest::SetProjectChildModels { .. })
                     | ClientRequest::Project(ProjectRequest::SendProjectAgentMessage { .. })
                     | ClientRequest::Project(ProjectRequest::ListProjectAgentMessages { .. })
                     | ClientRequest::Project(ProjectRequest::ControlProjectChild { .. })
@@ -685,6 +687,13 @@ impl InProcessConnection {
                 ..
             })
             | ClientRequest::Session(SessionRequest::RenameAgentSession {
+                session_id: requested_session,
+                ..
+            })
+            | ClientRequest::Project(ProjectRequest::GetProjectChildModels {
+                session_id: requested_session,
+            })
+            | ClientRequest::Project(ProjectRequest::SetProjectChildModels {
                 session_id: requested_session,
                 ..
             })

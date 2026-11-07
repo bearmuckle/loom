@@ -192,6 +192,12 @@ impl InProcessConnection {
             ClientRequest::Project(ProjectRequest::CreateSubProject { .. }) => {
                 self.project_dispatch(request, request_id)
             }
+            ClientRequest::Project(ProjectRequest::GetProjectChildModels { .. }) => {
+                self.project_dispatch(request, request_id)
+            }
+            ClientRequest::Project(ProjectRequest::SetProjectChildModels { .. }) => {
+                self.project_dispatch(request, request_id)
+            }
             ClientRequest::Project(ProjectRequest::SendProjectAgentMessage { .. }) => {
                 self.project_dispatch(request, request_id)
             }

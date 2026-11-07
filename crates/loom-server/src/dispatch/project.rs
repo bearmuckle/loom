@@ -21,6 +21,13 @@ impl InProcessConnection {
                 parent_session_id,
                 name,
             }) => self.create_sub_project(parent_session_id, name),
+            ClientRequest::Project(ProjectRequest::GetProjectChildModels { session_id }) => {
+                self.get_project_child_models(session_id)
+            }
+            ClientRequest::Project(ProjectRequest::SetProjectChildModels {
+                session_id,
+                policy,
+            }) => self.set_project_child_models(session_id, policy),
             ClientRequest::Project(ProjectRequest::SendProjectAgentMessage { message }) => {
                 self.send_project_agent_message(request_id, message)
             }

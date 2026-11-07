@@ -406,6 +406,12 @@ pub enum ProjectResponse {
         session: Box<AgentSessionSnapshot>,
     },
 
+    /// The child model policy a project stores, as read or as just replaced.
+    ProjectChildModels {
+        project_id: ProjectId,
+        policy: loom_core::ProjectChildModelPolicy,
+    },
+
     ProjectChildCreated {
         task: Box<DelegatedTaskRecord>,
         child: ProjectAgentRecord,

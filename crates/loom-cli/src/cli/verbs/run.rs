@@ -68,7 +68,7 @@ use crate::cli::args::{ApprovalPreset, DEFAULT_MODEL, Invocation, RunArgs};
 use crate::cli::client::Client;
 use crate::cli::text::run_state_name;
 
-use super::{Caller, Failure, Outcome, derived_id, emit, handshake, providers};
+use super::{Caller, Failure, Outcome, child_models, derived_id, emit, handshake, providers};
 
 /// `run`: resolve the model and the session, attach the inputs to a session this
 /// invocation created, pin the approval policy, and start the run.
@@ -180,6 +180,21 @@ pub(super) async fn run<C: Client>(
         }
     }
 
+    // Delegations read the project's child models when they happen, so the
+    // entries the flags name are stored before the run can delegate.
+    let child_models = if args.child_models.is_empty() {
+        None
+    } else {
+        let (_, policy) = child_models::change(
+            &mut caller,
+            session_id,
+            &args.child_models,
+            child_models::run_change_id(args.request_id),
+        )
+        .await?;
+        Some(policy)
+    };
+
     // The caller's id, when it named one, is the idempotency key of this run
     // start: the worker answers a repeated id with the run it already started.
     let request_id = args.request_id.unwrap_or_default();
@@ -209,6 +224,9 @@ pub(super) async fn run<C: Client>(
         if let Some(project) = args.project {
             emit(out, &format!("parent {project}\n"))?;
         }
+        if let Some(policy) = &child_models {
+            child_models::emit_policy(out, policy)?;
+        }
     }
     // A session `run` places in a project is a sub project: its own project id
     // is its session id, and `parent_id` is the project it belongs to.
@@ -218,7 +236,7 @@ pub(super) async fn run<C: Client>(
             "parent_id": parent.to_string(),
         })
     });
-    let data = json!({
+    let mut data = json!({
         "session": { "id": session_id.to_string(), "name": session_name },
         "run": { "id": started.id.to_string(), "state": state },
         "project": project,
@@ -229,6 +247,9 @@ pub(super) async fn run<C: Client>(
             "run": request_id.to_string(),
         },
     });
+    if let Some(policy) = &child_models {
+        data["child_models"] = child_models::policy_value(policy);
+    }
     Ok(Outcome::new(data, Some(request_id)).with_replayed(caller.replayed()))
 }
 

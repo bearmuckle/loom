@@ -457,6 +457,21 @@ dirty or locked linked worktree that would otherwise refuse the deletion;
 without it, such a project is refused, and the caller decides whether to force
 it.
 
+`GetProjectChildModels { session_id }` returns `project_child_models {
+project_id, policy }` for the project any member session belongs to, under
+`read_project` and the observer role. `SetProjectChildModels { session_id,
+policy }` replaces the policy of the project whose root is `session_id` and
+returns the stored, normalized policy in the same response. It is a retryable
+mutation under `control_agent_session` and the owner role. `policy` is `{
+default_model_id, by_kind }`: an optional model for any delegated child and a
+map from kind of work (1 to 32 bytes of `a-z0-9_-`, at most 16) to model.
+Every model must resolve to a configured provider with pricing, `current` is
+refused, and a member that is not the root is refused, all before any state
+changes; an empty policy makes children reuse their parent's model again. Both
+need durable storage. The delegation tools resolve a child's model from the
+agent's explicit `model_id`, then the child's `kind`, then the default, then
+the delegating agent's model, and list the policy in their descriptions.
+
 `RestoreAgentSession { session_id }` returns
 `agent_session_restored(snapshot)` and journals
 `AgentSessionRestored { session_id }`, mirrored as the
@@ -564,7 +579,8 @@ the project it branches out of. 11.11 adds automatic project titles,
 the session goal field, request, response, and event; 11.13 adds clearing it.
 11.14 adds the one-time sign-in credential; 11.15 adds `RestoreAgentSession`
 with its response and `AgentSessionRestored` event; 11.16 adds `SetAgentRunModel`
-and the `ModelChanged` run event. Every addition is a new enum
+and the `ModelChanged` run event; 11.17 adds `GetProjectChildModels` and
+`SetProjectChildModels` with the `ProjectChildModels` response. Every addition is a new enum
 variant, a capability, or a field with a compatible default (an omitted field
 keeps the older behavior), so clients of an older 11.x minor keep working; they
 simply never send the new requests, negotiate the new capability, or ask for

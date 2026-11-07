@@ -38,7 +38,7 @@ use crate::cli::text::{
     escape, run_state_name, session_state_name, task_status_name, worktree_line,
 };
 
-use super::{Caller, Failure, Outcome, derived_id, emit, handshake};
+use super::{Caller, Failure, Outcome, child_models, derived_id, emit, handshake};
 
 /// How long `wait` waits before its first poll returns nothing new.
 const WAIT_MIN_DELAY: Duration = Duration::from_millis(250);
@@ -602,6 +602,9 @@ struct ProjectTree {
     snapshot: ProjectSnapshot,
     verdict: &'static str,
     decisions: Vec<Decision>,
+    /// The project's child models, or `None` when the worker did not report
+    /// them.
+    child_models: Option<loom_core::ProjectChildModelPolicy>,
 }
 
 /// One pending approval or question a project agent waits on.
@@ -695,10 +698,12 @@ async fn project_tree<C: Client>(
     if !listed {
         decisions.extend(pending_decision(requested));
     }
+    let child_models = child_models::optional(caller, session_id).await?;
     Ok(ProjectTree {
         snapshot,
         verdict,
         decisions,
+        child_models,
     })
 }
 
@@ -773,6 +778,9 @@ fn emit_project(out: &mut dyn Write, project: &ProjectTree) -> Result<(), Failur
         emit(out, &format!("parent {parent}\n"))?;
     }
     emit(out, &format!("root {}\n", snapshot.root_session_id))?;
+    if let Some(policy) = &project.child_models {
+        child_models::emit_policy(out, policy)?;
+    }
     for agent in &snapshot.agents {
         emit(
             out,
@@ -882,6 +890,7 @@ fn project_value(project: &ProjectTree) -> Value {
             .iter()
             .map(Decision::value)
             .collect::<Vec<_>>(),
+        "child_models": project.child_models.as_ref().map(child_models::policy_value),
     })
 }
 

@@ -586,6 +586,22 @@ pub enum ProjectRequest {
         name: String,
     },
 
+    /// Reads the child model policy of the project `session_id` belongs to:
+    /// the models its delegated children run on unless the delegating agent
+    /// names one.
+    GetProjectChildModels {
+        session_id: AgentSessionId,
+    },
+
+    /// Replaces the child model policy of the project whose root session is
+    /// `session_id`. The backend normalizes the policy and refuses a model the
+    /// worker has not configured before it changes any state; an empty policy
+    /// makes every child reuse its parent's model again.
+    SetProjectChildModels {
+        session_id: AgentSessionId,
+        policy: loom_core::ProjectChildModelPolicy,
+    },
+
     SendProjectAgentMessage {
         message: AgentMessageDraft,
     },

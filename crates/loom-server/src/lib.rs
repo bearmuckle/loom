@@ -440,6 +440,10 @@ struct DelegateProjectTaskArguments {
     intent: String,
     #[serde(default)]
     model_id: Option<String>,
+    /// The kind of work, which the project's child model policy may map to a
+    /// model.
+    #[serde(default)]
+    kind: Option<String>,
     #[serde(default)]
     context_references: Vec<TaskContextReference>,
     #[serde(default)]

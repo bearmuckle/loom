@@ -9,6 +9,7 @@ use uuid::Uuid;
 use support::*;
 
 mod catalog;
+mod child_models;
 mod content;
 mod feed;
 mod misc;

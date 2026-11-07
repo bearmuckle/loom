@@ -13,6 +13,7 @@
 //! more session metadata projection per blocked agent, because the project
 //! record says that an agent waits but not on which approval or question.
 
+mod child_models;
 mod events;
 mod operator;
 mod project;
@@ -237,6 +238,10 @@ pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
                     capabilities.push(Capability::ReadSessionFilesystem);
                 }
             }
+            // Child model flags read the stored policy and replace it.
+            if !args.child_models.is_empty() {
+                capabilities.extend([Capability::ReadProject, Capability::ControlAgentSession]);
+            }
         }
         Verb::Send { .. } | Verb::Answer { .. } => {
             capabilities.extend([Capability::ControlAgentRun, Capability::ReadAgentRun]);
@@ -302,8 +307,14 @@ pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
         Verb::ProjectWorktreeIntegrate { .. } => {
             capabilities.extend([Capability::ReadProject, Capability::IntegrateProjectChild]);
         }
-        Verb::ProjectGet { .. } | Verb::ProjectTree { .. } | Verb::ProjectTasks { .. } => {
+        Verb::ProjectGet { .. }
+        | Verb::ProjectTree { .. }
+        | Verb::ProjectTasks { .. }
+        | Verb::ProjectModelsGet { .. } => {
             capabilities.push(Capability::ReadProject);
+        }
+        Verb::ProjectModelsSet { .. } => {
+            capabilities.extend([Capability::ReadProject, Capability::ControlAgentSession]);
         }
         Verb::ProjectChildren { .. } => {
             capabilities.extend([Capability::ReadProject, Capability::ReadAgentSession]);
@@ -635,6 +646,14 @@ pub(crate) async fn run<C: Client>(
             text,
             request_id,
         } => project::send(client, invocation, *session, text, *request_id, out).await,
+        Verb::ProjectModelsGet { session } => {
+            child_models::get(client, invocation, *session, out).await
+        }
+        Verb::ProjectModelsSet {
+            session,
+            changes,
+            request_id,
+        } => child_models::set(client, invocation, *session, changes, *request_id, out).await,
         Verb::ProjectChild {
             session,
             task,

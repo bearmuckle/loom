@@ -1196,16 +1196,16 @@ pub(crate) fn run_can_be_deferred_during_restore(
         && has_pending_project_join == Some(false)
 }
 
-pub(crate) fn delegated_child_model_id(
-    requested: Option<String>,
+/// Chooses a delegated child's model from the model the delegating agent
+/// named, the kind of work, and the project's child model policy, falling back
+/// to the delegating agent's current model.
+pub(crate) fn delegated_child_model(
+    requested: Option<&str>,
+    kind: Option<&str>,
+    policy: &loom_core::ProjectChildModelPolicy,
     current_model: &ModelId,
-) -> String {
-    match requested {
-        Some(requested) if !requested.trim().eq_ignore_ascii_case("current") => {
-            requested.trim().to_owned()
-        }
-        _ => current_model.as_str().to_owned(),
-    }
+) -> loom_core::ChildModelChoice {
+    policy.resolve(requested, kind, current_model.as_str())
 }
 
 pub(crate) fn project_permissions_are_subset(
@@ -1870,20 +1870,60 @@ mod tests {
     }
 
     #[test]
-    fn delegated_child_model_id_resolves_current() {
+    fn delegated_child_model_resolves_current() {
         let current = ModelId::new("gpt-6-luna");
+        let none = loom_core::ProjectChildModelPolicy::default();
         assert_eq!(
-            delegated_child_model_id(None, &current),
-            "gpt-6-luna".to_owned()
+            delegated_child_model(None, None, &none, &current).model_id,
+            "gpt-6-luna"
         );
         assert_eq!(
-            delegated_child_model_id(Some("current".to_owned()), &current),
-            "gpt-6-luna".to_owned()
+            delegated_child_model(Some("current"), None, &none, &current).model_id,
+            "gpt-6-luna"
         );
         assert_eq!(
-            delegated_child_model_id(Some("custom".to_owned()), &current),
-            "custom".to_owned()
+            delegated_child_model(Some("custom"), None, &none, &current).model_id,
+            "custom"
         );
+    }
+
+    #[test]
+    fn delegated_child_model_follows_the_project_policy() {
+        use loom_core::ChildModelSource;
+        let current = ModelId::new("parent/model");
+        let policy = loom_core::ProjectChildModelPolicy {
+            default_model_id: Some("cheap/model".to_owned()),
+            by_kind: [("vision".to_owned(), "vision/model".to_owned())]
+                .into_iter()
+                .collect(),
+        };
+        let cases = [
+            (
+                Some("named/model"),
+                Some("vision"),
+                "named/model",
+                ChildModelSource::Explicit,
+            ),
+            (None, Some("vision"), "vision/model", ChildModelSource::Kind),
+            (
+                Some("current"),
+                Some("vision"),
+                "vision/model",
+                ChildModelSource::Kind,
+            ),
+            (
+                None,
+                Some("coding"),
+                "cheap/model",
+                ChildModelSource::ProjectDefault,
+            ),
+            (None, None, "cheap/model", ChildModelSource::ProjectDefault),
+        ];
+        for (requested, kind, model, source) in cases {
+            let choice = delegated_child_model(requested, kind, &policy, &current);
+            assert_eq!(choice.model_id, model, "{requested:?} {kind:?}");
+            assert_eq!(choice.source, source, "{requested:?} {kind:?}");
+        }
     }
 
     #[test]

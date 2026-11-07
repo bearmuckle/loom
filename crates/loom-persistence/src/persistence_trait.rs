@@ -761,6 +761,17 @@ pub trait ProjectRepository: Send + Sync {
         root_session_id: AgentSessionId,
     ) -> Result<Vec<(AgentSessionId, u8)>>;
     fn clear_archived_project_members(&self, root_session_id: AgentSessionId) -> Result<()>;
+    /// Loads the child model policy a project root stores; empty when none.
+    fn load_project_child_model_policy(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<loom_core::ProjectChildModelPolicy>;
+    /// Replaces the child model policy a project root stores.
+    fn replace_project_child_model_policy(
+        &self,
+        project_id: ProjectId,
+        policy: &loom_core::ProjectChildModelPolicy,
+    ) -> Result<()>;
     fn load_project_child_by_request(
         &self,
         request_id: RequestId,
@@ -946,6 +957,19 @@ impl ProjectRepository for FilePersistence {
     }
     fn clear_archived_project_members(&self, root_session_id: AgentSessionId) -> Result<()> {
         FilePersistence::clear_archived_project_members(self, root_session_id)
+    }
+    fn load_project_child_model_policy(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<loom_core::ProjectChildModelPolicy> {
+        FilePersistence::load_project_child_model_policy(self, project_id)
+    }
+    fn replace_project_child_model_policy(
+        &self,
+        project_id: ProjectId,
+        policy: &loom_core::ProjectChildModelPolicy,
+    ) -> Result<()> {
+        FilePersistence::replace_project_child_model_policy(self, project_id, policy)
     }
     fn load_project_child_by_request(
         &self,
@@ -1156,6 +1180,19 @@ impl<T: ProjectRepository + ?Sized> ProjectRepository for Arc<T> {
     }
     fn clear_archived_project_members(&self, root_session_id: AgentSessionId) -> Result<()> {
         (**self).clear_archived_project_members(root_session_id)
+    }
+    fn load_project_child_model_policy(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<loom_core::ProjectChildModelPolicy> {
+        (**self).load_project_child_model_policy(project_id)
+    }
+    fn replace_project_child_model_policy(
+        &self,
+        project_id: ProjectId,
+        policy: &loom_core::ProjectChildModelPolicy,
+    ) -> Result<()> {
+        (**self).replace_project_child_model_policy(project_id, policy)
     }
     fn load_project_child_by_request(
         &self,

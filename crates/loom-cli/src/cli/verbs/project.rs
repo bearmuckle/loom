@@ -35,7 +35,7 @@ use crate::cli::client::Client;
 use crate::cli::text::{bound, escape, run_state_name, session_state_name};
 
 use super::supervise::{act, finish_action};
-use super::{Caller, Failure, Outcome, emit, handshake};
+use super::{Caller, Failure, Outcome, child_models, emit, handshake};
 
 /// `project get`: the project's members and the project it was branched from.
 pub(super) async fn get<C: Client>(
@@ -47,6 +47,7 @@ pub(super) async fn get<C: Client>(
     let mut caller = Caller::new(client);
     handshake(&mut caller, &invocation.verb).await?;
     let (_, project) = snapshot(&mut caller, session_id).await?;
+    let child_models = child_models::optional(&mut caller, session_id).await?;
     if !invocation.globals.json {
         emit_header(out, &project)?;
         for agent in &project.agents {
@@ -61,8 +62,18 @@ pub(super) async fn get<C: Client>(
                 ),
             )?;
         }
+        if let Some(policy) = &child_models {
+            child_models::emit_policy(out, policy)?;
+        }
     }
-    Ok(Outcome::new(value_of(&project), caller.primary))
+    let mut data = value_of(&project);
+    if let (Some(policy), Some(object)) = (&child_models, data.as_object_mut()) {
+        object.insert(
+            "child_models".to_owned(),
+            child_models::policy_value(policy),
+        );
+    }
+    Ok(Outcome::new(data, caller.primary))
 }
 
 /// `project tree`: the same hierarchy, walked from the root as an indented tree.

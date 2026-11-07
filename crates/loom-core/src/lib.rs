@@ -1,4 +1,5 @@
 mod capability;
+mod child_model;
 mod collaboration;
 mod command_env;
 mod context;
@@ -22,6 +23,11 @@ mod version;
 mod workspace;
 
 pub use capability::{Capability, CapabilitySet};
+pub use child_model::{
+    CURRENT_MODEL_ALIAS, ChildModelChoice, ChildModelSource, MAX_CHILD_MODEL_ID_BYTES,
+    MAX_CHILD_MODEL_KIND_BYTES, MAX_CHILD_MODEL_KINDS, ProjectChildModelPolicy,
+    normalize_child_model_id, normalize_child_model_kind,
+};
 pub use collaboration::{
     Author, CollaborationEntry, CollaborationEntryKind, MAX_COLLABORATION_TEXT_BYTES, Recipient,
     RunControlAction, RunRevision,

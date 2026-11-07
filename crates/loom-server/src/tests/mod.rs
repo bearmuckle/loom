@@ -45,6 +45,7 @@ mod goal;
 mod idempotency;
 mod identity;
 mod project_child;
+mod project_child_models;
 mod project_child_reliability;
 mod project_integration;
 mod project_manager;
