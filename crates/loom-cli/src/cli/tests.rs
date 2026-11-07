@@ -1978,8 +1978,13 @@ fn following_with_a_timeout_flushes_the_cursor_and_reports_a_deadline() {
     assert_eq!(stored["after"].as_u64(), Some(last_sequence));
     assert_eq!(stored["session_id"], session.as_str());
 
-    // `--json` reports the deadline in the envelope, where it is retryable: a
-    // resumed follow continues the same read from the stored cursor.
+    // `--json` buffers the events into one envelope, so the deadline must keep
+    // them: the envelope is successful with exit 4, it carries every event the
+    // follow delivered, and the cursor names the last of them, so a resumed run
+    // neither reprints nor skips one.
+    let json_cursor = temporary_path("follow-timeout-json-cursor");
+    let _ = std::fs::remove_file(&json_cursor);
+    let json_cursor_path = json_cursor.to_str().unwrap().to_owned();
     let json_timeout = run(
         &mut client,
         &[
@@ -1990,25 +1995,46 @@ fn following_with_a_timeout_flushes_the_cursor_and_reports_a_deadline() {
             "--timeout",
             "1",
             "--json",
+            "--cursor-file",
+            &json_cursor_path,
         ],
     );
     assert_eq!(json_timeout.code, exit::TIMEOUT, "{}", json_timeout.stderr);
     let envelope = json_envelope(&json_timeout);
-    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["ok"], true, "{envelope}");
     assert_eq!(envelope["verb"], "events");
-    assert_eq!(envelope["error"]["code"], "deadline_exceeded");
-    assert_eq!(envelope["error"]["retryable"], true);
-    assert_eq!(envelope["error"]["exit_code"], 4);
+    assert_eq!(envelope["data"]["timed_out"], true, "{envelope}");
+    let events = envelope["data"]["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no delivered events: {envelope}"));
+    let delivered: Vec<u64> = events
+        .iter()
+        .map(|event| event["seq"].as_u64().expect("a delivered sequence"))
+        .collect();
     assert!(
-        envelope["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("deadline of 1s"),
-        "{envelope}"
+        !delivered.is_empty(),
+        "the events delivered before the deadline are in the envelope: {envelope}"
+    );
+    assert!(
+        delivered.windows(2).all(|pair| pair[0] < pair[1]),
+        "the delivered events are in journal order: {delivered:?}"
+    );
+    assert_eq!(
+        envelope["data"]["after"].as_u64(),
+        delivered.last().copied(),
+        "the reported position is the last delivered event: {envelope}"
+    );
+    let stored: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&json_cursor).unwrap()).unwrap();
+    assert_eq!(
+        stored["after"].as_u64(),
+        delivered.last().copied(),
+        "the cursor holds the last delivered event, so a resume continues past it"
     );
     assert_eq!(json_timeout.stderr, "", "--json reports on stdout alone");
 
     let _ = std::fs::remove_file(&cursor);
+    let _ = std::fs::remove_file(&json_cursor);
 }
 
 #[test]

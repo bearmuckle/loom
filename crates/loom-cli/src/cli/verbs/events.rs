@@ -18,9 +18,15 @@
 //! `--timeout <seconds>` bounds a `--follow`. Because the cursor is written after
 //! every fully rendered batch, the deadline is checked after that write: the last
 //! delivered sequence is on disk when the timeout is reported, so the same
-//! command with the same cursor file resumes exactly there. The timeout is
-//! reported as `deadline_exceeded` with exit `4`, and it is retryable, because a
-//! resumed follow is the way to continue a bound that ended.
+//! command with the same cursor file resumes exactly there. Under `--json` the
+//! events are buffered until the command ends, so a bounded follow that reaches
+//! its deadline still delivers them: it returns an `ok: true` envelope with
+//! `data.timed_out: true`, the events delivered before the deadline, and exit
+//! `4`, which keeps the envelope and the cursor file telling the same story.
+//! Text and `--format jsonl` stream each event as it arrives, so they report the
+//! deadline as the `deadline_exceeded` failure (exit `4`). The deadline is
+//! retryable either way, because a resumed follow is the way to continue a bound
+//! that ended.
 
 use std::{io::Write, path::Path, time::Duration};
 
@@ -34,6 +40,7 @@ use serde_json::{Value, json};
 use crate::cli::args::{EventsArgs, Format, Invocation, PeekArgs};
 use crate::cli::client::Client;
 use crate::cli::cursor::{self, Cursor};
+use crate::cli::exit;
 use crate::cli::text::{self, Rendered};
 
 use super::{Caller, Failure, Outcome, emit, handshake};
@@ -202,6 +209,24 @@ pub(super) async fn events<C: Client>(
         if let Some(deadline) = deadline
             && tokio::time::Instant::now() >= deadline
         {
+            // Under `--json` the events of this follow are still buffered here,
+            // and the cursor file already names the last of them: reporting a
+            // failure would drop them from the envelope while a resumed run
+            // skips them, so the delivered suffix is returned instead, with the
+            // documented timeout code. Text and jsonl streamed every event
+            // already, so they report the deadline as a failure.
+            if json_output {
+                return Ok(Outcome::new(
+                    json!({
+                        "events": rendered,
+                        "gap": gap_json(gap),
+                        "timed_out": true,
+                        "after": floor,
+                    }),
+                    caller.primary,
+                )
+                .with_code(exit::TIMEOUT));
+            }
             return Err(Failure::Timeout {
                 request_id: caller.primary,
                 message: timeout_message(args, floor),
@@ -233,17 +258,23 @@ pub(super) async fn events<C: Client>(
         }
     }
 
-    let gap = gap.map(|gap| {
-        json!({
+    Ok(Outcome::new(
+        json!({ "events": rendered, "gap": gap_json(gap) }),
+        caller.primary,
+    ))
+}
+
+/// The `gap` field of both `events` envelopes: the range a truncated snapshot
+/// could not carry, or `null` when every requested event was delivered.
+fn gap_json(gap: Option<Gap>) -> Value {
+    match gap {
+        Some(gap) => json!({
             "after": gap.after,
             "before": gap.before,
             "missing": gap.missing(),
-        })
-    });
-    Ok(Outcome::new(
-        json!({ "events": rendered, "gap": gap }),
-        caller.primary,
-    ))
+        }),
+        None => Value::Null,
+    }
 }
 
 /// `peek`: the newest events of a session, bounded by `--lines`.

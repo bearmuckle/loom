@@ -365,9 +365,10 @@
 //! A verb whose documented exit code reports something other than success is
 //! still a successful determination: a blocked `wait` is `ok:true` with exit
 //! `3`, a terminal `wait` is `ok:true` with exit `0` whatever the run outcome,
-//! and a `liveness` verdict of `gone` or `unknown` is `ok:true` with exit `5` or
-//! `7`. The `data` payload carries the verdict, state, attempt id, and tool call
-//! id, so a caller never has to parse the message.
+//! a `json` `events --follow` that reached its deadline is `ok:true` with exit
+//! `4`, and a `liveness` verdict of `gone` or `unknown` is `ok:true` with exit
+//! `5` or `7`. The `data` payload carries the verdict, state, attempt id, and
+//! tool call id, so a caller never has to parse the message.
 //!
 //! # Exit codes
 //!
@@ -384,12 +385,16 @@
 //!
 //! `events --follow --timeout <seconds>` bounds the follow. The cursor file is
 //! written after every fully rendered batch, so when the bound elapses the last
-//! delivered sequence is already on disk: the verb stops, reports
-//! `deadline_exceeded` with exit `4`, and the same command with the same cursor
-//! file resumes exactly there. That is why a timeout is reported as retryable.
-//! Without `--timeout` a follow is unbounded, because it still stops at the
-//! run's `run_completed` event, and `--timeout` without `--follow` is a usage
-//! error.
+//! delivered sequence is already on disk: the verb stops and the same command
+//! with the same cursor file resumes exactly there. Text and `--format jsonl`
+//! stream every event as it arrives, so they report the elapsed bound as the
+//! `deadline_exceeded` failure with exit `4`. `--json` buffers the events, so a
+//! bounded follow that reaches its deadline reports `ok: true` with
+//! `data.timed_out: true`, the events it delivered, and exit `4`, rather than a
+//! failure that would drop events the cursor file already points past. The
+//! deadline is retryable either way. Without `--timeout` a follow is unbounded,
+//! because it still stops at the run's `run_completed` event, and `--timeout`
+//! without `--follow` is a usage error.
 //!
 //! `events --cursor-file <path>` keeps
 //! `{"version":1,"url":...,"session_id":...,"after":...,"stream_epoch":...}`
