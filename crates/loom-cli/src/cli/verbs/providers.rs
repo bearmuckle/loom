@@ -21,7 +21,7 @@ use loom_model::{
 use loom_protocol::{ClientRequest, ProviderRequest, ProviderResponse, ServerResponse};
 use serde_json::{Value, json};
 
-use crate::cli::args::{Invocation, ProviderKeySource, ProviderSetKeyArgs};
+use crate::cli::args::{Invocation, ProviderAddArgs, ProviderKeySource, ProviderSetKeyArgs};
 use crate::cli::client::Client;
 
 use super::{Caller, Failure, Outcome, emit, handshake};
@@ -84,7 +84,10 @@ pub(super) async fn models<C: Client>(
     for provider in listed {
         let mut models = provider.models.iter().collect::<Vec<_>>();
         models.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        let default = default_model(provider, &models);
+        // The default is read from the provider's own model order, which is the
+        // order the worker stores, so a model `providers add --default-model`
+        // put first stays the default regardless of how it sorts.
+        let default = default_model(provider, &provider.models);
         for model in models {
             let is_default = default == Some(model.id.as_str());
             if !invocation.globals.json {
@@ -95,6 +98,139 @@ pub(super) async fn models<C: Client>(
     }
     Ok(Outcome::new(
         json!({ "provider": filter, "models": payload }),
+        caller.primary,
+    ))
+}
+
+/// `providers add`: register an OpenAI-compatible provider, such as OpenCode
+/// Go or OpenCode Zen, and print the models it now serves.
+///
+/// The key is not part of this request: it is stored afterwards with
+/// `providers set-key`, through the same server path every other API-key
+/// provider uses.
+pub(super) async fn add<C: Client>(
+    client: &mut C,
+    invocation: &Invocation,
+    args: &ProviderAddArgs,
+    out: &mut dyn Write,
+) -> Result<Outcome, Failure> {
+    let mut caller = Caller::new(client);
+    handshake(&mut caller, &invocation.verb).await?;
+    let models = args.ordered_models();
+    let (request_id, response) = caller
+        .call(ClientRequest::Provider(
+            ProviderRequest::ConfigureOpenAiCompatibleProvider {
+                provider_id: loom_model::ProviderId::new(args.provider.clone()),
+                endpoint: args.endpoint.clone(),
+                models: models.iter().map(ModelId::new).collect(),
+            },
+        ))
+        .await?;
+    match response {
+        ServerResponse::Provider(ProviderResponse::ProviderConfigured) => {}
+        _ => return Err(Failure::unexpected(request_id, "provider configuration")),
+    }
+    if !invocation.globals.json {
+        emit(
+            out,
+            &format!("provider {} kind=openai-compatible\n", args.provider),
+        )?;
+        for model in &models {
+            emit(
+                out,
+                &format!(
+                    "model={} default={}\n",
+                    model,
+                    flag(models.first().is_some_and(|first| first == model))
+                ),
+            )?;
+        }
+    }
+    Ok(Outcome::new(
+        json!({
+            "provider": args.provider,
+            "kind": "openai_compatible",
+            "endpoint": args.endpoint,
+            "models": models
+                .iter()
+                .map(|model| json!({
+                    "id": model,
+                    "default": models.first().is_some_and(|first| first == model),
+                }))
+                .collect::<Vec<_>>(),
+        }),
+        caller.primary,
+    ))
+}
+
+/// `providers remove`: drop an OpenAI-compatible provider and the key stored
+/// for it. A built-in provider is refused by the worker.
+pub(super) async fn remove<C: Client>(
+    client: &mut C,
+    invocation: &Invocation,
+    provider: &str,
+    out: &mut dyn Write,
+) -> Result<Outcome, Failure> {
+    let mut caller = Caller::new(client);
+    handshake(&mut caller, &invocation.verb).await?;
+    let (request_id, response) = caller
+        .call(ClientRequest::Provider(ProviderRequest::RemoveProvider {
+            provider_id: loom_model::ProviderId::new(provider.to_owned()),
+        }))
+        .await?;
+    match response {
+        ServerResponse::Provider(ProviderResponse::ProviderConfigured) => {}
+        _ => return Err(Failure::unexpected(request_id, "provider removal")),
+    }
+    if !invocation.globals.json {
+        emit(out, &format!("provider {provider} removed\n"))?;
+    }
+    Ok(Outcome::new(
+        json!({ "provider": provider, "removed": true }),
+        caller.primary,
+    ))
+}
+
+/// `providers discover`: replace one provider's model catalog with the one its
+/// endpoint's `/models` answers with.
+///
+pub(super) async fn discover<C: Client>(
+    client: &mut C,
+    invocation: &Invocation,
+    provider: &str,
+    out: &mut dyn Write,
+) -> Result<Outcome, Failure> {
+    let mut caller = Caller::new(client);
+    handshake(&mut caller, &invocation.verb).await?;
+    let (request_id, response) = caller
+        .call(ClientRequest::Provider(
+            ProviderRequest::DiscoverProviderModels {
+                provider_id: loom_model::ProviderId::new(provider.to_owned()),
+            },
+        ))
+        .await?;
+    let models = match response {
+        ServerResponse::Provider(ProviderResponse::Models { models }) => models,
+        _ => return Err(Failure::unexpected(request_id, "provider model discovery")),
+    };
+    if !invocation.globals.json {
+        for model in &models {
+            emit(out, &format!("model={}\n", model.id.as_str()))?;
+        }
+    }
+    Ok(Outcome::new(
+        json!({
+            "provider": provider,
+            "models": models
+                .iter()
+                .map(|model| json!({
+                    "id": model.id.as_str(),
+                    "display_name": model.display_name,
+                    "context_window": model.context_window,
+                    "max_output_tokens": model.max_output_tokens,
+                }))
+                .collect::<Vec<_>>(),
+        }),
         caller.primary,
     ))
 }
@@ -179,20 +315,16 @@ fn model_value(provider: &ProviderSummary, model: &ModelDescriptor, default: boo
 pub(super) fn default_selection(providers: &[ProviderSummary]) -> Option<ModelId> {
     providers.iter().find_map(|provider| {
         provider.credential_id.as_ref()?;
-        let mut models = provider.models.iter().collect::<Vec<_>>();
-        models.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
-        let model = default_model(provider, &models)?;
+        let model = default_model(provider, &provider.models)?;
         Some(ModelId::for_provider(&provider.id, &ModelId::new(model)))
     })
 }
 
 /// The model id a provider marks as its default: the kind's declared default
-/// when that model is present, otherwise the first model of the sorted list.
-/// `None` when the provider lists no model, so no default is invented.
-fn default_model<'a>(
-    provider: &ProviderSummary,
-    models: &[&'a ModelDescriptor],
-) -> Option<&'a str> {
+/// when that model is present, otherwise the first model in the order the
+/// worker stores it. `None` when the provider lists no model, so no default is
+/// invented.
+fn default_model<'a>(provider: &ProviderSummary, models: &'a [ModelDescriptor]) -> Option<&'a str> {
     if let Some(declared) = declared_default(provider.kind)
         && models.iter().any(|model| model.id.as_str() == declared)
     {

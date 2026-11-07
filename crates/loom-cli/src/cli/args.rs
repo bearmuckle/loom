@@ -107,6 +107,16 @@ Verbs:
                                     policy; the next sweep applies it
   providers list                    list configured providers and whether
                                     each has a credential; prints no secrets
+  providers add --id <id> --kind openai-compatible --endpoint <url>
+                [--model <id>]... [--default-model <id>]
+                                    register an OpenAI-compatible provider such
+                                    as OpenCode Go or OpenCode Zen; the default
+                                    model is stored first
+  providers remove --id <id>        remove an OpenAI-compatible provider and
+                                    the API key stored for it
+  providers discover --provider <id>
+                                    replace one provider's models with the
+                                    catalog its endpoint's /models returns
   models list [--provider <id>]     list the models of the configured
                                     providers and mark one default per
                                     provider; prints no secrets
@@ -315,6 +325,17 @@ command line is visible to every process on the node. A provider API key is
 read from the environment or a file only: --key is rejected for the same
 reason.
 
+`providers add` registers an OpenAI-compatible gateway the worker did not seed,
+which is how a headless node reaches OpenCode Go or OpenCode Zen. The models
+keep the order given and `--default-model` is moved to the front, because that
+first model is the one `run` starts when it derives a model from the worker.
+Add the provider first, then store its key with `providers set-key`; a provider
+without a key is not restored after a worker restart. Go and Zen may share one
+key, which is stored once per provider id. `providers discover` replaces the
+models with the endpoint's own `/models` catalog, and `providers remove` drops
+the provider and its stored key. A built-in provider (openai, deepseek,
+ollama, github-copilot, deterministic) can be neither redefined nor removed.
+
 Exit codes: 0 ok, 1 internal, 2 usage, 3 blocked, 4 timeout, 5 not found or
 gone, 6 protocol or auth mismatch, 7 transport unreachable.
 "#;
@@ -490,6 +511,39 @@ pub(crate) struct ProviderSetKeyArgs {
     pub source: ProviderKeySource,
 }
 
+/// The flags of `providers add`.
+///
+/// The provider is an OpenAI-compatible gateway the operator supplies: its id,
+/// its chat-completions endpoint, and the models it serves. The models keep the
+/// order given, and `--default-model` names the one stored first, which is the
+/// model `run` starts when it derives a model from the worker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderAddArgs {
+    pub provider: String,
+    pub endpoint: String,
+    pub models: Vec<String>,
+    pub default_model: Option<String>,
+}
+
+impl ProviderAddArgs {
+    /// The models in the order the worker stores them: the default model
+    /// first, then the rest as they were given.
+    pub(crate) fn ordered_models(&self) -> Vec<String> {
+        let Some(default) = &self.default_model else {
+            return self.models.clone();
+        };
+        let mut models = Vec::with_capacity(self.models.len());
+        models.push(default.clone());
+        models.extend(
+            self.models
+                .iter()
+                .filter(|model| *model != default)
+                .cloned(),
+        );
+        models
+    }
+}
+
 /// The flags of `retention set`.
 ///
 /// Each field is `None` when its flag was absent, so that value is kept from
@@ -601,6 +655,17 @@ pub(crate) enum Verb {
     RetentionSet(RetentionSetArgs),
     ProvidersList,
     ProvidersSetKey(ProviderSetKeyArgs),
+    /// `providers add`: register an OpenAI-compatible provider.
+    ProvidersAdd(ProviderAddArgs),
+    /// `providers remove`: drop an OpenAI-compatible provider and its key.
+    ProvidersRemove {
+        provider: String,
+    },
+    /// `providers discover`: replace one provider's models with the endpoint's
+    /// own `/models` catalog.
+    ProvidersDiscover {
+        provider: String,
+    },
     /// `models list`: the models of the configured providers, optionally of one
     /// exact provider.
     ModelsList {
@@ -797,6 +862,9 @@ pub(crate) fn verb_name(verb: &Verb) -> &'static str {
         Verb::RetentionSet(_) => "retention set",
         Verb::ProvidersList => "providers list",
         Verb::ProvidersSetKey(_) => "providers set-key",
+        Verb::ProvidersAdd(_) => "providers add",
+        Verb::ProvidersRemove { .. } => "providers remove",
+        Verb::ProvidersDiscover { .. } => "providers discover",
         Verb::ModelsList { .. } => "models list",
         Verb::SessionArchive { .. } => "session archive",
         Verb::SessionDelete { .. } => "session delete",
@@ -1291,19 +1359,27 @@ Examples:
     ),
     (
         "providers",
-        r#"Usage: loom-cli providers list|set-key
+        r#"Usage: loom-cli providers list|add|remove|discover|set-key
 
-List the configured providers or store one provider's API key.
+List the configured providers, register an OpenAI-compatible one, or store one
+provider's API key.
 
 Sub-verbs:
   list                        list the providers and their credentials
+  add                         register an OpenAI-compatible provider
+  remove                      remove an OpenAI-compatible provider and its key
+  discover                    replace one provider's models with its /models
   set-key                     store a key read from a variable or a file
 
 Global flags are accepted anywhere; see 'loom-cli --help'.
 
 Examples:
   loom-cli providers list
+  loom-cli providers add --id opencode-go --kind openai-compatible \
+    --endpoint https://opencode.ai/inference/go/openai/v1/chat/completions \
+    --model qwen3.8-flash
   loom-cli providers set-key --provider openai --from-env OPENAI_API_KEY
+  loom-cli providers remove --id opencode-go
 "#,
     ),
     (
@@ -1340,6 +1416,76 @@ Global flags are accepted anywhere; see 'loom-cli --help'.
 Examples:
   loom-cli providers set-key --provider openai --from-env OPENAI_API_KEY
   loom-cli providers set-key --provider deepseek --key-file ~/.config/loom/deepseek.key --json
+  loom-cli providers set-key --provider opencode-go --key-file ~/.config/loom/opencode.key
+"#,
+    ),
+    (
+        "providers add",
+        r#"Usage: loom-cli providers add --id <id> --kind openai-compatible
+                              --endpoint <url> [--model <id>]...
+                              [--default-model <id>]
+
+Register an OpenAI-compatible provider that the worker did not seed, then store
+its key with 'providers set-key --provider <id>'.
+
+Flags:
+  --id <id>                   the provider id, such as opencode-go (required)
+  --kind <kind>               openai-compatible (required)
+  --endpoint <url>            the chat-completions URL (required)
+  --model <id>                a model the endpoint serves; repeatable, and at
+                              least one is required
+  --default-model <id>        the model 'run' starts when it derives one; it
+                              must be one of the --model ids and is stored
+                              first
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+A provider without a stored key is not restored after a worker restart, so add
+it and store its key in the same session.
+
+Examples:
+  loom-cli providers add --id opencode-go --kind openai-compatible \
+    --endpoint https://opencode.ai/inference/go/openai/v1/chat/completions \
+    --model qwen3.8-flash --model glm-5.3-flash --default-model qwen3.8-flash
+  loom-cli providers set-key --provider opencode-go \
+    --key-file ~/.config/loom/opencode.key
+  loom-cli providers discover --provider opencode-go
+"#,
+    ),
+    (
+        "providers remove",
+        r#"Usage: loom-cli providers remove --id <id>
+
+Remove an OpenAI-compatible provider and the API key stored for it. A built-in
+provider (openai, deepseek, ollama, github-copilot, deterministic) is refused.
+
+Flags:
+  --id <id>                   the provider to remove (required)
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli providers remove --id opencode-go
+  loom-cli providers remove --id opencode-go --json
+"#,
+    ),
+    (
+        "providers discover",
+        r#"Usage: loom-cli providers discover --provider <id>
+
+Replace one provider's model catalog with the catalog its endpoint's /models
+returns. The worker stores the answer, so a later restart serves it without
+contacting the provider. Store the API key first when the endpoint requires
+one.
+
+Flags:
+  --provider <id>             the provider to refresh (required)
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli providers discover --provider opencode-go
+  loom-cli providers discover --provider opencode-go --json
 "#,
     ),
     (
@@ -1933,6 +2079,7 @@ fn arity(name: &str) -> Option<bool> {
         "--run" | "--text" | "--tool-call" | "--reason" | "--until" | "--timeout" => true,
         "--window" | "--force-discard" | "--sub-agent" => true,
         "--provider" | "--from-env" | "--key-file" | "--key" | "--api-key" => true,
+        "--id" | "--kind" | "--endpoint" | "--default-model" => true,
         "--expected-parent-revision" | "--project" => true,
         "--new" | "--archive" | "--retry-on-conflict" | "--force" | "--yes" | "--tree" => false,
         "--keep" | "--remove" | "--discard" => false,
@@ -2431,10 +2578,14 @@ fn parse_retention(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String>
 }
 
 /// The `providers` sub-verbs. `list` takes no flags. `set-key` takes the
-/// provider id and exactly one of `--from-env` or `--key-file`.
+/// provider id and exactly one of `--from-env` or `--key-file`. `add`,
+/// `remove`, and `discover` manage an operator-supplied OpenAI-compatible
+/// provider and its model catalog.
 fn parse_providers(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
     let Some(sub_verb) = rest.first() else {
-        return Err("providers requires 'list' or 'set-key'".to_owned());
+        return Err(
+            "providers requires 'list', 'add', 'remove', 'discover', or 'set-key'".to_owned(),
+        );
     };
     if rest.len() > 1 {
         return Err(format!("providers takes one sub-verb, got '{}'", rest[1]));
@@ -2471,10 +2622,79 @@ fn parse_providers(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String>
                 source,
             }))
         }
+        "add" => parse_providers_add(flags),
+        "remove" => {
+            let provider = provider_id(&flags.required("--id")?)?;
+            Ok(Verb::ProvidersRemove { provider })
+        }
+        "discover" => {
+            let provider = provider_id(&flags.required("--provider")?)?;
+            Ok(Verb::ProvidersDiscover { provider })
+        }
         other => Err(format!(
-            "unknown providers sub-verb '{other}'; use list or set-key"
+            "unknown providers sub-verb '{other}'; use list, add, remove, discover, or set-key"
         )),
     }
+}
+
+/// `providers add`: an OpenAI-compatible provider the operator supplies.
+///
+/// Only `--kind openai-compatible` is accepted, because every other provider
+/// kind is seeded by the worker. At least one `--model` is required, and
+/// `--default-model` must name one of them, so a provider never registers with
+/// a model `run` cannot start.
+fn parse_providers_add(flags: &mut FlagSet) -> Result<Verb, String> {
+    let kind = flags.required("--kind")?;
+    if !kind.trim().replace('_', "-").eq_ignore_ascii_case("openai-compatible") {
+        return Err(format!(
+            "providers add supports --kind openai-compatible, got '{}'",
+            kind.trim()
+        ));
+    }
+    let provider = provider_id(&flags.required("--id")?)?;
+    let endpoint = flags.required("--endpoint")?;
+    let endpoint = endpoint.trim().to_owned();
+    if !(endpoint.starts_with("http://") || endpoint.starts_with("https://"))
+        || endpoint
+            .split_once("://")
+            .is_none_or(|(_, rest)| rest.trim().is_empty())
+    {
+        return Err(format!(
+            "--endpoint must be an http:// or https:// URL, got '{endpoint}'"
+        ));
+    }
+    let mut models: Vec<String> = Vec::new();
+    for model in flags.values("--model") {
+        let model = model.trim().to_owned();
+        if model.is_empty() || models.contains(&model) {
+            continue;
+        }
+        models.push(model);
+    }
+    if models.is_empty() {
+        return Err(
+            "providers add requires at least one --model <id>; an OpenAI-compatible provider \
+             needs the models it serves"
+                .to_owned(),
+        );
+    }
+    let default_model = flags
+        .value("--default-model")
+        .map(|model| model.trim().to_owned());
+    if let Some(default) = &default_model
+        && !models.contains(default)
+    {
+        return Err(format!(
+            "--default-model '{default}' is not one of the --model ids; the default is stored \
+             first, so it must be one of them"
+        ));
+    }
+    Ok(Verb::ProvidersAdd(ProviderAddArgs {
+        provider,
+        endpoint,
+        models,
+        default_model,
+    }))
 }
 
 /// The `models` sub-verbs. `list` takes the optional exact provider id.

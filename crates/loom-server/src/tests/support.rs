@@ -1016,12 +1016,20 @@ pub(super) struct ScriptedModelRequest {
     /// The request's `Authorization` header, so a test can tell which
     /// credential a provider call authenticated with.
     pub(super) authorization: Option<String>,
+    /// The request's `User-Agent` header, so a test can tell what the worker
+    /// told the gateway it is.
+    pub(super) user_agent: Option<String>,
+    /// The request's `x-opencode-session` header, so a test can tell which Loom
+    /// session the gateway was asked to keep as one conversation.
+    pub(super) opencode_session: Option<String>,
     pub(super) stream: TcpStream,
 }
 
 /// One scripted HTTP request: the headers a test inspects and the raw body.
 struct ScriptedHttpRequest {
     authorization: Option<String>,
+    user_agent: Option<String>,
+    opencode_session: Option<String>,
     body: Vec<u8>,
 }
 
@@ -1084,6 +1092,8 @@ impl ScriptedOpenAiEndpoint {
                             let _ = sender.send(ScriptedModelRequest {
                                 request: body,
                                 authorization: request.authorization,
+                                user_agent: request.user_agent,
+                                opencode_session: request.opencode_session,
                                 stream,
                             });
                         });
@@ -1233,6 +1243,8 @@ fn read_scripted_http_request(stream: &mut TcpStream) -> std::io::Result<Scripte
         })
     };
     let authorization = header_value("authorization");
+    let user_agent = header_value("user-agent");
+    let opencode_session = header_value("x-opencode-session");
     let content_length = header_value("content-length")
         .and_then(|value| value.parse::<usize>().ok())
         .ok_or_else(|| {
@@ -1245,6 +1257,8 @@ fn read_scripted_http_request(stream: &mut TcpStream) -> std::io::Result<Scripte
     stream.read_exact(&mut body)?;
     Ok(ScriptedHttpRequest {
         authorization,
+        user_agent,
+        opencode_session,
         body,
     })
 }

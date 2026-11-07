@@ -5922,6 +5922,248 @@ fn providers_list_prints_credentials_without_secrets_and_set_key_stores_them() {
 }
 
 #[test]
+fn providers_add_parses_and_sends_an_openai_compatible_registration() {
+    let add = invocation(&[
+        "providers",
+        "add",
+        "--id",
+        "opencode-go",
+        "--kind",
+        "openai-compatible",
+        "--endpoint",
+        "https://opencode.ai/inference/go/openai/v1/chat/completions",
+        "--model",
+        "qwen3.8-flash",
+        "--model",
+        "glm-5.3-flash",
+        "--default-model",
+        "glm-5.3-flash",
+    ]);
+    let Verb::ProvidersAdd(args) = add.verb else {
+        panic!("providers add parses as providers add");
+    };
+    assert_eq!(args.provider, "opencode-go");
+    assert_eq!(args.models, ["qwen3.8-flash", "glm-5.3-flash"]);
+    // The default model is stored first, so it is the one `run` derives.
+    assert_eq!(
+        args.ordered_models(),
+        ["glm-5.3-flash", "qwen3.8-flash"]
+    );
+
+    // An underscore spelling of the kind is the same kind.
+    assert!(matches!(
+        invocation(&[
+            "providers",
+            "add",
+            "--id",
+            "opencode-go",
+            "--kind",
+            "openai_compatible",
+            "--endpoint",
+            "https://opencode.ai/inference/go/openai/v1/chat/completions",
+            "--model",
+            "qwen3.8-flash",
+        ])
+        .verb,
+        Verb::ProvidersAdd(_)
+    ));
+
+    assert!(matches!(
+        invocation(&["providers", "remove", "--id", "opencode-go"]).verb,
+        Verb::ProvidersRemove { provider } if provider == "opencode-go"
+    ));
+    assert!(matches!(
+        invocation(&["providers", "discover", "--provider", "opencode-go"]).verb,
+        Verb::ProvidersDiscover { provider } if provider == "opencode-go"
+    ));
+
+    assert!(parse_error(&["providers", "add", "--id", "x"]).contains("requires --kind"));
+    assert!(
+        parse_error(&[
+            "providers",
+            "add",
+            "--id",
+            "x",
+            "--kind",
+            "deepseek",
+            "--endpoint",
+            "https://example.test/v1/chat/completions",
+            "--model",
+            "m",
+        ])
+        .contains("supports --kind openai-compatible")
+    );
+    assert!(
+        parse_error(&[
+            "providers",
+            "add",
+            "--id",
+            "x",
+            "--kind",
+            "openai-compatible",
+            "--endpoint",
+            "opencode.ai/inference",
+            "--model",
+            "m",
+        ])
+        .contains("must be an http:// or https:// URL")
+    );
+    assert!(
+        parse_error(&[
+            "providers",
+            "add",
+            "--id",
+            "x",
+            "--kind",
+            "openai-compatible",
+            "--endpoint",
+            "https://example.test/v1/chat/completions",
+        ])
+        .contains("at least one --model")
+    );
+    assert!(
+        parse_error(&[
+            "providers",
+            "add",
+            "--id",
+            "x",
+            "--kind",
+            "openai-compatible",
+            "--endpoint",
+            "https://example.test/v1/chat/completions",
+            "--model",
+            "m",
+            "--default-model",
+            "other",
+        ])
+        .contains("is not one of the --model ids")
+    );
+    assert!(parse_error(&["providers", "remove"]).contains("requires --id"));
+    assert!(parse_error(&["providers", "discover"]).contains("requires --provider"));
+    assert!(parse_error(&["providers", "add", "--key", "sk-secret"]).contains("--from-env"));
+    assert!(parse_error(&["providers", "nope"]).contains("list, add, remove, discover"));
+}
+
+#[test]
+fn providers_add_registers_models_in_order_and_remove_drops_the_provider() {
+    let fixture = fixture();
+    let endpoint = "https://opencode.ai/inference/go/openai/v1/chat/completions";
+    let mut client = InProcessClient::new(&fixture.backend);
+    let registration = run(
+        &mut client,
+        &[
+            "providers",
+            "add",
+            "--id",
+            "opencode-go",
+            "--kind",
+            "openai-compatible",
+            "--endpoint",
+            endpoint,
+            "--model",
+            "qwen3.8-flash",
+            "--model",
+            "glm-5.3-flash",
+            "--default-model",
+            "glm-5.3-flash",
+        ],
+    );
+    assert_eq!(registration.code, exit::OK, "{}", registration.stderr);
+    assert_eq!(
+        registration.stdout,
+        "provider opencode-go kind=openai-compatible\n\
+         model=glm-5.3-flash default=true\n\
+         model=qwen3.8-flash default=false\n"
+    );
+    let provider = fixture
+        .backend
+        .provider_registry()
+        .list_providers()
+        .unwrap()
+        .into_iter()
+        .find(|provider| provider.id.as_str() == "opencode-go")
+        .expect("the added provider is listed");
+    assert_eq!(provider.credential_id, None);
+    assert!(provider.api_key_configurable);
+    assert_eq!(
+        provider
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        ["glm-5.3-flash", "qwen3.8-flash"]
+    );
+
+    // The key is stored through the request every other API-key provider uses.
+    let key_file = temporary_path("opencode-key");
+    std::fs::write(&key_file, "opencode-secret\n").unwrap();
+    let keyed = run(
+        &mut client,
+        &[
+            "providers",
+            "set-key",
+            "--provider",
+            "opencode-go",
+            "--key-file",
+            key_file.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(keyed.code, exit::OK, "{}", keyed.stderr);
+    let listed = run(&mut client, &["providers", "list"]);
+    assert!(
+        listed.stdout.contains(
+            "id=opencode-go kind=open_ai_compatible credential=true api-key-configurable=true\n"
+        ),
+        "{}",
+        listed.stdout
+    );
+    assert!(!listed.stdout.contains("opencode-secret"));
+
+    // `models list` marks the stored default, not the alphabetically first one.
+    let models = run(&mut client, &["models", "list", "--provider", "opencode-go"]);
+    assert_eq!(
+        models.stdout,
+        "provider=opencode-go model=glm-5.3-flash default=true\n\
+         provider=opencode-go model=qwen3.8-flash default=false\n"
+    );
+    // `run` without --model derives the model this list marks, so the stored
+    // default is what a plain `run` starts.
+    let models_json = json_envelope(&run(
+        &mut client,
+        &["models", "list", "--provider", "opencode-go", "--json"],
+    ));
+    let marked = models_json["data"]["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["default"] == true)
+        .expect("one model is marked as the default");
+    assert_eq!(marked["id"], "glm-5.3-flash");
+
+    let removed = run(&mut client, &["providers", "remove", "--id", "opencode-go"]);
+    assert_eq!(removed.code, exit::OK, "{}", removed.stderr);
+    assert_eq!(removed.stdout, "provider opencode-go removed\n");
+    assert!(
+        fixture
+            .backend
+            .provider_registry()
+            .list_providers()
+            .unwrap()
+            .iter()
+            .all(|provider| provider.id.as_str() != "opencode-go")
+    );
+    // A built-in provider is refused by the worker, and the client reports it.
+    let refused = run(&mut client, &["providers", "remove", "--id", "ollama"]);
+    assert_eq!(refused.code, exit::INTERNAL, "{}", refused.stderr);
+    assert!(
+        refused.stderr.contains("cannot be removed"),
+        "{}",
+        refused.stderr
+    );
+    let _ = std::fs::remove_file(key_file);
+}
+
+#[test]
 fn providers_set_key_rejects_a_blank_key_before_sending_it() {
     let fixture = fixture();
     let saw_key = Rc::new(Cell::new(false));

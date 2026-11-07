@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use loom_core::{ErrorCode, LoomError, Result, Timestamp, ToolCallId};
+use loom_core::{AgentSessionId, ErrorCode, LoomError, Result, Timestamp, ToolCallId};
 use loom_model::{
     CancellationToken, FinishReason, MessageRole, ModelCapabilities, ModelDescriptor, ModelId,
     ModelMessage, ModelRequest, ModelStreamEvent, ModelStreamSink, ProviderId, StreamFlow,
@@ -661,6 +661,22 @@ mod tests {
             read_request_headers(&mut stream)?;
             write_response(&mut stream, content_type, body)?;
             Ok(())
+        });
+        (format!("http://{address}/v1/chat/completions"), server)
+    }
+
+    /// Serves one request and returns everything the client sent, so a fixture
+    /// can assert on the headers of a request rather than on its body alone.
+    fn serve_capturing_request(
+        body: &'static str,
+    ) -> (String, thread::JoinHandle<std::result::Result<String, String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let request = read_request_with_body(&mut stream)?;
+            write_response(&mut stream, "application/json", body)?;
+            Ok(request)
         });
         (format!("http://{address}/v1/chat/completions"), server)
     }
@@ -1484,6 +1500,79 @@ mod tests {
             .join()
             .expect("fixture server panicked")
             .expect("fixture server failed");
+    }
+
+    #[test]
+    fn a_gateway_request_identifies_loom_and_the_session_it_serves() {
+        const BODY: &str =
+            r#"{"choices":[{"message":{"content":"gateway fixture"},"finish_reason":"stop"}]}"#;
+        let session = AgentSessionId::new();
+        let provider_id = ProviderId::new("opencode-go");
+        let (endpoint, server) = serve_capturing_request(BODY);
+        let registry =
+            ProviderRegistry::with_credentials(Arc::new(InMemoryCredentialStore::default()));
+        registry
+            .configure_openai_compatible_provider(
+                provider_id.clone(),
+                endpoint,
+                vec![
+                    ModelId::new("qwen3.8-flash"),
+                    ModelId::new("glm-5.3-flash"),
+                ],
+            )
+            .unwrap();
+        registry
+            .configure_api_key_provider(&provider_id, "gateway-key".to_owned())
+            .unwrap();
+        let model = ModelId::for_provider(&provider_id, &ModelId::new("glm-5.3-flash"));
+        let request = ModelRequest {
+            model: model.clone(),
+            messages: vec![ModelMessage::new(MessageRole::User, "hello")],
+            tools: Vec::new(),
+            options: Default::default(),
+        };
+        let mut provider = registry
+            .create_provider_for_session(session, &model, 0, None)
+            .unwrap();
+        provider
+            .stream_collected(&request, &CancellationToken::new())
+            .unwrap();
+        let sent = server
+            .join()
+            .expect("fixture server panicked")
+            .expect("fixture server failed")
+            .to_ascii_lowercase();
+        // OpenCode Go refuses a generic HTTP-library agent.
+        assert!(
+            sent.contains(&format!("user-agent: loom/{}", env!("CARGO_PKG_VERSION"))),
+            "{sent}"
+        );
+        // One Loom session keeps one upstream conversation.
+        assert!(
+            sent.contains(&format!("x-opencode-session: {session}")),
+            "{sent}"
+        );
+        assert!(sent.contains("authorization: bearer gateway-key"), "{sent}");
+
+        // A provider built without a session sends no conversation header, so
+        // only a run that knows its session can claim an upstream conversation.
+        let (endpoint, server) = serve_capturing_request(BODY);
+        let mut plain = OpenAiCompatibleProvider::with_descriptor(
+            endpoint,
+            "gateway-key",
+            registry.describe_model(&model).unwrap(),
+        );
+        collect(&mut plain, &request);
+        let sent = server
+            .join()
+            .expect("fixture server panicked")
+            .expect("fixture server failed")
+            .to_ascii_lowercase();
+        assert!(!sent.contains("x-opencode-session"), "{sent}");
+        assert!(
+            sent.contains(&format!("user-agent: loom/{}", env!("CARGO_PKG_VERSION"))),
+            "{sent}"
+        );
     }
 
     #[test]

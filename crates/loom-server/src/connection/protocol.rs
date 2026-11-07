@@ -1014,6 +1014,8 @@ impl InProcessConnection {
             ClientRequest::Provider(ProviderRequest::ConfigureGitHubCopilot { .. })
             | ClientRequest::Provider(ProviderRequest::ConfigureApiKeyProvider { .. })
             | ClientRequest::Provider(ProviderRequest::RemoveApiKeyProvider { .. })
+            | ClientRequest::Provider(ProviderRequest::ConfigureOpenAiCompatibleProvider { .. })
+            | ClientRequest::Provider(ProviderRequest::RemoveProvider { .. })
             | ClientRequest::Provider(ProviderRequest::ConfigureGitHubRepository { .. }) => {}
             ClientRequest::Access(loom_protocol::AccessRequest::GetCurrentParticipant)
             | ClientRequest::Access(loom_protocol::AccessRequest::ListParticipants)

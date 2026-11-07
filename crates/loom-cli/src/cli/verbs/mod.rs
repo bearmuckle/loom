@@ -285,7 +285,10 @@ pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
         Verb::ProvidersList | Verb::ModelsList { .. } => {
             capabilities.push(Capability::ListProviders);
         }
-        Verb::ProvidersSetKey(_) => capabilities.push(Capability::ConfigureProviders),
+        Verb::ProvidersSetKey(_) | Verb::ProvidersAdd(_) | Verb::ProvidersRemove { .. } => {
+            capabilities.push(Capability::ConfigureProviders);
+        }
+        Verb::ProvidersDiscover { .. } => capabilities.push(Capability::ListProviders),
         Verb::SessionArchive { .. } | Verb::ProjectArchive { .. } => {
             capabilities.extend([Capability::ReadProject, Capability::ControlAgentSession]);
         }
@@ -521,6 +524,13 @@ pub(crate) async fn run<C: Client>(
         Verb::RetentionSet(args) => operator::retention_set(client, invocation, args, out).await,
         Verb::ProvidersList => providers::list(client, invocation, out).await,
         Verb::ProvidersSetKey(args) => providers::set_key(client, invocation, args, out).await,
+        Verb::ProvidersAdd(args) => providers::add(client, invocation, args, out).await,
+        Verb::ProvidersRemove { provider } => {
+            providers::remove(client, invocation, provider, out).await
+        }
+        Verb::ProvidersDiscover { provider } => {
+            providers::discover(client, invocation, provider, out).await
+        }
         Verb::ModelsList { provider } => {
             providers::models(client, invocation, provider.as_deref(), out).await
         }

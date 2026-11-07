@@ -334,6 +334,110 @@ impl ProviderRegistry {
         self.register(ProviderConfig::ollama(endpoint, model))
     }
 
+    /// Registers an operator-supplied OpenAI-compatible provider, such as an
+    /// OpenCode Go or OpenCode Zen gateway.
+    ///
+    /// The models keep the order they are given in, so the first one is the
+    /// provider's default. Re-registering the same id keeps the credential
+    /// reference, so changing an endpoint does not drop the stored key; the
+    /// key itself is attached by [`ProviderRegistry::configure_api_key_provider`]
+    /// and lives in the instance credential store.
+    pub fn configure_openai_compatible_provider(
+        &self,
+        provider_id: ProviderId,
+        endpoint: impl Into<String>,
+        requested: Vec<ModelId>,
+    ) -> Result<()> {
+        if provider_id.as_str().trim().is_empty() {
+            return Err(LoomError::invalid_request("provider id must not be empty"));
+        }
+        let endpoint = endpoint.into().trim().to_owned();
+        if endpoint.is_empty() {
+            return Err(LoomError::invalid_request(
+                "provider endpoint must not be empty",
+            ));
+        }
+        let mut models = Vec::new();
+        for model in requested {
+            let raw = model.as_str().trim();
+            if raw.is_empty()
+                || models
+                    .iter()
+                    .any(|existing: &ModelDescriptor| existing.id.as_str() == raw)
+            {
+                continue;
+            }
+            let mut descriptor = configured_gateway_descriptor(raw);
+            descriptor.provider = provider_id.clone();
+            models.push(descriptor);
+        }
+        let Some(default_model) = models.first().cloned() else {
+            return Err(LoomError::invalid_request(
+                "an OpenAI-compatible provider needs at least one model",
+            ));
+        };
+        let existing = self
+            .configurations
+            .lock()
+            .map_err(|_| internal_lock_error("provider configuration"))?
+            .get(&provider_id)
+            .cloned();
+        if let Some(existing) = &existing
+            && existing.kind != ProviderKind::OpenAiCompatible
+        {
+            return Err(LoomError::invalid_request(format!(
+                "provider '{}' is a built-in {} provider and cannot be redefined",
+                provider_id.as_str(),
+                provider_kind_name(existing.kind)
+            )));
+        }
+        let mut config = ProviderConfig::openai_compatible(
+            provider_id.clone(),
+            provider_id.as_str(),
+            endpoint,
+            default_model,
+            existing.as_ref().and_then(|config| config.credential.clone()),
+        );
+        config.models = models;
+        self.register(config)
+    }
+
+    /// Removes an operator-supplied OpenAI-compatible provider and the API key
+    /// stored for it.
+    ///
+    /// A built-in provider is never removed: its configuration is part of the
+    /// worker, and dropping it would also drop the models Loom seeds for it.
+    pub fn remove_provider(&self, provider_id: &ProviderId) -> Result<()> {
+        let config = self
+            .configurations
+            .lock()
+            .map_err(|_| internal_lock_error("provider configuration"))?
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| LoomError::not_found("provider", provider_id.as_str()))?;
+        if config.kind != ProviderKind::OpenAiCompatible {
+            return Err(LoomError::invalid_request(format!(
+                "provider '{}' is a built-in {} provider and cannot be removed",
+                provider_id.as_str(),
+                provider_kind_name(config.kind)
+            )));
+        }
+        if let Some(reference) = &config.credential
+            && reference.as_str().starts_with("api-key:")
+        {
+            self.instance_credentials()?.remove(reference)?;
+        }
+        self.configurations
+            .lock()
+            .map_err(|_| internal_lock_error("provider configuration"))?
+            .remove(provider_id);
+        self.health
+            .lock()
+            .map_err(|_| internal_lock_error("provider health"))?
+            .remove(provider_id);
+        Ok(())
+    }
+
     pub fn register_github_copilot(&self, credential: impl Into<CredentialRef>) -> Result<()> {
         self.register(ProviderConfig::github_copilot(credential))
     }
@@ -822,7 +926,23 @@ impl ProviderRegistry {
         model: &ModelId,
         deterministic_cursor: usize,
     ) -> Result<Box<dyn ModelProvider>> {
-        self.create_provider_with_credential(model, deterministic_cursor, None)
+        self.create_provider_with_credential(model, deterministic_cursor, None, None)
+    }
+
+    /// Creates the provider that serves `model` for `session`.
+    ///
+    /// The session id is carried into the adapter, so a gateway that keeps an
+    /// upstream conversation per session can be told which one a request
+    /// belongs to. A provider that has no use for it behaves exactly as
+    /// [`ProviderRegistry::create_provider`].
+    pub fn create_provider_for_session(
+        &self,
+        session: AgentSessionId,
+        model: &ModelId,
+        deterministic_cursor: usize,
+        pinned_secret: Option<String>,
+    ) -> Result<Box<dyn ModelProvider>> {
+        self.create_provider_with_credential(model, deterministic_cursor, pinned_secret, Some(session))
     }
 
     /// The provider id that serves `model`.
@@ -842,7 +962,7 @@ impl ProviderRegistry {
         deterministic_cursor: usize,
         secret: Option<String>,
     ) -> Result<Box<dyn ModelProvider>> {
-        self.create_provider_with_credential(model, deterministic_cursor, secret)
+        self.create_provider_with_credential(model, deterministic_cursor, secret, None)
     }
 
     fn create_provider_with_credential(
@@ -850,6 +970,7 @@ impl ProviderRegistry {
         model: &ModelId,
         deterministic_cursor: usize,
         pinned_secret: Option<String>,
+        session: Option<AgentSessionId>,
     ) -> Result<Box<dyn ModelProvider>> {
         let (config, descriptor) = self.resolve_model(model)?;
         let resolve_secret = |config: &ProviderConfig| -> Result<String> {
@@ -877,9 +998,14 @@ impl ProviderRegistry {
                     ))
                 })?;
                 let secret = resolve_secret(&config)?;
-                Box::new(OpenAiCompatibleProvider::with_descriptor(
-                    endpoint, secret, descriptor,
-                ))
+                let mut provider =
+                    OpenAiCompatibleProvider::with_descriptor(endpoint, secret, descriptor);
+                // A gateway is the one provider kind that may keep one
+                // upstream conversation per Loom session.
+                if let Some(session) = session {
+                    provider = provider.with_session(session.to_string());
+                }
+                Box::new(provider)
             }
 
             ProviderKind::OpenAi => {
@@ -1276,6 +1402,19 @@ fn configured_gateway_descriptor(model: &str) -> ModelDescriptor {
             vision: false,
             json_mode: true,
         },
+    }
+}
+
+/// The name a provider kind is reported under, for an error that names the
+/// provider a command refused to redefine or remove.
+fn provider_kind_name(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::Deterministic => "deterministic",
+        ProviderKind::OpenAi => "openai",
+        ProviderKind::OpenAiCompatible => "openai-compatible",
+        ProviderKind::DeepSeek => "deepseek",
+        ProviderKind::Ollama => "ollama",
+        ProviderKind::GitHubCopilot => "github-copilot",
     }
 }
 

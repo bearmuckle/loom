@@ -242,12 +242,21 @@ impl Render for LoomView {
                     );
                 }
             }
+            let listed = self
+                .providers
+                .iter()
+                .map(|provider| provider.id.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            self.provider_api_key_inputs
+                .retain(|provider_id, _| listed.contains(provider_id));
+            self.sync_provider_add_form(window, cx);
         } else {
             for input in self.provider_api_key_inputs.values() {
                 input.update(cx, |state, cx| state.set_value("", window, cx));
             }
             self.provider_api_key_inputs.clear();
             self.provider_setup_status.clear();
+            self.clear_provider_add_form();
         }
         if let Some(path) = self.pending_source_path.take() {
             let input = cx.new(|cx| {

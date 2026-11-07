@@ -37,6 +37,9 @@
 //! | `providers list` | `Provider/ListProviders` |
 //! | `models list` | `Provider/ListProviders` |
 //! | `providers set-key` | `Provider/ConfigureApiKeyProvider` |
+//! | `providers add` | `Provider/ConfigureOpenAiCompatibleProvider` |
+//! | `providers remove` | `Provider/RemoveProvider` |
+//! | `providers discover` | `Provider/DiscoverProviderModels` |
 //! | `delete` | `Project/GetProjectSnapshotForSession`, `Session/DeleteAgentSession` |
 //! | `session archive` | `Project/GetProjectSnapshotForSession`, `Session/ArchiveAgentSession` |
 //! | `session delete` | `Project/GetProjectSnapshotForSession`, `Session/DeleteAgentSession` |
@@ -84,7 +87,8 @@
 //! `retention get`, `providers list`, `models list`, and every `project` read
 //! are the read-only verbs: they send nothing that mutates and negotiate only
 //! the capabilities their reads need, so a read-only-scoped token can run them.
-//! `retention set`, `providers set-key`, and `delete` are operator-level
+//! `retention set`, `providers set-key`, `providers add`, `providers remove`,
+//! and `delete` are operator-level
 //! mutations: a token without `configure_archive_retention`,
 //! `configure_providers`, or `delete_agent_session` is refused at negotiation
 //! with exit `3`.
@@ -143,7 +147,8 @@
 //! model as `provider=<provider-id> model=<model-id> default=<true|false>` for
 //! every configured provider, or for the one `--provider` id, and marks exactly
 //! one default per provider: the provider kind's declared default when that
-//! model is present, otherwise the first model in sorted order. A `--provider`
+//! model is present, otherwise the first model in the order the worker stores
+//! it, which is what makes `providers add --default-model` stick. A `--provider`
 //! id the worker does not have is an empty list with exit `0`, not an error.
 //! Its `--json` payload is `provider` (the filter or `null`) and `models`, whose
 //! entries carry `provider`, `id`, `display_name`, `default`, `context_window`,
@@ -152,6 +157,13 @@
 //! `providers set-key` reads the key from `--from-env` or
 //! `--key-file` and sends `Provider/ConfigureApiKeyProvider`; the worker stores
 //! the secret, and the command prints only `provider <id> credential set`.
+//! `providers add` sends `Provider/ConfigureOpenAiCompatibleProvider` to
+//! register a gateway the worker did not seed (OpenCode Go or OpenCode Zen, for
+//! example), `providers remove` sends `Provider/RemoveProvider` to drop it with
+//! its key, and `providers discover` sends `Provider/DiscoverProviderModels` to
+//! replace its models with the endpoint's own `/models` catalog. The key of an
+//! operator-added provider is stored by the same `set-key` path as any other
+//! API-key provider, so no separate key mechanism exists.
 //! `retention get` prints `window`, `force-discard`, and
 //! `sub-agent`, with a disabled window as `off`. `retention set` merges the
 //! flags it was given into the policy the worker already stores (a flag that is

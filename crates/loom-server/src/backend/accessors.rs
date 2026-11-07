@@ -104,14 +104,6 @@ impl InProcessBackend {
         self.providers.create_provider(model)
     }
 
-    pub(crate) fn provider_at(
-        &self,
-        model: &ModelId,
-        cursor: usize,
-    ) -> Result<Box<dyn ModelProvider>> {
-        self.providers.create_provider_at(model, cursor)
-    }
-
     /// The credential pin a new run of `session_id` with `model` gets, and
     /// the provider authenticated with it.
     ///
@@ -135,7 +127,11 @@ impl InProcessBackend {
                 owner: None,
                 owner_label: "worker".to_owned(),
             };
-            return Ok((pin, self.provider(model)?));
+            return Ok((
+                pin,
+                self.providers
+                    .create_provider_for_session(session_id, model, 0, None)?,
+            ));
         };
         let credential = credential.ok_or_else(|| {
             services::provider_credentials::credential_error(format!(
@@ -158,7 +154,7 @@ impl InProcessBackend {
             owner: credential.owner,
             owner_label: credential.owner_label.clone(),
         };
-        let provider = self.pinned_provider(&pin, model, 0)?;
+        let provider = self.pinned_provider(session_id, &pin, model, 0)?;
         Ok((pin, provider))
     }
 
@@ -185,8 +181,10 @@ impl InProcessBackend {
         let (pin, provider) = match self.provider_credentials.run_pin(run_id) {
             Some(pin) if pin.provider == provider_id.as_str() => {
                 let provider = match pin.credential_id {
-                    Some(_) => self.pinned_provider(&pin, model, 0)?,
-                    None => self.provider(model)?,
+                    Some(_) => self.pinned_provider(session_id, &pin, model, 0)?,
+                    None => self
+                        .providers
+                        .create_provider_for_session(session_id, model, 0, None)?,
                 };
                 let pin = loom_core::RunCredentialPin {
                     model: model.as_str().to_owned(),
@@ -211,33 +209,42 @@ impl InProcessBackend {
     /// provider configuration.
     pub(crate) fn provider_for_run(
         &self,
+        session_id: AgentSessionId,
         run_id: loom_core::RunId,
         model: &ModelId,
         cursor: usize,
     ) -> Result<Box<dyn ModelProvider>> {
         match self.provider_credentials.run_pin(run_id) {
-            Some(pin) if pin.credential_id.is_some() => self.pinned_provider(&pin, model, cursor),
-            _ => self.provider_at(model, cursor),
+            Some(pin) if pin.credential_id.is_some() => {
+                self.pinned_provider(session_id, &pin, model, cursor)
+            }
+            _ => self.providers.create_provider_for_session(session_id, model, cursor, None),
         }
     }
 
     fn pinned_provider(
         &self,
+        session_id: AgentSessionId,
         pin: &loom_core::RunCredentialPin,
         model: &ModelId,
         cursor: usize,
     ) -> Result<Box<dyn ModelProvider>> {
         let (Some(credential_id), Some(version)) = (pin.credential_id, pin.version) else {
-            return self.provider_at(model, cursor);
+            return self
+                .providers
+                .create_provider_for_session(session_id, model, cursor, None);
         };
         let secret = self.provider_credentials.resolve_secret(
             self.providers.instance_credentials()?.as_ref(),
             credential_id,
             version,
         )?;
-        let inner = self
-            .providers
-            .create_provider_with_secret(model, cursor, Some(secret))?;
+        let inner = self.providers.create_provider_for_session(
+            session_id,
+            model,
+            cursor,
+            Some(secret),
+        )?;
         Ok(Box::new(PinnedCredentialProvider {
             inner,
             credentials: Arc::clone(&self.provider_credentials),
@@ -263,9 +270,13 @@ impl InProcessBackend {
         let handles = self.runs()?.values().cloned().collect::<Vec<_>>();
         let mut updated = 0_usize;
         for handle in handles {
-            let (model, cursor) = {
+            let (model, cursor, session_id) = {
                 let state = handle.locked_state();
-                (state.run.model.clone(), state.provider_cursor)
+                (
+                    state.run.model.clone(),
+                    state.provider_cursor,
+                    state.session_id,
+                )
             };
             let model_provider = match self.providers.provider_id_for_model(&model) {
                 Ok(model_provider) => model_provider,
@@ -292,7 +303,9 @@ impl InProcessBackend {
             {
                 continue;
             }
-            let provider = self.provider_at(&model, cursor)?;
+            let provider =
+                self.providers
+                    .create_provider_for_session(session_id, &model, cursor, None)?;
             match handle.try_runtime() {
                 Ok(mut runtime) => runtime.replace_provider(provider)?,
                 // A turn is in flight, so the run worker applies the

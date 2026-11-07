@@ -607,6 +607,7 @@ impl InProcessBackend {
             let workspace = self.restore_session_filesystem(session.id)?;
             let mut recovery_reason = None;
             let provider = match self.provider_for_run(
+                runtime_state.session_id,
                 run_id,
                 &runtime_state.task.model,
                 runtime_state.provider_cursor,
