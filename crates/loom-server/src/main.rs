@@ -53,10 +53,15 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// `RUST_LOG` overrides this.
+const DEFAULT_LOG_FILTER: &str = "warn,loom_server=info";
+
 /// Initializes the `log` facade so operator diagnostics are visible. The default
-/// filter keeps the backend's own startup and health lines.
+/// filter keeps the backend's own startup and health lines plus every warning
+/// and error, including those from the agent and provider crates (a provider
+/// failure used to leave no trace because only `loom_server` was enabled).
 fn init_logging() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("loom_server=info"))
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(DEFAULT_LOG_FILTER))
         .format_timestamp_millis()
         .init();
 }

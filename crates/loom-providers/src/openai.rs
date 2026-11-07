@@ -6,7 +6,37 @@ pub struct OpenAiCompatibleProvider {
     pub endpoint: String,
     pub api_key: String,
     pub descriptor: ModelDescriptor,
+    pub stream_timeouts: StreamTimeouts,
 }
+
+/// Deadlines for a streamed completion.
+///
+/// A streamed reply has no total deadline: a reasoning model can think and
+/// write for many minutes. Instead the response headers must arrive within
+/// `response`, and once the body is streaming some bytes (an event or a
+/// `: keep-alive` comment) must arrive at least every `idle`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StreamTimeouts {
+    /// Deadline for the response status and headers.
+    pub response: Duration,
+    /// Longest silence tolerated between two body chunks of a streamed
+    /// reply. A buffered (non-SSE) body, or an error body, must arrive in full
+    /// within it.
+    pub idle: Duration,
+}
+
+impl Default for StreamTimeouts {
+    fn default() -> Self {
+        Self {
+            response: Duration::from_secs(120),
+            idle: Duration::from_secs(180),
+        }
+    }
+}
+
+/// How often a wait on the provider re-checks the cancellation token, so an
+/// interrupt does not have to wait for the next chunk or a deadline.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 impl OpenAiCompatibleProvider {
     pub fn new(
@@ -44,7 +74,15 @@ impl OpenAiCompatibleProvider {
             endpoint: endpoint.into(),
             api_key: api_key.into(),
             descriptor,
+            stream_timeouts: StreamTimeouts::default(),
         }
+    }
+
+    /// Replaces the streaming deadlines (used by tests and slow endpoints).
+    #[must_use]
+    pub fn with_stream_timeouts(mut self, stream_timeouts: StreamTimeouts) -> Self {
+        self.stream_timeouts = stream_timeouts;
+        self
     }
 
     pub fn endpoint(&self) -> &str {
@@ -116,6 +154,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
             payload,
             self.descriptor.provider.as_str(),
             None,
+            self.stream_timeouts,
             cancel,
             sink,
         )
@@ -326,6 +365,7 @@ pub fn send_openai_request(
     mut payload: serde_json::Value,
     provider: &str,
     call_ids: Option<&mut BTreeMap<String, ToolCallId>>,
+    timeouts: StreamTimeouts,
     cancel: &CancellationToken,
     sink: &mut dyn ModelStreamSink,
 ) -> Result<()> {
@@ -342,6 +382,7 @@ pub fn send_openai_request(
         provider,
         responses_api,
         call_ids,
+        timeouts,
         cancel,
         sink,
     ))
@@ -356,13 +397,16 @@ async fn send_openai_request_async(
     provider: &str,
     responses_api: bool,
     call_ids: Option<&mut BTreeMap<String, ToolCallId>>,
+    timeouts: StreamTimeouts,
     cancel: &CancellationToken,
     sink: &mut dyn ModelStreamSink,
 ) -> Result<()> {
     let client = shared_http_client()?;
+    // No `.timeout(..)` here: reqwest's request timeout covers the whole body,
+    // so it cut off every reply that streamed longer than its deadline. The
+    // header and idle deadlines below bound a stalled stream instead.
     let mut request = client
         .post(endpoint)
-        .timeout(PROVIDER_REQUEST_TIMEOUT)
         .header("Content-Type", "application/json")
         .header("Accept", "text/event-stream")
         .json(&payload);
@@ -373,10 +417,18 @@ async fn send_openai_request_async(
         request = request.header(*name, *value);
     }
     cancel.check()?;
-    let response = request
-        .send()
-        .await
-        .map_err(|error| normalize_transport_error(provider, &error.to_string()))?;
+    let response = match wait_cancellable(request.send(), timeouts.response, cancel).await? {
+        Some(response) => response.map_err(|error| transport_error(provider, &error))?,
+        None => {
+            return Err(normalize_transport_error(
+                provider,
+                &format!(
+                    "no response headers within {}s",
+                    timeouts.response.as_secs_f64()
+                ),
+            ));
+        }
+    };
     let status = response.status();
     if !status.is_success() {
         let retry_after = response
@@ -385,7 +437,10 @@ async fn send_openai_request_async(
             .and_then(|value| value.to_str().ok())
             .filter(|value| !value.trim().is_empty())
             .map(str::to_owned);
-        let detail = response.text().await.unwrap_or_default();
+        let detail = wait_cancellable(response.text(), timeouts.idle, cancel)
+            .await?
+            .and_then(std::result::Result::ok)
+            .unwrap_or_default();
         let detail = detail
             .replace("Bearer ", "****** ")
             .replace("token ", "token [redacted] ")
@@ -414,7 +469,16 @@ async fn send_openai_request_async(
     let mut own_call_ids = BTreeMap::new();
     let call_ids = call_ids.unwrap_or(&mut own_call_ids);
     if !event_stream {
-        let body: serde_json::Value = response.json().await.map_err(|error| {
+        let Some(body) = wait_cancellable(response.json(), timeouts.idle, cancel).await? else {
+            return Err(normalize_transport_error(
+                provider,
+                &format!(
+                    "the response body did not arrive within {}s",
+                    timeouts.idle.as_secs_f64()
+                ),
+            ));
+        };
+        let body: serde_json::Value = body.map_err(|error| {
             LoomError::new(
                 ErrorCode::ProviderInvalidResponse,
                 format!("{provider} returned a response that was not valid JSON: {error}"),
@@ -439,12 +503,23 @@ async fn send_openai_request_async(
     } else {
         StreamDecoder::chat_completions(provider.to_owned())
     };
-    let mut stream = response.bytes_stream();
+    let mut stream = std::pin::pin!(response.bytes_stream());
     let mut buffer = String::new();
-    'outer: while let Some(chunk) = stream.next().await {
+    'outer: loop {
+        let Some(chunk) = wait_cancellable(stream.next(), timeouts.idle, cancel).await? else {
+            return Err(normalize_transport_error(
+                provider,
+                &format!(
+                    "the stream sent no data for {}s",
+                    timeouts.idle.as_secs_f64()
+                ),
+            ));
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         cancel.check()?;
-        let chunk =
-            chunk.map_err(|error| normalize_transport_error(provider, &error.to_string()))?;
+        let chunk = chunk.map_err(|error| transport_error(provider, &error))?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(index) = buffer.find('\n') {
             let line = buffer[..index].trim_end_matches('\r').to_owned();
@@ -472,6 +547,28 @@ async fn send_openai_request_async(
         }
     }
     decoder.finish(sink)
+}
+
+/// Awaits `future` for at most `limit`, re-checking `cancel` every
+/// [`CANCEL_POLL_INTERVAL`]. Returns `Ok(None)` when the deadline passes.
+async fn wait_cancellable<F: std::future::Future>(
+    future: F,
+    limit: Duration,
+    cancel: &CancellationToken,
+) -> Result<Option<F::Output>> {
+    let mut future = std::pin::pin!(future);
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        cancel.check()?;
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        let slice = (deadline - now).min(CANCEL_POLL_INTERVAL);
+        if let Ok(output) = tokio::time::timeout(slice, future.as_mut()).await {
+            return Ok(Some(output));
+        }
+    }
 }
 
 /// Incremental decoder for the two OpenAI-shaped event streams Loom speaks.

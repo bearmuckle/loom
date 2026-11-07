@@ -496,6 +496,7 @@ impl ModelProvider for GitHubCopilotProvider {
             } else {
                 None
             },
+            StreamTimeouts::default(),
             cancel,
             sink,
         )
