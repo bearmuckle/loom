@@ -992,6 +992,136 @@ fn rejecting_a_destructive_tool_reports_the_rejection_reason() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// A model turn that offers an allowed read and then a call the policy gates
+/// must run the read first and stop in the state the approval owns. Stopping
+/// with the run still executing and an approval pending is the contradictory
+/// pair the durable state rejects, which fail-stops the worker.
+#[test]
+fn an_allowed_call_before_a_gated_call_leaves_the_run_awaiting_approval() {
+    let root = workspace();
+    fs::write(root.join("notes.txt"), "read me\n").unwrap();
+    let task = AgentTask::new("read and run", ModelId::new("deterministic/demo")).unwrap();
+    let provider = DeterministicProvider {
+        descriptor: loom_providers::deterministic_descriptor(),
+        steps: vec![
+            vec![
+                ModelStreamEvent::ToolCallDelta {
+                    call: ToolCall {
+                        id: loom_core::ToolCallId::new(),
+                        name: "read_file".to_owned(),
+                        arguments: serde_json::json!({"path": "notes.txt"}),
+                    },
+                },
+                ModelStreamEvent::ToolCallDelta {
+                    call: ToolCall {
+                        id: loom_core::ToolCallId::new(),
+                        name: "run_command".to_owned(),
+                        arguments: serde_json::json!({"command": "git status"}),
+                    },
+                },
+                ModelStreamEvent::Completed {
+                    reason: loom_model::FinishReason::ToolCall,
+                },
+            ],
+            vec![
+                ModelStreamEvent::TextDelta {
+                    text: "Done.".to_owned(),
+                },
+                ModelStreamEvent::Completed {
+                    reason: loom_model::FinishReason::Stop,
+                },
+            ],
+        ],
+        cursor: 0,
+    };
+    let mut runtime = AgentRuntime::new_with_policy(
+        AgentSessionId::new(),
+        task,
+        Box::new(provider),
+        ToolExecutor::new(&root).unwrap(),
+        loom_core::ApprovalPolicy::default(),
+    );
+
+    let events = runtime.start().unwrap();
+
+    // The export is what the server persists, and it must satisfy the durable
+    // state: an approval is pending only while awaiting approval or paused.
+    let state = runtime.export_state();
+    assert_eq!(state.run.state, AgentRunState::AwaitingApproval);
+    let pending = state
+        .pending_approval
+        .clone()
+        .expect("the gated call waits for approval");
+    assert_eq!(pending.name, "run_command");
+    assert!(state.pending_tool_execution.is_none());
+    // The allowed read before it already ran and kept its result.
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolCallCompleted { result, .. }
+            if result.success && result.name == "read_file"
+    )));
+
+    let approved = runtime.approve(pending.id).unwrap();
+    assert!(approved.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolCallStarted { call, .. } if call.name == "run_command"
+    )));
+    assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// The same turn shape with `ask_user`: the allowed read runs, and the run
+/// stops waiting for input instead of executing with the prompt pending.
+#[test]
+fn an_allowed_call_before_ask_user_leaves_the_run_needs_input() {
+    let root = workspace();
+    fs::write(root.join("notes.txt"), "read me\n").unwrap();
+    let task = AgentTask::new("read and ask", ModelId::new("deterministic/demo")).unwrap();
+    let provider = DeterministicProvider {
+        descriptor: loom_providers::deterministic_descriptor(),
+        steps: vec![vec![
+            ModelStreamEvent::ToolCallDelta {
+                call: ToolCall {
+                    id: loom_core::ToolCallId::new(),
+                    name: "read_file".to_owned(),
+                    arguments: serde_json::json!({"path": "notes.txt"}),
+                },
+            },
+            ModelStreamEvent::ToolCallDelta {
+                call: ToolCall {
+                    id: loom_core::ToolCallId::new(),
+                    name: "ask_user".to_owned(),
+                    arguments: serde_json::json!({"prompt": "Which option?"}),
+                },
+            },
+            ModelStreamEvent::Completed {
+                reason: loom_model::FinishReason::ToolCall,
+            },
+        ]],
+        cursor: 0,
+    };
+    let mut runtime = AgentRuntime::new_with_policy(
+        AgentSessionId::new(),
+        task,
+        Box::new(provider),
+        ToolExecutor::new(&root).unwrap(),
+        loom_core::ApprovalPolicy::default(),
+    );
+
+    let events = runtime.start().unwrap();
+
+    let state = runtime.export_state();
+    assert_eq!(state.run.state, AgentRunState::NeedsInput);
+    assert_eq!(state.pending_input.as_deref(), Some("Which option?"));
+    assert!(state.pending_approval.is_none());
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolCallCompleted { result, .. }
+            if result.success && result.name == "read_file"
+    )));
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// A policy that denies the destructive dimension still refuses the call,
 /// and the completed result carries the policy reason with the pin and the
 /// remedy that changes it.

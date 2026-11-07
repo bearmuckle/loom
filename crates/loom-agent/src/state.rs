@@ -2,6 +2,29 @@ use super::*;
 
 impl AgentRuntime {
     pub fn export_state(&self) -> AgentRuntimeState {
+        // The durable state requires a pending intent to match the run state, so
+        // an export caught between the two is a producer bug here, not a save to
+        // repair later.
+        debug_assert!(
+            self.pending_approval.is_none()
+                || matches!(
+                    self.run.state,
+                    AgentRunState::AwaitingApproval | AgentRunState::Paused
+                ),
+            "run {} exports a pending approval while {:?}",
+            self.run.id,
+            self.run.state,
+        );
+        debug_assert!(
+            self.pending_input.is_none()
+                || matches!(
+                    self.run.state,
+                    AgentRunState::NeedsInput | AgentRunState::Paused
+                ),
+            "run {} exports a pending input prompt while {:?}",
+            self.run.id,
+            self.run.state,
+        );
         AgentRuntimeState {
             session_id: self.session_id,
             task: self.task.clone(),
