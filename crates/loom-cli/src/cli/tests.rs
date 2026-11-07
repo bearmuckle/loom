@@ -5945,10 +5945,7 @@ fn providers_add_parses_and_sends_an_openai_compatible_registration() {
     assert_eq!(args.provider, "opencode-go");
     assert_eq!(args.models, ["qwen3.8-flash", "glm-5.3-flash"]);
     // The default model is stored first, so it is the one `run` derives.
-    assert_eq!(
-        args.ordered_models(),
-        ["glm-5.3-flash", "qwen3.8-flash"]
-    );
+    assert_eq!(args.ordered_models(), ["glm-5.3-flash", "qwen3.8-flash"]);
 
     // An underscore spelling of the kind is the same kind.
     assert!(matches!(
@@ -6120,7 +6117,10 @@ fn providers_add_registers_models_in_order_and_remove_drops_the_provider() {
     assert!(!listed.stdout.contains("opencode-secret"));
 
     // `models list` marks the stored default, not the alphabetically first one.
-    let models = run(&mut client, &["models", "list", "--provider", "opencode-go"]);
+    let models = run(
+        &mut client,
+        &["models", "list", "--provider", "opencode-go"],
+    );
     assert_eq!(
         models.stdout,
         "provider=opencode-go model=glm-5.3-flash default=true\n\
@@ -7116,8 +7116,13 @@ fn the_parser_covers_the_operator_verbs() {
     assert_eq!(from_file.provider, "deepseek");
     assert!(matches!(from_file.source, ProviderKeySource::File(_)));
 
-    assert!(parse_error(&["providers"]).contains("requires 'list' or 'set-key'"));
-    assert!(parse_error(&["providers", "show"]).contains("list or set-key"));
+    assert!(
+        parse_error(&["providers"])
+            .contains("requires 'list', 'add', 'remove', 'discover', or 'set-key'")
+    );
+    assert!(
+        parse_error(&["providers", "show"]).contains("use list, add, remove, discover, or set-key")
+    );
     assert!(parse_error(&["providers", "list", "extra"]).contains("one sub-verb"));
     assert!(
         parse_error(&["providers", "set-key", "--provider", "openai"])

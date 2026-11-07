@@ -218,7 +218,9 @@ impl InProcessBackend {
             Some(pin) if pin.credential_id.is_some() => {
                 self.pinned_provider(session_id, &pin, model, cursor)
             }
-            _ => self.providers.create_provider_for_session(session_id, model, cursor, None),
+            _ => self
+                .providers
+                .create_provider_for_session(session_id, model, cursor, None),
         }
     }
 
@@ -239,12 +241,9 @@ impl InProcessBackend {
             credential_id,
             version,
         )?;
-        let inner = self.providers.create_provider_for_session(
-            session_id,
-            model,
-            cursor,
-            Some(secret),
-        )?;
+        let inner =
+            self.providers
+                .create_provider_for_session(session_id, model, cursor, Some(secret))?;
         Ok(Box::new(PinnedCredentialProvider {
             inner,
             credentials: Arc::clone(&self.provider_credentials),
@@ -303,9 +302,9 @@ impl InProcessBackend {
             {
                 continue;
             }
-            let provider =
-                self.providers
-                    .create_provider_for_session(session_id, &model, cursor, None)?;
+            let provider = self
+                .providers
+                .create_provider_for_session(session_id, &model, cursor, None)?;
             match handle.try_runtime() {
                 Ok(mut runtime) => runtime.replace_provider(provider)?,
                 // A turn is in flight, so the run worker applies the

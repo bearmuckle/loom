@@ -1015,12 +1015,12 @@ impl LoomView {
             id: Some(cx.new(|cx| {
                 InputState::new(window, cx).placeholder("Provider id, such as opencode-go")
             })),
-            endpoint: Some(cx.new(|cx| {
-                InputState::new(window, cx).placeholder("Chat-completions endpoint")
-            })),
-            models: Some(cx.new(|cx| {
-                InputState::new(window, cx).placeholder("Models, comma separated")
-            })),
+            endpoint: Some(
+                cx.new(|cx| InputState::new(window, cx).placeholder("Chat-completions endpoint")),
+            ),
+            models: Some(
+                cx.new(|cx| InputState::new(window, cx).placeholder("Models, comma separated")),
+            ),
             status: None,
         };
     }
@@ -1037,7 +1037,8 @@ impl LoomView {
     /// path and one credential mechanism with DeepSeek.
     pub(crate) fn add_openai_compatible_provider(&mut self, cx: &mut Context<Self>) {
         let Some(node_id) = self.providers_node_id.clone() else {
-            self.provider_add_form.status = Some("Choose a worker before adding a provider".to_owned());
+            self.provider_add_form.status =
+                Some("Choose a worker before adding a provider".to_owned());
             cx.notify();
             return;
         };
@@ -1048,7 +1049,9 @@ impl LoomView {
                 .unwrap_or_default()
         };
         let provider_id = value(&self.provider_add_form.id, cx).trim().to_owned();
-        let endpoint = value(&self.provider_add_form.endpoint, cx).trim().to_owned();
+        let endpoint = value(&self.provider_add_form.endpoint, cx)
+            .trim()
+            .to_owned();
         let models = value(&self.provider_add_form.models, cx)
             .split(',')
             .map(str::trim)
@@ -1144,8 +1147,7 @@ impl LoomView {
             }),
             move |view, response, cx| match response.result {
                 Ok(ServerResponse::Provider(ProviderResponse::ProviderConfigured)) => {
-                    view.provider_setup_status
-                        .remove(&provider_id);
+                    view.provider_setup_status.remove(&provider_id);
                     view.provider_api_key_inputs.remove(&provider_id);
                     view.record_status(format!(
                         "Provider {} removed on {node_id}",

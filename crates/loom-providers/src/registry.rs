@@ -396,7 +396,9 @@ impl ProviderRegistry {
             provider_id.as_str(),
             endpoint,
             default_model,
-            existing.as_ref().and_then(|config| config.credential.clone()),
+            existing
+                .as_ref()
+                .and_then(|config| config.credential.clone()),
         );
         config.models = models;
         self.register(config)
@@ -942,7 +944,12 @@ impl ProviderRegistry {
         deterministic_cursor: usize,
         pinned_secret: Option<String>,
     ) -> Result<Box<dyn ModelProvider>> {
-        self.create_provider_with_credential(model, deterministic_cursor, pinned_secret, Some(session))
+        self.create_provider_with_credential(
+            model,
+            deterministic_cursor,
+            pinned_secret,
+            Some(session),
+        )
     }
 
     /// The provider id that serves `model`.

@@ -55,24 +55,24 @@ impl InProcessConnection {
             &state.task.model,
             state.provider_cursor,
         ) {
-                Ok(provider) => provider,
-                Err(error) => {
-                    let descriptor = self
-                        .backend
-                        .providers
-                        .describe_model(&state.task.model)
-                        .unwrap_or_else(|_| ModelDescriptor {
-                            id: state.task.model.clone(),
-                            provider: ProviderId::new("recovered"),
-                            display_name: "Unavailable persisted model".to_owned(),
-                            context_window: None,
-                            max_input_tokens: None,
-                            max_output_tokens: None,
-                            capabilities: ModelCapabilities::default(),
-                        });
-                    Box::new(UnavailableProvider::new(descriptor, error))
-                }
-            };
+            Ok(provider) => provider,
+            Err(error) => {
+                let descriptor = self
+                    .backend
+                    .providers
+                    .describe_model(&state.task.model)
+                    .unwrap_or_else(|_| ModelDescriptor {
+                        id: state.task.model.clone(),
+                        provider: ProviderId::new("recovered"),
+                        display_name: "Unavailable persisted model".to_owned(),
+                        context_window: None,
+                        max_input_tokens: None,
+                        max_output_tokens: None,
+                        capabilities: ModelCapabilities::default(),
+                    });
+                Box::new(UnavailableProvider::new(descriptor, error))
+            }
+        };
         let tools = ToolExecutor::new_with_workspace(workspace)
             .with_build_cache_root(self.backend.build_cache_root())
             .with_github_token(self.backend.providers.github_account_token().ok())
