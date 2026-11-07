@@ -69,6 +69,9 @@ error invalid_request could not read the token file \
 | `retention get` | The worker-wide archive-retention policy, with a disabled window as `off`. |
 | `retention set [--window <duration>] [--force-discard <bool>] [--sub-agent <duration>]` | Merge the given fields into the stored worker-wide archive-retention policy. |
 | `providers list` | Configured providers, and whether each has a credential. No secrets. |
+| `providers add --id <id> --kind openai-compatible --endpoint <url> [--model <id>]... [--default-model <id>]` | Register an OpenAI-compatible provider the worker did not seed, such as OpenCode Go. |
+| `providers remove --id <id>` | Drop an OpenAI-compatible provider and the key stored for it. A built-in provider is refused. |
+| `providers discover --provider <id>` | Replace one provider's model catalog with the one its endpoint's `/models` answers with. |
 | `models list [--provider <id>]` | The models of the configured providers, one default per provider. No secrets. |
 | `providers set-key --provider <id> (--from-env <NAME> \| --key-file <path>)` | Store an API key for `openai`, `deepseek`, or an OpenAI-compatible provider. |
 | `delete <session-id> [--force] [--yes] [--request-id <uuid>]` | Permanently delete an archived session, or a project root with its descendants; the same operation as `session delete`. |
@@ -92,11 +95,13 @@ error invalid_request could not read the token file \
 | `project worktree cleanup <session-id> --task <task-id> (--keep \| --remove \| --discard) [--yes] [--request-id <uuid>]` | Keep or remove the checkout recorded for one delegated task. |
 
 `node`, `whoami`, `ls`, `get`, `events`, `peek`, `retention get`, `providers
-list`, `models list`, and every `project` read are read-only, issue no mutation,
-and work with a read-only-scoped token. `run` starts a run; `send`,
+list`, `providers discover`, `models list`, and every `project` read are
+read-only, issue no mutation, and work with a read-only-scoped token. `run`
+starts a run; `send`,
 `project send`, `answer`, `approve`, `deny`, and `stop` control one; `wait`,
 `status`, `liveness`, and `result` read one. `retention set`, `providers
-set-key`, `session archive`, `session delete` (and its `delete` alias), `project
+set-key`, `providers add`, `providers remove`, `session archive`, `session
+delete` (and its `delete` alias), `project
 archive`, `project delete`, `project models set`, `project worktree integrate`,
 and `project worktree cleanup` are operator-level mutations. No verb waits for a run except `wait`,
 which is always bounded by `--timeout`.
@@ -670,6 +675,71 @@ and then by model id, and a provider that declares no default
 (`deterministic`, `ollama`) marks its first model, so two models are never
 marked.
 
+### `providers add`
+
+`providers add --id <id> --kind openai-compatible --endpoint <url>
+[--model <id>]... [--default-model <id>]` registers an OpenAI-compatible
+provider the worker did not seed, which is how a headless node reaches a gateway
+such as OpenCode Go. It sends `Provider/ConfigureOpenAiCompatibleProvider`, the
+request Settings → Providers sends:
+
+```sh
+loom-cli providers add --id opencode-go --kind openai-compatible \
+  --endpoint https://opencode.ai/inference/go/openai/v1/chat/completions \
+  --model qwen3.8-flash --model glm-5.3-flash --default-model qwen3.8-flash
+loom-cli providers set-key --provider opencode-go \
+  --key-file ~/.config/loom/opencode.key
+```
+
+`--kind` accepts `openai-compatible` (or `openai_compatible`) only, because
+every other provider kind is seeded by the worker. `--endpoint` is the
+chat-completions URL and must be `http://` or `https://`. At least one `--model`
+is required, and the ids keep the order given with duplicates dropped;
+`--default-model` must name one of them and is stored first, so a provider never
+registers with a model `run` cannot start. Re-adding an id redefines that
+provider in place and keeps the key already stored for it, and a built-in id
+(`openai`, `deepseek`, `ollama`, `github-copilot`, `deterministic`) is refused as
+`invalid_request`, which keeps the seeded catalogs intact.
+
+The key is not part of this command: store it afterwards with `providers
+set-key`, through the same credential-store path every other API-key provider
+uses. A provider that has no stored key is not restored after a worker restart,
+so add it and store the key in the same session. The text output is:
+
+```text
+provider opencode-go kind=openai-compatible
+model=qwen3.8-flash default=true
+model=glm-5.3-flash default=false
+```
+
+`--json` is `{"provider","kind":"openai_compatible","endpoint","models":[{"id","default"}]}`.
+`providers add` needs `configure_providers`; a token without it exits `3`.
+
+The worker sends `User-Agent: loom/<version>` on every provider request, because
+a gateway such as OpenCode Go refuses a generic HTTP-library agent, and
+`x-opencode-session: <loom-session-id>` on every chat request of a run, which is
+a stable id per Loom session that such a gateway uses to keep one conversation on
+one upstream session. Both are sent by the worker; no flag names or changes them.
+
+### `providers remove`
+
+`providers remove --id <id>` sends `Provider/RemoveProvider`, which drops an
+OpenAI-compatible provider together with the key stored for it, and prints
+`provider <id> removed`. `--json` is `{"provider","removed":true}`. A built-in
+provider is refused as `invalid_request` and an id the worker does not have is
+`not_found` (exit `5`). The verb needs `configure_providers`.
+
+### `providers discover`
+
+`providers discover --provider <id>` sends `Provider/DiscoverProviderModels`,
+which replaces that provider's model catalog with the one its endpoint's
+`/models` answers with, and prints one `model=<id>` per discovered model. The
+worker stores the answer durably, so a later restart serves that catalog without
+contacting the provider; the API key must already be stored when the endpoint
+requires one. `--json` is
+`{"provider","models":[{"id","display_name","context_window","max_output_tokens"}]}`.
+The verb needs `list_providers`, so a read-only-scoped token can run it.
+
 `providers set-key --provider <id>` stores a key for an API-key provider
 (`openai`, `deepseek`, or an OpenAI-compatible provider) by sending
 `Provider/ConfigureApiKeyProvider`, the same request Settings → Providers sends.
@@ -690,8 +760,9 @@ record keeps only an opaque reference. `github-copilot` is not an API-key
 provider; `set-key` refuses it. A provider id the worker does not have is
 `not_found` (exit `5`).
 
-`providers list` and `models list` need `list_providers`. `providers set-key`
-needs `configure_providers`; a token without it exits `3`.
+`providers list`, `providers discover`, and `models list` need `list_providers`.
+`providers set-key`, `providers add`, and `providers remove` need
+`configure_providers`; a token without it exits `3`.
 
 ## Session and project lifecycle
 
@@ -927,6 +998,18 @@ loom-cli doctor
 # See which providers have a credential, then store an OpenAI key from the environment.
 loom-cli providers list
 loom-cli providers set-key --provider openai --from-env OPENAI_API_KEY
+
+# Register OpenCode Go as a gateway, store its key from a file, and refresh its
+# model list from the endpoint.
+loom-cli providers add --id opencode-go --kind openai-compatible \
+  --endpoint https://opencode.ai/inference/go/openai/v1/chat/completions \
+  --model qwen3.8-flash --default-model qwen3.8-flash
+loom-cli providers set-key --provider opencode-go --key-file opencode-go.key
+loom-cli providers discover --provider opencode-go
+loom-cli models list --provider opencode-go
+
+# Drop the gateway and the key stored for it.
+loom-cli providers remove --id opencode-go
 
 # List workspaces, then the sessions of one.
 loom-cli ls

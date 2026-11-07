@@ -235,6 +235,7 @@ DiscoverProviderModels
 GetProviderHealth
 ConfigureGitHubCopilot
 ConfigureApiKeyProvider / RemoveApiKeyProvider
+ConfigureOpenAiCompatibleProvider / RemoveProvider
 StartGitHubCopilotLogin / GetGitHubCopilotLoginStatus
 GetRunUsage
 InspectAgentContext

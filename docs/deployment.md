@@ -309,6 +309,15 @@ running a provider that cannot authenticate. `LOOM_API_KEY` or `LOOM_MODEL`
 alone registers nothing. Startup logging and the `/health` endpoint never print
 the key; provider summaries carry only the credential reference.
 
+A gateway such as [OpenCode Go](https://opencode.ai/docs/go/) is added at run time
+instead, with `loom-cli providers add --id opencode-go --kind
+openai-compatible --endpoint
+https://opencode.ai/inference/go/openai/v1/chat/completions --model <id>` and then
+`loom-cli providers set-key --provider opencode-go --key-file <path>`. Its
+requests carry `User-Agent: loom/<version>`, which Go requires instead of a
+generic HTTP-library agent, and `x-opencode-session: <loom-session-id>`, which
+gives each Loom session one stable upstream conversation.
+
 `--providers configured|demo` selects the registry a start serves:
 
 - `configured` (the default) is the registry described above.
