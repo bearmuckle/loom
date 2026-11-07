@@ -331,6 +331,7 @@ fn test_capabilities() -> CapabilitySet {
         Capability::ReadVcsDiff,
         Capability::ReadSessionTaskEvidence,
         Capability::StartSessionTask,
+        Capability::ReadProject,
     ])
 }
 
@@ -10251,4 +10252,455 @@ fn the_parser_covers_the_project_verbs() {
         ])
         .contains("one task id")
     );
+}
+
+/// The project snapshot of `session_id`, as `status --tree` reads it.
+fn project_of(connection: &InProcessConnection, session_id: AgentSessionId) -> ProjectSnapshot {
+    match connection
+        .request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::GetProjectSnapshotForSession { session_id },
+        )))
+        .result
+    {
+        Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(snapshot))) => snapshot,
+        other => panic!("unexpected project snapshot response: {other:?}"),
+    }
+}
+
+/// Mounts a fresh local folder into `session_id` at `path`.
+fn attach_folder(connection: &InProcessConnection, session_id: AgentSessionId, path: &str) {
+    let source = temporary_path(&format!("project-folder-{path}"));
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("README.md"), "project folder\n").unwrap();
+    let attached = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::AttachSessionDirectory {
+            session_id,
+            source: source.to_string_lossy().into_owned(),
+            path: path.to_owned(),
+        },
+    )));
+    assert!(
+        matches!(
+            attached.result,
+            Ok(ServerResponse::Filesystem(
+                FilesystemResponse::SessionDirectoryAttached { .. }
+            ))
+        ),
+        "{:?}",
+        attached.result
+    );
+}
+
+#[test]
+fn run_project_creates_a_sub_project_that_the_project_tree_names_and_reuses_it_by_name() {
+    let (fixture, directory) = persistent_fixture("run-project");
+    let workspace = fixture.workspace.id.to_string();
+    let project = fixture.session.id;
+    let project_text = project.to_string();
+    attach_folder(&fixture.control, project, "src");
+    // A project root of the same name elsewhere in the workspace is not a sub
+    // project of this one, so `--project` must never reuse it.
+    let unrelated = create_session(&fixture.control, fixture.workspace.id, "cli work");
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let created = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--project",
+            &project_text,
+            "--name",
+            "cli work",
+            "--task",
+            "add the flag",
+            "--model",
+            "deterministic/demo",
+            "--json",
+        ],
+    );
+    assert_eq!(created.code, exit::OK, "{}", created.stderr);
+    assert_eq!(
+        created.stderr, "",
+        "inheriting a folder warns about nothing"
+    );
+    let envelope = json_envelope(&created);
+    let child: AgentSessionId = envelope["data"]["session"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_ne!(child, project);
+    assert_ne!(
+        child, unrelated.id,
+        "the same-named project root is not reused"
+    );
+    assert_eq!(envelope["data"]["created"], true);
+    assert_eq!(envelope["data"]["session"]["name"], "cli work");
+    assert_eq!(
+        envelope["data"]["project"],
+        serde_json::json!({"id": child.to_string(), "parent_id": project_text}),
+        "--json reports the project the session belongs to"
+    );
+
+    // The worker records the session as a sub project of the project, which is
+    // the link loom-ui nests the row by, and `status --tree` prints it.
+    let snapshot = project_of(&fixture.control, child);
+    assert_eq!(snapshot.root_session_id, child);
+    assert_eq!(
+        snapshot.parent_project_id.map(|id| *id.as_uuid()),
+        Some(*project.as_uuid())
+    );
+    let tree = run(
+        &mut client,
+        &["status", "--session", &child.to_string(), "--tree"],
+    );
+    assert_eq!(tree.code, exit::OK, "{}", tree.stderr);
+    assert!(
+        tree.stdout
+            .contains(&format!("\nparent {project}\nroot {child}\n")),
+        "{}",
+        tree.stdout
+    );
+    let tree_json = run(
+        &mut client,
+        &[
+            "status",
+            "--session",
+            &child.to_string(),
+            "--tree",
+            "--json",
+        ],
+    );
+    assert_eq!(
+        json_envelope(&tree_json)["data"]["project"]["parent_project_id"],
+        project_text.as_str()
+    );
+
+    // The sub project starts where the project is: its folder is inherited.
+    let inherited: Vec<String> = session_directories(&fixture.control, child)
+        .into_iter()
+        .map(|directory| directory.path)
+        .collect();
+    assert_eq!(inherited, vec!["src".to_owned()]);
+
+    // A sub project with the resolved name is reused, not created twice. A
+    // session that already ran refuses a second run, so the reused one is an
+    // idle sub project, created the way loom-ui creates one.
+    let idle = match fixture
+        .control
+        .request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::CreateSubProject {
+                parent_session_id: project,
+                name: "idle stream".to_owned(),
+            },
+        )))
+        .result
+    {
+        Ok(ServerResponse::Project(ProjectResponse::SubProjectCreated { session, .. })) => *session,
+        other => panic!("unexpected sub project response: {other:?}"),
+    };
+    let reused = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--project",
+            &project_text,
+            "--name",
+            "idle stream",
+            "--task",
+            "keep going",
+            "--model",
+            "deterministic/demo",
+        ],
+    );
+    assert_eq!(reused.code, exit::OK, "{}", reused.stderr);
+    let lines = lines(&reused.stdout);
+    assert_eq!(lines.len(), 3, "{}", reused.stdout);
+    assert_eq!(lines[0], format!("session {} idle stream", idle.id));
+    assert!(lines[1].starts_with("run "), "{}", reused.stdout);
+    assert_eq!(lines[2], format!("parent {project}"));
+    assert!(
+        session_directories(&fixture.control, idle.id).is_empty(),
+        "a reused sub project is not attached to again"
+    );
+
+    // `--new` always creates another sub project of the same project.
+    let fresh = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--project",
+            &project_text,
+            "--name",
+            "cli work",
+            "--task",
+            "a second stream",
+            "--model",
+            "deterministic/demo",
+            "--new",
+            "--json",
+        ],
+    );
+    assert_eq!(fresh.code, exit::OK, "{}", fresh.stderr);
+    let fresh_envelope = json_envelope(&fresh);
+    let second: AgentSessionId = fresh_envelope["data"]["session"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_ne!(second, child);
+    assert_eq!(fresh_envelope["data"]["project"]["parent_id"], project_text);
+    assert_eq!(
+        project_of(&fixture.control, second)
+            .parent_project_id
+            .map(|id| *id.as_uuid()),
+        Some(*project.as_uuid())
+    );
+
+    // A plain run without --project still never lands under the project.
+    let plain = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--name",
+            "standalone",
+            "--task",
+            "unrelated",
+            "--model",
+            "deterministic/demo",
+            "--json",
+        ],
+    );
+    assert_eq!(plain.code, exit::OK, "{}", plain.stderr);
+    let plain_envelope = json_envelope(&plain);
+    assert_eq!(plain_envelope["data"]["project"], serde_json::Value::Null);
+    let standalone: AgentSessionId = plain_envelope["data"]["session"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        project_of(&fixture.control, standalone).parent_project_id,
+        None
+    );
+
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn run_project_with_a_named_input_attaches_it_instead_of_the_projects_sources() {
+    let (fixture, directory) = persistent_fixture("run-project-input");
+    let workspace = fixture.workspace.id.to_string();
+    let project_text = fixture.session.id.to_string();
+    attach_folder(&fixture.control, fixture.session.id, "src");
+    let own = temporary_path("run-project-own-input");
+    std::fs::create_dir_all(&own).unwrap();
+    let own_text = own.to_string_lossy().into_owned();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let outcome = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--project",
+            &project_text,
+            "--task",
+            "work on the other folder",
+            "--as-directory",
+            &own_text,
+            "--path",
+            "other",
+            "--model",
+            "deterministic/demo",
+            "--json",
+        ],
+    );
+    assert_eq!(outcome.code, exit::OK, "{}", outcome.stderr);
+    let child: AgentSessionId = json_envelope(&outcome)["data"]["session"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let paths: Vec<String> = session_directories(&fixture.control, child)
+        .into_iter()
+        .map(|directory| directory.path)
+        .collect();
+    assert_eq!(paths, vec!["other".to_owned()]);
+
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn run_project_refuses_an_unknown_an_archived_a_foreign_and_a_non_root_project() {
+    let (fixture, directory) = persistent_fixture("run-project-refusals");
+    let workspace = fixture.workspace.id.to_string();
+    let other_workspace = create_workspace(&fixture.control, "other workspace");
+    let foreign = create_session(&fixture.control, other_workspace.id, "foreign project");
+    let archived = create_session(&fixture.control, fixture.workspace.id, "archived project");
+    archive_session(&fixture.control, archived.id);
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let unknown = AgentSessionId::new();
+    for (project, label) in [
+        (unknown, "unknown"),
+        (archived.id, "archived"),
+        (foreign.id, "foreign"),
+    ] {
+        let sessions_before = live_sessions(&fixture.control, fixture.workspace.id).len();
+        let outcome = run(
+            &mut client,
+            &[
+                "run",
+                "--workspace",
+                &workspace,
+                "--project",
+                &project.to_string(),
+                "--task",
+                "nothing",
+                "--model",
+                "deterministic/demo",
+                "--new",
+            ],
+        );
+        assert_eq!(outcome.code, exit::GONE, "{label}: {}", outcome.stderr);
+        assert_eq!(outcome.stdout, "", "{label}");
+        assert!(
+            outcome.stderr.contains(&format!(
+                "--project {project} is not a live session of workspace"
+            )),
+            "{label}: {}",
+            outcome.stderr
+        );
+        assert_eq!(
+            live_sessions(&fixture.control, fixture.workspace.id).len(),
+            sessions_before,
+            "{label}: a refused project creates nothing"
+        );
+    }
+
+    // An agent of a project is not a project root. The worker answers the
+    // snapshot of a delegated agent with its project's root, which this double
+    // produces without running a project agent.
+    let agent = create_session(&fixture.control, fixture.workspace.id, "delegated agent");
+    let root = fixture.session.id;
+    let mut wrapped =
+        Wrapped::new(InProcessClient::new(&fixture.backend)).after(move |request, response| {
+            if let ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession {
+                session_id,
+            }) = request
+                && *session_id == agent.id
+                && let Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(snapshot))) =
+                    &mut response.result
+            {
+                snapshot.project_id = ProjectId::from_uuid(*root.as_uuid());
+                snapshot.root_session_id = root;
+            }
+        });
+    let outcome = run(
+        &mut wrapped,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--project",
+            &agent.id.to_string(),
+            "--task",
+            "nothing",
+            "--model",
+            "deterministic/demo",
+            "--json",
+        ],
+    );
+    assert_eq!(outcome.code, exit::USAGE, "{}", outcome.stderr);
+    let envelope = json_envelope(&outcome);
+    assert_eq!(envelope["ok"], false, "{envelope}");
+    let message = envelope["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("not a project root") && message.contains(&format!("--project {root}")),
+        "{envelope}"
+    );
+
+    // A malformed id is a usage error before anything is sent.
+    let malformed = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--project",
+            "not-a-session",
+            "--task",
+            "nothing",
+        ],
+    );
+    assert_eq!(malformed.code, exit::USAGE);
+    assert!(
+        malformed.stderr.contains("not a valid project session id"),
+        "{}",
+        malformed.stderr
+    );
+
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn run_project_new_with_a_request_id_replays_the_same_sub_project_and_run() {
+    let (fixture, directory) = persistent_fixture("run-project-replay");
+    let workspace = fixture.workspace.id.to_string();
+    let project = fixture.session.id;
+    let project_text = project.to_string();
+    attach_folder(&fixture.control, project, "src");
+    let request_id = RequestId::new().to_string();
+    let mut client = InProcessClient::new(&fixture.backend);
+    let arguments = [
+        "run",
+        "--workspace",
+        &workspace,
+        "--project",
+        &project_text,
+        "--task",
+        "replay me",
+        "--model",
+        "deterministic/demo",
+        "--new",
+        "--request-id",
+        &request_id,
+        "--json",
+    ];
+
+    let first = run(&mut client, &arguments);
+    assert_eq!(first.code, exit::OK, "{}", first.stderr);
+    let second = run(&mut client, &arguments);
+    assert_eq!(second.code, exit::OK, "{}", second.stderr);
+    assert_eq!(
+        second.stderr, "",
+        "a replayed inheritance warns about nothing"
+    );
+    let (first, second) = (json_envelope(&first), json_envelope(&second));
+    assert_eq!(first["data"]["session"], second["data"]["session"]);
+    assert_eq!(first["data"]["run"]["id"], second["data"]["run"]["id"]);
+    assert_eq!(second["replayed"], true, "{second}");
+    let child: AgentSessionId = first["data"]["session"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(session_directories(&fixture.control, child).len(), 1);
+    let sub_projects = live_sessions(&fixture.control, fixture.workspace.id)
+        .into_iter()
+        .filter(|session| session.id != project)
+        .count();
+    assert_eq!(sub_projects, 1, "the replay created no second sub project");
+
+    close_persistent_fixture(fixture, directory);
 }

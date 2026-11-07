@@ -23,6 +23,19 @@
 //!   safe to repeat. An answer served from that cache is reported as
 //!   `replayed: true` in the `--json` envelope.
 //!
+//! - `--project <session-id>` makes the session a sub project of that project
+//!   root, the same link loom-ui's "New sub project" records: the project is
+//!   checked to be a live root of `--workspace`
+//!   (`Workspace/ListWorkspaceSessions` and
+//!   `Project/GetProjectSnapshotForSession`), a session with the resolved name
+//!   is reused only when its snapshot names that project as its parent, and a
+//!   new one is created with `Project/CreateSubProject`, which is a retryable
+//!   mutation exactly like the workspace creation it replaces. A sub project
+//!   this invocation created inherits the project's folders, then the
+//!   repositories no inherited folder covers, unless `--repo` or
+//!   `--as-directory` names its input; a source that cannot be inherited is a
+//!   warning on stderr, because the new project is still usable.
+//!
 //! The verb returns as soon as `AgentRunStarted` arrives. It never polls and
 //! never waits for the run: `loom-cli events --follow` is the verb that watches
 //! one.
@@ -42,11 +55,12 @@ use std::io::Write;
 use loom_core::{
     AgentSessionId, ApprovalPolicy, ContextAssemblyOptions, ErrorCode, RequestId, SessionLimits,
 };
+use loom_core::{AgentSessionSnapshot, LoomError, ProjectSnapshot};
 use loom_model::ModelId;
 use loom_protocol::{
-    ClientRequest, FilesystemRequest, FilesystemResponse, ProviderRequest, ProviderResponse,
-    RepositoryRequest, RepositoryResponse, RunRequest, RunResponse, ServerResponse, SessionRequest,
-    SessionResponse, WorkspaceRequest,
+    ClientRequest, FilesystemRequest, FilesystemResponse, ProjectRequest, ProjectResponse,
+    ProviderRequest, ProviderResponse, RepositoryRequest, RepositoryResponse, RunRequest,
+    RunResponse, ServerResponse, SessionRequest, SessionResponse, WorkspaceRequest,
 };
 use serde_json::json;
 
@@ -69,7 +83,10 @@ pub(super) async fn run<C: Client>(
     handshake(&mut caller, &invocation.verb).await?;
 
     let model = resolve_model(&mut caller, args, err).await?;
-    let resolved = resolve_session(&mut caller, args).await?;
+    let resolved = match args.project {
+        Some(project) => resolve_sub_project(&mut caller, args, project).await?,
+        None => resolve_session(&mut caller, args).await?,
+    };
     let session_id = resolved.session_id;
     let session_name = resolved.session_name;
     let created = resolved.created;
@@ -121,6 +138,14 @@ pub(super) async fn run<C: Client>(
                     return Err(Failure::unexpected(request_id, "session directory attach"));
                 }
             }
+        }
+        // A sub project starts where its project is, unless the caller named
+        // its input: the same inheritance loom-ui's "New sub project" applies.
+        if let Some(project) = args.project
+            && args.repository.is_none()
+            && args.directory.is_none()
+        {
+            inherit_project_sources(&mut caller, args, project, session_id, err).await?;
         }
     }
 
@@ -181,10 +206,22 @@ pub(super) async fn run<C: Client>(
     if !invocation.globals.json {
         emit(out, &format!("session {session_id} {session_name}\n"))?;
         emit(out, &format!("run {} {state}\n", started.id))?;
+        if let Some(project) = args.project {
+            emit(out, &format!("parent {project}\n"))?;
+        }
     }
+    // A session `run` places in a project is a sub project: its own project id
+    // is its session id, and `parent_id` is the project it belongs to.
+    let project = args.project.map(|parent| {
+        json!({
+            "id": session_id.to_string(),
+            "parent_id": parent.to_string(),
+        })
+    });
     let data = json!({
         "session": { "id": session_id.to_string(), "name": session_name },
         "run": { "id": started.id.to_string(), "state": state },
+        "project": project,
         "created": created,
         "request_id": request_id.to_string(),
         "request_ids": {
@@ -258,18 +295,7 @@ async fn resolve_session<C: Client>(
     if args.new {
         return create_session(caller, args, derived_id(args.request_id, "session")).await;
     }
-    let (request_id, response) = caller
-        .call(ClientRequest::Workspace(
-            WorkspaceRequest::ListWorkspaceSessions {
-                workspace_id: args.workspace,
-                include_archived: false,
-            },
-        ))
-        .await?;
-    let sessions = match response {
-        ServerResponse::Session(SessionResponse::AgentSessions { sessions }) => sessions,
-        _ => return Err(Failure::unexpected(request_id, "workspace sessions")),
-    };
+    let (_, sessions) = workspace_sessions(caller, args).await?;
     if let Some(session) = sessions
         .iter()
         .find(|session| session.name == args.name)
@@ -309,6 +335,251 @@ async fn create_session<C: Client>(
         }),
         _ => Err(Failure::unexpected(request_id, "session creation")),
     }
+}
+
+/// The sub project of `project` that `run` starts in: the first live session of
+/// the workspace with the resolved name whose project names `project` as its
+/// parent, or the sub project this invocation creates. `--new` creates one
+/// unconditionally, but still checks the project first, so a mistyped id is a
+/// clear refusal rather than a failed creation.
+async fn resolve_sub_project<C: Client>(
+    caller: &mut Caller<'_, C>,
+    args: &RunArgs,
+    project: AgentSessionId,
+) -> Result<Resolved, Failure> {
+    let (list_id, sessions) = workspace_sessions(caller, args).await?;
+    if !sessions.iter().any(|session| session.id == project) {
+        return Err(Failure::Server {
+            request_id: list_id,
+            error: LoomError::new(
+                ErrorCode::NotFound,
+                format!(
+                    "--project {project} is not a live session of workspace {}; \
+                     'loom-cli ls --workspace {}' lists them",
+                    args.workspace, args.workspace
+                ),
+                false,
+            ),
+        });
+    }
+    let (_, snapshot) = project_snapshot(caller, project).await?;
+    if snapshot.root_session_id != project {
+        return Err(Failure::Usage(format!(
+            "--project {project} is an agent of project {}, not a project root; \
+             pass --project {}",
+            snapshot.project_id, snapshot.root_session_id
+        )));
+    }
+    if !args.new {
+        for session in sessions
+            .iter()
+            .filter(|session| session.name == args.name && session.id != project)
+        {
+            let (_, candidate) = project_snapshot(caller, session.id).await?;
+            let parent = candidate.parent_project_id.map(|id| *id.as_uuid());
+            if candidate.root_session_id == session.id && parent == Some(*project.as_uuid()) {
+                return Ok(Resolved {
+                    session_id: session.id,
+                    session_name: session.name.clone(),
+                    created: false,
+                    session_request_id: None,
+                });
+            }
+        }
+    }
+    let request_id = if args.new {
+        derived_id(args.request_id, "session")
+    } else {
+        RequestId::new()
+    };
+    let (_, response) = caller
+        .call_with_id(
+            request_id,
+            ClientRequest::Project(ProjectRequest::CreateSubProject {
+                parent_session_id: project,
+                name: args.name.clone(),
+            }),
+        )
+        .await?;
+    match response {
+        ServerResponse::Project(ProjectResponse::SubProjectCreated { session, .. }) => {
+            Ok(Resolved {
+                session_id: session.id,
+                session_name: session.name,
+                created: true,
+                session_request_id: Some(request_id),
+            })
+        }
+        _ => Err(Failure::unexpected(request_id, "sub project creation")),
+    }
+}
+
+/// The workspace's live sessions, and the id of the request that listed them.
+async fn workspace_sessions<C: Client>(
+    caller: &mut Caller<'_, C>,
+    args: &RunArgs,
+) -> Result<(RequestId, Vec<AgentSessionSnapshot>), Failure> {
+    let (request_id, response) = caller
+        .call(ClientRequest::Workspace(
+            WorkspaceRequest::ListWorkspaceSessions {
+                workspace_id: args.workspace,
+                include_archived: false,
+            },
+        ))
+        .await?;
+    match response {
+        ServerResponse::Session(SessionResponse::AgentSessions { sessions }) => {
+            Ok((request_id, sessions))
+        }
+        _ => Err(Failure::unexpected(request_id, "workspace sessions")),
+    }
+}
+
+/// The project that covers `session_id`, and the id of the request that read it.
+async fn project_snapshot<C: Client>(
+    caller: &mut Caller<'_, C>,
+    session_id: AgentSessionId,
+) -> Result<(RequestId, ProjectSnapshot), Failure> {
+    let (request_id, response) = caller
+        .call(ClientRequest::Project(
+            ProjectRequest::GetProjectSnapshotForSession { session_id },
+        ))
+        .await?;
+    match response {
+        ServerResponse::Project(ProjectResponse::ProjectSnapshot(snapshot)) => {
+            Ok((request_id, snapshot))
+        }
+        _ => Err(Failure::unexpected(request_id, "project snapshot")),
+    }
+}
+
+/// Attaches the project's folders, then the repositories no inherited folder
+/// covers, to the sub project this invocation created.
+///
+/// This is the inheritance loom-ui applies to a sub project: a mounted folder
+/// already carries the checkouts inside it, so a repository under one is not
+/// cloned a second time, and a repository is attached from its own source with
+/// the worker's existing clone reused. A source that cannot be attached is a
+/// warning, because the new project is still usable and a person can add the
+/// source later; a failure to reach the worker is still a failure.
+async fn inherit_project_sources<C: Client>(
+    caller: &mut Caller<'_, C>,
+    args: &RunArgs,
+    project: AgentSessionId,
+    session_id: AgentSessionId,
+    err: &mut dyn Write,
+) -> Result<(), Failure> {
+    let mut mounted = Vec::new();
+    let (request_id, response) = caller
+        .call(ClientRequest::Filesystem(
+            FilesystemRequest::ListSessionDirectories {
+                session_id: project,
+            },
+        ))
+        .await?;
+    let directories = match response {
+        ServerResponse::Filesystem(FilesystemResponse::SessionDirectories { directories }) => {
+            directories
+        }
+        _ => return Err(Failure::unexpected(request_id, "session directories")),
+    };
+    for directory in directories {
+        let attached = caller
+            .call_with_id(
+                auxiliary_id(args, &format!("inherit-directory/{}", directory.path)),
+                ClientRequest::Filesystem(FilesystemRequest::AttachSessionDirectory {
+                    session_id,
+                    source: directory.source.clone(),
+                    path: directory.path.clone(),
+                }),
+            )
+            .await;
+        match attached {
+            Ok((
+                _,
+                ServerResponse::Filesystem(FilesystemResponse::SessionDirectoryAttached { .. }),
+            )) => {
+                mounted.push(directory.path);
+            }
+            Ok((request_id, _)) => {
+                return Err(Failure::unexpected(request_id, "session directory attach"));
+            }
+            Err(Failure::Server { error, .. }) => {
+                warn(
+                    err,
+                    &format!(
+                        "could not inherit folder '{}' of project {project}: {}",
+                        directory.source, error.message
+                    ),
+                )?;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    let (request_id, response) = caller
+        .call(ClientRequest::Repository(
+            RepositoryRequest::ListSessionRepositories {
+                session_id: project,
+            },
+        ))
+        .await?;
+    let repositories = match response {
+        ServerResponse::Repository(RepositoryResponse::SessionRepositories { repositories }) => {
+            repositories
+        }
+        _ => return Err(Failure::unexpected(request_id, "session repositories")),
+    };
+    for repository in repositories {
+        if mounted
+            .iter()
+            .any(|mount| path_is_within(&repository.path, mount))
+        {
+            continue;
+        }
+        let attached = caller
+            .call_with_id(
+                auxiliary_id(args, &format!("inherit-repository/{}", repository.path)),
+                ClientRequest::Repository(RepositoryRequest::AttachSessionRepository {
+                    session_id,
+                    source: repository.source.clone(),
+                    path: repository.path.clone(),
+                    revision: None,
+                    reuse_local: true,
+                }),
+            )
+            .await;
+        match attached {
+            Ok((
+                _,
+                ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(_)),
+            )) => {}
+            Ok((request_id, _)) => {
+                return Err(Failure::unexpected(request_id, "session repository attach"));
+            }
+            Err(Failure::Server { error, .. }) => {
+                warn(
+                    err,
+                    &format!(
+                        "could not inherit repository '{}' of project {project}: {}",
+                        repository.source, error.message
+                    ),
+                )?;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Ok(())
+}
+
+/// Whether a session path is a mounted folder or lies inside one.
+fn path_is_within(path: &str, mount: &str) -> bool {
+    path == mount || path.starts_with(&format!("{mount}/"))
+}
+
+/// Writes one warning line on stderr.
+fn warn(err: &mut dyn Write, message: &str) -> Result<(), Failure> {
+    writeln!(err, "warning: {message}")
+        .map_err(|error| Failure::Internal(format!("could not write a warning: {error}")))
 }
 
 /// What `run` resolved: the session, whether this invocation created it, and

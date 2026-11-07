@@ -62,12 +62,15 @@ Verbs:
       [--model <id>] [--repo <source> [--revision <rev>] [--path <path>]]
       [--as-directory <path> [--path <path>]]
       [--approval-policy default|auto] [--request-id <uuid>] [--new]
+      [--project <session-id>]
                                     reuse the workspace's session named
                                     --name, or create it, attach the inputs
                                     to a session this run created, and start
                                     one agent run without waiting for it;
                                     without --model the first credentialed
-                                    provider's default model is started
+                                    provider's default model is started;
+                                    --project creates the session as a sub
+                                    project of that project root
   send --run <id> --text <text> [--request-id <uuid>]
                                     direct the active run and print its state
   answer --run <id> --text <text> [--request-id <uuid>]
@@ -181,7 +184,12 @@ is answered from the worker's durable cache with the same run, while the other
 mutations of the verb use fresh ids. On a session this invocation creates,
 --approval-policy (default when absent) is pinned before the run starts; on a
 reused session it is only changed when the flag is given, so a plain run does
-not overwrite a policy a person set.
+not overwrite a policy a person set. --project <session-id> names a project
+root of the workspace: the session is then reused only among that project's
+sub projects, is created as a sub project of it (listed beneath it in
+loom-ui), inherits its folders and repositories unless --repo or
+--as-directory names the input instead, and `run` prints a third line,
+`parent <project-id>`.
 
 `status --tree` reports the project the session belongs to as well: one line
 per agent, delegated task, and worktree, the conflict paths of a worktree, and
@@ -402,6 +410,11 @@ pub(crate) struct RunArgs {
     /// `--new`: create a session unconditionally instead of reusing one by
     /// name.
     pub new: bool,
+    /// `--project`: the project root the session is a sub project of. The
+    /// session is reused only among that project's sub projects and created
+    /// with `Project/CreateSubProject`, so a client lists it beneath the
+    /// project instead of as a project of its own.
+    pub project: Option<AgentSessionId>,
 }
 
 /// Where `providers set-key` reads the API key. The secret itself is not stored
@@ -923,12 +936,24 @@ Examples:
                       [--repo <source> [--revision <rev>] [--path <path>]]
                       [--as-directory <path> [--path <path>]]
                       [--approval-policy default|auto] [--request-id <uuid>] [--new]
+                      [--project <session-id>]
 
 Reuse the workspace's session named --name, or create it, attach the inputs to
 a session this run created, and start one agent run without waiting for it.
 Without --model, the first provider that has a credential and a known default
 model is started; when there is none, 'deterministic/demo' is started and a
 warning is printed on stderr.
+
+With --project, the session belongs to that project instead of being a project
+of its own. The id must be a live project root in --workspace (the id
+`status --tree` prints on its `project` line); an agent of a project, an
+archived session, or a session of another workspace is refused. --name is then
+reused only among that project's sub projects, --new always creates a new sub
+project, and a sub project this run creates inherits the project's folders and
+repositories, the way loom-ui's "New sub project" does, unless --repo or
+--as-directory names its input instead. A source that cannot be inherited is a
+warning on stderr, not a failure. The output gains a third line,
+`parent <project-id>`, and --json reports `project.parent_id`.
 
 Flags:
   --workspace <id>            the workspace the session belongs to (required)
@@ -943,11 +968,15 @@ Flags:
   --approval-policy <preset>  pin default or auto before the run starts
   --request-id <uuid>         the idempotency key of the run start
   --new                       always create a session
+  --project <session-id>      create the session as a sub project of this
+                              project root, and reuse only its sub projects
   --json                      print one JSON envelope instead of text
 Global flags are accepted anywhere; see 'loom-cli --help'.
 
 Examples:
   loom-cli run --workspace <workspace-id> --task 'fix the failing test'
+  loom-cli run --workspace <workspace-id> --project <project-session-id> \
+    --name 'cli: run --project' --task-file task.md --new --json
   loom-cli run --workspace <workspace-id> --task-file task.md \
     --repo https://github.com/acme/widgets.git --approval-policy auto
   loom-cli run --workspace <workspace-id> --task 'summarise the diff' \
@@ -1562,7 +1591,7 @@ fn arity(name: &str) -> Option<bool> {
         "--run" | "--text" | "--tool-call" | "--reason" | "--until" | "--timeout" => true,
         "--window" | "--force-discard" | "--sub-agent" => true,
         "--provider" | "--from-env" | "--key-file" | "--key" | "--api-key" => true,
-        "--expected-parent-revision" => true,
+        "--expected-parent-revision" | "--project" => true,
         "--new" | "--archive" | "--retry-on-conflict" | "--force" | "--yes" | "--tree" => false,
         "--keep" | "--remove" | "--discard" => false,
         _ => return None,
@@ -2489,6 +2518,10 @@ fn parse_run(flags: &mut FlagSet) -> Result<RunArgs, String> {
         }
     };
     let request_id = parse_request_id(flags)?;
+    let project = flags
+        .value("--project")
+        .map(|project| parse_id("project session id", &project))
+        .transpose()?;
     Ok(RunArgs {
         workspace: parse_id("workspace id", &workspace)?,
         task,
@@ -2499,6 +2532,7 @@ fn parse_run(flags: &mut FlagSet) -> Result<RunArgs, String> {
         approval,
         request_id,
         new: flags.flag("--new"),
+        project,
     })
 }
 

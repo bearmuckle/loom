@@ -227,6 +227,16 @@ pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
             if args.model.is_none() {
                 capabilities.push(Capability::ListProviders);
             }
+            // `--project` lists the workspace and reads project snapshots to
+            // check the project and find its sub projects, and a sub project
+            // it creates without a named input lists the project's sources to
+            // inherit them.
+            if args.project.is_some() {
+                capabilities.extend([Capability::ReadAgentSession, Capability::ReadProject]);
+                if args.repository.is_none() && args.directory.is_none() {
+                    capabilities.push(Capability::ReadSessionFilesystem);
+                }
+            }
         }
         Verb::Send { .. } | Verb::Answer { .. } => {
             capabilities.extend([Capability::ControlAgentRun, Capability::ReadAgentRun]);
