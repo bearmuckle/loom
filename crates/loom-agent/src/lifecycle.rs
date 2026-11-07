@@ -40,6 +40,10 @@ impl AgentRuntime {
             summary: None,
             evidence: Vec::new(),
             approval_policy: Some(approval_policy.clone()),
+            // A run created here has no Jev switches pinned: the caller that
+            // creates a run resolves them (workspace, project, session, and the
+            // decider credential) and pins the result.
+            jev: None,
         };
         let attempts = vec![loom_model::AgentRunAttemptRecord {
             run_id: run.id,

@@ -178,6 +178,7 @@ fn fixture(
             control_revision: 0,
             session_id: session.id,
             task: "large durable transcript benchmark".to_owned(),
+            jev: None,
             model: ModelId::new("checkpoint-delta-benchmark"),
             state: AgentRunState::Executing,
             started_at: now,

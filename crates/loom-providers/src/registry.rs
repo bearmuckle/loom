@@ -216,6 +216,16 @@ impl ProviderRegistry {
         ))
     }
 
+    /// Offers the Jev decision model beside the chat providers.
+    ///
+    /// The entry is offered keyless so an operator can store a key for it; until
+    /// that key resolves the decider is unusable, absent from the model catalog,
+    /// and every Jev surface stays absent, so a keyless decider is refused at
+    /// every point of use rather than at registration.
+    pub fn register_decider(&self, source: DeciderSource) -> Result<()> {
+        self.register(ProviderConfig::decider(source))
+    }
+
     pub fn build_demo(credentials: Arc<dyn CredentialStore>, include_github_copilot: bool) -> Self {
         let registry = Self::with_credentials(credentials);
         registry
@@ -549,6 +559,9 @@ impl ProviderRegistry {
         Ok(configurations
             .values()
             .filter(|config| self.is_usable(config))
+            // The decider answers one decision request, never a chat request, so
+            // its descriptor stays out of the catalog a run selects a model from.
+            .filter(|config| !config.is_decider())
             .flat_map(|config| config.models.iter().cloned())
             .collect())
     }
@@ -564,8 +577,24 @@ impl ProviderRegistry {
     /// still appear in `list_providers` for setup, but their seeded models are
     /// only catalogued once a credential is stored.
     fn is_usable(&self, config: &ProviderConfig) -> bool {
+        if config.is_decider() {
+            // The enablement gate for every Jev surface: without a stored key no
+            // call can succeed, so the decider is unusable and Jev is absent.
+            return config.credential.is_some() && self.is_configured(config);
+        }
         self.is_configured(config)
             && (!config.kind.requires_credential() || config.credential.is_some())
+    }
+
+    /// Whether the decider can answer on this worker, which is the gate the Jev
+    /// switches are ANDed with before any of them takes effect.
+    pub fn decider_available(&self) -> Result<bool> {
+        Ok(self
+            .configurations
+            .lock()
+            .map_err(|_| internal_lock_error("provider configuration"))?
+            .values()
+            .any(|config| config.is_decider() && self.is_usable(config)))
     }
 
     pub fn models(&self) -> Result<Vec<ModelDescriptor>> {
@@ -581,6 +610,11 @@ impl ProviderRegistry {
             .cloned()
             .ok_or_else(|| LoomError::not_found("provider", provider_id.as_str()))?;
         if config.kind == ProviderKind::Deterministic {
+            return Ok(config.models);
+        }
+        if config.is_decider() {
+            // The decision endpoint publishes no model catalog, and the entry
+            // declares the model it answers under, so discovery never calls it.
             return Ok(config.models);
         }
         if config.kind == ProviderKind::GitHubCopilot {

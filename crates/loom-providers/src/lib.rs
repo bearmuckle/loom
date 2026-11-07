@@ -15,15 +15,17 @@ use loom_model::{
     TokenUsage, ToolCall,
 };
 pub use loom_model::{
-    CredentialRef, CredentialReference, DEEPSEEK_API_ENDPOINT, DEEPSEEK_DEFAULT_MODEL,
-    DEEPSEEK_MAX_OUTPUT_TOKENS, DEEPSEEK_PROVIDER_ID, GITHUB_COPILOT_API_ENDPOINT,
+    CredentialRef, CredentialReference, DECIDER_DISPLAY_NAME, DECIDER_PROVIDER_ID,
+    DEEPSEEK_API_ENDPOINT, DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_MAX_OUTPUT_TOKENS,
+    DEEPSEEK_PROVIDER_ID, DeciderSource, GITHUB_COPILOT_API_ENDPOINT,
     GITHUB_COPILOT_CREDENTIAL_REF, GITHUB_COPILOT_DEFAULT_MODEL, GITHUB_COPILOT_PROVIDER_ID,
     GITHUB_REPOSITORY_CREDENTIAL_REF, ModelProvider, OPENAI_API_ENDPOINT,
     OPENAI_COMPATIBLE_CREDENTIAL_REF, OPENAI_COMPATIBLE_PROVIDER_ID, OPENAI_DEFAULT_MODEL,
-    OPENAI_PROVIDER_ID, ProviderConfig, ProviderDescriptor, ProviderHealth, ProviderHealthState,
-    ProviderKind, ProviderSummary, ProviderUsageKey, ProviderUsageRecord, ProviderUsageSummary,
-    UnavailableProvider, UsageLedger, declared_context_window, deterministic_descriptor,
-    estimate_tokens, github_copilot_descriptor,
+    OPENAI_PROVIDER_ID, OPENCODE_DECIDER_ENDPOINT, OPENCODE_DECIDER_MODEL, ProviderConfig,
+    ProviderDescriptor, ProviderHealth, ProviderHealthState, ProviderKind, ProviderSummary,
+    ProviderUsageKey, ProviderUsageRecord, ProviderUsageSummary, TYPESAFE_DECIDER_ENDPOINT,
+    TYPESAFE_DECIDER_MODEL, UnavailableProvider, UsageLedger, declared_context_window,
+    deterministic_descriptor, estimate_tokens, github_copilot_descriptor,
 };
 use serde::Deserialize;
 
@@ -1268,6 +1270,89 @@ mod tests {
                 .any(|model| model.provider.as_str() == DEEPSEEK_PROVIDER_ID),
             "DeepSeek models must appear once a key is configured"
         );
+    }
+
+    #[test]
+    fn the_decider_is_offered_keyless_and_kept_out_of_the_model_catalog() {
+        let registry =
+            ProviderRegistry::with_credentials(Arc::new(InMemoryCredentialStore::default()));
+        registry.register_decider(DeciderSource::OpenCode).unwrap();
+
+        let provider = registry
+            .list_providers()
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.id.as_str() == DECIDER_PROVIDER_ID)
+            .expect("the decider is offered so that a key can be stored for it");
+        assert_eq!(provider.credential_id, None);
+        assert!(provider.api_key_configurable);
+        assert_eq!(provider.models[0].id.as_str(), OPENCODE_DECIDER_MODEL);
+        // Without a key the decider cannot answer, which is the gate every Jev
+        // surface is resolved against.
+        assert!(!registry.decider_available().unwrap());
+        assert!(
+            !registry
+                .list_models()
+                .unwrap()
+                .iter()
+                .any(|model| model.provider.as_str() == DECIDER_PROVIDER_ID),
+            "a decision model must never reach the catalog a run selects from"
+        );
+    }
+
+    #[test]
+    fn a_stored_decider_key_enables_it_without_cataloguing_its_model() {
+        let registry =
+            ProviderRegistry::with_credentials(Arc::new(InMemoryCredentialStore::default()));
+        registry.register_decider(DeciderSource::TypeSafe).unwrap();
+        registry
+            .configure_api_key_provider(
+                &ProviderId::new(DECIDER_PROVIDER_ID),
+                "decider-test-key".to_owned(),
+            )
+            .unwrap();
+
+        assert!(registry.decider_available().unwrap());
+        let provider = registry
+            .list_providers()
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.id.as_str() == DECIDER_PROVIDER_ID)
+            .unwrap();
+        assert_eq!(provider.models[0].id.as_str(), TYPESAFE_DECIDER_MODEL);
+        assert!(
+            !registry
+                .list_models()
+                .unwrap()
+                .iter()
+                .any(|model| model.provider.as_str() == DECIDER_PROVIDER_ID)
+        );
+        // The key stays in the credential store: the summary carries a reference
+        // and the exported configuration carries none.
+        assert!(
+            !serde_json::to_string(&provider)
+                .unwrap()
+                .contains("decider-test-key")
+        );
+        assert!(
+            !serde_json::to_string(&registry.export_configs().unwrap())
+                .unwrap()
+                .contains("decider-test-key")
+        );
+    }
+
+    #[test]
+    fn discovering_decider_models_reports_the_declared_model_without_a_call() {
+        let registry =
+            ProviderRegistry::with_credentials(Arc::new(InMemoryCredentialStore::default()));
+        registry.register_decider(DeciderSource::OpenCode).unwrap();
+
+        let models = registry
+            .discover_models(&ProviderId::new(DECIDER_PROVIDER_ID))
+            .unwrap();
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id.as_str(), OPENCODE_DECIDER_MODEL);
     }
 
     #[test]

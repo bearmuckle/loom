@@ -752,6 +752,7 @@ fn selecting_a_model_switches_the_active_run_and_reverts_a_refusal(cx: &mut Test
             control_revision: 1,
             session_id: view.active_session.id,
             task: "switch model".to_owned(),
+            jev: None,
             model: first.clone(),
             state: AgentRunState::Completed,
             started_at: Timestamp::now(),

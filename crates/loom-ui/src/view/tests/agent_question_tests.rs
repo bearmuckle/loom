@@ -332,6 +332,7 @@ fn choosing_a_choice_answers_the_question(cx: &mut TestAppContext) {
                 control_revision: 1,
                 session_id: view.active_session.id,
                 task: "cut the release".to_owned(),
+                jev: None,
                 model: ModelId::new("deterministic/demo"),
                 state: loom_protocol::AgentRunState::NeedsInput,
                 started_at: Timestamp::from_unix_millis(1),

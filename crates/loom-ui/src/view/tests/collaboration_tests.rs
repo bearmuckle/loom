@@ -17,6 +17,7 @@ fn run_snapshot(view: &LoomView, state: AgentRunState) -> AgentRunSnapshot {
         control_revision: 1,
         session_id: view.active_session.id,
         task: "task".to_owned(),
+        jev: None,
         model: ModelId::new("deterministic/demo"),
         state,
         started_at: Timestamp::now(),

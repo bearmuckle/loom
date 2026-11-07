@@ -1937,6 +1937,7 @@ fn deleting_an_archived_session_with_a_stale_run_summary_succeeds() {
             control_revision: 0,
             session_id: session.id,
             task: "Interrupted by a crash before its checkpoint".to_owned(),
+            jev: None,
             model: ModelId::new("fixture/stale-run"),
             state: AgentRunState::Executing,
             started_at: created_at,

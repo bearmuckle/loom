@@ -966,6 +966,7 @@ mod tests {
             control_revision: 3,
             session_id: AgentSessionId::new(),
             task: "task".to_owned(),
+            jev: None,
             model: loom_model::ModelId::new("deterministic/demo"),
             state,
             started_at: Timestamp::now(),
