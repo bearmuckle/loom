@@ -39,8 +39,8 @@ registries is expected and not filtered by Loom; network-classified tool actions
 policy";
 
 /// How agent commands inherit their environment, printed verbatim.
-const AGENT_COMMAND_ENVIRONMENT: &str = "inherited from the backend process; each command runs with the session \
-filesystem root as its working directory";
+const AGENT_COMMAND_ENVIRONMENT: &str = "inherited from the backend process; each command runs in the directory attached \
+to the session when it has exactly one, and otherwise in the session filesystem root";
 
 /// The line printed when no container runtime was detected.
 const RUNTIME_NOT_DETECTED: &str = "not detected";

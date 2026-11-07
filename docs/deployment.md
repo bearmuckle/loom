@@ -295,8 +295,9 @@ of the backend, in the same context the backend runs in.
 
 - On a host deployment, which is an unpacked binary or the sample systemd unit,
   a command runs on the host. It runs as the backend account, inherits the
-  backend process environment, and starts with the session filesystem root as
-  its working directory.
+  backend process environment, and starts in the directory the session has
+  attached when it has exactly one, and otherwise in the session filesystem
+  root.
 - In the published container image, the backend and therefore every agent
   command it starts run inside that one container. The container's filesystem,
   users, and network namespace are the boundary; there is no second container

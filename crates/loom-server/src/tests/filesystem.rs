@@ -1968,3 +1968,140 @@ fn protocol_filesystem_requests_cover_snapshots_edits_checkpoints_and_undo() {
     ));
     fs::remove_dir_all(&backend.session_root_base).unwrap();
 }
+
+/// `run --as-directory` attaches the user's folder as the session's input, so
+/// the agent's tools must work inside it: a file the run writes lands in the
+/// folder instead of in Loom's private session storage, and the run is told
+/// where its working directory is.
+#[cfg(unix)]
+#[test]
+fn a_run_works_inside_the_attached_directory() {
+    let source = workspace();
+    let temp = workspace();
+    let backend = InProcessBackend::new_persistent(temp.join("state.sqlite")).unwrap();
+    let connection = backend.connect();
+    negotiate_m5(&connection);
+    let Ok(ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace))) = connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Attached directory".to_owned(),
+            },
+        )))
+        .result
+    else {
+        panic!("expected workspace creation");
+    };
+    let Ok(ServerResponse::Session(SessionResponse::AgentSessionCreated(session))) = connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Attached directory".to_owned(),
+            },
+        )))
+        .result
+    else {
+        panic!("expected session creation");
+    };
+    let attached = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::AttachSessionDirectory {
+            session_id: session.id,
+            source: source.display().to_string(),
+            path: "demo".to_owned(),
+        },
+    )));
+    assert!(attached.result.is_ok(), "{:?}", attached.result);
+    let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id: session.id,
+            task: "create a demo file".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            system_instructions: None,
+            repository_instructions: Some("Keep changes focused.".to_owned()),
+        },
+    )));
+    let Ok(ServerResponse::Run(RunResponse::AgentRunStarted(run))) = started.result else {
+        panic!("expected run start: {:?}", started.result);
+    };
+    assert_eq!(
+        await_settled_run(&connection, run.id).state,
+        AgentRunState::Completed
+    );
+
+    // The run wrote the file the user asked for into their own folder, and its
+    // own session storage stayed empty.
+    assert_eq!(
+        fs::read_to_string(source.join("loom-m1-demo.txt")).unwrap(),
+        "Loom M1 deterministic demo\n"
+    );
+    let filesystem_root = backend
+        .session_root_base
+        .join(workspace.id.to_string())
+        .join(session.id.to_string())
+        .join("fs");
+    assert!(
+        !filesystem_root.join("loom-m1-demo.txt").exists(),
+        "the write must not stay in Loom's private session storage"
+    );
+
+    // The tool result names where the file landed, so a transcript reader can
+    // tell the same thing.
+    let transcript = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunTranscriptPage {
+            run_id: run.id,
+            before_ordinal: None,
+            limit: MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE,
+            activity_detail: loom_protocol::ActivityDetail::Full,
+        },
+    )));
+    let Ok(ServerResponse::Run(RunResponse::AgentRunTranscriptPage { messages, .. })) =
+        transcript.result
+    else {
+        panic!("expected a transcript page");
+    };
+    assert!(
+        messages.iter().any(|message| {
+            message.message.role == loom_model::MessageRole::Tool
+                && message
+                    .message
+                    .content
+                    .contains("updated demo/loom-m1-demo.txt")
+        }),
+        "the write result should name the attached directory: {messages:?}"
+    );
+
+    // The run is told where its tools work, after the client's own text.
+    let instructions = backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .load_run_runtime_config(run.id)
+        .unwrap()
+        .unwrap()
+        .repository_instructions
+        .unwrap();
+    assert!(instructions.starts_with("Keep changes focused."));
+    assert!(
+        instructions.contains("## Working directory"),
+        "{instructions}"
+    );
+    let canonical = fs::canonicalize(&source).unwrap();
+    assert!(instructions.contains("`demo/`"), "{instructions}");
+    assert!(
+        instructions.contains(&canonical.display().to_string()),
+        "{instructions}"
+    );
+    backend.shutdown().unwrap();
+
+    // A restarted worker installs the session's attached directories before it
+    // builds a run's tools, so the same folder is still the working directory
+    // of the run it restores.
+    let backend = InProcessBackend::new_persistent(temp.join("state.sqlite")).unwrap();
+    let restored = backend.restore_session_filesystem(session.id).unwrap();
+    assert_eq!(
+        loom_tools::ToolExecutor::new_with_workspace(restored).working_directory(),
+        Some("demo")
+    );
+    backend.shutdown().unwrap();
+    let _ = fs::remove_dir_all(&source);
+    let _ = fs::remove_dir_all(&temp);
+}

@@ -497,6 +497,15 @@ impl InProcessConnection {
             input.repository_instructions.take(),
             &workspace.instruction_text()?,
         );
+        // Mounted directories (`run --as-directory`) do not appear in a root
+        // listing, and the agent's tools work inside the folder a session was
+        // started for, so the run is told where its working directory is;
+        // otherwise its files land in Loom's private session storage instead of
+        // the user's folder.
+        input.repository_instructions = merge_repository_instructions(
+            input.repository_instructions.take(),
+            &loom_tools::session_directory_instructions(&workspace),
+        );
         // A checkout stays pinned to the revision it was cloned at, so the run
         // is told how far that revision has drifted from its remote's default
         // branch now (#282): a stale base is what a push or a pull request

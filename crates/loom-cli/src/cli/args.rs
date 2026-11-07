@@ -181,7 +181,9 @@ Verbs:
 `run` never prints more than `session <id> <name>` and `run <id> <state>`: it
 returns as soon as the worker accepts the run. --repo and --as-directory are
 mutually exclusive, --revision applies to --repo only, and --path defaults to
-the source's final path component without a trailing `.git`. Without --model,
+the source's final path component without a trailing `.git`. --as-directory
+attaches the folder in place and the run's tools work inside it, so the files
+the session writes for that input land in the folder itself. Without --model,
 `run` asks the worker for its providers and selects the first provider (in the
 order the worker returns them) that has a credential and a known default model,
 as `loom:model:v1:["<provider-id>","<model>"]`; when no provider has a
@@ -1015,6 +1017,11 @@ Without --model, the first provider that has a credential and a known default
 model is started; when there is none, 'deterministic/demo' is started and a
 warning is printed on stderr.
 
+--as-directory attaches a local folder in place as the session's input and makes
+it the agent's working directory, so the files the run writes for that input
+land in the folder instead of in the worker's private session storage; --path
+names the session path the same folder is also reachable at.
+
 With --project, the session belongs to that project instead of being a project
 of its own. The id must be a live project root in --workspace (the id
 `status --tree` prints on its `project` line); an agent of a project, an
@@ -1039,7 +1046,7 @@ Flags:
   --name <name>               reuse or create the session with that name
   --model <id>                the model to start
   --repo <source>             clone a repository into a new session
-  --as-directory <path>       mount a local directory into a new session
+  --as-directory <path>       the local folder the run works in (new session)
   --revision <rev>            the revision to clone (with --repo)
   --path <path>               where an attached input lands
   --approval-policy <preset>  pin default or auto before the run starts
