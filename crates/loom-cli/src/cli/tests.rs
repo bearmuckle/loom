@@ -7023,11 +7023,11 @@ fn the_parser_covers_the_lifecycle_verbs() {
     );
     assert!(parse_error(&["project"]).contains(
         "requires 'get', 'tree', 'tasks', 'children', 'messages', 'send', 'child', 'archive', \
-             'delete', 'worktrees', or 'worktree'"
+             'delete', 'worktrees', 'worktree', or 'models'"
     ));
     assert!(parse_error(&["project", "nope"]).contains(
         "use get, tree, tasks, children, messages, send, child, archive, delete, worktrees, \
-                 or worktree"
+                 worktree, or models"
     ));
     assert!(
         parse_error(&["project", "worktree"])
@@ -9985,7 +9985,8 @@ fn project_reads_of_a_real_session_use_the_single_root_fallback() {
         get.stdout,
         format!(
             "project {project_id} root {session} parent -\n\
-             agent {session} idle depth 1 parent -\n"
+             agent {session} idle depth 1 parent -\n\
+             child-model default -\n"
         )
     );
 
@@ -10703,4 +10704,505 @@ fn run_project_new_with_a_request_id_replays_the_same_sub_project_and_run() {
     assert_eq!(sub_projects, 1, "the replay created no second sub project");
 
     close_persistent_fixture(fixture, directory);
+}
+
+// 9. The project's child models.
+
+#[test]
+fn child_model_flags_parse_into_named_changes() {
+    let parsed = invocation(&[
+        "project",
+        "models",
+        "set",
+        "00000000-0000-4000-8000-000000000001",
+        "--child-model",
+        " deterministic/demo ",
+        "--child-model-for",
+        "Vision=vision/model",
+        "--child-model-for=cheap=cheap/model",
+        "--unset-kind",
+        "review",
+    ]);
+    let Verb::ProjectModelsSet {
+        changes,
+        request_id,
+        ..
+    } = &parsed.verb
+    else {
+        panic!("unexpected verb {:?}", parsed.verb);
+    };
+    assert_eq!(*request_id, None);
+    assert_eq!(
+        changes.default_model,
+        Some(Some("deterministic/demo".to_owned()))
+    );
+    assert_eq!(
+        changes.set_kinds,
+        vec![
+            ("vision".to_owned(), "vision/model".to_owned()),
+            ("cheap".to_owned(), "cheap/model".to_owned()),
+        ]
+    );
+    assert_eq!(changes.unset_kinds, vec!["review".to_owned()]);
+    assert!(!changes.clear);
+    assert_eq!(args::verb_name(&parsed.verb), "project models set");
+
+    // The changes apply to the stored policy entry by entry.
+    let stored = loom_core::ProjectChildModelPolicy {
+        default_model_id: None,
+        by_kind: [
+            ("review".to_owned(), "old/review".to_owned()),
+            ("coding".to_owned(), "old/coding".to_owned()),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    let applied = changes.apply(stored);
+    assert_eq!(
+        applied.default_model_id.as_deref(),
+        Some("deterministic/demo")
+    );
+    assert_eq!(
+        applied
+            .by_kind
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["cheap", "coding", "vision"]
+    );
+
+    let run = invocation(&[
+        "run",
+        "--workspace",
+        "00000000-0000-4000-8000-000000000002",
+        "--task",
+        "t",
+        "--child-model",
+        "a/b",
+        "--child-model-for",
+        "vision=c/d",
+    ]);
+    let Verb::Run(run_args) = &run.verb else {
+        panic!("unexpected verb {:?}", run.verb);
+    };
+    assert_eq!(
+        run_args.child_models.default_model,
+        Some(Some("a/b".to_owned()))
+    );
+    assert_eq!(
+        run_args.child_models.set_kinds,
+        vec![("vision".to_owned(), "c/d".to_owned())]
+    );
+    let capabilities = verbs::used_capabilities(&run.verb);
+    assert!(capabilities.contains(Capability::ReadProject));
+    assert!(capabilities.contains(Capability::ControlAgentSession));
+    let plain = invocation(&[
+        "run",
+        "--workspace",
+        "00000000-0000-4000-8000-000000000002",
+        "--task",
+        "t",
+    ]);
+    assert!(!verbs::used_capabilities(&plain.verb).contains(Capability::ControlAgentSession));
+
+    let session = "00000000-0000-4000-8000-000000000001";
+    for (arguments, expected) in [
+        (
+            vec!["project", "models", "set", session],
+            "project models set requires",
+        ),
+        (
+            vec![
+                "project",
+                "models",
+                "set",
+                session,
+                "--child-model-for",
+                "vision",
+            ],
+            "takes <kind>=<model-id>",
+        ),
+        (
+            vec![
+                "project",
+                "models",
+                "set",
+                session,
+                "--child-model-for",
+                "two words=a/b",
+            ],
+            "child model kind 'two words'",
+        ),
+        (
+            vec![
+                "project",
+                "models",
+                "set",
+                session,
+                "--child-model-for",
+                "a=x/y",
+                "--child-model-for",
+                "A=x/z",
+            ],
+            "more than once",
+        ),
+        (
+            vec![
+                "project",
+                "models",
+                "set",
+                session,
+                "--child-model",
+                "current",
+            ],
+            "'current' is implicit",
+        ),
+        (
+            vec![
+                "project",
+                "models",
+                "set",
+                session,
+                "--child-model",
+                "a/b",
+                "--no-child-model",
+            ],
+            "exclude each other",
+        ),
+        (
+            vec![
+                "project",
+                "models",
+                "set",
+                session,
+                "--child-model-for",
+                "a=x/y",
+                "--unset-kind",
+                "a",
+            ],
+            "both set and unset",
+        ),
+        (
+            vec!["project", "models"],
+            "project models requires 'get' or 'set'",
+        ),
+        (vec!["project", "models", "list", session], "use get or set"),
+        (
+            vec![
+                "run",
+                "--workspace",
+                session,
+                "--task",
+                "t",
+                "--unset-kind",
+                "a",
+            ],
+            "does not apply to 'run'",
+        ),
+    ] {
+        let message = parse_error(&arguments);
+        assert!(message.contains(expected), "{arguments:?}: {message}");
+    }
+}
+
+#[test]
+fn project_models_help_pages_print_their_own_usage() {
+    let fixture = fixture();
+    let mut client = InProcessClient::new(&fixture.backend);
+    for (arguments, usage) in [
+        (
+            vec!["project", "models", "get", "--help"],
+            "Usage: loom-cli project models get",
+        ),
+        (
+            vec!["project", "models", "set", "--help"],
+            "Usage: loom-cli project models set",
+        ),
+    ] {
+        let page = run(&mut client, &arguments);
+        assert_eq!(page.code, exit::OK);
+        assert!(page.stdout.starts_with(usage), "{}", page.stdout);
+        assert!(page.stdout.contains("--json"), "{}", page.stdout);
+    }
+    let run_page = run(&mut client, &["run", "--help"]);
+    assert!(
+        run_page.stdout.contains("--child-model-for"),
+        "{}",
+        run_page.stdout
+    );
+    let manual = run(&mut client, &["--help"]);
+    assert!(
+        manual.stdout.contains("project models set"),
+        "{}",
+        manual.stdout
+    );
+}
+
+#[test]
+fn project_models_get_and_set_change_the_stored_policy() {
+    let (fixture, directory) = persistent_fixture("project-models");
+    let session = fixture.session.id.to_string();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let empty = run(&mut client, &["project", "models", "get", &session]);
+    assert_eq!(empty.code, exit::OK, "{}", empty.stderr);
+    assert_eq!(
+        empty.stdout,
+        format!("project {session}\nchild-model default -\n")
+    );
+
+    let set = run(
+        &mut client,
+        &[
+            "project",
+            "models",
+            "set",
+            &session,
+            "--child-model",
+            "deterministic/demo",
+            "--child-model-for",
+            "Vision=deterministic/demo",
+            "--child-model-for",
+            "cheap=deterministic/demo",
+        ],
+    );
+    assert_eq!(set.code, exit::OK, "{}", set.stderr);
+    assert_eq!(
+        set.stdout,
+        format!(
+            "project {session}\nchild-model default deterministic/demo\n\
+             child-model kind cheap deterministic/demo\n\
+             child-model kind vision deterministic/demo\n"
+        )
+    );
+
+    // A later change keeps the entries it does not name.
+    let unset = run(
+        &mut client,
+        &[
+            "project",
+            "models",
+            "set",
+            &session,
+            "--unset-kind",
+            "cheap",
+            "--no-child-model",
+            "--json",
+        ],
+    );
+    assert_eq!(unset.code, exit::OK, "{}", unset.stderr);
+    let envelope = json_envelope(&unset);
+    assert_eq!(envelope["verb"], "project models set");
+    assert_eq!(envelope["data"]["project_id"], session);
+    assert_eq!(
+        envelope["data"]["child_models"],
+        serde_json::json!({
+            "default_model_id": null,
+            "by_kind": {"vision": "deterministic/demo"},
+        })
+    );
+    let read = run(
+        &mut client,
+        &["project", "models", "get", &session, "--json"],
+    );
+    assert_eq!(json_envelope(&read)["data"], envelope["data"]);
+
+    // A model the worker does not configure is refused and changes nothing.
+    let refused = run(
+        &mut client,
+        &[
+            "project",
+            "models",
+            "set",
+            &session,
+            "--child-model-for",
+            "review=deterministic/absent-model",
+        ],
+    );
+    assert_eq!(refused.code, exit::INTERNAL, "{}", refused.stdout);
+    assert!(
+        refused.stderr.contains("deterministic/absent-model"),
+        "{}",
+        refused.stderr
+    );
+    let unchanged = run(
+        &mut client,
+        &["project", "models", "get", &session, "--json"],
+    );
+    assert_eq!(json_envelope(&unchanged)["data"], envelope["data"]);
+
+    // `project get` and `status --tree` report the policy beside the project.
+    let get = run(&mut client, &["project", "get", &session]);
+    assert!(
+        get.stdout
+            .ends_with("child-model default -\nchild-model kind vision deterministic/demo\n"),
+        "{}",
+        get.stdout
+    );
+    let get_json = json_envelope(&run(&mut client, &["project", "get", &session, "--json"]));
+    assert_eq!(
+        get_json["data"]["child_models"]["by_kind"]["vision"],
+        "deterministic/demo"
+    );
+    let status = run(&mut client, &["status", "--session", &session, "--tree"]);
+    assert_eq!(status.code, exit::OK, "{}", status.stderr);
+    assert!(
+        status
+            .stdout
+            .contains("child-model kind vision deterministic/demo\n"),
+        "{}",
+        status.stdout
+    );
+    let status_json = json_envelope(&run(
+        &mut client,
+        &["status", "--session", &session, "--tree", "--json"],
+    ));
+    assert_eq!(
+        status_json["data"]["project"]["child_models"]["by_kind"]["vision"],
+        "deterministic/demo"
+    );
+
+    let cleared = run(
+        &mut client,
+        &["project", "models", "set", &session, "--clear"],
+    );
+    assert_eq!(
+        cleared.stdout,
+        format!("project {session}\nchild-model default -\n")
+    );
+    drop(client);
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn run_stores_the_child_models_before_it_starts() {
+    let (fixture, directory) = persistent_fixture("run-child-models");
+    let workspace = fixture.workspace.id.to_string();
+    let mut client = InProcessClient::new(&fixture.backend);
+    let started = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--new",
+            "--name",
+            "child models",
+            "--task",
+            "delegate the screenshots",
+            "--model",
+            "deterministic/demo",
+            "--child-model",
+            "deterministic/demo",
+            "--child-model-for",
+            "vision=deterministic/demo",
+            "--json",
+        ],
+    );
+    assert_eq!(started.code, exit::OK, "{}", started.stderr);
+    let envelope = json_envelope(&started);
+    assert_eq!(
+        envelope["data"]["child_models"],
+        serde_json::json!({
+            "default_model_id": "deterministic/demo",
+            "by_kind": {"vision": "deterministic/demo"},
+        })
+    );
+    let session = envelope["data"]["session"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let read = run(
+        &mut client,
+        &["project", "models", "get", &session, "--json"],
+    );
+    assert_eq!(
+        json_envelope(&read)["data"]["child_models"],
+        envelope["data"]["child_models"]
+    );
+
+    // A model the worker does not configure stops the run before it starts.
+    let refused = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--new",
+            "--name",
+            "refused child models",
+            "--task",
+            "t",
+            "--model",
+            "deterministic/demo",
+            "--child-model",
+            "deterministic/absent-model",
+        ],
+    );
+    assert_eq!(refused.code, exit::INTERNAL, "{}", refused.stdout);
+    assert!(
+        refused.stderr.contains("deterministic/absent-model"),
+        "{}",
+        refused.stderr
+    );
+    drop(client);
+    fixture.backend.shutdown().unwrap();
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+#[test]
+fn run_project_stores_the_child_models_on_the_sub_project_it_creates() {
+    let (fixture, directory) = persistent_fixture("run-project-child-models");
+    let workspace = fixture.workspace.id.to_string();
+    let project = fixture.session.id.to_string();
+    let mut client = InProcessClient::new(&fixture.backend);
+    let started = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--project",
+            &project,
+            "--name",
+            "sub project",
+            "--task",
+            "delegate the review",
+            "--model",
+            "deterministic/demo",
+            "--child-model-for",
+            "review=deterministic/demo",
+            "--json",
+        ],
+    );
+    assert_eq!(started.code, exit::OK, "{}", started.stderr);
+    let envelope = json_envelope(&started);
+    let sub_project = envelope["data"]["session"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(sub_project, project);
+    assert_eq!(envelope["data"]["project"]["parent_id"], project.as_str());
+
+    // The sub project is a project of its own, so the policy is its own and
+    // the parent project keeps no child models.
+    let sub = run(
+        &mut client,
+        &["project", "models", "get", &sub_project, "--json"],
+    );
+    assert_eq!(
+        json_envelope(&sub)["data"]["child_models"],
+        serde_json::json!({
+            "default_model_id": null,
+            "by_kind": {"review": "deterministic/demo"},
+        })
+    );
+    let parent = run(&mut client, &["project", "models", "get", &project]);
+    assert_eq!(
+        parent.stdout,
+        format!("project {project}\nchild-model default -\n")
+    );
+    drop(client);
+    fixture.backend.shutdown().unwrap();
+    let _ = std::fs::remove_dir_all(directory);
 }

@@ -22,16 +22,32 @@ fn delegated_task_is_terminal(status: loom_core::DelegatedTaskStatus) -> bool {
 impl ToolExtension for ProjectAgentTools {
     fn definitions(&self) -> Vec<ToolDefinition> {
         let mut definitions = Vec::new();
+        let child_model_guidance = if self.can_delegate || self.can_delegate_code {
+            match self.child_model_policy() {
+                Ok(policy) => child_model_guidance(&policy),
+                Err(error) => {
+                    log::debug!(
+                        "could not read project {} child models for tool guidance: {}",
+                        self.project_id,
+                        error.message
+                    );
+                    String::new()
+                }
+            }
+        } else {
+            String::new()
+        };
         if self.can_delegate {
             definitions.push(ToolDefinition {
                 name: "delegate_project_task".to_owned(),
-                description: "Create a bounded non-code child agent task in this project. The child is read-only: when the project has one clean Git repository it receives its own isolated checkout of your current revision, so delegate by objective and reference files by path instead of pasting their contents. Omit model_id or set it to `current` to reuse this agent's model; use a provider/model ID to choose another model.".to_owned(),
+                description: "Create a bounded non-code child agent task in this project. The child is read-only: when the project has one clean Git repository it receives its own isolated checkout of your current revision, so delegate by objective and reference files by path instead of pasting their contents. ".to_owned() + &child_model_guidance,
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "child_name": {"type": "string", "minLength": 1, "maxLength": 128},
                         "intent": {"type": "string", "minLength": 1, "maxLength": 16384},
-                        "model_id": {"type": "string", "minLength": 1, "maxLength": loom_persistence::MAX_MODEL_ID_BYTES, "description": "Optional provider/model ID. Omit this field or use `current` to reuse this agent's model."},
+                        "model_id": {"type": "string", "minLength": 1, "maxLength": loom_persistence::MAX_MODEL_ID_BYTES, "description": "Optional provider/model ID that overrides the project's child models. Omit this field, or use `current`, to let the project choose by kind and default, falling back to this agent's model."},
+                        "kind": {"type": "string", "minLength": 1, "maxLength": loom_core::MAX_CHILD_MODEL_KIND_BYTES, "description": "Optional kind of work, such as cheap, coding, review, or vision. The project may map a kind to a model; an unmapped kind uses the project's default child model."},
                         "context_references": {
                             "type": "array",
                             "maxItems": 128,
@@ -72,13 +88,14 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_delegate_code {
             definitions.push(ToolDefinition {
                 name: "delegate_project_code_task".to_owned(),
-                description: "Create a bounded code-changing child task in an isolated Git worktree based on the project's clean current revision. The child must commit its result and report the commit. Only use this for source changes; the child cannot access the parent checkout. Describe the intended change rather than quoting code, because the child reads its own checkout.".to_owned(),
+                description: "Create a bounded code-changing child task in an isolated Git worktree based on the project's clean current revision. The child must commit its result and report the commit. Only use this for source changes; the child cannot access the parent checkout. Describe the intended change rather than quoting code, because the child reads its own checkout.".to_owned() + &child_model_guidance,
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "child_name": {"type": "string", "minLength": 1, "maxLength": 128},
                         "intent": {"type": "string", "minLength": 1, "maxLength": 16384},
-                        "model_id": {"type": "string", "minLength": 1, "maxLength": loom_persistence::MAX_MODEL_ID_BYTES, "description": "Optional provider/model ID. Omit this field or use `current` to reuse this agent's model."},
+                        "model_id": {"type": "string", "minLength": 1, "maxLength": loom_persistence::MAX_MODEL_ID_BYTES, "description": "Optional provider/model ID that overrides the project's child models. Omit this field, or use `current`, to let the project choose by kind and default, falling back to this agent's model."},
+                        "kind": {"type": "string", "minLength": 1, "maxLength": loom_core::MAX_CHILD_MODEL_KIND_BYTES, "description": "Optional kind of work, such as cheap, coding, review, or vision. The project may map a kind to a model; an unmapped kind uses the project's default child model."},
                         "context_references": {
                             "type": "array",
                             "maxItems": 128,
@@ -743,6 +760,18 @@ impl ProjectAgentTools {
         }
     }
 
+    /// The child model policy of this agent's project, read on every call so a
+    /// change applies to the next delegation without restarting the run.
+    pub(crate) fn child_model_policy(&self) -> Result<loom_core::ProjectChildModelPolicy> {
+        let Some(backend) = self.backend.upgrade() else {
+            return Ok(loom_core::ProjectChildModelPolicy::default());
+        };
+        match backend.persistence.as_ref() {
+            Some(persistence) => persistence.load_project_child_model_policy(self.project_id),
+            None => Ok(loom_core::ProjectChildModelPolicy::default()),
+        }
+    }
+
     pub(crate) fn execute_delegation(&self, call: &ToolCall) -> ToolResult {
         self.execute_delegation_with_kind(call, false)
     }
@@ -801,10 +830,32 @@ impl ProjectAgentTools {
             }
             Err(error) => return ToolResult::failure(call, error.message),
         }
+        let policy = match self.child_model_policy() {
+            Ok(policy) => policy,
+            Err(error) => {
+                return ToolResult::failure(
+                    call,
+                    format!(
+                        "could not read the project's child models: {}",
+                        error.message
+                    ),
+                );
+            }
+        };
+        let choice = delegated_child_model(
+            arguments.model_id.as_deref(),
+            arguments.kind.as_deref(),
+            &policy,
+            &self.current_model_id(),
+        );
+        let kind = arguments
+            .kind
+            .as_deref()
+            .and_then(|kind| loom_core::normalize_child_model_kind(kind).ok());
         let request_id = RequestId::from_uuid(*call.id.as_uuid());
         let spec = DelegatedTaskSpec {
             intent: arguments.intent,
-            model_id: delegated_child_model_id(arguments.model_id, &self.current_model_id()),
+            model_id: choice.model_id,
             context_references: arguments.context_references,
             dependencies: arguments.dependencies,
             code_change,
@@ -828,6 +879,8 @@ impl ProjectAgentTools {
                         "child_name": task.child_name,
                         "intent": task.intent,
                         "model_id": task.model_id,
+                        "model_source": choice.source,
+                        "kind": kind,
                         "checkout_base": self.child_checkout_base(task.task_id),
                     }))
                     .unwrap_or_else(|error| format!("could not encode delegation result: {error}")),
@@ -1347,4 +1400,29 @@ impl ProjectAgentTools {
             Err(error) => ToolResult::failure(call, error.message),
         }
     }
+}
+
+/// The sentence a delegation tool description ends with: how this project
+/// chooses a child's model, so the agent knows which kinds exist and what each
+/// runs on without a separate lookup.
+pub(crate) fn child_model_guidance(policy: &loom_core::ProjectChildModelPolicy) -> String {
+    if policy.is_empty() {
+        return " This project sets no child models, so a child reuses your model unless you \
+                 pass model_id."
+            .to_owned();
+    }
+    let mut parts = policy
+        .by_kind
+        .iter()
+        .map(|(kind, model)| format!("kind `{kind}` runs on `{model}`"))
+        .collect::<Vec<_>>();
+    match &policy.default_model_id {
+        Some(model) => parts.push(format!("any other child runs on `{model}`")),
+        None => parts.push("any other child reuses your model".to_owned()),
+    }
+    format!(
+        " This project chooses child models: {}. Pass `kind` to pick the kind of work; pass \
+         model_id only to override the project.",
+        parts.join("; ")
+    )
 }

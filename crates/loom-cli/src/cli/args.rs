@@ -63,6 +63,7 @@ Verbs:
       [--as-directory <path> [--path <path>]]
       [--approval-policy default|auto] [--request-id <uuid>] [--new]
       [--project <session-id>]
+      [--child-model <id>] [--child-model-for <kind>=<id>]...
                                     reuse the workspace's session named
                                     --name, or create it, attach the inputs
                                     to a session this run created, and start
@@ -70,7 +71,9 @@ Verbs:
                                     without --model the first credentialed
                                     provider's default model is started;
                                     --project creates the session as a sub
-                                    project of that project root
+                                    project of that project root;
+                                    --child-model and --child-model-for set
+                                    the models its delegated children use
   send --run <id> --text <text> [--request-id <uuid>]
                                     direct the active run and print its state
   answer --run <id> --text <text> [--request-id <uuid>]
@@ -123,6 +126,13 @@ Verbs:
                                     required for a cascade or with --force
   project get <session-id>          report one project's members and parent
                                     project
+  project models get <session-id>   report the models the project's delegated
+                                    children run on
+  project models set <session-id> [--child-model <id> | --no-child-model]
+                     [--child-model-for <kind>=<id>]... [--unset-kind <kind>]...
+                     [--clear] [--request-id <uuid>]
+                                    change the project's child models; the
+                                    id must be the project root
   project tree <session-id>         print the project hierarchy as an
                                     indented tree
   project tasks <session-id>        list the project's delegated tasks
@@ -415,6 +425,51 @@ pub(crate) struct RunArgs {
     /// with `Project/CreateSubProject`, so a client lists it beneath the
     /// project instead of as a project of its own.
     pub project: Option<AgentSessionId>,
+    /// `--child-model` and `--child-model-for`: the child model entries stored
+    /// on the session's project before the run starts.
+    pub child_models: ChildModelChanges,
+}
+
+/// The child model entries one command changes. Entries a flag does not name
+/// keep their stored value, so a command never drops a kind it did not mention.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ChildModelChanges {
+    /// `--clear`: start from an empty policy.
+    pub clear: bool,
+    /// `--child-model` (`Some(Some(id))`) or `--no-child-model` (`Some(None)`).
+    pub default_model: Option<Option<String>>,
+    /// `--child-model-for <kind>=<id>`, with normalized kinds.
+    pub set_kinds: Vec<(String, String)>,
+    /// `--unset-kind <kind>`, normalized.
+    pub unset_kinds: Vec<String>,
+}
+
+impl ChildModelChanges {
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The policy these changes turn `stored` into.
+    pub(crate) fn apply(
+        &self,
+        stored: loom_core::ProjectChildModelPolicy,
+    ) -> loom_core::ProjectChildModelPolicy {
+        let mut policy = if self.clear {
+            loom_core::ProjectChildModelPolicy::default()
+        } else {
+            stored
+        };
+        if let Some(default_model) = &self.default_model {
+            policy.default_model_id = default_model.clone();
+        }
+        for kind in &self.unset_kinds {
+            policy.by_kind.remove(kind);
+        }
+        for (kind, model) in &self.set_kinds {
+            policy.by_kind.insert(kind.clone(), model.clone());
+        }
+        policy
+    }
 }
 
 /// Where `providers set-key` reads the API key. The secret itself is not stored
@@ -628,6 +683,18 @@ pub(crate) enum Verb {
         /// open.
         request_id: Option<RequestId>,
     },
+    /// `project models get`: the project's child model policy.
+    ProjectModelsGet {
+        session: AgentSessionId,
+    },
+    /// `project models set`: change the project's child model policy.
+    ProjectModelsSet {
+        session: AgentSessionId,
+        changes: ChildModelChanges,
+        /// The change's idempotency key, or `None` when the caller left it
+        /// open.
+        request_id: Option<RequestId>,
+    },
     /// `project get`: the hierarchy and parent project of one member.
     ProjectGet {
         session: AgentSessionId,
@@ -740,6 +807,8 @@ pub(crate) fn verb_name(verb: &Verb) -> &'static str {
         Verb::ProjectWorktreeCleanup { .. } => "project worktree cleanup",
         Verb::Delete { .. } => "delete",
         Verb::ProjectGet { .. } => "project get",
+        Verb::ProjectModelsGet { .. } => "project models get",
+        Verb::ProjectModelsSet { .. } => "project models set",
         Verb::ProjectTree { .. } => "project tree",
         Verb::ProjectTasks { .. } => "project tasks",
         Verb::ProjectChildren { .. } => "project children",
@@ -938,6 +1007,8 @@ Examples:
                       [--approval-policy default|auto] [--request-id <uuid>] [--new]
                       [--project <session-id>]
 
+                      [--child-model <id>] [--child-model-for <kind>=<id>]...
+
 Reuse the workspace's session named --name, or create it, attach the inputs to
 a session this run created, and start one agent run without waiting for it.
 Without --model, the first provider that has a credential and a known default
@@ -955,6 +1026,12 @@ repositories, the way loom-ui's "New sub project" does, unless --repo or
 warning on stderr, not a failure. The output gains a third line,
 `parent <project-id>`, and --json reports `project.parent_id`.
 
+--model is the model of this run. --child-model and --child-model-for choose
+the models the run's delegated children use, stored on the session's project
+before the run starts: a child of a mapped kind runs on that kind's model, any
+other child on --child-model, and without either it reuses the run's model.
+They change only the entries they name; 'project models set' edits the rest.
+
 Flags:
   --workspace <id>            the workspace the session belongs to (required)
   --task <text>               the task text
@@ -970,6 +1047,8 @@ Flags:
   --new                       always create a session
   --project <session-id>      create the session as a sub project of this
                               project root, and reuse only its sub projects
+  --child-model <id>          the default model of delegated children
+  --child-model-for <k>=<id>  the model of children of kind k; repeatable
   --json                      print one JSON envelope instead of text
 Global flags are accepted anywhere; see 'loom-cli --help'.
 
@@ -977,6 +1056,9 @@ Examples:
   loom-cli run --workspace <workspace-id> --task 'fix the failing test'
   loom-cli run --workspace <workspace-id> --project <project-session-id> \
     --name 'cli: run --project' --task-file task.md --new --json
+  loom-cli run --workspace <workspace-id> --task 'triage the screenshots' \
+    --model deepseek-flash --child-model deepseek-flash \
+    --child-model-for vision=<vision-model-id>
   loom-cli run --workspace <workspace-id> --task-file task.md \
     --repo https://github.com/acme/widgets.git --approval-policy auto
   loom-cli run --workspace <workspace-id> --task 'summarise the diff' \
@@ -1309,6 +1391,55 @@ Examples:
 "#,
     ),
     (
+        "project models get",
+        r#"Usage: loom-cli project models get <session-id>
+
+Report the models the project's delegated children run on: the default child
+model and one model per kind of work. Any member session addresses its project.
+A child the agent delegates with a mapped `kind` runs on that kind's model, any
+other child on the default, and without a default it reuses its parent's model.
+A model the agent names explicitly overrides the project.
+
+Flags:
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project models get <project-root-id>
+  loom-cli project models get <session-id> --json
+"#,
+    ),
+    (
+        "project models set",
+        r#"Usage: loom-cli project models set <project-root-id>
+                      [--child-model <id> | --no-child-model]
+                      [--child-model-for <kind>=<id>]... [--unset-kind <kind>]...
+                      [--clear] [--request-id <uuid>]
+
+Change the models the project's delegated children run on, and print the
+stored result. Only the entries a flag names change; --clear starts from an
+empty policy. A kind is 1 to 32 characters of a-z, 0-9, '_' or '-' such as
+cheap, coding, review, or vision, and at most 16 kinds are stored. The worker
+refuses a model it has not configured; 'loom-cli models list' shows them.
+
+Flags:
+  --child-model <id>          the default model of delegated children
+  --no-child-model            remove the default; children reuse their parent's
+  --child-model-for <k>=<id>  the model of children of kind k; repeatable
+  --unset-kind <kind>         remove one kind's model; repeatable
+  --clear                     drop every entry before applying the others
+  --request-id <uuid>         the idempotency key of the change
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project models set <project-root-id> --child-model deepseek-flash
+  loom-cli project models set <project-root-id> --child-model-for cheap=deepseek-flash \
+    --child-model-for vision=<vision-model-id> --json
+  loom-cli project models set <project-root-id> --clear
+"#,
+    ),
+    (
         "project tree",
         r#"Usage: loom-cli project tree <session-id>
 
@@ -1594,6 +1725,8 @@ fn arity(name: &str) -> Option<bool> {
         "--expected-parent-revision" | "--project" => true,
         "--new" | "--archive" | "--retry-on-conflict" | "--force" | "--yes" | "--tree" => false,
         "--keep" | "--remove" | "--discard" => false,
+        "--child-model" | "--child-model-for" | "--unset-kind" => true,
+        "--no-child-model" | "--clear" => false,
         _ => return None,
     })
 }
@@ -1613,6 +1746,15 @@ impl FlagSet {
     fn value(&mut self, name: &str) -> Option<String> {
         let index = self.flags.iter().position(|flag| flag.name == name)?;
         self.flags.remove(index).value
+    }
+
+    /// Every value of a repeatable flag, in command-line order.
+    fn values(&mut self, name: &str) -> Vec<String> {
+        let mut values = Vec::new();
+        while let Some(index) = self.flags.iter().position(|flag| flag.name == name) {
+            values.extend(self.flags.remove(index).value);
+        }
+        values
     }
 
     fn required(&mut self, name: &str) -> Result<String, String> {
@@ -2225,7 +2367,7 @@ fn parse_project(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
     let Some(sub_verb) = rest.first() else {
         return Err(
             "project requires 'get', 'tree', 'tasks', 'children', 'messages', 'send', \
-             'child', 'archive', 'delete', 'worktrees', or 'worktree'"
+             'child', 'archive', 'delete', 'worktrees', 'worktree', or 'models'"
                 .to_owned(),
         );
     };
@@ -2349,9 +2491,43 @@ fn parse_project(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
             session: one_session_id(flags, rest)?,
         }),
         "worktree" => parse_project_worktree(flags, rest),
+        "models" => parse_project_models(flags, rest),
         other => Err(format!(
             "unknown project sub-verb '{other}'; use get, tree, tasks, children, messages, send, \
-             child, archive, delete, worktrees, or worktree"
+             child, archive, delete, worktrees, worktree, or models"
+        )),
+    }
+}
+
+/// The `project models` sub-verbs: `get` and `set`.
+fn parse_project_models(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
+    let Some(sub_verb) = rest.get(1) else {
+        return Err("project models requires 'get' or 'set'".to_owned());
+    };
+    flags.verb = format!("project models {sub_verb}");
+    match sub_verb.as_str() {
+        "get" => Ok(Verb::ProjectModelsGet {
+            session: one_session_id(flags, rest)?,
+        }),
+        "set" => {
+            let request_id = parse_request_id(flags)?;
+            let session = one_session_id(flags, rest)?;
+            let changes = parse_child_model_changes(flags, true)?;
+            if changes.is_empty() {
+                return Err(
+                    "project models set requires --child-model, --no-child-model, \
+                     --child-model-for, --unset-kind, or --clear"
+                        .to_owned(),
+                );
+            }
+            Ok(Verb::ProjectModelsSet {
+                session,
+                changes,
+                request_id,
+            })
+        }
+        other => Err(format!(
+            "unknown project models sub-verb '{other}'; use get or set"
         )),
     }
 }
@@ -2522,6 +2698,7 @@ fn parse_run(flags: &mut FlagSet) -> Result<RunArgs, String> {
         .value("--project")
         .map(|project| parse_id("project session id", &project))
         .transpose()?;
+    let child_models = parse_child_model_changes(flags, false)?;
     Ok(RunArgs {
         workspace: parse_id("workspace id", &workspace)?,
         task,
@@ -2533,7 +2710,71 @@ fn parse_run(flags: &mut FlagSet) -> Result<RunArgs, String> {
         request_id,
         new: flags.flag("--new"),
         project,
+        child_models,
     })
+}
+
+/// The child model flags of `run` and `project models set`. Only `project
+/// models set` removes entries, so `removals` gates `--no-child-model`,
+/// `--unset-kind`, and `--clear`.
+fn parse_child_model_changes(
+    flags: &mut FlagSet,
+    removals: bool,
+) -> Result<ChildModelChanges, String> {
+    let model = |raw: &str, flag: &str| {
+        loom_core::normalize_child_model_id(raw)
+            .map_err(|error| format!("{flag}: {}", error.message))
+    };
+    let kind = |raw: &str, flag: &str| {
+        loom_core::normalize_child_model_kind(raw)
+            .map_err(|error| format!("{flag}: {}", error.message))
+    };
+    let mut changes = ChildModelChanges::default();
+    let defaults = flags.values("--child-model");
+    if defaults.len() > 1 {
+        return Err("--child-model may be given once".to_owned());
+    }
+    if let Some(default_model) = defaults.first() {
+        changes.default_model = Some(Some(model(default_model, "--child-model")?));
+    }
+    for entry in flags.values("--child-model-for") {
+        let Some((raw_kind, raw_model)) = entry.split_once('=') else {
+            return Err(format!(
+                "--child-model-for takes <kind>=<model-id>, got '{entry}'"
+            ));
+        };
+        let entry_kind = kind(raw_kind, "--child-model-for")?;
+        if changes
+            .set_kinds
+            .iter()
+            .any(|(existing, _)| *existing == entry_kind)
+        {
+            return Err(format!(
+                "--child-model-for names kind '{entry_kind}' more than once"
+            ));
+        }
+        let entry_model = model(raw_model, "--child-model-for")?;
+        changes.set_kinds.push((entry_kind, entry_model));
+    }
+    if removals {
+        if flags.flag("--no-child-model") {
+            if changes.default_model.is_some() {
+                return Err("--child-model and --no-child-model exclude each other".to_owned());
+            }
+            changes.default_model = Some(None);
+        }
+        for raw in flags.values("--unset-kind") {
+            let unset = kind(&raw, "--unset-kind")?;
+            if changes.set_kinds.iter().any(|(set, _)| *set == unset) {
+                return Err(format!(
+                    "kind '{unset}' is both set and unset; pass one of them"
+                ));
+            }
+            changes.unset_kinds.push(unset);
+        }
+        changes.clear = flags.flag("--clear");
+    }
+    Ok(changes)
 }
 
 /// Reads the task file or the direction text file as UTF-8, dropping one

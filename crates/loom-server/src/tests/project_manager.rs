@@ -8,22 +8,15 @@ use super::*;
 fn delegated_child_current_model_alias_resolves_to_manager_model() {
     let current_model = ModelId::new("provider/model");
 
-    assert_eq!(
-        delegated_child_model_id(None, &current_model),
-        "provider/model"
-    );
-    assert_eq!(
-        delegated_child_model_id(Some("current".to_owned()), &current_model),
-        "provider/model"
-    );
-    assert_eq!(
-        delegated_child_model_id(Some("  CURRENT  ".to_owned()), &current_model),
-        "provider/model"
-    );
-    assert_eq!(
-        delegated_child_model_id(Some("provider/other".to_owned()), &current_model),
-        "provider/other"
-    );
+    let policy = loom_core::ProjectChildModelPolicy::default();
+    let resolve = |requested: Option<&str>| {
+        delegated_child_model(requested, None, &policy, &current_model).model_id
+    };
+
+    assert_eq!(resolve(None), "provider/model");
+    assert_eq!(resolve(Some("current")), "provider/model");
+    assert_eq!(resolve(Some("  CURRENT  ")), "provider/model");
+    assert_eq!(resolve(Some("provider/other")), "provider/other");
 }
 
 /// A provider registry that configures the fixture's captured and live models,
@@ -64,26 +57,34 @@ fn delegation_model_registry(models: &[ModelId]) -> ProviderRegistry {
 /// A persistent backend with one manager session and the manager's project
 /// tools, whose captured model deliberately differs from any live run model so
 /// a test can tell which one a delegation resolved.
-struct DelegationModelSetup {
-    temp: PathBuf,
-    backend: Arc<InProcessBackend>,
-    connection: InProcessConnection,
-    root: AgentSessionId,
+pub(super) struct DelegationModelSetup {
+    pub(super) temp: PathBuf,
+    pub(super) backend: Arc<InProcessBackend>,
+    pub(super) connection: InProcessConnection,
+    pub(super) root: AgentSessionId,
     /// The model captured in the tools when the delegating run started.
-    captured_model: ModelId,
+    pub(super) captured_model: ModelId,
     /// The model a live run for the manager session uses.
-    live_model: ModelId,
-    tools: ToolExecutor,
+    pub(super) live_model: ModelId,
+    pub(super) tools: ToolExecutor,
 }
 
 impl DelegationModelSetup {
-    fn new(prefix: &str) -> Self {
+    pub(super) fn new(prefix: &str) -> Self {
+        Self::with_models(prefix, &[])
+    }
+
+    /// The same setup with `extra` models configured as well, so a test can
+    /// point a project's child models at models other than the manager's.
+    pub(super) fn with_models(prefix: &str, extra: &[ModelId]) -> Self {
         let temp = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&temp).unwrap();
         let captured_model = ModelId::new(format!("fixture/{prefix}-captured"));
         let live_model = ModelId::new(format!("fixture/{prefix}-live"));
+        let mut models = vec![captured_model.clone(), live_model.clone()];
+        models.extend(extra.iter().cloned());
         let backend = InProcessBackend::with_provider_registry_persistent(
-            delegation_model_registry(&[captured_model.clone(), live_model.clone()]),
+            delegation_model_registry(&models),
             temp.join("state.sqlite"),
         )
         .unwrap();
@@ -142,7 +143,7 @@ impl DelegationModelSetup {
 
     /// Registers a run for the manager session with `model`, optionally marked
     /// as executing, so the tool extension sees a live run to resolve against.
-    fn register_manager_run(&self, model: &ModelId, running: bool) -> Arc<RunHandle> {
+    pub(super) fn register_manager_run(&self, model: &ModelId, running: bool) -> Arc<RunHandle> {
         let run_root =
             std::env::temp_dir().join(format!("loom-delegation-run-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&run_root).unwrap();
@@ -164,7 +165,7 @@ impl DelegationModelSetup {
 
     /// Settles the fixture's runs before the backend shuts down, so shutdown
     /// never waits on a run this test registered without a worker.
-    fn teardown(self) {
+    pub(super) fn teardown(self) {
         for handle in self.backend.runs().unwrap().values() {
             handle.set_running(false);
         }
@@ -193,7 +194,7 @@ fn delegate_project_task_with_model(tools: &ToolExecutor, model_id: Option<&str>
 
 /// The project's delegated tasks, so a test can read the durable model a child
 /// was created with.
-fn project_tasks(setup: &DelegationModelSetup) -> Vec<loom_core::DelegatedTaskRecord> {
+pub(super) fn project_tasks(setup: &DelegationModelSetup) -> Vec<loom_core::DelegatedTaskRecord> {
     setup
         .backend
         .persistence

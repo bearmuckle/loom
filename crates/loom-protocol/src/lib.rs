@@ -456,8 +456,14 @@ impl ClientRequest {
                 Some(Capability::ReadAgentSession)
             }
             Self::Project(ProjectRequest::GetProjectSnapshot { .. })
-            | Self::Project(ProjectRequest::GetProjectSnapshotForSession { .. }) => {
+            | Self::Project(ProjectRequest::GetProjectSnapshotForSession { .. })
+            | Self::Project(ProjectRequest::GetProjectChildModels { .. }) => {
                 Some(Capability::ReadProject)
+            }
+            // The child model policy is project configuration, changed with the
+            // capability that changes a session's name and goal.
+            Self::Project(ProjectRequest::SetProjectChildModels { .. }) => {
+                Some(Capability::ControlAgentSession)
             }
             // A sub project is an agent session of its own, so creating one
             // needs the capability that creates sessions.
@@ -684,6 +690,7 @@ impl ClientRequest {
             | Self::Task(TaskRequest::GetSessionTaskEvidence { .. })
             | Self::Project(ProjectRequest::GetProjectSnapshot { .. })
             | Self::Project(ProjectRequest::GetProjectSnapshotForSession { .. })
+            | Self::Project(ProjectRequest::GetProjectChildModels { .. })
             | Self::Project(ProjectRequest::ListProjectAgentMessages { .. })
             | Self::Project(ProjectRequest::GetProjectChildReview { .. })
             | Self::Collaboration(CollaborationRequest::GetRunRevision { .. })
@@ -750,6 +757,9 @@ impl ClientRequest {
             // branched out of, so it needs the role that may change that
             // project.
             Self::Project(ProjectRequest::CreateSubProject { .. }) => Some(Owner),
+            // Choosing the models a project's children run on changes what the
+            // project spends, so it needs the role that may change the project.
+            Self::Project(ProjectRequest::SetProjectChildModels { .. }) => Some(Owner),
         }
     }
 
@@ -820,6 +830,8 @@ impl ClientRequest {
             | Self::Run(RunRequest::StartSessionAgentRun { session_id, .. })
             | Self::Run(RunRequest::StartSessionAgentRunWithOptions { session_id, .. })
             | Self::Project(ProjectRequest::GetProjectSnapshotForSession { session_id })
+            | Self::Project(ProjectRequest::GetProjectChildModels { session_id })
+            | Self::Project(ProjectRequest::SetProjectChildModels { session_id, .. })
             | Self::Project(ProjectRequest::ListProjectAgentMessages { session_id, .. })
             | Self::Project(ProjectRequest::ControlProjectChild {
                 manager_session_id: session_id,
@@ -900,6 +912,7 @@ impl ClientRequest {
                 | Self::Workspace(WorkspaceRequest::RenameWorkspace { .. })
                 | Self::Workspace(WorkspaceRequest::CreateAgentSessionInWorkspace { .. })
                 | Self::Project(ProjectRequest::CreateSubProject { .. })
+                | Self::Project(ProjectRequest::SetProjectChildModels { .. })
                 | Self::Project(ProjectRequest::ControlProjectChild { .. })
                 | Self::Project(ProjectRequest::IntegrateProjectChild { .. })
                 | Self::Project(ProjectRequest::CleanupProjectChildWorktree { .. })
@@ -1336,7 +1349,7 @@ mod run_message_protocol_tests {
 
     #[test]
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 16));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 17));
         let project_id = ProjectId::new();
         let request = ClientRequest::Project(ProjectRequest::GetProjectSnapshot { project_id });
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));
@@ -1436,6 +1449,52 @@ mod run_message_protocol_tests {
                 updated_at: loom_core::Timestamp::from_unix_millis(1),
                 title_source: loom_core::SessionTitleSource::Auto,
             }),
+        });
+        let encoded = encode_response(&ResponseEnvelope::success(
+            RequestId::new(),
+            response.clone(),
+        ))
+        .unwrap();
+        assert_eq!(decode_response(&encoded).unwrap().result.unwrap(), response);
+    }
+
+    #[test]
+    fn child_model_requests_read_the_project_and_change_it_as_owner() {
+        let session_id = AgentSessionId::new();
+        let get = ClientRequest::Project(ProjectRequest::GetProjectChildModels { session_id });
+        assert_eq!(get.required_capability(), Some(Capability::ReadProject));
+        assert_eq!(get.required_session_role(), Some(SessionRole::Observer));
+        assert_eq!(get.access_target(), Some(AccessTarget::Session(session_id)));
+        assert!(!get.is_retryable_mutation());
+
+        let policy = loom_core::ProjectChildModelPolicy {
+            default_model_id: Some("deepseek/deepseek-flash".into()),
+            by_kind: [("vision".to_owned(), "openai/gpt-6-luna".to_owned())]
+                .into_iter()
+                .collect(),
+        };
+        let set = ClientRequest::Project(ProjectRequest::SetProjectChildModels {
+            session_id,
+            policy: policy.clone(),
+        });
+        assert_eq!(
+            set.required_capability(),
+            Some(Capability::ControlAgentSession)
+        );
+        assert_eq!(set.required_session_role(), Some(SessionRole::Owner));
+        assert_eq!(set.access_target(), Some(AccessTarget::Session(session_id)));
+        assert!(set.is_retryable_mutation());
+        for request in [get, set] {
+            assert_eq!(
+                decode_request(&encode_request(&RequestEnvelope::new(request.clone())).unwrap())
+                    .unwrap()
+                    .request,
+                request
+            );
+        }
+        let response = ServerResponse::Project(ProjectResponse::ProjectChildModels {
+            project_id: ProjectId::new(),
+            policy,
         });
         let encoded = encode_response(&ResponseEnvelope::success(
             RequestId::new(),

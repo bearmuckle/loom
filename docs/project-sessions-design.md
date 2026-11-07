@@ -375,7 +375,9 @@ record commit but before notification persistence.
 
 1. **Implemented:** expose a root-only `delegate_project_task` agent tool with
    bounded non-code inputs, optional model selection, and durable retry
-   identity. Child creation remains behind the existing write approval policy.
+   identity. A project root may store child models (a default and one per
+   kind of work); a delegation without an explicit `model_id` resolves its
+   `kind`, then that default, then the manager's own model. Child creation remains behind the existing write approval policy.
    Persist its capability grant with the run so recovery restores the same
    tool surface without retaining backend or caller objects.
 2. **Implemented:** enforce configurable bounded parallelism and project

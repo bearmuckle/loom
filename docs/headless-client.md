@@ -56,7 +56,7 @@ error invalid_request could not read the token file \
 | `get <session-id> [--metadata]` | One session snapshot, or that snapshot with its active run metadata. |
 | `events --session <id> [--after <seq>] [--cursor-file <path>] [--follow] [--timeout <seconds>] [--format text\|jsonl] [--max-bytes <n>]` | Session events, followed until the run completes or the caller interrupts; `--timeout` bounds the follow and exits `4` when it elapses. |
 | `peek --session <id> [--lines <n>] [--format text\|jsonl] [--max-bytes <n>]` | The tail of the session's current output; 200 lines by default. |
-| `run --workspace <id> (--task <text> \| --task-file <path>) [--name <name>] [--model <id>] [--repo <source> [--revision <rev>] [--path <path>]] [--as-directory <path>] [--approval-policy default\|auto] [--request-id <uuid>] [--new] [--project <session-id>]` | Reuse or create the session named `--name`, attach the inputs, and start one run. `--new` always creates a session. `--project` makes it a sub project of that project root. Without `--model` the first credentialed provider's default model is started. |
+| `run --workspace <id> (--task <text> \| --task-file <path>) [--name <name>] [--model <id>] [--repo <source> [--revision <rev>] [--path <path>]] [--as-directory <path>] [--approval-policy default\|auto] [--request-id <uuid>] [--new] [--project <session-id>] [--child-model <id>] [--child-model-for <kind>=<id>]...` | Reuse or create the session named `--name`, attach the inputs, and start one run. `--new` always creates a session. `--project` makes it a sub project of that project root. Without `--model` the first credentialed provider's default model is started. `--child-model` and `--child-model-for` store the models delegated children use before the run starts. |
 | `send --run <id> --text <text>` | Follow-up direction to the active run. |
 | `answer --run <id> --text <text>` | Answer the question the run is waiting on. |
 | `approve --run <id> --tool-call <id>` | Approve the tool call that blocked the run. |
@@ -76,6 +76,8 @@ error invalid_request could not read the token file \
 | `session delete <session-id> [--force] [--yes] [--request-id <uuid>]` | Permanently delete an archived session, or a project root with its descendants. |
 | `project get <session-id>` | One project's members, their depth and parent, and the project it was branched from. |
 | `project tree <session-id>` | The same hierarchy as an indented pre-order tree. |
+| `project models get <session-id>` | The models the project's delegated children run on: the default child model and one model per kind of work. |
+| `project models set <project-root-id> [--child-model <id> \| --no-child-model] [--child-model-for <kind>=<id>]... [--unset-kind <kind>]... [--clear] [--request-id <uuid>]` | Change only the named child model entries of a project, and print the stored policy. |
 | `project tasks <session-id>` | The project's delegated tasks with status, owner, target, model, dependency blocks, and intent. |
 | `project children <session-id>` | The direct child agents with their task, run, pending approval, and pending question. |
 | `project messages <session-id> [--after <seq>] [--limit <n>]` | One page of the project's agent message history; `--limit` is 1 to 512 and 100 by default. |
@@ -95,8 +97,8 @@ and work with a read-only-scoped token. `run` starts a run; `send`,
 `project send`, `answer`, `approve`, `deny`, and `stop` control one; `wait`,
 `status`, `liveness`, and `result` read one. `retention set`, `providers
 set-key`, `session archive`, `session delete` (and its `delete` alias), `project
-archive`, `project delete`, `project worktree integrate`, and `project worktree
-cleanup` are operator-level mutations. No verb waits for a run except `wait`,
+archive`, `project delete`, `project models set`, `project worktree integrate`,
+and `project worktree cleanup` are operator-level mutations. No verb waits for a run except `wait`,
 which is always bounded by `--timeout`.
 
 Every verb negotiates only the capabilities its own requests need. `doctor`
@@ -275,6 +277,13 @@ command returns the same run instead of starting a second one, and the `--json`
 envelope reports `replayed: true` when the answer came from that cache. A
 worker accepts a run only in an idle session, so reusing a session that already
 ran reports `invalid_state` (exit `5`) and creates nothing.
+
+`--child-model <id>` and `--child-model-for <kind>=<id>` (repeatable) store the
+models the run's delegated children use on the session's project before the run
+starts, so the run's first delegation already follows them. They change only
+the entries they name, exactly like `project models set`, and the `--json`
+envelope reports the stored policy under `data.child_models`. A model the worker
+has not configured stops the command before the run starts.
 
 ### `run --new`
 
@@ -488,6 +497,52 @@ an agent-attributed message: the worker refuses
 `Project/SendProjectAgentMessage` for every client connection, because that
 channel is reserved for the server-bound agent tool. A person directs a live
 child instead, with `project send`.
+
+### Child models
+
+`--model` chooses the model of the run you start. The agents that run delegates
+to start their own runs, and a project stores which models those children use:
+one optional default child model and one model per kind of work. A kind is a
+short label of `a-z`, `0-9`, `_`, or `-` (at most 32 characters, 16 kinds per
+project) such as `cheap`, `coding`, `review`, `vision`, or `long-reasoning`.
+Kinds are free-form because what counts as a kind of work differs per project
+and per provider line-up; the delegation tools list the kinds a project
+defines, with their models, so an agent does not have to guess them.
+
+A delegating agent passes an optional `kind` and an optional `model_id`. The
+child's model is, in order: the `model_id` the agent named, the model the
+project maps the `kind` to, the project's default child model, and last the
+delegating agent's own model. `current`, like an omitted `model_id`, leaves the
+choice to the project, so a policy is not bypassed by an agent that habitually
+passes the alias; an agent that wants its own model despite the policy names
+it. An unknown kind falls through to the default. The delegation result reports
+`model_id`, `model_source` (`explicit`, `kind`, `project_default`, or
+`parent`), and the normalized `kind`.
+
+`project models get <session-id>` sends `Project/GetProjectChildModels`, which
+any member session addresses, and negotiates `read_project`. `project models set
+<project-root-id>` reads the stored policy, applies only the entries its flags
+name (`--clear` starts from an empty policy), and sends
+`Project/SetProjectChildModels`, negotiating `control_agent_session`; the id
+must name the project root, and the change needs the owner role. The worker
+trims the model ids, lower-cases the kinds, and refuses a model it has not
+configured (`loom-cli models list` shows them) before it changes anything.
+`--request-id` keys the replacement. The text output is the project line then
+the policy, which `project get` and `status --tree` also print after their own
+lines:
+
+```
+project <project-id>
+child-model default <model-id|->
+child-model kind <kind> <model-id>
+```
+
+Under `--json` both verbs carry `{"project_id", "child_models":
+{"default_model_id", "by_kind"}}`; `project get` adds `child_models` to the
+snapshot and `status --tree` adds it to `data.project`, `null` when the worker
+does not report it. The policy is stored on the project root and removed with
+it; a change applies to the next delegation, also of a run that is already
+going.
 
 ### `project send`
 
@@ -871,6 +926,14 @@ loom-cli run --workspace <workspace-id> --task 'tidy the fixtures'
 # Choose the model explicitly instead, and ask for the JSON envelope.
 loom-cli run --workspace <workspace-id> --task 'tidy the fixtures' \
   --model 'loom:model:v1:["deepseek","deepseek-flash"]' --json
+
+# Run the manager on one model, its children on a cheap default, and screenshots
+# on a vision model; then inspect and change the project's child models.
+loom-cli run --workspace <workspace-id> --task 'triage the bug reports' \
+  --model deepseek-flash --child-model deepseek-flash \
+  --child-model-for vision=<vision-model-id>
+loom-cli project models get <project-root-id>
+loom-cli project models set <project-root-id> --child-model-for review=<model-id> --json
 
 # Retrigger CI without colliding with the completed session of the same name.
 loom-cli run --workspace <workspace-id> --task-file task.md --new \
