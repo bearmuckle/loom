@@ -38,6 +38,7 @@ pub fn shared_http_client() -> Result<reqwest::Client> {
     CLIENT
         .get_or_init(|| {
             reqwest::Client::builder()
+                .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
                 .build()
                 .map_err(|error| error.to_string())
         })
@@ -84,12 +85,12 @@ pub async fn request_json(
     let response = request
         .send()
         .await
-        .map_err(|error| normalize_transport_error("provider", &error.to_string()))?;
+        .map_err(|error| transport_error("provider", &error))?;
     let status = response.status().as_u16();
     let text = response
         .text()
         .await
-        .map_err(|error| normalize_transport_error("provider", &error.to_string()))?;
+        .map_err(|error| transport_error("provider", &error))?;
     let value = if text.trim().is_empty() {
         serde_json::Value::Null
     } else {

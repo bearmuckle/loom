@@ -77,7 +77,12 @@ const GITHUB_COPILOT_EDITOR_VERSION: &str = "vscode/1.96.2";
 const GITHUB_COPILOT_PLUGIN_VERSION: &str = "copilot-chat/0.26.7";
 const GITHUB_COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.26.7";
 const GITHUB_API_VERSION: &str = "2025-04-01";
+/// Total deadline for a short, buffered provider request (health checks, token
+/// exchanges, model discovery). Never applied to a streamed completion: a long
+/// reply can legitimately stream for many minutes.
 const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long opening a TCP/TLS connection to a provider may take.
+const PROVIDER_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn internal_lock_error(resource: &str) -> LoomError {
     LoomError::new(
@@ -760,6 +765,132 @@ mod tests {
             .write_all(response.as_bytes())
             .map_err(|error| error.to_string())?;
         stream.flush().map_err(|error| error.to_string())
+    }
+
+    /// Serves one streamed completion whose body is written as `(delay, bytes)`
+    /// pieces, so a test controls how long the stream lasts and where it stalls.
+    fn serve_slow_stream(
+        pieces: Vec<(Duration, &'static str)>,
+    ) -> (String, thread::JoinHandle<std::result::Result<(), String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            read_request_headers(&mut stream)?;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .map_err(|error| error.to_string())?;
+            for (delay, bytes) in pieces {
+                thread::sleep(delay);
+                // The client may have given up on a stalled stream already.
+                if stream.write_all(bytes.as_bytes()).is_err() || stream.flush().is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        });
+        (format!("http://{address}/v1/chat/completions"), server)
+    }
+
+    fn fixture_request() -> ModelRequest {
+        ModelRequest {
+            model: ModelId::new("fixture/model"),
+            messages: vec![ModelMessage::new(MessageRole::User, "write a long answer")],
+            tools: Vec::new(),
+            options: Default::default(),
+        }
+    }
+
+    /// Regression: a streamed reply used to carry a 120 s *total* request
+    /// timeout, so every DeepSeek reply that streamed for longer than two
+    /// minutes died with a bare "transport failed". The deadlines here are
+    /// scaled down: the stream lasts several times the idle timeout and must
+    /// still complete, because bytes (events and `: keep-alive` comments)
+    /// keep arriving.
+    #[test]
+    fn openai_compatible_stream_may_outlast_its_deadlines_while_data_keeps_arriving() {
+        let tick = Duration::from_millis(150);
+        let mut pieces = Vec::new();
+        for _ in 0..12 {
+            pieces.push((tick, ": keep-alive\n\n"));
+            pieces.push((
+                tick,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n",
+            ));
+        }
+        pieces.push((
+            tick,
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        ));
+        let (endpoint, server) = serve_slow_stream(pieces);
+        let mut provider =
+            OpenAiCompatibleProvider::new(endpoint, "", ModelId::new("fixture/model"))
+                .with_stream_timeouts(StreamTimeouts {
+                    response: Duration::from_millis(600),
+                    idle: Duration::from_millis(600),
+                });
+        let started = Instant::now();
+        let events = collect(&mut provider, &fixture_request());
+        let elapsed = started.elapsed();
+        server
+            .join()
+            .expect("fixture server thread panicked")
+            .expect("fixture server failed");
+        assert!(
+            elapsed > Duration::from_millis(1_800),
+            "the fixture stream should outlast the deadlines, took {elapsed:?}"
+        );
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                ModelStreamEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "x".repeat(12));
+    }
+
+    /// A stream that goes silent is abandoned after the idle timeout with an
+    /// error that says why, instead of hanging or saying only "transport
+    /// failed".
+    #[test]
+    fn openai_compatible_stream_reports_a_stalled_stream_with_its_cause() {
+        let (endpoint, server) = serve_slow_stream(vec![
+            (
+                Duration::ZERO,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            ),
+            (Duration::from_secs(2), "data: [DONE]\n\n"),
+        ]);
+        let mut provider =
+            OpenAiCompatibleProvider::new(endpoint, "", ModelId::new("fixture/model"))
+                .with_stream_timeouts(StreamTimeouts {
+                    response: Duration::from_secs(2),
+                    idle: Duration::from_millis(300),
+                });
+        let mut sink = CollectingSink::default();
+        let started = Instant::now();
+        let error = provider
+            .stream(&fixture_request(), &CancellationToken::new(), &mut sink)
+            .expect_err("a stalled stream must fail");
+        assert!(started.elapsed() < Duration::from_millis(1_500));
+        assert_eq!(error.code, ErrorCode::ProviderUnavailable);
+        assert!(error.retryable);
+        assert!(
+            error.message.contains("no data for 0.3s"),
+            "unexpected message: {}",
+            error.message
+        );
+        assert!(matches!(
+            sink.events.first(),
+            Some(ModelStreamEvent::TextDelta { text }) if text == "partial"
+        ));
+        server
+            .join()
+            .expect("fixture server thread panicked")
+            .expect("fixture server failed");
     }
 
     #[test]
