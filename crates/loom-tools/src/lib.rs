@@ -2,7 +2,7 @@ use std::{
     collections::BTreeSet,
     fs,
     io::Read,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
     thread,
@@ -499,6 +499,9 @@ impl WebSearchProvider for HtmlSearchProvider {
 #[derive(Clone)]
 pub struct ToolExecutor {
     root: PathBuf,
+    /// Session-relative directory relative tool paths and the default command
+    /// working directory resolve in.
+    working_directory: Option<String>,
     max_output_bytes: usize,
     workspace: Workspace,
     web_search_provider: Option<Arc<dyn WebSearchProvider>>,
@@ -521,8 +524,10 @@ impl ToolExecutor {
 
     pub fn new_with_workspace(workspace: Workspace) -> Self {
         let root = workspace.root().to_owned();
+        let working_directory = attached_working_directory(&workspace);
         Self {
             root,
+            working_directory,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             workspace,
             web_search_provider: None,
@@ -690,6 +695,64 @@ impl ToolExecutor {
         &self.root
     }
 
+    /// The session-relative directory the tools work in, when the session has
+    /// exactly one attached local directory.
+    ///
+    /// Relative paths and the default command working directory resolve in
+    /// it, so a session that was started for one folder writes there instead
+    /// of at Loom's private session root.
+    pub fn working_directory(&self) -> Option<&str> {
+        self.working_directory.as_deref()
+    }
+
+    /// The session-relative path a tool path names.
+    ///
+    /// A relative path is resolved inside the working directory, unless it
+    /// already names a path inside it. An absolute path, and a path that tries
+    /// to leave the root, is returned untouched so the resolver reports its
+    /// own error instead of the path silently moving under the working
+    /// directory.
+    ///
+    /// Scoping is idempotent, so a caller can keep the scoped path for its own
+    /// bookkeeping and hand it to [`Self::resolve_relative`], which scopes it
+    /// again.
+    fn scoped_path(&self, relative: &str) -> String {
+        let Some(working_directory) = self.working_directory.as_deref() else {
+            return relative.to_owned();
+        };
+        let path = Path::new(relative);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+        {
+            return relative.to_owned();
+        }
+        let mut cleaned = PathBuf::new();
+        for component in path.components() {
+            if let Component::Normal(component) = component {
+                cleaned.push(component);
+            }
+        }
+        if cleaned.as_os_str().is_empty() {
+            return working_directory.to_owned();
+        }
+        if cleaned.starts_with(working_directory) {
+            return cleaned.to_string_lossy().replace('\\', "/");
+        }
+        Path::new(working_directory)
+            .join(&cleaned)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    /// The directory a tool works in when its caller names none: the attached
+    /// working directory, or otherwise the session filesystem root.
+    fn default_directory(&self) -> PathBuf {
+        self.resolve_relative(".")
+            .unwrap_or_else(|_| self.root.clone())
+    }
+
     pub fn execute(&self, call: &ToolCall) -> ToolResult {
         self.execute_with_cancel(call, &CancellationToken::new())
     }
@@ -756,7 +819,8 @@ impl ToolExecutor {
             Ok(arguments) => arguments,
             Err(error) => return ToolResult::failure(call, error),
         };
-        let relative = arguments.path.as_deref().unwrap_or(".");
+        let relative = self.scoped_path(arguments.path.as_deref().unwrap_or("."));
+        let relative = relative.as_str();
         let path = match self.resolve_relative(relative) {
             Ok(path) => path,
             Err(error) => return ToolResult::failure(call, error),
@@ -866,7 +930,8 @@ impl ToolExecutor {
         if arguments.query.is_empty() {
             return ToolResult::failure(call, "search query must not be empty");
         }
-        let relative = arguments.path.as_deref().unwrap_or(".");
+        let relative = self.scoped_path(arguments.path.as_deref().unwrap_or("."));
+        let relative = relative.as_str();
         let path = match self.resolve_relative(relative) {
             Ok(path) => path,
             Err(error) => return ToolResult::failure(call, error),
@@ -913,7 +978,8 @@ impl ToolExecutor {
         if arguments.pattern.trim().is_empty() {
             return ToolResult::failure(call, "glob pattern must not be empty");
         }
-        let relative = arguments.path.as_deref().unwrap_or(".");
+        let relative = self.scoped_path(arguments.path.as_deref().unwrap_or("."));
+        let relative = relative.as_str();
         let path = match self.resolve_relative(relative) {
             Ok(path) => path,
             Err(error) => return ToolResult::failure(call, error),
@@ -1035,7 +1101,7 @@ impl ToolExecutor {
             Ok(edits) => edits,
             Err(error) => return ToolResult::failure(call, error),
         };
-        let path = arguments.path.clone();
+        let path = self.scoped_path(&arguments.path);
         let mut diffs = Vec::with_capacity(edits.len());
         for (old_text, new_text) in edits {
             match self.apply_single_edit(&path, old_text, new_text) {
@@ -1104,11 +1170,10 @@ impl ToolExecutor {
                 ),
             );
         }
-        let cwd = match arguments
-            .cwd
-            .as_deref()
-            .map_or_else(|| Ok(self.root.clone()), |cwd| self.resolve_relative(cwd))
-        {
+        let cwd = match arguments.cwd.as_deref().map_or_else(
+            || Ok(self.default_directory()),
+            |cwd| self.resolve_relative(cwd),
+        ) {
             Ok(cwd) => cwd,
             Err(error) => return ToolResult::failure(call, error),
         };
@@ -1428,7 +1493,7 @@ impl ToolExecutor {
                 // behind its base is stale before review starts, so the result
                 // states the base drift the same way a push does. The refresh is
                 // advisory: it can only change this note.
-                let freshness = match GitService::open(&self.root) {
+                let freshness = match GitService::open(self.default_directory()) {
                     Ok(service) => Some(checkout_base_freshness_note(
                         &service,
                         self.github_token.as_deref(),
@@ -2156,7 +2221,7 @@ impl ToolExecutor {
         }
         let cwd = match path {
             Some(path) => self.resolve_relative(path)?,
-            None => self.root.clone(),
+            None => self.default_directory(),
         };
         let service = GitService::open(&cwd).map_err(|error| error.message)?;
         let origin = match service
@@ -2289,7 +2354,14 @@ impl ToolExecutor {
         })
     }
 
+    /// Resolves a tool path to an absolute path inside the session.
+    ///
+    /// A relative path is scoped to the working directory first, so every tool
+    /// that resolves a path this way works in the attached directory without
+    /// repeating the scope itself.
     fn resolve_relative(&self, relative: &str) -> std::result::Result<PathBuf, String> {
+        let relative = self.scoped_path(relative);
+        let relative = relative.as_str();
         let path = Path::new(relative);
         if path.is_absolute() {
             let resolved = fs::canonicalize(path)
@@ -3991,6 +4063,66 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
+/// The session-relative directory the tools work in: the session's only
+/// attached local directory, when it has exactly one.
+///
+/// `loom-cli run --as-directory <folder>` attaches the folder the user named as
+/// the session's input and nothing else, so that folder is what the task is
+/// about. The tools would otherwise resolve relative paths at the session
+/// filesystem root, which is Loom's own state folder, and the user's folder
+/// would stay empty. With more than one attached directory there is no single
+/// input to choose, so the tools stay rooted at that root and the run is told
+/// to name the directory it means.
+fn attached_working_directory(workspace: &Workspace) -> Option<String> {
+    let mounts = workspace.mounted_directories().ok()?;
+    match mounts.as_slice() {
+        [(path, _)] => Some(path.clone()),
+        _ => None,
+    }
+}
+
+/// Describes where this session's tools work, and the directories attached to
+/// it, as text for a run's repository instructions.
+///
+/// A root listing does not show an attached directory (the session filesystem
+/// records the mount as a symlink, and a listing skips symlinks), so the run
+/// has to be told where it works; otherwise an agent that writes `hello.py`
+/// cannot tell that the file landed in Loom's private session storage instead
+/// of the folder the user named.
+///
+/// Returns an empty string when the session has no attached directory.
+pub fn session_directory_instructions(workspace: &Workspace) -> String {
+    let Ok(mounts) = workspace.mounted_directories() else {
+        return String::new();
+    };
+    let mut text = String::new();
+    match mounts.as_slice() {
+        [] => return text,
+        [(path, source)] => text.push_str(&format!(
+            "## Working directory\n\
+             Your working directory is `{path}/`, the user's own directory at {}. \
+             Relative paths and commands resolve inside it, so files you create or \
+             edit there land on the user's disk and commands run with it as their \
+             working directory. Tool results still name paths from the session \
+             root, so a file there is reported as `{path}/<name>`.\n",
+            source.display()
+        )),
+        _ => {
+            text.push_str(
+                "## Session directories\n\
+                 Relative paths and commands resolve at the session root, which is \
+                 Loom's private storage and not one of these directories. Name the \
+                 directory you mean in the path when you create, edit, or run \
+                 something in it:\n",
+            );
+            for (path, source) in &mounts {
+                text.push_str(&format!("- `{path}/` -> {}\n", source.display()));
+            }
+        }
+    }
+    text
+}
+
 /// A short, server-owned preamble that tells the model how to use the built-in
 /// tools that are actually advertised for this session. Deriving it from the
 /// live definitions keeps the guidance consistent with the request, including
@@ -4433,6 +4565,149 @@ mod tests {
         assert_eq!(read.output, "attached content");
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(source).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_single_attached_directory_is_the_working_directory() {
+        let root = workspace();
+        let source = std::env::temp_dir().join(format!("loom-tools-dir-{}", AgentSessionId::new()));
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("notes.txt"), "user notes\n").unwrap();
+        let workspace = Workspace::open(AgentSessionId::new(), &root).unwrap();
+        workspace.mount_directory("demo", &source).unwrap();
+        let executor = ToolExecutor::new_with_workspace(workspace);
+        assert_eq!(executor.working_directory(), Some("demo"));
+
+        // What the agent writes for the user lands in the user's folder, not in
+        // Loom's own session storage at the root.
+        let written = executor.execute(&call(
+            "apply_patch",
+            serde_json::json!({"path": "hello.py", "old_text": "", "new_text": "print(1)\n"}),
+        ));
+        assert!(written.success, "{}", written.output);
+        assert!(
+            written.output.contains("updated demo/hello.py"),
+            "{}",
+            written.output
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("hello.py")).unwrap(),
+            "print(1)\n"
+        );
+        assert!(!root.join("hello.py").exists());
+
+        // Reading, listing, and searching resolve there too.
+        let read = executor.execute(&call("read_file", serde_json::json!({"path": "notes.txt"})));
+        assert_eq!(read.output, "user notes\n");
+        let listed = executor.execute(&call("list_files", serde_json::json!({})));
+        assert!(
+            listed.output.contains("demo/notes.txt"),
+            "{}",
+            listed.output
+        );
+        let found = executor.execute(&call("search_text", serde_json::json!({"query": "user"})));
+        assert!(
+            found.output.contains("demo/notes.txt:1"),
+            "{}",
+            found.output
+        );
+
+        // A command runs in the folder, so its own writes land there.
+        let command = executor.execute(&call(
+            "run_command",
+            serde_json::json!({"command": "sh", "args": ["-c", "printf made > made.txt"]}),
+        ));
+        assert!(command.success, "{}", command.output);
+        assert_eq!(fs::read_to_string(source.join("made.txt")).unwrap(), "made");
+        assert!(!root.join("made.txt").exists());
+
+        // Naming the mount explicitly is the same place, not a nested copy.
+        let explicit = executor.execute(&call(
+            "read_file",
+            serde_json::json!({"path": "demo/hello.py"}),
+        ));
+        assert_eq!(explicit.output, "print(1)\n");
+
+        // A path that leaves the root is still refused instead of being moved
+        // under the working directory.
+        let escape = executor.execute(&call(
+            "read_file",
+            serde_json::json!({"path": "../escape.txt"}),
+        ));
+        assert!(!escape.success, "{}", escape.output);
+        assert!(
+            escape.output.contains("inside the workspace root"),
+            "{}",
+            escape.output
+        );
+
+        // The run is told where its tools work.
+        let instructions = session_directory_instructions(executor.workspace());
+        assert!(
+            instructions.starts_with("## Working directory\n"),
+            "{instructions}"
+        );
+        assert!(instructions.contains("`demo/`"), "{instructions}");
+        assert!(
+            instructions.contains(&source.display().to_string()),
+            "{instructions}"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(source).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn several_attached_directories_keep_the_workspace_root() {
+        let root = workspace();
+        let first = root.with_extension("first-mount");
+        let second = root.with_extension("second-mount");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let workspace = Workspace::open(AgentSessionId::new(), &root).unwrap();
+        workspace.mount_directory("one", &first).unwrap();
+        workspace.mount_directory("two", &second).unwrap();
+        let executor = ToolExecutor::new_with_workspace(workspace);
+
+        // There is no single input to choose, so the tools stay at the root and
+        // the run is told to name the directory it means.
+        assert_eq!(executor.working_directory(), None);
+        let written = executor.execute(&call(
+            "apply_patch",
+            serde_json::json!({"path": "top.txt", "old_text": "", "new_text": "root\n"}),
+        ));
+        assert!(written.success, "{}", written.output);
+        assert!(root.join("top.txt").is_file());
+        assert!(!first.join("top.txt").exists());
+        assert!(!second.join("top.txt").exists());
+        let instructions = session_directory_instructions(executor.workspace());
+        assert!(
+            instructions.starts_with("## Session directories\n"),
+            "{instructions}"
+        );
+        assert!(
+            instructions.contains("Name the directory you mean"),
+            "{instructions}"
+        );
+        assert!(instructions.contains("- `one/` -> "), "{instructions}");
+        assert!(instructions.contains("- `two/` -> "), "{instructions}");
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(first).unwrap();
+        fs::remove_dir_all(second).unwrap();
+    }
+
+    #[test]
+    fn a_session_without_an_attached_directory_has_no_working_directory() {
+        let root = workspace();
+        let workspace = Workspace::open(AgentSessionId::new(), &root).unwrap();
+        assert_eq!(attached_working_directory(&workspace), None);
+        assert_eq!(session_directory_instructions(&workspace), "");
+        let executor = ToolExecutor::new_with_workspace(workspace);
+        assert_eq!(executor.working_directory(), None);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

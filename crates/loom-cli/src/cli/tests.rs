@@ -11377,3 +11377,59 @@ fn every_nested_command_and_group_has_its_own_help() {
         .to_vec();
     assert!(args::help_text(&nested).starts_with("Usage: loom-cli project models get"));
 }
+
+/// `run --as-directory` on a new root session sends the folder itself as the
+/// input, mounted under its final path component.
+///
+/// This is the request half of the `run --as-directory` fix: the tools only
+/// work inside the folder when the worker has the folder attached as the
+/// session's single input. A CLI that stopped sending the attach, or that sent a
+/// different path, would leave the agent's files in Loom's private session
+/// storage again while this test stayed green in every other respect.
+#[test]
+fn run_as_directory_mounts_the_folder_in_a_new_root_session() {
+    let (fixture, directory) = persistent_fixture("run-as-directory-root");
+    let workspace = fixture.workspace.id.to_string();
+    let folder = temporary_path("child-model-test");
+    std::fs::create_dir_all(&folder).unwrap();
+    let folder_text = folder.to_string_lossy().into_owned();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let outcome = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--task",
+            "write hello.py",
+            "--as-directory",
+            &folder_text,
+            "--model",
+            "deterministic/demo",
+            "--json",
+        ],
+    );
+    assert_eq!(outcome.code, exit::OK, "{}", outcome.stderr);
+    let session: AgentSessionId = json_envelope(&outcome)["data"]["session"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mounts = session_directories(&fixture.control, session);
+    assert_eq!(mounts.len(), 1, "{mounts:?}");
+    let expected = folder.file_name().unwrap().to_string_lossy().into_owned();
+    assert_eq!(mounts[0].path, expected);
+    assert_eq!(
+        std::fs::canonicalize(&mounts[0].source).unwrap(),
+        std::fs::canonicalize(&folder).unwrap()
+    );
+    assert_eq!(
+        started_run_ids(&fixture.control, session).len(),
+        1,
+        "the same command starts the run in the session it attached the folder to"
+    );
+
+    close_persistent_fixture(fixture, directory);
+    std::fs::remove_dir_all(&folder).ok();
+}

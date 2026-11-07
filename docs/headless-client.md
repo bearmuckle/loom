@@ -254,6 +254,15 @@ derived from the task) and otherwise creates it. It attaches `--repo` or
 `--as-directory` only when it created the session, so a replay neither
 duplicates an attachment nor fails on one that already exists.
 
+`--as-directory <path>` attaches the folder in place as the session's input and
+makes it the agent's working directory: relative tool paths and the working
+directory of commands the run starts resolve inside it, so the files the
+session writes for that input land in the folder itself rather than in the
+worker's private session storage. The folder is also reachable at `--path`
+(its final path component by default) inside the session filesystem. A session
+that already has the folder attached keeps it as it is, because the input is
+only attached when `run` created the session.
+
 Without `--model`, `run` reads the provider catalog with the same
 `Provider/ListProviders` request `providers list` and `models list` send, and
 starts the first provider, in the order the worker returned it, that has a
