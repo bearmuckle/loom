@@ -1165,7 +1165,7 @@ pub(super) fn file_status_name(kind: GitFileStatusKind) -> &'static str {
 }
 
 /// The metadata projection of one session.
-async fn session_projection<C: Client>(
+pub(super) async fn session_projection<C: Client>(
     caller: &mut Caller<'_, C>,
     session_id: AgentSessionId,
 ) -> Result<(RequestId, AgentSessionSnapshotProjection), Failure> {

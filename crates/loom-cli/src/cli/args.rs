@@ -39,6 +39,12 @@ pub(crate) const DEFAULT_WAIT_TIMEOUT_SECS: u64 = 60;
 pub(crate) const DEFAULT_MESSAGE_LIMIT: u32 = 100;
 /// The largest page `project messages --limit` accepts.
 pub(crate) const MAX_MESSAGE_LIMIT: u32 = 512;
+/// The confidence `jev triage --apply` requires by default before it approves.
+pub(crate) const DEFAULT_JEV_THRESHOLD: f64 = 0.9;
+/// The largest state `jev ask` sends, which is the endpoint's documented ceiling.
+pub(crate) const MAX_JEV_STATE_BYTES: usize = 128 * 1024;
+/// The most choice labels one Jev question may offer.
+pub(crate) const MAX_JEV_OPTIONS: usize = 255;
 
 pub(crate) const HELP: &str = r#"Usage: loom-cli <verb> [flags]
 
@@ -124,6 +130,24 @@ Verbs:
             (--from-env <NAME> | --key-file <path>)
                                     store an API key for openai, deepseek, or
                                     an openai-compatible provider
+  jev status [--source opencode|typesafe] [--key-file <path>]
+             [--endpoint <url>] [--model <id>]
+                                    report whether a Jev key is configured,
+                                    where it is read, and which endpoint and
+                                    model a call would use; never prints it
+  jev ask (--state <text> | --state-file <path>) --question <text>
+          (--option <label>[=<when it applies>])... [--source ...]
+          [--key-file <path>] [--endpoint <url>] [--model <id>]
+                                    ask the decision model one choice
+                                    question and print the choice, the
+                                    confidence, and the probabilities
+  jev triage --session <id> [--apply] [--threshold <0..1>]
+             [--request-id <uuid>] [--source ...] [--key-file <path>]
+             [--endpoint <url>] [--model <id>]
+                                    suggest approve or ask-user for the
+                                    approval a session waits on; --apply
+                                    approves only a read inside the session
+                                    root at or above the threshold
   session archive <session-id> [--yes] [--request-id <uuid>]
                                     archive one session, keeping its
                                     transcript, checkpoints, and every
@@ -305,6 +329,28 @@ their pre-reads: a repeated id is answered from the worker's durable cache
 instead of directing or controlling twice, and the `--json` envelope then
 reports `replayed: true`. The project snapshot read, the session metadata read,
 and the run revision read always keep fresh ids.
+
+`jev` is the supervision helper of this client alone: it calls a decision model
+directly, not through the worker, and no core crate knows it exists.
+`jev status` and `jev ask` are local, so they need neither a worker nor a
+`--token-file`; `jev triage` reads one session's pending approval from the
+worker and always prints a suggestion. The key is read from `--key-file`, else
+`~/.config/loom/typesafe.key` or `~/.config/loom/opencode.key` by source, and is
+never printed, stored in a parsed command, or included in an error. `--source`
+selects the endpoint and model (`typesafe` is `jev-latest` at
+https://api.typesafe.ai/v1/systemone, `opencode` is `jev-1.13-free` at
+https://opencode.ai/inference/systemone/v1/systemone); without it the first
+source whose default key file exists wins, typesafe first. `--endpoint` and
+`--model` override them. Every call sends `User-Agent: loom-cli/<version>`.
+
+`jev triage --session <id>` suggests a verdict, and `--apply` is the only way it
+acts: it approves the pending tool call only when the suggested verdict is
+`approve`, its confidence is at or above `--threshold` (0.9 by default), the
+call is one of the read tools (`read_file`, `list_files`, `search_text`,
+`glob`), and every path argument resolves inside the session root the worker
+reports. Anything else is reported as a skip and nothing is approved. A
+suggestion is always advisory: it is this client's reading of one model answer
+and never a substitute for `approve`.
 
 Global flags, accepted anywhere as --flag value or --flag=value:
   --connect <url>             worker WebSocket URL (fallback LOOM_URL, then
@@ -556,6 +602,42 @@ pub(crate) struct RetentionSetArgs {
     pub sub_agent_ms: Option<Option<u64>>,
 }
 
+/// Where the `jev` verbs find their key and which endpoint and model they call.
+///
+/// The secret is never stored here: the verb reads the file when it runs, so a
+/// debug print of a parsed command cannot contain a key. `None` fields were not
+/// named on the command line and are resolved by the verb, which is what lets
+/// `jev status` report the path it would read without any flag at all.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct JevFlags {
+    pub source: Option<String>,
+    pub key_file: Option<PathBuf>,
+    pub endpoint: Option<String>,
+    pub model: Option<String>,
+}
+
+/// The flags of `jev ask`: one choice question over a bounded state.
+#[derive(Clone, Debug)]
+pub(crate) struct JevAskArgs {
+    pub state: String,
+    pub question: String,
+    /// The choice labels, each with the condition under which it applies.
+    pub options: Vec<(String, String)>,
+    pub flags: JevFlags,
+}
+
+/// The flags of `jev triage`: the approval one session waits on.
+#[derive(Clone, Debug)]
+pub(crate) struct JevTriageArgs {
+    pub session: AgentSessionId,
+    pub flags: JevFlags,
+    /// `--apply`: approve the call when the verdict clears every guard.
+    pub apply: bool,
+    pub threshold: f64,
+    /// The approval's idempotency key, or `None` when the caller left it open.
+    pub request_id: Option<RequestId>,
+}
+
 /// The action a `project child` sub-verb sends.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProjectChildAction {
@@ -666,6 +748,12 @@ pub(crate) enum Verb {
     ProvidersDiscover {
         provider: String,
     },
+    /// `jev status`: the key, endpoint, and model a Jev call would use.
+    JevStatus(JevFlags),
+    /// `jev ask`: one raw choice question to the decision model.
+    JevAsk(Box<JevAskArgs>),
+    /// `jev triage`: a suggested verdict for the approval a session waits on.
+    JevTriage(Box<JevTriageArgs>),
     /// `models list`: the models of the configured providers, optionally of one
     /// exact provider.
     ModelsList {
@@ -865,6 +953,9 @@ pub(crate) fn verb_name(verb: &Verb) -> &'static str {
         Verb::ProvidersAdd(_) => "providers add",
         Verb::ProvidersRemove { .. } => "providers remove",
         Verb::ProvidersDiscover { .. } => "providers discover",
+        Verb::JevStatus(_) => "jev status",
+        Verb::JevAsk(_) => "jev ask",
+        Verb::JevTriage(_) => "jev triage",
         Verb::ModelsList { .. } => "models list",
         Verb::SessionArchive { .. } => "session archive",
         Verb::SessionDelete { .. } => "session delete",
@@ -891,6 +982,15 @@ pub(crate) fn verb_name(verb: &Verb) -> &'static str {
             ProjectChildAction::Cancel => "project child cancel",
         },
     }
+}
+
+/// Whether a verb answers without a worker connection.
+///
+/// `jev status` and `jev ask` read the local key file and call the decision
+/// model, so they run on a machine that has no worker and no token. `jev
+/// triage` reads one session from the worker and is therefore not local.
+pub(crate) fn is_local(verb: &Verb) -> bool {
+    matches!(verb, Verb::JevStatus(_) | Verb::JevAsk(_))
 }
 
 /// Whether `--json` appears anywhere in the arguments, so a usage error can be
@@ -925,6 +1025,7 @@ pub(crate) fn named_verb(arguments: &[String]) -> &'static str {
             "result" => "result",
             "retention" => "retention",
             "providers" => "providers",
+            "jev" => "jev",
             "models" => "models",
             "delete" => "delete",
             "session" => "session",
@@ -2026,6 +2127,117 @@ Examples:
   loom-cli project worktree cleanup <project-root-id> --task <task-id> --discard --yes --json
 "#,
     ),
+    (
+        "jev",
+        r#"Usage: loom-cli jev status|ask|triage [flags]
+
+Call the Jev decision model for a supervision judgement this client makes
+itself: whether a Jev key is configured, one raw choice question, or a
+suggested verdict for the approval a session waits on. No core crate is
+involved and the worker is never asked about Jev.
+
+Sub-verbs:
+  status                      the key, endpoint, and model a call would use
+  ask                         one choice question, with its probabilities
+  triage --session <id>       a verdict for the pending approval of a session
+
+Flags:
+  --source <opencode|typesafe>  the endpoint and model, and the default key
+  --key-file <path>             the key file (default ~/.config/loom/<source>.key)
+  --endpoint <url>              override the endpoint
+  --model <id>                  override the model
+  --json                        print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli jev --help
+  loom-cli jev status --json
+"#,
+    ),
+    (
+        "jev status",
+        r#"Usage: loom-cli jev status [--source <opencode|typesafe>] [--key-file <path>]
+                            [--endpoint <url>] [--model <id>] [--json]
+
+Report whether a Jev key is configured, the path it is read from, and the
+endpoint and model a call would use. The key itself is never printed, and this
+verb needs neither a worker nor a token.
+
+Flags:
+  --source <opencode|typesafe>  the endpoint and model, and the default key
+  --key-file <path>             the key file (default ~/.config/loom/<source>.key)
+  --endpoint <url>              override the endpoint
+  --model <id>                  override the model
+  --json                        print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli jev status
+  loom-cli jev status --source opencode --json
+"#,
+    ),
+    (
+        "jev ask",
+        r#"Usage: loom-cli jev ask (--state <text> | --state-file <path>)
+                 --question <text>
+                 (--option <label>[=<when it applies>])...
+                 [--source <opencode|typesafe>] [--key-file <path>]
+                 [--endpoint <url>] [--model <id>] [--json]
+
+Ask the decision model one choice question over a bounded state, and print the
+chosen label, its confidence, and the full probability distribution. At least
+two --option labels are required; the text after `=` says when that option
+applies, which is how the service is asked to interpret each label.
+
+Flags:
+  --state <text>                the situation, as compactly as possible
+  --state-file <path>           the same state, read from a file
+  --question <text>             the instruction for the choice
+  --option <label>[=<when>]     one label; repeat for each option
+  --source <opencode|typesafe>  the endpoint and model, and the default key
+  --key-file <path>             the key file (default ~/.config/loom/<source>.key)
+  --endpoint <url>              override the endpoint
+  --model <id>                  override the model
+  --json                        print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli jev ask --state 'The build passes.' --question 'Is the change safe?' \
+    --option approve='safe to merge' --option ask_user='a person must look'
+  loom-cli jev ask --state-file /tmp/state.txt --question 'Which crate?' \
+    --option cli --option server --json
+"#,
+    ),
+    (
+        "jev triage",
+        r#"Usage: loom-cli jev triage --session <session-id> [--apply]
+                           [--threshold <0..1>] [--request-id <uuid>]
+                           [--source <opencode|typesafe>] [--key-file <path>]
+                           [--endpoint <url>] [--model <id>] [--json]
+
+Read the approval a session waits on, ask the decision model for a verdict, and
+print it with its confidence. It never approves anything by itself: --apply
+approves the pending call only when the verdict is approve, its confidence is
+at or above --threshold (0.9 by default), the call is a read tool, and every
+path argument resolves inside the session root.
+
+Flags:
+  --session <session-id>        the session whose approval is triaged
+  --apply                       approve the call when every guard passes
+  --threshold <0..1>            the confidence --apply requires (default 0.9)
+  --request-id <uuid>           the idempotency key of the approval
+  --source <opencode|typesafe>  the endpoint and model, and the default key
+  --key-file <path>             the key file (default ~/.config/loom/<source>.key)
+  --endpoint <url>              override the endpoint
+  --model <id>                  override the model
+  --json                        print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli jev triage --session <session-id>
+  loom-cli jev triage --session <session-id> --apply --threshold 0.95 --json
+"#,
+    ),
 ];
 
 /// The help text a command line asking for help prints: the named verb's page
@@ -2085,6 +2297,9 @@ fn arity(name: &str) -> Option<bool> {
         "--keep" | "--remove" | "--discard" => false,
         "--child-model" | "--child-model-for" | "--unset-kind" => true,
         "--no-child-model" | "--clear" => false,
+        "--source" | "--endpoint" | "--state" | "--state-file" | "--question" | "--option"
+        | "--threshold" => true,
+        "--apply" => false,
         _ => return None,
     })
 }
@@ -2417,6 +2632,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
         "retention" => parse_retention(&mut flags, rest)?,
         "providers" => parse_providers(&mut flags, rest)?,
         "models" => parse_models(&mut flags, rest)?,
+        "jev" => parse_jev(&mut flags, rest)?,
         "session" => parse_session(&mut flags, rest)?,
         "project" => parse_project(&mut flags, rest)?,
         "delete" => {
@@ -2720,6 +2936,155 @@ fn parse_models(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
         }
         other => Err(format!("unknown models sub-verb '{other}'; use list")),
     }
+}
+
+/// The `jev` sub-verbs: the supervision helper that calls the decision model
+/// directly instead of through the worker.
+///
+/// `status` and `ask` are local, so they never name a session and never need a
+/// token; `triage` reads one session's approval from the worker and is the only
+/// sub-verb that negotiates a capability.
+fn parse_jev(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
+    let Some(sub_verb) = rest.first() else {
+        return Err("jev requires 'status', 'ask', or 'triage'".to_owned());
+    };
+    if rest.len() > 1 {
+        return Err(format!("jev takes one sub-verb, got '{}'", rest[1]));
+    }
+    flags.verb = format!("jev {sub_verb}");
+    match sub_verb.as_str() {
+        "status" => Ok(Verb::JevStatus(jev_flags(flags)?)),
+        "ask" => {
+            let state = match (flags.value("--state"), flags.value("--state-file")) {
+                (Some(text), None) => text,
+                (None, Some(path)) => std::fs::read_to_string(&path)
+                    .map_err(|error| format!("could not read the state file '{path}': {error}"))?,
+                (Some(_), Some(_)) => {
+                    return Err("jev ask accepts --state or --state-file, not both".to_owned());
+                }
+                (None, None) => {
+                    return Err("jev ask requires --state <text> or --state-file <path>".to_owned());
+                }
+            };
+            if state.trim().is_empty() {
+                return Err("the state to ask about must not be empty".to_owned());
+            }
+            if state.len() > MAX_JEV_STATE_BYTES {
+                return Err(format!(
+                    "the state is {} bytes, over the {MAX_JEV_STATE_BYTES} the endpoint accepts",
+                    state.len()
+                ));
+            }
+            let question = flags.required("--question")?;
+            if question.trim().is_empty() {
+                return Err("--question must not be empty".to_owned());
+            }
+            let options = parse_jev_options(flags.values("--option"))?;
+            Ok(Verb::JevAsk(Box::new(JevAskArgs {
+                state,
+                question,
+                options,
+                flags: jev_flags(flags)?,
+            })))
+        }
+        "triage" => {
+            let session = parse_id("session id", &flags.required("--session")?)?;
+            let threshold = match flags.value("--threshold") {
+                None => DEFAULT_JEV_THRESHOLD,
+                Some(value) => {
+                    let threshold = value.parse::<f64>().map_err(|_| {
+                        format!("--threshold must be a number between 0 and 1, got '{value}'")
+                    })?;
+                    // A NaN fails the range test, so it is refused as well.
+                    if !(0.0..=1.0).contains(&threshold) {
+                        return Err(format!(
+                            "--threshold must be between 0 and 1, got '{value}'"
+                        ));
+                    }
+                    threshold
+                }
+            };
+            Ok(Verb::JevTriage(Box::new(JevTriageArgs {
+                session,
+                flags: jev_flags(flags)?,
+                apply: flags.flag("--apply"),
+                threshold,
+                request_id: parse_request_id(flags)?,
+            })))
+        }
+        other => Err(format!(
+            "unknown jev sub-verb '{other}'; use status, ask, or triage"
+        )),
+    }
+}
+
+/// The flags every `jev` sub-verb shares. The key is not read here: the path is,
+/// so a parsed command never carries a secret.
+fn jev_flags(flags: &mut FlagSet) -> Result<JevFlags, String> {
+    let source = flags.value("--source");
+    if let Some(source) = &source
+        && !matches!(source.as_str(), "typesafe" | "opencode")
+    {
+        return Err(format!(
+            "--source must be typesafe or opencode, got '{source}'"
+        ));
+    }
+    let key_file = flags.value("--key-file").map(PathBuf::from);
+    if let Some(path) = &key_file
+        && path.as_os_str().is_empty()
+    {
+        return Err("--key-file requires a path".to_owned());
+    }
+    let endpoint = flags.value("--endpoint");
+    if let Some(endpoint) = &endpoint
+        && !(endpoint.starts_with("http://") || endpoint.starts_with("https://"))
+    {
+        return Err(format!(
+            "--endpoint must be an http or https URL, got '{endpoint}'"
+        ));
+    }
+    let model = flags.value("--model");
+    if let Some(model) = &model
+        && model.trim().is_empty()
+    {
+        return Err("--model must not be empty".to_owned());
+    }
+    Ok(JevFlags {
+        source,
+        key_file,
+        endpoint,
+        model,
+    })
+}
+
+/// The `--option` labels of `jev ask`, each with the condition it applies under.
+fn parse_jev_options(values: Vec<String>) -> Result<Vec<(String, String)>, String> {
+    if values.len() < 2 {
+        return Err(
+            "jev ask requires at least two --option <label>[=<when it applies>]".to_owned(),
+        );
+    }
+    if values.len() > MAX_JEV_OPTIONS {
+        return Err(format!(
+            "jev ask accepts at most {MAX_JEV_OPTIONS} options, got {}",
+            values.len()
+        ));
+    }
+    let mut options: Vec<(String, String)> = Vec::new();
+    for value in values {
+        let (label, when) = match value.split_once('=') {
+            Some((label, when)) => (label.trim().to_owned(), when.trim().to_owned()),
+            None => (value.trim().to_owned(), String::new()),
+        };
+        if label.is_empty() {
+            return Err("a --option label must not be empty".to_owned());
+        }
+        if options.iter().any(|(existing, _)| *existing == label) {
+            return Err(format!("--option '{label}' was given more than once"));
+        }
+        options.push((label, when));
+    }
+    Ok(options)
 }
 
 /// A provider id is the worker's id, such as `openai`. Blank is a usage error;

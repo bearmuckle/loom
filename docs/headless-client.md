@@ -74,6 +74,9 @@ error invalid_request could not read the token file \
 | `providers discover --provider <id>` | Replace one provider's model catalog with the one its endpoint's `/models` answers with. |
 | `models list [--provider <id>]` | The models of the configured providers, one default per provider. No secrets. |
 | `providers set-key --provider <id> (--from-env <NAME> \| --key-file <path>)` | Store an API key for `openai`, `deepseek`, or an OpenAI-compatible provider. |
+| `jev status [--source <opencode\|typesafe>] [--key-file <path>] [--endpoint <url>] [--model <id>]` | Whether a Jev key is configured, the path it is read from, and the endpoint and model a call would use. No key is printed, and no worker is contacted. |
+| `jev ask (--state <text> \| --state-file <path>) --question <text> (--option <label>[=<when it applies>])...` | One raw choice question to the decision model: the choice, its confidence, and the probabilities. |
+| `jev triage --session <id> [--apply] [--threshold <0..1>] [--request-id <uuid>]` | A suggested verdict (`approve` or `ask_user`) for the approval a session waits on. `--apply` approves the call only under the documented guards. |
 | `delete <session-id> [--force] [--yes] [--request-id <uuid>]` | Permanently delete an archived session, or a project root with its descendants; the same operation as `session delete`. |
 | `session archive <session-id> [--yes] [--request-id <uuid>]` | Archive one session, and the live descendants of a project root that cascades; every checkout is kept. |
 | `session delete <session-id> [--force] [--yes] [--request-id <uuid>]` | Permanently delete an archived session, or a project root with its descendants. |
@@ -764,6 +767,126 @@ provider; `set-key` refuses it. A provider id the worker does not have is
 `providers set-key`, `providers add`, and `providers remove` need
 `configure_providers`; a token without it exits `3`.
 
+## Jev supervision
+
+`jev` is a supervision helper of this client alone. It calls Jev, TypeSafe's
+System One decision model — one factual `state` and one closed question in, one
+choice with its probabilities out — directly, not through the worker, and no
+core crate knows the model exists. `jev status` and `jev ask` are local: they
+need no worker, no `--token-file`, and no negotiated capability. `jev triage`
+reads one session's pending approval from the worker and prints a suggestion.
+
+A call goes to one of two sources, which speak the same request and answer
+shape:
+
+| Source | Endpoint | Model | Default key file |
+| --- | --- | --- | --- |
+| `typesafe` | `https://api.typesafe.ai/v1/systemone` | `jev-latest` | `~/.config/loom/typesafe.key` |
+| `opencode` | `https://opencode.ai/inference/systemone/v1/systemone` | `jev-1.13-free` | `~/.config/loom/opencode.key` |
+
+`--source` selects one. Without it, the first source whose default key file
+exists is used, `typesafe` first, and `typesafe` also wins when neither exists so
+`jev status` can report the path it would read. `--key-file` names another file
+(a leading `~` is expanded with `HOME`), and `--endpoint` and `--model` override
+what the source declares. Every call sends `User-Agent: loom-cli/<version>` and
+`Authorization: Bearer <key>`.
+
+The key is read from the file when the command runs and never appears in a
+parsed command, a text line, a `--json` envelope, or an error message. A missing,
+unreadable, or blank key file is a usage error (exit `2`) that names the path,
+and it sends no request. `--key` is rejected, exactly like `--token`.
+
+`jev status` prints four lines and makes no request at all:
+
+```text
+source typesafe
+endpoint https://api.typesafe.ai/v1/systemone
+model jev-latest
+key configured /home/u/.config/loom/typesafe.key
+```
+
+`key missing <path>` replaces the last line when the file is absent or blank. A
+missing key is still a successful determination with exit `0`, so a script can
+branch on it. `--json` is
+`{"source","source_explicit","endpoint","model","key_file","key_configured","user_agent"}`.
+
+`jev ask` sends one `choice` question and prints the chosen label, its
+confidence, one line per probability, and the model the service reported:
+
+```sh
+loom-cli jev ask --state 'The build passes.' --question 'Is the change safe?' \
+  --option approve='safe to merge' --option ask_user='a person must look'
+```
+
+```text
+choice approve 0.86
+probability approve 0.86
+probability ask_user 0.14
+model jev-1.14.0
+```
+
+At least two `--option` labels are required and each may carry `=<when it
+applies>`, which the service is given as the criterion for that label. `--state`
+is at most 128 KiB, which is the endpoint's documented ceiling. A missing
+confidence is printed as `-`. `--json` is
+`{"choice","confidence","probabilities":[{"label","probability"}],"model","source","endpoint"}`,
+with the labels sorted so two runs over the same answer print identical bytes.
+
+`jev triage` reads the session projection and asks one question about the
+`pending_approval` it finds:
+
+```sh
+loom-cli jev triage --session <session-id>
+```
+
+```text
+session 4f1c… tool list_files call 9a02…
+verdict approve 0.95
+apply not-requested
+```
+
+The verdict is always advisory. `--apply` is the only way the verb acts, and it
+approves the pending call only when all four guards hold:
+
+1. the verdict is `approve`;
+2. its confidence is at or above `--threshold` (`0.9` by default);
+3. the call is one of the read tools `read_file`, `list_files`, `search_text`,
+   or `glob` — a strict allow-list, so an unknown tool is never approved
+   automatically;
+4. every `path` or `paths` argument the call names resolves inside the session
+   root the worker reports, checked lexically and refused when it cannot be
+   resolved (`..` above the root, an absolute path elsewhere, a path this client
+   cannot read as a string).
+
+Anything else is reported and nothing is approved:
+
+```text
+apply skipped below-threshold
+apply skipped verdict-ask-user
+apply skipped not-a-read-tool
+apply skipped path-outside-session-root
+```
+
+An applied approval prints `apply approved <run-id> <run-state>` and is the same
+revision-checked `Collaboration/ControlRun` request `approve` sends, retried once
+after a conflict, under `--request-id` when one is given. `--json` is
+`{"session","run","run_state","tool_call","tool_name","arguments","session_root","verdict","confidence","probabilities","model","source","endpoint","threshold","read_tool","paths_inside_root","applied","skipped","run_after"}`,
+where `skipped` is the refusal word or `null`. A session that waits on no
+approval is `invalid_state` (exit `5`) and asks the model nothing.
+
+`jev triage` negotiates `read_agent_session`, `read_agent_run`, and
+`read_session_filesystem`, and `approve_agent_action` only when `--apply` is
+given, so a token without the approval capability can still read a suggestion.
+
+Failure codes follow the service: a refused key is `6`
+(`authentication_failed`), a request the service rejects (`400`/`422`, such as a
+state over its limit) is `2` with the service's own message, and a rate limit, an
+unreachable endpoint, or an answer without a choice is `1`
+(`provider_rate_limited`, `provider_unavailable`, `provider_invalid_response`).
+
+The tests for these verbs talk to a mock HTTP server on `127.0.0.1` that records
+the request it received; no test calls the real endpoint.
+
 ## Session and project lifecycle
 
 Archiving, deletion, and worktree cleanup are separate operations, and every
@@ -1077,6 +1200,16 @@ loom-cli session archive <session-id> \
   --request-id 0199f0f4-0000-7000-8000-000000000002
 loom-cli project worktree cleanup <project-root-id> --task <task-id> \
   --remove --request-id 0199f0f4-0000-7000-8000-000000000003
+
+# Check what a Jev call would use, then ask one question and read its verdict.
+loom-cli jev status
+loom-cli jev ask --state-file state.txt --question 'Which crate owns this?' \
+  --option cli='the command-line client' --option server='the worker'
+
+# Triage the approval a session waits on; a suggestion changes nothing.
+loom-cli jev triage --session <session-id> --json
+# Approve it only if the verdict is confident and the call is a read in the root.
+loom-cli jev triage --session <session-id> --apply --threshold 0.95
 
 # Direct a delegated child's active run, and key the repeat of the direction.
 loom-cli project send <child-session-id> --text "prefer the smaller diff" \

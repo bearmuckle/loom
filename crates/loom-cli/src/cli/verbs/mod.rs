@@ -15,6 +15,7 @@
 
 mod child_models;
 mod events;
+mod jev;
 mod operator;
 mod project;
 mod providers;
@@ -59,6 +60,10 @@ pub(crate) enum Failure {
         request_id: RequestId,
         error: LoomError,
     },
+    /// A call outside the worker connection failed, such as a decision-model
+    /// request this client made itself. Its code and exit code are the
+    /// provider's, not the worker's.
+    Provider(LoomError),
 }
 
 impl Failure {
@@ -70,6 +75,7 @@ impl Failure {
             Self::Transport { .. } => exit::UNREACHABLE,
             Self::Timeout { .. } => exit::TIMEOUT,
             Self::Server { error, .. } => exit::for_code(error.code),
+            Self::Provider(error) => exit::for_code(error.code),
         }
     }
 
@@ -82,6 +88,7 @@ impl Failure {
             Self::BrokenPipe => "broken_pipe".to_owned(),
             Self::Timeout { .. } => ErrorCode::DeadlineExceeded.to_string(),
             Self::Transport { error, .. } | Self::Server { error, .. } => error.code.to_string(),
+            Self::Provider(error) => error.code.to_string(),
         }
     }
 
@@ -91,6 +98,7 @@ impl Failure {
             Self::BrokenPipe => "the output stream was closed",
             Self::Timeout { message, .. } => message,
             Self::Transport { error, .. } | Self::Server { error, .. } => &error.message,
+            Self::Provider(error) => &error.message,
         }
     }
 
@@ -102,12 +110,14 @@ impl Failure {
             // continues from where the bound stopped it.
             Self::Timeout { .. } => true,
             Self::Transport { error, .. } | Self::Server { error, .. } => error.retryable,
+            Self::Provider(error) => error.retryable,
         }
     }
 
     fn request_id(&self) -> Option<RequestId> {
         match self {
             Self::Usage(_) | Self::Internal(_) | Self::BrokenPipe => None,
+            Self::Provider(_) => None,
             Self::Transport { request_id, .. } | Self::Timeout { request_id, .. } => *request_id,
             Self::Server { request_id, .. } => Some(*request_id),
         }
@@ -289,6 +299,20 @@ pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
             capabilities.push(Capability::ConfigureProviders);
         }
         Verb::ProvidersDiscover { .. } => capabilities.push(Capability::ListProviders),
+        // `jev status` and `jev ask` are local and send nothing at all; `jev
+        // triage` reads the session, its pending approval, and the session
+        // root, and approves the call only when `--apply` allows it.
+        Verb::JevStatus(_) | Verb::JevAsk(_) => {}
+        Verb::JevTriage(args) => {
+            capabilities.extend([
+                Capability::ReadAgentSession,
+                Capability::ReadAgentRun,
+                Capability::ReadSessionFilesystem,
+            ]);
+            if args.apply {
+                capabilities.push(Capability::ApproveAgentAction);
+            }
+        }
         Verb::SessionArchive { .. } | Verb::ProjectArchive { .. } => {
             capabilities.extend([Capability::ReadProject, Capability::ControlAgentSession]);
         }
@@ -531,6 +555,9 @@ pub(crate) async fn run<C: Client>(
         Verb::ProvidersDiscover { provider } => {
             providers::discover(client, invocation, provider, out).await
         }
+        Verb::JevStatus(flags) => jev::status(client, invocation, flags, out).await,
+        Verb::JevAsk(args) => jev::ask(client, invocation, args, out).await,
+        Verb::JevTriage(args) => jev::triage(client, invocation, args, out).await,
         Verb::ModelsList { provider } => {
             providers::models(client, invocation, provider.as_deref(), out).await
         }
