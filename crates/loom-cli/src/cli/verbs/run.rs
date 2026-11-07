@@ -26,33 +26,49 @@
 //! The verb returns as soon as `AgentRunStarted` arrives. It never polls and
 //! never waits for the run: `loom-cli events --follow` is the verb that watches
 //! one.
+//!
+//! The model is the caller's `--model` when one was given. Otherwise the verb
+//! sends `Provider/ListProviders` - the same read `providers list` sends - and
+//! starts the first provider, in the order the worker returned them, that has a
+//! credential and a known default model, selected as
+//! `loom:model:v1:["<provider-id>","<model>"]`. A worker that offers no such
+//! provider, or that refuses the catalog read as a missing capability, falls
+//! back to `deterministic/demo` with one warning on stderr, because a run with
+//! the demo model is better than no run; a transport failure is still a
+//! failure, because the worker was never reached.
 
 use std::io::Write;
 
-use loom_core::{AgentSessionId, ApprovalPolicy, ContextAssemblyOptions, RequestId, SessionLimits};
+use loom_core::{
+    AgentSessionId, ApprovalPolicy, ContextAssemblyOptions, ErrorCode, RequestId, SessionLimits,
+};
+use loom_model::ModelId;
 use loom_protocol::{
-    ClientRequest, FilesystemRequest, FilesystemResponse, RepositoryRequest, RepositoryResponse,
-    RunRequest, RunResponse, ServerResponse, SessionRequest, SessionResponse, WorkspaceRequest,
+    ClientRequest, FilesystemRequest, FilesystemResponse, ProviderRequest, ProviderResponse,
+    RepositoryRequest, RepositoryResponse, RunRequest, RunResponse, ServerResponse, SessionRequest,
+    SessionResponse, WorkspaceRequest,
 };
 use serde_json::json;
 
-use crate::cli::args::{ApprovalPreset, Invocation, RunArgs};
+use crate::cli::args::{ApprovalPreset, DEFAULT_MODEL, Invocation, RunArgs};
 use crate::cli::client::Client;
 use crate::cli::text::run_state_name;
 
-use super::{Caller, Failure, Outcome, derived_id, emit, handshake};
+use super::{Caller, Failure, Outcome, derived_id, emit, handshake, providers};
 
-/// `run`: resolve the session, attach the inputs to a session this invocation
-/// created, pin the approval policy, and start the run.
+/// `run`: resolve the model and the session, attach the inputs to a session this
+/// invocation created, pin the approval policy, and start the run.
 pub(super) async fn run<C: Client>(
     client: &mut C,
     invocation: &Invocation,
     args: &RunArgs,
     out: &mut dyn Write,
+    err: &mut dyn Write,
 ) -> Result<Outcome, Failure> {
     let mut caller = Caller::new(client);
     handshake(&mut caller, &invocation.verb).await?;
 
+    let model = resolve_model(&mut caller, args, err).await?;
     let resolved = resolve_session(&mut caller, args).await?;
     let session_id = resolved.session_id;
     let session_name = resolved.session_name;
@@ -148,7 +164,7 @@ pub(super) async fn run<C: Client>(
             ClientRequest::Run(RunRequest::StartSessionAgentRunWithOptions {
                 session_id,
                 task: args.task.clone(),
-                model: args.model.clone(),
+                model: model.clone(),
                 system_instructions: None,
                 repository_instructions: None,
                 limits: SessionLimits::default(),
@@ -177,6 +193,59 @@ pub(super) async fn run<C: Client>(
         },
     });
     Ok(Outcome::new(data, Some(request_id)).with_replayed(caller.replayed()))
+}
+
+/// The model the run starts: `--model` when the caller named one, otherwise the
+/// first provider the worker returned that has a credential and a known default
+/// model.
+///
+/// `Provider/ListProviders` is the same read `providers list` and `models list`
+/// send, and the selection is the same default those verbs mark. The tie-break is
+/// the order the worker returned the providers in, so two runs against one
+/// worker select the same model.
+///
+/// A worker that refuses the read as a missing capability, and a worker where no
+/// credential-bearing provider has a default model, both fall back to
+/// `deterministic/demo` with one warning on stderr: the demo model runs, so
+/// failing the whole command would cost more than saying what happened. A
+/// transport failure is not caught, because the worker was never reached and
+/// the run would fail the same way.
+async fn resolve_model<C: Client>(
+    caller: &mut Caller<'_, C>,
+    args: &RunArgs,
+    err: &mut dyn Write,
+) -> Result<ModelId, Failure> {
+    if let Some(model) = &args.model {
+        return Ok(model.clone());
+    }
+    let (request_id, response) = match caller
+        .call(ClientRequest::Provider(ProviderRequest::ListProviders))
+        .await
+    {
+        Ok(answer) => answer,
+        Err(Failure::Server { error, .. }) if error.code == ErrorCode::CapabilityDenied => {
+            return fallback(err, "the worker does not offer its provider catalog");
+        }
+        Err(other) => return Err(other),
+    };
+    let providers = match response {
+        ServerResponse::Provider(ProviderResponse::Providers { providers }) => providers,
+        _ => return Err(Failure::unexpected(request_id, "provider list")),
+    };
+    match providers::default_selection(&providers) {
+        Some(model) => Ok(model),
+        None => fallback(err, "no provider with a credential has a default model"),
+    }
+}
+
+/// Starts the demo model and says on stderr why no provider was selected.
+fn fallback(err: &mut dyn Write, reason: &str) -> Result<ModelId, Failure> {
+    writeln!(
+        err,
+        "warning: {reason}; starting the run with '{DEFAULT_MODEL}'"
+    )
+    .map_err(|error| Failure::Internal(format!("could not write a warning: {error}")))?;
+    Ok(ModelId::new(DEFAULT_MODEL))
 }
 
 /// The session `run` starts in: the first of the workspace's live sessions with

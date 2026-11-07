@@ -7,7 +7,10 @@
 //! `--flag=value` forms reach the same place, and a flag the verb does not use
 //! is a usage error rather than something silently ignored.
 
-use std::{path::PathBuf, str::FromStr};
+use std::{
+    path::{Component, Path, PathBuf},
+    str::FromStr,
+};
 
 use loom_core::{AgentSessionId, RequestId, RunId, TaskId, ToolCallId, WorkspaceId};
 use loom_model::ModelId;
@@ -18,8 +21,12 @@ pub(crate) const DEFAULT_MAX_BYTES: usize = 4096;
 pub(crate) const MIN_MAX_BYTES: usize = 64;
 /// How many events `peek` asks for by default.
 pub(crate) const DEFAULT_LINES: u32 = 200;
-/// The model `run` starts when `--model` is absent.
+/// The model `run` falls back to when the worker offers no credentialed
+/// provider to derive one from.
 pub(crate) const DEFAULT_MODEL: &str = "deterministic/demo";
+/// The worker URL a command connects to when neither `--connect` nor `LOOM_URL`
+/// names one.
+pub(crate) const DEFAULT_CONNECT_URL: &str = "ws://127.0.0.1:8765/ws";
 /// How many of the task's leading words a derived session name keeps.
 const NAME_WORDS: usize = 6;
 /// The longest derived session name, in characters.
@@ -45,9 +52,10 @@ Verbs:
                                     list workspaces, or one workspace's sessions
   get <session-id> [--metadata]     show one session, and its active run
   events --session <id> [--after <seq>] [--cursor-file <path>] [--follow]
-         [--format text|jsonl] [--max-bytes <n>]
+         [--timeout <seconds>] [--format text|jsonl] [--max-bytes <n>]
                                     print a session's events, optionally
-                                    following for new ones
+                                    following for new ones; --timeout bounds
+                                    the follow and is exit 4 when it elapses
   peek --session <id> [--lines <n>] [--format text|jsonl] [--max-bytes <n>]
                                     print the newest events of a session
   run --workspace <id> (--task <text> | --task-file <path>) [--name <name>]
@@ -57,7 +65,9 @@ Verbs:
                                     reuse the workspace's session named
                                     --name, or create it, attach the inputs
                                     to a session this run created, and start
-                                    one agent run without waiting for it
+                                    one agent run without waiting for it;
+                                    without --model the first credentialed
+                                    provider's default model is started
   send --run <id> --text <text> [--request-id <uuid>]
                                     direct the active run and print its state
   answer --run <id> --text <text> [--request-id <uuid>]
@@ -158,10 +168,15 @@ Verbs:
 `run` never prints more than `session <id> <name>` and `run <id> <state>`: it
 returns as soon as the worker accepts the run. --repo and --as-directory are
 mutually exclusive, --revision applies to --repo only, and --path defaults to
-the source's final path component without a trailing `.git`. A session is only
-attached to when this invocation created it, so replaying a command with the
-same --request-id neither duplicates an attachment nor fails on one that
-exists. --request-id is the idempotency key of the run start alone: the same id
+the source's final path component without a trailing `.git`. Without --model,
+`run` asks the worker for its providers and selects the first provider (in the
+order the worker returns them) that has a credential and a known default model,
+as `loom:model:v1:["<provider-id>","<model>"]`; when no provider has a
+credential it warns on stderr and starts `deterministic/demo`. An explicit
+--model always wins. A session is only attached to when this invocation
+created it, so replaying a command with the same --request-id neither
+duplicates an attachment nor fails on one that exists. --request-id is the
+idempotency key of the run start alone: the same id
 is answered from the worker's durable cache with the same run, while the other
 mutations of the verb use fresh ids. On a session this invocation creates,
 --approval-policy (default when absent) is pinned before the run starts; on a
@@ -262,14 +277,18 @@ reports `replayed: true`. The project snapshot read, the session metadata read,
 and the run revision read always keep fresh ids.
 
 Global flags, accepted anywhere as --flag value or --flag=value:
-  --connect <url>             worker WebSocket URL (fallback LOOM_URL)
-  --token-file <path>         file holding the bearer token
-                              (fallback LOOM_TOKEN_FILE)
+  --connect <url>             worker WebSocket URL (fallback LOOM_URL, then
+                              ws://127.0.0.1:8765/ws)
+  --token-file <path>         file holding the bearer token (fallback
+                              LOOM_TOKEN_FILE, then <state dir>/<host>_<port>
+                              /token derived from the connected URL); a
+                              leading ~/ is expanded with HOME
   --ca-file <pem>             also trust this PEM certificate
   --allow-insecure-remote     accept plaintext ws:// to a non-loopback host
   --max-frame-bytes <n>       transport frame size limit
   --json                      print exactly one JSON envelope on stdout
-  --help, -h                  print this help
+  --help, -h                  print this help, or one verb's page when the
+                              line names a verb, as in 'loom-cli run --help'
 
 The token is read from a file only: --token is rejected, because a token on a
 command line is visible to every process on the node. A provider API key is
@@ -305,6 +324,10 @@ pub(crate) struct EventsArgs {
     pub after: Option<u64>,
     pub cursor_file: Option<PathBuf>,
     pub follow: bool,
+    /// `--timeout`: the bound of a `--follow`, in seconds. `None` follows until
+    /// the run completes, the journal stalls the caller, or the process is
+    /// interrupted.
+    pub timeout_secs: Option<u64>,
     pub format: Format,
     pub max_bytes: usize,
 }
@@ -363,7 +386,9 @@ pub(crate) struct RunArgs {
     pub task: String,
     /// The session to reuse or create, derived from the task when absent.
     pub name: String,
-    pub model: ModelId,
+    /// `--model`, or `None` when the flag was absent and the model is derived
+    /// from the worker's providers at run time.
+    pub model: Option<ModelId>,
     /// `--repo`, attached only when this invocation creates the session.
     pub repository: Option<Attach>,
     /// `--as-directory`, attached only when this invocation creates the session.
@@ -660,7 +685,9 @@ pub(crate) struct Invocation {
 }
 
 pub(crate) enum Parsed {
-    Help,
+    /// Print this text: the global manual, or one verb's page when the command
+    /// line named a verb.
+    Help(&'static str),
     Run(Invocation),
 }
 
@@ -755,6 +782,773 @@ pub(crate) fn named_verb(arguments: &[String]) -> &'static str {
         .unwrap_or("")
 }
 
+/// The per-verb help pages, keyed by the words that name the verb.
+///
+/// A page prints only its own usage, its flags, and a few copy-pasteable
+/// examples, so a caller who knows the verb does not have to read the whole
+/// manual. A bare `--help`, and a verb the table does not know, keep the global
+/// manual in [`HELP`]. The table is static text: it is the contract a reader
+/// copies from, not a second parser.
+const VERB_HELP: &[(&str, &str)] = &[
+    (
+        "doctor",
+        r#"Usage: loom-cli doctor
+
+Report the negotiated protocol, the granted capability intersection, the
+participant this connection acts as, and the worker node.
+
+Flags:
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli doctor
+  loom-cli doctor --json
+"#,
+    ),
+    (
+        "node",
+        r#"Usage: loom-cli node
+
+Report the worker node's id, name, online flag, capabilities, and health.
+
+Flags:
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli node
+  loom-cli node --json
+"#,
+    ),
+    (
+        "whoami",
+        r#"Usage: loom-cli whoami
+
+Report the participant this connection acts as: the person the token belongs
+to, or {"kind":"operator"} for an operator token.
+
+Flags:
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli whoami
+  loom-cli whoami --json
+"#,
+    ),
+    (
+        "ls",
+        r#"Usage: loom-cli ls [--workspace <id>] [--archived]
+
+List every workspace, or the sessions of one workspace.
+
+Flags:
+  --workspace <id>            list that workspace's sessions instead
+  --archived                  include archived sessions
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli ls
+  loom-cli ls --workspace <workspace-id> --archived
+  loom-cli ls --json
+"#,
+    ),
+    (
+        "get",
+        r#"Usage: loom-cli get <session-id> [--metadata]
+
+Show one session, and with --metadata its active run.
+
+Flags:
+  --metadata                  also read the session's active run
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli get <session-id>
+  loom-cli get <session-id> --metadata --json
+"#,
+    ),
+    (
+        "events",
+        r#"Usage: loom-cli events --session <id> [--after <seq>] [--cursor-file <path>]
+                        [--follow] [--timeout <seconds>]
+                        [--format text|jsonl] [--max-bytes <n>]
+
+Print a session's events, optionally following for new ones.
+
+Flags:
+  --session <id>              the session whose journal to read (required)
+  --after <seq>               resume after that event sequence
+  --cursor-file <path>        resume from, and persist, the cursor file
+  --follow                    keep reading until the run completes
+  --timeout <seconds>         bound the follow; exit 4 when it elapses
+  --format text|jsonl         one text line or one JSON object per event
+  --max-bytes <n>             byte budget of one rendered payload
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli events --session <session-id>
+  loom-cli events --session <session-id> --cursor-file .loom-cursor --follow
+  loom-cli events --session <session-id> --follow --timeout 60 --format jsonl
+"#,
+    ),
+    (
+        "peek",
+        r#"Usage: loom-cli peek --session <id> [--lines <n>] [--format text|jsonl]
+                     [--max-bytes <n>]
+
+Print the newest events of a session, without following it.
+
+Flags:
+  --session <id>              the session to read (required)
+  --lines <n>                 how many events to ask for (200 by default)
+  --format text|jsonl         one text line or one JSON object per event
+  --max-bytes <n>             byte budget of one rendered payload
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli peek --session <session-id>
+  loom-cli peek --session <session-id> --lines 40 --json
+"#,
+    ),
+    (
+        "run",
+        r#"Usage: loom-cli run --workspace <id> (--task <text> | --task-file <path>)
+                      [--name <name>] [--model <id>]
+                      [--repo <source> [--revision <rev>] [--path <path>]]
+                      [--as-directory <path> [--path <path>]]
+                      [--approval-policy default|auto] [--request-id <uuid>] [--new]
+
+Reuse the workspace's session named --name, or create it, attach the inputs to
+a session this run created, and start one agent run without waiting for it.
+Without --model, the first provider that has a credential and a known default
+model is started; when there is none, 'deterministic/demo' is started and a
+warning is printed on stderr.
+
+Flags:
+  --workspace <id>            the workspace the session belongs to (required)
+  --task <text>               the task text
+  --task-file <path>          read the task text from a file instead
+  --name <name>               reuse or create the session with that name
+  --model <id>                the model to start
+  --repo <source>             clone a repository into a new session
+  --as-directory <path>       mount a local directory into a new session
+  --revision <rev>            the revision to clone (with --repo)
+  --path <path>               where an attached input lands
+  --approval-policy <preset>  pin default or auto before the run starts
+  --request-id <uuid>         the idempotency key of the run start
+  --new                       always create a session
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli run --workspace <workspace-id> --task 'fix the failing test'
+  loom-cli run --workspace <workspace-id> --task-file task.md \
+    --repo https://github.com/acme/widgets.git --approval-policy auto
+  loom-cli run --workspace <workspace-id> --task 'summarise the diff' \
+    --model 'loom:model:v1:["deepseek","deepseek-flash"]' --json
+"#,
+    ),
+    (
+        "send",
+        r#"Usage: loom-cli send --run <id> --text <text> [--request-id <uuid>]
+
+Direct the active run and print its state.
+
+Flags:
+  --run <id>                  the run to direct (required)
+  --text <text>               the direction to send (required)
+  --request-id <uuid>         the idempotency key of the direction
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli send --run <run-id> --text 'prefer the smaller diff'
+  loom-cli send --run <run-id> --text 'stop at the first failure' --json
+"#,
+    ),
+    (
+        "answer",
+        r#"Usage: loom-cli answer --run <id> --text <text> [--request-id <uuid>]
+
+Answer the question the run is waiting on.
+
+Flags:
+  --run <id>                  the run to answer (required)
+  --text <text>               the answer (required)
+  --request-id <uuid>         the idempotency key of the answer
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli answer --run <run-id> --text 'use the existing migration'
+  loom-cli answer --run <run-id> --text 'yes, delete the fixture' --json
+"#,
+    ),
+    (
+        "approve",
+        r#"Usage: loom-cli approve --run <id> --tool-call <id> [--request-id <uuid>]
+
+Approve the tool call that blocked the run.
+
+Flags:
+  --run <id>                  the blocked run (required)
+  --tool-call <id>            the pending tool call (required)
+  --request-id <uuid>         the idempotency key of the approval
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli approve --run <run-id> --tool-call <tool-call-id>
+  loom-cli approve --run <run-id> --tool-call <tool-call-id> --json
+"#,
+    ),
+    (
+        "deny",
+        r#"Usage: loom-cli deny --run <id> --tool-call <id> [--reason <text>]
+                    [--request-id <uuid>]
+
+Deny the tool call that blocked the run.
+
+Flags:
+  --run <id>                  the blocked run (required)
+  --tool-call <id>            the pending tool call (required)
+  --reason <text>             why it was denied
+  --request-id <uuid>         the idempotency key of the denial
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli deny --run <run-id> --tool-call <tool-call-id>
+  loom-cli deny --run <run-id> --tool-call <tool-call-id> --reason 'watch the tests' --json
+"#,
+    ),
+    (
+        "stop",
+        r#"Usage: loom-cli stop --run <id> [--session <id> --archive]
+                    [--retry-on-conflict] [--request-id <uuid>]
+
+Interrupt a run, and optionally archive its session afterwards.
+
+Flags:
+  --run <id>                  the run to interrupt (required)
+  --archive                   archive the session after the interrupt
+  --session <id>              the session --archive archives (required with it)
+  --retry-on-conflict         re-read the revision and retry once
+  --request-id <uuid>         the idempotency key of the interrupt
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli stop --run <run-id>
+  loom-cli stop --run <run-id> --session <session-id> --archive --json
+"#,
+    ),
+    (
+        "wait",
+        r#"Usage: loom-cli wait --session <id> [--until blocked|terminal] [--timeout <seconds>]
+
+Poll until the run blocks or reaches a terminal state; always time-bounded.
+
+Flags:
+  --session <id>              the session to poll (required)
+  --until blocked|terminal    what to wait for (blocked by default)
+  --timeout <seconds>         the poll deadline (60 by default)
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli wait --session <session-id> --until blocked --timeout 30
+  loom-cli wait --session <session-id> --until terminal --timeout 600 --json
+"#,
+    ),
+    (
+        "status",
+        r#"Usage: loom-cli status --session <id> [--format text|verb] [--tree]
+
+Report the session and its latest run.
+
+Flags:
+  --session <id>              the session to report (required)
+  --format text|verb          one declaration line with verb
+  --tree                      also print the project the session belongs to
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli status --session <session-id>
+  loom-cli status --session <session-id> --tree
+  loom-cli status --session <session-id> --format verb --json
+"#,
+    ),
+    (
+        "liveness",
+        r#"Usage: loom-cli liveness --session <id>
+
+Report alive, dead, gone, or unknown for one session, never guessing.
+
+Flags:
+  --session <id>              the session to classify (required)
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli liveness --session <session-id>
+  loom-cli liveness --session <session-id> --json
+"#,
+    ),
+    (
+        "result",
+        r#"Usage: loom-cli result --session <id> [--task <id>]
+
+Report branch, head, diffstat, changed paths, and task evidence.
+
+Flags:
+  --session <id>              the session whose result to report (required)
+  --task <id>                 also report that task's evidence links
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli result --session <session-id>
+  loom-cli result --session <session-id> --task <task-id> --json
+"#,
+    ),
+    (
+        "retention get",
+        r#"Usage: loom-cli retention get
+
+Report the worker-wide archive-retention policy, with a disabled window as off.
+
+Flags:
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli retention get
+  loom-cli retention get --json
+"#,
+    ),
+    (
+        "retention set",
+        r#"Usage: loom-cli retention set [--window <duration>] [--force-discard <bool>]
+                              [--sub-agent <duration>]
+
+Merge the given fields into the stored worker-wide archive-retention policy.
+The next sweep applies it; the command never deletes anything itself.
+
+Flags:
+  --window <duration>         how long an archived session is kept
+  --force-discard <bool>      discard dirty worktrees on the next sweep
+  --sub-agent <duration>      the window of a delegated worktree
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli retention set --window 14d
+  loom-cli retention set --window off --force-discard true --json
+"#,
+    ),
+    (
+        "providers list",
+        r#"Usage: loom-cli providers list
+
+List the configured providers and whether each has a credential. No secret,
+credential reference, or key is ever printed.
+
+Flags:
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli providers list
+  loom-cli providers list --json
+"#,
+    ),
+    (
+        "providers set-key",
+        r#"Usage: loom-cli providers set-key --provider <id>
+                              (--from-env <NAME> | --key-file <path>)
+
+Store an API key for openai, deepseek, or an openai-compatible provider. The
+key is read from a variable or a file, never from the command line.
+
+Flags:
+  --provider <id>             the provider to configure (required)
+  --from-env <NAME>           read the key from that variable
+  --key-file <path>           read the key from a file
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli providers set-key --provider openai --from-env OPENAI_API_KEY
+  loom-cli providers set-key --provider deepseek --key-file ~/.config/loom/deepseek.key --json
+"#,
+    ),
+    (
+        "models list",
+        r#"Usage: loom-cli models list [--provider <id>]
+
+List the models of the configured providers and mark one default per provider.
+No secret is printed.
+
+Flags:
+  --provider <id>             keep only that exact provider
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli models list
+  loom-cli models list --provider deepseek --json
+"#,
+    ),
+    (
+        "session archive",
+        r#"Usage: loom-cli session archive <session-id> [--yes] [--request-id <uuid>]
+
+Archive one session, keeping its transcript, checkpoints, and every checkout.
+--yes is required when the id is a project root whose archive also reaches its
+descendants.
+
+Flags:
+  --yes                       acknowledge a project-root cascade
+  --request-id <uuid>         the idempotency key of the archive
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli session archive <session-id>
+  loom-cli session archive <project-root-id> --yes --json
+"#,
+    ),
+    (
+        "session delete",
+        r#"Usage: loom-cli session delete <session-id> [--force] [--yes] [--request-id <uuid>]
+
+Delete an archived session, or a project root with its descendants. --yes is
+required for a cascade or with --force, and nothing restores a deleted session.
+
+Flags:
+  --force                     discard dirty or locked worktrees
+  --yes                       acknowledge a cascade or a force discard
+  --request-id <uuid>         the idempotency key of the deletion
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli session delete <session-id>
+  loom-cli session delete <project-root-id> --yes --json
+"#,
+    ),
+    (
+        "delete",
+        r#"Usage: loom-cli delete <session-id> [--force] [--yes] [--request-id <uuid>]
+
+Delete an archived session, or a project root with its descendants; the same
+operation as 'session delete', and irreversible.
+
+Flags:
+  --force                     discard dirty or locked worktrees
+  --yes                       acknowledge a cascade or a force discard
+  --request-id <uuid>         the idempotency key of the deletion
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli delete <session-id>
+  loom-cli delete <project-root-id> --yes --json
+"#,
+    ),
+    (
+        "project get",
+        r#"Usage: loom-cli project get <session-id>
+
+Report one project's members and the project it was branched from.
+
+Flags:
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project get <session-id>
+  loom-cli project get <session-id> --json
+"#,
+    ),
+    (
+        "project tree",
+        r#"Usage: loom-cli project tree <session-id>
+
+Print the project hierarchy as an indented tree, rooted at the project root.
+
+Flags:
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project tree <session-id>
+  loom-cli project tree <project-root-id> --json
+"#,
+    ),
+    (
+        "project tasks",
+        r#"Usage: loom-cli project tasks <session-id>
+
+List the project's delegated tasks with status, owner, target, and intent.
+
+Flags:
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project tasks <session-id>
+  loom-cli project tasks <session-id> --json
+"#,
+    ),
+    (
+        "project children",
+        r#"Usage: loom-cli project children <session-id>
+
+List the direct child agents with their task, run, and blocking state.
+
+Flags:
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project children <session-id>
+  loom-cli project children <session-id> --json
+"#,
+    ),
+    (
+        "project messages",
+        r#"Usage: loom-cli project messages <session-id> [--after <seq>] [--limit <n>]
+
+Print one page of the project's agent message history. --limit is 1..512 and
+100 by default.
+
+Flags:
+  --after <seq>               resume after that project message sequence
+  --limit <n>                 the page size (1 to 512, 100 by default)
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project messages <session-id>
+  loom-cli project messages <session-id> --after 40 --limit 20 --json
+"#,
+    ),
+    (
+        "project send",
+        r#"Usage: loom-cli project send <session-id> (--text <text> | --text-file <path>)
+                              [--request-id <uuid>]
+
+Direct the active run of a delegated child and print its state.
+
+Flags:
+  --text <text>               the direction to send
+  --text-file <path>          read the direction from a file instead
+  --request-id <uuid>         the idempotency key of the direction
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project send <child-session-id> --text 'prefer the smaller diff'
+  loom-cli project send <child-session-id> --text-file direction.md --json
+"#,
+    ),
+    (
+        "project child",
+        r#"Usage: loom-cli project child pause|resume|interrupt|cancel <task-id> --session <id>
+                              [--request-id <uuid>]
+
+Control one delegated child task. The manager session comes from the project
+snapshot, never from a flag.
+
+Flags:
+  --session <id>              the project member session to read (required)
+  --request-id <uuid>         the idempotency key of the control request
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project child pause <task-id> --session <session-id>
+  loom-cli project child cancel <task-id> --session <session-id> --json
+"#,
+    ),
+    (
+        "project archive",
+        r#"Usage: loom-cli project archive <session-id> [--request-id <uuid>]
+
+Archive a project root with its idle members. The id must name such a root.
+
+Flags:
+  --request-id <uuid>         the idempotency key of the archive
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project archive <project-root-id>
+  loom-cli project archive <project-root-id> --json
+"#,
+    ),
+    (
+        "project delete",
+        r#"Usage: loom-cli project delete <session-id> [--force] [--yes] [--request-id <uuid>]
+
+Delete a project root and its tree. The id must name such a root, and --yes is
+required because deleting a project is irreversible.
+
+Flags:
+  --force                     discard dirty or locked worktrees
+  --yes                       confirm the deletion
+  --request-id <uuid>         the idempotency key of the deletion
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project delete <project-root-id> --yes
+  loom-cli project delete <project-root-id> --force --yes --json
+"#,
+    ),
+    (
+        "project worktrees",
+        r#"Usage: loom-cli project worktrees <session-id>
+
+List the checkouts the project's snapshot records, in snapshot order.
+
+Flags:
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project worktrees <project-root-id>
+  loom-cli project worktrees <project-root-id> --json
+"#,
+    ),
+    (
+        "project worktree get",
+        r#"Usage: loom-cli project worktree get <session-id> --task <task-id>
+
+Report one delegated task's durable worktree record without opening it.
+
+Flags:
+  --task <task-id>            the delegated task (required)
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project worktree get <project-root-id> --task <task-id>
+  loom-cli project worktree get <project-root-id> --task <task-id> --json
+"#,
+    ),
+    (
+        "project worktree diff",
+        r#"Usage: loom-cli project worktree diff <session-id> --task <task-id>
+
+Report the worker's bounded review of one checkout. The client never runs Git
+and never re-bounds a diff it did not compute.
+
+Flags:
+  --task <task-id>            the delegated task (required)
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project worktree diff <project-root-id> --task <task-id>
+  loom-cli project worktree diff <project-root-id> --task <task-id> --json
+"#,
+    ),
+    (
+        "project worktree integrate",
+        r#"Usage: loom-cli project worktree integrate <session-id> --task <task-id>
+                                    [--expected-parent-revision <rev>]
+                                    [--request-id <uuid>]
+
+Fast-forward the parent with the task's result revision. A conflict is
+reported, never retried.
+
+Flags:
+  --task <task-id>            the delegated task (required)
+  --expected-parent-revision <rev>
+                              the parent tip the integration expects
+  --request-id <uuid>         the idempotency key of the integration
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project worktree integrate <project-root-id> --task <task-id>
+  loom-cli project worktree integrate <project-root-id> --task <task-id> --json
+"#,
+    ),
+    (
+        "project worktree cleanup",
+        r#"Usage: loom-cli project worktree cleanup <session-id> --task <task-id>
+                                  (--keep | --remove | --discard) [--yes]
+                                  [--request-id <uuid>]
+
+Keep or remove the checkout recorded for one delegated task. --discard throws
+away uncommitted changes and needs --yes.
+
+Flags:
+  --task <task-id>            the delegated task (required)
+  --keep                      retain the checkout
+  --remove                    remove it; refused while it holds changes
+  --discard                   remove it with those changes (needs --yes)
+  --yes                       confirm a discard
+  --request-id <uuid>         the idempotency key of the cleanup
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project worktree cleanup <project-root-id> --task <task-id> --keep
+  loom-cli project worktree cleanup <project-root-id> --task <task-id> --discard --yes --json
+"#,
+    ),
+];
+
+/// The help text a command line asking for help prints: the named verb's page
+/// when the table knows it, the global manual otherwise.
+pub(crate) fn help_text(arguments: &[String]) -> &'static str {
+    let words = verb_words(arguments);
+    for length in (1..=words.len()).rev() {
+        let key = words[..length].join(" ");
+        if let Some((_, text)) = VERB_HELP.iter().find(|(name, _)| *name == key) {
+            return text;
+        }
+    }
+    HELP
+}
+
+/// The first three positional words of a command line, so help can name the verb
+/// (`project worktree integrate`) even when the rest of the line would be
+/// rejected. A flag's value is skipped for the flags whose arity says it takes
+/// one, so `--session <id>` never becomes a verb word.
+fn verb_words(arguments: &[String]) -> Vec<&str> {
+    let mut words = Vec::new();
+    let mut skip_value = false;
+    for argument in arguments {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if argument.starts_with('-') {
+            // `--flag=value` already carries its value.
+            skip_value = !argument.contains('=') && arity(argument).unwrap_or(false);
+            continue;
+        }
+        words.push(argument.as_str());
+        if words.len() == 3 {
+            break;
+        }
+    }
+    words
+}
+
 /// Every flag the parser knows, with whether it takes a value.
 fn arity(name: &str) -> Option<bool> {
     Some(match name {
@@ -819,12 +1613,14 @@ impl FlagSet {
 pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
     // Help wins over everything else on the line, including an argument that
     // would otherwise be rejected, so asking for help always explains the
-    // surface instead of failing on one token.
+    // surface instead of failing on one token. A line that names a verb gets
+    // that verb's own page; one that names none, or names an unknown verb,
+    // gets the global manual.
     if arguments
         .iter()
         .any(|argument| argument == "--help" || argument == "-h")
     {
-        return Ok(Parsed::Help);
+        return Ok(Parsed::Help(help_text(arguments)));
     }
     let (flags, positionals) = split(arguments)?;
     let mut globals = Globals::default();
@@ -902,11 +1698,35 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
                     })?),
                     None => None,
                 };
+            // `--timeout` bounds a follow only. A plain read already ends at the
+            // journal head, so the flag there would promise a bound it does not
+            // need and is refused instead of ignored.
+            let follow = flags.flag("--follow");
+            let timeout_secs = match flags.value("--timeout") {
+                None => None,
+                Some(value) => {
+                    let seconds = value
+                        .parse::<u64>()
+                        .map_err(|_| format!("--timeout must be a second count, got '{value}'"))?;
+                    if seconds == 0 {
+                        return Err("--timeout must be greater than zero".to_owned());
+                    }
+                    if !follow {
+                        return Err(
+                            "--timeout bounds events --follow; a plain read already ends at the \
+                             journal head"
+                                .to_owned(),
+                        );
+                    }
+                    Some(seconds)
+                }
+            };
             Verb::Events(EventsArgs {
                 session: parse_id("session id", &session)?,
                 after,
                 cursor_file: flags.value("--cursor-file").map(PathBuf::from),
-                follow: flags.flag("--follow"),
+                follow,
+                timeout_secs,
                 format: parse_format(flags.value("--format"))?,
                 max_bytes: parse_max_bytes(flags.value("--max-bytes"))?,
             })
@@ -1622,11 +2442,7 @@ fn parse_run(flags: &mut FlagSet) -> Result<RunArgs, String> {
     if name.trim().is_empty() {
         return Err("--name must not be empty".to_owned());
     }
-    let model = ModelId::new(
-        flags
-            .value("--model")
-            .unwrap_or_else(|| DEFAULT_MODEL.to_owned()),
-    );
+    let model = flags.value("--model").map(ModelId::new);
 
     let repository = flags.value("--repo");
     let directory = flags.value("--as-directory");
@@ -1750,16 +2566,141 @@ fn no_positionals(verb: &str, rest: &[String]) -> Result<(), String> {
     }
 }
 
-/// The worker URL, with the flag winning over the environment.
+/// The worker URL, with the flag winning over the environment and
+/// [`DEFAULT_CONNECT_URL`] filling in when neither names one.
 ///
 /// `parse` deliberately leaves the environment alone so parsing is a pure
 /// function of its arguments; the binary applies this once, beside the token
 /// file fallback, and stores the result in the invocation before the verb runs,
 /// so the URL a cursor file is scoped to is the one that was connected to. An
-/// empty or whitespace-only environment value is treated as unset, so it fails
-/// the "a worker URL is required" check instead of producing an unusable link.
-pub(crate) fn resolve_connect(flag: Option<String>, environment: Option<String>) -> Option<String> {
+/// empty or whitespace-only environment value is treated as unset, so it never
+/// produces an unusable link.
+pub(crate) fn resolve_connect(flag: Option<String>, environment: Option<String>) -> String {
     flag.or_else(|| environment.filter(|url| !url.trim().is_empty()))
+        .unwrap_or_else(|| DEFAULT_CONNECT_URL.to_owned())
+}
+
+/// Where a command reads its bearer token.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TokenFile {
+    pub path: PathBuf,
+    /// The worker URL the path was derived from, or `None` when the caller named
+    /// the file. A read error names it, so a missing default says which URL it
+    /// was derived for.
+    pub derived_for: Option<String>,
+}
+
+/// The token file, in the precedence the contract documents: `--token-file`,
+/// then `LOOM_TOKEN_FILE`, then the path derived from the connected URL inside
+/// `state_directory`.
+///
+/// The derived path is `<state directory>/<host>_<port>/token`, which is exactly
+/// where a standalone worker stores the token of the instance bound to that
+/// address: [`loom_core::instance_dir`] names the instance directory by
+/// [`loom_core::bind_key`], and [`loom_core::token_path`] is `token` inside it.
+/// The host and port come from the URL's authority, with `ws` defaulting to port
+/// 80 and `wss` to 443, and the key applies the same transform `bind_key` does
+/// to a socket address, so `ws://127.0.0.1:8765/ws` reads
+/// `<state directory>/127.0.0.1_8765/token`.
+///
+/// A blank environment value is treated as unset, like `LOOM_URL`, so an empty
+/// variable falls through to the derived path instead of naming no file.
+pub(crate) fn resolve_token_file(
+    flag: Option<PathBuf>,
+    environment: Option<PathBuf>,
+    home: Option<&Path>,
+    state_directory: &Path,
+    connect: &str,
+) -> Result<TokenFile, String> {
+    if let Some(path) = flag {
+        return Ok(TokenFile {
+            path: expand_home(path, home),
+            derived_for: None,
+        });
+    }
+    if let Some(path) = environment.filter(|path| !path.as_os_str().is_empty()) {
+        return Ok(TokenFile {
+            path: expand_home(path, home),
+            derived_for: None,
+        });
+    }
+    let (host, port) = ws_authority(connect).ok_or_else(|| {
+        format!(
+            "could not derive a token file from the worker URL '{connect}': it has no host and \
+             port, so pass --token-file <path> or set LOOM_TOKEN_FILE"
+        )
+    })?;
+    let instance = state_directory.join(authority_key(&host, port));
+    Ok(TokenFile {
+        path: loom_core::token_path(&instance),
+        derived_for: Some(connect.to_owned()),
+    })
+}
+
+/// The host and port of a `ws://` or `wss://` URL, using the scheme's default
+/// port when the URL has none.
+///
+/// The CLI has no URL crate, so this reads the one part it needs: everything
+/// between `scheme://` and the first `/`, `?`, or `#`, minus any user
+/// information. `None` means the URL names no authority this client can address,
+/// and the caller reports that instead of guessing a token path.
+fn ws_authority(url: &str) -> Option<(String, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let default_port = match scheme.trim().to_ascii_lowercase().as_str() {
+        "ws" => 80,
+        "wss" => 443,
+        _ => return None,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let authority = authority.trim();
+    if authority.is_empty() {
+        return None;
+    }
+    // An IPv6 literal is bracketed, so its port follows the closing bracket.
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, tail) = bracketed.split_once(']')?;
+        let port = match tail {
+            "" => default_port,
+            tail => tail.strip_prefix(':')?.parse().ok()?,
+        };
+        return Some((format!("[{host}]"), port));
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => Some((host.to_owned(), port.parse().ok()?)),
+        Some(_) => None,
+        None => Some((authority.to_owned(), default_port)),
+    }
+}
+
+/// The instance-directory key of a host and port: the same transform
+/// [`loom_core::bind_key`] applies to a socket address, so a hostname maps the
+/// same way a literal address does.
+fn authority_key(host: &str, port: u16) -> String {
+    format!("{host}:{port}")
+        .chars()
+        .filter(|value| !matches!(value, '[' | ']'))
+        .map(|value| if value == ':' { '_' } else { value })
+        .collect()
+}
+
+/// Expands a leading `~/` (or a bare `~`) with `home`. Any other path, including
+/// `~user` and a path with no `~` at all, is returned unchanged, and a path whose
+/// home is unknown is returned unchanged as well so the error names what the
+/// caller wrote.
+fn expand_home(path: PathBuf, home: Option<&Path>) -> PathBuf {
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::Normal(first)) if first == "~") {
+        return path;
+    }
+    let Some(home) = home else {
+        return path;
+    };
+    components.fold(home.to_path_buf(), |expanded, component| {
+        expanded.join(component)
+    })
 }
 
 fn parse_format(value: Option<String>) -> Result<Format, String> {
