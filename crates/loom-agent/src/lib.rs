@@ -89,6 +89,28 @@ struct StepContext {
     finished: bool,
     activity_id: ActivityId,
     buffered_tools: Vec<ToolCall>,
+    /// The blocking interaction this turn stopped at. It is applied after the
+    /// calls the turn already had allowed, so the run never rests in
+    /// `Executing` while an approval or an input prompt is still pending.
+    deferred_block: Option<DeferredBlock>,
+}
+
+/// A tool call the turn stops at because it needs a person.
+#[derive(Clone, Debug)]
+pub(crate) enum DeferredBlock {
+    Approval {
+        call: ToolCall,
+        step_id: StepId,
+        step_index: u32,
+        control_revision: u64,
+    },
+    Input {
+        call: ToolCall,
+        prompt: String,
+        step_id: StepId,
+        step_index: u32,
+        control_revision: u64,
+    },
 }
 
 impl StepContext {
@@ -106,6 +128,7 @@ impl StepContext {
             finished: false,
             activity_id,
             buffered_tools: Vec::new(),
+            deferred_block: None,
         }
     }
 }

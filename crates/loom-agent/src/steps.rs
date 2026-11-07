@@ -218,15 +218,26 @@ impl AgentRuntime {
             continue_after_truncation,
             finished,
             buffered_tools,
+            deferred_block,
             ..
         } = ctx;
         events.extend(step_events);
         self.flush_offset = base.saturating_add(published);
         if !buffered_tools.is_empty() {
-            // Tool execution is its own phase: report it as executing instead
-            // of leaving the run in the evaluating state set for the model turn.
-            events.extend(self.set_state(AgentRunState::Executing));
-            self.flush_tool_calls(buffered_tools, events);
+            if matches!(
+                self.run.state,
+                AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+            ) {
+                // The turn failed while it was still producing calls. Answer
+                // them as not run so every call keeps a result, and leave the
+                // terminal state alone instead of reporting the run active.
+                self.answer_unexecuted_tools(buffered_tools, events);
+            } else {
+                // Tool execution is its own phase: report it as executing instead
+                // of leaving the run in the evaluating state set for the model turn.
+                events.extend(self.set_state(AgentRunState::Executing));
+                self.flush_tool_calls(buffered_tools, events);
+            }
         }
         let model_status = match &stream_result {
             Err(_) if self.control.is_stopping() => AgentActivityStatus::Cancelled,
@@ -250,6 +261,12 @@ impl AgentRuntime {
                 events.extend(self.finish_failed(error.message));
                 return Ok(StepOutcome::Blocked);
             }
+        }
+        // The turn's allowed calls ran above, so the blocking interaction a
+        // later call stopped at is entered now: the run goes straight from
+        // `Executing` to the state that interaction owns.
+        if let Some(block) = deferred_block {
+            events.extend(self.enter_deferred_block(block));
         }
         if let Some(events_from_control) = self.apply_control_request() {
             events.extend(events_from_control);
@@ -302,6 +319,103 @@ impl AgentRuntime {
         }
         if !calls.is_empty() {
             self.last_failed_call = None;
+        }
+    }
+
+    /// Enters the blocking interaction one call of a finished model turn needs.
+    ///
+    /// The state that owns the interaction is set before the pending intent is
+    /// recorded, so no reader of the runtime or of an exported state can see a
+    /// pending approval or input while the run is `Executing`.
+    fn enter_deferred_block(&mut self, block: DeferredBlock) -> Vec<AgentEvent> {
+        match block {
+            DeferredBlock::Approval {
+                call,
+                step_id,
+                step_index,
+                control_revision,
+            } => {
+                self.step_id = None;
+                self.step_index = self.step_index.saturating_add(1);
+                let mut events = vec![AgentEvent::StepCompleted {
+                    run_id: self.run.id,
+                    step_id,
+                    index: step_index,
+                }];
+                events.extend(self.set_state(AgentRunState::AwaitingApproval));
+                let interaction_id = self.open_interaction(
+                    loom_model::AgentInteractionKind::ToolApproval,
+                    "Tool approval requested".to_owned(),
+                    Some(call.id),
+                    control_revision,
+                );
+                self.pending_approval = Some(PendingApproval { call: call.clone() });
+                events.push(
+                    self.update_activity_status(call.id, AgentActivityStatus::AwaitingApproval),
+                );
+                events.push(AgentEvent::ToolApprovalRequired {
+                    run_id: self.run.id,
+                    attempt_id: self.run.attempt_id,
+                    control_revision,
+                    interaction_id,
+                    call,
+                });
+                events
+            }
+            DeferredBlock::Input {
+                call,
+                prompt,
+                step_id,
+                step_index,
+                control_revision,
+            } => {
+                self.step_id = None;
+                self.step_index = self.step_index.saturating_add(1);
+                let mut events = vec![AgentEvent::StepCompleted {
+                    run_id: self.run.id,
+                    step_id,
+                    index: step_index,
+                }];
+                events.extend(self.set_state(AgentRunState::NeedsInput));
+                let interaction_id = self.open_interaction(
+                    loom_model::AgentInteractionKind::UserInput,
+                    prompt.clone(),
+                    None,
+                    control_revision,
+                );
+                self.pending_input = Some(prompt.clone());
+                self.push_message(ModelMessage {
+                    role: MessageRole::Tool,
+                    content: format!("Waiting for user input: {prompt}"),
+                    name: Some(call.name.clone()),
+                    tool_call_id: Some(call.id),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                });
+                events
+                    .push(self.update_activity_status(call.id, AgentActivityStatus::AwaitingInput));
+                events.push(AgentEvent::NeedsInput {
+                    run_id: self.run.id,
+                    attempt_id: self.run.attempt_id,
+                    control_revision,
+                    interaction_id,
+                    prompt,
+                });
+                events
+            }
+        }
+    }
+
+    /// Answers calls of a turn that failed while they were still buffered, so
+    /// every call keeps a tool result without reporting the terminal run as
+    /// executing again.
+    fn answer_unexecuted_tools(&mut self, calls: Vec<ToolCall>, events: &mut Vec<AgentEvent>) {
+        for call in calls {
+            let output = format!(
+                "not run: the run was already {:?} when this call was ready",
+                self.run.state
+            );
+            self.fail_tool_call(&call, output, events);
         }
     }
 
@@ -563,32 +677,17 @@ impl AgentRuntime {
                         return Ok(StreamFlow::Continue);
                     }
                     let control_revision = self.next_control_revision()?;
-                    self.pending_approval = Some(PendingApproval { call: call.clone() });
                     self.run.control_revision = control_revision;
-                    let interaction_id = self.open_interaction(
-                        loom_model::AgentInteractionKind::ToolApproval,
-                        "Tool approval requested".to_owned(),
-                        Some(call.id),
-                        control_revision,
-                    );
-                    self.step_id = None;
-                    self.step_index = self.step_index.saturating_add(1);
-                    ctx.events.push(AgentEvent::StepCompleted {
-                        run_id: self.run.id,
-                        step_id: ctx.step_id,
-                        index: ctx.step_index,
-                    });
-                    ctx.events
-                        .extend(self.set_state(AgentRunState::AwaitingApproval));
-                    ctx.events.push(
-                        self.update_activity_status(call.id, AgentActivityStatus::AwaitingApproval),
-                    );
-                    ctx.events.push(AgentEvent::ToolApprovalRequired {
-                        run_id: self.run.id,
-                        attempt_id: self.run.attempt_id,
-                        control_revision,
-                        interaction_id,
+                    // Earlier calls in this turn are still allowed and must run
+                    // in `Executing` first, so the approval is entered after
+                    // the turn's buffered calls ran. Entering it here would
+                    // leave the run `Executing` with a pending approval, which
+                    // the durable state rejects.
+                    ctx.deferred_block = Some(DeferredBlock::Approval {
                         call,
+                        step_id: ctx.step_id,
+                        step_index: ctx.step_index,
+                        control_revision,
                     });
                     ctx.finished = true;
                     return Ok(StreamFlow::Stop);
@@ -734,39 +833,16 @@ impl AgentRuntime {
                         return Ok(StreamFlow::Stop);
                     };
                     let control_revision = self.next_control_revision()?;
-                    let interaction_id = self.open_interaction(
-                        loom_model::AgentInteractionKind::UserInput,
-                        prompt.to_owned(),
-                        None,
-                        control_revision,
-                    );
-                    self.pending_input = Some(prompt.to_owned());
                     self.run.control_revision = control_revision;
-                    self.push_message(ModelMessage {
-                        role: MessageRole::Tool,
-                        content: format!("Waiting for user input: {prompt}"),
-                        name: Some(call.name.clone()),
-                        tool_call_id: Some(call.id),
-                        tool_calls: Vec::new(),
-                        reasoning_content: None,
-                    });
-                    self.step_id = None;
-                    self.step_index = self.step_index.saturating_add(1);
-                    ctx.events.push(AgentEvent::StepCompleted {
-                        run_id: self.run.id,
+                    let prompt = prompt.to_owned();
+                    // Answered after the turn's allowed calls ran, for the same
+                    // reason as a tool approval.
+                    ctx.deferred_block = Some(DeferredBlock::Input {
+                        call,
+                        prompt,
                         step_id: ctx.step_id,
-                        index: ctx.step_index,
-                    });
-                    ctx.events.extend(self.set_state(AgentRunState::NeedsInput));
-                    ctx.events.push(
-                        self.update_activity_status(call.id, AgentActivityStatus::AwaitingInput),
-                    );
-                    ctx.events.push(AgentEvent::NeedsInput {
-                        run_id: self.run.id,
-                        attempt_id: self.run.attempt_id,
+                        step_index: ctx.step_index,
                         control_revision,
-                        interaction_id,
-                        prompt: prompt.to_owned(),
                     });
                     ctx.finished = true;
                     return Ok(StreamFlow::Stop);
