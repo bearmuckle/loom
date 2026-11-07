@@ -70,28 +70,49 @@ impl InProcessBackend {
             ));
         }
         let session = self.sessions()?.get(session_id)?;
-        let expected_root = self
-            .session_root_base
-            .join(session.workspace_id.to_string())
-            .join(session_id.to_string())
-            .join("fs");
-        let canonical_expected_root = fs::canonicalize(&expected_root).map_err(|error| {
-            LoomError::new(
-                ErrorCode::RecoveryRequired,
-                format!("session filesystem root for {session_id} is unavailable: {error}"),
-                true,
-            )
-        })?;
-        if Path::new(&persisted.filesystem.root) != canonical_expected_root {
-            return Err(LoomError::new(
-                ErrorCode::MalformedPayload,
-                format!("persisted filesystem root for session {session_id} is invalid"),
-                false,
-            ));
-        }
-        let filesystem = Workspace::open_for_restore(session_id, &canonical_expected_root)?;
+        // A delegated session of a project without a checkout works in the
+        // project root's workspace, so either root is a valid durable layout.
+        // The persisted root decides which one this session was created with.
+        let private_root =
+            fs::canonicalize(self.session_filesystem_dir(session.workspace_id, session_id));
+        let project_root = self.project_root_owner(session_id)?.and_then(|owner| {
+            fs::canonicalize(self.session_filesystem_dir(session.workspace_id, owner)).ok()
+        });
+        let persisted_root = Path::new(&persisted.filesystem.root);
+        let shared = project_root.as_deref() == Some(persisted_root);
+        let root = if private_root
+            .as_deref()
+            .is_ok_and(|root| root == persisted_root)
+            || shared
+        {
+            persisted_root.to_path_buf()
+        } else {
+            return Err(match (private_root, project_root) {
+                (Err(error), None) => LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    format!("session filesystem root for {session_id} is unavailable: {error}"),
+                    true,
+                ),
+                _ => LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted filesystem root for session {session_id} is invalid"),
+                    false,
+                ),
+            });
+        };
+        let filesystem = Workspace::open_for_restore(session_id, &root)?;
         for directory in &persisted.directories {
             filesystem.mount_directory(&directory.path, &directory.source)?;
+        }
+        if shared {
+            // The project root owns the attached directories. Mounting them
+            // again here is idempotent and keeps a session created before an
+            // attachment working in the same view as its project.
+            if let Some(owner) = self.project_root_owner(session_id)? {
+                for (path, source) in self.session_directories(owner)? {
+                    filesystem.mount_directory(&path, source)?;
+                }
+            }
         }
         filesystem.restore_state(persisted.filesystem)?;
         let owned_worktree_repository_ids = self
@@ -201,16 +222,110 @@ impl InProcessBackend {
         Ok(Some(persisted))
     }
 
+    /// Directory of the filesystem a session owns below the session root base.
+    pub(crate) fn session_filesystem_dir(
+        &self,
+        workspace_id: WorkspaceId,
+        session_id: AgentSessionId,
+    ) -> PathBuf {
+        self.session_root_base
+            .join(workspace_id.to_string())
+            .join(session_id.to_string())
+            .join("fs")
+    }
+
+    /// The project root of a delegated session, or `None` when it is a root.
+    pub(crate) fn project_root_owner(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<Option<AgentSessionId>> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(None);
+        };
+        Ok(persistence
+            .load_project_snapshot_for_session(session_id)?
+            .map(|project| project.root_session_id)
+            .filter(|owner| *owner != session_id))
+    }
+
+    /// The project root whose workspace this session works in, when they share
+    /// one.
+    ///
+    /// A delegated session of a project that keeps no Git checkout works in
+    /// the project root's directory, so a sibling sees what another child wrote
+    /// and every agent sees the root's attached directories. A project with a
+    /// checkout isolates each child in its own linked worktree, which needs a
+    /// private filesystem. The live workspace, or the durable record before it
+    /// is opened, says which layout this session has.
+    pub(crate) fn shared_workspace_owner(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<Option<AgentSessionId>> {
+        let Some(owner) = self.project_root_owner(session_id)? else {
+            return Ok(None);
+        };
+        let session = self.sessions()?.get(session_id)?;
+        let root = match self.session_filesystems()?.get(&session_id) {
+            Some(filesystem) => filesystem.root().to_path_buf(),
+            None => {
+                let Some(persistence) = self.persistence.as_ref() else {
+                    return Ok(None);
+                };
+                let Some(record) = persistence.load_filesystem_record(session_id)? else {
+                    return Ok(None);
+                };
+                PathBuf::from(record.root)
+            }
+        };
+        let owner_root =
+            fs::canonicalize(self.session_filesystem_dir(session.workspace_id, owner)).ok();
+        Ok((owner_root.as_deref() == Some(root.as_path())).then_some(owner))
+    }
+
+    /// Whether a session has a Git checkout attached to it, read from the live
+    /// catalog and otherwise from its durable filesystem record.
+    pub(crate) fn session_has_repositories(&self, session_id: AgentSessionId) -> Result<bool> {
+        if let Some(repositories) = self.session_repositories()?.get(&session_id) {
+            return Ok(!repositories.is_empty());
+        }
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(false);
+        };
+        Ok(persistence
+            .load_filesystem_record(session_id)?
+            .is_some_and(|record| !record.repositories.is_empty()))
+    }
+
+    /// Directories attached to a session, live when its workspace is open and
+    /// from its durable record otherwise.
+    pub(crate) fn session_directories(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<Vec<(String, PathBuf)>> {
+        if let Some(filesystem) = self.session_filesystems()?.get(&session_id).cloned() {
+            return filesystem.mounted_directories();
+        }
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(Vec::new());
+        };
+        Ok(persistence
+            .load_filesystem_record(session_id)?
+            .map(|record| {
+                record
+                    .directories
+                    .into_iter()
+                    .map(|directory| (directory.path, PathBuf::from(directory.source)))
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     pub(crate) fn create_session_filesystem(
         &self,
         workspace_id: WorkspaceId,
         session_id: AgentSessionId,
     ) -> Result<Workspace> {
-        let root = self
-            .session_root_base
-            .join(workspace_id.to_string())
-            .join(session_id.to_string())
-            .join("fs");
+        let root = self.session_filesystem_dir(workspace_id, session_id);
         fs::create_dir_all(&root).map_err(|error| {
             LoomError::new(
                 ErrorCode::WorkspaceAccessDenied,
@@ -219,6 +334,26 @@ impl InProcessBackend {
             )
         })?;
         Workspace::open(session_id, root)
+    }
+
+    /// Opens the project workspace a delegated session shares with its root.
+    ///
+    /// The session keeps its own checkpoints, undo history, and change feed,
+    /// but reads and writes the project root's files and attached directories.
+    /// Attaching or detaching a directory stays with the root that owns it, so
+    /// this never creates a mount of its own.
+    pub(crate) fn create_shared_session_filesystem(
+        &self,
+        workspace_id: WorkspaceId,
+        session_id: AgentSessionId,
+        owner_session_id: AgentSessionId,
+    ) -> Result<Workspace> {
+        let root = self.session_filesystem_dir(workspace_id, owner_session_id);
+        let workspace = Workspace::open(session_id, &root)?;
+        for (path, source) in self.session_directories(owner_session_id)? {
+            workspace.mount_directory(&path, source)?;
+        }
+        Ok(workspace)
     }
 
     pub(crate) fn restore_persisted(self: &Arc<Self>) -> Result<()> {

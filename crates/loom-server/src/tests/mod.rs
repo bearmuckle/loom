@@ -51,6 +51,7 @@ mod project_integration;
 mod project_manager;
 mod project_misc;
 mod project_sub_project;
+mod project_workspace;
 mod providers;
 mod resources;
 mod retention;
