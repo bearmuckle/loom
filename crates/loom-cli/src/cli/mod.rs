@@ -44,6 +44,8 @@
 //! | `project children` | `Project/GetProjectSnapshotForSession`, `Session/GetAgentSessionSnapshotMetadata` per direct child |
 //! | `project messages` | `Project/GetProjectSnapshotForSession`, `Project/ListProjectAgentMessages` |
 //! | `project child` | `Project/GetProjectSnapshotForSession`, `Project/ControlProjectChild` |
+//! | `project models get` | `Project/GetProjectSnapshotForSession`, `Project/GetProjectChildModels` |
+//! | `project models set` | `Project/GetProjectSnapshotForSession`, `Project/GetProjectChildModels`, `Project/SetProjectChildModels` |
 //! | `project archive` | `Project/GetProjectSnapshotForSession`, `Session/ArchiveAgentSession` |
 //! | `project delete` | `Project/GetProjectSnapshotForSession`, `Session/DeleteAgentSession` |
 //! | `project worktrees` | `Project/GetProjectSnapshotForSession` |
@@ -184,6 +186,13 @@
 //! `project messages` also `read_project_agent_messages`, so a
 //! read-only-scoped token can run them.
 //!
+//! `project models get` reads the child model policy stored for the project
+//! root, so it resolves the addressed session through
+//! `Project/GetProjectSnapshotForSession` first and sends
+//! `Project/GetProjectChildModels` with the root id; a member session therefore
+//! reports its project's policy, and a session the worker does not know fails
+//! instead of reporting an empty policy for a made-up project.
+//!
 //! The project id every later request needs comes from
 //! `Project/GetProjectSnapshotForSession`, which is the authoritative projection
 //! of the hierarchy and its tasks. `project messages` pages
@@ -286,8 +295,11 @@
 //! `Collaboration/GetRunRevision` once it has something to report. It is always
 //! time-bounded: `--timeout` (60 seconds by default) ends the poll with
 //! `deadline_exceeded` and exit `4`. A run parked on an approval or a question
-//! is reported at once with exit `3`, and the `--json` envelope carries the
-//! attempt id and, for an approval, the tool call id. Any terminal state is
+//! is reported at once with exit `3`, and the `--json` envelope carries the run
+//! id, the attempt id, and, for an approval, the tool call id and the exact
+//! `approve` command. The text names the run id on the `blocked` line and prints
+//! that command after it, so a supervisor can approve without another read. Any
+//! terminal state is
 //! reported at once with exit `0`, whether the run completed, failed, or was
 //! cancelled: `data.state` and `terminal: true` name the outcome. The timeout
 //! therefore covers only a run that is still working, never a person's decision.
@@ -306,7 +318,9 @@
 //! metadata of every agent whose project record is `awaiting_approval` or
 //! `needs_input` to learn which decision it waits on. The requested session
 //! reuses its own projection, so its pending decision appears once as a
-//! `decision` line instead of the plain `pending` line.
+//! `decision` line instead of the plain `pending` line. A `decision` line names
+//! the session, its run, and the tool call or question, so a blocked child is
+//! actionable from the line alone.
 //!
 //! `liveness` never guesses: an archived or terminal session is `dead`, a
 //! session the worker does not know is `gone` with exit `5`, a transport

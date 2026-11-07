@@ -1231,6 +1231,23 @@ Examples:
 "#,
     ),
     (
+        "retention",
+        r#"Usage: loom-cli retention get|set
+
+Report or change the worker-wide archive-retention policy.
+
+Sub-verbs:
+  get                         report the stored policy
+  set                         merge fields into the stored policy
+
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli retention get
+  loom-cli retention set --window 14d --json
+"#,
+    ),
+    (
         "retention get",
         r#"Usage: loom-cli retention get
 
@@ -1263,6 +1280,23 @@ Global flags are accepted anywhere; see 'loom-cli --help'.
 Examples:
   loom-cli retention set --window 14d
   loom-cli retention set --window off --force-discard true --json
+"#,
+    ),
+    (
+        "providers",
+        r#"Usage: loom-cli providers list|set-key
+
+List the configured providers or store one provider's API key.
+
+Sub-verbs:
+  list                        list the providers and their credentials
+  set-key                     store a key read from a variable or a file
+
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli providers list
+  loom-cli providers set-key --provider openai --from-env OPENAI_API_KEY
 "#,
     ),
     (
@@ -1302,6 +1336,22 @@ Examples:
 "#,
     ),
     (
+        "models",
+        r#"Usage: loom-cli models list [--provider <id>]
+
+List the models of the configured providers.
+
+Sub-verbs:
+  list                        list the models and one default per provider
+
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli models list
+  loom-cli models list --provider deepseek --json
+"#,
+    ),
+    (
         "models list",
         r#"Usage: loom-cli models list [--provider <id>]
 
@@ -1316,6 +1366,23 @@ Global flags are accepted anywhere; see 'loom-cli --help'.
 Examples:
   loom-cli models list
   loom-cli models list --provider deepseek --json
+"#,
+    ),
+    (
+        "session",
+        r#"Usage: loom-cli session archive|delete <session-id>
+
+Archive or delete one session.
+
+Sub-verbs:
+  archive                     keep the transcript and every checkout
+  delete                      delete an archived session for good
+
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli session archive <session-id>
+  loom-cli session delete <session-id> --yes --json
 "#,
     ),
     (
@@ -1376,6 +1443,37 @@ Examples:
 "#,
     ),
     (
+        "project",
+        r#"Usage: loom-cli project <sub-verb> [flags]
+
+Read a project's hierarchy, tasks, children, messages, worktrees, and child
+model policy; direct or control one delegated child; archive or delete a
+project.
+
+Sub-verbs:
+  get <session-id>            members and the project it was branched from
+  tree <session-id>           the hierarchy as a tree
+  tasks <session-id>          delegated tasks with status
+  children <session-id>       direct child agents
+  messages <session-id>       delegated-agent message history
+  send <session-id>           direct a delegated child's active run
+  child pause|resume|interrupt|cancel <task-id>
+                              control one delegated child task
+  archive <session-id>        archive a project root and its idle members
+  delete <session-id>         delete a project root and its tree
+  worktrees <session-id>      the checkouts the snapshot records
+  worktree get|diff|integrate|cleanup <session-id> --task <task-id>
+                              inspect or land one delegated checkout
+  models get|set <session-id> the models delegated children run on
+
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project get <session-id>
+  loom-cli project children <session-id> --json
+"#,
+    ),
+    (
         "project get",
         r#"Usage: loom-cli project get <session-id>
 
@@ -1391,14 +1489,32 @@ Examples:
 "#,
     ),
     (
+        "project models",
+        r#"Usage: loom-cli project models get|set <session-id>
+
+Report or change the models the project's delegated children run on.
+
+Sub-verbs:
+  get                         the stored default and per-kind models
+  set                         change only the entries a flag names
+
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project models get <session-id>
+  loom-cli project models set <project-root-id> --child-model deepseek-flash
+"#,
+    ),
+    (
         "project models get",
         r#"Usage: loom-cli project models get <session-id>
 
 Report the models the project's delegated children run on: the default child
-model and one model per kind of work. Any member session addresses its project.
-A child the agent delegates with a mapped `kind` runs on that kind's model, any
-other child on the default, and without a default it reuses its parent's model.
-A model the agent names explicitly overrides the project.
+model and one model per kind of work. The policy belongs to the project root,
+so a member session is resolved to its root first; the printed project line
+names that root. A child the agent delegates with a mapped `kind` runs on that
+kind's model, any other child on the default, and without a default it reuses
+its parent's model. A model the agent names explicitly overrides the project.
 
 Flags:
   --json                      print one JSON envelope instead of text
@@ -1541,6 +1657,75 @@ Examples:
 "#,
     ),
     (
+        "project child pause",
+        r#"Usage: loom-cli project child pause <task-id> --session <id> [--request-id <uuid>]
+
+Pause one delegated child task; its run stops at the next safe point.
+
+Flags:
+  --session <id>              the project member session to read (required)
+  --request-id <uuid>         the idempotency key of the control request
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project child pause <task-id> --session <session-id>
+  loom-cli project child pause <task-id> --session <session-id> --json
+"#,
+    ),
+    (
+        "project child resume",
+        r#"Usage: loom-cli project child resume <task-id> --session <id> [--request-id <uuid>]
+
+Resume one paused delegated child task.
+
+Flags:
+  --session <id>              the project member session to read (required)
+  --request-id <uuid>         the idempotency key of the control request
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project child resume <task-id> --session <session-id>
+  loom-cli project child resume <task-id> --session <session-id> --json
+"#,
+    ),
+    (
+        "project child interrupt",
+        r#"Usage: loom-cli project child interrupt <task-id> --session <id> [--request-id <uuid>]
+
+Interrupt the run of one delegated child task, keeping the task and its
+checkout.
+
+Flags:
+  --session <id>              the project member session to read (required)
+  --request-id <uuid>         the idempotency key of the control request
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project child interrupt <task-id> --session <session-id>
+  loom-cli project child interrupt <task-id> --session <session-id> --json
+"#,
+    ),
+    (
+        "project child cancel",
+        r#"Usage: loom-cli project child cancel <task-id> --session <id> [--request-id <uuid>]
+
+Cancel one delegated child task and its run.
+
+Flags:
+  --session <id>              the project member session to read (required)
+  --request-id <uuid>         the idempotency key of the control request
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project child cancel <task-id> --session <session-id>
+  loom-cli project child cancel <task-id> --session <session-id> --json
+"#,
+    ),
+    (
         "project archive",
         r#"Usage: loom-cli project archive <session-id> [--request-id <uuid>]
 
@@ -1588,6 +1773,25 @@ Global flags are accepted anywhere; see 'loom-cli --help'.
 Examples:
   loom-cli project worktrees <project-root-id>
   loom-cli project worktrees <project-root-id> --json
+"#,
+    ),
+    (
+        "project worktree",
+        r#"Usage: loom-cli project worktree get|diff|integrate|cleanup <session-id> --task <task-id>
+
+Inspect, land, or clean up the checkout one delegated task records.
+
+Sub-verbs:
+  get                         the durable worktree record
+  diff                        the worker's bounded review of the checkout
+  integrate                   fast-forward the parent with the result revision
+  cleanup                     keep, remove, or discard the checkout
+
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli project worktree diff <session-id> --task <task-id>
+  loom-cli project worktree cleanup <session-id> --task <task-id> --keep
 "#,
     ),
     (

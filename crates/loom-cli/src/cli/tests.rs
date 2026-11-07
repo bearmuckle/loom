@@ -5201,9 +5201,15 @@ fn wait_reports_blocked_and_terminal_and_is_always_bounded() {
         ],
     );
     assert_eq!(blocked.code, exit::BLOCKED, "{}", blocked.stderr);
+    // The blocked line names the run as well as the attempt and the tool call,
+    // because `loom-cli approve --run` needs the run id. The approve line is the
+    // exact command that unblocks the run.
     assert_eq!(
         blocked.stdout,
-        format!("run {run_id} awaiting_approval\nblocked {attempt} {call}\n")
+        format!(
+            "run {run_id} awaiting_approval\nblocked {run_id} {attempt} {call}\n\
+             approve loom-cli approve --run {run_id} --tool-call {call}\n"
+        )
     );
 
     let blocked_json = run(
@@ -5221,6 +5227,11 @@ fn wait_reports_blocked_and_terminal_and_is_always_bounded() {
     let envelope = json_envelope(&blocked_json);
     assert_eq!(envelope["ok"], true);
     assert_eq!(envelope["data"]["blocked"], true);
+    assert_eq!(envelope["data"]["run_id"], run_id.to_string());
+    assert_eq!(
+        envelope["data"]["approve_command"],
+        format!("loom-cli approve --run {run_id} --tool-call {call}")
+    );
     assert_eq!(envelope["data"]["attempt_id"], attempt.to_string().as_str());
     assert_eq!(envelope["data"]["tool_call_id"], call.to_string().as_str());
 
@@ -6271,7 +6282,7 @@ fn status_tree_projects_agents_tasks_worktrees_and_decisions() {
              {result_revision} {integrated_revision}"
         ),
         "conflict wt-1 src/main.rs".to_owned(),
-        format!("decision approval {child} {call} {tool_name}"),
+        format!("decision approval {child} {run_id} {call} {tool_name}"),
     ]
     .join("\n");
     assert_eq!(tree.stdout, format!("{expected}\n"));
@@ -6413,7 +6424,7 @@ fn status_tree_reports_a_question_decision() {
         format!("root {root}"),
         format!("agent {root} 1 idle done -"),
         format!("agent {child} 2 needs_input blocked -"),
-        format!("decision question {child} which branch should I use?"),
+        format!("decision question {child} {child_run} which branch should I use?"),
     ]
     .join("\n");
     assert_eq!(tree.stdout, format!("{expected}\n"));
@@ -6442,7 +6453,7 @@ fn status_tree_reports_a_question_decision() {
         format!("project {root} done"),
         format!("root {root}"),
         format!("agent {root} 1 idle done -"),
-        format!("decision question {child} which branch should I use?"),
+        format!("decision question {child} {child_run} which branch should I use?"),
     ]
     .join("\n");
     assert_eq!(tree.stdout, format!("{expected}\n"));
@@ -10909,20 +10920,42 @@ fn child_model_flags_parse_into_named_changes() {
 fn project_models_help_pages_print_their_own_usage() {
     let fixture = fixture();
     let mut client = InProcessClient::new(&fixture.backend);
-    for (arguments, usage) in [
+    for (arguments, usage, expected) in [
+        (
+            vec!["project", "--help"],
+            "Usage: loom-cli project ",
+            "worktree get|diff|integrate|cleanup",
+        ),
+        (
+            vec!["project", "models", "--help"],
+            "Usage: loom-cli project models",
+            "get|set",
+        ),
+        (
+            vec!["project", "worktree", "--help"],
+            "Usage: loom-cli project worktree",
+            "integrate",
+        ),
+        (
+            vec!["project", "child", "pause", "--help"],
+            "Usage: loom-cli project child pause",
+            "--json",
+        ),
         (
             vec!["project", "models", "get", "--help"],
             "Usage: loom-cli project models get",
+            "--json",
         ),
         (
             vec!["project", "models", "set", "--help"],
             "Usage: loom-cli project models set",
+            "--json",
         ),
     ] {
         let page = run(&mut client, &arguments);
-        assert_eq!(page.code, exit::OK);
+        assert_eq!(page.code, exit::OK, "{arguments:?}");
         assert!(page.stdout.starts_with(usage), "{}", page.stdout);
-        assert!(page.stdout.contains("--json"), "{}", page.stdout);
+        assert!(page.stdout.contains(expected), "{}", page.stdout);
     }
     let run_page = run(&mut client, &["run", "--help"]);
     assert!(
@@ -11075,6 +11108,83 @@ fn project_models_get_and_set_change_the_stored_policy() {
 }
 
 #[test]
+fn project_models_get_resolves_a_member_session_to_its_root() {
+    let (fixture, directory) = persistent_fixture("project-models-member");
+    let root = fixture.session.id;
+    let root_text = root.to_string();
+    let mut client = InProcessClient::new(&fixture.backend);
+    let set = run(
+        &mut client,
+        &[
+            "project",
+            "models",
+            "set",
+            &root_text,
+            "--child-model",
+            "deterministic/demo",
+        ],
+    );
+    assert_eq!(set.code, exit::OK, "{}", set.stderr);
+
+    // A delegated child is a member of the root's project, not a root itself.
+    let member = create_session(&fixture.control, fixture.workspace.id, "delegated member").id;
+    let snapshot = fake_project(root, &[root, member], Vec::new());
+    let mut client = Wrapped::new(InProcessClient::new(&fixture.backend))
+        .after(move |request, response| {
+            if let ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession {
+                session_id,
+            }) = request
+                && *session_id == member
+            {
+                response.result = Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(
+                    snapshot.clone(),
+                )));
+            }
+        })
+        // A worker that stores the policy only on the root refuses to read it
+        // through a member session; resolving first is what makes this pass.
+        .fail_on(move |request| match request {
+            ClientRequest::Project(ProjectRequest::GetProjectChildModels { session_id })
+                if *session_id == member =>
+            {
+                Some(loom_core::LoomError::invalid_request(format!(
+                    "session {member} is a member of project {root}; read the project root {root}"
+                )))
+            }
+            _ => None,
+        });
+
+    let member_text = member.to_string();
+    let get = run(
+        &mut client,
+        &["project", "models", "get", &member_text, "--json"],
+    );
+    assert_eq!(get.code, exit::OK, "{}", get.stderr);
+    let envelope = json_envelope(&get);
+    assert_eq!(envelope["verb"], "project models get");
+    assert_eq!(envelope["data"]["project_id"], root_text.as_str());
+    assert_eq!(
+        envelope["data"]["child_models"]["default_model_id"],
+        "deterministic/demo"
+    );
+
+    // A session the worker does not know names no project root, and the error
+    // says so instead of printing an empty policy for a made-up project.
+    let unknown = AgentSessionId::new().to_string();
+    let missing = run(&mut client, &["project", "models", "get", &unknown]);
+    assert_eq!(missing.code, exit::GONE, "{}", missing.stderr);
+    assert!(
+        missing.stderr.contains(&format!(
+            "'{unknown}' does not name a session, so it names no project root"
+        )),
+        "{}",
+        missing.stderr
+    );
+    drop(client);
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
 fn run_stores_the_child_models_before_it_starts() {
     let (fixture, directory) = persistent_fixture("run-child-models");
     let workspace = fixture.workspace.id.to_string();
@@ -11205,4 +11315,65 @@ fn run_project_stores_the_child_models_on_the_sub_project_it_creates() {
     drop(client);
     fixture.backend.shutdown().unwrap();
     let _ = std::fs::remove_dir_all(directory);
+}
+
+#[test]
+fn every_nested_command_and_group_has_its_own_help() {
+    // A group and every nested verb prints its own page instead of the global
+    // manual, whichever help flag asks for it.
+    let commands = [
+        "retention",
+        "retention get",
+        "retention set",
+        "providers",
+        "providers list",
+        "providers set-key",
+        "models",
+        "models list",
+        "session",
+        "session archive",
+        "session delete",
+        "project",
+        "project get",
+        "project tree",
+        "project tasks",
+        "project children",
+        "project messages",
+        "project send",
+        "project archive",
+        "project delete",
+        "project models",
+        "project models get",
+        "project models set",
+        "project child",
+        "project child pause",
+        "project child resume",
+        "project child interrupt",
+        "project child cancel",
+        "project worktrees",
+        "project worktree",
+        "project worktree get",
+        "project worktree diff",
+        "project worktree integrate",
+        "project worktree cleanup",
+    ];
+    for command in commands {
+        for flag in ["--help", "-h"] {
+            let mut arguments: Vec<String> =
+                command.split_whitespace().map(str::to_owned).collect();
+            arguments.push(flag.to_owned());
+            let page = args::help_text(&arguments);
+            assert!(
+                page.starts_with(&format!("Usage: loom-cli {command}")),
+                "{command}: {page}"
+            );
+            assert_ne!(page, args::HELP, "{command}");
+        }
+    }
+
+    // A positional argument between the verb and the flag still names the verb.
+    let nested = ["project", "models", "get", "<session-id>", "--help"]
+        .map(str::to_owned)
+        .to_vec();
+    assert!(args::help_text(&nested).starts_with("Usage: loom-cli project models get"));
 }
