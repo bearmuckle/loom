@@ -76,7 +76,7 @@ error invalid_request could not read the token file \
 | `session delete <session-id> [--force] [--yes] [--request-id <uuid>]` | Permanently delete an archived session, or a project root with its descendants. |
 | `project get <session-id>` | One project's members, their depth and parent, and the project it was branched from. |
 | `project tree <session-id>` | The same hierarchy as an indented pre-order tree. |
-| `project models get <session-id>` | The models the project's delegated children run on: the default child model and one model per kind of work. |
+| `project models get <session-id>` | The models the project's delegated children run on: the default child model and one model per kind of work. A member session resolves to its project root. |
 | `project models set <project-root-id> [--child-model <id> \| --no-child-model] [--child-model-for <kind>=<id>]... [--unset-kind <kind>]... [--clear] [--request-id <uuid>]` | Change only the named child model entries of a project, and print the stored policy. |
 | `project tasks <session-id>` | The project's delegated tasks with status, owner, target, model, dependency blocks, and intent. |
 | `project children <session-id>` | The direct child agents with their task, run, pending approval, and pending question. |
@@ -343,14 +343,26 @@ the `pending_approval` event or from `wait`/`status`. They read
   and prints `archived <session-id>` after `stopped <run-id> <state>`.
 
 `wait --until blocked` returns exit `3` as soon as the run is
-`awaiting_approval` or `needs_input`, with the attempt id and, for an approval,
-the tool call id in the `--json` envelope. It does not wait for a person to
-decide. The timeout covers only a run that is still working, and a run parked
-on a question or approval is likewise reported at once by `--until terminal`,
-because it cannot reach a terminal state without a decision. `--until terminal`
-exits `0` for every terminal state, whether the run `completed`, `failed`, or
-was `cancelled`; `data.state` and `terminal: true` distinguish them, so a
-caller reads the outcome from the envelope instead of the exit code.
+`awaiting_approval` or `needs_input`, and it does not wait for a person to
+decide. The text output names the run, the attempt, and the pending tool call,
+and for a pending approval it prints the exact command that unblocks the run:
+
+```
+run <run-id> awaiting_approval
+blocked <run-id> <attempt-id> <tool-call-id|->
+approve loom-cli approve --run <run-id> --tool-call <tool-call-id>
+```
+
+The `--json` envelope carries the same values as `data.run_id`,
+`data.attempt_id`, `data.tool_call_id`, and `data.approve_command` (null
+without a pending approval), so a supervisor never has to reconstruct the run
+id from another request. The timeout covers only a run that is still working,
+and a run parked on a question or approval is likewise reported at once by
+`--until terminal`, because it cannot reach a terminal state without a decision.
+`--until terminal` exits `0` for every terminal state, whether the run
+`completed`, `failed`, or was `cancelled`; `data.state` and `terminal: true`
+distinguish them, so a caller reads the outcome from the envelope instead of
+the exit code.
 
 `status --format verb` prints the declaration grammar the rest of the ecosystem
 uses: `working: …`, `blocked: …`, `paused: …`, `done: …`, or `failed: …`, each
@@ -380,8 +392,8 @@ agent <session-id> <depth> <state> <verdict> <task-summary-or-dash>
 task <task-id> <status> <child-name>
 worktree <worktree-name> <relative-path> <status> <task-id> <base-revision> <result-revision-or-dash> <integrated-revision-or-dash>
 conflict <worktree-name> <path>
-decision approval <session-id> <tool-call-id> <tool-name>
-decision question <session-id> <question-text>
+decision approval <session-id> <run-id> <tool-call-id> <tool-name>
+decision question <session-id> <run-id> <question-text>
 ```
 
 `parent` appears only for a sub project, `conflict` appears after the worktree
@@ -519,8 +531,11 @@ it. An unknown kind falls through to the default. The delegation result reports
 `model_id`, `model_source` (`explicit`, `kind`, `project_default`, or
 `parent`), and the normalized `kind`.
 
-`project models get <session-id>` sends `Project/GetProjectChildModels`, which
-any member session addresses, and negotiates `read_project`. `project models set
+`project models get <session-id>` resolves the id to the project root first,
+then sends `Project/GetProjectChildModels` with that root, so any member
+session addresses the same policy; a session the worker does not know fails
+instead of reporting the policy of a made-up project. The verb negotiates
+`read_project`. `project models set
 <project-root-id>` reads the stored policy, applies only the entries its flags
 name (`--clear` starts from an empty policy), and sends
 `Project/SetProjectChildModels`, negotiating `control_agent_session`; the id

@@ -8,7 +8,9 @@
 
 use std::io::Write;
 
-use loom_core::{AgentSessionId, ProjectChildModelPolicy, ProjectId, RequestId};
+use loom_core::{
+    AgentSessionId, ErrorCode, LoomError, ProjectChildModelPolicy, ProjectId, RequestId,
+};
 use loom_protocol::{ClientRequest, ProjectRequest, ProjectResponse, ServerResponse};
 use serde_json::{Value, json};
 
@@ -19,6 +21,10 @@ use crate::cli::text::escape;
 use super::{Caller, Failure, Outcome, derived_id, emit, handshake};
 
 /// `project models get`: the policy of the project any member addresses.
+///
+/// The policy is stored for the project root, so a member session is resolved
+/// to its root first: the read names the root the policy belongs to, and the
+/// printed project id is the root's.
 pub(super) async fn get<C: Client>(
     client: &mut C,
     invocation: &Invocation,
@@ -27,12 +33,53 @@ pub(super) async fn get<C: Client>(
 ) -> Result<Outcome, Failure> {
     let mut caller = Caller::new(client);
     handshake(&mut caller, &invocation.verb).await?;
-    let (_, project_id, policy) = read(&mut caller, session_id).await?;
+    let root = root_session(&mut caller, session_id).await?;
+    let (_, project_id, policy) = read(&mut caller, root).await?;
     if !invocation.globals.json {
         emit(out, &format!("project {project_id}\n"))?;
         emit_policy(out, &policy)?;
     }
     Ok(Outcome::new(value(project_id, &policy), caller.primary))
+}
+
+/// The root session of the project `session_id` belongs to.
+///
+/// A project is addressed by any of its member sessions, but only the root
+/// stores its child model policy, so `project models get` resolves the session
+/// first. A session the worker does not know names no project root, and the
+/// error says so instead of reporting the policy of a made-up project.
+async fn root_session<C: Client>(
+    caller: &mut Caller<'_, C>,
+    session_id: AgentSessionId,
+) -> Result<AgentSessionId, Failure> {
+    match caller
+        .call(ClientRequest::Project(
+            ProjectRequest::GetProjectSnapshotForSession { session_id },
+        ))
+        .await
+    {
+        Ok((_, ServerResponse::Project(ProjectResponse::ProjectSnapshot(project)))) => {
+            Ok(project.root_session_id)
+        }
+        Ok((request_id, _)) => Err(Failure::unexpected(request_id, "project snapshot")),
+        Err(failure) => Err(failure),
+    }
+    .map_err(|failure| match failure {
+        Failure::Server { request_id, error } if error.code == ErrorCode::NotFound => {
+            Failure::Server {
+                request_id,
+                error: LoomError::new(
+                    ErrorCode::NotFound,
+                    format!(
+                        "'{session_id}' does not name a session, so it names no project root; \
+                         'loom-cli ls' lists the sessions"
+                    ),
+                    false,
+                ),
+            }
+        }
+        other => other,
+    })
 }
 
 /// `project models set`: apply the flags to the stored policy of the project

@@ -446,22 +446,30 @@ pub(super) async fn wait<C: Client>(
                     emit(
                         out,
                         &format!(
-                            "blocked {} {}\n",
+                            "blocked {} {} {}\n",
+                            active.run.id,
                             active.run.attempt_id,
                             tool_call_id
                                 .map(|id| id.to_string())
                                 .unwrap_or_else(|| "-".to_owned())
                         ),
                     )?;
+                    // The blocked line names the run and the tool call, but the
+                    // exact command that unblocks it is what a supervisor copies.
+                    if let Some(command) = approve_command(active.run.id, tool_call_id) {
+                        emit(out, &format!("approve {command}\n"))?;
+                    }
                 }
             }
             let data = json!({
                 "session": session_id.to_string(),
                 "until": until_name(until),
                 "run": run_value(&active.run),
+                "run_id": active.run.id.to_string(),
                 "state": run_state_name(state),
                 "attempt_id": active.run.attempt_id.to_string(),
                 "tool_call_id": tool_call_id.map(|id| id.to_string()),
+                "approve_command": approve_command(active.run.id, tool_call_id),
                 "revision": revision,
                 "blocked": blocked,
                 "terminal": terminal,
@@ -476,6 +484,13 @@ pub(super) async fn wait<C: Client>(
         tokio::time::sleep(delay.min(remaining)).await;
         delay = (delay * 2).min(WAIT_MAX_DELAY);
     }
+}
+
+/// The exact command that approves `tool_call_id` of `run_id`, so a blocked
+/// report carries what a supervisor copies instead of only the ids.
+fn approve_command(run_id: RunId, tool_call_id: Option<ToolCallId>) -> Option<String> {
+    tool_call_id
+        .map(|tool_call_id| format!("loom-cli approve --run {run_id} --tool-call {tool_call_id}"))
 }
 
 /// The timeout failure `wait` reports when the deadline passes first.
@@ -826,23 +841,28 @@ fn emit_project(out: &mut dyn Write, project: &ProjectTree) -> Result<(), Failur
         match decision {
             Decision::Approval {
                 session_id,
+                run_id,
                 tool_call_id,
                 tool_name,
                 ..
             } => emit(
                 out,
                 &format!(
-                    "decision approval {session_id} {tool_call_id} {}\n",
+                    "decision approval {session_id} {run_id} {tool_call_id} {}\n",
                     escape(tool_name)
                 ),
             )?,
             Decision::Question {
                 session_id,
+                run_id,
                 question,
                 ..
             } => emit(
                 out,
-                &format!("decision question {session_id} {}\n", escape(question)),
+                &format!(
+                    "decision question {session_id} {run_id} {}\n",
+                    escape(question)
+                ),
             )?,
         }
     }
