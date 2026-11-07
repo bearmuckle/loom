@@ -56,7 +56,7 @@ error invalid_request could not read the token file \
 | `get <session-id> [--metadata]` | One session snapshot, or that snapshot with its active run metadata. |
 | `events --session <id> [--after <seq>] [--cursor-file <path>] [--follow] [--timeout <seconds>] [--format text\|jsonl] [--max-bytes <n>]` | Session events, followed until the run completes or the caller interrupts; `--timeout` bounds the follow and exits `4` when it elapses. |
 | `peek --session <id> [--lines <n>] [--format text\|jsonl] [--max-bytes <n>]` | The tail of the session's current output; 200 lines by default. |
-| `run --workspace <id> (--task <text> \| --task-file <path>) [--name <name>] [--model <id>] [--repo <source> [--revision <rev>] [--path <path>]] [--as-directory <path>] [--approval-policy default\|auto] [--request-id <uuid>] [--new]` | Reuse or create the session named `--name`, attach the inputs, and start one run. `--new` always creates a session. Without `--model` the first credentialed provider's default model is started. |
+| `run --workspace <id> (--task <text> \| --task-file <path>) [--name <name>] [--model <id>] [--repo <source> [--revision <rev>] [--path <path>]] [--as-directory <path>] [--approval-policy default\|auto] [--request-id <uuid>] [--new] [--project <session-id>]` | Reuse or create the session named `--name`, attach the inputs, and start one run. `--new` always creates a session. `--project` makes it a sub project of that project root. Without `--model` the first credentialed provider's default model is started. |
 | `send --run <id> --text <text>` | Follow-up direction to the active run. |
 | `answer --run <id> --text <text>` | Answer the question the run is waiting on. |
 | `approve --run <id> --tool-call <id>` | Approve the tool call that blocked the run. |
@@ -291,6 +291,30 @@ session creation and the input attachments use deterministic ids derived from
 it. Repeating the command returns the same session and the same run, with
 exactly one of each. The `--json` envelope reports both ids under
 `data.request_ids` (`session` and `run`).
+
+### `run --project`
+
+`--project <session-id>` puts the session in an existing project instead of
+making it a project of its own. The id is a project root, the id
+`status --tree` prints on its `project` line. The verb lists the workspace and
+reads `GetProjectSnapshotForSession` first: an id that is not a live session
+of `--workspace` (unknown, archived, or in another workspace) is `not_found`
+(exit `5`), and an agent of a project is a usage error that names the root to
+pass instead. These checks run with `--new` too, so `--new --project` does list
+the workspace.
+
+The session is created with `Project/CreateSubProject`, the request loom-ui's
+**New sub project** sends, so loom-ui lists it beneath the project and
+`status --session <id> --tree` prints `parent <project-id>`. Without `--new`,
+`--name` is reused only among the project's sub projects; a project root of the
+same name elsewhere is never picked. A sub project this command created
+inherits the project's folders, then the repositories no inherited folder
+covers, unless `--repo` or `--as-directory` names its input instead; a source
+that cannot be inherited is a warning on stderr. Text output gains a third
+line, `parent <project-id>`, and `--json` reports
+`data.project = {"id": <session-id>, "parent_id": <project-id>}` (`null`
+without `--project`). With `--new --request-id <base>` the creation and every
+inherited attachment use ids derived from `<base>`, so the command replays.
 
 ## Supervising a run
 
