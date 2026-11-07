@@ -7,7 +7,15 @@ pub struct OpenAiCompatibleProvider {
     pub api_key: String,
     pub descriptor: ModelDescriptor,
     pub stream_timeouts: StreamTimeouts,
+    /// The Loom session this provider serves, when it was created for one.
+    /// Sent as [`OPENCODE_SESSION_HEADER`] so a gateway that keeps upstream
+    /// affinity per conversation can follow one Loom session's requests.
+    pub session_id: Option<String>,
 }
+
+/// The header an OpenAI-compatible gateway reads to keep one conversation on
+/// one upstream session. OpenCode Go requires it on every chat request.
+pub const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 
 /// Deadlines for a streamed completion.
 ///
@@ -75,7 +83,17 @@ impl OpenAiCompatibleProvider {
             api_key: api_key.into(),
             descriptor,
             stream_timeouts: StreamTimeouts::default(),
+            session_id: None,
         }
+    }
+
+    /// Names the Loom session this provider serves. Its id is sent as a header
+    /// on every chat request, so the gateway sees a stable conversation id that
+    /// outlives a single run of the session.
+    #[must_use]
+    pub fn with_session(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
     }
 
     /// Replaces the streaming deadlines (used by tests and slow endpoints).
@@ -147,10 +165,14 @@ impl ModelProvider for OpenAiCompatibleProvider {
         } else {
             bearer_header(&self.api_key)
         };
+        let session = self
+            .session_id
+            .as_deref()
+            .map(|session| (OPENCODE_SESSION_HEADER, session));
         send_openai_request(
             &self.endpoint,
             &authorization,
-            &[],
+            session.as_slice(),
             payload,
             self.descriptor.provider.as_str(),
             None,

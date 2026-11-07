@@ -1002,6 +1002,177 @@ impl LoomView {
         );
     }
 
+    /// Creates the add-provider form's inputs on the first render of the
+    /// Providers pane, and drops whatever an earlier pane left behind.
+    ///
+    /// The renderer is the only place with a window, so it is where an input is
+    /// created; the form keeps the entity so typing survives a redraw.
+    pub(crate) fn sync_provider_add_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.provider_add_form.id.is_some() {
+            return;
+        }
+        self.provider_add_form = ProviderAddForm {
+            id: Some(cx.new(|cx| {
+                InputState::new(window, cx).placeholder("Provider id, such as opencode-go")
+            })),
+            endpoint: Some(cx.new(|cx| {
+                InputState::new(window, cx).placeholder("Chat-completions endpoint")
+            })),
+            models: Some(cx.new(|cx| {
+                InputState::new(window, cx).placeholder("Models, comma separated")
+            })),
+            status: None,
+        };
+    }
+
+    /// Drops the add-provider form when the Providers pane is not on screen.
+    pub(crate) fn clear_provider_add_form(&mut self) {
+        self.provider_add_form = ProviderAddForm::default();
+    }
+
+    /// Adds an OpenAI-compatible provider from the Providers pane.
+    ///
+    /// The provider is registered first and keyed afterwards through the same
+    /// "Save key" row every API-key provider has, so Go and Zen share one server
+    /// path and one credential mechanism with DeepSeek.
+    pub(crate) fn add_openai_compatible_provider(&mut self, cx: &mut Context<Self>) {
+        let Some(node_id) = self.providers_node_id.clone() else {
+            self.provider_add_form.status = Some("Choose a worker before adding a provider".to_owned());
+            cx.notify();
+            return;
+        };
+        let value = |input: &Option<Entity<InputState>>, cx: &Context<Self>| {
+            input
+                .as_ref()
+                .map(|input| input.read(cx).value().to_string())
+                .unwrap_or_default()
+        };
+        let provider_id = value(&self.provider_add_form.id, cx).trim().to_owned();
+        let endpoint = value(&self.provider_add_form.endpoint, cx).trim().to_owned();
+        let models = value(&self.provider_add_form.models, cx)
+            .split(',')
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(ModelId::new)
+            .collect::<Vec<_>>();
+        if provider_id.is_empty() || endpoint.is_empty() || models.is_empty() {
+            self.provider_add_form.status =
+                Some("Enter a provider id, an endpoint, and at least one model".to_owned());
+            cx.notify();
+            return;
+        }
+        let default_model = models.first().cloned();
+        self.provider_add_form.status = Some(format!(
+            "Adding provider on {}…",
+            self.node_names
+                .get(&node_id)
+                .map_or("worker", String::as_str)
+        ));
+        cx.notify();
+        self.dispatch_to_node(
+            cx,
+            node_id.clone(),
+            ClientRequest::Provider(ProviderRequest::ConfigureOpenAiCompatibleProvider {
+                provider_id: loom_model::ProviderId::new(provider_id.clone()),
+                endpoint,
+                models,
+            }),
+            move |view, response, cx| match response.result {
+                Ok(ServerResponse::Provider(ProviderResponse::ProviderConfigured)) => {
+                    // The form is replaced rather than edited in place: a fresh
+                    // render creates empty inputs, and the new provider's API
+                    // key row is the next step.
+                    view.provider_add_form = ProviderAddForm {
+                        status: Some(match default_model.as_ref() {
+                            Some(model) => format!(
+                                "Provider {provider_id} added with default model {}; save its API \
+                                 key below",
+                                model.as_str()
+                            ),
+                            None => format!("Provider {provider_id} added; save its API key below"),
+                        }),
+                        ..ProviderAddForm::default()
+                    };
+                    view.record_status(format!("Provider {provider_id} added on {node_id}"));
+                    view.load_provider_scope(node_id.clone(), cx);
+                    view.refresh_models_for_node_async(node_id, cx);
+                }
+                Err(error) => {
+                    view.provider_add_form.status =
+                        Some(format!("Could not add provider: {}", error.message));
+                    view.record_backend_error("add provider", error);
+                }
+                Ok(response) => {
+                    let error = unexpected_response("provider registration", response);
+                    view.provider_add_form.status =
+                        Some(format!("Could not add provider: {}", error.message));
+                    view.record_backend_error("add provider", error);
+                }
+            },
+        );
+    }
+
+    /// Removes an OpenAI-compatible provider and the key stored for it.
+    pub(crate) fn remove_provider(
+        &mut self,
+        provider_id: loom_model::ProviderId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(node_id) = self.providers_node_id.clone() else {
+            self.provider_setup_status.insert(
+                provider_id,
+                "Choose a worker before removing a provider".to_owned(),
+            );
+            cx.notify();
+            return;
+        };
+        self.provider_setup_status.insert(
+            provider_id.clone(),
+            format!(
+                "Removing provider from {}…",
+                self.node_names
+                    .get(&node_id)
+                    .map_or("worker", String::as_str)
+            ),
+        );
+        cx.notify();
+        self.dispatch_to_node(
+            cx,
+            node_id.clone(),
+            ClientRequest::Provider(ProviderRequest::RemoveProvider {
+                provider_id: provider_id.clone(),
+            }),
+            move |view, response, cx| match response.result {
+                Ok(ServerResponse::Provider(ProviderResponse::ProviderConfigured)) => {
+                    view.provider_setup_status
+                        .remove(&provider_id);
+                    view.provider_api_key_inputs.remove(&provider_id);
+                    view.record_status(format!(
+                        "Provider {} removed on {node_id}",
+                        provider_id.as_str()
+                    ));
+                    view.load_provider_scope(node_id.clone(), cx);
+                    view.refresh_models_for_node_async(node_id, cx);
+                }
+                Err(error) => {
+                    view.provider_setup_status.insert(
+                        provider_id.clone(),
+                        format!("Could not remove provider: {}", error.message),
+                    );
+                    view.record_backend_error("remove provider", error);
+                }
+                Ok(response) => {
+                    let error = unexpected_response("provider removal", response);
+                    view.provider_setup_status.insert(
+                        provider_id.clone(),
+                        format!("Could not remove provider: {}", error.message),
+                    );
+                    view.record_backend_error("remove provider", error);
+                }
+            },
+        );
+    }
+
     /// Drops the API key configured for `provider_id` on the scoped worker.
     pub(crate) fn remove_api_key_provider(
         &mut self,

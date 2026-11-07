@@ -531,6 +531,8 @@ impl ClientRequest {
             Self::Provider(ProviderRequest::ConfigureGitHubCopilot { .. })
             | Self::Provider(ProviderRequest::ConfigureApiKeyProvider { .. })
             | Self::Provider(ProviderRequest::RemoveApiKeyProvider { .. })
+            | Self::Provider(ProviderRequest::ConfigureOpenAiCompatibleProvider { .. })
+            | Self::Provider(ProviderRequest::RemoveProvider { .. })
             | Self::Provider(ProviderRequest::StartGitHubCopilotLogin)
             | Self::Provider(ProviderRequest::GetGitHubCopilotLoginStatus { .. })
             | Self::Provider(ProviderRequest::ConfigureGitHubRepository { .. })

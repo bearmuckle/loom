@@ -446,6 +446,22 @@ pub enum ProviderRequest {
         provider_id: ProviderId,
     },
 
+    /// Registers an operator-supplied OpenAI-compatible provider, such as an
+    /// OpenCode Go or OpenCode Zen gateway. The models keep the order they are
+    /// given in, so the first one is the provider's default, and a provider of
+    /// the same id is redefined in place rather than duplicated.
+    ConfigureOpenAiCompatibleProvider {
+        provider_id: ProviderId,
+        endpoint: String,
+        models: Vec<ModelId>,
+    },
+
+    /// Removes an operator-supplied OpenAI-compatible provider and the API key
+    /// stored for it. A built-in provider is refused.
+    RemoveProvider {
+        provider_id: ProviderId,
+    },
+
     StartGitHubCopilotLogin,
 
     GetGitHubCopilotLoginStatus {

@@ -6,6 +6,15 @@ pub fn bearer_header(token: &str) -> String {
     value
 }
 
+/// The `User-Agent` every provider request carries.
+///
+/// Some OpenAI-compatible gateways reject a request whose agent is a generic
+/// HTTP library name, so the client identifies Loom and its version. A request
+/// that sets its own agent (GitHub Copilot) keeps the explicit value.
+pub fn provider_user_agent() -> String {
+    format!("loom/{}", env!("CARGO_PKG_VERSION"))
+}
+
 pub fn trim_endpoint(endpoint: &str) -> String {
     endpoint.trim_end_matches('/').to_owned()
 }
@@ -39,6 +48,7 @@ pub fn shared_http_client() -> Result<reqwest::Client> {
         .get_or_init(|| {
             reqwest::Client::builder()
                 .connect_timeout(PROVIDER_CONNECT_TIMEOUT)
+                .user_agent(provider_user_agent())
                 .build()
                 .map_err(|error| error.to_string())
         })

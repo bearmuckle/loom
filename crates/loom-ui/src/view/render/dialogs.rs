@@ -2305,10 +2305,108 @@ impl LoomView {
                         ),
                     );
                 }
+                // Only a provider this pane can also add is removable: a
+                // built-in provider's configuration belongs to the worker.
+                if provider.kind == loom_model::ProviderKind::OpenAiCompatible {
+                    let remove_id = provider_id.clone();
+                    card = card.child(
+                        div().px_4().pb_3().child(
+                            Button::new(format!("remove-provider-{}", provider.id.as_str()))
+                                .label("Remove provider")
+                                .danger()
+                                .xsmall()
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.remove_provider(remove_id.clone(), cx);
+                                })),
+                        ),
+                    );
+                }
                 body = body.child(card);
             }
         }
+        body = body.child(self.render_provider_add_form(cx));
         body.into_any_element()
+    }
+
+    /// The form that registers an OpenAI-compatible provider such as OpenCode Go
+    /// or OpenCode Zen. Its API key is saved afterwards with the row the new
+    /// provider gets, so no separate key mechanism exists.
+    fn render_provider_add_form(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let mut card = settings_card().child(
+            div()
+                .px_4()
+                .pt_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0xf3f4f6))
+                        .child("Add an OpenAI-compatible provider"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x8f98a6))
+                        .child(
+                            "OpenCode Go, OpenCode Zen, or another gateway. Save its API key \
+                             after it is added.",
+                        ),
+                ),
+        );
+        let mut fields = div().w_full().flex().flex_col().gap_2().px_4().py_3();
+        for (label, id, input) in [
+            (
+                "Provider id",
+                "provider-add-id",
+                self.provider_add_form.id.as_ref(),
+            ),
+            (
+                "Endpoint",
+                "provider-add-endpoint",
+                self.provider_add_form.endpoint.as_ref(),
+            ),
+            (
+                "Models",
+                "provider-add-models",
+                self.provider_add_form.models.as_ref(),
+            ),
+        ] {
+            if let Some(input) = input {
+                fields = fields.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(div().text_xs().text_color(rgb(0x8f98a6)).child(label))
+                        .child(
+                            KitInput::new(input)
+                                .id(format!("{id}-input"))
+                                .small(),
+                        ),
+                );
+            }
+        }
+        card = card.child(fields).child(
+            div().px_4().pb_3().child(
+                Button::new("add-openai-compatible-provider")
+                    .label("Add provider")
+                    .small()
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.add_openai_compatible_provider(cx);
+                    })),
+            ),
+        );
+        if let Some(status) = &self.provider_add_form.status {
+            card = card.child(
+                div()
+                    .id("provider-add-status")
+                    .px_4()
+                    .pb_3()
+                    .text_xs()
+                    .text_color(rgb(0x8f98a6))
+                    .child(status.clone()),
+            );
+        }
+        card.into_any_element()
     }
 }
 

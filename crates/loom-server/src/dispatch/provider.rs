@@ -94,6 +94,28 @@ impl InProcessConnection {
                     ProviderResponse::ProviderConfigured,
                 ))
             }
+            ClientRequest::Provider(ProviderRequest::ConfigureOpenAiCompatibleProvider {
+                provider_id,
+                endpoint,
+                models,
+            }) => {
+                self.backend
+                    .providers
+                    .configure_openai_compatible_provider(provider_id, endpoint, models)?;
+                // Persist only the provider configuration: the API key is a
+                // separate credential-store entry with an opaque reference.
+                self.backend.persist_state()?;
+                Ok(ServerResponse::Provider(
+                    ProviderResponse::ProviderConfigured,
+                ))
+            }
+            ClientRequest::Provider(ProviderRequest::RemoveProvider { provider_id }) => {
+                self.backend.providers.remove_provider(&provider_id)?;
+                self.backend.persist_state()?;
+                Ok(ServerResponse::Provider(
+                    ProviderResponse::ProviderConfigured,
+                ))
+            }
             ClientRequest::Provider(ProviderRequest::StartGitHubCopilotLogin) => {
                 self.start_github_copilot_login()
             }

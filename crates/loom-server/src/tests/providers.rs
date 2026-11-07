@@ -5,6 +5,185 @@ use super::support::*;
 use super::*;
 
 #[test]
+fn an_operator_adds_keys_and_removes_an_openai_compatible_provider() {
+    let root = std::env::temp_dir().join(format!("loom-provider-add-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("backend.sqlite");
+    let provider_id = ProviderId::new("opencode-go");
+    let endpoint = "https://opencode.ai/inference/go/openai/v1/chat/completions";
+    let backend = InProcessBackend::new_persistent(&path).unwrap();
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+
+    let added = connection.request(RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::ConfigureOpenAiCompatibleProvider {
+            provider_id: provider_id.clone(),
+            endpoint: endpoint.to_owned(),
+            models: vec![
+                ModelId::new("qwen3.8-flash"),
+                ModelId::new("glm-5.3-flash"),
+            ],
+        },
+    )));
+    assert!(
+        matches!(
+            added.result,
+            Ok(ServerResponse::Provider(
+                ProviderResponse::ProviderConfigured
+            ))
+        ),
+        "{:?}",
+        added.result
+    );
+    // The provider is listed before it has a key, so Settings and the CLI can
+    // offer the API key row the added provider needs.
+    let listed = backend
+        .provider_registry()
+        .list_providers()
+        .unwrap()
+        .into_iter()
+        .find(|provider| provider.id == provider_id)
+        .expect("the added provider is listed");
+    assert_eq!(listed.kind, loom_providers::ProviderKind::OpenAiCompatible);
+    assert!(listed.api_key_configurable);
+    assert!(listed.credential_id.is_none());
+    // The catalogue keeps the order it was given, so the first model is the
+    // provider's default.
+    assert_eq!(
+        listed
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        ["qwen3.8-flash", "glm-5.3-flash"]
+    );
+
+    // The key travels through the same request every API-key provider uses.
+    let keyed = connection.request(RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::ConfigureApiKeyProvider {
+            provider_id: provider_id.clone(),
+            api_key: "opencode-go-secret".to_owned(),
+        },
+    )));
+    assert!(matches!(
+        keyed.result,
+        Ok(ServerResponse::Provider(
+            ProviderResponse::ProviderConfigured
+        ))
+    ));
+
+    // The configuration and its key survive a restart of the worker.
+    drop(connection);
+    drop(backend);
+    let reopened = InProcessBackend::new_persistent(&path).unwrap();
+    let connection = reopened.connect();
+    negotiate_m3(&connection);
+    let recovered = reopened
+        .provider_registry()
+        .list_providers()
+        .unwrap()
+        .into_iter()
+        .find(|provider| provider.id == provider_id)
+        .expect("the added provider is restored");
+    assert!(recovered.credential_id.is_some());
+    let config = reopened
+        .provider_registry()
+        .export_configs()
+        .unwrap()
+        .into_iter()
+        .find(|config| config.id == provider_id)
+        .unwrap();
+    assert_eq!(config.endpoint.as_deref(), Some(endpoint));
+    let database = fs::read(&path).unwrap();
+    assert!(
+        !database
+            .windows("opencode-go-secret".len())
+            .any(|window| window == b"opencode-go-secret"),
+        "the API key must live in the credential store, not in the database"
+    );
+
+    // A built-in provider cannot be removed, and an operator-added one can.
+    let refused = connection.request(RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::RemoveProvider {
+            provider_id: ProviderId::new("ollama"),
+        },
+    )));
+    assert_eq!(refused.result.unwrap_err().code, ErrorCode::InvalidRequest);
+    let removed = connection.request(RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::RemoveProvider {
+            provider_id: provider_id.clone(),
+        },
+    )));
+    assert!(matches!(
+        removed.result,
+        Ok(ServerResponse::Provider(
+            ProviderResponse::ProviderConfigured
+        ))
+    ));
+    assert!(
+        reopened
+            .provider_registry()
+            .list_providers()
+            .unwrap()
+            .iter()
+            .all(|provider| provider.id != provider_id)
+    );
+    assert_eq!(
+        connection
+            .request(RequestEnvelope::new(ClientRequest::Provider(
+                ProviderRequest::RemoveProvider {
+                    provider_id: provider_id.clone(),
+                },
+            )))
+            .result
+            .unwrap_err()
+            .code,
+        ErrorCode::NotFound
+    );
+    drop(connection);
+    drop(reopened);
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// OpenCode Go requires a client-declared agent and a stable per-conversation
+/// session id, so a run through an OpenAI-compatible provider sends both.
+#[test]
+fn a_run_through_a_gateway_sends_the_loom_agent_and_its_session() {
+    let mut model = ScriptedOpenAiEndpoint::start();
+    let model_id = ModelId::new("fixture/gateway-session");
+    let providers = ProviderRegistry::new();
+    scripted_api_key_provider(
+        &providers,
+        &model.endpoint,
+        "opencode-go",
+        &model_id,
+        "gateway-key",
+    );
+    let backend = InProcessBackend::with_provider_registry(providers);
+    let connection = backend.connect();
+    negotiate(&connection);
+    let session_id = create_key_session(&connection, "Gateway session");
+    let run_id = start_key_run(&connection, session_id, &model_id);
+
+    let first_turn = next_request_for(&mut model, &model_id);
+    assert_eq!(
+        first_turn.user_agent.as_deref(),
+        Some(format!("loom/{}", env!("CARGO_PKG_VERSION")).as_str())
+    );
+    assert_eq!(
+        first_turn.opencode_session.as_deref(),
+        Some(session_id.to_string().as_str())
+    );
+    assert_eq!(first_turn.authorization.as_deref(), Some("Bearer gateway-key"));
+    model.respond_with_text(first_turn, "Workspace inspected.");
+    assert_eq!(
+        await_settled_run(&connection, run_id).state,
+        AgentRunState::Completed
+    );
+    fs::remove_dir_all(&backend.session_root_base).unwrap();
+}
+
+#[test]
 fn api_key_provider_configuration_is_backend_scoped_and_recovers_without_persisting_the_secret_in_sqlite()
  {
     let root = std::env::temp_dir().join(format!("loom-api-key-scope-{}", uuid::Uuid::new_v4()));

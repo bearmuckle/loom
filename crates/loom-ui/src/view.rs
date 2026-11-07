@@ -652,6 +652,9 @@ pub(crate) struct LoomView {
     providers_node_id: Option<String>,
     provider_api_key_inputs: BTreeMap<loom_model::ProviderId, Entity<InputState>>,
     provider_setup_status: BTreeMap<loom_model::ProviderId, String>,
+    /// The form that adds an OpenAI-compatible provider from the Providers
+    /// pane, and the status of its last attempt.
+    provider_add_form: ProviderAddForm,
     pub(crate) theme_choice: ThemeChoice,
     font_scale_percent: u16,
     /// Whether provider reasoning is shown in the transcript. Off by default.
@@ -1567,6 +1570,20 @@ pub(crate) fn browser_resumption(
     }
 }
 
+/// The Providers pane's add form: the fields of an OpenAI-compatible provider
+/// and the status of the last attempt.
+///
+/// The inputs are created by the renderer, which is the only place with a
+/// window, and kept here so what a person typed survives a redraw. The form is
+/// only shown while the Providers pane is, so leaving the pane drops it.
+#[derive(Default)]
+pub(crate) struct ProviderAddForm {
+    pub(crate) id: Option<Entity<InputState>>,
+    pub(crate) endpoint: Option<Entity<InputState>>,
+    pub(crate) models: Option<Entity<InputState>>,
+    pub(crate) status: Option<String>,
+}
+
 /// A small uppercase section heading inside a settings pane.
 fn settings_section_heading(label: &str) -> impl IntoElement {
     div()
@@ -2179,6 +2196,7 @@ impl LoomView {
             providers_node_id: None,
             provider_api_key_inputs: BTreeMap::new(),
             provider_setup_status: BTreeMap::new(),
+            provider_add_form: ProviderAddForm::default(),
             theme_choice: ThemeChoice::System,
             font_scale_percent: DEFAULT_FONT_SCALE_PERCENT,
             show_reasoning: false,

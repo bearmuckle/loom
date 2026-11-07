@@ -49,11 +49,12 @@ impl InProcessConnection {
             ));
         }
         let workspace = self.backend.restore_session_filesystem(state.session_id)?;
-        let provider =
-            match self
-                .backend
-                .provider_for_run(run_id, &state.task.model, state.provider_cursor)
-            {
+        let provider = match self.backend.provider_for_run(
+            state.session_id,
+            run_id,
+            &state.task.model,
+            state.provider_cursor,
+        ) {
                 Ok(provider) => provider,
                 Err(error) => {
                     let descriptor = self
