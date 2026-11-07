@@ -4631,6 +4631,7 @@ dependencies = [
  "loom-protocol",
  "loom-providers",
  "loom-server",
+ "reqwest",
  "serde_json",
  "tokio",
 ]

@@ -40,6 +40,8 @@
 //! | `providers add` | `Provider/ConfigureOpenAiCompatibleProvider` |
 //! | `providers remove` | `Provider/RemoveProvider` |
 //! | `providers discover` | `Provider/DiscoverProviderModels` |
+//! | `jev status`, `jev ask` | none: the local key file and the decision model |
+//! | `jev triage` | `Session/GetAgentSessionSnapshotMetadata`, `Filesystem/GetSessionFilesystemSnapshot`, plus `Collaboration/GetRunRevision` and `Collaboration/ControlRun` with `Approve` under `--apply` |
 //! | `delete` | `Project/GetProjectSnapshotForSession`, `Session/DeleteAgentSession` |
 //! | `session archive` | `Project/GetProjectSnapshotForSession`, `Session/ArchiveAgentSession` |
 //! | `session delete` | `Project/GetProjectSnapshotForSession`, `Session/DeleteAgentSession` |
@@ -83,7 +85,10 @@
 //!
 //! Every verb first sends `Control/Negotiate` with the version this build
 //! speaks and with only the capabilities it uses, because a worker refuses an
-//! unnegotiated connection. `node`, `whoami`, `ls`, `get`, `events`, `peek`,
+//! unnegotiated connection. `jev status` and `jev ask` are the exception: they
+//! answer from the local key file and the decision model, so the binary runs
+//! them before it resolves a token or opens a connection. `node`, `whoami`,
+//! `ls`, `get`, `events`, `peek`,
 //! `retention get`, `providers list`, `models list`, and every `project` read
 //! are the read-only verbs: they send nothing that mutates and negotiate only
 //! the capabilities their reads need, so a read-only-scoped token can run them.
@@ -459,9 +464,12 @@ mod args;
 mod client;
 mod cursor;
 mod exit;
+mod jev;
 mod text;
 mod verbs;
 
+#[cfg(test)]
+mod jev_tests;
 #[cfg(test)]
 mod tests;
 
@@ -481,6 +489,12 @@ pub fn main(arguments: Vec<String>) -> i32 {
         Ok(Parsed::Run(invocation)) => invocation,
         Err(message) => return report_usage_stdio(&message, json, args::named_verb(&arguments)),
     };
+    // `jev status` and `jev ask` answer from the local key file and the decision
+    // model, so they run before a token is resolved or a connection opened: a
+    // machine with no worker and no token can still run them.
+    if args::is_local(&invocation.verb) {
+        return run_offline(&invocation);
+    }
     // The environment is consulted exactly once, here, and the result is stored
     // on the invocation so the URL a cursor file is scoped to is the one the
     // connection uses. Parsing itself stays a pure function of its arguments.
@@ -666,6 +680,33 @@ async fn run_invocation<C: Client>(
         }
         Err(failure) => report_failure(&failure, json, verb, out, err),
     }
+}
+
+/// Runs a verb that answers without a worker connection and returns its exit
+/// code, with the same JSON envelope the connected path writes.
+fn run_offline(invocation: &Invocation) -> i32 {
+    let mut out = std::io::stdout();
+    let mut err = std::io::stderr();
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return report_failure(
+                &verbs::Failure::Internal(format!("could not start the async runtime: {error}")),
+                invocation.globals.json,
+                args::verb_name(&invocation.verb),
+                &mut out,
+                &mut err,
+            );
+        }
+    };
+    let mut client = client::Offline;
+    let code = runtime.block_on(run_invocation(&mut client, invocation, &mut out, &mut err));
+    let _ = out.flush();
+    let _ = err.flush();
+    code
 }
 
 fn print_help(text: &str) -> i32 {

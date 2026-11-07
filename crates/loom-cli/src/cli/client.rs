@@ -9,7 +9,7 @@
 
 use std::{future::Future, pin::Pin};
 
-use loom_core::LoomError;
+use loom_core::{ErrorCode, LoomError};
 use loom_local::WebSocketConnection;
 use loom_protocol::{RequestEnvelope, ResponseEnvelope};
 
@@ -20,6 +20,29 @@ pub trait Client {
         &'a mut self,
         envelope: RequestEnvelope,
     ) -> Pin<Box<dyn Future<Output = Result<ResponseEnvelope, LoomError>> + 'a>>;
+}
+
+/// A client for a verb that answers without a worker.
+///
+/// `jev status` and `jev ask` read the local key file and call the decision
+/// model, so the binary runs them before it resolves a token or opens a
+/// connection. A request from such a verb is a defect, and it is reported as a
+/// local failure rather than answered from nowhere.
+pub struct Offline;
+
+impl Client for Offline {
+    fn request<'a>(
+        &'a mut self,
+        _envelope: RequestEnvelope,
+    ) -> Pin<Box<dyn Future<Output = Result<ResponseEnvelope, LoomError>> + 'a>> {
+        Box::pin(async move {
+            Err(LoomError::new(
+                ErrorCode::Internal,
+                "this verb does not connect to a worker",
+                false,
+            ))
+        })
+    }
 }
 
 /// A client backed by a WebSocket connection to a worker.
