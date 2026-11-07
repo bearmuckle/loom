@@ -59,6 +59,9 @@ jobs:
       - name: Generate stable browser entry point
         run: node scripts/build-browser-entry.mjs crates/loom-ui/dist
 
+      - name: Publish the install script
+        run: install -m 755 scripts/install.sh crates/loom-ui/dist/install.sh
+
       - name: Setup Pages
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
 

@@ -51,6 +51,21 @@ For browser development, run `./scripts/dev-wasm.sh`. It needs Trunk and the
 a development bearer token in the browser URL, so keep it local. Pushes to
 `main` publish the browser client to https://bearmuckle.github.io/loom/.
 
+## Install from a release
+
+On Linux or macOS, one command installs the latest `loom-server` into
+`~/.local/bin`; add `--client` for the desktop client as well:
+
+```sh
+curl -fsSL https://github.com/bearmuckle/loom/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/bearmuckle/loom/releases/latest/download/install.sh | sh -s -- --client
+```
+
+The script checks every download against the release's `SHA256SUMS`, never
+uses `sudo` and never edits a shell profile. `--version`, `--prefix`,
+`--dry-run` and `--uninstall` are described by `--help` and in
+[deployment](docs/deployment.md#installing-from-a-release).
+
 ## Standalone server
 
 Tagged releases and the container image also ship `loom-server`, the backend a

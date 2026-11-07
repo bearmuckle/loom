@@ -62,6 +62,37 @@ installed from an archive, AppImage, or `.deb` may ship `loom-server` next to
 itself, but the setup install still puts its own copy under the state
 directory so the service has a stable path.
 
+## Installing from a release
+
+`scripts/install.sh` installs a release on Linux (x86_64, aarch64) or macOS. It
+is attached to every release and published with the browser client, so either
+URL serves the same script:
+
+```sh
+curl -fsSL https://github.com/bearmuckle/loom/releases/latest/download/install.sh | sh
+curl -fsSL https://bearmuckle.github.io/loom/install.sh | sh -s -- --client
+```
+
+By default it installs `loom-server` into `~/.local/bin`; `--client` installs
+`loom-ui` and the `loom-server` that its archive carries. Other options are
+`--version <tag>`, `--prefix <dir>` (binaries go in `<dir>/bin`), `--dry-run`
+and `--uninstall`; `LOOM_VERSION` and `LOOM_PREFIX` stand in for the first two.
+
+- The release is found from the `releases/latest` redirect, so the GitHub API's
+  rate limit does not apply.
+- The archive is downloaded, checked against the release's `SHA256SUMS`, and
+  only then unpacked. A mismatch or a missing entry installs nothing.
+  `install.sh` is itself listed in `SHA256SUMS`.
+- It never runs `sudo`: a prefix it cannot write to is an error. It never edits
+  a shell profile; when the install directory is not on `PATH` it prints the
+  line to add.
+- Running it again upgrades, replacing each binary in one step. `--uninstall`
+  removes the binaries and leaves a worker's state alone.
+- Windows is not supported by the script; its archives are on the release page.
+  To set up a worker on another machine, see the next section instead.
+
+`sh scripts/install.test.sh` runs the script against local fake release assets.
+
 ## Provisioning a worker over SSH
 
 Giving Loom SSH access to a machine is enough to turn it into a worker. In the

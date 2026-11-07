@@ -546,6 +546,11 @@ jobs:
           pattern: release-*
           path: release-assets
           merge-multiple: true
+      - name: Add the install script
+        # Published as a release asset so that
+        # `releases/latest/download/install.sh` always names the script that
+        # shipped with the newest release, and listed in SHA256SUMS below.
+        run: install -m 755 scripts/install.sh release-assets/install.sh
       - name: Generate SHA256SUMS
         run: |
           set -euo pipefail

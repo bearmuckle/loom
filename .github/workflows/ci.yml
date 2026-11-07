@@ -27,6 +27,8 @@ jobs:
           node-version: 24
       - name: Test browser entry point
         run: node --experimental-vm-modules --test scripts/browser-entry.test.mjs scripts/pwa.test.mjs
+      - name: Test the install script
+        run: sh scripts/install.test.sh
 
   fmt:
     runs-on: ubuntu-latest
