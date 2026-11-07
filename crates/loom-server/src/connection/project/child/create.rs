@@ -219,12 +219,15 @@ impl InProcessConnection {
                 {
                     self.session_filesystem(existing_task.target_session_id)?
                 } else {
-                    self.backend.create_session_filesystem(
-                        self.backend
-                            .sessions()?
-                            .get(existing_task.target_session_id)?
-                            .workspace_id,
+                    let workspace_id = self
+                        .backend
+                        .sessions()?
+                        .get(existing_task.target_session_id)?
+                        .workspace_id;
+                    self.create_child_filesystem(
+                        workspace_id,
                         existing_task.target_session_id,
+                        self.delegated_workspace_owner(&existing_project, parent_session_id)?,
                     )?
                 };
                 self.backend
@@ -377,6 +380,11 @@ impl InProcessConnection {
         };
         let mut initial_worktree = None;
         let mut precreated_child_filesystem = None;
+        // A project that keeps no checkout has no worktree isolation to
+        // preserve, so its delegated sessions work in the project root's
+        // workspace and see each other's files. A project with a checkout keeps
+        // the per-session filesystem that holds each child's linked worktree.
+        let shared_workspace_owner = self.delegated_workspace_owner(&project, parent_session_id)?;
         // A check-out is provisioned for every delegated task, not only code
         // tasks, whenever the parent exposes exactly one clean repository.
         // `code_change` selects write authority; the presence of a check-out no
@@ -420,9 +428,10 @@ impl InProcessConnection {
             match checkout {
                 Some((parent_repository_id, base_revision, base_refresh)) => {
                     let child_repository_id = RepositoryId::new();
-                    let child_filesystem = self.backend.create_session_filesystem(
+                    let child_filesystem = self.create_child_filesystem(
                         parent_snapshot.workspace_id,
                         child_session_id,
+                        shared_workspace_owner,
                     )?;
                     let worktree_relative_path = format!("project-worktrees/{task_id}");
                     initial_worktree = Some(ProjectWorktreeRecord {
@@ -487,7 +496,12 @@ impl InProcessConnection {
         let mut persisted_task = match create_result {
             Ok(task) => task,
             Err(error) => {
-                if let Some(filesystem) = precreated_child_filesystem {
+                // Only a filesystem this attempt created for the child's own
+                // worktree is removed here. A child that shares the project
+                // workspace has no directory of its own to clean up.
+                if initial_worktree.is_some()
+                    && let Some(filesystem) = precreated_child_filesystem
+                {
                     let _ = fs::remove_dir_all(filesystem.root());
                 }
                 return Err(error);
@@ -526,9 +540,11 @@ impl InProcessConnection {
             self.backend.journal()?.append_session(event);
             let filesystem = match precreated_child_filesystem.take() {
                 Some(filesystem) => filesystem,
-                None => self
-                    .backend
-                    .create_session_filesystem(created.workspace_id, actual_child_session_id)?,
+                None => self.create_child_filesystem(
+                    created.workspace_id,
+                    actual_child_session_id,
+                    shared_workspace_owner,
+                )?,
             };
             self.backend
                 .session_filesystems()?
@@ -541,9 +557,11 @@ impl InProcessConnection {
             .session_filesystems()?
             .contains_key(&actual_child_session_id)
         {
-            let filesystem = self
-                .backend
-                .create_session_filesystem(actual_snapshot.workspace_id, actual_child_session_id)?;
+            let filesystem = self.create_child_filesystem(
+                actual_snapshot.workspace_id,
+                actual_child_session_id,
+                shared_workspace_owner,
+            )?;
             self.backend
                 .session_filesystems()?
                 .insert(actual_child_session_id, filesystem);
@@ -592,6 +610,54 @@ impl InProcessConnection {
                 child,
             },
         ))
+    }
+}
+
+impl InProcessConnection {
+    /// The project root whose workspace a delegated child works in, when the
+    /// project keeps no Git checkout.
+    ///
+    /// A project with a repository isolates each delegated child in its own
+    /// linked worktree, so every child keeps a private session filesystem. A
+    /// project without one has no worktree isolation to preserve, and its
+    /// agents are expected to read and write the same files as their manager.
+    fn delegated_workspace_owner(
+        &self,
+        project: &ProjectSnapshot,
+        manager_session_id: AgentSessionId,
+    ) -> Result<Option<AgentSessionId>> {
+        let manager_has_checkout = self
+            .backend
+            .session_repositories()?
+            .get(&manager_session_id)
+            .is_some_and(|repositories| !repositories.is_empty());
+        if manager_has_checkout
+            || self
+                .backend
+                .session_has_repositories(project.root_session_id)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(project.root_session_id))
+    }
+
+    /// Opens a delegated child's filesystem, either its own or the project
+    /// workspace it shares with the project root.
+    fn create_child_filesystem(
+        &self,
+        workspace_id: WorkspaceId,
+        session_id: AgentSessionId,
+        shared_owner: Option<AgentSessionId>,
+    ) -> Result<Workspace> {
+        match shared_owner {
+            Some(owner) => {
+                self.backend
+                    .create_shared_session_filesystem(workspace_id, session_id, owner)
+            }
+            None => self
+                .backend
+                .create_session_filesystem(workspace_id, session_id),
+        }
     }
 }
 

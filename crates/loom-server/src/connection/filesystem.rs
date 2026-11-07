@@ -11,7 +11,9 @@ impl InProcessConnection {
     /// every mounted tree. Mounts can point at arbitrarily large directories
     /// (for example a user's Downloads folder), so a cheap metadata read must not
     /// trigger that scan. The in-memory mounts are authoritative once a
-    /// workspace is live; otherwise the persisted directory rows are used.
+    /// workspace is live; otherwise the persisted directory rows are used. A
+    /// session that works in its project's shared workspace reports the
+    /// project root's directories.
     pub(crate) fn session_mounted_directories(
         &self,
         session_id: AgentSessionId,
@@ -19,6 +21,21 @@ impl InProcessConnection {
         if let Some(filesystem) = self.backend.session_filesystems()?.get(&session_id) {
             return filesystem.mounted_directories();
         }
+        let directories = self.persisted_session_directories(session_id)?;
+        if !directories.is_empty() {
+            return Ok(directories);
+        }
+        match self.backend.shared_workspace_owner(session_id)? {
+            Some(owner) => self.persisted_session_directories(owner),
+            None => Ok(directories),
+        }
+    }
+
+    /// Directories recorded for one session, ignoring the project it belongs to.
+    fn persisted_session_directories(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<Vec<(String, std::path::PathBuf)>> {
         let persistence = self.backend.persistence.as_ref().ok_or_else(|| {
             LoomError::new(
                 ErrorCode::RecoveryRequired,
@@ -154,6 +171,7 @@ impl InProcessConnection {
             ));
         }
         checked_session_relative_path(&relative_path)?;
+        self.ensure_session_owns_its_workspace(session_id)?;
         let filesystem = self.session_filesystem(session_id)?;
         let source_path = Path::new(&source);
         if !source_path.is_absolute() {
@@ -195,6 +213,7 @@ impl InProcessConnection {
             services.push((path, service));
         }
         let source_path = filesystem.mount_directory(&relative_path, &source_path)?;
+        self.share_directory_with_project_members(session_id, &relative_path, Some(&source_path))?;
         let mut repositories = Vec::new();
         for (path, service) in services {
             let repository = SessionRepository {
@@ -245,8 +264,10 @@ impl InProcessConnection {
                 "directories cannot be detached while a session is active",
             ));
         }
+        self.ensure_session_owns_its_workspace(session_id)?;
         let filesystem = self.session_filesystem(session_id)?;
         filesystem.unmount_directory(&path)?;
+        self.share_directory_with_project_members(session_id, &path, None)?;
         let removed = self
             .backend
             .session_repositories()?
@@ -267,6 +288,73 @@ impl InProcessConnection {
             self.backend
                 .session_vcs()?
                 .remove(&(session_id, repository_id));
+        }
+        Ok(())
+    }
+
+    /// Refuses a directory attachment on a session that works in its project's
+    /// shared workspace.
+    ///
+    /// A shared session has no filesystem of its own to mount into: the
+    /// directory would become part of the project root's workspace and be
+    /// registered for one member only. The project root owns those attachments.
+    fn ensure_session_owns_its_workspace(&self, session_id: AgentSessionId) -> Result<()> {
+        match self.backend.shared_workspace_owner(session_id)? {
+            Some(owner) => Err(LoomError::invalid_request(format!(
+                "session {session_id} works in the shared workspace of its project root {owner}; attach or detach directories on that session"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Applies a directory attachment or detachment to the live sessions that
+    /// share the changed workspace.
+    ///
+    /// The project root owns the mount, so its members follow it immediately
+    /// instead of keeping a stale view until they are opened again. Each
+    /// follower persists its own directory rows on the next state save.
+    fn share_directory_with_project_members(
+        &self,
+        owner_session_id: AgentSessionId,
+        relative: &str,
+        source: Option<&Path>,
+    ) -> Result<()> {
+        let Some(owner_root) = self
+            .backend
+            .session_filesystems()?
+            .get(&owner_session_id)
+            .map(|filesystem| filesystem.root().to_path_buf())
+        else {
+            return Ok(());
+        };
+        let sharers = self
+            .backend
+            .session_filesystems()?
+            .iter()
+            .filter(|(session_id, filesystem)| {
+                **session_id != owner_session_id && filesystem.root() == owner_root.as_path()
+            })
+            .map(|(session_id, filesystem)| (*session_id, filesystem.clone()))
+            .collect::<Vec<_>>();
+        for (session_id, filesystem) in sharers {
+            let followed = match source {
+                Some(source) => filesystem.mount_directory(relative, source).map(|_| ()),
+                None => match filesystem.forget_mount(relative) {
+                    Err(error) if error.code == ErrorCode::NotFound => Ok(()),
+                    other => other,
+                },
+            };
+            match followed {
+                Ok(()) => log::debug!(
+                    "[loom-server] session {session_id} followed directory '{relative}' of its shared workspace"
+                ),
+                // A follower that cannot follow is still correct on its next
+                // open, which reads the project root's directories again.
+                Err(error) => log::warn!(
+                    "[loom-server] session {session_id} could not follow directory '{relative}' of its shared workspace: {}",
+                    error.message
+                ),
+            }
         }
         Ok(())
     }

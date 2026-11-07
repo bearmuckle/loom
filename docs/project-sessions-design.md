@@ -59,7 +59,9 @@ Project archive waits until child tasks are terminal, then archives the
 descendants with the root. Code-changing children use isolated linked
 worktrees; managers can review bounded diffs, integrate eligible commits by
 fast-forward or conflict-aware merge, and retain or remove child checkouts with
-an explicit cleanup disposition.
+an explicit cleanup disposition. A project that keeps no Git checkout has no
+worktree to isolate, so its delegated sessions share the project root's
+workspace instead of an empty private one.
 Workspace settings bound delegated-agent parallelism from one to sixteen
 (default four); additional tasks remain durable and queued. A project can have
 up to fifty queued or active delegated tasks.
@@ -71,6 +73,21 @@ communicate with them, and integrate their results. Workspaces remain the
 grouping and settings boundary and may contain multiple projects. There is no
 standalone session workflow: every agent session is either a project's root or
 a descendant.
+
+A project that keeps no Git checkout does not isolate its agents: its delegated
+sessions share the project root's session filesystem, so a child reads and
+writes the files its manager and its siblings see, including the directories
+attached to the root. A review sibling can therefore inspect what a coding
+sibling wrote without a review request, and nothing has to be copied or
+integrated. The decision is project-wide and made when the child is created: a
+project with a repository keeps a private filesystem for every child, because
+that root holds the child's linked worktree, and worktree review and
+integration remain the only path from a child's work to its parent. Attaching
+or detaching a directory is refused on a shared child and stays with the
+project root, where a live change also reaches the members that share it.
+Checkpoints, undo, and change feeds stay per session even though the files are
+shared, so a checkpoint taken by one agent captures the shared tree at that
+moment.
 
 ## Product and domain model
 
@@ -562,7 +579,10 @@ protocol contract tests, and a deterministic end-to-end fixture at its
 boundary. Exercise duplicate child-creation/message requests, inactive
 recipients, ordering across reconnect, unauthorized cross-project access,
 parallelism limits, cancellation, process restart, depth overflow, and partial
-worktree/merge failures. UI work should verify empty, active, blocked, failed,
+worktree/merge failures. Delegated-session filesystem coverage includes a
+sibling reading and writing a child's file in a project without a checkout,
+before and after a restart, and a child of a project with a checkout keeping
+its own linked worktree. UI work should verify empty, active, blocked, failed,
 completed, and stale/reconnecting child states.
 
 The backend rejects clients that negotiate an incompatible protocol major
@@ -579,8 +599,11 @@ server validates the persisted grant before creating a child.
   state with an atomic wait claim and serialized, oldest-first workspace
   admission. Recovery runs before queued work is admitted.
 - The first worktree implementation accepts one clean Git repository attached
-  to the parent session. Multi-repository tasks and native in-place directory
-  attachments are rejected until their isolation model is designed.
+  to the parent session; multi-repository code tasks are rejected until their
+  isolation model is designed. A project that attaches only plain directories
+  has no checkout, so its children share the project root's workspace instead
+  of receiving an empty private filesystem, and a sibling reads what another
+  child wrote without a copy or an integration step.
 - The first UI lets the user select any project session and message that agent
   directly through its normal session composer. Manager-mediated user messages
   are not required. Agent-to-agent branch messages remain separately

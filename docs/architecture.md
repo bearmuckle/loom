@@ -184,7 +184,7 @@ is a grouping and configuration boundary, not a security boundary. Sessions
 reference their workspace; their files and repository checkouts remain
 session-scoped.
 
-Each `AgentSession` owns a backend-managed **session filesystem** with its own
+Each `AgentSession` has a backend-managed **session filesystem** with its own
 root. It contains session data and zero or more attached sources at normalized
 paths relative to that root. GitHub repositories receive independent checkouts.
 A directory selected in native local mode is attached in place: file and Git
@@ -194,14 +194,24 @@ source path and the session-relative attachment path. A fork copies attached
 contents into its own filesystem so the two sessions do not share a mutable
 working tree after forking.
 
+The one exception is a project that keeps no Git checkout: its agents share the
+project root's filesystem root, so a delegated child reads and writes the files
+its manager and its siblings see, including the root's attached directories.
+Directory attachment stays with the project root; a shared child refuses to
+attach one of its own. A project with a repository keeps a per-session root for
+every child, because each child's linked worktree needs one, so children stay
+isolated there. Checkpoints, undo history, and change feeds remain per session
+even when the files are shared.
+
 Use independent clones for remote repositories. A shared bare-object cache may
 reduce clone cost, but it is an internal optimization. Native local directories
 are an explicit exception: a session edits the original files, and another
-session can attach the same path. Sharing a checkout with hierarchical
-sub-sessions may be considered later; it would need explicit ownership and
-coordination rules for concurrent file edits and Git operations. The
-filesystem boundary does not by itself promise OS-level process sandboxing;
-process isolation is a separate backend security capability.
+session can attach the same path. The shared project workspace above is the
+only place where hierarchical sessions write the same tree; it carries no Git
+bookkeeping of its own, so code-changing delegation still requires a checkout
+and a reviewable child worktree. The filesystem boundary does not by itself
+promise OS-level process sandboxing; process isolation is a separate backend
+security capability.
 
 `loom-sessionfs` is the session-filesystem service. It owns file trees,
 contents, watches, edits, snapshots, checkpoints, and repository-instruction

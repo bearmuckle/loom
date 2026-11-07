@@ -398,6 +398,34 @@ impl Workspace {
         Ok(())
     }
 
+    /// Forgets a mount without touching its link on disk.
+    ///
+    /// A session that shares its root with the session that registered a mount
+    /// records the mount too, so path resolution stays inside the attached
+    /// source. When the owning session detaches it, the link is already gone
+    /// and a sharer only drops its own registration, which also narrows its
+    /// next durable record. A name this workspace never mounted is reported the
+    /// same way an unmount of it is.
+    pub fn forget_mount(&self, relative: &str) -> Result<()> {
+        checked_mount_path(relative)?;
+        let mut mounts = self
+            .inner
+            .mounts
+            .lock()
+            .map_err(|_| LoomError::invalid_state("workspace mounts are unavailable"))?;
+        if mounts.remove(relative).is_none() {
+            return Err(LoomError::new(
+                ErrorCode::NotFound,
+                "session directory not attached",
+                false,
+            ));
+        }
+        drop(mounts);
+        let mut state = self.lock_state()?;
+        Self::advance_generation(&mut state);
+        Ok(())
+    }
+
     pub fn watch(&self) -> WorkspaceWatcher {
         WorkspaceWatcher {
             workspace: self.clone(),
@@ -1901,6 +1929,37 @@ mod tests {
         workspace.unmount_directory("sources/local").unwrap();
         assert!(source.join("note.txt").exists());
         assert!(!root.join("sources/local").exists());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(source).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sharing_workspace_forgets_a_mount_once_its_owner_detaches_it() {
+        let (owner, root) = workspace();
+        let source = std::env::temp_dir().join(format!("loom-source-{}", AgentSessionId::new()));
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("note.txt"), "before").unwrap();
+        owner.mount_directory("shared", &source).unwrap();
+        let sharer = Workspace::open(AgentSessionId::new(), &root).unwrap();
+        sharer.mount_directory("shared", &source).unwrap();
+        assert_eq!(
+            sharer.read_file("shared/note.txt").unwrap().content,
+            "before"
+        );
+
+        owner.unmount_directory("shared").unwrap();
+        sharer.forget_mount("shared").unwrap();
+        assert_eq!(
+            sharer.forget_mount("shared").unwrap_err().code,
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            sharer.read_file("shared/note.txt").unwrap_err().code,
+            ErrorCode::NotFound
+        );
+        assert!(source.join("note.txt").exists());
+        assert!(sharer.mounted_directories().unwrap().is_empty());
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(source).unwrap();
     }

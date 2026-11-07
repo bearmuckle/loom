@@ -42,14 +42,21 @@ The target domain model separates organization from execution:
 
 - A `Workspace` groups sessions and workspace-level settings. It has an ID
   and lifecycle independent of any local directory or Git repository.
-- An `AgentSession` belongs to a workspace and owns an isolated filesystem
+- An `AgentSession` belongs to a workspace and has an isolated filesystem
   root on its backend. The host path is backend-internal and is not returned
   to remote clients. This defines filesystem ownership and path scope; it
-  does not by itself guarantee OS-level process sandboxing.
+  does not by itself guarantee OS-level process sandboxing. A session delegated
+  inside a project that keeps no Git checkout instead works in the project
+  root's filesystem root, so its requests address the files the manager and its
+  siblings see, and its durable record names that shared directory as its root.
 - A session may attach zero or more repository sources. Each attachment
   identifies a source, requested revision, and stable relative checkout path
   within that root. The backend materializes a session-owned clone or
-  worktree; mutable working trees are not shared between sessions.
+  worktree; mutable working trees are not shared between sessions, except that
+  agents of a project without a checkout read and write the same project
+  workspace. `AttachSessionDirectory` and `DetachSessionDirectory` are refused
+  for such an agent and stay with the session that owns the workspace, the
+  project root.
 - File, process, terminal, checkpoint, change, and VCS operations are scoped
   to a session. Repository paths are interpreted relative to that session's
   checkout, while root-relative paths can address files elsewhere in the
