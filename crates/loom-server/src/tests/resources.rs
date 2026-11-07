@@ -154,3 +154,21 @@ fn worker_resource_percentages_handle_unavailable_and_out_of_range_samples() {
     assert_eq!(memory_usage_percent(Some(100), Some(25)), Some(75));
     assert_eq!(memory_usage_percent(Some(100), Some(150)), Some(0));
 }
+
+#[test]
+fn a_monitor_without_sysinfo_reports_no_cpu_or_memory() {
+    let mut monitor = ResourceMonitor {
+        system: None,
+        has_cpu_baseline: false,
+    };
+    for _ in 0..2 {
+        let resources = monitor.sample(Some(100), Some(40));
+        assert!(resources.cpu_count > 0);
+        assert_eq!(resources.cpu_usage_percent, None);
+        assert_eq!(resources.memory_total_bytes, None);
+        assert_eq!(resources.memory_available_bytes, None);
+        assert_eq!(resources.memory_usage_percent, None);
+        assert_eq!(resources.disk_total_bytes, Some(100));
+        assert_eq!(resources.disk_available_bytes, Some(40));
+    }
+}

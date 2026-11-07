@@ -556,10 +556,23 @@ struct ProjectAgentTools {
     can_integrate_children: bool,
 }
 
-#[derive(Default)]
 struct ResourceMonitor {
-    system: System,
+    /// `None` when the platform could not initialize `sysinfo`; the worker
+    /// then reports no CPU or memory figures instead of failing to start.
+    system: Option<System>,
     has_cpu_baseline: bool,
+}
+
+impl Default for ResourceMonitor {
+    fn default() -> Self {
+        let system = System::new()
+            .inspect_err(|error| log::warn!("resource monitoring is unavailable: {error}"))
+            .ok();
+        Self {
+            system,
+            has_cpu_baseline: false,
+        }
+    }
 }
 
 #[derive(Clone)]

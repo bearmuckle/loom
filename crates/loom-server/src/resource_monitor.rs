@@ -6,20 +6,21 @@ impl ResourceMonitor {
         disk_total_bytes: Option<u64>,
         disk_available_bytes: Option<u64>,
     ) -> WorkerNodeResources {
-        self.system.refresh_cpu_all();
-        self.system.refresh_memory();
-
-        let cpu_usage_percent = if self.has_cpu_baseline {
-            cpu_usage_percent(self.system.global_cpu_usage())
-        } else {
-            None
-        };
-        self.has_cpu_baseline = true;
-
-        let memory_total = self.system.total_memory();
-        let memory_available = self.system.available_memory();
-        let memory_total_bytes = (memory_total > 0).then_some(memory_total);
-        let memory_available_bytes = memory_total_bytes.map(|_| memory_available.min(memory_total));
+        let mut cpu_usage_percent = None;
+        let mut memory_total_bytes = None;
+        let mut memory_available_bytes = None;
+        if let Some(system) = self.system.as_mut() {
+            system.refresh_cpu_all();
+            system.refresh_memory();
+            if self.has_cpu_baseline {
+                cpu_usage_percent = super::cpu_usage_percent(system.global_cpu_usage());
+            }
+            self.has_cpu_baseline = true;
+            let memory_total = system.total_memory();
+            memory_total_bytes = (memory_total > 0).then_some(memory_total);
+            memory_available_bytes =
+                memory_total_bytes.map(|_| system.available_memory().min(memory_total));
+        }
 
         WorkerNodeResources {
             cpu_count: std::thread::available_parallelism()
