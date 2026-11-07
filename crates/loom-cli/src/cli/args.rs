@@ -2645,7 +2645,11 @@ fn parse_providers(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String>
 /// a model `run` cannot start.
 fn parse_providers_add(flags: &mut FlagSet) -> Result<Verb, String> {
     let kind = flags.required("--kind")?;
-    if !kind.trim().replace('_', "-").eq_ignore_ascii_case("openai-compatible") {
+    if !kind
+        .trim()
+        .replace('_', "-")
+        .eq_ignore_ascii_case("openai-compatible")
+    {
         return Err(format!(
             "providers add supports --kind openai-compatible, got '{}'",
             kind.trim()

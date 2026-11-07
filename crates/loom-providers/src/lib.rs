@@ -667,7 +667,10 @@ mod tests {
     /// can assert on the headers of a request rather than on its body alone.
     fn serve_capturing_request(
         body: &'static str,
-    ) -> (String, thread::JoinHandle<std::result::Result<String, String>>) {
+    ) -> (
+        String,
+        thread::JoinHandle<std::result::Result<String, String>>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -1430,10 +1433,7 @@ mod tests {
             .configure_openai_compatible_provider(
                 provider_id.clone(),
                 endpoint,
-                vec![
-                    ModelId::new("qwen3.8-flash"),
-                    ModelId::new("glm-5.3-flash"),
-                ],
+                vec![ModelId::new("qwen3.8-flash"), ModelId::new("glm-5.3-flash")],
             )
             .unwrap();
         registry

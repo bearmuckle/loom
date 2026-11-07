@@ -303,9 +303,9 @@ impl InProcessConnection {
             ClientRequest::Provider(ProviderRequest::RemoveApiKeyProvider { .. }) => {
                 self.provider_dispatch(request, request_id)
             }
-            ClientRequest::Provider(ProviderRequest::ConfigureOpenAiCompatibleProvider { .. }) => {
-                self.provider_dispatch(request, request_id)
-            }
+            ClientRequest::Provider(ProviderRequest::ConfigureOpenAiCompatibleProvider {
+                ..
+            }) => self.provider_dispatch(request, request_id),
             ClientRequest::Provider(ProviderRequest::RemoveProvider { .. }) => {
                 self.provider_dispatch(request, request_id)
             }

@@ -19,10 +19,7 @@ fn an_operator_adds_keys_and_removes_an_openai_compatible_provider() {
         ProviderRequest::ConfigureOpenAiCompatibleProvider {
             provider_id: provider_id.clone(),
             endpoint: endpoint.to_owned(),
-            models: vec![
-                ModelId::new("qwen3.8-flash"),
-                ModelId::new("glm-5.3-flash"),
-            ],
+            models: vec![ModelId::new("qwen3.8-flash"), ModelId::new("glm-5.3-flash")],
         },
     )));
     assert!(
@@ -174,7 +171,10 @@ fn a_run_through_a_gateway_sends_the_loom_agent_and_its_session() {
         first_turn.opencode_session.as_deref(),
         Some(session_id.to_string().as_str())
     );
-    assert_eq!(first_turn.authorization.as_deref(), Some("Bearer gateway-key"));
+    assert_eq!(
+        first_turn.authorization.as_deref(),
+        Some("Bearer gateway-key")
+    );
     model.respond_with_text(first_turn, "Workspace inspected.");
     assert_eq!(
         await_settled_run(&connection, run_id).state,

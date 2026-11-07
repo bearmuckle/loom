@@ -2342,15 +2342,10 @@ impl LoomView {
                         .text_color(rgb(0xf3f4f6))
                         .child("Add an OpenAI-compatible provider"),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x8f98a6))
-                        .child(
-                            "OpenCode Go, OpenCode Zen, or another gateway. Save its API key \
+                .child(div().text_xs().text_color(rgb(0x8f98a6)).child(
+                    "OpenCode Go, OpenCode Zen, or another gateway. Save its API key \
                              after it is added.",
-                        ),
-                ),
+                )),
         );
         let mut fields = div().w_full().flex().flex_col().gap_2().px_4().py_3();
         for (label, id, input) in [
@@ -2377,11 +2372,7 @@ impl LoomView {
                         .flex_col()
                         .gap_1()
                         .child(div().text_xs().text_color(rgb(0x8f98a6)).child(label))
-                        .child(
-                            KitInput::new(input)
-                                .id(format!("{id}-input"))
-                                .small(),
-                        ),
+                        .child(KitInput::new(input).id(format!("{id}-input")).small()),
                 );
             }
         }
