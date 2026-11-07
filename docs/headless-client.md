@@ -230,10 +230,15 @@ hand as a snapshot.
 
 `--follow --timeout <seconds>` bounds the follow. The cursor file is written
 after every rendered batch, so when the bound elapses the last delivered
-sequence is already stored: `events` stops, reports `deadline_exceeded` (exit
-`4`), and the next run with the same cursor file continues exactly there. The
-failure is `retryable: true` for that reason, even though nothing is retried by
-the command itself. Without `--timeout` a follow is unbounded, because it still
+sequence is already stored: `events` stops and the next run with the same
+cursor file continues exactly there. Text and `--format jsonl` stream every
+event as it arrives and report the elapsed bound as the `deadline_exceeded`
+failure with exit `4`. `--json` buffers the events into one envelope, so a
+bounded follow that reaches its deadline reports `ok: true` with
+`data.timed_out: true`, the events it delivered before the deadline, and exit
+`4`: no delivered event is dropped from the result the cursor points past. The
+deadline is retryable for that reason, even though nothing is retried by the
+command itself. Without `--timeout` a follow is unbounded, because it still
 stops at the run's `run_completed` event, and `--timeout` without `--follow` is
 a usage error (exit `2`).
 
