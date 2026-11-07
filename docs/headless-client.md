@@ -15,14 +15,35 @@ The examples below use the installed binary name. In a checkout, replace
 
 ## Connecting
 
-- `--connect <url>` (or `LOOM_URL`) names the worker WebSocket endpoint.
+- `--connect <url>` (or `LOOM_URL`) names the worker WebSocket endpoint. When
+  neither names one, `ws://127.0.0.1:8765/ws` is used, so a local worker needs no
+  flags.
 - `--token-file <path>` (or `LOOM_TOKEN_FILE`) is the only credential path.
   There is deliberately no `--token` flag, so a token never appears on a
-  command line, and no diagnostic or output line carries it.
+  command line, and no diagnostic or output line carries it. When neither names
+  a file, the path is derived from the connected URL as
+  `<state dir>/<host>_<port>/token`, which is where a standalone worker stores
+  the token of the instance bound to that address
+  (`<state dir>` honours `LOOM_STATE_DIR`, then `XDG_STATE_HOME`, then
+  `$HOME/.local/state`; `ws` defaults to port 80 and `wss` to 443, and the host
+  and port map the way the worker's bind key does). A leading `~/` in a named
+  path is expanded with `HOME`.
 - `--ca-file <pem>` trusts an additional TLS certificate.
 - `--allow-insecure-remote` permits plaintext `ws://` to a non-loopback host.
 - `--max-frame-bytes <n>` sets the client's frame limit; the default is 4 MiB.
 - `--json` prints one JSON envelope for a call instead of text.
+- `--help` (or `-h`) prints the global manual, or one verb's page when the line
+  names a verb: `loom-cli run --help`, `loom-cli providers list --help`, and
+  `loom-cli project worktree cleanup --help` each print only that verb's usage,
+  its flags, and a few copy-pasteable examples.
+
+A token file that cannot be read is a usage error (exit `2`) that names the path
+that was tried, and, when the path was derived, the URL it was derived for:
+
+```text
+error invalid_request could not read the token file \
+  '/state/loom/127.0.0.1_8765/token' (default for ws://127.0.0.1:8765/ws): …
+```
 
 ## Verbs
 
@@ -30,12 +51,12 @@ The examples below use the installed binary name. In a checkout, replace
 | --- | --- |
 | `doctor` | Negotiated protocol, capability intersection, participant, and worker node. |
 | `node` | The worker node's id, name, capabilities, and health. |
-| `whoami` | The participant bound to the token. |
+| `whoami` | The participant bound to the token; `{"kind":"operator"}` under `--json` for an operator token. |
 | `ls [--workspace <id>] [--archived]` | Workspaces, or the sessions of one workspace. |
 | `get <session-id> [--metadata]` | One session snapshot, or that snapshot with its active run metadata. |
-| `events --session <id> [--after <seq>] [--cursor-file <path>] [--follow] [--format text\|jsonl] [--max-bytes <n>]` | Session events, followed until the run completes or the caller interrupts. |
+| `events --session <id> [--after <seq>] [--cursor-file <path>] [--follow] [--timeout <seconds>] [--format text\|jsonl] [--max-bytes <n>]` | Session events, followed until the run completes or the caller interrupts; `--timeout` bounds the follow and exits `4` when it elapses. |
 | `peek --session <id> [--lines <n>] [--format text\|jsonl] [--max-bytes <n>]` | The tail of the session's current output; 200 lines by default. |
-| `run --workspace <id> (--task <text> \| --task-file <path>) [--name <name>] [--model <id>] [--repo <source> [--revision <rev>] [--path <path>]] [--as-directory <path>] [--approval-policy default\|auto] [--request-id <uuid>] [--new]` | Reuse or create the session named `--name`, attach the inputs, and start one run. `--new` always creates a session. |
+| `run --workspace <id> (--task <text> \| --task-file <path>) [--name <name>] [--model <id>] [--repo <source> [--revision <rev>] [--path <path>]] [--as-directory <path>] [--approval-policy default\|auto] [--request-id <uuid>] [--new]` | Reuse or create the session named `--name`, attach the inputs, and start one run. `--new` always creates a session. Without `--model` the first credentialed provider's default model is started. |
 | `send --run <id> --text <text>` | Follow-up direction to the active run. |
 | `answer --run <id> --text <text>` | Answer the question the run is waiting on. |
 | `approve --run <id> --tool-call <id>` | Approve the tool call that blocked the run. |
@@ -116,7 +137,10 @@ caller repeats a `--request-id`; a repeated archive, deletion, integration,
 cleanup, child control, or child direction is recognised that way. A failure
 uses the same envelope with `ok: false`
 and an `error` object carrying `code`, `message`, `retryable`, and `exit_code`.
-`events` adds `gap { after, before, missing }` to `data` when a snapshot could
+`whoami` and `doctor` carry `participant`: the identity object of the person the
+token belongs to, or `{"kind":"operator"}` for an operator token, which is the
+same connection the `participant operator` text line reports. `events` adds
+`gap { after, before, missing }` to `data` when a snapshot could
 not carry every event after the cursor, and `null` otherwise.
 
 `--json` with `--follow` keeps every followed event in that one envelope, so
@@ -204,6 +228,15 @@ A changed `stream_epoch` invalidates the stored cursor, because the sequence
 numbers no longer name the same events. The client then treats the response in
 hand as a snapshot.
 
+`--follow --timeout <seconds>` bounds the follow. The cursor file is written
+after every rendered batch, so when the bound elapses the last delivered
+sequence is already stored: `events` stops, reports `deadline_exceeded` (exit
+`4`), and the next run with the same cursor file continues exactly there. The
+failure is `retryable: true` for that reason, even though nothing is retried by
+the command itself. Without `--timeout` a follow is unbounded, because it still
+stops at the run's `run_completed` event, and `--timeout` without `--follow` is
+a usage error (exit `2`).
+
 The polling cadence, paging, snapshot replacement, and epoch rules are stated in
 [the protocol document](protocol.md#headless-polling-client).
 
@@ -213,6 +246,18 @@ The polling cadence, paging, snapshot replacement, and epoch rules are stated in
 derived from the task) and otherwise creates it. It attaches `--repo` or
 `--as-directory` only when it created the session, so a replay neither
 duplicates an attachment nor fails on one that already exists.
+
+Without `--model`, `run` reads the provider catalog with the same
+`Provider/ListProviders` request `providers list` and `models list` send, and
+starts the first provider, in the order the worker returned it, that has a
+credential and a known default model. The selection is written as
+`loom:model:v1:["<provider-id>","<model>"]`, so the worker cannot resolve the
+model to another provider, and the model is the default `models list` marks for
+that provider, so the two verbs never disagree. When no provider has a
+credential, or when the worker refuses the catalog read as a missing capability,
+`run` prints one warning on stderr and starts `deterministic/demo`; a transport
+failure is still a failure, because the worker was never reached. An explicit
+`--model` always wins and never reads the catalog.
 
 The approval policy is set before the run starts, because a run resolves its
 policy once when it is created. A created session is pinned to
@@ -779,8 +824,9 @@ loom-cli providers set-key --provider openai --from-env OPENAI_API_KEY
 loom-cli ls
 loom-cli ls --workspace <workspace-id>
 
-# Follow a session from a persisted cursor.
-loom-cli events --session <session-id> --cursor-file .loom-cursor --follow
+# Follow a session from a persisted cursor, bounded to five minutes.
+loom-cli events --session <session-id> --cursor-file .loom-cursor --follow \
+  --timeout 300
 
 # Read the tail of a session's output.
 loom-cli peek --session <session-id> --lines 40
@@ -789,6 +835,13 @@ loom-cli peek --session <session-id> --lines 40
 loom-cli run --workspace <workspace-id> --name release-check \
   --repo https://github.com/acme/widgets.git --task-file task.md \
   --request-id 0199f0f4-0000-7000-8000-000000000000
+
+# Start a run on the worker's first credentialed provider and its default model.
+loom-cli run --workspace <workspace-id> --task 'tidy the fixtures'
+
+# Choose the model explicitly instead, and ask for the JSON envelope.
+loom-cli run --workspace <workspace-id> --task 'tidy the fixtures' \
+  --model 'loom:model:v1:["deepseek","deepseek-flash"]' --json
 
 # Retrigger CI without colliding with the completed session of the same name.
 loom-cli run --workspace <workspace-id> --task-file task.md --new \

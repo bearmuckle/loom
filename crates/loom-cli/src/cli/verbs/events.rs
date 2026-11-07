@@ -14,6 +14,13 @@
 //! because a later snapshot would carry the same window again. Only a fresh
 //! start without a cursor has no gap: starting from the current window is the
 //! documented behaviour of a first read.
+//!
+//! `--timeout <seconds>` bounds a `--follow`. Because the cursor is written after
+//! every fully rendered batch, the deadline is checked after that write: the last
+//! delivered sequence is on disk when the timeout is reported, so the same
+//! command with the same cursor file resumes exactly there. The timeout is
+//! reported as `deadline_exceeded` with exit `4`, and it is retryable, because a
+//! resumed follow is the way to continue a bound that ended.
 
 use std::{io::Write, path::Path, time::Duration};
 
@@ -66,6 +73,9 @@ pub(super) async fn events<C: Client>(
     let mut gap: Option<Gap> = None;
     let mut followed_run_completed = false;
     let mut delay = FOLLOW_MIN_DELAY;
+    let deadline = args
+        .timeout_secs
+        .map(|seconds| tokio::time::Instant::now() + Duration::from_secs(seconds));
     loop {
         let requested_after = after;
         let (request_id, response) = caller
@@ -181,6 +191,23 @@ pub(super) async fn events<C: Client>(
             write_cursor(path, &url, args.session, floor, epoch.clone())?;
         }
 
+        // This batch ends the command when the journal is at its head and the
+        // command is a plain read, or when a follow observed the run complete.
+        if page.next.is_none() && (!args.follow || followed_run_completed) {
+            break;
+        }
+        // The deadline is checked after the cursor write above, so the last
+        // delivered sequence is on disk before the timeout is reported and the
+        // next run resumes exactly there.
+        if let Some(deadline) = deadline
+            && tokio::time::Instant::now() >= deadline
+        {
+            return Err(Failure::Timeout {
+                request_id: caller.primary,
+                message: timeout_message(args, floor),
+            });
+        }
+
         match page.next {
             Some(next) => {
                 after = Some(next);
@@ -189,11 +216,15 @@ pub(super) async fn events<C: Client>(
             }
             None => {
                 after = floor.map(EventSequence::new);
-                if !args.follow || followed_run_completed {
-                    break;
-                }
                 if printed == 0 {
-                    tokio::time::sleep(delay).await;
+                    // Never sleep past the deadline: the bound is checked again
+                    // at the top of the next iteration.
+                    let wait = deadline.map_or(delay, |deadline| {
+                        deadline
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            .min(delay)
+                    });
+                    tokio::time::sleep(wait).await;
                     delay = (delay * 2).min(FOLLOW_MAX_DELAY);
                 } else {
                     delay = FOLLOW_MIN_DELAY;
@@ -256,6 +287,26 @@ pub(super) async fn peek<C: Client>(
         )?;
     }
     Ok(Outcome::new(json!({ "events": rendered }), caller.primary))
+}
+
+/// What a `--timeout` that elapsed reports: how long the follow was bounded to,
+/// the last sequence it delivered, and where the cursor holds that position.
+///
+/// The message names the cursor file only when the caller used one, because that
+/// is the only case where the next run resumes without reprinting.
+fn timeout_message(args: &EventsArgs, floor: Option<u64>) -> String {
+    let position = match floor {
+        Some(sequence) => format!(" after sequence {sequence}"),
+        None => " before any event".to_owned(),
+    };
+    let cursor = match &args.cursor_file {
+        Some(path) => format!("; the cursor file '{}' holds it", path.display()),
+        None => String::new(),
+    };
+    format!(
+        "the follow deadline of {}s elapsed{position}{cursor}",
+        args.timeout_secs.unwrap_or_default()
+    )
 }
 
 /// One response's worth of events, normalised over both batch shapes.

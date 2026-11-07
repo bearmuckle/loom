@@ -6,6 +6,13 @@
 //! `--flag value` and `--flag=value` forms. The first non-flag token names the
 //! verb.
 //!
+//! `--help` (or `-h`) prints the global manual. When the line also names a verb,
+//! as in `loom-cli run --help` or `loom-cli project worktree cleanup --help`, it
+//! prints only that verb's usage, its flags, and a few copy-and-paste examples,
+//! so one command answers without the whole table; a verb the per-verb table does
+//! not know falls back to the global manual, and help always wins over a token
+//! that would otherwise be rejected.
+//!
 //! | verb | requests |
 //! | --- | --- |
 //! | `doctor` | `Control/DiscoverCapabilities`, `Control/Negotiate`, `Access/GetCurrentParticipant`, `Control/GetWorkerNodeStatus` |
@@ -15,7 +22,7 @@
 //! | `get` | `Session/GetAgentSession`, plus `Session/GetAgentSessionSnapshotMetadata` with `--metadata` |
 //! | `events` | `Events/GetSessionEvents` |
 //! | `peek` | `Events/GetRecentSessionEvents` |
-//! | `run` | `Control/Negotiate`, `Workspace/ListWorkspaceSessions`, `Workspace/CreateAgentSessionInWorkspace`, `Repository/AttachSessionRepository`, `Filesystem/AttachSessionDirectory`, `Session/SetSessionApprovalPolicy`, `Run/StartSessionAgentRunWithOptions` |
+//! | `run` | `Control/Negotiate`, `Workspace/ListWorkspaceSessions`, `Workspace/CreateAgentSessionInWorkspace`, `Repository/AttachSessionRepository`, `Filesystem/AttachSessionDirectory`, `Session/SetSessionApprovalPolicy`, `Run/StartSessionAgentRunWithOptions`, plus `Provider/ListProviders` when `--model` is absent |
 //! | `send` | `Collaboration/GetRunRevision`, `Collaboration/DirectAgent` |
 //! | `project send` | `Project/GetProjectSnapshotForSession`, `Session/GetAgentSessionSnapshotMetadata`, `Collaboration/GetRunRevision`, `Collaboration/DirectAgent` |
 //! | `answer` | `Collaboration/GetRunRevision`, `Collaboration/AnswerAgentQuestion` |
@@ -79,6 +86,11 @@
 //! mutations: a token without `configure_archive_retention`,
 //! `configure_providers`, or `delete_agent_session` is refused at negotiation
 //! with exit `3`.
+//!
+//! `whoami` and `doctor` report the connection's participant: the identity
+//! object of the person the token belongs to, or `{"kind":"operator"}` for an
+//! operator token, which is the same connection the text line calls
+//! `participant operator`. Neither verb invents a person.
 //!
 //! `session archive`, `session delete` (and its `delete` alias), `project
 //! archive`, `project delete`, and `project worktree cleanup` are the
@@ -211,6 +223,17 @@
 //!
 //! `run` starts a run, and it is described here because its requests are the
 //! longest sequence the client sends:
+//!
+//! Its model is `--model` when the caller named one. Otherwise it sends the same
+//! `Provider/ListProviders` read that `providers list` sends and starts the
+//! first provider, in the order the worker returned them, that has a credential
+//! and a known default model, selected as
+//! `loom:model:v1:["<provider-id>","<model>"]` - a selection, not a raw id, so
+//! the worker cannot resolve the model to another provider. With no such
+//! provider it warns on stderr and starts `deterministic/demo`, and a worker
+//! that refuses the catalog read as a missing capability falls back the same
+//! way, because a run with the demo model is better than no run; a transport
+//! failure is never caught.
 //!
 //! 1. `Workspace/ListWorkspaceSessions { include_archived: false }` resolves the
 //!    workspace's live sessions. The first session whose name equals the
@@ -359,6 +382,15 @@
 //!
 //! # Cursor file
 //!
+//! `events --follow --timeout <seconds>` bounds the follow. The cursor file is
+//! written after every fully rendered batch, so when the bound elapses the last
+//! delivered sequence is already on disk: the verb stops, reports
+//! `deadline_exceeded` with exit `4`, and the same command with the same cursor
+//! file resumes exactly there. That is why a timeout is reported as retryable.
+//! Without `--timeout` a follow is unbounded, because it still stops at the
+//! run's `run_completed` event, and `--timeout` without `--follow` is a usage
+//! error.
+//!
 //! `events --cursor-file <path>` keeps
 //! `{"version":1,"url":...,"session_id":...,"after":...,"stream_epoch":...}`
 //! so a later run resumes without reprinting history. A cursor written for a
@@ -378,6 +410,19 @@
 //! `LOOM_TOKEN_FILE`. `--token` is rejected as a usage error that says so,
 //! because a token on a command line is visible to every process on the node.
 //! No diagnostic, envelope, or log line ever carries the token.
+//!
+//! The worker URL is `--connect <url>`, then `LOOM_URL`, then
+//! `ws://127.0.0.1:8765/ws`, so a local worker needs no flags at all. When neither
+//! `--token-file` nor `LOOM_TOKEN_FILE` names a file, the token path is derived
+//! from that URL as `<state directory>/<host>_<port>/token`, which is exactly
+//! where a standalone worker stores the token of the instance bound to that
+//! address: the state directory honours `LOOM_STATE_DIR`, then
+//! `XDG_STATE_HOME`, then `$HOME/.local/state`, and the host and port key is the
+//! worker's own bind key (`ws` defaults to port 80 and `wss` to 443). A leading
+//! `~/` in a named path is expanded with `HOME`. A token read failure names the
+//! path that was tried and, for a derived path, the URL it was derived for, and
+//! it is a usage error with exit `2` like every other local failure of the
+//! command line.
 
 mod args;
 mod client;
@@ -401,44 +446,49 @@ use args::{Invocation, Parsed};
 pub fn main(arguments: Vec<String>) -> i32 {
     let json = args::wants_json(&arguments);
     let mut invocation = match args::parse(&arguments) {
-        Ok(Parsed::Help) => return print_help(),
+        Ok(Parsed::Help(text)) => return print_help(text),
         Ok(Parsed::Run(invocation)) => invocation,
         Err(message) => return report_usage_stdio(&message, json, args::named_verb(&arguments)),
     };
-    // The environment is consulted exactly once, here, beside the token file
-    // fallback, and the result is stored on the invocation so the URL a cursor
-    // file is scoped to is the one the connection uses. Parsing itself stays a
-    // pure function of its arguments.
-    invocation.globals.connect = args::resolve_connect(
+    // The environment is consulted exactly once, here, and the result is stored
+    // on the invocation so the URL a cursor file is scoped to is the one the
+    // connection uses. Parsing itself stays a pure function of its arguments.
+    let url = args::resolve_connect(
         invocation.globals.connect.take(),
         std::env::var("LOOM_URL").ok(),
     );
+    let state_directory = loom_core::state_dir();
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let token_file = match args::resolve_token_file(
+        invocation.globals.token_file.clone(),
+        std::env::var_os("LOOM_TOKEN_FILE").map(std::path::PathBuf::from),
+        home.as_deref(),
+        &state_directory,
+        &url,
+    ) {
+        Ok(token_file) => token_file,
+        Err(message) => {
+            return report_usage_stdio(&message, json, args::named_verb(&arguments));
+        }
+    };
+    invocation.globals.connect = Some(url.clone());
+    invocation.globals.token_file = Some(token_file.path.clone());
     let settings = &invocation.globals;
-    let Some(url) = settings.connect.clone() else {
-        return report_usage_stdio(
-            "a worker URL is required: pass --connect <url> or set LOOM_URL",
-            settings.json,
-            args::verb_name(&invocation.verb),
-        );
-    };
-    let token_path = settings
-        .token_file
-        .clone()
-        .or_else(|| std::env::var_os("LOOM_TOKEN_FILE").map(Into::into));
-    let Some(token_path) = token_path else {
-        return report_usage_stdio(
-            "a bearer token is required: pass --token-file <path> or set LOOM_TOKEN_FILE",
-            settings.json,
-            args::verb_name(&invocation.verb),
-        );
-    };
-    let token = match std::fs::read_to_string(&token_path) {
+    let token = match std::fs::read_to_string(&token_file.path) {
         Ok(token) => token.trim().to_owned(),
         Err(error) => {
-            let message = format!(
-                "could not read the token file '{}': {error}",
-                token_path.display()
-            );
+            // The message names the path that was tried, and, when the caller
+            // named no file, the URL the default was derived from.
+            let message = match &token_file.derived_for {
+                Some(worker) => format!(
+                    "could not read the token file '{}' (default for {worker}): {error}",
+                    token_file.path.display()
+                ),
+                None => format!(
+                    "could not read the token file '{}': {error}",
+                    token_file.path.display()
+                ),
+            };
             return report_usage_stdio(&message, settings.json, args::verb_name(&invocation.verb));
         }
     };
@@ -541,8 +591,8 @@ pub async fn run_command<C: Client>(
 ) -> i32 {
     let json = args::wants_json(arguments);
     match args::parse(arguments) {
-        Ok(Parsed::Help) => {
-            let _ = out.write_all(args::HELP.as_bytes());
+        Ok(Parsed::Help(text)) => {
+            let _ = out.write_all(text.as_bytes());
             exit::OK
         }
         Ok(Parsed::Run(invocation)) => run_parsed(client, &invocation, out, err).await,
@@ -587,9 +637,9 @@ async fn run_invocation<C: Client>(
     }
 }
 
-fn print_help() -> i32 {
+fn print_help(text: &str) -> i32 {
     let mut out = std::io::stdout();
-    let _ = out.write_all(args::HELP.as_bytes());
+    let _ = out.write_all(text.as_bytes());
     let _ = out.flush();
     exit::OK
 }

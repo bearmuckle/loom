@@ -238,7 +238,8 @@ pub(super) async fn get<C: Client>(
 }
 
 /// `operator` for a connection that is not bound to a person, otherwise the
-/// person's display name and stable id.
+/// person's display name and stable id. The `--json` payload says
+/// `{"kind":"operator"}` for the same connection.
 fn participant_line(participant: Option<&ParticipantIdentity>) -> String {
     match participant {
         None => "participant operator\n".to_owned(),
@@ -251,7 +252,10 @@ fn participant_line(participant: Option<&ParticipantIdentity>) -> String {
 
 fn participant_value(participant: Option<&ParticipantIdentity>) -> Value {
     match participant {
-        None => Value::Null,
+        // An operator token is not bound to a person, so the payload names the
+        // kind instead of repeating `null`: a caller can then join the text line
+        // and the envelope on one identity.
+        None => json!({ "kind": "operator" }),
         Some(participant) => serde_json::to_value(participant).unwrap_or(Value::Null),
     }
 }

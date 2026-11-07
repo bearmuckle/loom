@@ -1427,6 +1427,27 @@ fn each_verb_negotiates_only_the_capabilities_its_requests_need() {
                 Capability::WriteSessionFilesystem,
                 Capability::ConfigureApprovalPolicy,
                 Capability::StartAgentRun,
+                Capability::ListProviders,
+            ],
+        ),
+        (
+            vec![
+                "run",
+                "--workspace",
+                &workspace,
+                "--task",
+                "a task",
+                "--model",
+                "deterministic/demo",
+            ],
+            vec![
+                Capability::JsonProtocol,
+                Capability::ReadAgentSession,
+                Capability::CreateAgentSession,
+                Capability::ManageSessionRepositories,
+                Capability::WriteSessionFilesystem,
+                Capability::ConfigureApprovalPolicy,
+                Capability::StartAgentRun,
             ],
         ),
         (
@@ -1445,6 +1466,7 @@ fn each_verb_negotiates_only_the_capabilities_its_requests_need() {
                 Capability::WriteSessionFilesystem,
                 Capability::ConfigureApprovalPolicy,
                 Capability::StartAgentRun,
+                Capability::ListProviders,
             ],
         ),
         (
@@ -1746,11 +1768,23 @@ fn json_envelopes_and_error_exit_codes_are_pinned() {
     let envelope: serde_json::Value = serde_json::from_str(success.stdout.trim()).unwrap();
     assert_eq!(envelope["ok"], true);
     assert_eq!(envelope["verb"], "whoami");
-    assert_eq!(envelope["data"]["participant"], serde_json::Value::Null);
+    assert_eq!(
+        envelope["data"]["participant"],
+        serde_json::json!({ "kind": "operator" }),
+        "an operator token names its kind instead of null"
+    );
     assert_eq!(
         envelope["request_id"].as_str().map(str::len),
         Some(36),
         "a UUID request id"
+    );
+
+    let doctor = run(&mut client, &["doctor", "--json"]);
+    assert_eq!(doctor.code, exit::OK, "{}", doctor.stderr);
+    assert_eq!(
+        json_envelope(&doctor)["data"]["participant"],
+        serde_json::json!({ "kind": "operator" }),
+        "doctor reports the same operator identity"
     );
 
     let usage = run(&mut client, &["get", "--json"]);
@@ -1887,6 +1921,123 @@ fn following_a_session_stops_after_the_run_completes() {
     let followed = run(&mut client, &["events", "--session", &session, "--follow"]);
     assert_eq!(followed.code, exit::OK);
     assert_eq!(followed.stdout, captured.join("\n") + "\n");
+}
+
+#[test]
+fn following_with_a_timeout_flushes_the_cursor_and_reports_a_deadline() {
+    // A session that never completes a run: the journal holds only its creation
+    // event, so a bounded follow has nothing to deliver after it and must reach
+    // its deadline instead of waiting forever.
+    let fixture = fixture();
+    let session = fixture.session.id.to_string();
+    let cursor = temporary_path("follow-timeout-cursor");
+    let _ = std::fs::remove_file(&cursor);
+    let cursor_path = cursor.to_str().unwrap().to_owned();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let started = std::time::Instant::now();
+    let timed_out = run(
+        &mut client,
+        &[
+            "events",
+            "--session",
+            &session,
+            "--follow",
+            "--timeout",
+            "1",
+            "--cursor-file",
+            &cursor_path,
+        ],
+    );
+    assert_eq!(timed_out.code, exit::TIMEOUT, "{}", timed_out.stderr);
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "the bound is honoured rather than a best effort"
+    );
+    assert!(
+        timed_out.stderr.contains("deadline_exceeded"),
+        "{}",
+        timed_out.stderr
+    );
+    assert!(
+        timed_out.stderr.contains("deadline of 1s"),
+        "{}",
+        timed_out.stderr
+    );
+
+    // The delivered events were printed, and the cursor holds exactly the last
+    // of them, so the next run resumes there.
+    let delivered = timed_out
+        .stdout
+        .lines()
+        .last()
+        .unwrap_or_else(|| panic!("no delivered event: {:?}", timed_out.stdout));
+    let last_sequence = sequence_of(delivered);
+    let stored: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&cursor).unwrap()).unwrap();
+    assert_eq!(stored["after"].as_u64(), Some(last_sequence));
+    assert_eq!(stored["session_id"], session.as_str());
+
+    // `--json` reports the deadline in the envelope, where it is retryable: a
+    // resumed follow continues the same read from the stored cursor.
+    let json_timeout = run(
+        &mut client,
+        &[
+            "events",
+            "--session",
+            &session,
+            "--follow",
+            "--timeout",
+            "1",
+            "--json",
+        ],
+    );
+    assert_eq!(json_timeout.code, exit::TIMEOUT, "{}", json_timeout.stderr);
+    let envelope = json_envelope(&json_timeout);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["verb"], "events");
+    assert_eq!(envelope["error"]["code"], "deadline_exceeded");
+    assert_eq!(envelope["error"]["retryable"], true);
+    assert_eq!(envelope["error"]["exit_code"], 4);
+    assert!(
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("deadline of 1s"),
+        "{envelope}"
+    );
+    assert_eq!(json_timeout.stderr, "", "--json reports on stdout alone");
+
+    let _ = std::fs::remove_file(&cursor);
+}
+
+#[test]
+fn a_timeout_without_follow_is_a_usage_error() {
+    let fixture = fixture();
+    let session = fixture.session.id.to_string();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let plain = run(
+        &mut client,
+        &["events", "--session", &session, "--timeout", "5"],
+    );
+    assert_eq!(plain.code, exit::USAGE, "{}", plain.stderr);
+    assert_eq!(plain.stdout, "");
+    assert!(plain.stderr.contains("events --follow"), "{}", plain.stderr);
+
+    let zero = run(
+        &mut client,
+        &[
+            "events",
+            "--session",
+            &session,
+            "--follow",
+            "--timeout",
+            "0",
+        ],
+    );
+    assert_eq!(zero.code, exit::USAGE, "{}", zero.stderr);
+    assert!(zero.stderr.contains("greater than zero"), "{}", zero.stderr);
 }
 
 #[test]
@@ -3058,7 +3209,12 @@ fn run_prints_the_session_and_the_started_run() {
         ],
     );
     assert_eq!(outcome.code, exit::OK, "{}", outcome.stderr);
-    assert_eq!(outcome.stderr, "");
+    assert_eq!(
+        outcome.stderr,
+        "warning: no provider with a credential has a default model; starting the run with \
+         'deterministic/demo'\n",
+        "the demo fallback says so once, and the two stdout lines stay untouched"
+    );
 
     // The session this invocation created is the one it printed, and its name
     // is derived from the task.
@@ -3083,6 +3239,99 @@ fn run_prints_the_session_and_the_started_run() {
     // The default policy parks the run on its first write, which is a stable
     // state to shut down from.
     fixture.backend.shutdown().unwrap();
+}
+
+#[test]
+fn run_without_a_model_starts_the_first_credentialed_providers_default() {
+    let (fixture, directory) = persistent_fixture("run-default-model");
+    let workspace = fixture.workspace.id.to_string();
+    fixture
+        .backend
+        .provider_registry()
+        .register(loom_providers::ProviderConfig::deepseek("deepseek-test"))
+        .unwrap();
+    let key_file = directory.join("deepseek.key");
+    std::fs::write(&key_file, "sk-fixture-value\n").unwrap();
+    {
+        let mut client = InProcessClient::new(&fixture.backend);
+        let stored = run(
+            &mut client,
+            &[
+                "providers",
+                "set-key",
+                "--provider",
+                "deepseek",
+                "--key-file",
+                key_file.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(stored.code, exit::OK, "{}", stored.stderr);
+    }
+
+    // The run start carries the derived selection: the only provider with a
+    // credential, and the default model that provider marks.
+    let seen: Rc<RefCell<Vec<ModelId>>> = Rc::new(RefCell::new(Vec::new()));
+    let hook = Rc::clone(&seen);
+    let mut client = Wrapped::new(InProcessClient::new(&fixture.backend)).before(move |envelope| {
+        if let ClientRequest::Run(RunRequest::StartSessionAgentRunWithOptions { model, .. }) =
+            &envelope.request
+        {
+            hook.borrow_mut().push(model.clone());
+        }
+    });
+    let started = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--task",
+            "use the provider",
+        ],
+    );
+    assert_eq!(started.code, exit::OK, "{}", started.stderr);
+    assert_eq!(
+        started.stderr, "",
+        "a credentialed provider needs no warning"
+    );
+    let selected = seen.borrow()[0].clone();
+    let (provider, model) = selected
+        .provider_model()
+        .expect("an explicit provider selection");
+    assert_eq!(provider.as_str(), "deepseek");
+    assert_eq!(model.as_str(), "deepseek-test");
+    drop(client);
+
+    // An explicit --model is used as written and never reads the catalog.
+    let saw_catalog = Rc::new(Cell::new(false));
+    let flag = Rc::clone(&saw_catalog);
+    let mut explicit =
+        Wrapped::new(InProcessClient::new(&fixture.backend)).before(move |envelope| {
+            if matches!(&envelope.request, ClientRequest::Provider(_)) {
+                flag.set(true);
+            }
+        });
+    let pinned = run(
+        &mut explicit,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--task",
+            "an explicit model",
+            "--model",
+            "deterministic/demo",
+        ],
+    );
+    assert_eq!(pinned.code, exit::OK, "{}", pinned.stderr);
+    assert_eq!(pinned.stderr, "");
+    assert!(
+        !saw_catalog.get(),
+        "an explicit --model never reads the provider catalog"
+    );
+    drop(explicit);
+
+    close_persistent_fixture(fixture, directory);
 }
 
 #[test]
@@ -3639,7 +3888,7 @@ fn parse(arguments: &[&str]) -> Result<Parsed, String> {
 fn invocation(arguments: &[&str]) -> args::Invocation {
     match parse(arguments) {
         Ok(Parsed::Run(invocation)) => invocation,
-        Ok(Parsed::Help) => panic!("{arguments:?} unexpectedly parsed as help"),
+        Ok(Parsed::Help(_)) => panic!("{arguments:?} unexpectedly parsed as help"),
         Err(message) => panic!("{arguments:?} was rejected: {message}"),
     }
 }
@@ -3775,15 +4024,128 @@ fn the_parser_rejects_unknown_verbs_flags_and_missing_values() {
 #[test]
 fn the_worker_url_comes_from_the_flag_then_the_environment() {
     assert_eq!(
-        args::resolve_connect(Some("ws://flag".to_owned()), Some("ws://env".to_owned())).as_deref(),
-        Some("ws://flag")
+        args::resolve_connect(Some("ws://flag".to_owned()), Some("ws://env".to_owned())),
+        "ws://flag"
     );
     assert_eq!(
-        args::resolve_connect(None, Some("ws://env".to_owned())).as_deref(),
-        Some("ws://env")
+        args::resolve_connect(None, Some("ws://env".to_owned())),
+        "ws://env"
     );
-    assert_eq!(args::resolve_connect(None, Some("   ".to_owned())), None);
-    assert_eq!(args::resolve_connect(None, None), None);
+    // A blank environment value is unset, so the local default fills in.
+    assert_eq!(
+        args::resolve_connect(None, Some("   ".to_owned())),
+        args::DEFAULT_CONNECT_URL
+    );
+    assert_eq!(args::resolve_connect(None, None), "ws://127.0.0.1:8765/ws");
+}
+
+#[test]
+fn the_token_file_is_named_or_derived_from_the_connected_url() {
+    let state = std::path::Path::new("/state/loom");
+    let home = std::path::Path::new("/home/person");
+    let local = "ws://127.0.0.1:8765/ws";
+
+    // A named file wins over the environment and over the derivation.
+    let named = args::resolve_token_file(
+        Some(PathBuf::from("/secrets/loom.token")),
+        Some(PathBuf::from("/env/loom.token")),
+        Some(home),
+        state,
+        local,
+    )
+    .expect("a named file");
+    assert_eq!(named.path, PathBuf::from("/secrets/loom.token"));
+    assert_eq!(named.derived_for, None);
+
+    let environment = args::resolve_token_file(
+        None,
+        Some(PathBuf::from("/env/loom.token")),
+        Some(home),
+        state,
+        local,
+    )
+    .expect("an environment file");
+    assert_eq!(environment.path, PathBuf::from("/env/loom.token"));
+    assert_eq!(environment.derived_for, None);
+
+    // Neither flag nor variable: the default URL derives the default instance's
+    // token path, and a blank variable is treated as unset.
+    let blank = args::resolve_token_file(
+        None,
+        Some(PathBuf::new()),
+        Some(home),
+        state,
+        args::DEFAULT_CONNECT_URL,
+    )
+    .expect("a derived file");
+    assert_eq!(blank.path, state.join("127.0.0.1_8765").join("token"));
+    assert_eq!(
+        blank.derived_for.as_deref(),
+        Some(args::DEFAULT_CONNECT_URL)
+    );
+
+    // The key follows the scheme's default port, drops user information, and
+    // maps an IPv6 literal the way bind_key maps a socket address.
+    let default_port =
+        args::resolve_token_file(None, None, Some(home), state, "wss://worker.example/ws")
+            .expect("a default port");
+    assert_eq!(
+        default_port.path,
+        state.join("worker.example_443").join("token")
+    );
+    let userinfo = args::resolve_token_file(
+        None,
+        None,
+        Some(home),
+        state,
+        "ws://person:pw@127.0.0.1:9000/ws",
+    )
+    .expect("user information");
+    assert_eq!(userinfo.path, state.join("127.0.0.1_9000").join("token"));
+    let ipv6 = args::resolve_token_file(None, None, Some(home), state, "ws://[::1]:8765/ws")
+        .expect("an IPv6 literal");
+    assert_eq!(ipv6.path, state.join("__1_8765").join("token"));
+
+    // A URL with no authority cannot name a path, and the error points at the
+    // flags that can.
+    let error = args::resolve_token_file(None, None, Some(home), state, "not-a-url")
+        .expect_err("a URL without an authority");
+    assert!(error.contains("--token-file"), "{error}");
+    assert!(error.contains("not-a-url"), "{error}");
+
+    // A leading ~/ is expanded with HOME, and a bare ~ is HOME itself.
+    let tilde = args::resolve_token_file(
+        Some(PathBuf::from("~/secrets/loom.token")),
+        None,
+        Some(home),
+        state,
+        local,
+    )
+    .expect("a tilde path");
+    assert_eq!(tilde.path, PathBuf::from("/home/person/secrets/loom.token"));
+    let bare = args::resolve_token_file(Some(PathBuf::from("~")), None, Some(home), state, local)
+        .expect("a bare tilde");
+    assert_eq!(bare.path, PathBuf::from("/home/person"));
+    // ~user is another account, and an unknown HOME leaves the path alone, so
+    // the error names what the caller wrote.
+    let other_user = args::resolve_token_file(
+        Some(PathBuf::from("~other/loom.token")),
+        None,
+        Some(home),
+        state,
+        local,
+    )
+    .expect("another account");
+    assert_eq!(other_user.path, PathBuf::from("~other/loom.token"));
+    let no_home = args::resolve_token_file(
+        Some(PathBuf::from("~/loom.token")),
+        None,
+        None,
+        state,
+        local,
+    )
+    .expect("no HOME");
+    assert_eq!(no_home.path, PathBuf::from("~/loom.token"));
 }
 
 #[test]
@@ -3805,7 +4167,7 @@ fn the_parser_applies_the_run_defaults_and_rejects_its_conflicts() {
     assert_eq!(args.workspace.to_string(), workspace);
     assert_eq!(args.task, "  keep   this workspace tidy  ");
     assert_eq!(args.name, "keep this workspace tidy");
-    assert_eq!(args.model.as_str(), "deterministic/demo");
+    assert_eq!(args.model, None, "--model is absent until it is given");
     assert_eq!(args.approval, None);
     assert_eq!(
         args.request_id.map(|id| id.to_string()).as_deref(),
@@ -3989,16 +4351,176 @@ fn the_parser_applies_the_run_defaults_and_rejects_its_conflicts() {
 
 #[test]
 fn help_short_circuits_parsing_whatever_else_is_given() {
-    assert!(matches!(parse(&["--help"]), Ok(Parsed::Help)));
-    assert!(matches!(parse(&["-h"]), Ok(Parsed::Help)));
+    assert!(matches!(parse(&["--help"]), Ok(Parsed::Help(_))));
+    assert!(matches!(parse(&["-h"]), Ok(Parsed::Help(_))));
     assert!(matches!(
         parse(&["events", "--help", "--mystery"]),
-        Ok(Parsed::Help)
+        Ok(Parsed::Help(_))
     ));
     assert!(args::HELP.contains("loom-cli"));
     assert!(args::HELP.contains("--cursor-file"));
     assert!(args::HELP.contains("--token-file"));
     assert!(args::HELP.contains("models list"));
+}
+
+#[test]
+fn a_verb_help_page_prints_its_own_usage_and_examples() {
+    let fixture = fixture();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let run_page = run(&mut client, &["run", "--help"]);
+    assert_eq!(run_page.code, exit::OK);
+    assert_eq!(run_page.stderr, "");
+    assert!(
+        run_page
+            .stdout
+            .starts_with("Usage: loom-cli run --workspace <id>"),
+        "{}",
+        run_page.stdout
+    );
+    assert!(run_page.stdout.contains("Examples"), "{}", run_page.stdout);
+    assert!(run_page.stdout.contains("--model"), "{}", run_page.stdout);
+    assert!(
+        run_page.stdout.contains("--json"),
+        "every page carries a --json example: {}",
+        run_page.stdout
+    );
+    // One verb, not the whole manual.
+    assert!(!run_page.stdout.contains("Verbs:"), "{}", run_page.stdout);
+    assert!(
+        !run_page.stdout.contains("project worktree cleanup"),
+        "{}",
+        run_page.stdout
+    );
+
+    // Every page the table covers answers with its own usage line, including the
+    // sub-verbs and the verbs whose flags would otherwise be rejected.
+    for (arguments, usage) in [
+        (owned(&["doctor", "--help"]), "Usage: loom-cli doctor"),
+        (owned(&["node", "--help"]), "Usage: loom-cli node"),
+        (owned(&["whoami", "-h"]), "Usage: loom-cli whoami"),
+        (owned(&["ls", "--help"]), "Usage: loom-cli ls"),
+        (owned(&["get", "--help"]), "Usage: loom-cli get"),
+        (owned(&["events", "--help"]), "Usage: loom-cli events"),
+        (owned(&["peek", "--help"]), "Usage: loom-cli peek"),
+        (owned(&["send", "--help"]), "Usage: loom-cli send"),
+        (owned(&["answer", "--help"]), "Usage: loom-cli answer"),
+        (owned(&["approve", "--help"]), "Usage: loom-cli approve"),
+        (owned(&["deny", "--help"]), "Usage: loom-cli deny"),
+        (owned(&["stop", "--help"]), "Usage: loom-cli stop"),
+        (
+            owned(&["wait", "--session", "<id>", "--help"]),
+            "Usage: loom-cli wait",
+        ),
+        (owned(&["status", "--help"]), "Usage: loom-cli status"),
+        (owned(&["liveness", "--help"]), "Usage: loom-cli liveness"),
+        (owned(&["result", "--help"]), "Usage: loom-cli result"),
+        (
+            owned(&["retention", "get", "--help"]),
+            "Usage: loom-cli retention get",
+        ),
+        (
+            owned(&["retention", "set", "--help"]),
+            "Usage: loom-cli retention set",
+        ),
+        (
+            owned(&["providers", "list", "--help"]),
+            "Usage: loom-cli providers list",
+        ),
+        (
+            owned(&["providers", "set-key", "--help"]),
+            "Usage: loom-cli providers set-key",
+        ),
+        (
+            owned(&["models", "list", "--help"]),
+            "Usage: loom-cli models list",
+        ),
+        (
+            owned(&["session", "archive", "--help"]),
+            "Usage: loom-cli session archive",
+        ),
+        (
+            owned(&["session", "delete", "--help"]),
+            "Usage: loom-cli session delete",
+        ),
+        (owned(&["delete", "--help"]), "Usage: loom-cli delete"),
+        (
+            owned(&["project", "get", "--help"]),
+            "Usage: loom-cli project get",
+        ),
+        (
+            owned(&["project", "tree", "--help"]),
+            "Usage: loom-cli project tree",
+        ),
+        (
+            owned(&["project", "tasks", "--help"]),
+            "Usage: loom-cli project tasks",
+        ),
+        (
+            owned(&["project", "children", "--help"]),
+            "Usage: loom-cli project children",
+        ),
+        (
+            owned(&["project", "messages", "--help"]),
+            "Usage: loom-cli project messages",
+        ),
+        (
+            owned(&["project", "send", "--help"]),
+            "Usage: loom-cli project send",
+        ),
+        (
+            owned(&["project", "child", "pause", "--help"]),
+            "Usage: loom-cli project child",
+        ),
+        (
+            owned(&["project", "archive", "--help"]),
+            "Usage: loom-cli project archive",
+        ),
+        (
+            owned(&["project", "delete", "--help"]),
+            "Usage: loom-cli project delete",
+        ),
+        (
+            owned(&["project", "worktrees", "--help"]),
+            "Usage: loom-cli project worktrees",
+        ),
+        (
+            owned(&["project", "worktree", "get", "--help"]),
+            "Usage: loom-cli project worktree get",
+        ),
+        (
+            owned(&["project", "worktree", "diff", "--help"]),
+            "Usage: loom-cli project worktree diff",
+        ),
+        (
+            owned(&["project", "worktree", "integrate", "--help"]),
+            "Usage: loom-cli project worktree integrate",
+        ),
+        (
+            owned(&["project", "worktree", "cleanup", "--help"]),
+            "Usage: loom-cli project worktree cleanup",
+        ),
+    ] {
+        let page = run_owned(&mut client, &arguments);
+        assert_eq!(page.code, exit::OK, "{arguments:?}");
+        assert!(
+            page.stdout.starts_with(usage),
+            "{arguments:?} printed {}",
+            page.stdout
+        );
+        assert!(page.stdout.contains("Examples"), "{arguments:?}");
+        assert!(page.stdout.contains("--json"), "{arguments:?}");
+        assert!(!page.stdout.contains("Verbs:"), "{arguments:?}");
+    }
+
+    // A bare --help and an unknown verb keep the global manual.
+    let manual = run(&mut client, &["--help"]);
+    assert_eq!(manual.code, exit::OK);
+    assert_eq!(manual.stdout, args::HELP);
+    assert!(manual.stdout.contains("Verbs:"));
+    let unknown = run(&mut client, &["mystery", "--help"]);
+    assert_eq!(unknown.code, exit::OK);
+    assert_eq!(unknown.stdout, args::HELP);
 }
 
 #[test]

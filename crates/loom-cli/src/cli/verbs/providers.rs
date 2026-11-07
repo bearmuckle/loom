@@ -15,8 +15,8 @@
 use std::{env, fs, io::Write, path::Path};
 
 use loom_model::{
-    DEEPSEEK_DEFAULT_MODEL, GITHUB_COPILOT_DEFAULT_MODEL, ModelDescriptor, OPENAI_DEFAULT_MODEL,
-    ProviderKind, ProviderSummary,
+    DEEPSEEK_DEFAULT_MODEL, GITHUB_COPILOT_DEFAULT_MODEL, ModelDescriptor, ModelId,
+    OPENAI_DEFAULT_MODEL, ProviderKind, ProviderSummary,
 };
 use loom_protocol::{ClientRequest, ProviderRequest, ProviderResponse, ServerResponse};
 use serde_json::{Value, json};
@@ -165,6 +165,24 @@ fn model_value(provider: &ProviderSummary, model: &ModelDescriptor, default: boo
         "default": default,
         "context_window": model.context_window,
         "max_output_tokens": model.max_output_tokens,
+    })
+}
+
+/// The model `run` starts when `--model` is absent: the first provider, in the
+/// order the worker returned them, that has a credential and a known default
+/// model, encoded as `loom:model:v1:["<provider-id>","<model>"]`.
+///
+/// The default is the one `models list` marks for that provider, so the two
+/// verbs never disagree about which model a provider prefers. `None` when no
+/// provider has both a credential and a model, which is what `run` reports with
+/// its deterministic fallback.
+pub(super) fn default_selection(providers: &[ProviderSummary]) -> Option<ModelId> {
+    providers.iter().find_map(|provider| {
+        provider.credential_id.as_ref()?;
+        let mut models = provider.models.iter().collect::<Vec<_>>();
+        models.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
+        let model = default_model(provider, &models)?;
+        Some(ModelId::for_provider(&provider.id, &ModelId::new(model)))
     })
 }
 

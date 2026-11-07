@@ -95,7 +95,11 @@ impl Failure {
 
     fn retryable(&self) -> bool {
         match self {
-            Self::Usage(_) | Self::Internal(_) | Self::BrokenPipe | Self::Timeout { .. } => false,
+            Self::Usage(_) | Self::Internal(_) | Self::BrokenPipe => false,
+            // A bounded poll that reached its deadline can be resumed: the
+            // state it waited for is still there, so running the command again
+            // continues from where the bound stopped it.
+            Self::Timeout { .. } => true,
             Self::Transport { error, .. } | Self::Server { error, .. } => error.retryable,
         }
     }
@@ -216,6 +220,12 @@ pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
             // read that listing would need.
             if !args.new {
                 capabilities.push(Capability::ReadAgentSession);
+            }
+            // Without `--model` the verb asks the worker for its providers to
+            // derive the model, which is the same read `providers list` sends.
+            // An explicit `--model` never asks for it.
+            if args.model.is_none() {
+                capabilities.push(Capability::ListProviders);
             }
         }
         Verb::Send { .. } | Verb::Answer { .. } => {
@@ -422,7 +432,7 @@ pub(crate) async fn run<C: Client>(
         }
         Verb::Events(args) => events::events(client, invocation, args, out, err).await,
         Verb::Peek(args) => events::peek(client, invocation, args, out, err).await,
-        Verb::Run(args) => run::run(client, invocation, args, out).await,
+        Verb::Run(args) => run::run(client, invocation, args, out, err).await,
         Verb::Send {
             run,
             text,
