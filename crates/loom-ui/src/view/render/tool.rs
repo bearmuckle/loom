@@ -1,4 +1,6 @@
 use super::*;
+use gpui_kit::base::Button as ChoiceButton;
+use gpui_kit::relative;
 
 impl LoomView {
     pub(crate) fn render_assistant_turn(
@@ -855,9 +857,11 @@ impl LoomView {
     /// disclosure: the whole text wraps to the available width and stays
     /// readable at phone sizes. A question that offers choices answers with one
     /// click, and an open question keeps the free-text route through the
-    /// composer, which is where a typed answer is written. The question comes
-    /// from the call that asked it, so the prompt and its choices read the same
-    /// when the run asks them, after a reload, and in history.
+    /// composer, which is where a typed answer is written. Each choice wraps
+    /// like the question does, so a long option reads in full instead of being
+    /// cut to its first line. The question comes from the call that asked it, so
+    /// the prompt and its choices read the same when the run asks them, after a
+    /// reload, and in history.
     fn render_agent_question(
         &self,
         part: &ToolPart,
@@ -912,22 +916,42 @@ impl LoomView {
                     .child(question.prompt.clone()),
             );
         if !question.choices.is_empty() {
-            let mut list = div().w_full().flex().flex_col().gap_1();
+            let mut list = div().w_full().min_w(px(0.)).flex().flex_col().gap_1();
             for (choice_index, choice) in question.choices.iter().enumerate() {
                 let answer = choice.clone();
                 let parent_for_choice = parent.clone();
-                list = list.child(
-                    Button::new((
-                        "agent-question-choice",
-                        question_choice_id(index, part_index, choice_index),
-                    ))
-                    .label(choice.clone())
-                    .outline()
-                    .small()
-                    .w_full()
-                    .when(layout.phone, |button| button.h(layout.control_size()))
-                    .disabled(!open)
+                let choice_id = question_choice_id(index, part_index, choice_index);
+                // A choice carries the answer, so its whole text has to read in
+                // the row: a one-line button clipped a long option into an
+                // ellipsis. The base button keeps the interaction, focus,
+                // keyboard activation and disabled behavior, while this row
+                // supplies wrapping text and the padding around it.
+                let mut button = ChoiceButton::new(("agent-question-choice", choice_id))
                     .accessibility_label(format!("Answer the agent question with {answer}"))
+                    .disabled(!open)
+                    .w_full()
+                    .min_w(px(0.))
+                    // The row grows past the minimum once the text wraps.
+                    .min_h(layout.control_size())
+                    .px_3()
+                    .py_1()
+                    .rounded_sm()
+                    .border_1()
+                    // Every color is a theme-role alias, so the row follows the
+                    // active palette instead of fixing a dark one.
+                    .border_color(if open { rgb(0x3b4555) } else { rgb(0x242833) })
+                    .bg(rgb(0x20242c))
+                    .line_height(relative(1.25))
+                    .text_sm()
+                    .text_color(if open { rgb(0xe9d5ff) } else { rgb(0x8f98a6) })
+                    .child(
+                        div()
+                            .id(("agent-question-choice-text", choice_id))
+                            .test_support()
+                            .w_full()
+                            .min_w(px(0.))
+                            .child(choice.clone()),
+                    )
                     .on_click(move |_, _, cx| {
                         // The chosen text is the answer, so it is sent as one
                         // instead of being typed into the composer first.
@@ -935,8 +959,16 @@ impl LoomView {
                         parent_for_choice.update(cx, |view, cx| {
                             view.answer_question(answer, cx);
                         });
-                    }),
-                );
+                    });
+                if open {
+                    button = button
+                        .cursor_pointer()
+                        .hover(|row| row.bg(rgb(0x293b56)))
+                        // Keyboard focus lands on the row rather than on a
+                        // single line of text, so the whole choice shows it.
+                        .focus(|row| row.border_color(rgb(0x93c5fd)));
+                }
+                list = list.child(button);
             }
             card = card.child(list);
         }
