@@ -15,7 +15,10 @@ use loom_core::{
     Result, Timestamp,
 };
 pub use loom_model::ToolResult;
-use loom_model::{CancellationToken, ToolCall, ToolDefinition};
+use loom_model::{
+    CancellationToken, DecisionOption, DecisionProvider, DecisionQuestion, DecisionRequest,
+    ToolCall, ToolDefinition,
+};
 use loom_sessionfs::{Workspace, WorkspaceEdit};
 use loom_vcs::{
     BranchPush, GitService, PushReport, RemoteRef, RemoteRefreshReport, RemoteRefsReport,
@@ -107,6 +110,7 @@ pub enum ToolKind {
     ClaimGoalReached,
     ApplyPatch,
     RunCommand,
+    Decide,
     GitHubListPullRequests,
     GitHubGetPullRequest,
     GitHubGetBranchChecks,
@@ -141,6 +145,7 @@ impl ToolKind {
             "claim_goal_reached" => Some(Self::ClaimGoalReached),
             "apply_patch" => Some(Self::ApplyPatch),
             "run_command" => Some(Self::RunCommand),
+            "decide" => Some(Self::Decide),
             "github_list_pull_requests" => Some(Self::GitHubListPullRequests),
             "github_get_pull_request" => Some(Self::GitHubGetPullRequest),
             "github_get_branch_checks" => Some(Self::GitHubGetBranchChecks),
@@ -178,6 +183,7 @@ impl ToolKind {
             Self::ClaimGoalReached => "claim_goal_reached",
             Self::ApplyPatch => "apply_patch",
             Self::RunCommand => "run_command",
+            Self::Decide => "decide",
             Self::GitHubListPullRequests => "github_list_pull_requests",
             Self::GitHubGetPullRequest => "github_get_pull_request",
             Self::GitHubGetBranchChecks => "github_get_branch_checks",
@@ -223,7 +229,12 @@ impl ToolKind {
             | Self::Glob
             | Self::ProposePlan
             | Self::AskUser
-            | Self::ClaimGoalReached => ActionKind::Read,
+            | Self::ClaimGoalReached
+            // A decision is an input to a judgement the agent still makes, never
+            // an action: the tool reads a model answer and changes nothing, so
+            // it runs under the default policy without a prompt and can never
+            // approve or execute anything.
+            | Self::Decide => ActionKind::Read,
             Self::WebSearch
             | Self::GitHubListPullRequests
             | Self::GitHubGetPullRequest
@@ -505,6 +516,10 @@ pub struct ToolExecutor {
     max_output_bytes: usize,
     workspace: Workspace,
     web_search_provider: Option<Arc<dyn WebSearchProvider>>,
+    /// The decision model this run may ask for an advisory choice. `None` means
+    /// the run has no decision model configured, and the `decide` tool is then
+    /// not advertised at all.
+    decision_provider: Option<Arc<dyn DecisionProvider>>,
     github_token: Option<String>,
     github_write_enabled: bool,
     /// Whether the connected account holds the repository-scoped credential a
@@ -531,6 +546,7 @@ impl ToolExecutor {
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             workspace,
             web_search_provider: None,
+            decision_provider: None,
             github_token: None,
             github_write_enabled: false,
             github_repository_access: None,
@@ -550,6 +566,13 @@ impl ToolExecutor {
 
     pub fn with_web_search_provider(mut self, provider: Arc<dyn WebSearchProvider>) -> Self {
         self.web_search_provider = Some(provider);
+        self
+    }
+
+    /// Enables the read-only `decide` tool for this run. Without a provider the
+    /// tool is not advertised, so a run without a decision model never sees it.
+    pub fn with_decision_provider(mut self, provider: Arc<dyn DecisionProvider>) -> Self {
+        self.decision_provider = Some(provider);
         self
     }
 
@@ -623,6 +646,10 @@ impl ToolExecutor {
                 | ToolKind::GitHubRemoveLabels,
             ) => github_connected,
             Some(ToolKind::GitHubPushBranch) => github_connected && self.github_write_enabled,
+            // A decision model is optional per run, so the tool it backs is
+            // advertised only when a provider is configured. A run without one
+            // does not see the tool at all.
+            Some(ToolKind::Decide) => self.decision_provider.is_some(),
             _ => true,
         });
         if let Some(extension) = &self.extension {
@@ -788,6 +815,7 @@ impl ToolExecutor {
             }
             ToolKind::ApplyPatch => self.apply_patch(call),
             ToolKind::RunCommand => self.run_command(call, cancel),
+            ToolKind::Decide => self.decide(call, cancel),
             ToolKind::GitHubListPullRequests => self.github_list_pull_requests(call),
             ToolKind::GitHubGetPullRequest => self.github_get_pull_request(call),
             ToolKind::GitHubGetBranchChecks => self.github_get_branch_checks(call),
@@ -1193,6 +1221,38 @@ impl ToolExecutor {
         } else {
             ToolResult::failure(call, text)
         }
+    }
+
+    /// Asks the decision model for one choice per closed question.
+    ///
+    /// The answer is advisory: this tool reads a model answer and changes
+    /// nothing, so a decision failure is a failed tool result the agent can
+    /// report, never a panic or a failed run.
+    fn decide(&self, call: &ToolCall, cancel: &CancellationToken) -> ToolResult {
+        let Some(provider) = &self.decision_provider else {
+            return ToolResult::failure(call, "the decide tool is not enabled for this run");
+        };
+        let arguments: DecideArguments = match parse_arguments(call) {
+            Ok(arguments) => arguments,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let request = arguments.into_request();
+        // A model can ignore a JSON schema, so the request is checked before it
+        // is sent and a malformed call is reported in the caller's own words.
+        if let Err(error) = request.validate() {
+            return ToolResult::failure(
+                call,
+                format!("invalid arguments for '{}': {error}", call.name),
+            );
+        }
+        let response = match provider.decide(&request, cancel) {
+            Ok(response) => response,
+            Err(error) => return ToolResult::failure(call, error.message),
+        };
+        let Ok(answers) = serde_json::to_value(&response.answers) else {
+            return ToolResult::failure(call, "the decision answers could not be encoded");
+        };
+        ToolResult::success(call, serde_json::json!({ "answers": answers }).to_string())
     }
 
     fn execute_command(
@@ -3787,6 +3847,46 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: ToolKind::Decide.name().to_owned(),
+            description: "Ask the decision model for one choice per closed question about a factual state. The answer is advisory only: the tool is read-only, it cannot approve, execute, or write, it must not be used to decide a tool approval or to claim success, and a decision is not a fact. Pass the facts in `state` and up to six questions with two or more labelled options each, and judge the answer yourself.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "state": {"type": "string", "description": "The facts to decide from."},
+                    "questions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": loom_model::MAX_DECISION_QUESTIONS,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "instructions": {"type": "string"},
+                                "options": {
+                                    "type": "array",
+                                    "minItems": loom_model::MIN_DECISION_OPTIONS,
+                                    "maxItems": loom_model::MAX_DECISION_OPTIONS,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {"type": "string"},
+                                            "when": {"type": "string", "description": "The criterion for this label."}
+                                        },
+                                        "required": ["label"],
+                                        "additionalProperties": false
+                                    }
+                                }
+                            },
+                            "required": ["id", "options"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["state", "questions"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
             name: ToolKind::GitHubListPullRequests.name().to_owned(),
             description: "List pull requests for a GitHub repository. Requires a connected GitHub account and approval for network access.".to_owned(),
             input_schema: serde_json::json!({
@@ -4303,6 +4403,55 @@ struct RunCommandArguments {
     args: Vec<String>,
     cwd: Option<String>,
     timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DecideArguments {
+    state: String,
+    #[serde(default)]
+    questions: Vec<DecideQuestionArguments>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DecideQuestionArguments {
+    id: String,
+    #[serde(default)]
+    instructions: Option<String>,
+    #[serde(default)]
+    options: Vec<DecideOptionArguments>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DecideOptionArguments {
+    label: String,
+    /// The criterion the label applies by. An absent value leaves the label to
+    /// the model's interpretation, which is what the contract allows.
+    #[serde(default, rename = "when")]
+    when: Option<String>,
+}
+
+impl DecideArguments {
+    fn into_request(self) -> DecisionRequest {
+        DecisionRequest {
+            state: self.state,
+            questions: self
+                .questions
+                .into_iter()
+                .map(|question| DecisionQuestion {
+                    id: question.id,
+                    instructions: question.instructions,
+                    options: question
+                        .options
+                        .into_iter()
+                        .map(|option| DecisionOption {
+                            label: option.label,
+                            when: option.when,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
 }
 
 fn normalize_domains(domains: Vec<String>) -> std::result::Result<Vec<String>, String> {
@@ -5447,6 +5596,285 @@ mod tests {
                 .iter()
                 .any(|name| name == "github_push_branch")
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A fake decision model that records every request and answers its first
+    /// option, so the mapping into the contract can be read back.
+    struct FakeDecisionProvider {
+        seen: Mutex<Vec<DecisionRequest>>,
+        failure: Option<String>,
+    }
+
+    impl FakeDecisionProvider {
+        fn new(failure: Option<&str>) -> Self {
+            Self {
+                seen: Mutex::new(Vec::new()),
+                failure: failure.map(str::to_owned),
+            }
+        }
+
+        fn requests(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
+    }
+
+    impl DecisionProvider for FakeDecisionProvider {
+        fn descriptor(&self) -> loom_model::DecisionDescriptor {
+            loom_model::DecisionDescriptor {
+                provider: loom_model::ProviderId::new("fixture"),
+                model: loom_model::ModelId::new("fixture/decision"),
+            }
+        }
+
+        fn decide(
+            &self,
+            request: &DecisionRequest,
+            _cancel: &CancellationToken,
+        ) -> Result<loom_model::DecisionResponse> {
+            self.seen.lock().unwrap().push(request.clone());
+            if let Some(failure) = &self.failure {
+                return Err(loom_core::LoomError::invalid_request(failure.clone()));
+            }
+            let answers = request
+                .questions
+                .iter()
+                .map(|question| {
+                    let choice = question.options[0].label.clone();
+                    let probabilities = question
+                        .options
+                        .iter()
+                        .map(|option| {
+                            let probability = if option.label == choice { 1.0 } else { 0.0 };
+                            (option.label.clone(), probability)
+                        })
+                        .collect();
+                    (
+                        question.id.clone(),
+                        loom_model::DecisionAnswer {
+                            choice,
+                            confidence: 1.0,
+                            probabilities,
+                        },
+                    )
+                })
+                .collect();
+            Ok(loom_model::DecisionResponse {
+                answers,
+                model: "fixture/decision".to_owned(),
+                usage: Default::default(),
+            })
+        }
+    }
+
+    fn decision_arguments() -> serde_json::Value {
+        serde_json::json!({
+            "state": "the diff touches two test files and the suite passes",
+            "questions": [
+                {
+                    "id": "risk",
+                    "instructions": "Pick the risk level the state supports.",
+                    "options": [
+                        {"label": "low", "when": "only test files changed"},
+                        {"label": "high", "when": "runtime code changed"}
+                    ]
+                }
+            ]
+        })
+    }
+
+    /// A run without a decision model must not see the tool at all: it is
+    /// absent from the definitions rather than advertised and disabled.
+    #[test]
+    fn decide_is_advertised_only_when_a_decision_model_is_available() {
+        let root = workspace();
+        let names = |executor: &ToolExecutor| {
+            executor
+                .definitions()
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>()
+        };
+        let without = ToolExecutor::new(&root).unwrap();
+        assert!(!names(&without).iter().any(|name| name == "decide"));
+
+        let with = without.with_decision_provider(Arc::new(FakeDecisionProvider::new(None)));
+        assert!(names(&with).iter().any(|name| name == "decide"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The decision tool reads a model answer and changes nothing, so the
+    /// default policy runs it without a prompt and it can never approve or
+    /// execute anything.
+    #[test]
+    fn decide_is_a_read_that_needs_no_approval() {
+        assert_eq!(ToolKind::Decide.name(), "decide");
+        assert_eq!(ToolKind::from_name("decide"), Some(ToolKind::Decide));
+        assert_eq!(ToolKind::Decide.action_kind(), ActionKind::Read);
+        assert!(!ToolKind::Decide.requires_approval());
+        assert_eq!(
+            ApprovalPolicy::default().decision(ToolKind::Decide.action_kind()),
+            loom_core::PolicyDecision::Allow
+        );
+    }
+
+    #[test]
+    fn decide_advertises_the_closed_questions_it_accepts() {
+        let definition = tool_definitions()
+            .into_iter()
+            .find(|definition| definition.name == "decide")
+            .expect("the decide tool is defined");
+        let schema = &definition.input_schema;
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["state", "questions"])
+        );
+        assert_eq!(schema["additionalProperties"], false);
+        let question = &schema["properties"]["questions"];
+        assert_eq!(question["type"], "array");
+        assert_eq!(question["minItems"], 1);
+        assert_eq!(question["maxItems"], 6);
+        assert_eq!(
+            question["items"]["required"],
+            serde_json::json!(["id", "options"])
+        );
+        assert_eq!(question["items"]["additionalProperties"], false);
+        let options = &question["items"]["properties"]["options"];
+        assert_eq!(options["minItems"], 2);
+        assert_eq!(options["maxItems"], 255);
+        assert_eq!(options["items"]["required"], serde_json::json!(["label"]));
+        assert_eq!(options["items"]["additionalProperties"], false);
+        // A `when` criterion is optional, so an option can carry only a label.
+        assert!(options["items"]["properties"].get("when").is_some());
+        // The description must state that the answer is advisory, so the model
+        // cannot read it as permission, as success, or as a fact.
+        assert!(definition.description.contains("advisory only"));
+        assert!(
+            definition
+                .description
+                .contains("cannot approve, execute, or write")
+        );
+        assert!(definition.description.contains("a decision is not a fact"));
+    }
+
+    #[test]
+    fn decide_maps_the_arguments_into_the_request_and_returns_the_answers() {
+        let root = workspace();
+        let provider = Arc::new(FakeDecisionProvider::new(None));
+        let executor = ToolExecutor::new(&root)
+            .unwrap()
+            .with_decision_provider(provider.clone());
+        let result = executor.execute(&call("decide", decision_arguments()));
+        assert!(result.success, "{}", result.output);
+
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let request = &seen[0];
+        assert_eq!(
+            request.state,
+            "the diff touches two test files and the suite passes"
+        );
+        assert_eq!(request.questions.len(), 1);
+        let question = &request.questions[0];
+        assert_eq!(question.id, "risk");
+        assert_eq!(
+            question.instructions.as_deref(),
+            Some("Pick the risk level the state supports.")
+        );
+        assert_eq!(
+            question.options,
+            vec![
+                DecisionOption {
+                    label: "low".to_owned(),
+                    when: Some("only test files changed".to_owned()),
+                },
+                DecisionOption {
+                    label: "high".to_owned(),
+                    when: Some("runtime code changed".to_owned()),
+                },
+            ]
+        );
+        drop(seen);
+
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["answers"]["risk"]["choice"], "low");
+        assert_eq!(output["answers"]["risk"]["confidence"], 1.0);
+        assert_eq!(output["answers"]["risk"]["probabilities"]["low"], 1.0);
+        assert_eq!(output["answers"]["risk"]["probabilities"]["high"], 0.0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A malformed request is refused in the caller's own words and never
+    /// reaches the model.
+    #[test]
+    fn decide_refuses_a_malformed_request_before_it_reaches_the_provider() {
+        let root = workspace();
+        let provider = Arc::new(FakeDecisionProvider::new(None));
+        let executor = ToolExecutor::new(&root)
+            .unwrap()
+            .with_decision_provider(provider.clone());
+        for (arguments, expected) in [
+            (
+                serde_json::json!({
+                    "state": "a state",
+                    "questions": [{"id": "risk", "options": [{"label": "only"}]}]
+                }),
+                "at least 2 options",
+            ),
+            (
+                serde_json::json!({
+                    "state": "  ",
+                    "questions": [{
+                        "id": "risk",
+                        "options": [{"label": "low"}, {"label": "high"}]
+                    }]
+                }),
+                "state must not be empty",
+            ),
+            (
+                serde_json::json!({"state": "a state"}),
+                "questions must not be empty",
+            ),
+        ] {
+            let result = executor.execute(&call("decide", arguments));
+            assert!(!result.success, "{}", result.output);
+            assert!(
+                result.output.contains("invalid arguments for 'decide'"),
+                "{}",
+                result.output
+            );
+            assert!(result.output.contains(expected), "{}", result.output);
+        }
+        assert_eq!(provider.requests(), 0, "a malformed request is never sent");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_decision_failure_is_a_failed_tool_result() {
+        let root = workspace();
+        let executor = ToolExecutor::new(&root)
+            .unwrap()
+            .with_decision_provider(Arc::new(FakeDecisionProvider::new(Some(
+                "Jev is unavailable",
+            ))));
+        let result = executor.execute(&call("decide", decision_arguments()));
+        assert!(!result.success);
+        assert_eq!(result.output, "Jev is unavailable");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn decide_without_a_provider_fails_instead_of_being_unknown() {
+        let root = workspace();
+        let executor = ToolExecutor::new(&root).unwrap();
+        let result = executor.execute(&call("decide", decision_arguments()));
+        assert!(!result.success);
+        assert!(
+            result.output.contains("not enabled for this run"),
+            "{}",
+            result.output
+        );
+        assert!(!result.output.contains("unknown tool"), "{}", result.output);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -8593,6 +9021,7 @@ mod helper_tests {
             ToolKind::ClaimGoalReached,
             ToolKind::ApplyPatch,
             ToolKind::RunCommand,
+            ToolKind::Decide,
             ToolKind::GitHubListPullRequests,
             ToolKind::GitHubGetPullRequest,
             ToolKind::GitHubGetBranchChecks,
@@ -8626,6 +9055,7 @@ mod helper_tests {
                 | ToolKind::ClaimGoalReached
                 | ToolKind::ApplyPatch
                 | ToolKind::RunCommand
+                | ToolKind::Decide
                 | ToolKind::GitHubListPullRequests
                 | ToolKind::GitHubGetPullRequest
                 | ToolKind::GitHubGetBranchChecks
@@ -8698,6 +9128,7 @@ mod helper_tests {
             "propose_plan",
             "ask_user",
             "claim_goal_reached",
+            "decide",
         ];
         assert_eq!(unapproved, expected_unapproved.to_vec());
     }
