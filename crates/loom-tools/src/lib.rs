@@ -4,7 +4,10 @@ use std::{
     io::Read,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -296,26 +299,51 @@ const MAX_LIST_DEPTH: usize = 32;
 /// Cap for a scoped (single-subtree) listing used by search and glob tools.
 const MAX_SCOPED_LIST_ENTRIES: usize = 100_000;
 
+/// Hard wall-clock limit for one command. The limit covers the wait for the
+/// exit status, so a command that never finishes cannot pin an agent run. A
+/// call may lower or raise it with `timeout_ms`.
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const MIN_COMMAND_TIMEOUT_MS: u64 = 100;
 const MAX_COMMAND_TIMEOUT_MS: u64 = 600_000;
 /// Poll interval while waiting for a child process to exit.
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// How long the stdout and stderr pipes may keep delivering output after the
+/// command exited or was killed.
+///
+/// A command that backgrounds a process hands its pipes to a descendant that
+/// can outlive the shell and hold them open for the rest of its life, which is
+/// why the drain is bounded instead of following every writer to its end.
+const COMMAND_OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(250);
+/// How long an output reader gets to stop and hand over the bytes it already
+/// read once the drain grace is over.
+const COMMAND_READER_STOP_GRACE: Duration = Duration::from_millis(100);
+/// How long an output reader waits for more bytes before it re-checks whether
+/// it must stop.
+const COMMAND_READER_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// How long a killed command gets to report its exit status before the call
+/// gives up on it.
+const COMMAND_REAP_GRACE: Duration = Duration::from_secs(2);
+/// Read size used by the output readers.
+const COMMAND_OUTPUT_CHUNK_BYTES: usize = 8_192;
 
 /// Terminates a command that exceeded its timeout. On Unix the command runs in
 /// its own process group, so the whole tree is killed; otherwise only the
 /// direct child is killed. Killing only the direct child can leave grandchildren
-/// holding the stdout/stderr pipes open, which would block the reader threads.
+/// holding the stdout/stderr pipes open, which would block the output readers.
 fn terminate_command(child: &mut std::process::Child) {
     #[cfg(unix)]
-    {
-        // Safety: the child is the leader of its own process group, so the
-        // negative pid targets only the command and its descendants.
-        unsafe {
-            libc::kill(-(child.id() as i32), libc::SIGKILL);
-        }
-    }
+    kill_process_group(child.id());
     let _ = child.kill();
+}
+
+/// Kills every process in the group `pid` leads.
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    // Safety: only `kill` is called, and the negative pid addresses the group
+    // the command leads, so no unrelated process is targeted.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
 }
 
 const GITHUB_NOT_CONNECTED: &str =
@@ -1244,17 +1272,23 @@ impl ToolExecutor {
         let mut child = command
             .spawn()
             .map_err(|error| format!("could not start '{program}': {error}"))?;
+        // The leader's pid names the process group the command and its
+        // descendants belong to.
+        #[cfg(unix)]
+        let group = child.id();
         let cap = self.max_output_bytes.max(1);
-        let stdout_reader = child
-            .stdout
-            .take()
-            .map(|stdout| thread::spawn(move || read_capped(stdout, cap)));
-        let stderr_reader = child
-            .stderr
-            .take()
-            .map(|stderr| thread::spawn(move || read_capped(stderr, cap)));
+        let stdout_capture = OutputCapture::new(cap);
+        let stderr_capture = OutputCapture::new(cap);
+        if let Some(stdout) = child.stdout.take() {
+            spawn_output_reader(Arc::clone(&stdout_capture), stdout);
+        }
+        if let Some(stderr) = child.stderr.take() {
+            spawn_output_reader(Arc::clone(&stderr_capture), stderr);
+        }
+        let captures = [&stdout_capture, &stderr_capture];
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        let mut status = None;
+        let status: Option<std::process::ExitStatus>;
+        let mut timed_out = false;
         let mut cancelled = false;
         loop {
             // A user interrupt or pause cancels the token; terminate the whole
@@ -1262,7 +1296,7 @@ impl ToolExecutor {
             if cancel.is_cancelled() {
                 cancelled = true;
                 terminate_command(&mut child);
-                let _ = child.wait();
+                status = reap_command(&mut child);
                 break;
             }
             match child.try_wait() {
@@ -1272,21 +1306,44 @@ impl ToolExecutor {
                 }
                 Ok(None) => {
                     if Instant::now() >= deadline {
+                        timed_out = true;
                         terminate_command(&mut child);
-                        let _ = child.wait();
+                        status = reap_command(&mut child);
                         break;
                     }
                     thread::sleep(COMMAND_POLL_INTERVAL);
                 }
-                Err(error) => return Err(format!("could not wait for '{program}': {error}")),
+                Err(error) => {
+                    terminate_command(&mut child);
+                    let _ = reap_command(&mut child);
+                    return Err(format!("could not wait for '{program}': {error}"));
+                }
             }
         }
-        let (stdout, stdout_truncated) = stdout_reader.map_or((Vec::new(), false), |reader| {
-            reader.join().unwrap_or_default()
-        });
-        let (stderr, stderr_truncated) = stderr_reader.map_or((Vec::new(), false), |reader| {
-            reader.join().unwrap_or_default()
-        });
+        // Collect the output the command produced. The reader threads end at the
+        // pipe's end of file, which a backgrounded descendant can postpone
+        // indefinitely, so every wait here is bounded.
+        let mut complete =
+            wait_for_captures(&captures, Instant::now() + COMMAND_OUTPUT_DRAIN_GRACE);
+        if !complete {
+            // A descendant still holds the pipes. Killing the group closes them
+            // when the descendant stayed in it, so the readers get the same
+            // grace to reach the end of the stream.
+            #[cfg(unix)]
+            kill_process_group(group);
+            complete = wait_for_captures(&captures, Instant::now() + COMMAND_OUTPUT_DRAIN_GRACE);
+        }
+        if !complete {
+            // A descendant that detached with `setsid` survives the group kill
+            // and holds the pipes for as long as it lives, so the readers are
+            // stopped instead of followed to the end of its life.
+            for capture in captures {
+                capture.stop();
+            }
+            let _ = wait_for_captures(&captures, Instant::now() + COMMAND_READER_STOP_GRACE);
+        }
+        let (stdout, stdout_truncated) = stdout_capture.take();
+        let (stderr, stderr_truncated) = stderr_capture.take();
         if cancelled {
             return Err("command was cancelled".to_owned());
         }
@@ -1294,8 +1351,11 @@ impl ToolExecutor {
             status,
             stdout,
             stderr,
-            stdout_truncated,
-            stderr_truncated,
+            stdout_truncated: stdout_truncated || !complete,
+            stderr_truncated: stderr_truncated || !complete,
+            timed_out,
+            timeout_ms,
+            output_incomplete: !complete,
         })
     }
 
@@ -2694,11 +2754,19 @@ struct CommandOutput {
     stderr: Vec<u8>,
     stdout_truncated: bool,
     stderr_truncated: bool,
+    /// Set when the hard timeout expired, so the result names the limit that
+    /// ended the command instead of reporting a missing exit status.
+    timed_out: bool,
+    /// The limit the command ran under, reported with a timeout.
+    timeout_ms: u64,
+    /// Set when a descendant kept the output pipes open past their grace, so
+    /// the collected output may be missing its tail.
+    output_incomplete: bool,
 }
 
 impl CommandOutput {
     fn success(&self) -> bool {
-        self.status.is_some_and(|status| status.success())
+        !self.timed_out && self.status.is_some_and(|status| status.success())
     }
 
     fn render(&self) -> String {
@@ -2722,9 +2790,23 @@ impl CommandOutput {
                 text.push_str("\n[stderr truncated]");
             }
         }
-        let status = match self.status {
-            Some(status) => format!("exit status: {status}"),
-            None => "command timed out and was killed".to_owned(),
+        if self.output_incomplete {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(
+                "[output may be incomplete: a background process kept the command's stdout/stderr open]",
+            );
+        }
+        let status = if self.timed_out {
+            format!(
+                "command timed out after {}ms and was killed",
+                self.timeout_ms
+            )
+        } else if let Some(status) = self.status {
+            format!("exit status: {status}")
+        } else {
+            "command ended without an exit status".to_owned()
         };
         if text.is_empty() {
             status
@@ -2734,28 +2816,188 @@ impl CommandOutput {
     }
 }
 
-fn read_capped(mut reader: impl Read, cap: usize) -> (Vec<u8>, bool) {
-    let mut stored = Vec::new();
-    let mut truncated = false;
-    let mut buffer = [0u8; 8192];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => {
-                if stored.len() < cap {
-                    let take = (cap - stored.len()).min(read);
-                    stored.extend_from_slice(&buffer[..take]);
-                    if take < read {
-                        truncated = true;
-                    }
-                } else {
-                    truncated = true;
-                }
+/// One command stream's output, shared by the reader thread and the caller.
+///
+/// Every chunk is stored as it arrives, so a stream that has to be abandoned
+/// while a backgrounded writer still holds it open keeps the output produced up
+/// to that point instead of losing it.
+#[derive(Debug)]
+struct OutputCapture {
+    cap: usize,
+    state: Mutex<(Vec<u8>, bool)>,
+    finished: AtomicBool,
+    stop: AtomicBool,
+}
+
+impl OutputCapture {
+    fn new(cap: usize) -> Arc<Self> {
+        Arc::new(Self {
+            cap,
+            state: Mutex::new((Vec::new(), false)),
+            finished: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+        })
+    }
+
+    fn push(&self, chunk: &[u8]) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (stored, truncated) = &mut *state;
+        if stored.len() < self.cap {
+            let take = (self.cap - stored.len()).min(chunk.len());
+            stored.extend_from_slice(&chunk[..take]);
+            if take < chunk.len() {
+                *truncated = true;
             }
+        } else {
+            *truncated = true;
+        }
+    }
+
+    fn finish(&self) {
+        self.finished.store(true, Ordering::Release);
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+
+    /// Asks the reader to stop instead of waiting for the writer to close the
+    /// stream. It then hands over what it read and drops the read end.
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    fn take(&self) -> (Vec<u8>, bool) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.clone()
+    }
+}
+
+/// Waits until every capture reached the end of its stream or the deadline
+/// passes, returning whether they all finished.
+fn wait_for_captures(captures: &[&Arc<OutputCapture>], deadline: Instant) -> bool {
+    loop {
+        if captures.iter().all(|capture| capture.is_finished()) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(COMMAND_POLL_INTERVAL);
+    }
+}
+
+/// Collects the exit status of a command that was killed, giving up after a
+/// bounded grace so a stuck process cannot pin the call.
+fn reap_command(child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + COMMAND_REAP_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(COMMAND_POLL_INTERVAL),
+            _ => return None,
+        }
+    }
+}
+
+/// Starts the thread that reads one command stream into `capture`.
+///
+/// The handle is dropped on purpose, which detaches the reader: the caller
+/// bounds its run through `capture` instead of a join that could wait for a
+/// writer that never closes the pipe.
+#[cfg(unix)]
+fn spawn_output_reader<R>(capture: Arc<OutputCapture>, stream: R)
+where
+    R: Read + std::os::fd::AsRawFd + Send + 'static,
+{
+    let descriptor = stream.as_raw_fd();
+    let _ = thread::spawn(move || {
+        let mut stream = ReadableStream { stream, descriptor };
+        read_stream(&capture, &mut stream);
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_output_reader<R>(capture: Arc<OutputCapture>, mut stream: R)
+where
+    R: Read + Send + 'static,
+{
+    let _ = thread::spawn(move || read_stream(&capture, &mut stream));
+}
+
+/// Reads one stream until it ends or the capture asks to stop.
+fn read_stream<C: CommandStream>(capture: &OutputCapture, stream: &mut C) {
+    let mut buffer = [0u8; COMMAND_OUTPUT_CHUNK_BYTES];
+    loop {
+        if capture.stop_requested() {
+            break;
+        }
+        if !stream.await_readable(COMMAND_READER_POLL_INTERVAL) {
+            continue;
+        }
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => capture.push(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
     }
-    (stored, truncated)
+    capture.finish();
+}
+
+/// A command stream that can be waited on before it is read, so a reader
+/// notices a stop request even while no writer produces more output.
+trait CommandStream: Read {
+    fn await_readable(&mut self, timeout: Duration) -> bool;
+}
+
+/// A command stream that can be polled for readability.
+#[cfg(unix)]
+struct ReadableStream<R> {
+    stream: R,
+    descriptor: std::os::fd::RawFd,
+}
+
+#[cfg(unix)]
+impl<R: Read> Read for ReadableStream<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.read(buffer)
+    }
+}
+
+#[cfg(unix)]
+impl<R: Read> CommandStream for ReadableStream<R> {
+    fn await_readable(&mut self, timeout: Duration) -> bool {
+        let mut polled = libc::pollfd {
+            fd: self.descriptor,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        // Safety: `polled` describes the single descriptor this reader owns,
+        // and `poll` only writes the returned events into it. A timeout or an
+        // interrupted wait just means no bytes are ready yet.
+        unsafe { libc::poll(&mut polled, 1, millis) > 0 }
+    }
+}
+
+/// Outside Unix a pipe read cannot be interrupted, so the reader waits for the
+/// stream itself instead of polling it.
+#[cfg(not(unix))]
+impl<R: Read> CommandStream for R {
+    fn await_readable(&mut self, _timeout: Duration) -> bool {
+        true
+    }
 }
 
 fn parse_arguments<T: for<'de> Deserialize<'de>>(
@@ -3773,14 +4015,19 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolKind::RunCommand.name().to_owned(),
-            description: "Run a program directly without a shell in the workspace, with an optional timeout and working directory. Returns stdout and stderr separately with the exit status; output is bounded. Requires approval for command execution.".to_owned(),
+            description: "Run a program directly without a shell in the workspace, with an optional timeout and working directory. Returns stdout and stderr separately with the exit status; output is bounded. The timeout is a hard limit: when it expires the whole process group is killed and the partial output is returned. A command that backgrounds a process does not keep the call open, because the call stops following the inherited stdout/stderr once the command itself exits. Requires approval for command execution.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
                     "args": {"type": "array", "items": {"type": "string"}},
                     "cwd": {"type": "string"},
-                    "timeout_ms": {"type": "integer", "minimum": 100, "maximum": 600_000}
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 100,
+                        "maximum": 600_000,
+                        "description": "Hard wall-clock limit for the command, in milliseconds. Defaults to 30000; the whole process group is killed when it expires."
+                    }
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -4151,7 +4398,7 @@ pub fn tool_guidance(definitions: &[ToolDefinition]) -> Option<String> {
     }
     if present(ToolKind::RunCommand) {
         guidance.push(
-            "run_command launches a program directly without a shell; use it for builds, tests, and other commands, not as a substitute for the file tools.".to_owned(),
+            "run_command launches a program directly without a shell; use it for builds, tests, and other commands, not as a substitute for the file tools. It stops following output once the command exits and kills the process group at its timeout, so start a long-running server detached with its output going to a log file.".to_owned(),
         );
     }
     if present(ToolKind::ProposePlan) {
@@ -5314,6 +5561,173 @@ mod tests {
             "a cancelled command must terminate promptly instead of running to its timeout"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_does_not_wait_on_a_backgrounded_writer() {
+        let root = workspace();
+        let executor = ToolExecutor::new(&root).unwrap();
+        // The backgrounded `sleep` inherits the command's stdout/stderr and
+        // holds them open after the shell exits. Waiting for that writer to
+        // close the pipes is what used to hang a call for the writer's whole
+        // lifetime.
+        let started = Instant::now();
+        let result = executor.execute(&call(
+            "run_command",
+            serde_json::json!({
+                "command": "sh",
+                "args": ["-c", "sleep 30 & echo started"],
+                "timeout_ms": 30_000
+            }),
+        ));
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("started"), "{}", result.output);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a backgrounded process holding the output pipes must not be waited on; the call took {}ms",
+            started.elapsed().as_millis()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_reads_oversized_output_without_stalling() {
+        let root = workspace();
+        let executor = ToolExecutor::new(&root).unwrap();
+        // Far more output than the cap, so the reader has to keep draining a
+        // stream whose bytes are discarded instead of stalling on a full pipe.
+        let result = executor.execute(&call(
+            "run_command",
+            serde_json::json!({
+                "command": "sh",
+                "args": [
+                    "-c",
+                    "i=0; while [ $i -lt 5000 ]; do echo aaaaaaaaaaaaaaaaaaaa; i=$((i+1)); done"
+                ],
+                "timeout_ms": 30_000
+            }),
+        ));
+        assert!(result.success, "{}", result.output);
+        assert!(
+            result.output.contains("bytes omitted"),
+            "oversized output must stay bounded: {} bytes",
+            result.output.len()
+        );
+        assert!(
+            result.output.len() < 2 * DEFAULT_MAX_OUTPUT_BYTES,
+            "the result must stay within the output budget: {} bytes",
+            result.output.len()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_returns_when_a_detached_writer_keeps_the_pipes_open() {
+        // A process that detached with `setsid` leaves the command's process
+        // group, so killing the group cannot reach it and the pipes stay open.
+        // The call must still return, with the output it already collected.
+        if std::process::Command::new("setsid")
+            .arg("true")
+            .stdout(Stdio::null())
+            .status()
+            .is_err()
+        {
+            return;
+        }
+        let root = workspace();
+        let executor = ToolExecutor::new(&root).unwrap();
+        let started = Instant::now();
+        let result = executor.execute(&call(
+            "run_command",
+            serde_json::json!({
+                "command": "sh",
+                "args": ["-c", "setsid sleep 5 & echo started"],
+                "timeout_ms": 30_000
+            }),
+        ));
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("started"), "{}", result.output);
+        assert!(
+            result.output.contains("output may be incomplete"),
+            "{}",
+            result.output
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a detached writer must not pin the call; it took {}ms",
+            started.elapsed().as_millis()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_timeout_returns_partial_output_and_kills_the_group() {
+        let root = workspace();
+        let executor = ToolExecutor::new(&root).unwrap();
+        let started = Instant::now();
+        let result = executor.execute(&call(
+            "run_command",
+            serde_json::json!({
+                "command": "sh",
+                "args": [
+                    "-c",
+                    "echo before; echo oops 1>&2; sleep 30 & echo $! > child.pid; wait"
+                ],
+                "timeout_ms": 1_000
+            }),
+        ));
+        assert!(!result.success, "{}", result.output);
+        assert!(
+            result.output.contains("stdout:\nbefore"),
+            "the output produced before the timeout must come back: {}",
+            result.output
+        );
+        assert!(result.output.contains("oops"), "{}", result.output);
+        assert!(
+            result
+                .output
+                .contains("command timed out after 1000ms and was killed"),
+            "{}",
+            result.output
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a timed-out command must return promptly; it took {}ms",
+            started.elapsed().as_millis()
+        );
+
+        // The grandchild belongs to the command's process group, so the timeout
+        // must take it down with the command instead of leaving it behind.
+        let pid: i32 = fs::read_to_string(root.join("child.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process_is_running(pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !process_is_running(pid),
+            "process {pid} survived the timeout"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Reports whether `pid` still exists, so a test can tell that a timeout
+    /// really killed a descendant.
+    #[cfg(unix)]
+    fn process_is_running(pid: i32) -> bool {
+        // Safety: signal 0 only performs the existence and permission check.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        // A permission error still means the process exists.
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
 
     #[test]
