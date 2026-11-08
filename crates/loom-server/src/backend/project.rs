@@ -182,6 +182,10 @@ impl InProcessBackend {
     /// Only a task that is complete — and, for code work, already integrated —
     /// is reclaimed, so an unreviewed result never disappears. A refusal is
     /// logged and never fails the run checkpoint that triggered it.
+    ///
+    /// Archiving a session also reclaims its build cache, which is why this path
+    /// removes it here: it archives through the catalog rather than through the
+    /// connection's archive request, so nothing else would.
     pub(crate) fn auto_archive_completed_child(&self, session_id: AgentSessionId) -> Result<()> {
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(());
@@ -218,6 +222,10 @@ impl InProcessBackend {
             Ok((_snapshot, record)) => {
                 self.journal()?.append_session(record);
                 log::info!("[loom-server] auto-archived completed sub agent {session_id}");
+                // An archived session never runs again, so its reproducible
+                // build output is reclaimed with the archive, exactly as the
+                // archive request does it.
+                self.remove_build_cache(session_id);
             }
             Err(error) => {
                 log::warn!(
