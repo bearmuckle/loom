@@ -918,6 +918,7 @@ impl LoomView {
                 },
             },
             is_local: false,
+            remote_startup: false,
             url: None,
             connection: None,
             connection_state: WorkerConnectionState::Connected,

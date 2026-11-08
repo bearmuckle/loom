@@ -29,6 +29,7 @@ fn worker_node(id: u64, node_id: &str, name: &str, is_local: bool) -> WorkerNode
             },
         },
         is_local,
+        remote_startup: false,
         url: (!is_local).then(|| format!("ws://{node_id}/ws")),
         connection: None,
         connection_state: WorkerConnectionState::Connected,

@@ -4,15 +4,15 @@ use super::{
     ACTIVE_BACKEND_NODE_ENTRY_ID, SessionSourceChoice, SessionSourceDialogPurpose,
     WorkerConnectionStage, WorkerConnectionState, WorkerNodeEntry, adjusted_cpu_pulse_threshold,
     adjusted_project_agent_concurrency, assigned_node_id, classify_connectivity_failure,
-    connection_placeholder, format_worker_node_resources, format_worker_node_resources_compact,
-    initial_worker_nodes, local_source_available, mark_worker_connection_failed,
-    merge_node_sessions, next_severe_load_streak, order_session_nodes,
-    project_child_control_actions, project_snapshot_has_unloaded_agent_sessions,
-    remove_worker_node_entry, safe_worker_url_label, session_id_for_request, session_status_pill,
-    source_choice_is_allowed, source_dialog_initial_state,
-    transition_worker_connection_to_connecting, uncovered_session_ids, update_worker_node_status,
-    validate_model_for_node, worker_connection_failure_detail, worker_node_display_name,
-    worker_url_embeds_credential,
+    connection_placeholder, endpoint_is_remote, format_worker_node_resources,
+    format_worker_node_resources_compact, initial_worker_nodes, local_source_available,
+    mark_worker_connection_failed, merge_node_sessions, next_severe_load_streak,
+    order_session_nodes, project_child_control_actions,
+    project_snapshot_has_unloaded_agent_sessions, remove_worker_node_entry, safe_worker_url_label,
+    session_id_for_request, session_status_pill, source_choice_is_allowed,
+    source_dialog_initial_state, transition_worker_connection_to_connecting, uncovered_session_ids,
+    update_worker_node_status, validate_model_for_node, worker_connection_failure_detail,
+    worker_node_display_name, worker_url_embeds_credential,
 };
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, EventSequence, RunId,
@@ -46,6 +46,7 @@ fn node(id: u64, is_local: bool) -> WorkerNodeEntry {
             },
         },
         is_local,
+        remote_startup: false,
         url: (!is_local).then(|| format!("ws://worker-{id}/ws")),
         connection: None,
         connection_state: if is_local {
@@ -348,6 +349,7 @@ fn worker_node_fixtures_preserve_local_connection_and_hide_url_credentials() {
     );
     assert_eq!(nodes.len(), 2);
     assert!(nodes[0].is_local);
+    assert!(nodes[0].remote_startup);
     assert_eq!(nodes[0].connection_state, WorkerConnectionState::Connected);
     assert_eq!(nodes[1].id, 1);
     assert_eq!(nodes[1].url.as_deref(), Some("wss://remote-worker/ws"));
@@ -1182,6 +1184,11 @@ fn worker_names_are_short_and_do_not_collide() {
     // name, and the node id stays out of the pane.
     assert_eq!(worker_node_display_name(&local), "This machine");
 
+    // A startup connection to another machine reads as that worker.
+    local.remote_startup = true;
+    local.status.name = "hetzner-box · 1a2b3c4d".to_owned();
+    assert_eq!(worker_node_display_name(&local), "hetzner-box");
+
     let mut derived = node(1, false);
     derived.status.name = "build-box · 1a2b3c4d".to_owned();
     assert_eq!(worker_node_display_name(&derived), "build-box");
@@ -1193,4 +1200,24 @@ fn worker_names_are_short_and_do_not_collide() {
     // A name whose last segment is not the generated id is left alone.
     named.status.name = "prod · builder".to_owned();
     assert_eq!(worker_node_display_name(&named), "prod · builder");
+}
+
+#[test]
+fn only_non_loopback_startup_endpoints_count_as_remote() {
+    for local in [
+        "ws://127.0.0.1:8765/ws",
+        "ws://localhost:8765/ws",
+        "ws://[::1]:8765/ws",
+        "ws://user@127.0.0.1:1/ws",
+        "not a url",
+    ] {
+        assert!(!endpoint_is_remote(local), "{local}");
+    }
+    for remote in [
+        "wss://static.example.de/ws",
+        "ws://10.0.0.5:8765/ws",
+        "wss://host.example/ws?x=1",
+    ] {
+        assert!(endpoint_is_remote(remote), "{remote}");
+    }
 }

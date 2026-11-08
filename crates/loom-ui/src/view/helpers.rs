@@ -397,12 +397,26 @@ fn format_bytes_compact(value: Option<u64>) -> String {
 }
 
 pub(crate) fn worker_node_display_name(node: &WorkerNodeEntry) -> String {
-    if node.is_local {
+    if node.is_local && !node.remote_startup {
         // The worker on this machine needs no identity line: its address and
         // node id are noise beside every project it owns.
         return "This machine".to_owned();
     }
     short_worker_name(&node.status.name)
+}
+
+/// Whether a worker endpoint is on another machine than this client.
+pub(crate) fn endpoint_is_remote(endpoint: &str) -> bool {
+    let Some(rest) = endpoint.split_once("://").map(|(_, rest)| rest) else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let authority = authority.rsplit('@').next().unwrap_or_default();
+    let host = match authority.strip_prefix('[') {
+        Some(bracketed) => bracketed.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    !(host.is_empty() || host == "localhost" || host == "::1" || host.starts_with("127."))
 }
 
 /// Drops the generated ` · <8 hex>` node id from a derived worker name, so a
@@ -3194,6 +3208,7 @@ pub(crate) fn connection_placeholder(
             },
         },
         is_local: false,
+        remote_startup: false,
         url: Some(url),
         connection: None,
         connection_state,
@@ -3327,6 +3342,7 @@ pub(crate) fn initial_worker_nodes(
         id: ACTIVE_BACKEND_NODE_ENTRY_ID,
         status: local_status,
         is_local: true,
+        remote_startup: local_url.is_some_and(endpoint_is_remote),
         url: None,
         connection: Some(local_connection),
         connection_state: WorkerConnectionState::Connected,

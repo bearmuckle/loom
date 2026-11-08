@@ -458,6 +458,8 @@ struct WorkerNodeEntry {
     id: u64,
     status: WorkerNodeStatus,
     is_local: bool,
+    /// The startup connection reaches a worker on another machine.
+    remote_startup: bool,
     url: Option<String>,
     connection: Option<ClientConnection>,
     connection_state: WorkerConnectionState,

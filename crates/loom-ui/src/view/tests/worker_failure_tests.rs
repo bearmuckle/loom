@@ -22,6 +22,7 @@ fn remote_node(id: u64, url: &str, state: WorkerConnectionState) -> WorkerNodeEn
             },
         },
         is_local: false,
+        remote_startup: false,
         url: Some(url.to_owned()),
         connection: None,
         connection_state: state,
