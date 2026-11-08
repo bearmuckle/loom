@@ -357,16 +357,21 @@ impl LoomView {
         // rebuild would not know about.
         let cursor_before = self.after_sequence;
         let activity_detail = self.output_detail.activity_detail(self.show_reasoning);
+        let session_id = self.active_session.id;
+        let revision = settled_revision(self.active_run.as_ref(), run_id);
         self.transcript_loading = true;
         cx.notify();
         cx.spawn(async move |view, cx| {
             let mut before_ordinal = before_ordinal;
             loop {
+                let key = PageKey {
+                    session_id,
+                    run_id,
+                    before_ordinal,
+                    activity_detail,
+                };
                 let cached = view
-                    .update(cx, |view, _| {
-                        view.transcript_cache
-                            .get(run_id, before_ordinal, activity_detail)
-                    })
+                    .update(cx, |view, _| view.transcript_cache.get(&key, revision))
                     .ok()
                     .flatten();
                 let result = match cached {
@@ -381,12 +386,7 @@ impl LoomView {
                         .await;
                         if let Ok(page) = &result {
                             view.update(cx, |view, _| {
-                                view.transcript_cache.insert(
-                                    run_id,
-                                    before_ordinal,
-                                    activity_detail,
-                                    page,
-                                )
+                                view.transcript_cache.insert(key, revision, page)
                             })
                             .ok();
                         }

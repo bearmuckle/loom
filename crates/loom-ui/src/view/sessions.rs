@@ -139,9 +139,14 @@ impl LoomView {
                 if self.active_run_id != Some(run_id) {
                     break;
                 }
-                let cached = self
-                    .transcript_cache
-                    .get(run_id, before_ordinal, activity_detail);
+                let key = PageKey {
+                    session_id: self.active_session.id,
+                    run_id,
+                    before_ordinal,
+                    activity_detail,
+                };
+                let revision = settled_revision(self.active_run.as_ref(), run_id);
+                let cached = self.transcript_cache.get(&key, revision);
                 let loaded = match cached {
                     Some(page) => Ok(page),
                     None => {
@@ -152,12 +157,7 @@ impl LoomView {
                             activity_detail,
                         );
                         if let Ok(page) = &loaded {
-                            self.transcript_cache.insert(
-                                run_id,
-                                before_ordinal,
-                                activity_detail,
-                                page,
-                            );
+                            self.transcript_cache.insert(key, revision, page);
                         }
                         loaded
                     }
@@ -434,6 +434,7 @@ impl LoomView {
         for session_id in &removed {
             self.session_node_ids.remove(session_id);
             self.session_task_cache.remove(session_id);
+            self.transcript_cache.forget_session(*session_id);
             self.session_models.remove(session_id);
             self.session_auto_approve_actions.remove(session_id);
             self.session_ask_before_destructive_actions

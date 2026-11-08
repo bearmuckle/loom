@@ -1584,6 +1584,7 @@ impl LoomView {
         cx: &mut Context<Self>,
     ) {
         self.archived_sessions.refusal = None;
+        self.transcript_cache.forget_session(deleted);
         let was_active = self.forget_archived_session(deleted);
         if was_active {
             // The session on screen no longer exists, so move the selection

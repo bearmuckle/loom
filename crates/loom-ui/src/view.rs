@@ -412,7 +412,7 @@ async fn browser_delay(duration: Duration) -> Result<(), LoomError> {
 }
 
 type TranscriptMessage = (u64, u64, ModelMessage);
-use transcript_cache::TranscriptPageCache;
+use transcript_cache::{PageKey, TranscriptPageCache, settled_revision};
 
 type TranscriptPage = (Vec<TranscriptMessage>, Option<u64>, bool);
 

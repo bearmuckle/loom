@@ -661,3 +661,103 @@ fn apply_event_snapshot_restores_durable_run_state_and_conversation(cx: &mut Tes
         );
     });
 }
+
+/// A finished run's transcript stops growing, so reopening its session reads the
+/// conversation from the client cache instead of fetching it again.
+#[cfg(not(target_family = "wasm"))]
+#[gpui_kit::test]
+fn reopening_a_finished_session_reads_its_transcript_from_the_cache(cx: &mut TestAppContext) {
+    const TASK: &str = "finish a run, then reopen its session twice";
+    cx.update(gpui_kit::init);
+
+    let backend = crate::local_backend::OwnedBackend::new();
+    let connection = ClientConnection::InProcess(Box::new(backend.connect()));
+    let negotiation = crate::connection::negotiate(&connection).unwrap();
+    let workspace = crate::connection::create_workspace(&connection, "Cache").unwrap();
+    let session =
+        crate::connection::create_session_in_workspace(&connection, workspace.id, "Cache session")
+            .unwrap();
+    let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id: session.id,
+            task: TASK.to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            system_instructions: None,
+            repository_instructions: None,
+        },
+    )));
+    assert!(
+        matches!(
+            started.result,
+            Ok(ServerResponse::Run(RunResponse::AgentRunStarted(_)))
+        ),
+        "unexpected run start response: {:?}",
+        started.result
+    );
+    wait_for_session_state(&connection, session.id, AgentSessionState::Completed);
+
+    let view_session = session.clone();
+    let view_connection = connection.clone();
+    let protocol_version = negotiation.protocol_version;
+    let handle = cx.open_window(size(px(1280.), px(800.)), move |_, cx| {
+        let options = UiOptions {
+            project: None,
+            task: TASK.to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            remote: None,
+            token: None,
+            reset_state: false,
+            server_binary: None,
+            ca: None,
+            allow_insecure_remote: false,
+        };
+        let mut view = LoomView::initialize_from_connection(
+            &options,
+            view_connection,
+            PathBuf::new(),
+            false,
+            None,
+            cx.focus_handle(),
+            false,
+            Some(protocol_version),
+            None,
+            true,
+        )
+        .unwrap();
+        view.owned_backend = Some(backend);
+        view.worker_nodes.clear();
+        view.select_session(view_session, cx);
+        view
+    });
+    cx.run_until_parked();
+
+    let view = cx
+        .update_window(handle.into(), |_, window, _| {
+            window.root::<LoomView>().unwrap().unwrap()
+        })
+        .unwrap();
+    let (cached, hits, timeline) = view.update(cx, |view, _| {
+        (
+            view.transcript_cache.len(),
+            view.transcript_cache.hits(),
+            view.timeline.len(),
+        )
+    });
+    assert!(cached > 0, "the finished run's newest page was kept");
+    assert!(timeline > 0, "the conversation is on screen");
+
+    // Opening the session again is served from the cache and shows the same
+    // conversation.
+    view.update(cx, |view, cx| {
+        view.select_session(session.clone(), cx);
+    });
+    cx.run_until_parked();
+    view.update(cx, |view, _| {
+        assert!(
+            view.transcript_cache.hits() > hits,
+            "the reopen fetched the transcript again"
+        );
+        assert_eq!(view.timeline.len(), timeline);
+        assert_eq!(view.transcript_cache.len(), cached);
+    });
+}
