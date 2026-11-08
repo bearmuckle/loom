@@ -60,13 +60,14 @@ pub(super) async fn events<C: Client>(
 ) -> Result<Outcome, Failure> {
     let mut caller = Caller::new(client);
     handshake(&mut caller, &invocation.verb).await?;
+    let session = super::session_id(&args.session)?;
     let url = invocation.globals.connect.clone().unwrap_or_default();
     let json_output = invocation.globals.json;
 
     // A stored cursor is adopted only when it names this worker and session;
     // an explicit `--after` wins over it.
     let stored = match &args.cursor_file {
-        Some(path) => cursor::read(path, &url, args.session).map_err(Failure::Internal)?,
+        Some(path) => cursor::read(path, &url, session).map_err(Failure::Internal)?,
         None => None,
     };
     let stored_after = stored.as_ref().and_then(|cursor| cursor.after);
@@ -88,7 +89,7 @@ pub(super) async fn events<C: Client>(
         let (request_id, response) = caller
             .call(ClientRequest::Events(EventsRequest::GetSessionEvents {
                 activity_detail: ActivityDetail::Full,
-                session_id: Some(args.session),
+                session_id: Some(session),
                 workspace_id: None,
                 after_sequence: after,
                 stream_epoch: epoch.clone(),
@@ -196,7 +197,7 @@ pub(super) async fn events<C: Client>(
             floor = Some(floor.map_or_else(|| latest.value(), |floor| floor.max(latest.value())));
         }
         if let Some(path) = &args.cursor_file {
-            write_cursor(path, &url, args.session, floor, epoch.clone())?;
+            write_cursor(path, &url, session, floor, epoch.clone())?;
         }
 
         // This batch ends the command when the journal is at its head and the
@@ -288,10 +289,11 @@ pub(super) async fn peek<C: Client>(
 ) -> Result<Outcome, Failure> {
     let mut caller = Caller::new(client);
     handshake(&mut caller, &invocation.verb).await?;
+    let session = super::session_id(&args.session)?;
     let (request_id, response) = caller
         .call(ClientRequest::Events(
             EventsRequest::GetRecentSessionEvents {
-                session_id: args.session,
+                session_id: session,
                 limit: args.lines,
                 activity_detail: ActivityDetail::Full,
             },

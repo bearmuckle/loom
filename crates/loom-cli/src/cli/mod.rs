@@ -457,6 +457,26 @@
 //! changed `stream_epoch` discards the stored cursor first, because a new epoch
 //! means the sequences no longer name the same events.
 //!
+//! # Short session ids
+//!
+//! Every session input accepts a full id or any unique prefix of one, so
+//! `loom-cli status --session 08bb3935` reports the one session whose id starts
+//! that way. A prefix is one to 32 hex digits of an id with the hyphens
+//! optional and in either case, and it is resolved before the verb runs by
+//! listing `Workspace/ListWorkspaces` and then
+//! `Workspace/ListWorkspaceSessions { include_archived: true }` per workspace,
+//! which is why a prefix needs the `read_agent_session` capability that a verb
+//! such as `session archive` does not otherwise negotiate. Resolution sends its
+//! own `Control/Negotiate` with that capability added, and the verb then
+//! negotiates the set it always did, so the resolution requests never change the
+//! `--json` envelope's `request_id`.
+//!
+//! An ambiguous prefix is a usage error that lists the sessions it matches, and
+//! one that matches none is `not_found` with exit `5`, which is what an unknown
+//! full id reports from the worker. A full id is never resolved: it is used as
+//! it is and sends no listing, so the previous behaviour and its request count
+//! are unchanged, including for a token that may not read sessions at all.
+//!
 //! # Token handling
 //!
 //! The bearer token may only come from a file: `--token-file <path>` or
@@ -503,7 +523,7 @@ pub fn main(arguments: Vec<String>) -> i32 {
     let json = args::wants_json(&arguments);
     let mut invocation = match args::parse(&arguments) {
         Ok(Parsed::Help(text)) => return print_help(text),
-        Ok(Parsed::Run(invocation)) => invocation,
+        Ok(Parsed::Run(invocation)) => *invocation,
         Err(message) => return report_usage_stdio(&message, json, args::named_verb(&arguments)),
     };
     // `jev status` and `jev ask` answer from the local key file and the decision

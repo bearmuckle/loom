@@ -4130,7 +4130,7 @@ fn parse(arguments: &[&str]) -> Result<Parsed, String> {
 
 fn invocation(arguments: &[&str]) -> args::Invocation {
     match parse(arguments) {
-        Ok(Parsed::Run(invocation)) => invocation,
+        Ok(Parsed::Run(invocation)) => *invocation,
         Ok(Parsed::Help(_)) => panic!("{arguments:?} unexpectedly parsed as help"),
         Err(message) => panic!("{arguments:?} was rejected: {message}"),
     }
@@ -12184,4 +12184,340 @@ fn run_as_directory_mounts_the_folder_in_a_new_root_session() {
 
     close_persistent_fixture(fixture, directory);
     std::fs::remove_dir_all(&folder).ok();
+}
+
+// 15. Short session ids: a unique prefix is the id it prefixes, an ambiguous one
+// is refused, and a full id still costs no listing.
+
+/// The first eight hex digits of `id`, which is the short form a caller types.
+fn short_session_id(id: AgentSessionId) -> String {
+    id.to_string().chars().take(8).collect()
+}
+
+#[test]
+fn a_unique_short_session_id_names_the_session_it_prefixes() {
+    let fixture = fixture();
+    let session_id = fixture.session.id;
+    let short = short_session_id(session_id);
+    let full = session_id.to_string();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let by_full = run(&mut client, &["get", &full]);
+    assert_eq!(by_full.code, exit::OK, "{}", by_full.stderr);
+    let by_short = run(&mut client, &["get", &short]);
+    assert_eq!(by_short.code, exit::OK, "{}", by_short.stderr);
+    assert_eq!(by_short.stderr, "");
+    assert_eq!(by_short.stdout, by_full.stdout);
+
+    // The `--session` flags of the reads resolve the same prefix.
+    let status = run(&mut client, &["status", "--session", &short]);
+    assert_eq!(status.code, exit::OK, "{}", status.stderr);
+    assert_eq!(
+        status.stdout,
+        format!("session {session_id} idle {}\n", fixture.session.name)
+    );
+    let events = run(&mut client, &["events", "--session", &short]);
+    assert_eq!(events.code, exit::OK, "{}", events.stderr);
+    let peek = run(&mut client, &["peek", "--session", &short, "--lines", "5"]);
+    assert_eq!(peek.code, exit::OK, "{}", peek.stderr);
+    assert_eq!(peek.stdout, events.stdout);
+    let liveness = run(&mut client, &["liveness", "--session", &short]);
+    assert_eq!(liveness.code, exit::OK, "{}", liveness.stderr);
+    assert_eq!(liveness.stdout, format!("liveness alive {session_id}\n"));
+
+    // A prefix is matched in either case, and with the hyphens left out.
+    let upper = run(&mut client, &["get", &short.to_uppercase()]);
+    assert_eq!(upper.code, exit::OK, "{}", upper.stderr);
+    assert_eq!(upper.stdout, by_full.stdout);
+    let hyphenated: String = full.chars().take(9).collect();
+    let hyphenated = run(&mut client, &["get", &hyphenated]);
+    assert_eq!(hyphenated.code, exit::OK, "{}", hyphenated.stderr);
+    assert_eq!(hyphenated.stdout, by_full.stdout);
+}
+
+#[test]
+fn a_full_session_id_lists_no_sessions_and_a_short_one_does() {
+    let fixture = fixture();
+    let listings = Rc::new(Cell::new(0usize));
+    let counted = Rc::clone(&listings);
+    let mut client = Wrapped::new(InProcessClient::new(&fixture.backend)).before(move |envelope| {
+        if matches!(
+            &envelope.request,
+            ClientRequest::Workspace(WorkspaceRequest::ListWorkspaces)
+        ) {
+            counted.set(counted.get() + 1);
+        }
+    });
+
+    let full = run(&mut client, &["get", &fixture.session.id.to_string()]);
+    assert_eq!(full.code, exit::OK, "{}", full.stderr);
+    assert_eq!(listings.get(), 0, "a full id is used as it is");
+
+    let short = run(&mut client, &["get", &short_session_id(fixture.session.id)]);
+    assert_eq!(short.code, exit::OK, "{}", short.stderr);
+    assert_eq!(short.stdout, full.stdout);
+    assert_eq!(
+        listings.get(),
+        1,
+        "a short id lists the worker's sessions once"
+    );
+}
+
+#[test]
+fn an_ambiguous_short_session_id_is_a_usage_error_that_lists_the_matches() {
+    let fixture = fixture();
+    let first: AgentSessionId = "abcdef01-0000-4000-8000-000000000001".parse().unwrap();
+    let second: AgentSessionId = "abcdef01-0000-4000-8000-000000000002".parse().unwrap();
+    let candidates = vec![
+        AgentSessionSnapshot {
+            id: first,
+            name: "first candidate".to_owned(),
+            ..fixture.session.clone()
+        },
+        AgentSessionSnapshot {
+            id: second,
+            name: "second candidate".to_owned(),
+            ..fixture.session.clone()
+        },
+    ];
+    let mut client =
+        Wrapped::new(InProcessClient::new(&fixture.backend)).after(move |request, response| {
+            if matches!(
+                request,
+                ClientRequest::Workspace(WorkspaceRequest::ListWorkspaceSessions { .. })
+            ) {
+                response.result = Ok(ServerResponse::Session(SessionResponse::AgentSessions {
+                    sessions: candidates.clone(),
+                }));
+            }
+        });
+
+    let outcome = run(&mut client, &["get", "abcdef01"]);
+    assert_eq!(outcome.code, exit::USAGE, "{}", outcome.stderr);
+    assert_eq!(outcome.stdout, "");
+    assert!(
+        outcome.stderr.contains("invalid_request"),
+        "{}",
+        outcome.stderr
+    );
+    assert!(
+        outcome
+            .stderr
+            .contains("session id prefix 'abcdef01' is ambiguous: 2 sessions match"),
+        "{}",
+        outcome.stderr
+    );
+    assert!(
+        outcome.stderr.contains(&first.to_string()),
+        "a match is named by its full id: {}",
+        outcome.stderr
+    );
+    assert!(
+        outcome.stderr.contains("second candidate"),
+        "a match is named by its session name: {}",
+        outcome.stderr
+    );
+
+    // The `--json` envelope carries the same failure and the usage exit code.
+    let as_json = run(&mut client, &["get", "abcdef01", "--json"]);
+    assert_eq!(as_json.code, exit::USAGE, "{}", as_json.stderr);
+    let envelope = json_envelope(&as_json);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["verb"], "get");
+    assert_eq!(envelope["error"]["code"], "invalid_request");
+    assert_eq!(envelope["error"]["exit_code"], exit::USAGE);
+}
+
+#[test]
+fn a_short_session_id_no_session_starts_with_is_not_found() {
+    let fixture = fixture();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let outcome = run(&mut client, &["status", "--session", "ffffffff"]);
+    assert_eq!(outcome.code, exit::GONE, "{}", outcome.stderr);
+    assert_eq!(outcome.stdout, "");
+    assert!(outcome.stderr.contains("not_found"), "{}", outcome.stderr);
+    assert!(
+        outcome.stderr.contains("no session starts with 'ffffffff'"),
+        "{}",
+        outcome.stderr
+    );
+
+    let as_json = run(&mut client, &["status", "--session", "ffffffff", "--json"]);
+    assert_eq!(as_json.code, exit::GONE, "{}", as_json.stderr);
+    let envelope = json_envelope(&as_json);
+    assert_eq!(envelope["ok"], false);
+    assert_eq!(envelope["error"]["code"], "not_found");
+    assert_eq!(envelope["error"]["exit_code"], exit::GONE);
+}
+
+#[test]
+fn a_short_session_id_archives_and_deletes_the_one_session_it_names() {
+    let (fixture, directory) = persistent_fixture("short-lifecycle");
+    let session_id = fixture.session.id;
+    let short = short_session_id(session_id);
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let archived = run(&mut client, &["session", "archive", &short]);
+    assert_eq!(archived.code, exit::OK, "{}", archived.stderr);
+    assert_eq!(
+        archived.stdout,
+        format!("archived {session_id}\nretained 0 worktrees\n")
+    );
+    assert_eq!(
+        session_snapshot(&fixture.control, session_id).state,
+        AgentSessionState::Archived
+    );
+
+    // An archived session is still listed, so its prefix still names it: the
+    // deletion resolves rather than reporting the session as gone.
+    let deleted = run(&mut client, &["delete", &short]);
+    assert_eq!(deleted.code, exit::OK, "{}", deleted.stderr);
+    assert!(
+        deleted.stdout.contains(&format!("deleted {session_id}")),
+        "{}",
+        deleted.stdout
+    );
+
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn a_short_session_id_addresses_the_project_of_that_session() {
+    let (fixture, directory) = persistent_fixture("short-project");
+    let session = fixture.session.id;
+    let project_id = ProjectId::from_uuid(*session.as_uuid());
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let get = run(&mut client, &["project", "get", &short_session_id(session)]);
+    assert_eq!(get.code, exit::OK, "{}", get.stderr);
+    assert_eq!(
+        get.stdout,
+        format!(
+            "project {project_id} root {session} parent -\n\
+             agent {session} idle depth 1 parent -\n\
+             child-model default -\n"
+        )
+    );
+
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn run_resolves_a_short_project_id_before_it_creates_the_sub_project() {
+    let (fixture, directory) = persistent_fixture("short-run-project");
+    let workspace = fixture.workspace.id.to_string();
+    let project = fixture.session.id;
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let created = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--project",
+            &short_session_id(project),
+            "--name",
+            "short project stream",
+            "--task",
+            "add the flag",
+            "--model",
+            "deterministic/demo",
+        ],
+    );
+    assert_eq!(created.code, exit::OK, "{}", created.stderr);
+    let printed = lines(&created.stdout);
+    assert_eq!(printed.len(), 3, "{}", created.stdout);
+    assert!(printed[1].starts_with("run "), "{}", created.stdout);
+    assert_eq!(printed[2], format!("parent {project}"));
+    let child = printed_session(&created.stdout);
+    assert_eq!(
+        project_of(&fixture.control, child)
+            .parent_project_id
+            .map(|id| *id.as_uuid()),
+        Some(*project.as_uuid()),
+        "the sub project hangs under the project the prefix named"
+    );
+
+    close_persistent_fixture(fixture, directory);
+}
+
+#[test]
+fn every_session_input_accepts_a_short_prefix_and_a_typo_is_still_refused() {
+    let prefix = "08bb3935";
+    let run_id = "11111111-2222-4333-8444-555555555555";
+    let workspace = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+    let task = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+    for arguments in [
+        vec!["get", prefix],
+        vec!["events", "--session", prefix],
+        vec!["peek", "--session", prefix],
+        vec!["wait", "--session", prefix],
+        vec!["status", "--session", prefix],
+        vec!["liveness", "--session", prefix],
+        vec!["result", "--session", prefix],
+        vec!["stop", "--run", run_id, "--session", prefix, "--archive"],
+        vec!["session", "archive", prefix],
+        vec!["session", "delete", prefix],
+        vec!["delete", prefix],
+        vec!["project", "get", prefix],
+        vec!["project", "tree", prefix],
+        vec!["project", "tasks", prefix],
+        vec!["project", "children", prefix],
+        vec!["project", "messages", prefix],
+        vec!["project", "send", prefix, "--text", "go"],
+        vec!["project", "archive", prefix],
+        vec!["project", "delete", prefix],
+        vec!["project", "models", "get", prefix],
+        vec![
+            "project",
+            "models",
+            "set",
+            prefix,
+            "--child-model",
+            "deterministic/demo",
+        ],
+        vec!["project", "worktrees", prefix],
+        vec!["project", "worktree", "get", prefix, "--task", task],
+        vec!["project", "worktree", "diff", prefix, "--task", task],
+        vec!["project", "worktree", "integrate", prefix, "--task", task],
+        vec![
+            "project", "worktree", "cleanup", prefix, "--task", task, "--keep",
+        ],
+        vec!["project", "child", "pause", task, "--session", prefix],
+        vec![
+            "run",
+            "--workspace",
+            workspace,
+            "--task",
+            "a task",
+            "--project",
+            prefix,
+        ],
+    ] {
+        let parsed = invocation(&arguments);
+        assert!(
+            parsed.verb.needs_session_resolution(),
+            "{arguments:?} keeps the prefix for resolution"
+        );
+    }
+
+    // A full id has nothing to resolve, which is the path it took before.
+    assert!(
+        !invocation(&["get", "08bb3935-b46d-4dc1-bde9-9bb0638f1a9f"])
+            .verb
+            .needs_session_resolution()
+    );
+    assert!(
+        !invocation(&["status", "--session", &AgentSessionId::new().to_string()])
+            .verb
+            .needs_session_resolution()
+    );
+
+    // A token that is neither a full id nor a prefix is still the usage error
+    // it was, so a typo never reaches the worker as a listing.
+    assert!(parse_error(&["get", "not-a-session"]).contains("is not a valid session id"));
+    assert!(parse_error(&["get", ""]).contains("is not a valid session id"));
+    assert!(parse_error(&["status", "--session", "loom"]).contains("is not a valid session id"));
 }

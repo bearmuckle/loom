@@ -83,7 +83,10 @@ pub(super) async fn run<C: Client>(
     handshake(&mut caller, &invocation.verb).await?;
 
     let model = resolve_model(&mut caller, args, err).await?;
-    let resolved = match args.project {
+    // `--project` may have been spelled as a short prefix, which the resolution
+    // pass already replaced with the full id it names.
+    let project = args.project.as_ref().map(super::session_id).transpose()?;
+    let resolved = match project {
         Some(project) => resolve_sub_project(&mut caller, args, project).await?,
         None => resolve_session(&mut caller, args).await?,
     };
@@ -141,7 +144,7 @@ pub(super) async fn run<C: Client>(
         }
         // A sub project starts where its project is, unless the caller named
         // its input: the same inheritance loom-ui's "New sub project" applies.
-        if let Some(project) = args.project
+        if let Some(project) = project
             && args.repository.is_none()
             && args.directory.is_none()
         {
@@ -221,7 +224,7 @@ pub(super) async fn run<C: Client>(
     if !invocation.globals.json {
         emit(out, &format!("session {session_id} {session_name}\n"))?;
         emit(out, &format!("run {} {state}\n", started.id))?;
-        if let Some(project) = args.project {
+        if let Some(project) = project {
             emit(out, &format!("parent {project}\n"))?;
         }
         if let Some(policy) = &child_models {
@@ -230,7 +233,7 @@ pub(super) async fn run<C: Client>(
     }
     // A session `run` places in a project is a sub project: its own project id
     // is its session id, and `parent_id` is the project it belongs to.
-    let project = args.project.map(|parent| {
+    let project = project.map(|parent| {
         json!({
             "id": session_id.to_string(),
             "parent_id": parent.to_string(),
