@@ -178,6 +178,58 @@ mod tests {
         );
     }
 
+    /// Regression: OpenCode Zen serves the claude models over an
+    /// Anthropic-messages backend, which rejects a request carrying a
+    /// per-message participant name ("messages[4].name: anthropic-messages
+    /// cannot preserve named conversation participants"). The body Loom puts on
+    /// the wire must leave the name out for such a route, and keep it for a
+    /// route whose wire can carry it.
+    #[test]
+    fn an_anthropic_route_reaches_the_wire_without_a_message_name() {
+        let body = r#"{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}"#;
+        for (model, name_on_the_wire) in [
+            ("opencode-go/claude-sonnet-4-5", false),
+            ("fixture/model", true),
+        ] {
+            let (endpoint, server) = serve_capturing_request(body);
+            let descriptor = ModelDescriptor {
+                id: ModelId::new(model),
+                provider: ProviderId::new("fixture"),
+                display_name: "Fixture model".to_owned(),
+                context_window: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
+                capabilities: ModelCapabilities::default(),
+            };
+            let mut provider = OpenAiCompatibleProvider::with_descriptor(endpoint, "", descriptor);
+            let mut tool = ModelMessage::new(MessageRole::Tool, "file contents");
+            tool.name = Some("read_file".to_owned());
+            tool.tool_call_id = Some(ToolCallId::new());
+            let request = ModelRequest {
+                model: ModelId::new(model),
+                messages: vec![tool],
+                tools: Vec::new(),
+                options: Default::default(),
+            };
+            collect(&mut provider, &request);
+            let sent = server
+                .join()
+                .expect("fixture server thread panicked")
+                .expect("fixture server failed");
+            let sent: serde_json::Value = serde_json::from_str(
+                sent.split_once("\r\n\r\n")
+                    .expect("fixture request has no body")
+                    .1,
+            )
+            .expect("fixture request body is not JSON");
+            assert_eq!(
+                sent["messages"][0].get("name").is_some(),
+                name_on_the_wire,
+                "unexpected name on the wire for {model}: {sent}"
+            );
+        }
+    }
+
     #[test]
     fn provider_usage_and_status_helpers_handle_empty_and_extreme_values() {
         assert_eq!(

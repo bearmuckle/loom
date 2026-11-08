@@ -1,6 +1,35 @@
 use super::*;
 
+/// Whether a message route can carry a per-message participant `name`.
+///
+/// Anthropic's messages API has no such field, and a gateway that translates an
+/// OpenAI-shaped request onto that wire rejects the whole request when one is
+/// present: "messages[4].name: anthropic-messages cannot preserve named
+/// conversation participants". A model an Anthropic backend serves is
+/// recognized by its id, so only such a route leaves the field out; every other
+/// route still sends it.
+pub fn route_keeps_message_names(model: &ModelId) -> bool {
+    let id = model.as_str().to_ascii_lowercase();
+    !(id.contains("claude") || id.contains("anthropic"))
+}
+
+/// Serializes a request's messages for a route.
+pub fn messages_json(request: &ModelRequest) -> Vec<serde_json::Value> {
+    let keep_names = route_keeps_message_names(&request.model);
+    request
+        .messages
+        .iter()
+        .map(|message| message_json_on_route(message, keep_names))
+        .collect()
+}
+
 pub fn message_json(message: &ModelMessage) -> serde_json::Value {
+    message_json_on_route(message, true)
+}
+
+/// Serializes one message, sending its participant `name` only when
+/// `keep_name` says the route can preserve it.
+pub fn message_json_on_route(message: &ModelMessage, keep_name: bool) -> serde_json::Value {
     let role = match message.role {
         MessageRole::System => "system",
         MessageRole::User => "user",
@@ -11,7 +40,7 @@ pub fn message_json(message: &ModelMessage) -> serde_json::Value {
         "role": role,
         "content": message.content
     });
-    if let Some(name) = &message.name {
+    if keep_name && let Some(name) = &message.name {
         value["name"] = serde_json::json!(name);
     }
     if let Some(tool_call_id) = message.tool_call_id {
@@ -194,6 +223,49 @@ mod tests {
 
         let assistant = ModelMessage::new(MessageRole::Assistant, "done");
         assert!(message_json(&assistant).get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn anthropic_routes_omit_a_message_name_they_cannot_preserve() {
+        // OpenCode Zen serves the claude models through an Anthropic-messages
+        // backend, which has no per-message participant name and rejects the
+        // whole request when one arrives: "messages[4].name:
+        // anthropic-messages cannot preserve named conversation participants".
+        let mut tool = ModelMessage::new(MessageRole::Tool, "file contents");
+        let call_id = ToolCallId::new();
+        tool.tool_call_id = Some(call_id);
+        tool.name = Some("read_file".to_owned());
+        let mut named_user = ModelMessage::new(MessageRole::User, "project message");
+        named_user.name = Some("loom_project_message".to_owned());
+        let request = ModelRequest {
+            model: ModelId::new("opencode-go/claude-sonnet-4-5"),
+            messages: vec![named_user.clone(), tool.clone()],
+            tools: Vec::new(),
+            options: Default::default(),
+        };
+        let payload = openai_request_payload(&request);
+        assert!(
+            payload["messages"][0].get("name").is_none(),
+            "an Anthropic route must not send a name it cannot preserve: {payload}"
+        );
+        assert!(
+            payload["messages"][1].get("name").is_none(),
+            "an Anthropic route must not send a name it cannot preserve: {payload}"
+        );
+        // The tool correlation survives: only the participant name is dropped.
+        assert_eq!(payload["messages"][1]["role"], "tool");
+        assert_eq!(payload["messages"][1]["tool_call_id"], call_id.to_string());
+
+        // A route whose wire carries the name still sends it.
+        let plain = ModelRequest {
+            model: ModelId::new("fixture/model"),
+            messages: vec![named_user, tool],
+            tools: Vec::new(),
+            options: Default::default(),
+        };
+        let payload = openai_request_payload(&plain);
+        assert_eq!(payload["messages"][0]["name"], "loom_project_message");
+        assert_eq!(payload["messages"][1]["name"], "read_file");
     }
 
     #[test]
