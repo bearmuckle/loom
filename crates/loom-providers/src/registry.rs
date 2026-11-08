@@ -703,6 +703,30 @@ impl ProviderRegistry {
             .any(|config| config.is_decider() && self.is_usable(config)))
     }
 
+    /// The decision client for the configured decider entry, or `None` when no
+    /// key resolves.
+    ///
+    /// The key is resolved here, at use, and only held by the returned client:
+    /// a replaced key is picked up by the next call and nothing exposes it. A
+    /// keyless entry returns `None` instead of a client that cannot answer.
+    pub fn decider(&self) -> Result<Option<Arc<dyn DecisionProvider>>> {
+        let config = self
+            .configurations
+            .lock()
+            .map_err(|_| internal_lock_error("provider configuration"))?
+            .values()
+            .find(|config| config.is_decider() && self.is_usable(config))
+            .cloned();
+        let Some(config) = config else {
+            return Ok(None);
+        };
+        let Some(reference) = config.credential.as_ref() else {
+            return Ok(None);
+        };
+        let api_key = self.resolve_credential(reference)?;
+        decider_from_config(&config, api_key).map(Some)
+    }
+
     pub fn models(&self) -> Result<Vec<ModelDescriptor>> {
         self.list_models()
     }

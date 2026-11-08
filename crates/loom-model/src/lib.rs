@@ -1,6 +1,7 @@
 mod activity;
 mod agent;
 mod config;
+mod decision;
 mod events;
 mod provider;
 mod tool;
@@ -25,6 +26,11 @@ pub use config::{
     OPENCODE_DECIDER_ENDPOINT, OPENCODE_DECIDER_MODEL, ProviderConfig, ProviderUsageKey,
     TYPESAFE_DECIDER_ENDPOINT, TYPESAFE_DECIDER_MODEL, UsageLedger, declared_context_window,
     deterministic_descriptor, github_copilot_descriptor,
+};
+pub use decision::{
+    DecisionAnswer, DecisionDescriptor, DecisionOption, DecisionProvider, DecisionQuestion,
+    DecisionRequest, DecisionResponse, MAX_DECISION_OPTIONS, MAX_DECISION_QUESTION_ID_BYTES,
+    MAX_DECISION_QUESTIONS, MAX_DECISION_STATE_BYTES, MIN_DECISION_OPTIONS,
 };
 pub use events::{
     MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES, MAX_AGENT_RUN_MESSAGE_PAGE_SIZE,
