@@ -401,9 +401,19 @@ pub fn openai_model_supported(model: &str) -> bool {
     OPENAI_SUPPORTED_MODELS.contains(&model)
 }
 
+// Advertised limits arrive in three catalog shapes: GitHub Copilot's
+// capabilities.limits, a models.dev style `limit` object as served by the
+// OpenCode Go/Zen catalogs, and a plain context_length. A prompt cap is also a
+// safe upper bound on our usable window, since the runtime separately reserves
+// output, but `limit.input` is not a window: using the smaller of it and the
+// context would waste window space, so it stays out of the window candidates.
+//
+// Each helper reduces its candidates to the smallest valid value and ignores
+// values that are zero, non-numeric, or do not fit in u32.
 pub fn discovered_context_window(model: &serde_json::Value) -> Option<u32> {
     [
         "/capabilities/limits/max_context_window_tokens",
+        "/limit/context",
         "/context_length",
     ]
     .iter()
@@ -417,6 +427,7 @@ pub fn discovered_input_tokens(model: &serde_json::Value) -> Option<u32> {
     [
         "/capabilities/limits/max_prompt_tokens",
         "/capabilities/limits/max_input_tokens",
+        "/limit/input",
     ]
     .iter()
     .filter_map(|path| model.pointer(path).and_then(serde_json::Value::as_u64))
@@ -426,7 +437,7 @@ pub fn discovered_input_tokens(model: &serde_json::Value) -> Option<u32> {
 }
 
 pub fn discovered_output_tokens(model: &serde_json::Value) -> Option<u32> {
-    ["/capabilities/limits/max_output_tokens"]
+    ["/capabilities/limits/max_output_tokens", "/limit/output"]
         .iter()
         .filter_map(|path| model.pointer(path).and_then(serde_json::Value::as_u64))
         .filter_map(|value| u32::try_from(value).ok())

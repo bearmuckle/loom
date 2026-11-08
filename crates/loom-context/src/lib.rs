@@ -395,15 +395,22 @@ pub fn output_reserve(options: &ContextAssemblyOptions) -> u64 {
 }
 
 /// Select an output reserve that respects a provider's advertised completion cap.
+///
+/// A cap that is not strictly smaller than the context window cannot leave room
+/// for input, so it is ignored and the window-derived default applies instead.
+/// OpenCode catalogs advertise such caps, for example 500k output on a 500k
+/// window, which would otherwise reserve the whole window.
 pub fn output_reserve_for_model(
     options: &ContextAssemblyOptions,
     model_max_output_tokens: Option<u64>,
 ) -> u64 {
+    let usable_cap = model_max_output_tokens
+        .filter(|limit| options.context_window.is_none_or(|window| *limit < window));
     let reserve = options
         .reserved_output_tokens
-        .or(model_max_output_tokens)
+        .or(usable_cap)
         .unwrap_or_else(|| output_reserve(options));
-    let reserve = model_max_output_tokens.map_or(reserve, |limit| reserve.min(limit));
+    let reserve = usable_cap.map_or(reserve, |limit| reserve.min(limit));
     options
         .context_window
         .map_or(reserve, |window| reserve.min(window.saturating_sub(1)))
@@ -581,7 +588,9 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(output_reserve_for_model(&options, Some(8_192)), 8_192);
-        assert_eq!(output_reserve_for_model(&options, Some(64_000)), 31_999);
+        // A cap that is not strictly smaller than the window cannot leave room
+        // for input, so the window-derived default reserve applies instead.
+        assert_eq!(output_reserve_for_model(&options, Some(64_000)), 8_000);
         // Without an advertised cap the reserve scales with the window instead
         // of collapsing to the 1,024-token unknown-model floor, which is too
         // small for thinking models that spend output on reasoning.
@@ -598,6 +607,21 @@ mod tests {
             ..options
         };
         assert_eq!(output_reserve_for_model(&requested, Some(8_192)), 8_192);
+
+        // An OpenCode model that advertises output == context (grok-4.7: 500k
+        // on 500k) must not reserve the whole window and leave a 1-token input
+        // budget, which would make an agent run unable to start.
+        let opencode = ContextAssemblyOptions {
+            context_window: Some(500_000),
+            ..Default::default()
+        };
+        assert_eq!(output_reserve_for_model(&opencode, Some(500_000)), 8_192);
+        // An explicit reserve still wins over the ignored advertised cap.
+        let explicit = ContextAssemblyOptions {
+            reserved_output_tokens: Some(16_000),
+            ..opencode
+        };
+        assert_eq!(output_reserve_for_model(&explicit, Some(500_000)), 16_000);
     }
     fn options(limit: u64) -> ContextAssemblyOptions {
         ContextAssemblyOptions {

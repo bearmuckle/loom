@@ -583,12 +583,28 @@ mod tests {
         });
         assert_eq!(discovered_input_tokens(&limits), Some(32_000));
         assert_eq!(discovered_output_tokens(&limits), Some(8_192));
+        // OpenCode Go/Zen catalogs advertise limits in models.dev style.
+        let opencode = serde_json::json!({
+            "limit": {"context": 500_000, "input": 400_000, "output": 128_000}
+        });
+        assert_eq!(discovered_context_window(&opencode), Some(500_000));
+        assert_eq!(discovered_input_tokens(&opencode), Some(400_000));
+        assert_eq!(discovered_output_tokens(&opencode), Some(128_000));
+        // The smallest valid candidate wins when a catalog reports both shapes.
+        let both = serde_json::json!({
+            "context_length": 1_000_000,
+            "limit": {"context": 500_000}
+        });
+        assert_eq!(discovered_context_window(&both), Some(500_000));
         for model in [
             serde_json::json!({}),
             serde_json::json!({"context_length": 0}),
             serde_json::json!({"context_length": -1}),
             serde_json::json!({"context_length": u64::MAX}),
             serde_json::json!({"context_length": "8192"}),
+            serde_json::json!({"limit": {"context": 0}}),
+            serde_json::json!({"limit": {"context": -1}}),
+            serde_json::json!({"limit": {"context": "8192"}}),
         ] {
             assert_eq!(discovered_context_window(&model), None);
         }
@@ -2543,6 +2559,61 @@ mod tests {
             registry.pricing(&ModelId::new("discovered/model")).unwrap(),
             (100, 200)
         );
+        server
+            .join()
+            .expect("fixture server thread panicked")
+            .expect("fixture server failed");
+    }
+
+    #[test]
+    fn registry_discovers_opencode_style_model_limits() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || -> std::result::Result<(), String> {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let request_text = read_request_headers(&mut stream)?;
+            if !request_text.contains("discovery-key") {
+                return Err("fixture request did not contain the expected key".to_owned());
+            }
+            // OpenCode Go/Zen serve a models.dev style limit object.
+            let body = r#"{"data":[{"id":"gpt-6-luna","limit":{"context":1000000,"input":900000,"output":128000}},{"id":"grok-4.7","limit":{"context":500000,"input":500000,"output":500000}}]}"#;
+            write_response(&mut stream, "application/json", body)
+        });
+        let credentials = Arc::new(InMemoryCredentialStore::default());
+        credentials.insert(CredentialRef::new("opencode-key"), "discovery-key");
+        let registry = ProviderRegistry::with_credentials(credentials);
+        let descriptor = ModelDescriptor {
+            id: ModelId::new("opencode/model"),
+            provider: ProviderId::new("opencode"),
+            display_name: "OpenCode model".to_owned(),
+            context_window: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
+            capabilities: ModelCapabilities {
+                tool_calling: true,
+                ..Default::default()
+            },
+        };
+        registry
+            .register(ProviderConfig::openai_compatible(
+                "opencode",
+                "OpenCode Zen",
+                format!("http://{address}/v1/chat/completions"),
+                descriptor,
+                Some(CredentialRef::new("opencode-key")),
+            ))
+            .unwrap();
+        let models = registry
+            .discover_models(&ProviderId::new("opencode"))
+            .unwrap();
+        assert_eq!(models[0].id.as_str(), "gpt-6-luna");
+        assert_eq!(models[0].context_window, Some(1_000_000));
+        assert_eq!(models[0].max_input_tokens, Some(900_000));
+        assert_eq!(models[0].max_output_tokens, Some(128_000));
+        assert_eq!(models[1].id.as_str(), "grok-4.7");
+        assert_eq!(models[1].context_window, Some(500_000));
+        assert_eq!(models[1].max_input_tokens, Some(500_000));
+        assert_eq!(models[1].max_output_tokens, Some(500_000));
         server
             .join()
             .expect("fixture server thread panicked")
