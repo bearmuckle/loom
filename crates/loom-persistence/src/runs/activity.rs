@@ -385,7 +385,14 @@ pub(crate) fn save_run_tool_activity_delta(
             persistence_error(format!("could not read logical tool call: {error}"), true)
         })?;
     if let Some((stored_session, stored_name, stored_hash)) = existing {
-        if stored_session != session_id || stored_name != call.name || stored_hash != arguments_hash
+        // A call that carries no arguments is a placeholder for a call whose
+        // arguments are already stored (for example a result that arrives for
+        // an activity the restored runtime no longer holds), so it must not
+        // rewrite or contradict them.
+        let placeholder = call.arguments.is_null();
+        if stored_session != session_id
+            || stored_name != call.name
+            || (!placeholder && stored_hash != arguments_hash)
         {
             return Err(LoomError::new(
                 ErrorCode::MalformedPayload,
@@ -614,7 +621,9 @@ pub(crate) fn save_run_tool_rows(
                 continue;
             };
             if let Some((existing, _)) = logical_calls.get(&call.id) {
-                if existing.name != call.name || existing.arguments != call.arguments {
+                if existing.name != call.name
+                    || (!call.arguments.is_null() && existing.arguments != call.arguments)
+                {
                     return Err(LoomError::new(
                         ErrorCode::MalformedPayload,
                         "a logical tool call changed its name or arguments",
@@ -659,7 +668,7 @@ pub(crate) fn save_run_tool_rows(
                 if let Some((stored_session, stored_name, stored_arguments_hash)) = existing {
                     if stored_session != session_id
                         || stored_name != call.name
-                        || stored_arguments_hash != arguments_hash
+                        || (!call.arguments.is_null() && stored_arguments_hash != arguments_hash)
                     {
                         return Err(LoomError::new(
                             ErrorCode::MalformedPayload,

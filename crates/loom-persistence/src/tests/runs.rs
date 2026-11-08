@@ -1083,3 +1083,92 @@ fn tool_attempt_state_storage_tracks_activity_outcomes_and_intents() {
     );
     fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn a_tool_result_without_arguments_keeps_the_stored_call() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+    let persistence = FilePersistence::open(&path).unwrap();
+    let mut sessions = SessionManager::default();
+    let (session, _) = sessions
+        .create_in_workspace(WorkspaceId::new(), "Placeholder owner")
+        .unwrap();
+    let run_id = RunId::new();
+    let attempt_id = RunAttemptId::new();
+    let call = loom_model::ToolCall {
+        id: loom_core::ToolCallId::new(),
+        name: "run_command".to_owned(),
+        arguments: serde_json::json!({"command": "ls"}),
+    };
+    let summary = DurableRunSummary {
+        snapshot: AgentRunSnapshot {
+            id: run_id,
+            attempt_id,
+            control_revision: 1,
+            session_id: session.id,
+            task: "Keep tool calls immutable".to_owned(),
+            jev: None,
+            model: ModelId::new("deterministic-model"),
+            state: AgentRunState::Executing,
+            started_at: Timestamp::from_unix_millis(1000),
+            updated_at: Timestamp::from_unix_millis(1000),
+            completed_at: None,
+            summary: None,
+            evidence: Vec::new(),
+            approval_policy: None,
+        },
+        usage: UsageSnapshot::default(),
+        attempts: None,
+        execution_state: None,
+        interactions: None,
+    };
+    let summaries = BTreeMap::from([(run_id, summary)]);
+    let activity_id = ActivityId::new();
+    let activity = |call: loom_model::ToolCall, status| AgentActivityRecord {
+        id: activity_id,
+        run_id,
+        timeline_ordinal: 0,
+        parent_id: None,
+        step_id: None,
+        kind: AgentActivityKind::ToolCall,
+        status,
+        started_at: Timestamp::from_unix_millis(1000),
+        completed_at: None,
+        elapsed_ms: None,
+        data: AgentActivityData::ToolCall { call, result: None },
+    };
+    let save = |record: AgentActivityRecord| {
+        let activities = BTreeMap::from([(run_id, vec![record])]);
+        persistence.save_state(DurableStateWrite {
+            sessions: &sessions.export_state(),
+            workspaces: None,
+            settings: None,
+            workspace_configs: None,
+            providers: None,
+            usage: None,
+            idempotency: None,
+            run_summaries: Some(&summaries),
+            run_runtime_configs: None,
+            run_context_checkpoints: None,
+            run_plans: None,
+            run_messages: None,
+            run_activities: Some(&activities),
+            filesystem_records: None,
+            feed: None,
+        })
+    };
+
+    save(activity(call.clone(), AgentActivityStatus::Started)).unwrap();
+    // A later record that names the call but carries no arguments, such as
+    // the answer to a call interrupted by a restart, must not be refused.
+    let placeholder = loom_model::ToolCall {
+        arguments: serde_json::Value::Null,
+        ..call.clone()
+    };
+    save(activity(placeholder, AgentActivityStatus::Cancelled)).unwrap();
+    // Different arguments are still a rewrite of the call and stay refused.
+    let rewritten = loom_model::ToolCall {
+        arguments: serde_json::json!({"command": "rm -rf /"}),
+        ..call
+    };
+    assert!(save(activity(rewritten, AgentActivityStatus::Started)).is_err());
+}
