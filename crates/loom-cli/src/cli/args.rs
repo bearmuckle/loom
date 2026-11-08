@@ -380,10 +380,12 @@ longer exist. `cache prune` lists what is still there, with the size of each
 cache and the state the worker reports for the session that owns it, and never
 removes anything without `--yes`. Even with `--yes` it only removes a cache
 whose session is archived or gone: a cache of a living session is listed and
-kept, because that session may still be building, and an entry the worker's
-catalog knows nothing about is only removed while its name is a session id. The
-worker is asked first and is the authority on the states, so the verb needs a
-reachable worker even though it reads the directory itself. The directory is
+kept, because that session may still be building, an entry the worker's catalog
+knows nothing about is only removed while its name is a session id, and an
+entry whose session the worker refuses to report is kept because its state is
+unknown. The worker is asked about each session by id, and is the authority on
+the states, so the verb needs a reachable worker even though it reads the
+directory itself. The directory is
 derived from the connected URL exactly like the default token file, which is
 what lets the verb find the instance of a worker on this machine;
 `--cache-root <path>` names the directory instead, and is required when the
@@ -2514,13 +2516,16 @@ Examples:
 List every per-session build cache of the connected worker's instance with its
 size and the state of the session that owns it. The command is a dry run unless
 --yes is given, and even then it only removes a cache whose session is archived
-or no longer exists: a cache of a session that still exists is always kept, and
-an entry named by something that is not a session id is never removed.
+or no longer exists: a cache of a session that still exists is always kept, an
+entry named by something that is not a session id is never removed, and an
+entry whose session the worker refuses to report is kept because its state is
+unknown.
 
 Archiving a session and deleting one already reclaim its cache, and a worker
 sweeps the caches of vanished sessions when it starts, so this is the repair
-tool for what a failed removal or an interrupted process left behind. Reaching
-the worker is required because the worker reports the session states.
+tool for what a failed removal or an interrupted process left behind. The
+worker reports each session's state and is asked about it by id, so the verb
+needs a reachable worker.
 
 Flags:
   --yes                       remove the reclaimable caches instead of only

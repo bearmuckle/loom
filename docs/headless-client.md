@@ -691,17 +691,21 @@ answers what is taking the space before it answers which of it is dead.
 
 Without `--yes` nothing is removed. With it, the verb removes only a cache
 whose session is archived or no longer exists: the cache of a session that
-still exists is listed and kept, because that session may still be building,
-and a directory whose name is not a session id is listed as `unrecognized` and
-kept. Archiving a session, deleting one, and a worker start already reclaim the
+still exists is listed and kept, because that session may still be building, a
+directory whose name is not a session id is listed as `unrecognized` and kept,
+and an owner the worker refuses to report is listed as `unreadable` and kept.
+Archiving a session, deleting one, and a worker start already reclaim the
 caches they reach, so this is the repair tool for what a failed removal or an
 interrupted process left behind. A cache the process cannot remove is reported
 on a `failed` line and the command exits `1`.
 
-The session states come from `Workspace/ListWorkspaces` and
-`Workspace/ListWorkspaceSessions` with archived sessions included, so the
-worker stays the authority on which caches are dead and the verb needs a
-reachable worker. The directory itself is read by this client, because it is
+The state of each owner comes from one `Session/GetAgentSessionSnapshotMetadata`
+request for the id the cache directory is named after, so the worker stays the
+authority on which caches are dead and the verb needs a reachable worker. The
+question is per id rather than a session listing because a listing is filtered
+by the token's grants, and a live session of another scope would look vanished;
+the verb therefore works with a scoped token and keeps what that token may not
+read. The directory itself is read by this client, because it is
 ordinary build output on the worker's machine. Without `--cache-root` it is
 derived from the connected URL exactly like the default token file
 (`<state dir>/<host>_<port>/state.build-cache`), which only names a path on
