@@ -129,7 +129,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
         cancel.check()?;
         let mut payload = serde_json::json!({
             "model": request.model.as_str(),
-            "messages": request.messages.iter().map(message_json).collect::<Vec<_>>(),
+            "messages": messages_json(request),
             "stream": false
         });
         if !request.tools.is_empty() {
@@ -259,7 +259,7 @@ impl ModelProvider for OllamaProvider {
 pub fn openai_request_payload(request: &ModelRequest) -> serde_json::Value {
     let mut payload = serde_json::json!({
         "model": request.model.as_str(),
-        "messages": request.messages.iter().map(message_json).collect::<Vec<_>>(),
+        "messages": messages_json(request),
         "stream": false
     });
     if !request.tools.is_empty() {
