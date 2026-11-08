@@ -1160,8 +1160,10 @@ pub(crate) async fn list_models_from_backend(
     };
     // Providers that advertise a seed model before any credential is stored
     // (the official OpenAI and DeepSeek APIs) must not contribute to the model
-    // catalog or trigger discovery until they are usable.
-    providers.retain(|provider: &ProviderSummary| provider.is_usable());
+    // catalog or trigger discovery until they are usable. The Jev decision
+    // model is never a chat model, so it stays out of the picker even when a
+    // key makes it usable.
+    providers.retain(|provider: &ProviderSummary| provider.is_usable() && !provider.is_decider());
     let mut models = providers
         .iter()
         .flat_map(|provider| {

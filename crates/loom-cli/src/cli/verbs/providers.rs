@@ -77,6 +77,7 @@ pub(super) async fn models<C: Client>(
     };
     let mut listed = providers
         .iter()
+        .filter(|provider| !provider.is_decider())
         .filter(|provider| filter.is_none_or(|id| provider.id.as_str() == id))
         .collect::<Vec<_>>();
     listed.sort_by(|left, right| left.id.as_str().cmp(right.id.as_str()));
@@ -313,11 +314,14 @@ fn model_value(provider: &ProviderSummary, model: &ModelDescriptor, default: boo
 /// provider has both a credential and a model, which is what `run` reports with
 /// its deterministic fallback.
 pub(super) fn default_selection(providers: &[ProviderSummary]) -> Option<ModelId> {
-    providers.iter().find_map(|provider| {
-        provider.credential_id.as_ref()?;
-        let model = default_model(provider, &provider.models)?;
-        Some(ModelId::for_provider(&provider.id, &ModelId::new(model)))
-    })
+    providers
+        .iter()
+        .filter(|provider| !provider.is_decider())
+        .find_map(|provider| {
+            provider.credential_id.as_ref()?;
+            let model = default_model(provider, &provider.models)?;
+            Some(ModelId::for_provider(&provider.id, &ModelId::new(model)))
+        })
 }
 
 /// The model id a provider marks as its default: the kind's declared default
@@ -403,10 +407,61 @@ fn read_key_file(path: &Path) -> Result<String, Failure> {
 #[cfg(test)]
 mod tests {
     use loom_model::{
-        DEEPSEEK_DEFAULT_MODEL, GITHUB_COPILOT_DEFAULT_MODEL, OPENAI_DEFAULT_MODEL, ProviderKind,
+        DECIDER_PROVIDER_ID, DEEPSEEK_DEFAULT_MODEL, GITHUB_COPILOT_DEFAULT_MODEL,
+        ModelCapabilities, ModelDescriptor, ModelId, OPENAI_DEFAULT_MODEL, ProviderHealth,
+        ProviderId, ProviderKind, ProviderSummary,
     };
 
-    use super::declared_default;
+    use super::{declared_default, default_selection};
+
+    fn summary(id: &str, model: &str, credential: Option<&str>) -> ProviderSummary {
+        ProviderSummary {
+            id: ProviderId::new(id),
+            kind: ProviderKind::OpenAiCompatible,
+            display_name: "provider".to_owned(),
+            models: vec![ModelDescriptor {
+                id: ModelId::new(model),
+                provider: ProviderId::new(id),
+                display_name: model.to_owned(),
+                context_window: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
+                capabilities: ModelCapabilities::default(),
+            }],
+            credential_id: credential.map(str::to_owned),
+            api_key_configurable: true,
+            health: ProviderHealth::default(),
+        }
+    }
+
+    #[test]
+    fn the_decision_model_is_never_a_default_chat_model() {
+        let decider = summary(
+            DECIDER_PROVIDER_ID,
+            loom_model::OPENCODE_DECIDER_MODEL,
+            Some("decider-key"),
+        );
+        let openai = summary(
+            loom_model::OPENAI_PROVIDER_ID,
+            OPENAI_DEFAULT_MODEL,
+            Some("key"),
+        );
+
+        // The decider sorts first and is credentialed, so only the exclusion
+        // keeps `run` off a model that cannot answer a chat request.
+        assert_eq!(
+            default_selection(&[decider.clone(), openai.clone()]),
+            Some(ModelId::for_provider(
+                &ProviderId::new(loom_model::OPENAI_PROVIDER_ID),
+                &ModelId::new(OPENAI_DEFAULT_MODEL)
+            ))
+        );
+        assert_eq!(
+            default_selection(&[decider]),
+            None,
+            "a decision model is never the fallback chat model"
+        );
+    }
 
     #[test]
     fn each_provider_kind_declares_its_default_model_or_none() {

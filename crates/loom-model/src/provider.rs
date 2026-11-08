@@ -7,8 +7,8 @@ use loom_core::{LoomError, Result, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ModelRequest, ModelStreamEvent,
-    ProviderId, TokenUsage,
+    DECIDER_PROVIDER_ID, ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ModelRequest,
+    ModelStreamEvent, ProviderId, TokenUsage,
 };
 
 /// Cooperative cancellation shared between a run and the provider serving it.
@@ -296,6 +296,17 @@ impl ProviderSummary {
     pub fn is_usable(&self) -> bool {
         !self.kind.requires_credential() || self.credential_id.is_some()
     }
+
+    /// Whether this provider is the Jev decision model rather than a chat
+    /// provider.
+    ///
+    /// A decision model answers one bounded decision request and never a chat
+    /// request, so a client that builds a model picker must leave it out. The
+    /// reserved id identifies it on the wire, so a client does not need a new
+    /// field to tell the two apart.
+    pub fn is_decider(&self) -> bool {
+        self.id.as_str() == DECIDER_PROVIDER_ID
+    }
 }
 
 pub type ProviderDescriptor = ProviderSummary;
@@ -341,6 +352,23 @@ mod tests {
         let raw_count = estimate_tokens(&request);
         request.model = ModelId::for_provider(&ProviderId::new("openai"), &request.model);
         assert_eq!(estimate_tokens(&request), raw_count);
+    }
+
+    #[test]
+    fn a_decision_model_is_not_a_chat_provider() {
+        let mut summary = ProviderSummary {
+            id: ProviderId::new(DECIDER_PROVIDER_ID),
+            kind: ProviderKind::OpenAiCompatible,
+            display_name: "Jev (decision model)".to_owned(),
+            models: Vec::new(),
+            credential_id: None,
+            api_key_configurable: true,
+            health: ProviderHealth::default(),
+        };
+        assert!(summary.is_decider());
+
+        summary.id = ProviderId::new("openai");
+        assert!(!summary.is_decider());
     }
 
     #[test]
