@@ -10,9 +10,9 @@ use std::{
 
 use loom_core::{AgentSessionId, ErrorCode, LoomError, Result, Timestamp, ToolCallId};
 use loom_model::{
-    CancellationToken, FinishReason, MessageRole, ModelCapabilities, ModelDescriptor, ModelId,
-    ModelMessage, ModelRequest, ModelStreamEvent, ModelStreamSink, ProviderId, StreamFlow,
-    TokenUsage, ToolCall,
+    CancellationToken, DecisionProvider, FinishReason, MessageRole, ModelCapabilities,
+    ModelDescriptor, ModelId, ModelMessage, ModelRequest, ModelStreamEvent, ModelStreamSink,
+    ProviderId, StreamFlow, TokenUsage, ToolCall,
 };
 pub use loom_model::{
     CredentialRef, CredentialReference, DECIDER_DISPLAY_NAME, DECIDER_PROVIDER_ID,
@@ -30,6 +30,7 @@ pub use loom_model::{
 use serde::Deserialize;
 
 mod credential;
+mod decider;
 mod deterministic;
 mod errors;
 mod github;
@@ -41,6 +42,7 @@ mod retry;
 mod tool_arguments;
 
 pub use credential::*;
+pub use decider::*;
 pub use deterministic::*;
 pub use errors::*;
 pub use github::*;
@@ -1358,6 +1360,28 @@ mod tests {
                 .unwrap()
                 .contains("decider-test-key")
         );
+    }
+
+    #[test]
+    fn a_decider_client_is_built_only_once_a_key_resolves() {
+        let registry =
+            ProviderRegistry::with_credentials(Arc::new(InMemoryCredentialStore::default()));
+        registry.register_decider(DeciderSource::TypeSafe).unwrap();
+
+        assert!(
+            registry.decider().unwrap().is_none(),
+            "a keyless decider must not produce a client that cannot answer"
+        );
+
+        registry
+            .configure_api_key_provider(
+                &ProviderId::new(DECIDER_PROVIDER_ID),
+                "decider-test-key".to_owned(),
+            )
+            .unwrap();
+        let decider = registry.decider().unwrap().unwrap();
+        assert_eq!(decider.descriptor().model.as_str(), TYPESAFE_DECIDER_MODEL);
+        assert_eq!(decider.descriptor().provider.as_str(), DECIDER_PROVIDER_ID);
     }
 
     #[test]
