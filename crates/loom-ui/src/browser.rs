@@ -162,6 +162,26 @@ impl BrowserOptions {
             })
     }
 
+    /// Forgets the saved startup connection when it names `url`, so a worker
+    /// that failed at startup and was removed is not retried on the next load.
+    pub(crate) fn forget_connection_for(url: &str) {
+        let Ok(storage) = browser_storage() else {
+            return;
+        };
+        let Ok((Some(saved), _)) = saved_connection(&storage) else {
+            return;
+        };
+        if saved.trim().trim_end_matches('/') != url.trim().trim_end_matches('/') {
+            return;
+        }
+        if let Err(error) = storage.remove_item(SAVED_CONNECTION_KEY) {
+            log::warn!(
+                "[loom-ui] could not forget the saved bootstrap worker config: {}",
+                describe_js(&error)
+            );
+        }
+    }
+
     pub(crate) fn persist_default_model(model: &ModelId) -> Result<(), LoomError> {
         browser_storage()?
             .set_item(SAVED_DEFAULT_MODEL_KEY, model.as_str())

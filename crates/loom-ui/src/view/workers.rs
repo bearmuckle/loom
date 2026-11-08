@@ -250,6 +250,8 @@ impl LoomView {
         if let Some(url) = &node.url {
             #[cfg(not(target_family = "wasm"))]
             crate::ssh_worker::close(url);
+            #[cfg(target_family = "wasm")]
+            crate::browser::BrowserOptions::forget_connection_for(url);
             let count = self.workspace_config.worker_nodes.len();
             self.workspace_config
                 .worker_nodes
