@@ -1885,6 +1885,14 @@ fn auto_archive_policy_archives_a_completed_child_agent() {
         )
         .unwrap();
     let archived_child = delegate("Archived child");
+    // Build output the child's commands left behind is reclaimed with the
+    // archive, so an auto-archived agent cannot leak its cache until the next
+    // start sweeps it.
+    let cache = backend
+        .build_cache_for_session(archived_child)
+        .expect("a durable backend owns a build cache");
+    fs::create_dir_all(cache.join("debug")).unwrap();
+    fs::write(cache.join("debug/artifact"), b"build output").unwrap();
     complete(archived_child);
     assert_eq!(
         backend
@@ -1894,6 +1902,10 @@ fn auto_archive_policy_archives_a_completed_child_agent() {
             .unwrap()
             .state,
         AgentSessionState::Archived
+    );
+    assert!(
+        !cache.exists(),
+        "auto-archiving a completed child must reclaim its build cache"
     );
     assert_eq!(
         backend
