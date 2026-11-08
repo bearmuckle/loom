@@ -48,6 +48,16 @@ impl AgentRuntime {
         self.run.clone()
     }
 
+    /// Pins the Jev switches this run evaluates against.
+    ///
+    /// The caller resolves the workspace, project, session, and credential
+    /// result once, like the approval policy, and pins it here. A later scope
+    /// change therefore applies from the next run instead of changing what a
+    /// run that already started may ask.
+    pub fn set_jev_policy(&mut self, policy: Option<JevPolicy>) {
+        self.run.jev = policy;
+    }
+
     pub fn usage(&self) -> UsageSnapshot {
         self.usage.clone()
     }

@@ -21,12 +21,12 @@ use loom_agent::{
 };
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy,
-    Capability, CapabilitySet, DelegatedTaskSpec, ErrorCode, EventSequence, LoomError,
-    MAX_PROJECT_AGENT_DEPTH, ProjectAgentRecord, ProjectId, ProjectSnapshot,
+    Capability, CapabilitySet, DelegatedTaskSpec, ErrorCode, EventSequence, JevPolicy, LoomError,
+    MAX_PROJECT_AGENT_DEPTH, ProjectAgentRecord, ProjectId, ProjectJevPolicy, ProjectSnapshot,
     ProjectWorktreeBaseRefresh, ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord,
     ProjectWorktreeStatus, ProtocolVersion, RepositoryId, RequestId, Result, RunAttemptId,
-    SessionEventRecord, SessionTitleSource, TaskContextReference, Timestamp, UsageSnapshot,
-    WorkspaceId, WorkspaceRecord, sanitize_title, title_from_goal, titles_diverge,
+    SessionEventRecord, SessionJevPolicy, SessionTitleSource, TaskContextReference, Timestamp,
+    UsageSnapshot, WorkspaceId, WorkspaceRecord, sanitize_title, title_from_goal, titles_diverge,
 };
 use loom_model::{
     ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId, ToolCall, ToolDefinition,
@@ -60,9 +60,9 @@ use loom_protocol::{
     WorkspaceResponse, unsupported_version_error,
 };
 use loom_providers::{
-    CredentialRef, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF, GitHubCopilotAuthenticator,
-    ModelProvider, ProviderConfig, ProviderHealth, ProviderRegistry, UnavailableProvider,
-    UsageLedger, deterministic_descriptor,
+    CredentialRef, DeciderSource, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF,
+    GitHubCopilotAuthenticator, ModelProvider, ProviderConfig, ProviderHealth, ProviderRegistry,
+    UnavailableProvider, UsageLedger, deterministic_descriptor,
 };
 use loom_session::{SessionManager, WorkspaceManager};
 use loom_sessionfs::Workspace;

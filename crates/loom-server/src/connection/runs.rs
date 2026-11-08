@@ -95,6 +95,10 @@ impl InProcessConnection {
                 integration: state.options.project_integration_enabled,
             },
         )?;
+        // A restored run resolves Jev again: the pinned switches are not durable
+        // yet, so the tool is re-gated against the workspace and the credential
+        // that resolve on this worker now.
+        let (tools, _) = self.backend.with_jev_tools(tools, state.session_id)?;
         let mut runtime = AgentRuntime::from_state(state, provider, tools)?;
         // A restored run is told the session's current goal again, because the
         // goal is owned by the session and not stored with the run. The next run
@@ -710,6 +714,7 @@ impl InProcessConnection {
                 integration: input.options.project_integration_enabled,
             },
         )?;
+        let (tools, jev_policy) = self.backend.with_jev_tools(tools, session.id)?;
         let policy = self.policy(session.id)?;
         let mut agent_task = AgentTask::new(input.task, input.model)?;
         agent_task.system_instructions = input.system_instructions;
@@ -722,6 +727,9 @@ impl InProcessConnection {
             policy,
             input.options,
         );
+        // The Jev switches are pinned with the run, like its approval policy, so
+        // a later workspace change applies from the next run.
+        runtime.set_jev_policy(jev_policy);
         // The goal is the session's durable objective, not a run attribute, so
         // it is stated in every model request the run assembles. A goal-driven
         // run keeps working until it claims the goal is reached.

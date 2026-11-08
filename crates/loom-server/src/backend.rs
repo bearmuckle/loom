@@ -5,6 +5,7 @@ mod archive;
 mod collaboration;
 mod constructors;
 mod filesystem;
+mod jev;
 mod persistence;
 mod person_tokens;
 mod process_service;

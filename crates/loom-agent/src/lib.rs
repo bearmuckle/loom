@@ -9,7 +9,7 @@ use std::{
 use loom_context::{ContextAssembler, ContextAssemblyOptions, ContextInput, ContextInspection};
 use loom_core::{
     ActivityId, AgentMessageRecord, AgentSessionId, ApprovalPolicy, ErrorCode, EvidenceLink,
-    InteractionId, LimitKind, LimitStatus, LoomError, PolicyEvaluation, Result, RunId,
+    InteractionId, JevPolicy, LimitKind, LimitStatus, LoomError, PolicyEvaluation, Result, RunId,
     SessionLimits, StepId, Timestamp, UsageSnapshot,
 };
 pub use loom_model::{

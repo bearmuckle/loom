@@ -273,6 +273,7 @@ impl InProcessBackend {
             providers
                 .scope_api_key_credentials(Arc::new(FileCredentialStore::open(credential_path)?))?;
         }
+        register_decider(&providers)?;
         let (node_id, node_name) = worker_node_identity(node_name);
         let session_root_base = persistence.as_ref().map_or_else(
             || {
@@ -439,4 +440,38 @@ impl InProcessBackend {
         backend.sweep_orphan_build_caches()?;
         Ok(backend)
     }
+}
+
+/// Selects which host serves the Jev decision model.
+///
+/// The two supported hosts answer the same request shape; only their endpoint,
+/// model alias, and key differ. The entry is registered keyless, so the choice
+/// is a deployment setting rather than a credential that has to exist first.
+const DECIDER_SOURCE_ENV: &str = "LOOM_DECIDER_SOURCE";
+
+/// Offers the Jev decision entry beside the chat providers.
+///
+/// An entry the caller already registered is kept: a test or an embedding may
+/// supply its own decider, including one with a stored key. Otherwise the entry
+/// is offered keyless, which every Jev surface refuses until an operator stores
+/// a key for it.
+fn register_decider(providers: &ProviderRegistry) -> Result<()> {
+    if providers
+        .export_configs()?
+        .iter()
+        .any(ProviderConfig::is_decider)
+    {
+        return Ok(());
+    }
+    let configured = std::env::var(DECIDER_SOURCE_ENV).ok();
+    let source = match configured.as_deref().map(str::trim) {
+        None | Some("") | Some("opencode") => DeciderSource::OpenCode,
+        Some("typesafe") => DeciderSource::TypeSafe,
+        Some(other) => {
+            return Err(LoomError::invalid_request(format!(
+                "{DECIDER_SOURCE_ENV} must be 'opencode' or 'typesafe', not '{other}'"
+            )));
+        }
+    };
+    providers.register_decider(source)
 }

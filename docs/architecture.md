@@ -333,6 +333,16 @@ Local models may have weaker tool calling, smaller context windows, or
 different streaming behavior. The capability handshake must let the runtime
 adapt prompts and feature availability without making the UI provider-aware.
 
+A decision model is a sibling of the chat providers, not one of them.
+`loom-model` defines `DecisionProvider`, which takes one factual state and a few
+closed choice questions and returns one choice per question with the
+distribution it was taken from; `loom-providers` implements the Jev client
+behind the `decider` provider entry. `loom-tools` exposes it as the read-only
+`decide` tool, which a run sees only when the workspace switch is on and a
+decider key resolves. A decision failure is a failed tool result rather than a
+failed run, and the decision model is never catalogued as a chat model, so no
+agent can select it with `--model`.
+
 Provider configuration uses opaque credential references, resolved only while
 constructing a backend provider. Usage is recorded as normalized token and
 cost records, and transport or status failures map to stable Loom error
