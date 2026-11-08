@@ -348,6 +348,32 @@ pub(crate) fn save_run_activity_deltas(
     Ok(())
 }
 
+/// Names the call and the parts of it that differ from the stored call, so a
+/// fail-stop log says which call was refused and why.
+fn immutable_tool_call_message(
+    call: &loom_model::ToolCall,
+    session_differs: bool,
+    name_differs: bool,
+    arguments_differ: bool,
+) -> String {
+    let mut parts = Vec::new();
+    if session_differs {
+        parts.push("session");
+    }
+    if name_differs {
+        parts.push("name");
+    }
+    if arguments_differ {
+        parts.push("arguments");
+    }
+    format!(
+        "persisted logical tool call is immutable (call {} '{}' differs in: {})",
+        call.id,
+        call.name,
+        parts.join(", ")
+    )
+}
+
 pub(crate) fn save_run_tool_activity_delta(
     transaction: &Transaction<'_>,
     run_id: RunId,
@@ -396,7 +422,12 @@ pub(crate) fn save_run_tool_activity_delta(
         {
             return Err(LoomError::new(
                 ErrorCode::MalformedPayload,
-                "persisted logical tool call is immutable",
+                immutable_tool_call_message(
+                    call,
+                    stored_session != session_id,
+                    stored_name != call.name,
+                    stored_hash != arguments_hash,
+                ),
                 false,
             ));
         }
@@ -672,7 +703,12 @@ pub(crate) fn save_run_tool_rows(
                     {
                         return Err(LoomError::new(
                             ErrorCode::MalformedPayload,
-                            "persisted logical tool call is immutable",
+                            immutable_tool_call_message(
+                                call,
+                                stored_session != session_id,
+                                stored_name != call.name,
+                                stored_arguments_hash != arguments_hash,
+                            ),
                             false,
                         ));
                     }
