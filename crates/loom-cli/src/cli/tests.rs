@@ -6432,6 +6432,73 @@ fn cache_prune_rejects_an_unknown_sub_verb_a_stray_flag_and_a_remote_worker() {
 }
 
 #[test]
+fn cache_prune_keeps_a_cache_whose_session_the_worker_refuses_to_report() {
+    let fixture = fixture();
+    let workspace_id = fixture.workspace.id;
+    let live = create_session(&fixture.control, workspace_id, "cache unreadable");
+    let root = temporary_cache_root("unreadable");
+    write_cache(&root, &live.id.to_string(), 7);
+    let root_argument = root.to_string_lossy().into_owned();
+
+    // A worker that answers a live session's metadata request with an
+    // authorization failure, which is what a scoped token meets outside its
+    // grants. Its cache must be listed as unreadable and kept, never removed as
+    // a session that no longer exists.
+    let mut client =
+        Wrapped::new(InProcessClient::new(&fixture.backend)).after(move |request, response| {
+            if matches!(
+                request,
+                ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata {
+                    session_id,
+                    ..
+                }) if *session_id == live.id
+            ) {
+                response.result = Err(loom_core::LoomError::new(
+                    loom_core::ErrorCode::AuthorizationDenied,
+                    format!("token is not authorized for session {}", live.id),
+                    false,
+                ));
+            }
+        });
+
+    let listing = run(
+        &mut client,
+        &["cache", "prune", "--cache-root", &root_argument],
+    );
+    assert_eq!(listing.code, exit::OK, "{}", listing.stderr);
+    assert_eq!(
+        listing.stdout,
+        format!(
+            "root {root_argument}\n\
+             cache {} unreadable 7 keep\n\
+             total caches 1 bytes 7\n\
+             reclaimable 0 bytes 0\n\
+             dry-run; pass --yes to remove 0 caches\n",
+            live.id
+        )
+    );
+
+    let pruned = run(
+        &mut client,
+        &["cache", "prune", "--cache-root", &root_argument, "--yes"],
+    );
+    assert_eq!(pruned.code, exit::OK, "{}", pruned.stderr);
+    assert!(
+        pruned.stdout.contains("removed 0 bytes 0\n"),
+        "{}",
+        pruned.stdout
+    );
+    assert!(
+        root.join(live.id.to_string())
+            .join("debug/artifact")
+            .is_file(),
+        "an unreadable session keeps its cache: {}",
+        pruned.stdout
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn providers_list_prints_credentials_without_secrets_and_set_key_stores_them() {
     let (fixture, directory) = persistent_fixture("providers");
     let database = directory.join("state.sqlite");

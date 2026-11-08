@@ -12,20 +12,23 @@
 //! Two authorities meet here. The directory is read by this client, because the
 //! build cache is ordinary build output on the worker's machine; the session
 //! states come from the worker, because only the worker knows whether a session
-//! still exists and whether it is archived. A dry run lists everything and
-//! removes nothing, and even `--yes` keeps the cache of a session that still
-//! exists, so a prune can never take the cache out from under a running build.
+//! still exists and whether it is archived. Each cache's owner is asked about by
+//! id rather than inferred from a listing, because a listing is filtered by the
+//! token's grants: an unseen session would look vanished to a scoped token, and
+//! its cache would be removed. A dry run lists everything and removes nothing,
+//! and even `--yes` keeps the cache of a session that still exists or whose
+//! state the worker refuses to report, so a prune can never take the cache out
+//! from under a running build.
 
 use std::{
-    collections::BTreeMap,
     fs,
     io::Write,
     path::{Path, PathBuf},
 };
 
-use loom_core::{AgentSessionId, AgentSessionState};
+use loom_core::{AgentSessionId, AgentSessionState, ErrorCode};
 use loom_protocol::{
-    ClientRequest, ServerResponse, SessionResponse, WorkspaceRequest, WorkspaceResponse,
+    ActivityDetail, ClientRequest, ServerResponse, SessionRequest, SessionResponse,
 };
 use serde_json::{Value, json};
 
@@ -44,10 +47,12 @@ const BUILD_CACHE_DIRECTORY: &str = "state.build-cache";
 /// What the worker reports for the session that owns one cache directory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Owner {
-    /// The worker lists a session with this id, in this state.
+    /// The worker reports a session with this id, in this state.
     Session(AgentSessionState),
-    /// The worker lists no session with this id.
+    /// The worker reports no session with this id.
     Missing,
+    /// The worker refused to report the session, so its state is unknown.
+    Unreadable,
     /// The directory name is not a session id, so no session owns it.
     Unrecognized,
 }
@@ -58,6 +63,7 @@ impl Owner {
         match self {
             Self::Session(state) => session_state_name(state),
             Self::Missing => "missing",
+            Self::Unreadable => "unreadable",
             Self::Unrecognized => "unrecognized",
         }
     }
@@ -87,9 +93,10 @@ struct Cache {
 /// answers both "how much is there" and "which of it is dead", which is what the
 /// worker's own archive and start-time reclamation already decided for the caches
 /// they reached. `--yes` removes exactly the reclaimable entries: the archived
-/// and the vanished. A failure to remove one is reported and leaves the rest of
-/// the round to run, and the command exits `1` because the operator asked for a
-/// removal that did not happen.
+/// and the vanished. Every state is resolved before anything is removed, so a
+/// failure part-way through the listing removes nothing. A failure to remove one
+/// cache is reported and leaves the rest of the round to run, and the command
+/// exits `1` because the operator asked for a removal that did not happen.
 pub(super) async fn prune<C: Client>(
     client: &mut C,
     invocation: &Invocation,
@@ -101,8 +108,13 @@ pub(super) async fn prune<C: Client>(
     let root = cache_root(invocation, args)?;
     let mut caller = Caller::new(client);
     handshake(&mut caller, &invocation.verb).await?;
-    let owners = session_states(&mut caller).await?;
-    let mut caches = read_caches(&root, &owners)?;
+    let mut caches = read_caches(&root)?;
+    for cache in &mut caches {
+        cache.owner = match cache.session_id {
+            Some(session_id) => session_owner(&mut caller, session_id).await?,
+            None => Owner::Unrecognized,
+        };
+    }
     // Largest first, so the listing answers "what is taking the space" before
     // the tie-break of the name makes the order stable.
     caches.sort_by(|left, right| {
@@ -265,53 +277,51 @@ fn cache_root(invocation: &Invocation, args: &CachePruneArgs) -> Result<PathBuf,
         .join(BUILD_CACHE_DIRECTORY))
 }
 
-/// The state of every session the worker's workspaces hold, archived ones
-/// included: archived is exactly the state a cache is reclaimable in, and a
-/// session id the listing does not carry is one that no longer exists.
-async fn session_states<C: Client>(
+/// The state the worker reports for one session, asked about by id.
+///
+/// The question is per id and not "which sessions do you hold", because every
+/// listing is filtered by the token's grants: to a session-scoped token, a live
+/// session of another scope is simply absent, and reading that absence as a
+/// vanished session would remove the cache of a session that still exists. An id
+/// the worker refuses to report is [`Owner::Unreadable`] and keeps its cache, so
+/// only a session the worker says does not exist is ever [`Owner::Missing`].
+async fn session_owner<C: Client>(
     caller: &mut Caller<'_, C>,
-) -> Result<BTreeMap<AgentSessionId, AgentSessionState>, Failure> {
-    let (request_id, response) = caller
-        .call(ClientRequest::Workspace(WorkspaceRequest::ListWorkspaces))
-        .await?;
-    let workspaces = match response {
-        ServerResponse::Workspace(WorkspaceResponse::Workspaces { workspaces }) => workspaces,
-        _ => return Err(Failure::unexpected(request_id, "workspace listing")),
-    };
-    let mut states = BTreeMap::new();
-    for workspace in workspaces {
-        let (request_id, response) = caller
-            .call(ClientRequest::Workspace(
-                WorkspaceRequest::ListWorkspaceSessions {
-                    workspace_id: workspace.id,
-                    include_archived: true,
-                },
-            ))
-            .await?;
-        match response {
-            ServerResponse::Session(SessionResponse::AgentSessions { sessions }) => {
-                states.extend(
-                    sessions
-                        .into_iter()
-                        .map(|session| (session.id, session.state)),
-                );
-            }
-            _ => return Err(Failure::unexpected(request_id, "workspace sessions")),
+    session_id: AgentSessionId,
+) -> Result<Owner, Failure> {
+    let (request_id, response) = match caller
+        .call(ClientRequest::Session(
+            SessionRequest::GetAgentSessionSnapshotMetadata {
+                session_id,
+                activity_detail: ActivityDetail::Replies,
+            },
+        ))
+        .await
+    {
+        Ok(answered) => answered,
+        Err(Failure::Server { error, .. }) if error.code == ErrorCode::NotFound => {
+            return Ok(Owner::Missing);
         }
+        Err(Failure::Server { error, .. }) if error.code == ErrorCode::AuthorizationDenied => {
+            return Ok(Owner::Unreadable);
+        }
+        Err(error) => return Err(error),
+    };
+    match response {
+        ServerResponse::Session(SessionResponse::AgentSessionSnapshot(snapshot)) => {
+            Ok(Owner::Session(snapshot.session.state))
+        }
+        _ => Err(Failure::unexpected(request_id, "session metadata")),
     }
-    Ok(states)
 }
 
-/// The caches under `root`, each with the state of the session that owns it.
+/// The caches under `root`, before their owners are asked about.
 ///
 /// A missing root is an empty listing rather than a failure: an instance that
 /// never let an agent build anything has no cache directory, and that is nothing
 /// to report as an error. An entry whose name is not a session id is listed as
 /// unrecognized and never removed, because nothing here can say what it is.
-fn read_caches(
-    root: &Path,
-    owners: &BTreeMap<AgentSessionId, AgentSessionState>,
-) -> Result<Vec<Cache>, Failure> {
+fn read_caches(root: &Path) -> Result<Vec<Cache>, Failure> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -335,18 +345,13 @@ fn read_caches(
             continue;
         };
         let session_id = name.parse::<AgentSessionId>().ok();
-        let owner = match session_id {
-            None => Owner::Unrecognized,
-            Some(id) => match owners.get(&id) {
-                Some(state) => Owner::Session(*state),
-                None => Owner::Missing,
-            },
-        };
         let bytes = path_size(&entry.path());
         caches.push(Cache {
             name,
             session_id,
-            owner,
+            // Replaced by the state pass; an entry whose name is not a session
+            // id keeps this word, because no session can own it.
+            owner: Owner::Unrecognized,
             bytes,
         });
     }
@@ -483,7 +488,9 @@ mod tests {
             );
         }
         assert!(!Owner::Unrecognized.reclaimable());
+        assert!(!Owner::Unreadable.reclaimable());
         assert_eq!(Owner::Missing.word(), "missing");
+        assert_eq!(Owner::Unreadable.word(), "unreadable");
         assert_eq!(Owner::Unrecognized.word(), "unrecognized");
         assert_eq!(
             Owner::Session(AgentSessionState::Archived).word(),

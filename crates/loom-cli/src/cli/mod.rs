@@ -34,7 +34,7 @@
 //! | `result` | `Repository/ListSessionRepositories`, `Repository/GetSessionVcsStatus`, `Repository/GetSessionVcsDiff`, `Task/GetSessionTaskEvidence` |
 //! | `retention get` | `Control/GetArchiveRetentionPolicy` |
 //! | `retention set` | `Control/GetArchiveRetentionPolicy`, `Control/SetArchiveRetentionPolicy` |
-//! | `cache prune` | `Workspace/ListWorkspaces`, `Workspace/ListWorkspaceSessions` |
+//! | `cache prune` | `Session/GetAgentSessionSnapshotMetadata` per cache |
 //! | `providers list` | `Provider/ListProviders` |
 //! | `models list` | `Provider/ListProviders` |
 //! | `providers set-key` | `Provider/ConfigureApiKeyProvider` |
@@ -185,11 +185,14 @@
 //! owns it (`root`, then `cache <session-id> <state> <bytes> remove|keep`, then
 //! `total` and `reclaimable`, and either a `dry-run; pass --yes` trailer or the
 //! `removed` and `failed` lines of the removal). The directory is read locally
-//! and the states come from `Workspace/ListWorkspaceSessions` with archived
-//! sessions included, so the worker stays the authority on which caches are
-//! dead: only a cache whose session is archived or gone is ever removed, and an
-//! entry whose name is not a session id is listed as `unrecognized` and kept.
-//! Without `--cache-root` the directory is derived from the connected URL the
+//! and every owner is asked about by id with
+//! `Session/GetAgentSessionSnapshotMetadata`, so the worker stays the authority
+//! on which caches are dead: only a cache whose session is archived or gone is
+//! ever removed, an entry whose name is not a session id is listed as
+//! `unrecognized` and kept, and an owner the worker refuses to report is listed
+//! as `unreadable` and kept, because a listing filtered by a token's grants would
+//! make a live session of another scope look gone. Without `--cache-root` the
+//! directory is derived from the connected URL the
 //! same way the default token file is, which is why the default only applies to
 //! a loopback worker; a cache the process cannot remove is reported and the
 //! command exits `1`.
