@@ -148,6 +148,39 @@ latest sequence in the response. Requests with a stable `RequestId` are
 idempotent for retryable mutations; the bounded idempotency cache is persisted
 with durable backend state.
 
+### Session lifecycle feed
+
+A client that lists a workspace's sessions has to follow another client's
+changes to that catalog: a session `loom-cli` or a second client creates,
+renames, re-states, restores, or archives. The workspace-scoped feed above
+carries those events, but it also carries every session's streamed transcript,
+which no session list renders, so following it from an idle client would
+download every run of the workspace.
+
+`GetWorkspaceSessionEvents` is the same workspace-scoped subscription narrowed to
+the events a catalog is built from: `AgentSessionCreated`,
+`AgentSessionForked`, `AgentSessionRenamed`, `AgentSessionGoalChanged`,
+`AgentSessionTitleSourceChanged`, `AgentSessionStateChanged`,
+`AgentSessionArchived`, `AgentSessionRestored`, and the project records a
+delegated child changes (`ProjectAgentCreated`, `ProjectAgentUpdated`,
+`ProjectTaskUpdated`, `ProjectChildWorktreeUpdated`). Run content, filesystem
+changes, terminal and task traffic, collaboration entries, and workspace rename
+and configuration events are left out. It requires the same
+`SubscribeWorkspaceEvents` capability and uses the same workspace sequence, so
+one client can follow both feeds with one cursor.
+
+The answer is `WorkspaceSessionEvents`. Its `latest_sequence` is the workspace
+feed head, so a client that received no event still advances past the ones this
+subscription filters out, and `next_after_sequence` names the next page when the
+answer was bounded to one response frame. `sessions` carries the workspace
+session catalog whenever the client cannot be brought up to date from events
+alone: on a first read, after the backend's stream epoch changed, and when
+retention carried the cursor's window away. Such a resynchronizing answer carries
+no events, because the catalog already is the state those events would have
+built; a client rebuilds its rows from it and resumes from `latest_sequence`. A
+session deletion has no event of its own, so it reaches a client through that
+catalog.
+
 The server sends WebSocket ping heartbeats, applies a configured request
 deadline, accepts cancellation frames for pending transport tasks, and uses a
 bounded outbound queue. A full queue closes the connection rather than

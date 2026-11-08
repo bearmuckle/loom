@@ -7,9 +7,9 @@ impl LoomView {
         self.project_snapshot = None;
         self.project_snapshot_stale = false;
         if workspace_changed {
-            self.project_feed_after_sequence = None;
-            self.project_feed_epoch = None;
-            self.project_poll_scheduled = false;
+            self.workspace_feed_after_sequence = None;
+            self.workspace_feed_epoch = None;
+            self.workspace_feed_poll_scheduled = false;
         }
         self.session_repositories.clear();
         self.session_directories.clear();
@@ -484,8 +484,8 @@ impl LoomView {
         if project_root_removed {
             self.project_snapshot = None;
             self.project_snapshot_stale = false;
-            self.project_feed_after_sequence = None;
-            self.project_poll_scheduled = false;
+            self.workspace_feed_after_sequence = None;
+            self.workspace_feed_poll_scheduled = false;
         } else if let Some(project) = self.project_snapshot.as_mut() {
             prune(project);
         }

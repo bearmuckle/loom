@@ -310,6 +310,28 @@ pub enum EventsRequest {
         #[serde(default)]
         activity_detail: ActivityDetail,
     },
+
+    /// A workspace's session lifecycle feed.
+    ///
+    /// A client that lists a workspace's sessions needs to know when another
+    /// client creates, renames, re-states, or archives one of them. The
+    /// workspace-scoped [`Self::GetSessionEvents`] answer would tell it, but it
+    /// also carries every run's streamed transcript, which no session list
+    /// renders. This request is the same subscription narrowed to the events
+    /// that change the session catalog: session creation, forking, rename, goal,
+    /// title source, state, archive, and restore, plus the project records a
+    /// delegated child changes.
+    ///
+    /// The cursor is the workspace feed's own sequence, so a client follows this
+    /// feed exactly like the unfiltered one and needs no second cursor.
+    GetWorkspaceSessionEvents {
+        workspace_id: WorkspaceId,
+        /// Last workspace feed sequence processed for this scope.
+        after_sequence: Option<EventSequence>,
+        /// Backend-instance identity paired with `after_sequence`.
+        #[serde(default)]
+        stream_epoch: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

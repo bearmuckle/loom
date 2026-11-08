@@ -593,49 +593,6 @@ fn project_child_controls_follow_run_and_task_state() {
 }
 
 #[test]
-fn project_worktree_updates_are_included_in_project_workspace_refreshes() {
-    let project_id = loom_core::ProjectId::new();
-    let root_session_id = AgentSessionId::new();
-    let worktree = loom_core::ProjectWorktreeRecord {
-        project_id,
-        task_id: loom_core::TaskId::new(),
-        parent_session_id: root_session_id,
-        child_session_id: AgentSessionId::new(),
-        parent_repository_id: loom_core::RepositoryId::new(),
-        child_repository_id: loom_core::RepositoryId::new(),
-        relative_path: "project-worktrees/example".to_owned(),
-        worktree_name: "loom-child-example".to_owned(),
-        branch_name: "loom/project-child-example".to_owned(),
-        base_revision: "base".to_owned(),
-        base_refresh: None,
-        result_revision: None,
-        integrated_revision: None,
-        status: loom_core::ProjectWorktreeStatus::Ready,
-        conflict_paths: Vec::new(),
-        error: None,
-        cleanup_disposition: None,
-        created_at: loom_core::Timestamp::from_unix_millis(1),
-        updated_at: loom_core::Timestamp::from_unix_millis(1),
-    };
-    let event = loom_protocol::WorkspaceFeedEvent::Session(loom_protocol::ServerEventEnvelope {
-        protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
-        sequence: EventSequence::new(3),
-        session_id: root_session_id,
-        event: loom_protocol::ServerEvent::ProjectChildWorktreeUpdated { worktree },
-    });
-    let members = std::collections::BTreeSet::from([root_session_id]);
-
-    assert!(super::is_project_workspace_event(
-        &event, project_id, &members
-    ));
-    assert!(!super::is_project_workspace_event(
-        &event,
-        loom_core::ProjectId::new(),
-        &members
-    ));
-}
-
-#[test]
 fn source_dialog_initial_choice_tracks_purpose_and_local_availability() {
     assert_eq!(
         source_dialog_initial_state(SessionSourceDialogPurpose::StartSession, true),

@@ -240,6 +240,9 @@ impl InProcessConnection {
             ClientRequest::Events(EventsRequest::GetRecentSessionEvents { .. }) => {
                 self.session_events_dispatch(request, request_id)
             }
+            ClientRequest::Events(EventsRequest::GetWorkspaceSessionEvents { .. }) => {
+                self.session_events_dispatch(request, request_id)
+            }
             ClientRequest::Run(RunRequest::GetAgentRun { .. }) => {
                 self.run_query_dispatch(request, request_id)
             }

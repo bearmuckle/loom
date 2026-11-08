@@ -1322,6 +1322,125 @@ async fn session_scopes_filter_workspace_session_listing() {
 }
 
 #[tokio::test]
+async fn workspace_lifecycle_feed_follows_another_clients_session_over_the_wire() {
+    let (_backend, _auth, token, server) = server().await;
+    let mut watcher = WebSocketTransport::new(server.websocket_url(), token.token.clone())
+        .connect()
+        .await
+        .unwrap();
+    negotiate(&mut watcher).await;
+    let workspace_id = create_workspace(&mut watcher).await;
+    let first = session(&mut watcher, workspace_id).await;
+
+    // The first read of a workspace the client does not know carries the
+    // catalog it builds its tree from, and the cursor it continues from.
+    let (events, catalog, cursor) = read_lifecycle_feed(&mut watcher, workspace_id, None).await;
+    let catalog = catalog.expect("a first read carries the catalog");
+    assert!(catalog.iter().any(|session| session.id == first.id));
+    assert!(
+        events
+            .iter()
+            .all(|event| matches!(event.event, ServerEvent::AgentSessionCreated { .. })),
+        "a first read carries events a session list does not render: {events:?}"
+    );
+
+    // A second client acts on the workspace while the watcher holds its cursor.
+    let mut actor = WebSocketTransport::new(server.websocket_url(), token.token.clone())
+        .connect()
+        .await
+        .unwrap();
+    negotiate(&mut actor).await;
+    let created = session(&mut actor, workspace_id).await;
+    let renamed = actor
+        .request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::RenameAgentSession {
+                session_id: first.id,
+                name: "renamed over the wire".to_owned(),
+            },
+        )))
+        .await
+        .unwrap();
+    assert!(renamed.result.is_ok(), "{:?}", renamed.result);
+    let archived = actor
+        .request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::ArchiveAgentSession {
+                session_id: created.id,
+            },
+        )))
+        .await
+        .unwrap();
+    assert!(archived.result.is_ok(), "{:?}", archived.result);
+
+    let (events, catalog, next_cursor) =
+        read_lifecycle_feed(&mut watcher, workspace_id, Some(cursor)).await;
+    assert!(catalog.is_none(), "an incremental page carries no catalog");
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.event,
+            ServerEvent::AgentSessionCreated { snapshot } if snapshot.id == created.id
+        )),
+        "the created session was not reported: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.event,
+            ServerEvent::AgentSessionRenamed { session_id, name, .. }
+                if *session_id == first.id && name == "renamed over the wire"
+        )),
+        "the rename was not reported: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.event,
+            ServerEvent::AgentSessionArchived { session_id } if *session_id == created.id
+        )),
+        "the archive was not reported: {events:?}"
+    );
+    assert!(next_cursor > cursor);
+
+    server.stop().await.unwrap();
+}
+
+/// Reads one page of a workspace's session lifecycle feed over the wire.
+async fn read_lifecycle_feed(
+    connection: &mut WebSocketConnection,
+    workspace_id: WorkspaceId,
+    after_sequence: Option<EventSequence>,
+) -> (
+    Vec<loom_protocol::ServerEventEnvelope>,
+    Option<Vec<loom_core::AgentSessionSnapshot>>,
+    EventSequence,
+) {
+    match connection
+        .request(RequestEnvelope::new(ClientRequest::Events(
+            EventsRequest::GetWorkspaceSessionEvents {
+                workspace_id,
+                after_sequence,
+                stream_epoch: None,
+            },
+        )))
+        .await
+        .unwrap()
+        .result
+        .unwrap()
+    {
+        ServerResponse::Events(EventsResponse::WorkspaceSessionEvents {
+            workspace_id: returned,
+            events,
+            sessions,
+            latest_sequence,
+            next_after_sequence,
+            ..
+        }) => {
+            assert_eq!(returned, workspace_id);
+            assert_eq!(next_after_sequence, None, "a small feed fits one page");
+            (events, sessions, latest_sequence)
+        }
+        response => panic!("unexpected lifecycle feed response: {response:?}"),
+    }
+}
+
+#[tokio::test]
 async fn reconnect_resumes_journal_and_approves_a_run_after_disconnect() {
     let (_backend, _auth, token, server) = server().await;
     let transport = WebSocketTransport::new(server.websocket_url(), token.token);

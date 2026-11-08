@@ -13,7 +13,7 @@ fn lifecycle_source_and_worker_actions(cx: &mut TestAppContext) {
         view.update_session_list();
         view.refresh_models();
         view.apply_models(vec![ModelId::new("deterministic/demo")]);
-        view.schedule_project_poll(cx);
+        view.schedule_workspace_feed_poll(cx);
         view.schedule_run_poll(cx);
         view.schedule_worker_node_poll(cx);
         view.poll_run_once(cx);

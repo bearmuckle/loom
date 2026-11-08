@@ -8,8 +8,9 @@
 //! does not run after the test body; a test that advances the clock must first
 //! clear the run (`view.active_run_id = None;` `view.run_state = None;`) or
 //! stop following the session, and `session_follow_tests.rs` shows both. The
-//! project poll still waits on a background thread, so a test must not leave a
-//! project with live children behind either.
+//! project tree's workspace feed poll waits on that timer as well, so a test
+//! that leaves a project with live children behind arms a cadence the clock
+//! never advances.
 
 use super::*;
 
@@ -27,6 +28,7 @@ mod event_resync_tests;
 mod github_sign_in_tests;
 mod goal_tests;
 mod lifecycle_source_action_tests;
+mod live_tree_tests;
 mod local_source_path_tests;
 mod loom_mark_tests;
 mod loom_view_render_tests;

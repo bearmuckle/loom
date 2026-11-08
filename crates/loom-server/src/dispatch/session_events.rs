@@ -280,9 +280,159 @@ impl InProcessConnection {
                     next_after_sequence: None,
                 }))
             }
+            ClientRequest::Events(EventsRequest::GetWorkspaceSessionEvents {
+                workspace_id,
+                after_sequence,
+                stream_epoch,
+            }) => {
+                if !self
+                    .negotiated_capabilities()?
+                    .as_ref()
+                    .is_some_and(|capabilities| {
+                        capabilities.contains(Capability::SubscribeWorkspaceEvents)
+                    })
+                {
+                    return Err(LoomError::new(
+                        ErrorCode::CapabilityDenied,
+                        "connection did not negotiate capability SubscribeWorkspaceEvents",
+                        false,
+                    ));
+                }
+                self.backend.workspace_records()?.get(workspace_id)?;
+                let current_stream_epoch = Some(self.backend.node_id.clone());
+                let stream_epoch_changed = stream_epoch
+                    .as_deref()
+                    .is_some_and(|epoch| Some(epoch) != current_stream_epoch.as_deref());
+                let after_sequence = if stream_epoch_changed {
+                    None
+                } else {
+                    after_sequence
+                };
+                let catalog = self
+                    .backend
+                    .sessions()?
+                    .list_in_workspace(Some(workspace_id), true);
+                let session_ids = catalog
+                    .iter()
+                    .map(|session| session.id)
+                    .collect::<BTreeSet<_>>();
+                // Read before any journal guard is taken: each of these takes
+                // one of its own, and holding two at once would block forever.
+                let latest_sequence = self.latest_workspace_event_sequence(workspace_id)?;
+                let durable_cursor = self.feed_workspace_cursor(workspace_id)?;
+                let (global_head_sequence, journal_cursor_stale) = {
+                    // EventJournal.next_sequence stores the last assigned global
+                    // sequence.
+                    let journal = self.backend.journal()?;
+                    (
+                        journal.next_sequence,
+                        journal.workspace_cursor_is_stale(
+                            &session_ids,
+                            workspace_id,
+                            after_sequence,
+                        ),
+                    )
+                };
+                // A cursor is stale exactly when the unfiltered workspace feed
+                // would have called it stale: this response filters content, not
+                // time, so pruning and epoch changes decide resynchronization.
+                let cursor_stale = stream_epoch_changed
+                    || match (durable_cursor, after_sequence) {
+                        (Some(cursor), Some(after)) => {
+                            after < cursor.pruned_through
+                                || after > global_head_sequence
+                                || (after > cursor.latest_sequence && journal_cursor_stale)
+                        }
+                        (None, Some(after)) => after > global_head_sequence || journal_cursor_stale,
+                        (Some(cursor), None) => cursor.pruned_through.value() > 0,
+                        (None, None) => false,
+                    };
+                let readable = self.readable_sessions()?;
+                // The catalog is sent whenever the client cannot be brought up
+                // to date from events alone: on a first read, after the epoch
+                // changed, and after pruning carried the cursor's window away.
+                // A resynchronizing response carries no events, because the
+                // catalog is the state those events would have built.
+                let sessions = if cursor_stale || after_sequence.is_none() {
+                    Some(
+                        catalog
+                            .into_iter()
+                            .filter(|session| {
+                                readable
+                                    .as_ref()
+                                    .is_none_or(|readable| readable.contains(&session.id))
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    None
+                };
+                let events = if cursor_stale {
+                    Vec::new()
+                } else {
+                    self.workspace_events_since(workspace_id, after_sequence)?
+                        .into_iter()
+                        .filter_map(|event| match event {
+                            WorkspaceFeedEvent::Session(event) => {
+                                session_lifecycle_event(&event.event).then_some(event)
+                            }
+                            // A workspace-level event (a rename or a config
+                            // change) does not change any session row.
+                            WorkspaceFeedEvent::Workspace(_) => None,
+                        })
+                        .filter(|event| {
+                            readable
+                                .as_ref()
+                                .is_none_or(|readable| readable.contains(&event.session_id))
+                        })
+                        .collect::<Vec<_>>()
+                };
+                // The feed is bounded to one response frame like every other
+                // events response, so a page names the cursor that follows it.
+                let page = self.bound_event_batch(events)?;
+                Ok(ServerResponse::Events(
+                    EventsResponse::WorkspaceSessionEvents {
+                        workspace_id,
+                        events: self.filter_private_events(page.events)?,
+                        sessions,
+                        latest_sequence,
+                        // A page that reached the head of the feed names no
+                        // continuation, and `latest_sequence` then carries the
+                        // cursor past the events this subscription filtered out.
+                        next_after_sequence: page.next_after_sequence,
+                        stream_epoch: current_stream_epoch,
+                    },
+                ))
+            }
             _ => unreachable!("request was routed to the wrong dispatch domain"),
         }
     }
+}
+
+/// Whether `event` changes a session catalog or the project records a session
+/// row renders, which is what a client's session and project tree is built
+/// from.
+///
+/// Streamed run content, filesystem changes, terminal and task traffic, and
+/// collaboration entries are all excluded: they belong to the session-scoped
+/// stream of the one session that renders them, and including them would make
+/// this feed as expensive as the unfiltered workspace feed it narrows.
+fn session_lifecycle_event(event: &ServerEvent) -> bool {
+    matches!(
+        event,
+        ServerEvent::AgentSessionCreated { .. }
+            | ServerEvent::AgentSessionStateChanged { .. }
+            | ServerEvent::AgentSessionForked { .. }
+            | ServerEvent::AgentSessionRenamed { .. }
+            | ServerEvent::AgentSessionGoalChanged { .. }
+            | ServerEvent::AgentSessionTitleSourceChanged { .. }
+            | ServerEvent::AgentSessionArchived { .. }
+            | ServerEvent::AgentSessionRestored { .. }
+            | ServerEvent::ProjectAgentCreated { .. }
+            | ServerEvent::ProjectAgentUpdated { .. }
+            | ServerEvent::ProjectTaskUpdated { .. }
+            | ServerEvent::ProjectChildWorktreeUpdated { .. }
+    )
 }
 
 /// Keeps workspace-level events and the session events a person may read.

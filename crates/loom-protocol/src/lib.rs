@@ -500,7 +500,8 @@ impl ClientRequest {
                 Some(Capability::DeleteAgentSession)
             }
             Self::Events(EventsRequest::GetSessionEvents { .. })
-            | Self::Events(EventsRequest::GetRecentSessionEvents { .. }) => {
+            | Self::Events(EventsRequest::GetRecentSessionEvents { .. })
+            | Self::Events(EventsRequest::GetWorkspaceSessionEvents { .. }) => {
                 Some(Capability::SubscribeSessionEvents)
             }
             Self::Run(RunRequest::GetAgentRun { .. })
@@ -663,6 +664,10 @@ impl ClientRequest {
                     None
                 }
             }
+            // A workspace's lifecycle feed is scoped to the workspace, not to a
+            // session, so it needs no session grant of its own; the sessions it
+            // reports are filtered to the ones this person may read.
+            Self::Events(EventsRequest::GetWorkspaceSessionEvents { .. }) => None,
             Self::Events(EventsRequest::GetRecentSessionEvents { .. })
             | Self::Session(SessionRequest::GetAgentSession { .. })
             | Self::Session(SessionRequest::GetAgentSessionSnapshot { .. })
@@ -1351,8 +1356,48 @@ mod run_message_protocol_tests {
     }
 
     #[test]
+    fn workspace_lifecycle_feed_request_round_trips() {
+        // The tree follows a workspace's session catalog through this request,
+        // so its shape and the capability it needs are part of the contract.
+        let workspace_id = WorkspaceId::new();
+        let request = ClientRequest::Events(EventsRequest::GetWorkspaceSessionEvents {
+            workspace_id,
+            after_sequence: Some(EventSequence::new(7)),
+            stream_epoch: Some("node".to_owned()),
+        });
+        assert_eq!(
+            request.required_capability(),
+            Some(Capability::SubscribeSessionEvents)
+        );
+        // It is scoped to a workspace, not to a session, so it needs no session
+        // grant of its own.
+        assert_eq!(request.required_session_role(), None);
+        assert_eq!(request.access_target(), None);
+        let encoded = encode_request(&RequestEnvelope::new(request.clone())).unwrap();
+        assert_eq!(decode_request(&encoded).unwrap().request, request);
+
+        let session_id = AgentSessionId::new();
+        let response = ServerResponse::Events(EventsResponse::WorkspaceSessionEvents {
+            workspace_id,
+            events: vec![ServerEventEnvelope {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                sequence: EventSequence::new(8),
+                session_id,
+                event: ServerEvent::AgentSessionArchived { session_id },
+            }],
+            sessions: None,
+            latest_sequence: EventSequence::new(9),
+            next_after_sequence: None,
+            stream_epoch: Some("node".to_owned()),
+        });
+        let envelope = ResponseEnvelope::success(RequestId::new(), response.clone());
+        let encoded = encode_response(&envelope).unwrap();
+        assert_eq!(decode_response(&encoded).unwrap().result, Ok(response));
+    }
+
+    #[test]
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 17));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 18));
         let project_id = ProjectId::new();
         let request = ClientRequest::Project(ProjectRequest::GetProjectSnapshot { project_id });
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));

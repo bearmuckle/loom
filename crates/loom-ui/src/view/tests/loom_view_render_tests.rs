@@ -564,7 +564,7 @@ fn open_nested_project_menu(
     let handle = cx.open_window(size(px(1280.), px(800.)), move |window, cx| {
         let view = cx.new(|cx| {
             let mut view = nested_project_view(cx.focus_handle());
-            view.project_poll_scheduled = true;
+            view.workspace_feed_poll_scheduled = true;
             view
         });
         let session = view.read(cx).sessions[session_index].clone();

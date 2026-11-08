@@ -20,6 +20,20 @@ const PAUSED_RUN_POLL_MILLIS: u64 = 1_000;
 /// poll then follows [`ACTIVE_RUN_POLL_MILLIS`].
 const IDLE_SESSION_POLL_MILLIS: u64 = 2_000;
 
+/// How often the workspace session lifecycle feed is polled while the active
+/// project has live children: the rows of that project are the ones moving at
+/// this cadence.
+const LIVE_PROJECT_POLL_MILLIS: u64 = 1_000;
+
+/// How often the lifecycle feed is polled otherwise.
+///
+/// This cadence is what makes the project tree follow another client: a session
+/// that `loom-cli` or a second client creates, renames, re-states, or archives
+/// appears here within this window instead of after the next restart. The feed
+/// carries catalog events only, so the choice is about how quickly the tree
+/// should move rather than about what a poll costs.
+const WORKSPACE_FEED_POLL_MILLIS: u64 = 2_000;
+
 impl LoomView {
     /// Delays a poll while the worker is unreachable.
     ///
@@ -35,15 +49,47 @@ impl LoomView {
         }
     }
 
-    pub(crate) fn schedule_project_poll(&mut self, cx: &mut Context<Self>) {
-        if self.project_poll_scheduled
-            || !self.project_root_is_active()
-            || !self.project_has_live_children()
-        {
+    /// Whether this client can follow the active workspace's session catalog.
+    ///
+    /// The tree lists the sessions of the worker the open session belongs to,
+    /// and another client — `loom-cli`, or a second client on the same worker —
+    /// can change that catalog at any moment. The feed is therefore followed
+    /// whenever such a session is open, and not only while this client manages a
+    /// project with live children as it used to be. The demo workspace has no
+    /// worker, and a connection waiting for a sign-in is refused the workspace
+    /// and session reads the feed is derived from, so neither is followed.
+    pub(crate) fn workspace_feed_should_poll(&self) -> bool {
+        !self.demo_workspace
+            && self.is_connected()
+            && !self.awaits_sign_in()
+            && self
+                .sessions
+                .iter()
+                .any(|session| session.id == self.active_session.id)
+            && self.node_backends.contains_key(self.active_node_id())
+    }
+
+    /// The cadence of one lifecycle feed poll: the fastest that applies.
+    pub(crate) fn workspace_feed_poll_delay_millis(&self) -> u64 {
+        if self.project_root_is_active() && self.project_has_live_children() {
+            LIVE_PROJECT_POLL_MILLIS
+        } else {
+            WORKSPACE_FEED_POLL_MILLIS
+        }
+    }
+
+    /// Follows the active workspace's session catalog.
+    ///
+    /// The tree renders sessions another client created, so it cannot be built
+    /// once at startup: the catalog is read as a feed, exactly like the open
+    /// session's own event stream, and each poll applies what changed. The
+    /// single-flight flag makes repeated calls from the render path free.
+    pub(crate) fn schedule_workspace_feed_poll(&mut self, cx: &mut Context<Self>) {
+        if self.workspace_feed_poll_scheduled || !self.workspace_feed_should_poll() {
             return;
         }
-        self.project_poll_scheduled = true;
-        let delay = self.poll_delay_millis(1_000);
+        self.workspace_feed_poll_scheduled = true;
+        let delay = self.poll_delay_millis(self.workspace_feed_poll_delay_millis());
         cx.spawn(async move |view, cx| {
             #[cfg(target_family = "wasm")]
             {
@@ -57,16 +103,18 @@ impl LoomView {
                 });
                 let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
             }
+            // The cadence waits on the executor timer instead of a blocking
+            // sleep, so following the catalog holds no background thread while
+            // it waits.
             #[cfg(not(target_family = "wasm"))]
-            cx.background_spawn(async move {
-                std::thread::sleep(Duration::from_millis(delay));
-            })
-            .await;
+            cx.background_executor()
+                .timer(Duration::from_millis(delay))
+                .await;
             view.update(cx, |view, cx| {
-                if view.project_root_is_active() {
-                    view.poll_project_once(cx);
+                if view.workspace_feed_should_poll() {
+                    view.poll_workspace_feed_once(cx);
                 } else {
-                    view.project_poll_scheduled = false;
+                    view.workspace_feed_poll_scheduled = false;
                 }
             })
             .ok();
@@ -74,120 +122,129 @@ impl LoomView {
         .detach();
     }
 
-    pub(crate) fn poll_project_once(&mut self, cx: &mut Context<Self>) {
-        let Some(project) = self.project_snapshot.as_ref() else {
-            self.project_poll_scheduled = false;
-            return;
-        };
-        self.project_poll_scheduled = true;
-        let project_id = project.project_id;
-        let root_session_id = project.root_session_id;
+    /// Applies one page of the workspace session lifecycle feed, then follows
+    /// the page it named.
+    ///
+    /// The response is the catalog's delta, so a page that reached the head of
+    /// the feed also carries the head sequence: the cursor advances past the
+    /// events this subscription filters out, and the next poll asks only for
+    /// what happened after this one.
+    pub(crate) fn poll_workspace_feed_once(&mut self, cx: &mut Context<Self>) {
+        self.workspace_feed_poll_scheduled = true;
+        let node_id = self.active_node_id().to_owned();
         let workspace_id = self.active_session.workspace_id;
-        let member_ids = project
-            .agents
-            .iter()
-            .map(|agent| agent.session_id)
-            .collect::<BTreeSet<_>>();
-        let request_cursor = self.project_feed_after_sequence;
-        let stream_epoch = self.project_feed_epoch.clone();
-        let activity_detail = self.output_detail.activity_detail(self.show_reasoning);
-        self.dispatch(
+        let request_cursor = self.workspace_feed_after_sequence;
+        let stream_epoch = self.workspace_feed_epoch.clone();
+        self.dispatch_to_node(
             cx,
-            ClientRequest::Events(EventsRequest::GetSessionEvents {
-                activity_detail,
-                session_id: None,
-                workspace_id: Some(workspace_id),
+            node_id.clone(),
+            ClientRequest::Events(EventsRequest::GetWorkspaceSessionEvents {
+                workspace_id,
                 after_sequence: request_cursor,
                 stream_epoch,
             }),
             move |view, response, cx| {
-                // Read before the response is consumed, so a page the backend
-                // bounded is followed from the cursor this poll asked on.
-                let continuation = workspace_feed_page_continuation(&response, request_cursor);
-                if view.active_session.id != root_session_id
-                    || view.active_session.workspace_id != workspace_id
-                {
-                    view.project_poll_scheduled = false;
-                    return;
-                }
+                // Read before the response is consumed, so the next page is
+                // followed from the cursor this poll asked on.
+                let continuation = workspace_lifecycle_page_continuation(&response, request_cursor);
+                // A page that named one is drained before the cadence waits
+                // again; the head sequence carries the cursor otherwise.
+                let next_page = continuation.map(|(next, _)| next);
                 match response.result {
-                    Ok(ServerResponse::Events(EventsResponse::WorkspaceEvents {
+                    Ok(ServerResponse::Events(EventsResponse::WorkspaceSessionEvents {
                         workspace_id: response_workspace,
                         events,
-                        stream_epoch,
-                        ..
-                    })) if response_workspace == workspace_id => {
-                        view.project_feed_epoch = stream_epoch;
-                        if let Some(latest) = events.iter().map(workspace_feed_event_sequence).max()
-                        {
-                            view.project_feed_after_sequence = Some(
-                                view.project_feed_after_sequence
-                                    .map_or(latest, |current| current.max(latest)),
-                            );
-                        }
-                        if events
-                            .iter()
-                            .any(|event| is_project_workspace_event(event, project_id, &member_ids))
-                        {
-                            view.project_snapshot_stale = true;
-                        }
-                    }
-                    Ok(ServerResponse::Events(EventsResponse::WorkspaceEventsSnapshot {
-                        workspace_id: response_workspace,
-                        events,
+                        sessions,
                         latest_sequence,
                         stream_epoch,
                         ..
                     })) if response_workspace == workspace_id => {
-                        view.project_feed_epoch = stream_epoch;
-                        view.project_feed_after_sequence = Some(latest_sequence);
-                        view.project_snapshot_stale = true;
-                        if events
-                            .iter()
-                            .any(|event| is_project_workspace_event(event, project_id, &member_ids))
+                        view.workspace_feed_epoch = stream_epoch;
+                        let reload = view.apply_workspace_lifecycle_events(&node_id, events, cx);
+                        // A catalog in the answer means this client cannot be
+                        // brought up to date from events alone, so it is applied
+                        // after the batch: the catalog is the state the workspace
+                        // is in now, and an event retained from before it must not
+                        // win over that.
+                        if let Some(catalog) = sessions
+                            && view.apply_workspace_session_catalog(&node_id, workspace_id, catalog)
                         {
-                            view.project_snapshot_stale = true;
+                            // A session this client has never listed may belong
+                            // to a project, so read the ones no known project
+                            // covers yet; a delegated child has to nest under
+                            // the project that delegated it.
+                            view.refresh_missing_project_snapshots(cx);
+                        }
+                        // The head of the feed carries the cursor past the
+                        // events this subscription filtered out; a page that
+                        // named a continuation advances to that instead.
+                        view.advance_workspace_feed_cursor(latest_sequence, next_page);
+                        if reload {
+                            // A restored session carries no snapshot in its
+                            // event, so the list is read again.
+                            view.reload_sessions(cx);
                         }
                     }
-                    Err(error) => view.record_backend_error("project event stream", error),
+                    Err(error) => view.record_backend_error("workspace event stream", error),
                     Ok(response) => view.record_backend_error(
-                        "project event stream",
-                        unexpected_response("project event stream", response),
+                        "workspace event stream",
+                        unexpected_response("workspace event stream", response),
                     ),
                 }
+                // The open project's snapshot is the only place a delegated
+                // agent's record is rendered from, so an event that invalidated
+                // it is read back as a fresh snapshot.
                 if view.project_snapshot_stale {
                     view.refresh_active_project_snapshot(cx);
                 }
                 // A manager that ended its turn while children still run is
                 // woken by the server. Keep consuming the root session's events
-                // alongside the project feed so that wake becomes visible.
+                // alongside the feed so that wake becomes visible.
                 if view.project_root_is_active()
                     && view.project_has_live_children()
                     && !view.run_is_active()
                 {
-                    // Share the session poll's single-flight flag: a project
-                    // poll must not dispatch a second session poll while one is
+                    // Share the session poll's single-flight flag: a feed poll
+                    // must not dispatch a second session poll while one is
                     // already in flight, because both would apply the same
                     // event batch.
                     view.start_run_poll_if_idle(cx);
                 }
-                match continuation {
-                    // Keep draining the feed pages the backend named without
-                    // waiting out the poll cadence; every answer advances the
-                    // cursor, so the loop ends at the latest feed event.
-                    Some((next, _)) => {
-                        view.project_feed_after_sequence = Some(
-                            view.project_feed_after_sequence
-                                .map_or(next, |current| current.max(next)),
-                        );
-                        view.poll_project_once(cx);
-                    }
+                // A poll for a workspace the client has since left is the last
+                // one that workspace answers: the next poll starts from its new
+                // cursor.
+                if view.active_session.workspace_id != workspace_id {
+                    view.workspace_feed_after_sequence = None;
+                    view.workspace_feed_epoch = None;
+                }
+                match next_page {
+                    // Keep draining the pages the backend named without waiting
+                    // out the poll cadence; every answer advances the cursor, so
+                    // the loop ends at the latest event of the feed.
+                    Some(_) => view.poll_workspace_feed_once(cx),
                     None => {
-                        view.project_poll_scheduled = false;
-                        view.schedule_project_poll(cx);
+                        view.workspace_feed_poll_scheduled = false;
+                        view.schedule_workspace_feed_poll(cx);
                     }
                 }
             },
+        );
+    }
+
+    /// Advances the feed cursor to the highest sequence the answer established.
+    ///
+    /// The cursor never moves backwards: a page's continuation and the head the
+    /// same page reported can arrive in either order, and a stale answer must
+    /// not make the next poll ask for events this client already applied.
+    pub(crate) fn advance_workspace_feed_cursor(
+        &mut self,
+        latest_sequence: EventSequence,
+        next_after_sequence: Option<EventSequence>,
+    ) {
+        let cursor = next_after_sequence.unwrap_or(latest_sequence);
+        self.workspace_feed_after_sequence = Some(
+            self.workspace_feed_after_sequence
+                .map_or(cursor, |current| current.max(cursor)),
         );
     }
 

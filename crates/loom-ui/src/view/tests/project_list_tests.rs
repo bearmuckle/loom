@@ -767,7 +767,7 @@ fn open_nested_project(
             let mut view = nested_project_view(cx.focus_handle());
             // A poll would replace the snapshot with one this backend cannot
             // answer, so keep the pane on the scenario it was given.
-            view.project_poll_scheduled = true;
+            view.workspace_feed_poll_scheduled = true;
             view
         });
         *rendered_for_window.borrow_mut() = Some(view.clone());
@@ -963,7 +963,7 @@ fn the_phone_drawer_closes_when_a_project_row_is_selected(cx: &mut TestAppContex
     let handle = cx.open_window(size(px(390.), px(844.)), move |window, cx| {
         let view = cx.new(|cx| {
             let mut view = nested_project_view(cx.focus_handle());
-            view.project_poll_scheduled = true;
+            view.workspace_feed_poll_scheduled = true;
             view.session_drawer_open = true;
             view
         });
