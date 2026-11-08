@@ -515,6 +515,13 @@ impl LoomView {
                 "New people join as observers (read-only). Promote them to participant to let \
                  them chat, direct the agent, and approve actions.",
             ));
+        } else if self.node_uses_operator_token(self.active_node_id()) {
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x8f98a6))
+                    .child(OPERATOR_ROLE_NOTE),
+            );
         } else if let Some(role) = state.role() {
             let note = match role {
                 SessionRole::Observer => {
@@ -626,3 +633,8 @@ impl LoomView {
         card("Repository access", body)
     }
 }
+
+/// Shown instead of the granted role on a token connection, which signing in
+/// attributes to a person without narrowing.
+const OPERATOR_ROLE_NOTE: &str = "You are connected with an operator token: session roles do \
+     not limit you, whatever role is listed for you.";
