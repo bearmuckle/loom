@@ -791,6 +791,12 @@ fn filesystem_and_repository_helpers_reject_unsafe_inputs_and_copy_trees() {
         ("wss://user:secret@worker.example/ws", false),
         ("wss://worker.example/ws#fragment", false),
         ("wss://worker.example/ws?access_TOKEN=secret", false),
+        ("ssh://root@worker.example", true),
+        ("ssh://root@worker.example:2222", true),
+        ("ssh://worker.example", true),
+        ("ssh://", false),
+        ("ssh://root:secret@worker.example", false),
+        ("ssh://root@worker.example?token=secret", false),
     ] {
         assert_eq!(worker_node_url_is_safe(url), safe, "{url}");
     }

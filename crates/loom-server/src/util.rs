@@ -43,9 +43,12 @@ pub(crate) fn worker_node_url_is_safe(url: &str) -> bool {
     let Ok(url) = url::Url::parse(url) else {
         return false;
     };
-    if !matches!(url.scheme(), "ws" | "wss")
+    // An `ssh://user@host` node names a login, not a credential: the user is
+    // part of how the client reaches the host, and no password is ever allowed.
+    let login_allowed = url.scheme() == "ssh";
+    if !matches!(url.scheme(), "ws" | "wss" | "ssh")
         || url.host_str().is_none_or(str::is_empty)
-        || !url.username().is_empty()
+        || (!login_allowed && !url.username().is_empty())
         || url.password().is_some()
         || url.fragment().is_some()
     {
