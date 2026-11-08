@@ -396,20 +396,27 @@ pub fn output_reserve(options: &ContextAssemblyOptions) -> u64 {
 
 /// Select an output reserve that respects a provider's advertised completion cap.
 ///
-/// A cap that is not strictly smaller than the context window cannot leave room
-/// for input, so it is ignored and the window-derived default applies instead.
-/// OpenCode catalogs advertise such caps, for example 500k output on a 500k
-/// window, which would otherwise reserve the whole window.
+/// A cap is used only when it leaves at least the baseline reserve
+/// (`output_reserve` for the same options) of tokens for input, so an advertised
+/// cap always leaves usable room for a prompt. Oversized caps fall back to the
+/// baseline reserve, which is still at or below the advertised cap: OpenCode
+/// catalogs advertise such caps, for example 500k output on a 500k window for
+/// grok-4.7, and reserving one would leave a 1-token input budget that makes a
+/// turn unable to start.
 pub fn output_reserve_for_model(
     options: &ContextAssemblyOptions,
     model_max_output_tokens: Option<u64>,
 ) -> u64 {
-    let usable_cap = model_max_output_tokens
-        .filter(|limit| options.context_window.is_none_or(|window| *limit < window));
+    let baseline_reserve = output_reserve(options);
+    let usable_cap = model_max_output_tokens.filter(|limit| {
+        options
+            .context_window
+            .is_none_or(|window| *limit <= window.saturating_sub(baseline_reserve))
+    });
     let reserve = options
         .reserved_output_tokens
         .or(usable_cap)
-        .unwrap_or_else(|| output_reserve(options));
+        .unwrap_or(baseline_reserve);
     let reserve = usable_cap.map_or(reserve, |limit| reserve.min(limit));
     options
         .context_window
@@ -582,14 +589,14 @@ mod tests {
     }
 
     #[test]
-    fn model_output_cap_sets_the_reserve_without_exceeding_the_context() {
+    fn output_reserve_uses_an_advertised_cap_only_when_input_room_remains() {
         let options = ContextAssemblyOptions {
             context_window: Some(32_000),
             ..Default::default()
         };
         assert_eq!(output_reserve_for_model(&options, Some(8_192)), 8_192);
-        // A cap that is not strictly smaller than the window cannot leave room
-        // for input, so the window-derived default reserve applies instead.
+        // A cap that would leave less than the baseline reserve for input is
+        // ignored, and the window-derived default reserve applies instead.
         assert_eq!(output_reserve_for_model(&options, Some(64_000)), 8_000);
         // Without an advertised cap the reserve scales with the window instead
         // of collapsing to the 1,024-token unknown-model floor, which is too
@@ -622,6 +629,34 @@ mod tests {
             ..opencode
         };
         assert_eq!(output_reserve_for_model(&explicit, Some(500_000)), 16_000);
+    }
+
+    #[test]
+    fn output_cap_that_leaves_no_input_room_falls_back_to_the_baseline_reserve() {
+        let options = ContextAssemblyOptions {
+            context_window: Some(32_000),
+            ..Default::default()
+        };
+        let baseline = output_reserve(&options);
+        assert_eq!(baseline, 8_000);
+        // A cap equal to the window reserves everything and a cap one token
+        // below it leaves a single input token. Both are ignored, so the turn
+        // keeps the baseline reserve of input room instead of failing to start.
+        for cap in [31_999, 32_000, 64_000] {
+            assert_eq!(
+                output_reserve_for_model(&options, Some(cap)),
+                baseline,
+                "cap {cap} leaves less than the baseline reserve for input"
+            );
+        }
+        // The boundary is the largest cap that still leaves the baseline reserve
+        // for input; one token more falls back to the baseline reserve.
+        let largest = 32_000 - baseline;
+        assert_eq!(output_reserve_for_model(&options, Some(largest)), largest);
+        assert_eq!(
+            output_reserve_for_model(&options, Some(largest + 1)),
+            baseline
+        );
     }
     fn options(limit: u64) -> ContextAssemblyOptions {
         ContextAssemblyOptions {
