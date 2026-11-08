@@ -2297,8 +2297,7 @@ fn arity(name: &str) -> Option<bool> {
         "--keep" | "--remove" | "--discard" => false,
         "--child-model" | "--child-model-for" | "--unset-kind" => true,
         "--no-child-model" | "--clear" => false,
-        "--source" | "--endpoint" | "--state" | "--state-file" | "--question" | "--option"
-        | "--threshold" => true,
+        "--source" | "--state" | "--state-file" | "--question" | "--option" | "--threshold" => true,
         "--apply" => false,
         _ => return None,
     })
