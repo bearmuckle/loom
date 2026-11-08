@@ -650,6 +650,10 @@ impl InProcessBackend {
                     integration: runtime_state.options.project_integration_enabled,
                 },
             )?;
+            // The pinned Jev switches are not durable yet, so a restored run
+            // re-resolves them against the workspace and the credential that
+            // resolve on this worker now.
+            let (tools, _) = self.with_jev_tools(tools, runtime_state.session_id)?;
             let mut runtime = AgentRuntime::from_state(runtime_state, provider, tools)?;
             if runtime.session_id() != session.id {
                 return Err(LoomError::new(

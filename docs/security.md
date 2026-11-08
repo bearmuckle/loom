@@ -165,6 +165,16 @@ rather than audited hard-to-reverse actions, and classifying every command as
 destructive would put each build and test in the same bucket as the two tools
 above.
 
+The `decide` tool asks the Jev decision model for one choice per closed
+question. It is classified as a read: it changes nothing, it runs without an
+approval prompt under the default policy, and it cannot approve, execute, or
+write. Its answer is advisory text for the agent, never a fact and never a
+substitute for an approval: the worker does not resolve a pending approval from
+a decision, and a tool result the agent later observes can contradict it. Jev
+failures are bounded and local to the tool: no decision call can fail a run. The
+tool is not advertised at all when the workspace switch is off or no decider
+credential resolves on the worker.
+
 A session's approval policy is configurable per session. A client can gate
 destructive actions with the `SetSessionApprovalPolicy` request (capability
 `ConfigureApprovalPolicy`), which replaces all five kind decisions and

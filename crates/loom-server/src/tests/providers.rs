@@ -571,6 +571,146 @@ fn pause_resume_fork_and_provider_discovery_are_protocol_operations() {
     fs::remove_dir_all(&backend.session_root_base).unwrap();
 }
 
+#[test]
+fn the_decider_is_offered_and_gates_the_decide_tool() {
+    let backend = InProcessBackend::new();
+    let workspace_id = WorkspaceId::new();
+    let session = backend
+        .sessions()
+        .unwrap()
+        .create_in_workspace(workspace_id, "jev")
+        .unwrap()
+        .0;
+    let root = std::env::temp_dir().join(format!("loom-jev-tools-{}", WorkspaceId::new()));
+    fs::create_dir_all(&root).unwrap();
+    let decider_id = ProviderId::new(loom_providers::DECIDER_PROVIDER_ID);
+    let advertised = |tools: &ToolExecutor| {
+        tools
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>()
+            .contains(&"decide".to_owned())
+    };
+    let build = || ToolExecutor::new(&root).unwrap();
+
+    // The entry is offered so an operator can store a key, and until one does
+    // no Jev surface exists: the master switch defaults on but the credential
+    // gate turns it into an absent policy.
+    assert!(
+        backend
+            .provider_registry()
+            .list_providers()
+            .unwrap()
+            .iter()
+            .any(|provider| provider.id == decider_id)
+    );
+    let (tools, policy) = backend.with_jev_tools(build(), session.id).unwrap();
+    assert_eq!(policy, None);
+    assert!(!advertised(&tools));
+
+    backend
+        .provider_registry()
+        .configure_api_key_provider(&decider_id, "decider-test-key".to_owned())
+        .unwrap();
+    let (tools, policy) = backend.with_jev_tools(build(), session.id).unwrap();
+    assert_eq!(policy.map(|policy| policy.decide_tool), Some(true));
+    assert!(advertised(&tools));
+
+    // The workspace can withhold the tool without turning Jev off.
+    backend
+        .set_workspace_config(
+            workspace_id,
+            WorkspaceConfig {
+                revision: 1,
+                jev: loom_protocol::JevSettings {
+                    decide_tool: false,
+                    ..Default::default()
+                },
+                ..WorkspaceConfig::default()
+            },
+        )
+        .unwrap();
+    let (tools, policy) = backend.with_jev_tools(build(), session.id).unwrap();
+    assert_eq!(policy.map(|policy| policy.decide_tool), Some(false));
+    assert!(!advertised(&tools));
+
+    // The master switch removes the policy entirely.
+    backend
+        .set_workspace_config(
+            workspace_id,
+            WorkspaceConfig {
+                revision: 2,
+                jev: loom_protocol::JevSettings {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..WorkspaceConfig::default()
+            },
+        )
+        .unwrap();
+    let (tools, policy) = backend.with_jev_tools(build(), session.id).unwrap();
+    assert_eq!(policy, None);
+    assert!(!advertised(&tools));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_started_run_pins_the_jev_switches_and_offers_the_tool() {
+    let backend = InProcessBackend::new();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Jev run".to_owned(),
+        },
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+        workspace.result.unwrap()
+    else {
+        panic!("unexpected workspace response");
+    };
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
+            workspace_id: workspace.id,
+            name: "jev run".to_owned(),
+        },
+    )));
+    let ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) =
+        created.result.unwrap()
+    else {
+        panic!("unexpected session response");
+    };
+    backend
+        .provider_registry()
+        .configure_api_key_provider(
+            &ProviderId::new(loom_providers::DECIDER_PROVIDER_ID),
+            "decider-test-key".to_owned(),
+        )
+        .unwrap();
+
+    let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id: session.id,
+            task: "Check the workspace.".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            system_instructions: None,
+            repository_instructions: None,
+        },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) = started.result.unwrap()
+    else {
+        panic!("unexpected run response");
+    };
+    let jev = snapshot.jev.expect("the run pins the resolved switches");
+    assert!(jev.enabled);
+    assert!(jev.decide_tool);
+    assert!(!jev.auto_model);
+    await_settled_run(&connection, snapshot.id);
+    fs::remove_dir_all(&backend.session_root_base).unwrap();
+}
+
 /// Registers an API-key provider that serves `model_id` through the scripted
 /// endpoint, authenticated with `api_key`, so a test can tell from each model
 /// request which key the run used.

@@ -318,6 +318,23 @@ requests carry `User-Agent: loom/<version>`, which Go requires instead of a
 generic HTTP-library agent, and `x-opencode-session: <loom-session-id>`, which
 gives each Loom session one stable upstream conversation.
 
+The Jev decision model is a separate entry, `decider`, offered beside the chat
+providers. It is registered keyless, so provider listings show it for setup and
+every Jev surface stays absent until a key resolves. `LOOM_DECIDER_SOURCE`
+selects the host: `opencode` (the default) uses
+`https://opencode.ai/inference/systemone/v1/systemone` with model `jev-1.13`,
+and `typesafe` uses `https://api.typesafe.ai/v1/systemone` with model
+`jev-latest`. Store a key for it through the same request Settings → Providers
+sends:
+
+```sh
+loom-cli providers set-key --provider decider --from-env OPENCODE_API_KEY
+```
+
+With a key, a workspace whose `jev.decide_tool` default is on offers the
+read-only `decide` tool to its agent runs. The decision model never appears in
+`models list`, and `run --model` cannot select it.
+
 `--providers configured|demo` selects the registry a start serves:
 
 - `configured` (the default) is the registry described above.

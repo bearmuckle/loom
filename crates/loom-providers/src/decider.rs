@@ -419,4 +419,29 @@ mod tests {
 
         assert_eq!(error.code, ErrorCode::RequestCancelled);
     }
+
+    #[test]
+    fn a_config_without_an_endpoint_or_model_is_refused() {
+        let mut config = ProviderConfig::decider(DeciderSource::TypeSafe);
+        config.endpoint = None;
+        assert_eq!(
+            decider_from_config(&config, "test-key".to_owned())
+                .err()
+                .map(|error| error.code),
+            Some(ErrorCode::InvalidRequest)
+        );
+
+        let mut config = ProviderConfig::decider(DeciderSource::TypeSafe);
+        config.models.clear();
+        assert_eq!(
+            decider_from_config(&config, "test-key".to_owned())
+                .err()
+                .map(|error| error.code),
+            Some(ErrorCode::InvalidRequest)
+        );
+
+        let config = ProviderConfig::decider(DeciderSource::TypeSafe);
+        let decider = decider_from_config(&config, "test-key".to_owned()).unwrap();
+        assert_eq!(decider.descriptor().model.as_str(), TYPESAFE_DECIDER_MODEL);
+    }
 }
