@@ -12190,6 +12190,36 @@ fn run_as_directory_mounts_the_folder_in_a_new_root_session() {
 // is refused, and a full id still costs no listing.
 
 /// The first eight hex digits of `id`, which is the short form a caller types.
+/// `text` with every RFC 3339 time (`2026-11-08T09:16:28.654Z`) removed.
+///
+/// `peek` stamps an event that records no time with the moment it was read, so
+/// two reads of the same journal can differ in that field alone.
+fn without_times(text: &str) -> String {
+    let is_time = |word: &str| {
+        word.ends_with('Z')
+            && word.contains('T')
+            && word.contains(':')
+            && word.chars().take(4).all(|c| c.is_ascii_digit())
+    };
+    text.lines()
+        .map(|line| {
+            line.split(' ')
+                .filter(|word| !is_time(word))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn without_times_drops_only_timestamps() {
+    assert_eq!(
+        without_times("1 2026-11-08T09:16:28.654Z session_created\n2 run_started Z\n"),
+        "1 session_created\n2 run_started Z"
+    );
+}
+
 fn short_session_id(id: AgentSessionId) -> String {
     id.to_string().chars().take(8).collect()
 }
@@ -12222,7 +12252,11 @@ fn a_unique_short_session_id_names_the_session_it_prefixes() {
     assert_eq!(peek.code, exit::OK, "{}", peek.stderr);
     let peek_full = run(&mut client, &["peek", "--session", &full, "--lines", "5"]);
     assert_eq!(peek_full.code, exit::OK, "{}", peek_full.stderr);
-    assert_eq!(peek.stdout, peek_full.stdout);
+    // Only the read time of an untimed event may differ between the two.
+    assert_eq!(
+        without_times(&peek.stdout),
+        without_times(&peek_full.stdout)
+    );
     let liveness = run(&mut client, &["liveness", "--session", &short]);
     assert_eq!(liveness.code, exit::OK, "{}", liveness.stderr);
     assert_eq!(liveness.stdout, format!("liveness alive {session_id}\n"));
