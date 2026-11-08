@@ -362,9 +362,37 @@ impl LoomView {
         cx.spawn(async move |view, cx| {
             let mut before_ordinal = before_ordinal;
             loop {
-                let result =
-                    load_transcript_page(backend.clone(), run_id, before_ordinal, activity_detail)
+                let cached = view
+                    .update(cx, |view, _| {
+                        view.transcript_cache
+                            .get(run_id, before_ordinal, activity_detail)
+                    })
+                    .ok()
+                    .flatten();
+                let result = match cached {
+                    Some(page) => Ok(page),
+                    None => {
+                        let result = load_transcript_page(
+                            backend.clone(),
+                            run_id,
+                            before_ordinal,
+                            activity_detail,
+                        )
                         .await;
+                        if let Ok(page) = &result {
+                            view.update(cx, |view, _| {
+                                view.transcript_cache.insert(
+                                    run_id,
+                                    before_ordinal,
+                                    activity_detail,
+                                    page,
+                                )
+                            })
+                            .ok();
+                        }
+                        result
+                    }
+                };
                 let next = view.update(cx, |view, cx| {
                     if view.active_run_id != Some(run_id)
                         || view.transcript_generation != transcript_generation

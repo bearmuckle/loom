@@ -412,6 +412,8 @@ async fn browser_delay(duration: Duration) -> Result<(), LoomError> {
 }
 
 type TranscriptMessage = (u64, u64, ModelMessage);
+use transcript_cache::TranscriptPageCache;
+
 type TranscriptPage = (Vec<TranscriptMessage>, Option<u64>, bool);
 
 async fn load_transcript_page(
@@ -714,6 +716,8 @@ pub(crate) struct LoomView {
     /// screen and must never blank it.
     conversation_opening: bool,
     transcript_generation: u64,
+    /// Older transcript pages already fetched, kept across session switches.
+    transcript_cache: TranscriptPageCache,
     /// Rows added at the head by an older-page load, consumed by the timeline's
     /// virtual list so it can prepend them without jumping the scroll anchor.
     transcript_prepend_count: usize,
@@ -2218,6 +2222,7 @@ impl LoomView {
             transcript_loading: false,
             conversation_opening: false,
             transcript_generation: 0,
+            transcript_cache: TranscriptPageCache::default(),
             transcript_prepend_count: 0,
             timeline_view: None,
             plan: None,
@@ -2422,6 +2427,7 @@ mod sub_project;
 mod surfaces;
 mod timeline;
 mod timeline_scroller;
+mod transcript_cache;
 mod workers;
 
 #[cfg(test)]

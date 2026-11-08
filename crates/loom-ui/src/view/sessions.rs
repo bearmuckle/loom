@@ -139,12 +139,30 @@ impl LoomView {
                 if self.active_run_id != Some(run_id) {
                     break;
                 }
-                match load_transcript_page_sync(
-                    &self.connection,
-                    run_id,
-                    before_ordinal,
-                    activity_detail,
-                ) {
+                let cached = self
+                    .transcript_cache
+                    .get(run_id, before_ordinal, activity_detail);
+                let loaded = match cached {
+                    Some(page) => Ok(page),
+                    None => {
+                        let loaded = load_transcript_page_sync(
+                            &self.connection,
+                            run_id,
+                            before_ordinal,
+                            activity_detail,
+                        );
+                        if let Ok(page) = &loaded {
+                            self.transcript_cache.insert(
+                                run_id,
+                                before_ordinal,
+                                activity_detail,
+                                page,
+                            );
+                        }
+                        loaded
+                    }
+                };
+                match loaded {
                     Ok((messages, next_before, has_older)) => {
                         let next =
                             backfill.record_page(before_ordinal, &messages, next_before, has_older);
