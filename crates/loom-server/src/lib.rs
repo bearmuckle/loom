@@ -85,6 +85,8 @@ mod deployment;
 mod dispatch;
 mod event_journal;
 mod fail_stop;
+mod fs_copy;
+mod github;
 mod instance;
 mod project_tools;
 mod remote;
@@ -92,13 +94,17 @@ mod resource_monitor;
 mod retention;
 mod run_executor;
 mod run_handle;
+mod run_projection;
 mod serve;
 mod services;
 pub mod update;
 mod util;
 
 use activity_detail::*;
+use fs_copy::*;
+use github::*;
 use run_executor::RunExecutor;
+use run_projection::*;
 use util::*;
 
 use services::access::AccessService;

@@ -160,7 +160,7 @@ impl GitHubSignInConfig {
     /// account id, the display name from the login.
     pub(crate) fn identity_for(
         &self,
-        account: &crate::util::GitHubAccountRef,
+        account: &crate::github::GitHubAccountRef,
     ) -> ParticipantIdentity {
         ParticipantIdentity {
             id: github_participant_id(account.id),
@@ -516,14 +516,14 @@ mod tests {
     #[test]
     fn a_github_account_derives_the_identity_from_its_numeric_id() {
         let config = GitHubSignInConfig::new(["octocat".to_owned()]);
-        let first = config.identity_for(&crate::util::GitHubAccountRef {
+        let first = config.identity_for(&crate::github::GitHubAccountRef {
             id: 141030,
             login: " octocat ".to_owned(),
         });
         assert_eq!(first.id, github_participant_id(141030));
         assert_eq!(first.display_name, "octocat");
         // A rename keeps the same person.
-        let renamed = config.identity_for(&crate::util::GitHubAccountRef {
+        let renamed = config.identity_for(&crate::github::GitHubAccountRef {
             id: 141030,
             login: "octocat-renamed".to_owned(),
         });

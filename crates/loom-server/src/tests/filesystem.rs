@@ -255,7 +255,7 @@ fn github_account_identity_reports_status_and_transport_failures() {
 
 #[test]
 fn github_search_needle_normalizes_references_and_urls() {
-    use crate::util::github_search_needle;
+    use crate::github::github_search_needle;
 
     assert_eq!(github_search_needle("loom"), "loom");
     assert_eq!(github_search_needle("  Loom  "), "loom");
@@ -280,7 +280,7 @@ fn github_search_needle_normalizes_references_and_urls() {
 
 #[test]
 fn github_repository_rank_prefers_name_over_description() {
-    use crate::util::github_repository_rank;
+    use crate::github::github_repository_rank;
 
     let repository = |full_name: &str, description: Option<&str>| crate::GitHubApiRepository {
         full_name: full_name.to_owned(),
