@@ -3602,6 +3602,106 @@ fn run_without_a_model_starts_the_first_credentialed_providers_default() {
     close_persistent_fixture(fixture, directory);
 }
 
+/// `run --model` takes `provider/model` beside a bare id and the versioned
+/// `loom:model:v1:` selector, so a person can name a gateway's model the way
+/// the provider spells it (`opencode-go/gpt-6-luna`). The worker owns model
+/// resolution, so the client still sends the flag as written; what this test
+/// pins is that the run starts for a qualified id and that a typo in either
+/// half is reported for the half that is missing.
+#[test]
+fn run_accepts_a_provider_qualified_model_and_reports_an_unknown_half() {
+    let fixture = empty_fixture();
+    let workspace = fixture.workspace.id.to_string();
+    // A gateway the flags can name. Its endpoint is unreachable on purpose: the
+    // provider adapter is built at the run start and only the streaming step
+    // below touches the network, so the start itself stays offline.
+    fixture
+        .backend
+        .provider_registry()
+        .register(loom_providers::ProviderConfig::openai_compatible(
+            "opencode-go",
+            "OpenCode Go",
+            "http://127.0.0.1:1/v1/chat/completions",
+            ModelDescriptor {
+                id: ModelId::new("gpt-6-luna"),
+                provider: ProviderId::new("opencode-go"),
+                display_name: "GPT-6 Luna".to_owned(),
+                context_window: Some(1_000_000),
+                max_input_tokens: None,
+                max_output_tokens: None,
+                capabilities: ModelCapabilities::default(),
+            },
+            None,
+        ))
+        .unwrap();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let started = run(
+        &mut client,
+        &[
+            "run",
+            "--workspace",
+            &workspace,
+            "--task",
+            "name a provider and a model",
+            "--model",
+            "opencode-go/gpt-6-luna",
+        ],
+    );
+    assert_eq!(started.code, exit::OK, "{}", started.stderr);
+    assert_eq!(
+        started.stderr, "",
+        "a resolved provider/model needs no warning"
+    );
+    let session = printed_session(&started.stdout);
+    let (run_id, state) = printed_run(&started.stdout);
+    assert_eq!(state, "executing");
+    assert_eq!(started_run_ids(&fixture.control, session), vec![run_id]);
+
+    // Both halves of the spelling are checked, and the report names the one the
+    // worker could not find. Nothing is started for either.
+    for (model, expected) in [
+        (
+            "opencode-go/absent-model",
+            "provider 'opencode-go' has no model 'absent-model'",
+        ),
+        (
+            "absent-provider/gpt-6-luna",
+            "no provider 'absent-provider' is configured",
+        ),
+    ] {
+        let refused = run(
+            &mut client,
+            &[
+                "run",
+                "--workspace",
+                &workspace,
+                "--task",
+                model,
+                "--model",
+                model,
+            ],
+        );
+        assert_eq!(refused.code, exit::INTERNAL, "{model}: {}", refused.stderr);
+        assert_eq!(refused.stdout, "", "{model}");
+        assert!(
+            refused.stderr.contains(expected),
+            "{model} reported '{}'",
+            refused.stderr
+        );
+        let refused_session = live_sessions(&fixture.control, fixture.workspace.id)
+            .into_iter()
+            .find(|session| session.name == *model)
+            .expect("the refused run left its session behind");
+        assert!(
+            started_run_ids(&fixture.control, refused_session.id).is_empty(),
+            "{model} starts no run"
+        );
+    }
+
+    let _ = fixture.backend.shutdown();
+}
+
 #[test]
 fn a_replayed_request_id_returns_the_same_run_and_reuses_the_session() {
     let fixture = empty_fixture();
