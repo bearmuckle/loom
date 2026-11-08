@@ -3206,6 +3206,41 @@ fn unknown_model_uses_a_visible_fallback_and_changed_limits_are_reapplied() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn model_advertising_output_as_large_as_the_context_can_start_a_turn() {
+    let root = workspace();
+    let mut runtime = context_runtime(&root);
+    let mut descriptor = runtime.provider().unwrap().descriptor().clone();
+    descriptor.context_window = Some(500_000);
+    descriptor.max_output_tokens = Some(500_000);
+    runtime.provider = Some(Box::new(DeterministicProvider {
+        descriptor,
+        steps: vec![vec![ModelStreamEvent::Completed {
+            reason: loom_model::FinishReason::Stop,
+        }]],
+        cursor: 0,
+    }));
+
+    let events = runtime.start().unwrap();
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::StepStarted { .. })),
+        "the turn starts instead of failing its own context budget"
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ContextError { .. } | AgentEvent::RunLimitReached { .. }
+    )));
+    assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+    let inspection = runtime.context_inspection().expect("context inspection");
+    assert_eq!(inspection.budget.context_window, Some(500_000));
+    assert_eq!(inspection.budget.reserved_output_tokens, 8_192);
+    assert_eq!(inspection.budget.effective_input_tokens, Some(491_808));
+    fs::remove_dir_all(root).unwrap();
+}
+
 /// Acceptance fixture: a representative task must run to completion,
 /// execute its tools in model order, and produce the expected workspace
 /// change without recovery.
