@@ -59,7 +59,12 @@ fn goal_command_sets_free_text_and_reports_it(cx: &mut TestAppContext) {
             view.status_banner
                 .as_ref()
                 .map(|banner| banner.text.as_str()),
-            Some("Goal updated.")
+            Some(
+                "session {} has no assigned worker node"
+                    .replace("{}", &view.active_session.id.to_string())
+                    .as_str()
+            ),
+            "a goal set while idle tries to start a run on it"
         );
         view.run_slash_command("/goal", cx);
         assert_eq!(

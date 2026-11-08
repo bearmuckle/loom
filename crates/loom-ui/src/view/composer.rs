@@ -119,7 +119,7 @@ impl LoomView {
         self.dispatch(
             cx,
             ClientRequest::Session(SessionRequest::SetAgentSessionGoal { session_id, goal }),
-            move |view, response, _cx| match response.result {
+            move |view, response, cx| match response.result {
                 Ok(ServerResponse::Session(SessionResponse::AgentSessionGoalChanged(snapshot))) => {
                     let cleared = snapshot.goal.is_none();
                     view.active_session = snapshot;
@@ -129,6 +129,13 @@ impl LoomView {
                     } else {
                         "Goal updated."
                     });
+                    // A goal set while idle starts work on it; an active run
+                    // picks the new goal up on its next turn.
+                    if let Some(goal) = view.active_session.goal.clone()
+                        && !view.run_is_active()
+                    {
+                        view.send_composer_text(format!("Work toward the goal: {goal}"), cx);
+                    }
                 }
                 Err(error) => view.record_backend_error("set session goal", error),
                 Ok(response) => view.record_backend_error(
