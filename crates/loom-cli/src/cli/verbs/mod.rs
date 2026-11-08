@@ -12,6 +12,11 @@
 //! for the records; this client only derives the verdict words and reads one
 //! more session metadata projection per blocked agent, because the project
 //! record says that an agent waits but not on which approval or question.
+//!
+//! Every session input is a full id or a unique prefix of one. [`run`] resolves
+//! a prefix against the worker's own session listing before it dispatches, so a
+//! verb below only ever sees the full id; a command line of full ids sends no
+//! listing at all.
 
 mod child_models;
 mod events;
@@ -25,14 +30,14 @@ mod supervise;
 
 use std::io::Write;
 
-use loom_core::{Capability, CapabilitySet, ErrorCode, LoomError, RequestId};
+use loom_core::{AgentSessionId, Capability, CapabilitySet, ErrorCode, LoomError, RequestId};
 use loom_protocol::{
-    CURRENT_PROTOCOL_VERSION, ClientRequest, ControlRequest, NegotiationResult, RequestEnvelope,
-    ServerResponse,
+    CURRENT_PROTOCOL_VERSION, ClientRequest, ControlRequest, ControlResponse, NegotiationResult,
+    RequestEnvelope, ServerResponse, SessionResponse, WorkspaceRequest, WorkspaceResponse,
 };
 use serde_json::Value;
 
-use crate::cli::args::{Invocation, Verb};
+use crate::cli::args::{Invocation, SessionRef, Verb, session_hex};
 use crate::cli::{client::Client, exit};
 
 /// Why a verb produced no success payload.
@@ -459,6 +464,195 @@ async fn handshake<C: Client>(
     }
 }
 
+/// How many of the sessions an ambiguous prefix matches are listed before the
+/// message counts the rest.
+const AMBIGUOUS_MATCHES: usize = 5;
+
+/// One short session id the command line spelled, with the form a listing is
+/// compared in.
+struct Prefix {
+    /// The argument as the caller typed it, which an error reports.
+    raw: String,
+    /// The hex digits of `raw`, lowercased and without hyphens.
+    hex: String,
+}
+
+/// One session the worker's listing reported.
+struct ListedSession {
+    id: AgentSessionId,
+    name: String,
+}
+
+/// Resolves every short session id of `verb` to the full id it names.
+///
+/// A command line that spells only full ids returns without sending a request,
+/// which is the path every existing caller keeps taking.
+async fn resolve_sessions<C: Client>(client: &mut C, verb: &mut Verb) -> Result<(), Failure> {
+    let mut wanted: Vec<Prefix> = Vec::new();
+    verb.for_each_session_mut(&mut |session| {
+        if !session.is_prefix() {
+            return;
+        }
+        let hex = session.hex();
+        if wanted.iter().any(|prefix| prefix.hex == hex) {
+            return;
+        }
+        wanted.push(Prefix {
+            raw: session.raw().to_owned(),
+            hex,
+        });
+    });
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let mut caller = Caller::new(client);
+    negotiate_for_resolution(&mut caller, verb).await?;
+    let sessions = list_sessions(&mut caller).await?;
+    let request_id = caller.primary;
+    let mut matched: Vec<(String, AgentSessionId)> = Vec::new();
+    for prefix in &wanted {
+        match matching(&prefix.hex, &sessions).as_slice() {
+            [] => return Err(no_session_matches(request_id, &prefix.raw)),
+            [one] => matched.push((prefix.hex.clone(), one.id)),
+            several => return Err(ambiguous_prefix(prefix, several)),
+        }
+    }
+    verb.for_each_session_mut(&mut |session| {
+        if !session.is_prefix() {
+            return;
+        }
+        let hex = session.hex();
+        if let Some((_, id)) = matched.iter().find(|(known, _)| *known == hex) {
+            session.resolve(*id);
+        }
+    });
+    Ok(())
+}
+
+/// Negotiates the capabilities the listing needs on top of the verb's own, so a
+/// verb that never reads sessions itself, such as `session archive`, can still
+/// resolve a prefix.
+async fn negotiate_for_resolution<C: Client>(
+    caller: &mut Caller<'_, C>,
+    verb: &Verb,
+) -> Result<(), Failure> {
+    let capabilities = CapabilitySet::new(
+        used_capabilities(verb)
+            .iter()
+            .copied()
+            .chain(std::iter::once(Capability::ReadAgentSession)),
+    );
+    let (request_id, response) = caller
+        .call(ClientRequest::Control(ControlRequest::Negotiate {
+            client_version: CURRENT_PROTOCOL_VERSION,
+            capabilities,
+        }))
+        .await?;
+    match response {
+        ServerResponse::Control(ControlResponse::Negotiated(_)) => Ok(()),
+        _ => Err(Failure::unexpected(request_id, "negotiate")),
+    }
+}
+
+/// Every session the worker's workspaces hold, archived sessions included: a
+/// prefix may name an archived session, which is what `session delete` takes.
+async fn list_sessions<C: Client>(
+    caller: &mut Caller<'_, C>,
+) -> Result<Vec<ListedSession>, Failure> {
+    let (request_id, response) = caller
+        .call(ClientRequest::Workspace(WorkspaceRequest::ListWorkspaces))
+        .await?;
+    let workspaces = match response {
+        ServerResponse::Workspace(WorkspaceResponse::Workspaces { workspaces }) => workspaces,
+        _ => return Err(Failure::unexpected(request_id, "workspace listing")),
+    };
+    let mut sessions = Vec::new();
+    for workspace in workspaces {
+        let (request_id, response) = caller
+            .call(ClientRequest::Workspace(
+                WorkspaceRequest::ListWorkspaceSessions {
+                    workspace_id: workspace.id,
+                    include_archived: true,
+                },
+            ))
+            .await?;
+        match response {
+            ServerResponse::Session(SessionResponse::AgentSessions { sessions: listed }) => {
+                sessions.extend(listed.into_iter().map(|session| ListedSession {
+                    id: session.id,
+                    name: session.name,
+                }));
+            }
+            _ => return Err(Failure::unexpected(request_id, "workspace sessions")),
+        }
+    }
+    Ok(sessions)
+}
+
+/// The sessions whose id starts with `prefix`, which is already hex.
+fn matching<'a>(prefix: &str, sessions: &'a [ListedSession]) -> Vec<&'a ListedSession> {
+    sessions
+        .iter()
+        .filter(|session| session_hex(&session.id.to_string()).starts_with(prefix))
+        .collect()
+}
+
+/// The failure of a prefix no session starts with. It reports the code and the
+/// exit code of an unknown full id, so a caller handles both the same way.
+fn no_session_matches(request_id: Option<RequestId>, raw: &str) -> Failure {
+    Failure::Server {
+        request_id: request_id.unwrap_or_default(),
+        error: LoomError::new(
+            ErrorCode::NotFound,
+            format!(
+                "no session starts with '{raw}'; 'loom-cli ls --workspace <workspace-id>' lists a \
+                 workspace's sessions"
+            ),
+            false,
+        ),
+    }
+}
+
+/// The failure of a prefix several sessions start with: a usage error that
+/// names them, because only the caller can say which one was meant.
+fn ambiguous_prefix(prefix: &Prefix, sessions: &[&ListedSession]) -> Failure {
+    let mut listed: Vec<&ListedSession> = sessions.to_vec();
+    listed.sort_by_key(|session| session.id);
+    let names: Vec<String> = listed
+        .iter()
+        .take(AMBIGUOUS_MATCHES)
+        .map(|session| {
+            if session.name.is_empty() {
+                session.id.to_string()
+            } else {
+                format!("{} ({})", session.id, session.name)
+            }
+        })
+        .collect();
+    let rest = listed.len().saturating_sub(AMBIGUOUS_MATCHES);
+    let rest = match rest {
+        0 => String::new(),
+        count => format!(", and {count} more"),
+    };
+    Failure::Usage(format!(
+        "session id prefix '{}' is ambiguous: {} sessions match: {}{rest}; pass more characters",
+        prefix.raw,
+        listed.len(),
+        names.join(", "),
+    ))
+}
+
+/// The resolved id of one session input. Resolution runs before the dispatch
+/// below, so this only reports an input the resolver does not visit.
+fn session_id(session: &SessionRef) -> Result<AgentSessionId, Failure> {
+    session.full().ok_or_else(|| {
+        Failure::Internal(format!(
+            "the session id '{}' was not resolved before the verb ran",
+            session.raw()
+        ))
+    })
+}
+
 /// Runs one verb and returns the payload a `--json` envelope reports, plus the
 /// id of its primary request.
 pub(crate) async fn run<C: Client>(
@@ -467,6 +661,13 @@ pub(crate) async fn run<C: Client>(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<Outcome, Failure> {
+    // A short session id is resolved against the worker's sessions before the
+    // verb runs, so every session input accepts a unique prefix. The resolved
+    // copy is what the dispatch below reads, and a command line of full ids
+    // dispatches unchanged without a listing request.
+    let mut resolved = invocation.clone();
+    resolve_sessions(client, &mut resolved.verb).await?;
+    let invocation = &resolved;
     match &invocation.verb {
         Verb::Doctor => query::doctor(client, invocation, out).await,
         Verb::Node => operator::node(client, invocation, out).await,
@@ -476,7 +677,7 @@ pub(crate) async fn run<C: Client>(
             archived,
         } => query::ls(client, invocation, *workspace, *archived, out).await,
         Verb::Get { session, metadata } => {
-            query::get(client, invocation, *session, *metadata, out).await
+            query::get(client, invocation, session_id(session)?, *metadata, out).await
         }
         Verb::Events(args) => events::events(client, invocation, args, out, err).await,
         Verb::Peek(args) => events::peek(client, invocation, args, out, err).await,
@@ -519,11 +720,12 @@ pub(crate) async fn run<C: Client>(
             retry_on_conflict,
             request_id,
         } => {
+            let archive = archive.as_ref().map(session_id).transpose()?;
             supervise::stop(
                 client,
                 invocation,
                 *run,
-                *archive,
+                archive,
                 *retry_on_conflict,
                 *request_id,
                 out,
@@ -534,15 +736,37 @@ pub(crate) async fn run<C: Client>(
             session,
             until,
             timeout_secs,
-        } => supervise::wait(client, invocation, *session, *until, *timeout_secs, out).await,
+        } => {
+            supervise::wait(
+                client,
+                invocation,
+                session_id(session)?,
+                *until,
+                *timeout_secs,
+                out,
+            )
+            .await
+        }
         Verb::Status {
             session,
             format,
             tree,
-        } => supervise::status(client, invocation, *session, *format, *tree, out).await,
-        Verb::Liveness { session } => supervise::liveness(client, invocation, *session, out).await,
+        } => {
+            supervise::status(
+                client,
+                invocation,
+                session_id(session)?,
+                *format,
+                *tree,
+                out,
+            )
+            .await
+        }
+        Verb::Liveness { session } => {
+            supervise::liveness(client, invocation, session_id(session)?, out).await
+        }
         Verb::Result { session, task } => {
-            supervise::result(client, invocation, *session, *task, out).await
+            supervise::result(client, invocation, session_id(session)?, *task, out).await
         }
         Verb::RetentionGet => operator::retention_get(client, invocation, out).await,
         Verb::RetentionSet(args) => operator::retention_set(client, invocation, args, out).await,
@@ -565,7 +789,18 @@ pub(crate) async fn run<C: Client>(
             session,
             yes,
             request_id,
-        } => operator::archive(client, invocation, *session, false, *yes, *request_id, out).await,
+        } => {
+            operator::archive(
+                client,
+                invocation,
+                session_id(session)?,
+                false,
+                *yes,
+                *request_id,
+                out,
+            )
+            .await
+        }
         Verb::SessionDelete {
             session,
             force,
@@ -575,7 +810,7 @@ pub(crate) async fn run<C: Client>(
             operator::delete(
                 client,
                 invocation,
-                *session,
+                session_id(session)?,
                 *force,
                 *yes,
                 false,
@@ -587,7 +822,18 @@ pub(crate) async fn run<C: Client>(
         Verb::ProjectArchive {
             session,
             request_id,
-        } => operator::archive(client, invocation, *session, true, false, *request_id, out).await,
+        } => {
+            operator::archive(
+                client,
+                invocation,
+                session_id(session)?,
+                true,
+                false,
+                *request_id,
+                out,
+            )
+            .await
+        }
         Verb::ProjectDelete {
             session,
             force,
@@ -597,7 +843,7 @@ pub(crate) async fn run<C: Client>(
             operator::delete(
                 client,
                 invocation,
-                *session,
+                session_id(session)?,
                 *force,
                 *yes,
                 true,
@@ -607,13 +853,13 @@ pub(crate) async fn run<C: Client>(
             .await
         }
         Verb::ProjectWorktrees { session } => {
-            operator::worktrees(client, invocation, *session, out).await
+            operator::worktrees(client, invocation, session_id(session)?, out).await
         }
         Verb::ProjectWorktreeGet { session, task } => {
-            operator::worktree_get(client, invocation, *session, *task, out).await
+            operator::worktree_get(client, invocation, session_id(session)?, *task, out).await
         }
         Verb::ProjectWorktreeDiff { session, task } => {
-            operator::worktree_diff(client, invocation, *session, *task, out).await
+            operator::worktree_diff(client, invocation, session_id(session)?, *task, out).await
         }
         Verb::ProjectWorktreeIntegrate {
             session,
@@ -624,7 +870,7 @@ pub(crate) async fn run<C: Client>(
             operator::worktree_integrate(
                 client,
                 invocation,
-                *session,
+                session_id(session)?,
                 *task,
                 expected_parent_revision.as_deref(),
                 *request_id,
@@ -641,7 +887,7 @@ pub(crate) async fn run<C: Client>(
             operator::worktree_cleanup(
                 client,
                 invocation,
-                *session,
+                session_id(session)?,
                 *task,
                 *disposition,
                 *request_id,
@@ -658,7 +904,7 @@ pub(crate) async fn run<C: Client>(
             operator::delete(
                 client,
                 invocation,
-                *session,
+                session_id(session)?,
                 *force,
                 *yes,
                 false,
@@ -667,30 +913,66 @@ pub(crate) async fn run<C: Client>(
             )
             .await
         }
-        Verb::ProjectGet { session } => project::get(client, invocation, *session, out).await,
-        Verb::ProjectTree { session } => project::tree(client, invocation, *session, out).await,
-        Verb::ProjectTasks { session } => project::tasks(client, invocation, *session, out).await,
+        Verb::ProjectGet { session } => {
+            project::get(client, invocation, session_id(session)?, out).await
+        }
+        Verb::ProjectTree { session } => {
+            project::tree(client, invocation, session_id(session)?, out).await
+        }
+        Verb::ProjectTasks { session } => {
+            project::tasks(client, invocation, session_id(session)?, out).await
+        }
         Verb::ProjectChildren { session } => {
-            project::children(client, invocation, *session, out).await
+            project::children(client, invocation, session_id(session)?, out).await
         }
         Verb::ProjectMessages {
             session,
             after,
             limit,
-        } => project::messages(client, invocation, *session, *after, *limit, out).await,
+        } => {
+            project::messages(
+                client,
+                invocation,
+                session_id(session)?,
+                *after,
+                *limit,
+                out,
+            )
+            .await
+        }
         Verb::ProjectSend {
             session,
             text,
             request_id,
-        } => project::send(client, invocation, *session, text, *request_id, out).await,
+        } => {
+            project::send(
+                client,
+                invocation,
+                session_id(session)?,
+                text,
+                *request_id,
+                out,
+            )
+            .await
+        }
         Verb::ProjectModelsGet { session } => {
-            child_models::get(client, invocation, *session, out).await
+            child_models::get(client, invocation, session_id(session)?, out).await
         }
         Verb::ProjectModelsSet {
             session,
             changes,
             request_id,
-        } => child_models::set(client, invocation, *session, changes, *request_id, out).await,
+        } => {
+            child_models::set(
+                client,
+                invocation,
+                session_id(session)?,
+                changes,
+                *request_id,
+                out,
+            )
+            .await
+        }
         Verb::ProjectChild {
             session,
             task,
@@ -700,7 +982,7 @@ pub(crate) async fn run<C: Client>(
             project::child(
                 client,
                 invocation,
-                *session,
+                session_id(session)?,
                 *task,
                 *action,
                 *request_id,

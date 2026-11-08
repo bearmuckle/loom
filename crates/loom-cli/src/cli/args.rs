@@ -280,6 +280,19 @@ A session name is a label, not an identity: a repeated --new can produce a
 second session with an existing name, so pass a unique --name when the name is
 meant to be a handle.
 
+A <session-id> may be a full id or any unique prefix of one, such as the first
+eight characters `loom-cli ls --workspace <id>` prints: `loom-cli status
+--session 08bb3935` reports the one session whose id starts that way, and
+`--session 08BB3935` and `--session 08bb3935-` name the same session. A prefix
+that matches several sessions is a usage error (exit 2) that lists them, and
+one that matches none is `not_found` (exit 5) as an unknown full id is, so a
+short id never acts on a session the caller did not name. Every session input
+accepts one: the <session-id> positionals of `get`, `delete`, `session
+archive`, `session delete`, and the `project` verbs, and the --session, --project,
+and --archive flags. A full id is sent as it is and lists nothing; a prefix
+resolves by listing the workspaces and their sessions, so a scoped token needs
+`read_agent_session` for it and full ids keep working without it.
+
 `events` never reprints an event at or below its cursor. A snapshot that cannot
 carry every event between the cursor and its window (the worker bounds it to
 the newest side) prints the window, reports the missing range as `gap` on
@@ -393,6 +406,105 @@ pub(crate) enum Format {
     Jsonl,
 }
 
+/// A session id as the caller spelled it: a full id, or a short prefix of one
+/// that is resolved against the worker's sessions before the verb runs.
+///
+/// A full id is kept as it is and costs no listing request. A prefix is one to
+/// 32 hex digits of an id with the hyphens optional, so anything that is
+/// neither a full id nor a plausible prefix is still the usage error it was.
+#[derive(Clone, Debug)]
+pub(crate) struct SessionRef {
+    raw: String,
+    /// The full id: `Some` when a full id was typed, and filled in by the
+    /// resolution pass for a prefix.
+    full: Option<AgentSessionId>,
+}
+
+impl SessionRef {
+    /// Reads one session id argument: a full id, or a prefix of one.
+    fn parse(what: &str, value: &str) -> Result<Self, String> {
+        match value.parse::<AgentSessionId>() {
+            Ok(id) => Ok(Self {
+                raw: value.to_owned(),
+                full: Some(id),
+            }),
+            Err(_) if is_session_prefix(value) => Ok(Self {
+                raw: value.to_owned(),
+                full: None,
+            }),
+            Err(_) => Err(format!("'{value}' is not a valid {what}")),
+        }
+    }
+
+    /// The argument as the caller spelled it, which an error reports.
+    pub(crate) fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    /// The full id, or `None` while a prefix still needs resolving.
+    pub(crate) fn full(&self) -> Option<AgentSessionId> {
+        self.full
+    }
+
+    /// Whether this input is a prefix the resolution pass has to resolve.
+    pub(crate) fn is_prefix(&self) -> bool {
+        self.full.is_none()
+    }
+
+    /// Records the one id the prefix named.
+    pub(crate) fn resolve(&mut self, id: AgentSessionId) {
+        self.full = Some(id);
+    }
+
+    /// The hex digits of the argument, lowercased: the form a prefix is
+    /// compared in, because an id is printed with hyphens and may be typed
+    /// without them and in either case.
+    pub(crate) fn hex(&self) -> String {
+        session_hex(&self.raw)
+    }
+}
+
+/// The test-facing shapes of a session input: the argument as it was typed,
+/// and equality with the full id it resolved to.
+#[cfg(test)]
+impl std::fmt::Display for SessionRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.raw)
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<AgentSessionId> for SessionRef {
+    fn eq(&self, other: &AgentSessionId) -> bool {
+        self.full == Some(*other)
+    }
+}
+
+/// The hex digits of `value`, lowercased and without hyphens.
+pub(crate) fn session_hex(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| *character != '-')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Whether `value` is a prefix of a hyphenated id: one to 32 hex digits, with
+/// hyphens allowed anywhere between them.
+fn is_session_prefix(value: &str) -> bool {
+    let mut digits = 0;
+    for character in value.chars() {
+        if character == '-' {
+            continue;
+        }
+        if !character.is_ascii_hexdigit() {
+            return false;
+        }
+        digits += 1;
+    }
+    (1..=32).contains(&digits)
+}
+
 /// Settings every verb shares.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Globals {
@@ -407,7 +519,7 @@ pub(crate) struct Globals {
 /// The flags of `events`.
 #[derive(Clone, Debug)]
 pub(crate) struct EventsArgs {
-    pub session: AgentSessionId,
+    pub session: SessionRef,
     pub after: Option<u64>,
     pub cursor_file: Option<PathBuf>,
     pub follow: bool,
@@ -422,7 +534,7 @@ pub(crate) struct EventsArgs {
 /// The flags of `peek`.
 #[derive(Clone, Debug)]
 pub(crate) struct PeekArgs {
-    pub session: AgentSessionId,
+    pub session: SessionRef,
     pub lines: u32,
     pub format: Format,
     pub max_bytes: usize,
@@ -493,7 +605,7 @@ pub(crate) struct RunArgs {
     /// session is reused only among that project's sub projects and created
     /// with `Project/CreateSubProject`, so a client lists it beneath the
     /// project instead of as a project of its own.
-    pub project: Option<AgentSessionId>,
+    pub project: Option<SessionRef>,
     /// `--child-model` and `--child-model-for`: the child model entries stored
     /// on the session's project before the run starts.
     pub child_models: ChildModelChanges,
@@ -670,7 +782,7 @@ pub(crate) enum Verb {
         archived: bool,
     },
     Get {
-        session: AgentSessionId,
+        session: SessionRef,
         metadata: bool,
     },
     Events(EventsArgs),
@@ -709,28 +821,28 @@ pub(crate) enum Verb {
     },
     Stop {
         run: RunId,
-        archive: Option<AgentSessionId>,
+        archive: Option<SessionRef>,
         retry_on_conflict: bool,
         /// The interrupt's idempotency key, or `None` when the caller left it
         /// open. An archive is keyed by an id derived from it.
         request_id: Option<RequestId>,
     },
     Wait {
-        session: AgentSessionId,
+        session: SessionRef,
         until: WaitUntil,
         timeout_secs: u64,
     },
     Status {
-        session: AgentSessionId,
+        session: SessionRef,
         format: StatusFormat,
         /// `--tree`: also print the project the session belongs to.
         tree: bool,
     },
     Liveness {
-        session: AgentSessionId,
+        session: SessionRef,
     },
     Result {
-        session: AgentSessionId,
+        session: SessionRef,
         task: Option<TaskId>,
     },
     RetentionGet,
@@ -762,7 +874,7 @@ pub(crate) enum Verb {
     /// `session archive`: archive one session, and its descendants when the id
     /// is a project root that cascades. `yes` acknowledges that cascade.
     SessionArchive {
-        session: AgentSessionId,
+        session: SessionRef,
         yes: bool,
         /// The archive request's idempotency key, or `None` when the caller
         /// left it open. The project pre-read is never keyed.
@@ -770,7 +882,7 @@ pub(crate) enum Verb {
     },
     /// `session delete`: the explicit spelling of `delete`.
     SessionDelete {
-        session: AgentSessionId,
+        session: SessionRef,
         force: bool,
         yes: bool,
         /// The deletion's idempotency key, or `None` when the caller left it
@@ -779,14 +891,14 @@ pub(crate) enum Verb {
     },
     /// `project archive`: archive a project root with its idle members.
     ProjectArchive {
-        session: AgentSessionId,
+        session: SessionRef,
         /// The archive request's idempotency key, or `None` when the caller
         /// left it open. The project pre-read is never keyed.
         request_id: Option<RequestId>,
     },
     /// `project delete`: delete a project root with its tree.
     ProjectDelete {
-        session: AgentSessionId,
+        session: SessionRef,
         force: bool,
         yes: bool,
         /// The deletion's idempotency key, or `None` when the caller left it
@@ -795,23 +907,23 @@ pub(crate) enum Verb {
     },
     /// `project worktrees`: every checkout the project's snapshot records.
     ProjectWorktrees {
-        session: AgentSessionId,
+        session: SessionRef,
     },
     /// `project worktree get`: one delegated task's durable worktree record.
     ProjectWorktreeGet {
-        session: AgentSessionId,
+        session: SessionRef,
         task: TaskId,
     },
     /// `project worktree diff`: the worker's bounded review of one checkout.
     ProjectWorktreeDiff {
-        session: AgentSessionId,
+        session: SessionRef,
         task: TaskId,
     },
     /// `project worktree integrate`: fast-forward the parent with the task's
     /// result, expecting `expected_parent_revision` (or the record's base
     /// revision) as the parent tip.
     ProjectWorktreeIntegrate {
-        session: AgentSessionId,
+        session: SessionRef,
         task: TaskId,
         expected_parent_revision: Option<String>,
         /// The integration request's idempotency key, or `None` when the
@@ -821,7 +933,7 @@ pub(crate) enum Verb {
     /// `project worktree cleanup`: keep or remove one delegated task's
     /// checkout.
     ProjectWorktreeCleanup {
-        session: AgentSessionId,
+        session: SessionRef,
         task: TaskId,
         disposition: WorktreeDisposition,
         /// The cleanup request's idempotency key, or `None` when the caller
@@ -831,7 +943,7 @@ pub(crate) enum Verb {
     /// `delete`: the id is the confirmation. `force` discards dirty or locked
     /// worktrees; `yes` acknowledges a cascade or a force discard.
     Delete {
-        session: AgentSessionId,
+        session: SessionRef,
         force: bool,
         yes: bool,
         /// The deletion's idempotency key, or `None` when the caller left it
@@ -840,11 +952,11 @@ pub(crate) enum Verb {
     },
     /// `project models get`: the project's child model policy.
     ProjectModelsGet {
-        session: AgentSessionId,
+        session: SessionRef,
     },
     /// `project models set`: change the project's child model policy.
     ProjectModelsSet {
-        session: AgentSessionId,
+        session: SessionRef,
         changes: ChildModelChanges,
         /// The change's idempotency key, or `None` when the caller left it
         /// open.
@@ -852,29 +964,29 @@ pub(crate) enum Verb {
     },
     /// `project get`: the hierarchy and parent project of one member.
     ProjectGet {
-        session: AgentSessionId,
+        session: SessionRef,
     },
     /// `project tree`: the same hierarchy as an indented pre-order tree.
     ProjectTree {
-        session: AgentSessionId,
+        session: SessionRef,
     },
     /// `project tasks`: the project's delegated tasks.
     ProjectTasks {
-        session: AgentSessionId,
+        session: SessionRef,
     },
     /// `project children`: the direct children of the addressed session.
     ProjectChildren {
-        session: AgentSessionId,
+        session: SessionRef,
     },
     /// `project messages`: one page of the project's agent message history.
     ProjectMessages {
-        session: AgentSessionId,
+        session: SessionRef,
         after: Option<u64>,
         limit: u32,
     },
     /// `project send`: a direction to a delegated child's active run.
     ProjectSend {
-        session: AgentSessionId,
+        session: SessionRef,
         text: String,
         /// The direction's idempotency key, or `None` when the caller left it
         /// open. The pre-reads before it are never keyed.
@@ -882,13 +994,91 @@ pub(crate) enum Verb {
     },
     /// `project child`: one control action on a delegated task.
     ProjectChild {
-        session: AgentSessionId,
+        session: SessionRef,
         task: TaskId,
         action: ProjectChildAction,
         /// The control request's idempotency key, or `None` when the caller
         /// left it open. The project pre-read is never keyed.
         request_id: Option<RequestId>,
     },
+}
+
+impl Verb {
+    /// Visits every session id input of the verb, in the order the command line
+    /// spells them.
+    ///
+    /// The match is exhaustive on purpose: a variant that adds a session input
+    /// has to be added here too, which is what keeps the resolution pass and
+    /// the dispatch below in step.
+    pub(crate) fn for_each_session_mut(&mut self, visit: &mut impl FnMut(&mut SessionRef)) {
+        match self {
+            // Verbs whose inputs are workspace, run, task, tool call, or
+            // provider ids, and the ones that take no id at all.
+            Verb::Doctor
+            | Verb::Node
+            | Verb::WhoAmI
+            | Verb::Ls { .. }
+            | Verb::RetentionGet
+            | Verb::RetentionSet(_)
+            | Verb::ProvidersList
+            | Verb::ProvidersSetKey(_)
+            | Verb::ModelsList { .. }
+            | Verb::Send { .. }
+            | Verb::Answer { .. }
+            | Verb::Approve { .. }
+            | Verb::Deny { .. } => {}
+            Verb::Get { session, .. } => visit(session),
+            Verb::Events(args) => visit(&mut args.session),
+            Verb::Peek(args) => visit(&mut args.session),
+            // `run` names a session only through `--project`.
+            Verb::Run(args) => {
+                if let Some(project) = &mut args.project {
+                    visit(project);
+                }
+            }
+            // `stop` names one only through `--session` with `--archive`.
+            Verb::Stop { archive, .. } => {
+                if let Some(archive) = archive {
+                    visit(archive);
+                }
+            }
+            Verb::Wait { session, .. }
+            | Verb::Status { session, .. }
+            | Verb::Liveness { session }
+            | Verb::Result { session, .. }
+            | Verb::SessionArchive { session, .. }
+            | Verb::SessionDelete { session, .. }
+            | Verb::ProjectArchive { session, .. }
+            | Verb::ProjectDelete { session, .. }
+            | Verb::ProjectWorktrees { session }
+            | Verb::ProjectWorktreeGet { session, .. }
+            | Verb::ProjectWorktreeDiff { session, .. }
+            | Verb::ProjectWorktreeIntegrate { session, .. }
+            | Verb::ProjectWorktreeCleanup { session, .. }
+            | Verb::Delete { session, .. }
+            | Verb::ProjectModelsGet { session }
+            | Verb::ProjectModelsSet { session, .. }
+            | Verb::ProjectGet { session }
+            | Verb::ProjectTree { session }
+            | Verb::ProjectTasks { session }
+            | Verb::ProjectChildren { session }
+            | Verb::ProjectMessages { session, .. }
+            | Verb::ProjectSend { session, .. }
+            | Verb::ProjectChild { session, .. } => visit(session),
+        }
+    }
+
+    /// Whether any session input is a short prefix the resolution pass has to
+    /// resolve before the verb runs.
+    #[cfg(test)]
+    pub(crate) fn needs_session_resolution(&self) -> bool {
+        let mut prefix = false;
+        let mut verb = self.clone();
+        verb.for_each_session_mut(&mut |session| {
+            prefix |= session.is_prefix();
+        });
+        prefix
+    }
 }
 
 /// The disposition `project worktree cleanup` asks the worker for.
@@ -923,7 +1113,9 @@ pub(crate) enum Parsed {
     /// Print this text: the global manual, or one verb's page when the command
     /// line named a verb.
     Help(&'static str),
-    Run(Invocation),
+    /// Boxed because the box keeps the enum small: parsing succeeds once per
+    /// command line, so one allocation costs nothing a caller can observe.
+    Run(Box<Invocation>),
 }
 
 /// The verb's name, as printed and as reported in a `--json` envelope.
@@ -1112,7 +1304,8 @@ Examples:
         "get",
         r#"Usage: loom-cli get <session-id> [--metadata]
 
-Show one session, and with --metadata its active run.
+Show one session, and with --metadata its active run. A unique prefix of an id
+is enough, as in 'loom-cli get 08bb3935'.
 
 Flags:
   --metadata                  also read the session's active run
@@ -1121,6 +1314,7 @@ Global flags are accepted anywhere; see 'loom-cli --help'.
 
 Examples:
   loom-cli get <session-id>
+  loom-cli get 08bb3935
   loom-cli get <session-id> --metadata --json
 "#,
     ),
@@ -1365,6 +1559,8 @@ Examples:
 Report the session and its latest run, and the tool call the run is executing
 right now: its name, its id, how long it has been running, and its arguments
 with credentials redacted and an over-long payload bounded.
+A unique prefix of an id is enough, as in
+'loom-cli status --session 08bb3935'.
 
 Flags:
   --session <id>              the session to report (required)
@@ -1375,6 +1571,7 @@ Global flags are accepted anywhere; see 'loom-cli --help'.
 
 Examples:
   loom-cli status --session <session-id>
+  loom-cli status --session 08bb3935
   loom-cli status --session <session-id> --tree
   loom-cli status --session <session-id> --format verb --json
 "#,
@@ -2433,7 +2630,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
                 return Err(format!("get takes one session id, got '{}'", rest[1]));
             }
             Verb::Get {
-                session: parse_id("session id", session)?,
+                session: parse_session_ref("session id", session)?,
                 metadata: flags.flag("--metadata"),
             }
         }
@@ -2471,7 +2668,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
                 }
             };
             Verb::Events(EventsArgs {
-                session: parse_id("session id", &session)?,
+                session: parse_session_ref("session id", &session)?,
                 after,
                 cursor_file: flags.value("--cursor-file").map(PathBuf::from),
                 follow,
@@ -2496,7 +2693,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
                 None => DEFAULT_LINES,
             };
             Verb::Peek(PeekArgs {
-                session: parse_id("session id", &session)?,
+                session: parse_session_ref("session id", &session)?,
                 lines,
                 format: parse_format(flags.value("--format"))?,
                 max_bytes: parse_max_bytes(flags.value("--max-bytes"))?,
@@ -2548,7 +2745,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
             let request_id = parse_request_id(&mut flags)?;
             let archive = flags.value("--session");
             let archive = match (flags.flag("--archive"), archive) {
-                (true, Some(session)) => Some(parse_id("session id", &session)?),
+                (true, Some(session)) => Some(parse_session_ref("session id", &session)?),
                 (true, None) => {
                     return Err("stop --archive requires --session <session-id>".to_owned());
                 }
@@ -2589,7 +2786,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
                 }
             };
             Verb::Wait {
-                session: parse_id("session id", &session)?,
+                session: parse_session_ref("session id", &session)?,
                 until,
                 timeout_secs,
             }
@@ -2611,7 +2808,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
                 );
             }
             Verb::Status {
-                session: parse_id("session id", &session)?,
+                session: parse_session_ref("session id", &session)?,
                 format,
                 tree,
             }
@@ -2619,7 +2816,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
         "liveness" => {
             no_positionals(&flags.verb, rest)?;
             Verb::Liveness {
-                session: parse_id("session id", &flags.required("--session")?)?,
+                session: parse_session_ref("session id", &flags.required("--session")?)?,
             }
         }
         "result" => {
@@ -2630,7 +2827,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
                 None => None,
             };
             Verb::Result {
-                session: parse_id("session id", &session)?,
+                session: parse_session_ref("session id", &session)?,
                 task,
             }
         }
@@ -2656,7 +2853,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
                 );
             }
             Verb::Delete {
-                session: parse_id("session id", session)?,
+                session: parse_session_ref("session id", session)?,
                 force,
                 yes,
                 request_id: parse_request_id(&mut flags)?,
@@ -2665,7 +2862,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
         other => return Err(format!("unknown verb '{other}'; try --help")),
     };
     flags.finish()?;
-    Ok(Parsed::Run(Invocation { globals, verb }))
+    Ok(Parsed::Run(Box::new(Invocation { globals, verb })))
 }
 
 /// Splits the arguments into flags and positional words, rejecting an unknown
@@ -2734,6 +2931,12 @@ fn parse_id<T: FromStr>(what: &str, value: &str) -> Result<T, String> {
     value
         .parse::<T>()
         .map_err(|_| format!("'{value}' is not a valid {what}"))
+}
+
+/// A session id argument: a full id, or a short prefix of one, which the verb
+/// resolves against the worker's sessions before it runs.
+fn parse_session_ref(what: &str, value: &str) -> Result<SessionRef, String> {
+    SessionRef::parse(what, value)
 }
 
 /// The idempotency key `--request-id` names, or `None` when the flag was
@@ -3263,7 +3466,7 @@ fn parse_project(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
                 ));
             }
             Ok(Verb::ProjectChild {
-                session: parse_id("session id", &flags.required("--session")?)?,
+                session: parse_session_ref("session id", &flags.required("--session")?)?,
                 task: parse_id("task id", task)?,
                 action,
                 request_id: parse_request_id(flags)?,
@@ -3419,7 +3622,7 @@ fn parse_worktree_cleanup(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, 
 
 /// The single positional id a sub-verb takes, after the words its own name
 /// already spells.
-fn one_session_id(flags: &FlagSet, rest: &[String]) -> Result<AgentSessionId, String> {
+fn one_session_id(flags: &FlagSet, rest: &[String]) -> Result<SessionRef, String> {
     let words = flags.verb.split(' ').count();
     let Some(session) = rest.get(words - 1) else {
         return Err(format!("{} requires a <session-id>", flags.verb));
@@ -3430,7 +3633,7 @@ fn one_session_id(flags: &FlagSet, rest: &[String]) -> Result<AgentSessionId, St
             flags.verb, rest[words]
         ));
     }
-    parse_id("session id", session)
+    parse_session_ref("session id", session)
 }
 
 /// The flags of `run`, which is the one verb whose flags interact: the task and
@@ -3501,7 +3704,7 @@ fn parse_run(flags: &mut FlagSet) -> Result<RunArgs, String> {
     let request_id = parse_request_id(flags)?;
     let project = flags
         .value("--project")
-        .map(|project| parse_id("project session id", &project))
+        .map(|project| parse_session_ref("project session id", &project))
         .transpose()?;
     let child_models = parse_child_model_changes(flags, false)?;
     Ok(RunArgs {
