@@ -403,10 +403,14 @@ pub fn openai_model_supported(model: &str) -> bool {
 
 // Advertised limits arrive in three catalog shapes: GitHub Copilot's
 // capabilities.limits, a models.dev style `limit` object as served by the
-// OpenCode Go/Zen catalogs, and a plain context_length. A prompt cap is also a
-// safe upper bound on our usable window, since the runtime separately reserves
-// output, but `limit.input` is not a window: using the smaller of it and the
-// context would waste window space, so it stays out of the window candidates.
+// OpenCode Go/Zen catalogs, and a plain context_length.
+//
+// Each helper reads only the fields that mean what it returns: the window comes
+// from the window fields, the prompt cap from the prompt fields, and the
+// completion cap from the output fields. `limit.input` and `limit.output` are
+// per-request caps, not window sizes, so they never shrink the window: the
+// runtime already subtracts its own output reserve from the window, and a cap
+// used as a window candidate would reserve the same tokens twice.
 //
 // Each helper reduces its candidates to the smallest valid value and ignores
 // values that are zero, non-numeric, or do not fit in u32.

@@ -611,6 +611,40 @@ mod tests {
     }
 
     #[test]
+    fn discovery_input_and_output_caps_ignore_invalid_values() {
+        // Zero, negative, non-numeric, oversized, and missing caps are all
+        // ignored, so a catalog cannot advertise a prompt or completion cap of
+        // zero and silently disable the runtime budget.
+        for model in [
+            serde_json::json!({}),
+            serde_json::json!({"limit": {}}),
+            serde_json::json!({"limit": {"context": 500_000}}),
+            serde_json::json!({"limit": {"input": 0, "output": 0}}),
+            serde_json::json!({"limit": {"input": -1, "output": -1}}),
+            serde_json::json!({"limit": {"input": "400000", "output": "128000"}}),
+            serde_json::json!({"limit": {"input": u64::MAX, "output": u64::MAX}}),
+            serde_json::json!({"capabilities": {"limits": {
+                "max_prompt_tokens": 0, "max_output_tokens": 0
+            }}}),
+            serde_json::json!({"capabilities": {"limits": {
+                "max_prompt_tokens": -1, "max_output_tokens": -2
+            }}}),
+        ] {
+            assert_eq!(discovered_input_tokens(&model), None, "{model}");
+            assert_eq!(discovered_output_tokens(&model), None, "{model}");
+        }
+
+        // An invalid candidate in one shape does not hide a valid sibling in
+        // another shape, and the smallest valid candidate still wins.
+        let mixed = serde_json::json!({
+            "capabilities": {"limits": {"max_prompt_tokens": 32_000, "max_output_tokens": 8_192}},
+            "limit": {"input": 0, "output": -1}
+        });
+        assert_eq!(discovered_input_tokens(&mixed), Some(32_000));
+        assert_eq!(discovered_output_tokens(&mixed), Some(8_192));
+    }
+
+    #[test]
     fn github_copilot_discovery_lists_only_models_with_tool_call_support() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
