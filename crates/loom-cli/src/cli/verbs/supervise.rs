@@ -21,10 +21,11 @@ use std::{
 
 use loom_core::{
     AgentSessionId, AgentSessionState, ErrorCode, GitFileStatusKind, ProjectSnapshot, RequestId,
-    RunControlAction, RunId, RunRevision, SessionRepository, ToolCallId,
+    RunControlAction, RunId, RunRevision, SessionRepository, Timestamp, ToolCallId,
 };
 use loom_protocol::{
-    ActivityDetail, AgentRunSnapshot, AgentSessionSnapshotProjection, ClientRequest,
+    ActivityDetail, AgentActivityData, AgentActivityStatus, AgentRunSnapshot,
+    AgentRunSnapshotProjection, AgentSessionSnapshotProjection, ClientRequest,
     CollaborationRequest, CollaborationResponse, ProjectRequest, ProjectResponse,
     RepositoryRequest, RepositoryResponse, RunActionOutcome, ServerResponse, SessionRequest,
     SessionResponse, TaskRequest, TaskResponse,
@@ -35,7 +36,7 @@ use crate::cli::args::{Invocation, StatusFormat, WaitUntil};
 use crate::cli::client::Client;
 use crate::cli::exit;
 use crate::cli::text::{
-    escape, run_state_name, session_state_name, task_status_name, worktree_line,
+    self, escape, run_state_name, session_state_name, task_status_name, worktree_line,
 };
 
 use super::{Caller, Failure, Outcome, child_models, derived_id, emit, handshake};
@@ -541,6 +542,7 @@ pub(super) async fn status<C: Client>(
     handshake(&mut caller, &invocation.verb).await?;
     let (_, projection) = session_projection(&mut caller, session_id).await?;
     let run = projection.active_run.as_ref().map(|active| &active.run);
+    let running = projection.active_run.as_ref().and_then(running_tool);
     let declaration = declaration(run.map(|run| run.state));
     let state = run.map(|run| run_state_name(run.state)).unwrap_or("idle");
     let project = match tree {
@@ -576,6 +578,21 @@ pub(super) async fn status<C: Client>(
                             run_state_name(active.run.state)
                         ),
                     )?;
+                    // The tool a run is executing is what "working" means in
+                    // practice, so the line names it with how long it has been
+                    // running and the arguments it was called with.
+                    if let Some(tool) = &running {
+                        emit(
+                            out,
+                            &format!(
+                                "tool {} {} {} {}\n",
+                                escape(&tool.name),
+                                tool.id,
+                                tool.elapsed(),
+                                tool.arguments()
+                            ),
+                        )?;
+                    }
                     // The tree reports the requested session's pending
                     // decision once, as a `decision` line.
                     if project.is_none()
@@ -604,11 +621,73 @@ pub(super) async fn status<C: Client>(
             .active_run
             .as_ref()
             .and_then(|active| active.pending_approval.as_ref().map(|call| call.id.to_string())),
+        "running_tool": running.as_ref().map(RunningTool::value),
     });
     if let Some(project) = &project {
         data["project"] = project_value(project);
     }
     Ok(Outcome::new(data, caller.primary))
+}
+
+/// The tool call a run is executing right now.
+///
+/// A call that finished, a call parked on an approval or a question, and a run
+/// whose newest activity is a model turn are all reported as no running tool:
+/// only a started activity that carries a call is one.
+struct RunningTool {
+    name: String,
+    id: ToolCallId,
+    /// How long the call has been running when the verb printed it.
+    elapsed_ms: u64,
+    arguments: Value,
+}
+
+impl RunningTool {
+    /// The duration the call has been running, as the short label a supervisor
+    /// reads without parsing milliseconds.
+    fn elapsed(&self) -> String {
+        text::format_duration(self.elapsed_ms)
+    }
+
+    /// The arguments as one escaped line part: credentials redacted, then
+    /// bounded, so no secret and no unbounded payload reaches the output.
+    fn arguments(&self) -> String {
+        text::arguments_text(&self.arguments, text::RUNNING_ARGUMENTS_BYTES)
+    }
+
+    fn value(&self) -> Value {
+        json!({
+            "name": self.name,
+            "tool_call_id": self.id.to_string(),
+            "elapsed_ms": self.elapsed_ms,
+            "elapsed": self.elapsed(),
+            "arguments": self.arguments(),
+        })
+    }
+}
+
+/// The tool call of `active` that is executing, or `None` when nothing is.
+fn running_tool(active: &AgentRunSnapshotProjection) -> Option<RunningTool> {
+    let activity = active
+        .activities
+        .iter()
+        .filter(|activity| activity.status == AgentActivityStatus::Started)
+        .max_by_key(|activity| (activity.timeline_ordinal, activity.started_at))?;
+    let call = match &activity.data {
+        AgentActivityData::ToolCall { call, .. }
+        | AgentActivityData::File { call, .. }
+        | AgentActivityData::Search { call, .. }
+        | AgentActivityData::Command { call, .. } => call,
+        AgentActivityData::ModelTurn { .. } => return None,
+    };
+    Some(RunningTool {
+        name: call.name.clone(),
+        id: call.id,
+        elapsed_ms: Timestamp::now()
+            .as_unix_millis()
+            .saturating_sub(activity.started_at.as_unix_millis()),
+        arguments: call.arguments.clone(),
+    })
 }
 
 /// The project projection of one session: the worker's records plus the verdict

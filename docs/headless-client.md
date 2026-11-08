@@ -55,7 +55,7 @@ error invalid_request could not read the token file \
 | `ls [--workspace <id>] [--archived]` | Workspaces, or the sessions of one workspace. |
 | `get <session-id> [--metadata]` | One session snapshot, or that snapshot with its active run metadata. |
 | `events --session <id> [--after <seq>] [--cursor-file <path>] [--follow] [--timeout <seconds>] [--format text\|jsonl] [--max-bytes <n>]` | Session events, followed until the run completes or the caller interrupts; `--timeout` bounds the follow and exits `4` when it elapses. |
-| `peek --session <id> [--lines <n>] [--format text\|jsonl] [--max-bytes <n>]` | The tail of the session's current output; 200 lines by default. |
+| `peek --session <id> [--lines <n>] [--format text\|jsonl] [--max-bytes <n>]` | The tail of the session's current output with a time on every line; 200 lines by default. |
 | `run --workspace <id> (--task <text> \| --task-file <path>) [--name <name>] [--model <id>] [--repo <source> [--revision <rev>] [--path <path>]] [--as-directory <path>] [--approval-policy default\|auto] [--request-id <uuid>] [--new] [--project <session-id>] [--child-model <id>] [--child-model-for <kind>=<id>]...` | Reuse or create the session named `--name`, attach the inputs, and start one run. `--new` always creates a session. `--project` makes it a sub project of that project root. Without `--model` the first credentialed provider's default model is started. `--child-model` and `--child-model-for` store the models delegated children use before the run starts. |
 | `send --run <id> --text <text>` | Follow-up direction to the active run. |
 | `answer --run <id> --text <text>` | Answer the question the run is waiting on. |
@@ -63,7 +63,7 @@ error invalid_request could not read the token file \
 | `deny --run <id> --tool-call <id> [--reason <text>]` | Deny the blocked tool call. |
 | `stop --run <id> [--session <id> --archive] [--retry-on-conflict]` | Interrupt the run, optionally archiving its session afterwards. |
 | `wait --session <id> [--until blocked\|terminal] [--timeout <seconds>]` | Poll until the run blocks or reaches a terminal state; 60 seconds by default. |
-| `status --session <id> [--format text\|verb] [--tree]` | The session and its latest run; `--format verb` prints one declaration line, `--tree` adds the project projection. |
+| `status --session <id> [--format text\|verb] [--tree]` | The session, its latest run, and the tool call that run is executing; `--format verb` prints one declaration line, `--tree` adds the project projection. |
 | `liveness --session <id>` | `alive`, `dead`, `gone`, or `unknown`. |
 | `result --session <id> [--task <id>]` | Branch, head, diffstat, changed paths, and task evidence. |
 | `retention get` | The worker-wide archive-retention policy, with a disabled window as `off`. |
@@ -116,6 +116,13 @@ an exact `[... N bytes omitted ...]` marker, and explicit `pending_approval` and
 `question` markers for the states that block a run. The same journal plus the
 same cursor produces identical bytes.
 
+`peek` prints `<seq> <time> <kind> <body>`, so a tail answers when as well as
+what. `<time>` is RFC 3339 in UTC with milliseconds. The event envelope carries
+no timestamp, so an event that records one for itself — an activity, a run
+start, a run completion — is named by it, and every other event is named by the
+moment this read saw it. `events` keeps `<seq> <kind> <body>`, so a follow stays
+comparable byte for byte with an earlier run of the same command.
+
 `events` and `peek` bound the tool payload of each rendered event to 4096 bytes
 by default; `--max-bytes` changes that cap.
 
@@ -123,7 +130,8 @@ by default; `--max-bytes` changes that cap.
 
 `--format jsonl` writes one JSON object per line that carries `seq` and
 `stream_epoch`, so a caller can resume. Each object also carries the rendered
-`kind`/`text` and the full `event` payload.
+`kind`/`text` and the full `event` payload. A `peek` object also carries `at`,
+the same time its text line prints.
 
 ### `--json`
 
@@ -378,6 +386,35 @@ uses: `working: …`, `blocked: …`, `paused: …`, `done: …`, or `failed: �
 followed by the run state and the run id. The word is derived by this client
 from the run state; no worker writes it. A session with no run is
 `done: idle -`.
+
+### The running tool call
+
+`status` names the tool call the run is executing right now, under the `run`
+line:
+
+```
+tool <tool-name> <tool-call-id> <elapsed> <arguments>
+```
+
+`<elapsed>` is how long the call has been running, as `123ms`, `4.5s`, or
+`2m 5s`. `<arguments>` is the call's argument JSON, escaped the way
+`loom-text/1` escapes a body and bounded to 512 bytes with the usual
+`[... N bytes omitted ...]` marker. The wire envelope carries no timestamp, so
+the duration compares the start the worker recorded with this client's clock;
+a skewed clock on either side shows up as skew in the duration.
+
+Credentials never reach the line: the value under a key that names one (`token`,
+`secret`, `password`, `passwd`, `credential`, `authorization`, `cookie`, `key`,
+case-insensitively) and any string that starts with a credential prefix (`sk-`,
+`ghp_`, `github_pat_`, `xoxb-`, `bearer `, and the other published prefixes) is
+printed as `[redacted]`. Redaction runs before bounding, so a secret is not
+printed even when it sits past the budget.
+
+The line appears only while a call is executing. A call that finished, a call
+parked on an approval or a question, and a run whose newest activity is a model
+turn print no `tool` line. The `--json` envelope carries the same values as
+`data.running_tool` (`name`, `tool_call_id`, `elapsed_ms`, `elapsed`,
+`arguments`), or `null`.
 
 ### `status --tree`
 

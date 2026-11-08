@@ -15,18 +15,19 @@ use std::{
 };
 
 use loom_core::{
-    AgentMessageId, AgentMessageKind, AgentMessageRecord, AgentSessionId, AgentSessionSnapshot,
-    AgentSessionState, ApprovalPolicy, Author, Capability, CapabilitySet, CollaborationEntryKind,
-    DelegatedTaskRecord, DelegatedTaskStatus, EventSequence, GitDiff, GitDiffHunk, GitDiffLine,
-    GitDiffLineKind, GitFileStatus, GitFileStatusKind, GitRepositoryStatus,
-    ProjectAgentPermissions, ProjectAgentRecord, ProjectId, ProjectSnapshot,
+    ActivityId, AgentMessageId, AgentMessageKind, AgentMessageRecord, AgentSessionId,
+    AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, Author, Capability, CapabilitySet,
+    CollaborationEntryKind, DelegatedTaskRecord, DelegatedTaskStatus, EventSequence, GitDiff,
+    GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus, GitFileStatusKind,
+    GitRepositoryStatus, ProjectAgentPermissions, ProjectAgentRecord, ProjectId, ProjectSnapshot,
     ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord, ProjectWorktreeStatus,
     ProtocolVersion, RepositoryId, RequestId, RunAttemptId, RunId, RunRevision, TaskId, Timestamp,
     ToolCallId, WorkspaceId,
 };
 use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ProviderId, ToolCall};
 use loom_protocol::{
-    ActivityDetail, AgentEvent, AgentRunSnapshot, AgentRunSnapshotProjection, AgentRunState,
+    ActivityDetail, AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
+    AgentEvent, AgentRunSnapshot, AgentRunSnapshotProjection, AgentRunState,
     AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION, ClientRequest, CollaborationRequest,
     CollaborationResponse, ControlRequest, ControlResponse, EventsRequest, EventsResponse,
     FilesystemRequest, FilesystemResponse, ProjectChildControlAction, ProjectRequest,
@@ -412,7 +413,8 @@ fn events_of_a_fresh_session_prints_its_creation_line() {
     assert_eq!(outcome.code, exit::OK);
     assert_eq!(outcome.stdout, format!("{sequence} session_created\n"));
 
-    // `peek` sees the same single event.
+    // `peek` sees the same single event, with the time each line reports in
+    // front of the kind.
     let peek = run(
         &mut client,
         &[
@@ -424,7 +426,131 @@ fn events_of_a_fresh_session_prints_its_creation_line() {
         ],
     );
     assert_eq!(peek.code, exit::OK);
-    assert_eq!(peek.stdout, outcome.stdout);
+    let peek_line = peek.stdout.lines().next().expect("one peek line");
+    let mut fields = peek_line.splitn(4, ' ');
+    assert_eq!(fields.next(), Some(sequence.to_string().as_str()));
+    let at = fields.next().expect("the time of the line");
+    assert_eq!(at.len(), "2025-10-09T08:53:20.123Z".len(), "{at}");
+    assert!(at.ends_with('Z'), "{at}");
+    assert_eq!(fields.next(), Some("session_created"));
+}
+
+#[test]
+fn peek_names_the_time_each_event_records_and_the_read_time_otherwise() {
+    let fixture = fixture();
+    let session_id = fixture.session.id;
+    let run_id = RunId::new();
+    let call = ToolCall {
+        id: ToolCallId::new(),
+        name: "run_command".to_owned(),
+        arguments: serde_json::json!({ "command": "cargo test" }),
+    };
+    // An activity records its own time, so the line prints it.
+    let recorded = ServerEventEnvelope {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        sequence: EventSequence::new(4),
+        session_id,
+        event: ServerEvent::Agent {
+            event: AgentEvent::ActivityRecorded {
+                run_id,
+                activity: AgentActivityRecord {
+                    id: ActivityId::new(),
+                    run_id,
+                    timeline_ordinal: 3,
+                    parent_id: None,
+                    step_id: None,
+                    kind: AgentActivityKind::ToolCall,
+                    status: AgentActivityStatus::Completed,
+                    started_at: Timestamp::from_unix_millis(1_760_000_000_000),
+                    completed_at: Some(Timestamp::from_unix_millis(1_760_000_004_000)),
+                    elapsed_ms: Some(4_000),
+                    data: AgentActivityData::ToolCall { call, result: None },
+                },
+            },
+        },
+    };
+    // A tool start records no time of its own, so the line prints the read time.
+    let unrecorded = ServerEventEnvelope {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        sequence: EventSequence::new(5),
+        session_id,
+        event: ServerEvent::Agent {
+            event: AgentEvent::ToolCallStarted {
+                run_id,
+                call: ToolCall {
+                    id: ToolCallId::new(),
+                    name: "run_command".to_owned(),
+                    arguments: serde_json::json!({ "command": "cargo test" }),
+                },
+            },
+        },
+    };
+    let scripted = vec![recorded, unrecorded];
+    let mut client =
+        Wrapped::new(InProcessClient::new(&fixture.backend)).after(move |request, response| {
+            if !matches!(
+                request,
+                ClientRequest::Events(EventsRequest::GetRecentSessionEvents { .. })
+            ) {
+                return;
+            }
+            if let Ok(ServerResponse::Events(EventsResponse::SessionEvents {
+                stream_epoch, ..
+            })) = &response.result
+            {
+                response.result = Ok(ServerResponse::Events(EventsResponse::SessionEvents {
+                    events: scripted.clone(),
+                    stream_epoch: stream_epoch.clone(),
+                    next_after_sequence: None,
+                }));
+            }
+        });
+
+    let peek = run(&mut client, &["peek", "--session", &session_id.to_string()]);
+    assert_eq!(peek.code, exit::OK, "{}", peek.stderr);
+    let lines: Vec<&str> = peek.stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "{}", peek.stdout);
+    assert!(
+        lines[0].starts_with("4 2025-10-09T08:53:24.000Z event activity_recorded"),
+        "{}",
+        lines[0]
+    );
+    let mut fields = lines[1].splitn(3, ' ');
+    assert_eq!(fields.next(), Some("5"));
+    let read_at = fields.next().expect("the read time");
+    assert_eq!(read_at.len(), "2025-10-09T08:53:24.000Z".len(), "{read_at}");
+    assert!(read_at.ends_with('Z'), "{read_at}");
+    assert_ne!(read_at, "2025-10-09T08:53:24.000Z");
+    assert!(
+        fields
+            .next()
+            .is_some_and(|rest| rest.starts_with("tool_start ")),
+        "{}",
+        lines[1]
+    );
+
+    // The JSON form carries the same time as `at`.
+    let jsonl = run(
+        &mut client,
+        &[
+            "peek",
+            "--session",
+            &session_id.to_string(),
+            "--format",
+            "jsonl",
+        ],
+    );
+    assert_eq!(jsonl.code, exit::OK, "{}", jsonl.stderr);
+    let first: serde_json::Value = serde_json::from_str(
+        jsonl
+            .stdout
+            .lines()
+            .next()
+            .expect("one JSON object per event"),
+    )
+    .unwrap();
+    assert_eq!(first["at"], "2025-10-09T08:53:24.000Z");
+    assert_eq!(first["kind"], "event");
 }
 
 fn worker_node(connection: &InProcessConnection) -> loom_protocol::WorkerNodeStatus {
@@ -552,6 +678,96 @@ fn bounding_a_multibyte_text_lands_on_character_boundaries() {
     assert!(bounded.ends_with("éé"));
     assert_eq!(bounded, "éé[... 12 bytes omitted ...]éé");
     assert_eq!(text::bound("short", 64), "short");
+}
+
+#[test]
+fn a_duration_reads_in_the_unit_it_needs() {
+    for (milliseconds, label) in [
+        (0, "0ms"),
+        (999, "999ms"),
+        (1_000, "1.0s"),
+        (4_500, "4.5s"),
+        (59_999, "60.0s"),
+        (60_000, "1m 0s"),
+        (125_000, "2m 5s"),
+    ] {
+        assert_eq!(text::format_duration(milliseconds), label, "{milliseconds}");
+    }
+}
+
+#[test]
+fn a_timestamp_is_rfc3339_utc_with_milliseconds() {
+    for (millis, expected) in [
+        (0, "1970-01-01T00:00:00.000Z"),
+        (1, "1970-01-01T00:00:00.001Z"),
+        // The leap day, and a time past the last whole minute of the day.
+        (1_709_164_800_000, "2024-02-29T00:00:00.000Z"),
+        (1_709_164_800_999, "2024-02-29T00:00:00.999Z"),
+        (1_760_000_000_123, "2025-10-09T08:53:20.123Z"),
+        (1_760_000_000_000 + 86_399_999, "2025-10-10T08:53:19.999Z"),
+    ] {
+        assert_eq!(
+            text::format_timestamp(Timestamp::from_unix_millis(millis)),
+            expected,
+            "{millis}"
+        );
+    }
+}
+
+#[test]
+fn a_running_tools_arguments_are_redacted_before_they_are_bounded() {
+    // The secret sits past a tiny budget, so bounding first would print it.
+    let arguments = serde_json::json!({
+        "command": "0123456789".repeat(8),
+        "api_key": "sk-live-0123456789",
+        "nested": { "access_token": "opaque", "path": "src/lib.rs" },
+        "headers": ["Bearer abcdef", "application/json"],
+        "password": "hunter2",
+    });
+    let printed = text::arguments_text(&arguments, 200);
+    for secret in ["sk-live-0123456789", "opaque", "Bearer abcdef", "hunter2"] {
+        assert!(!printed.contains(secret), "{secret} reached '{printed}'");
+    }
+    assert!(printed.contains("[redacted]"), "{printed}");
+    assert!(printed.contains("bytes omitted"), "{printed}");
+    // Under a budget that fits, the whole payload is printed with its secrets
+    // already redacted and everything else intact.
+    let whole = text::arguments_text(&arguments, 4_096);
+    assert!(whole.contains("src/lib.rs"), "{whole}");
+    assert!(!whole.contains("sk-live-0123456789"), "{whole}");
+    assert!(whole.contains("application/json"), "{whole}");
+    assert_eq!(
+        text::arguments_text(&serde_json::json!({"token": "x"}), 512),
+        "{\"token\":\"[redacted]\"}"
+    );
+}
+
+#[test]
+fn a_peek_line_names_its_time_before_the_kind() {
+    let rendered = text::Rendered {
+        kind: "tool_start",
+        body: "run_command id-one".to_owned(),
+    };
+    assert_eq!(
+        text::line_at(
+            EventSequence::new(7),
+            Timestamp::from_unix_millis(1_760_000_000_123),
+            &rendered
+        ),
+        "7 2025-10-09T08:53:20.123Z tool_start run_command id-one\n"
+    );
+    let empty = text::Rendered {
+        kind: "session_created",
+        body: String::new(),
+    };
+    assert_eq!(
+        text::line_at(
+            EventSequence::new(8),
+            Timestamp::from_unix_millis(0),
+            &empty
+        ),
+        "8 1970-01-01T00:00:00.000Z session_created\n"
+    );
 }
 
 #[test]
@@ -5387,6 +5603,294 @@ fn status_prints_its_lines_and_the_derived_declaration() {
         format!("blocked: awaiting_approval {run_id}")
     );
     assert_eq!(envelope["data"]["state"], "awaiting_approval");
+}
+
+/// A session metadata projection of a run that is executing `activities`,
+/// which is the answer `status` reads.
+fn active_run_projection(
+    session_id: AgentSessionId,
+    run_id: RunId,
+    activities: Vec<AgentActivityRecord>,
+) -> AgentSessionSnapshotProjection {
+    AgentSessionSnapshotProjection {
+        session: AgentSessionSnapshot {
+            id: session_id,
+            workspace_id: WorkspaceId::new(),
+            name: "running tool".to_owned(),
+            goal: None,
+            state: AgentSessionState::Executing,
+            created_at: synthetic_time(),
+            updated_at: synthetic_time(),
+            title_source: Default::default(),
+        },
+        active_run: Some(AgentRunSnapshotProjection {
+            run: AgentRunSnapshot {
+                id: run_id,
+                attempt_id: RunAttemptId::new(),
+                control_revision: 1,
+                session_id,
+                task: "run the tests".to_owned(),
+                model: ModelId::new("deterministic/demo"),
+                state: AgentRunState::Executing,
+                started_at: synthetic_time(),
+                updated_at: synthetic_time(),
+                completed_at: None,
+                summary: None,
+                evidence: Vec::new(),
+                approval_policy: None,
+                jev: None,
+            },
+            plan: Vec::new(),
+            plan_progress: Default::default(),
+            messages: Vec::new(),
+            pending_approval: None,
+            pending_input: None,
+            usage: Default::default(),
+            activities,
+            message_timeline_ordinals: Vec::new(),
+        }),
+        latest_sequence: EventSequence::default(),
+        approval_policy: ApprovalPolicy::default(),
+        auto_approve_actions: true,
+    }
+}
+
+/// A client that answers the session metadata read with `projection`, which is
+/// how a run executing a tool is produced without a provider that stalls.
+fn scripted_status_client(
+    backend: &Arc<InProcessBackend>,
+    projection: AgentSessionSnapshotProjection,
+) -> Wrapped<InProcessClient> {
+    let projection = Rc::new(projection);
+    Wrapped::new(InProcessClient::new(backend)).after(move |request, response| {
+        if matches!(
+            request,
+            ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata { .. })
+        ) {
+            response.result = Ok(ServerResponse::Session(
+                SessionResponse::AgentSessionSnapshot(Box::new(projection.as_ref().clone())),
+            ));
+        }
+    })
+}
+
+/// A command activity of `call` in `status`, which is the kind a shell call
+/// records.
+fn command_activity(
+    run_id: RunId,
+    call: &ToolCall,
+    status: AgentActivityStatus,
+    started_at: Timestamp,
+) -> AgentActivityRecord {
+    AgentActivityRecord {
+        id: ActivityId::new(),
+        run_id,
+        timeline_ordinal: 1,
+        parent_id: None,
+        step_id: None,
+        kind: AgentActivityKind::Command,
+        status,
+        started_at,
+        completed_at: None,
+        elapsed_ms: None,
+        data: AgentActivityData::Command {
+            call: call.clone(),
+            command: "cargo".to_owned(),
+            args: vec!["test".to_owned()],
+            cwd: None,
+            result: None,
+        },
+    }
+}
+
+/// A model turn of `run_id`, which carries no tool call at all.
+fn model_turn_activity(run_id: RunId, status: AgentActivityStatus) -> AgentActivityRecord {
+    AgentActivityRecord {
+        id: ActivityId::new(),
+        run_id,
+        timeline_ordinal: 1,
+        parent_id: None,
+        step_id: None,
+        kind: AgentActivityKind::ModelTurn,
+        status,
+        started_at: synthetic_time(),
+        completed_at: None,
+        elapsed_ms: None,
+        data: AgentActivityData::ModelTurn {
+            model: ModelId::new("deterministic/demo"),
+        },
+    }
+}
+
+#[test]
+fn status_reports_the_running_tool_call_and_how_long_it_has_run() {
+    let fixture = fixture();
+    let session_id = fixture.session.id;
+    let run_id = RunId::new();
+    let call = ToolCall {
+        id: ToolCallId::new(),
+        name: "run_command".to_owned(),
+        arguments: serde_json::json!({ "command": "cargo", "args": ["test"] }),
+    };
+    // Started 65 seconds ago, so the label is the minute-and-seconds form.
+    let started_at = Timestamp::from_unix_millis(Timestamp::now().as_unix_millis() - 65_000);
+    let mut client = scripted_status_client(
+        &fixture.backend,
+        active_run_projection(
+            session_id,
+            run_id,
+            vec![command_activity(
+                run_id,
+                &call,
+                AgentActivityStatus::Started,
+                started_at,
+            )],
+        ),
+    );
+
+    let status = run(
+        &mut client,
+        &["status", "--session", &session_id.to_string()],
+    );
+    assert_eq!(status.code, exit::OK, "{}", status.stderr);
+    let lines: Vec<&str> = status.stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "{}", status.stdout);
+    assert_eq!(lines[1], format!("run {run_id} executing"));
+    assert!(
+        lines[2].starts_with(&format!("tool run_command {} 1m 5s ", call.id)),
+        "{}",
+        lines[2]
+    );
+    assert!(lines[2].contains("\"command\":\"cargo\""), "{}", lines[2]);
+
+    let envelope = json_envelope(&run(
+        &mut client,
+        &["status", "--session", &session_id.to_string(), "--json"],
+    ));
+    assert_eq!(envelope["data"]["running_tool"]["name"], "run_command");
+    assert_eq!(
+        envelope["data"]["running_tool"]["tool_call_id"],
+        call.id.to_string()
+    );
+    assert_eq!(envelope["data"]["running_tool"]["elapsed"], "1m 5s");
+    assert!(
+        envelope["data"]["running_tool"]["elapsed_ms"]
+            .as_u64()
+            .unwrap_or_default()
+            >= 65_000,
+        "{}",
+        envelope["data"]["running_tool"]
+    );
+    assert!(
+        envelope["data"]["running_tool"]["arguments"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cargo"),
+        "{}",
+        envelope["data"]["running_tool"]
+    );
+}
+
+#[test]
+fn status_reports_no_running_tool_when_none_is_executing() {
+    let fixture = fixture();
+    let session_id = fixture.session.id;
+    let run_id = RunId::new();
+    let call = ToolCall {
+        id: ToolCallId::new(),
+        name: "run_command".to_owned(),
+        arguments: serde_json::json!({ "command": "cargo" }),
+    };
+    // A finished call, a call awaiting a decision, and a model turn are not a
+    // running tool, whatever order the activities are in.
+    for activities in [
+        vec![command_activity(
+            run_id,
+            &call,
+            AgentActivityStatus::Completed,
+            synthetic_time(),
+        )],
+        vec![command_activity(
+            run_id,
+            &call,
+            AgentActivityStatus::AwaitingApproval,
+            synthetic_time(),
+        )],
+        vec![model_turn_activity(run_id, AgentActivityStatus::Started)],
+    ] {
+        let mut client = scripted_status_client(
+            &fixture.backend,
+            active_run_projection(session_id, run_id, activities),
+        );
+        let status = run(
+            &mut client,
+            &["status", "--session", &session_id.to_string()],
+        );
+        assert_eq!(status.code, exit::OK, "{}", status.stderr);
+        assert_eq!(
+            status.stdout,
+            format!("session {session_id} executing running tool\nrun {run_id} executing\n")
+        );
+        let envelope = json_envelope(&run(
+            &mut client,
+            &["status", "--session", &session_id.to_string(), "--json"],
+        ));
+        assert_eq!(envelope["data"]["running_tool"], serde_json::Value::Null);
+    }
+}
+
+#[test]
+fn status_never_prints_a_secret_in_the_running_arguments() {
+    let fixture = fixture();
+    let session_id = fixture.session.id;
+    let run_id = RunId::new();
+    let call = ToolCall {
+        id: ToolCallId::new(),
+        name: "run_command".to_owned(),
+        arguments: serde_json::json!({
+            "command": "gh auth login --with-token",
+            "api_key": "sk-live-0123456789",
+            "path": "src/lib.rs",
+            "output": "0123456789".repeat(64),
+        }),
+    };
+    let mut client = scripted_status_client(
+        &fixture.backend,
+        active_run_projection(
+            session_id,
+            run_id,
+            vec![command_activity(
+                run_id,
+                &call,
+                AgentActivityStatus::Started,
+                synthetic_time(),
+            )],
+        ),
+    );
+
+    let status = run(
+        &mut client,
+        &["status", "--session", &session_id.to_string()],
+    );
+    assert_eq!(status.code, exit::OK, "{}", status.stderr);
+    assert!(status.stdout.contains("[redacted]"), "{}", status.stdout);
+    assert!(
+        !status.stdout.contains("sk-live-0123456789"),
+        "{}",
+        status.stdout
+    );
+    assert!(status.stdout.contains("bytes omitted"), "{}", status.stdout);
+    assert!(status.stdout.contains("src/lib.rs"), "{}", status.stdout);
+
+    let envelope = json_envelope(&run(
+        &mut client,
+        &["status", "--session", &session_id.to_string(), "--json"],
+    ));
+    let arguments = envelope["data"]["running_tool"]["arguments"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(!arguments.contains("sk-live-0123456789"), "{arguments}");
+    assert!(arguments.contains("[redacted]"), "{arguments}");
 }
 
 #[test]

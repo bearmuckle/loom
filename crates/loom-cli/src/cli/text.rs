@@ -8,7 +8,7 @@
 
 use loom_core::{
     AgentMessageKind, AgentSessionState, DelegatedTaskStatus, EventSequence, LimitStatus,
-    ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord, ProjectWorktreeStatus,
+    ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord, ProjectWorktreeStatus, Timestamp,
 };
 use loom_model::ToolCall;
 use loom_protocol::{AgentEvent, AgentRunState, ServerEvent, ToolResult};
@@ -72,6 +72,177 @@ pub(crate) fn line(sequence: EventSequence, rendered: &Rendered) -> String {
     } else {
         format!("{sequence} {} {body}\n", rendered.kind)
     }
+}
+
+/// The single physical line of one `peek` event: the time the line reports,
+/// then the sequence, kind, and body of [`line`].
+///
+/// `peek` is the verb that answers "what happened and when", so its line carries
+/// the time before the kind; `events` keeps the `<seq> <kind> <body>` shape of
+/// its documented follow output.
+pub(crate) fn line_at(sequence: EventSequence, at: Timestamp, rendered: &Rendered) -> String {
+    let at = format_timestamp(at);
+    let body = escape(&rendered.body);
+    if body.is_empty() {
+        format!("{sequence} {at} {}\n", rendered.kind)
+    } else {
+        format!("{sequence} {at} {} {body}\n", rendered.kind)
+    }
+}
+
+/// The time an event records for itself, or `None` when it carries none.
+///
+/// The wire envelope carries no timestamp of its own, so a caller names the time
+/// an event reports and falls back to the time the client read it. Activities and
+/// run snapshots are the events that record one.
+pub(crate) fn event_time(event: &ServerEvent) -> Option<Timestamp> {
+    let ServerEvent::Agent { event } = event else {
+        return None;
+    };
+    match event {
+        AgentEvent::RunStarted { snapshot } => Some(snapshot.started_at),
+        AgentEvent::RunCompleted { snapshot } => {
+            Some(snapshot.completed_at.unwrap_or(snapshot.updated_at))
+        }
+        AgentEvent::ActivityRecorded { activity, .. } => {
+            Some(activity.completed_at.unwrap_or(activity.started_at))
+        }
+        _ => None,
+    }
+}
+
+/// A duration the way the desktop client labels one: milliseconds below a
+/// second, one decimal of a second below a minute, and minutes with whole
+/// seconds above it.
+pub(crate) fn format_duration(milliseconds: u64) -> String {
+    if milliseconds < 1_000 {
+        format!("{milliseconds}ms")
+    } else if milliseconds < 60_000 {
+        format!("{:.1}s", milliseconds as f64 / 1_000.0)
+    } else {
+        format!(
+            "{}m {}s",
+            milliseconds / 60_000,
+            (milliseconds % 60_000) / 1_000
+        )
+    }
+}
+
+/// A recorded time as RFC 3339 in UTC with milliseconds, so a line can be
+/// compared with a log without knowing the reader's time zone.
+pub(crate) fn format_timestamp(at: Timestamp) -> String {
+    const MILLIS_PER_DAY: u64 = 86_400_000;
+    let millis = at.as_unix_millis();
+    let (year, month, day) = civil_date((millis / MILLIS_PER_DAY) as i64);
+    let of_day = millis % MILLIS_PER_DAY;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        of_day / 3_600_000,
+        (of_day % 3_600_000) / 60_000,
+        (of_day % 60_000) / 1_000,
+        of_day % 1_000
+    )
+}
+
+/// The proleptic Gregorian date of a day count since 1970-01-01.
+///
+/// Howard Hinnant's `civil_from_days`: the era starts in March, which puts the
+/// leap day at the end of a year and keeps the month arithmetic linear.
+fn civil_date(days_since_epoch: i64) -> (i64, i64, i64) {
+    let shifted = days_since_epoch + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let of_era = shifted.rem_euclid(146_097);
+    let year_of_era = (of_era - of_era / 1_460 + of_era / 36_524 - of_era / 146_096) / 365;
+    let day_of_year = of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = match shifted_month < 10 {
+        true => shifted_month + 3,
+        false => shifted_month - 9,
+    };
+    let year = match month <= 2 {
+        true => year_of_era + era * 400 + 1,
+        false => year_of_era + era * 400,
+    };
+    (year, month, day)
+}
+
+/// The value a redacted field prints instead of its content.
+const REDACTED: &str = "[redacted]";
+
+/// How much of a running tool call's arguments `status` prints. It is smaller
+/// than the `--max-bytes` budget of an event payload because the line is a
+/// summary of the run, not a transcript of it.
+pub(crate) const RUNNING_ARGUMENTS_BYTES: usize = 512;
+
+/// The key fragments that name a credential, so the value under one is never
+/// printed. `key` covers `api_key`, `apikey`, `access_key`, and `private_key`.
+const CREDENTIAL_KEY_PARTS: &[&str] = &[
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+    "authorization",
+    "cookie",
+    "key",
+];
+
+/// The prefixes a credential carries whatever key it is stored under, so an API
+/// key pasted into an argument, or an authorization header, is redacted too.
+const CREDENTIAL_VALUE_PREFIXES: &[&str] = &[
+    "sk-",
+    "sk_",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "github_pat_",
+    "xoxb-",
+    "xoxp-",
+    "bearer ",
+];
+
+fn is_credential_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    CREDENTIAL_KEY_PARTS.iter().any(|part| key.contains(part))
+}
+
+fn carries_credential(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    CREDENTIAL_VALUE_PREFIXES
+        .iter()
+        .any(|prefix| value.starts_with(prefix))
+}
+
+/// The copy of `arguments` that can be printed: the value under a credential key,
+/// and a string that starts with a credential prefix, is replaced by
+/// `[redacted]`.
+pub(crate) fn redacted_arguments(arguments: &Value) -> Value {
+    match arguments {
+        Value::Object(entries) => Value::Object(
+            entries
+                .iter()
+                .map(|(key, value)| {
+                    let value = match is_credential_key(key) {
+                        true => Value::String(REDACTED.to_owned()),
+                        false => redacted_arguments(value),
+                    };
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(redacted_arguments).collect()),
+        Value::String(text) if carries_credential(text) => Value::String(REDACTED.to_owned()),
+        other => other.clone(),
+    }
+}
+
+/// The arguments of a tool call as one escaped line part: credentials are
+/// redacted before the JSON is bounded, so no secret is printed even when the
+/// payload is longer than the budget.
+pub(crate) fn arguments_text(arguments: &Value, budget: usize) -> String {
+    escape(&bound(&json_text(&redacted_arguments(arguments)), budget))
 }
 
 /// The JSON object one event becomes in `--format jsonl`.

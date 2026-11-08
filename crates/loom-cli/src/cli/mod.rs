@@ -309,6 +309,15 @@
 //! `paused`, `done` for completed, and `failed` for failed and cancelled. The
 //! line is derived by this client from the run state; no worker writes it.
 //!
+//! `status` also names the tool call the run is executing right now, as
+//! `tool <name> <tool-call-id> <elapsed> <arguments>`. The call is the newest
+//! started activity of the run that carries one, so a finished call, a call
+//! parked on a decision, and a run whose newest activity is a model turn report
+//! no tool line; `<elapsed>` is how long it has been running, and the arguments
+//! have the values under credential-naming keys, and any value with a credential
+//! prefix, replaced by `[redacted]` before the JSON is bounded. The `--json`
+//! envelope carries the same values as `data.running_tool`, or `null`.
+//!
 //! `status --tree` additionally projects the agent session's project: the
 //! project verdict, its agents with a verdict each, its delegated tasks, its
 //! worktrees with their conflict paths, and one decision per agent waiting on an
@@ -335,6 +344,13 @@
 //! escapes, other C0 controls and `0x7f` become `\xNN`, and every other UTF-8
 //! byte is passed through unchanged. An empty body leaves no trailing space, so
 //! the line is `<seq> <kind>\n`.
+//!
+//! `peek` is the one verb that inserts the time of the line: its shape is
+//! `<seq> <time> <kind> <body>`, with `<time>` as RFC 3339 UTC with milliseconds.
+//! The wire envelope carries no timestamp, so an event that records one (an
+//! activity, a run start, a run completion) is named by it and every other event
+//! is named by the moment the read saw it. `events` keeps the shape above, so a
+//! follow stays comparable byte for byte with an earlier one.
 //!
 //! Fields of a body that are empty are omitted, which is how
 //! `run_completed` reports a run without a summary. `tool_done` carries the
@@ -374,7 +390,8 @@
 //! `events --format jsonl` and `peek --format jsonl` are a different shape:
 //! without `--json` they print one object per event,
 //! `{"seq":...,"stream_epoch":...,"session_id":...,"kind":...,"text":...,"event":...}`,
-//! where `kind` and `text` are exactly the text projection of that event.
+//! where `kind` and `text` are exactly the text projection of that event. A
+//! `peek` object also carries `at`, the same time its text line reports.
 //!
 //! A verb whose documented exit code reports something other than success is
 //! still a successful determination: a blocked `wait` is `ok:true` with exit
