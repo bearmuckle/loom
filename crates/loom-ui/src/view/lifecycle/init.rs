@@ -347,7 +347,8 @@ impl LoomView {
             let identity_key = crate::identity_store::worker_key(Some(&connect_url));
             let result = cx
                 .background_spawn(async move {
-                    let unsigned = background_token.trim().is_empty();
+                    let unsigned =
+                        crate::credential_store::connects_unsigned(&connect_url, &background_token);
                     let connection = connect_remote(
                         &connect_url,
                         &background_token,
@@ -1987,7 +1988,7 @@ impl LoomView {
         cx.spawn(async move |view, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let unsigned = token.trim().is_empty();
+                    let unsigned = crate::credential_store::connects_unsigned(&connect_url, &token);
                     // The GitHub sign-in the client kept for this worker, if
                     // any: a connection opened without an operator token replays
                     // it, so the node comes up signed in as that person.

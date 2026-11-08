@@ -556,7 +556,7 @@ impl LoomView {
                                 return Err((WorkerConnectionStage::CredentialRead, error, false));
                             }
                         };
-                        let unsigned = token.is_empty();
+                        let unsigned = crate::credential_store::connects_unsigned(&candidate_url, &token);
                         // The GitHub sign-in the client kept for this worker:
                         // a reconnect without an operator token replays it, and
                         // a worker that refuses it is retried once without.

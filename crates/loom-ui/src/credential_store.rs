@@ -34,6 +34,14 @@ pub(crate) fn replayable(
     stored.filter(|credential| !credential.trim().is_empty())
 }
 
+/// Whether a connection to `url` with `token` carries no operator token.
+///
+/// An `ssh://` worker is always reached with the token its host issued, whatever
+/// token was passed, so it is an operator connection and never an unsigned one.
+pub(crate) fn connects_unsigned(url: &str, token: &str) -> bool {
+    token.trim().is_empty() && !url.starts_with("ssh://")
+}
+
 /// Reads, saves, and clears can arrive from the UI thread and a reconnect
 /// thread at once; one lock keeps the read-modify-write whole.
 #[cfg(all(not(target_family = "wasm"), not(test)))]
@@ -282,6 +290,14 @@ mod tests {
             "loom-worker-credentials-{}.json",
             ParticipantId::new()
         ))
+    }
+
+    #[test]
+    fn an_ssh_worker_is_never_an_unsigned_connection() {
+        assert!(connects_unsigned("wss://worker.example/ws", ""));
+        assert!(connects_unsigned("wss://worker.example/ws", "  "));
+        assert!(!connects_unsigned("wss://worker.example/ws", "loom-token"));
+        assert!(!connects_unsigned("ssh://root@worker.example", ""));
     }
 
     #[test]
