@@ -621,11 +621,16 @@ pub(crate) fn session_events_request(
 
 /// The message-content bytes a reopen's transcript backfill may load before it
 /// stops following older pages.
-pub(crate) const REOPEN_TRANSCRIPT_BYTE_BUDGET: usize = 4 * 1024 * 1024;
+///
+/// The reopen must stay bounded: a long-running session can hold thousands of
+/// messages, and walking every page before the conversation is usable made the
+/// open compete with a live run for the same worker and time out. The newest
+/// window is enough to render; older pages stay available through scroll.
+pub(crate) const REOPEN_TRANSCRIPT_BYTE_BUDGET: usize = 1024 * 1024;
 
 /// The messages a reopen's transcript backfill may load before it stops
 /// following older pages.
-pub(crate) const REOPEN_TRANSCRIPT_MESSAGE_BUDGET: usize = 2_048;
+pub(crate) const REOPEN_TRANSCRIPT_MESSAGE_BUDGET: usize = 400;
 
 /// Follows the older transcript pages of a reopened run.
 ///

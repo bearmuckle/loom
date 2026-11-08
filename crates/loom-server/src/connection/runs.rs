@@ -481,6 +481,46 @@ impl InProcessConnection {
             }
         }
         if session.state != AgentSessionState::Idle {
+            // A client whose projection still shows the session's run as
+            // finished sends its next direction as a new run. While the run is
+            // not terminal, keep the message instead of refusing it: queue it as
+            // a durable direction to that run, or resume the run with it when it
+            // is idle. The answer names the active run, so the client adopts its
+            // real state.
+            if let Some(persistence) = self.backend.persistence.as_ref()
+                && let Some(summary) =
+                    persistence.load_latest_run_summary_for_session(input.session_id)?
+                && !matches!(
+                    summary.snapshot.state,
+                    AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+                )
+            {
+                let run_id = summary.snapshot.id;
+                let handle = self.run_handle(run_id)?;
+                let active = handle.is_running()
+                    || matches!(
+                        summary.snapshot.state,
+                        AgentRunState::Planning
+                            | AgentRunState::Executing
+                            | AgentRunState::Evaluating
+                    );
+                if active {
+                    persistence.enqueue_run_direction(
+                        run_id,
+                        input.session_id,
+                        &input.task,
+                        Timestamp::now(),
+                    )?;
+                    return Ok(ServerResponse::Run(RunResponse::AgentRun(
+                        handle.snapshot(),
+                    )));
+                }
+                let attempt_id = summary.snapshot.attempt_id;
+                let control_revision = summary.snapshot.control_revision;
+                return self.continue_run(run_id, |run| {
+                    run.message_entry_at_revision(input.task, attempt_id, control_revision)
+                });
+            }
             return Err(LoomError::new(
                 ErrorCode::InvalidState,
                 "agent session is already running or completed",
