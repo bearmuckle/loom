@@ -34,6 +34,7 @@
 //! | `result` | `Repository/ListSessionRepositories`, `Repository/GetSessionVcsStatus`, `Repository/GetSessionVcsDiff`, `Task/GetSessionTaskEvidence` |
 //! | `retention get` | `Control/GetArchiveRetentionPolicy` |
 //! | `retention set` | `Control/GetArchiveRetentionPolicy`, `Control/SetArchiveRetentionPolicy` |
+//! | `cache prune` | `Workspace/ListWorkspaces`, `Workspace/ListWorkspaceSessions` |
 //! | `providers list` | `Provider/ListProviders` |
 //! | `models list` | `Provider/ListProviders` |
 //! | `providers set-key` | `Provider/ConfigureApiKeyProvider` |
@@ -92,6 +93,8 @@
 //! `retention get`, `providers list`, `models list`, and every `project` read
 //! are the read-only verbs: they send nothing that mutates and negotiate only
 //! the capabilities their reads need, so a read-only-scoped token can run them.
+//! `cache prune` is read-only in the same sense: `--yes` removes build output on
+//! the worker's machine, but the only requests it sends are reads.
 //! `retention set`, `providers set-key`, `providers add`, `providers remove`,
 //! and `delete` are operator-level
 //! mutations: a token without `configure_archive_retention`,
@@ -176,6 +179,20 @@
 //! `stored for this worker; the next sweep applies it`: changing the policy
 //! never starts a sweep, and a session already archived is deleted by that next
 //! round rather than by the command.
+//!
+//! `cache prune` reports the per-session build caches of the connected worker's
+//! instance: one line per cache with its size and the state of the session that
+//! owns it (`root`, then `cache <session-id> <state> <bytes> remove|keep`, then
+//! `total` and `reclaimable`, and either a `dry-run; pass --yes` trailer or the
+//! `removed` and `failed` lines of the removal). The directory is read locally
+//! and the states come from `Workspace/ListWorkspaceSessions` with archived
+//! sessions included, so the worker stays the authority on which caches are
+//! dead: only a cache whose session is archived or gone is ever removed, and an
+//! entry whose name is not a session id is listed as `unrecognized` and kept.
+//! Without `--cache-root` the directory is derived from the connected URL the
+//! same way the default token file is, which is why the default only applies to
+//! a loopback worker; a cache the process cannot remove is reported and the
+//! command exits `1`.
 //!
 //! `delete` reads `Project/GetProjectSnapshotForSession` before it sends the
 //! mutation, because the id alone does not say whether it names a project root

@@ -118,6 +118,9 @@ session removes its cache, deleting a session or project tree removes every
 descendant's cache, and a startup sweep removes caches whose session no longer
 exists or is archived, so a crash between the state change and the removal
 cannot leak build output. Source and uncommitted work never live in the cache.
+`loom-cli cache prune` is the repair tool for what those paths still left
+behind: it lists each cache with its size and the state of its session, and
+`--yes` removes only the caches of archived or vanished sessions.
 
 ## Session deletion
 

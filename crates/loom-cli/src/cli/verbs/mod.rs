@@ -18,6 +18,7 @@
 //! verb below only ever sees the full id; a command line of full ids sends no
 //! listing at all.
 
+mod cache;
 mod child_models;
 mod events;
 mod jev;
@@ -297,6 +298,10 @@ pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
                 Capability::ConfigureArchiveRetention,
             ]);
         }
+        // `cache prune` asks the worker which sessions its workspaces hold, so
+        // the state of every cache's owner comes from the worker, and it is the
+        // only request the verb needs.
+        Verb::CachePrune(_) => capabilities.push(Capability::ReadAgentSession),
         Verb::ProvidersList | Verb::ModelsList { .. } => {
             capabilities.push(Capability::ListProviders);
         }
@@ -770,6 +775,7 @@ pub(crate) async fn run<C: Client>(
         }
         Verb::RetentionGet => operator::retention_get(client, invocation, out).await,
         Verb::RetentionSet(args) => operator::retention_set(client, invocation, args, out).await,
+        Verb::CachePrune(args) => cache::prune(client, invocation, args, out).await,
         Verb::ProvidersList => providers::list(client, invocation, out).await,
         Verb::ProvidersSetKey(args) => providers::set_key(client, invocation, args, out).await,
         Verb::ProvidersAdd(args) => providers::add(client, invocation, args, out).await,

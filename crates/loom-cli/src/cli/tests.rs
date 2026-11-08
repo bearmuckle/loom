@@ -8,7 +8,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
     time::Duration,
@@ -306,6 +306,27 @@ fn lines(stdout: &str) -> Vec<&str> {
 
 fn temporary_path(suffix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("loom-cli-{}-{suffix}", WorkspaceId::new()))
+}
+
+/// A per-session build-cache root for the `cache prune` tests, below the
+/// developer's cache directory and never the live state directory, so a test can
+/// never remove the caches of the worker the session itself runs on.
+fn temporary_cache_root(label: &str) -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let root = home
+        .join(".cache")
+        .join(format!("loom-cli-cache-{label}-{}", WorkspaceId::new()));
+    std::fs::create_dir_all(&root).unwrap();
+    root
+}
+
+/// One session's cache directory with a file of `bytes` bytes below it.
+fn write_cache(root: &Path, name: &str, bytes: usize) {
+    let directory = root.join(name).join("debug");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("artifact"), vec![b'x'; bytes]).unwrap();
 }
 
 /// The capabilities a test's direct control connection negotiates: everything
@@ -1774,6 +1795,10 @@ fn each_verb_negotiates_only_the_capabilities_its_requests_need() {
                 Capability::ReadWorkerNodeStatus,
                 Capability::ConfigureArchiveRetention,
             ],
+        ),
+        (
+            vec!["cache", "prune"],
+            vec![Capability::JsonProtocol, Capability::ReadAgentSession],
         ),
         (
             vec!["providers", "list"],
@@ -4667,6 +4692,10 @@ fn a_verb_help_page_prints_its_own_usage_and_examples() {
             "Usage: loom-cli retention set",
         ),
         (
+            owned(&["cache", "prune", "--help"]),
+            "Usage: loom-cli cache prune",
+        ),
+        (
             owned(&["providers", "list", "--help"]),
             "Usage: loom-cli providers list",
         ),
@@ -4755,6 +4784,23 @@ fn a_verb_help_page_prints_its_own_usage_and_examples() {
         assert!(page.stdout.contains("--json"), "{arguments:?}");
         assert!(!page.stdout.contains("Verbs:"), "{arguments:?}");
     }
+
+    // A sub-verb index page names its usage without claiming the flags of the
+    // sub-verb it lists.
+    let cache_index = run(&mut client, &["cache", "--help"]);
+    assert_eq!(cache_index.code, exit::OK);
+    assert!(
+        cache_index
+            .stdout
+            .starts_with("Usage: loom-cli cache prune"),
+        "{}",
+        cache_index.stdout
+    );
+    assert!(
+        cache_index.stdout.contains("prune"),
+        "{}",
+        cache_index.stdout
+    );
 
     // A bare --help and an unknown verb keep the global manual.
     let manual = run(&mut client, &["--help"]);
@@ -6219,6 +6265,170 @@ fn retention_set_rejects_a_bad_duration_and_an_empty_update() {
         "{}",
         no_sub_verb.stderr
     );
+}
+
+#[test]
+fn cache_prune_lists_sizes_and_states_and_removes_only_dead_caches() {
+    let fixture = fixture();
+    let workspace_id = fixture.workspace.id;
+    let active = create_session(&fixture.control, workspace_id, "cache active");
+    let archived = create_session(&fixture.control, workspace_id, "cache archived");
+    let archive = fixture
+        .control
+        .request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::ArchiveAgentSession {
+                session_id: archived.id,
+            },
+        )));
+    assert!(
+        archive.result.is_ok(),
+        "archive failed: {:?}",
+        archive.result
+    );
+
+    let root = temporary_cache_root("prune");
+    let vanished = AgentSessionId::new();
+    write_cache(&root, &active.id.to_string(), 10);
+    write_cache(&root, &archived.id.to_string(), 20);
+    write_cache(&root, &vanished.to_string(), 30);
+    // A name no session owns is listed, and is never removed.
+    std::fs::create_dir_all(root.join("not-a-session")).unwrap();
+    let root_argument = root.to_string_lossy().into_owned();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    // A dry run is the default: everything is listed, nothing is removed.
+    let dry = run(
+        &mut client,
+        &["cache", "prune", "--cache-root", &root_argument],
+    );
+    assert_eq!(dry.code, exit::OK, "{}", dry.stderr);
+    assert_eq!(
+        dry.stdout,
+        format!(
+            "root {root_argument}\n\
+             cache {vanished} missing 30 remove\n\
+             cache {} archived 20 remove\n\
+             cache {} idle 10 keep\n\
+             cache not-a-session unrecognized 0 keep\n\
+             total caches 4 bytes 60\n\
+             reclaimable 2 bytes 50\n\
+             dry-run; pass --yes to remove 2 caches\n",
+            archived.id, active.id
+        )
+    );
+    assert!(root.join(active.id.to_string()).is_dir());
+    assert!(root.join(archived.id.to_string()).is_dir());
+    assert!(root.join(vanished.to_string()).is_dir());
+    assert!(root.join("not-a-session").is_dir());
+
+    // `--yes` removes the archived and the vanished caches and nothing else.
+    let pruned = run(
+        &mut client,
+        &["cache", "prune", "--cache-root", &root_argument, "--yes"],
+    );
+    assert_eq!(pruned.code, exit::OK, "{}", pruned.stderr);
+    assert!(
+        pruned.stdout.contains("removed 2 bytes 50\n"),
+        "{}",
+        pruned.stdout
+    );
+    assert!(!root.join(archived.id.to_string()).exists());
+    assert!(!root.join(vanished.to_string()).exists());
+    assert!(
+        root.join(active.id.to_string())
+            .join("debug/artifact")
+            .is_file(),
+        "a living session keeps its cache: {}",
+        pruned.stdout
+    );
+    assert!(root.join("not-a-session").is_dir());
+
+    // The JSON envelope reports the same listing and removal.
+    write_cache(&root, &vanished.to_string(), 5);
+    let json = run(
+        &mut client,
+        &[
+            "cache",
+            "prune",
+            "--cache-root",
+            &root_argument,
+            "--yes",
+            "--json",
+        ],
+    );
+    assert_eq!(json.code, exit::OK, "{}", json.stderr);
+    let envelope = json_envelope(&json);
+    assert_eq!(envelope["verb"], "cache prune");
+    assert_eq!(envelope["data"]["root"], root_argument.as_str());
+    assert_eq!(envelope["data"]["dry_run"], false);
+    assert_eq!(envelope["data"]["totals"]["caches"], 3);
+    assert_eq!(envelope["data"]["totals"]["reclaimable"], 1);
+    assert_eq!(envelope["data"]["removed_bytes"], 5);
+    assert_eq!(
+        envelope["data"]["removed"][0]["session_id"],
+        vanished.to_string()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cache_prune_of_an_absent_root_is_an_empty_listing() {
+    let fixture = fixture();
+    let root = temporary_cache_root("absent");
+    let absent = root.join("never-created");
+    let absent_argument = absent.to_string_lossy().into_owned();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let listing = run(
+        &mut client,
+        &["cache", "prune", "--cache-root", &absent_argument],
+    );
+    assert_eq!(listing.code, exit::OK, "{}", listing.stderr);
+    assert_eq!(
+        listing.stdout,
+        format!(
+            "root {}\ntotal caches 0 bytes 0\nreclaimable 0 bytes 0\n\
+             dry-run; pass --yes to remove 0 caches\n",
+            absent.display()
+        )
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn cache_prune_rejects_an_unknown_sub_verb_a_stray_flag_and_a_remote_worker() {
+    let fixture = fixture();
+    let mut client = InProcessClient::new(&fixture.backend);
+
+    let unknown = run(&mut client, &["cache", "sweep"]);
+    assert_eq!(unknown.code, exit::USAGE);
+    assert!(
+        unknown.stderr.contains("unknown cache sub-verb 'sweep'"),
+        "{}",
+        unknown.stderr
+    );
+
+    let no_sub_verb = run(&mut client, &["cache"]);
+    assert_eq!(no_sub_verb.code, exit::USAGE);
+    assert!(
+        no_sub_verb.stderr.contains("cache requires 'prune'"),
+        "{}",
+        no_sub_verb.stderr
+    );
+
+    // A flag of another verb is refused instead of being ignored.
+    let stray = run(&mut client, &["cache", "prune", "--window", "14d"]);
+    assert_eq!(stray.code, exit::USAGE);
+    assert!(stray.stderr.contains("--window"), "{}", stray.stderr);
+
+    // The caches of a remote worker are not at a path derived from its address.
+    let remote = run(
+        &mut client,
+        &["cache", "prune", "--connect", "wss://worker.example/ws"],
+    );
+    assert_eq!(remote.code, exit::USAGE);
+    assert!(remote.stderr.contains("--cache-root"), "{}", remote.stderr);
+    assert_eq!(remote.stdout, "");
 }
 
 #[test]
