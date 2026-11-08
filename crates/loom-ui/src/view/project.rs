@@ -101,7 +101,7 @@ impl LoomView {
                 if view.project_snapshot_stale {
                     view.refresh_active_project_snapshot(cx);
                 }
-                view.schedule_project_poll(cx);
+                view.schedule_workspace_feed_poll(cx);
                 cx.notify();
             })
             .ok();
@@ -171,6 +171,135 @@ impl LoomView {
             }
         })
         .detach();
+    }
+
+    /// Marks the project whose records a feed event just changed for a fresh
+    /// read.
+    ///
+    /// The open project's snapshot is refreshed by
+    /// [`Self::refresh_active_project_snapshot`], which already coalesces
+    /// requests and queues an invalidation that arrives while one is in flight.
+    /// Every other known project joins the queue
+    /// [`Self::refresh_stale_project_snapshots`] drains, which is a set: a burst
+    /// of events for one project leaves one read behind. A project this client
+    /// does not know is ignored, because it becomes visible through the sessions
+    /// that make it up and `refresh_missing_project_snapshots` reads it then.
+    pub(crate) fn invalidate_project_snapshot(&mut self, project_id: loom_core::ProjectId) {
+        if self
+            .project_snapshot
+            .as_ref()
+            .is_some_and(|project| project.project_id == project_id)
+        {
+            self.project_snapshot_stale = true;
+            return;
+        }
+        if self
+            .project_tree_snapshots
+            .iter()
+            .any(|project| project.project_id == project_id)
+        {
+            self.stale_project_snapshots.insert(project_id);
+        }
+    }
+
+    /// Reads back every project a feed event touched, one request at a time.
+    ///
+    /// A project row renders the whole snapshot, so a delegated agent, task, or
+    /// worktree the feed reported is only visible once the project is read
+    /// again. The drain is single-flight and the queue is a set, so a burst of
+    /// events costs one read per project rather than one per event.
+    pub(crate) fn refresh_stale_project_snapshots(&mut self, cx: &mut Context<Self>) {
+        if self.stale_project_snapshots_refreshing || self.stale_project_snapshots.is_empty() {
+            return;
+        }
+        self.stale_project_snapshots_refreshing = true;
+        cx.spawn(async move |view, cx| {
+            loop {
+                let next = view.update(cx, |view, _| {
+                    while let Some(project_id) = view.stale_project_snapshots.iter().next().copied()
+                    {
+                        view.stale_project_snapshots.remove(&project_id);
+                        let Some(session_id) = view.known_project_root(project_id) else {
+                            continue;
+                        };
+                        let node_id = view
+                            .session_node_ids
+                            .get(&session_id)
+                            .cloned()
+                            .unwrap_or_else(|| view.default_backend_node_id.clone());
+                        let Some(backend) = view.node_backends.get(&node_id).cloned() else {
+                            continue;
+                        };
+                        return Some((project_id, session_id, backend));
+                    }
+                    view.stale_project_snapshots_refreshing = false;
+                    None
+                });
+                let Ok(Some((project_id, session_id, backend))) = next else {
+                    break;
+                };
+                let request = backend.submit(RequestEnvelope::new(ClientRequest::Project(
+                    ProjectRequest::GetProjectSnapshotForSession { session_id },
+                )));
+                let response = cx
+                    .background_spawn(async move { request.wait().await })
+                    .await;
+                view.update(cx, |view, cx| {
+                    match response.result {
+                        Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(snapshot)))
+                            if snapshot.project_id == project_id =>
+                        {
+                            // A project snapshot is authoritative for the agents
+                            // it carries, so their states are applied instead of
+                            // waiting for a full session reload.
+                            apply_project_agent_states(
+                                &mut view.sessions,
+                                &snapshot,
+                                view.active_session.id,
+                            );
+                            view.remember_project_snapshot(snapshot);
+                            cx.notify();
+                        }
+                        Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(_))) => {}
+                        Err(error) if error.code == ErrorCode::NotFound => {
+                            view.project_tree_snapshots
+                                .retain(|known| known.project_id != project_id);
+                        }
+                        Err(error) => view.record_backend_error("load project snapshot", error),
+                        Ok(response) => view.record_backend_error(
+                            "load project snapshot",
+                            unexpected_response("project snapshot", response),
+                        ),
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// The root session of a project this client already knows.
+    fn known_project_root(&self, project_id: loom_core::ProjectId) -> Option<AgentSessionId> {
+        self.project_snapshot
+            .iter()
+            .chain(self.project_tree_snapshots.iter())
+            .find(|project| project.project_id == project_id)
+            .map(|project| project.root_session_id)
+    }
+
+    /// Stores a snapshot as the client's copy of its project.
+    ///
+    /// The active project is the one the pane renders, so it is stored there as
+    /// well as in the tree's list of known projects; any other project only
+    /// belongs to the tree.
+    pub(crate) fn remember_project_snapshot(&mut self, snapshot: loom_core::ProjectSnapshot) {
+        let is_active_project = snapshot.root_session_id == self.active_session.id;
+        self.project_tree_snapshots
+            .retain(|known| known.project_id != snapshot.project_id);
+        if is_active_project {
+            self.project_snapshot = Some(snapshot.clone());
+        }
+        self.project_tree_snapshots.push(snapshot);
     }
 
     pub(crate) fn project_root_is_active(&self) -> bool {

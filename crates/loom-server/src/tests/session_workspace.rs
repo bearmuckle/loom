@@ -2502,3 +2502,297 @@ fn a_stale_cached_mirror_is_not_reused_for_the_next_session() {
     fs::remove_dir_all(&source).unwrap();
     let _ = fs::remove_dir_all(&mirror);
 }
+
+/// One workspace with two sessions, as a lifecycle feed client sees it.
+fn lifecycle_feed_fixture() -> (
+    Arc<InProcessBackend>,
+    InProcessConnection,
+    WorkspaceId,
+    AgentSessionId,
+    AgentSessionId,
+) {
+    let backend = InProcessBackend::new();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Lifecycle feed".to_owned(),
+        },
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+        created.result.unwrap()
+    else {
+        panic!("unexpected workspace response");
+    };
+    let create_session = |name: &str| {
+        let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: name.to_owned(),
+            },
+        )));
+        let ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) =
+            created.result.unwrap()
+        else {
+            panic!("unexpected session response");
+        };
+        session.id
+    };
+    let first = create_session("First");
+    let second = create_session("Second");
+    (backend, connection, workspace.id, first, second)
+}
+
+/// Reads the lifecycle feed the way the project tree does.
+type LifecycleFeedPage = (
+    Vec<loom_protocol::ServerEventEnvelope>,
+    Option<Vec<loom_core::AgentSessionSnapshot>>,
+    EventSequence,
+);
+
+fn read_lifecycle_feed(
+    connection: &InProcessConnection,
+    workspace_id: WorkspaceId,
+    after_sequence: Option<EventSequence>,
+    stream_epoch: Option<String>,
+) -> LifecycleFeedPage {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetWorkspaceSessionEvents {
+            workspace_id,
+            after_sequence,
+            stream_epoch,
+        },
+    )));
+    match response.result {
+        Ok(ServerResponse::Events(EventsResponse::WorkspaceSessionEvents {
+            workspace_id: returned,
+            events,
+            sessions,
+            latest_sequence,
+            next_after_sequence,
+            stream_epoch,
+        })) => {
+            assert_eq!(returned, workspace_id);
+            assert_eq!(next_after_sequence, None, "a small feed fits one page");
+            assert!(stream_epoch.is_some(), "the answer names the epoch it read");
+            assert!(
+                events.iter().all(|event| event.sequence <= latest_sequence),
+                "the head is behind an event the page carries"
+            );
+            (events, sessions, latest_sequence)
+        }
+        Err(error) => panic!("the lifecycle feed failed: {error}"),
+        Ok(response) => panic!("unexpected response: {response:?}"),
+    }
+}
+
+/// The lifecycle feed follows a workspace's catalog: a first read carries it,
+/// and later reads carry only the changes another client made.
+#[test]
+fn workspace_lifecycle_feed_reports_catalog_changes_only() {
+    let (backend, connection, workspace_id, first, second) = lifecycle_feed_fixture();
+
+    let (events, catalog, cursor) = read_lifecycle_feed(&connection, workspace_id, None, None);
+    let catalog = catalog.expect("a first read carries the catalog");
+    assert_eq!(catalog.len(), 2, "the catalog lists both sessions");
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.event,
+            loom_protocol::ServerEvent::AgentSessionCreated { snapshot } if snapshot.id == first
+        )),
+        "the first read carries the session creation events: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| lifecycle_event_is_reported(&event.event)),
+        "a first read carries an event no catalog reader renders: {events:?}"
+    );
+
+    // A rename another client makes is the only thing the next page carries.
+    connection
+        .request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::RenameAgentSession {
+                session_id: first,
+                name: "Renamed elsewhere".to_owned(),
+            },
+        )))
+        .result
+        .unwrap();
+    let (events, catalog, next_cursor) =
+        read_lifecycle_feed(&connection, workspace_id, Some(cursor), None);
+    assert!(catalog.is_none(), "an incremental page carries no catalog");
+    assert_eq!(events.len(), 1, "unexpected events: {events:?}");
+    assert!(
+        matches!(
+            &events[0].event,
+            loom_protocol::ServerEvent::AgentSessionRenamed { session_id, name, .. }
+                if *session_id == first && name == "Renamed elsewhere"
+        ),
+        "the page did not carry the rename: {events:?}"
+    );
+    assert!(next_cursor > cursor);
+
+    // Archiving is reported so the client can drop the row, and a resync reports
+    // the same session as archived instead of hiding it.
+    connection
+        .request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::ArchiveAgentSession { session_id: second },
+        )))
+        .result
+        .unwrap();
+    let (events, _, after_archive) =
+        read_lifecycle_feed(&connection, workspace_id, Some(next_cursor), None);
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.event,
+            loom_protocol::ServerEvent::AgentSessionArchived { session_id } if *session_id == second
+        )),
+        "the archive was not reported: {events:?}"
+    );
+    let (_, catalog, _) = read_lifecycle_feed(&connection, workspace_id, Some(after_archive), None);
+    assert!(catalog.is_none(), "an up-to-date read carries no catalog");
+    let (_, catalog, _) = read_lifecycle_feed(&connection, workspace_id, None, None);
+    let catalog = catalog.expect("a first read carries the catalog");
+    assert!(
+        catalog
+            .iter()
+            .any(|session| session.id == second && session.state == AgentSessionState::Archived),
+        "a resync must report the archived session as archived: {catalog:?}"
+    );
+
+    backend.shutdown().unwrap();
+}
+
+/// A run streams its transcript into the workspace feed, but the lifecycle feed
+/// a session tree reads carries none of it.
+#[test]
+fn workspace_lifecycle_feed_omits_run_content() {
+    let (backend, connection, workspace_id, first, _) = lifecycle_feed_fixture();
+    let (_, _, cursor) = read_lifecycle_feed(&connection, workspace_id, None, None);
+
+    let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id: first,
+            task: "say something".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            system_instructions: None,
+            repository_instructions: None,
+        },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunStarted(run)) = started.result.unwrap() else {
+        panic!("unexpected run response");
+    };
+    await_settled_run(&connection, run.id);
+
+    // The session's own stream carries the run's events, which is what the
+    // lifecycle feed has to leave out.
+    let session_events = connection.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetSessionEvents {
+            activity_detail: loom_protocol::ActivityDetail::Full,
+            session_id: Some(first),
+            workspace_id: None,
+            after_sequence: None,
+            stream_epoch: None,
+        },
+    )));
+    let session_event_count = match session_events.result.unwrap() {
+        ServerResponse::Events(EventsResponse::SessionEvents { events, .. })
+        | ServerResponse::Events(EventsResponse::SessionEventsSnapshot { events, .. }) => {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event.event, loom_protocol::ServerEvent::Agent { .. })),
+                "the run produced no session events to filter"
+            );
+            events.len()
+        }
+        response => panic!("unexpected response: {response:?}"),
+    };
+    let (events, _, _) = read_lifecycle_feed(&connection, workspace_id, Some(cursor), None);
+    assert!(
+        session_event_count > events.len(),
+        "the lifecycle feed carried as much as the session stream"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| lifecycle_event_is_reported(&event.event)),
+        "the lifecycle feed carried run content: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.event,
+            loom_protocol::ServerEvent::AgentSessionStateChanged { .. }
+        )),
+        "the run's session state changes belong in the feed: {events:?}"
+    );
+
+    backend.shutdown().unwrap();
+}
+
+/// A client that cannot reach the cursor it holds is given the catalog instead,
+/// and a connection without the workspace event capability is refused.
+#[test]
+fn workspace_lifecycle_feed_resynchronizes_and_requires_the_capability() {
+    let (backend, connection, workspace_id, first, _) = lifecycle_feed_fixture();
+    let (_, _, cursor) = read_lifecycle_feed(&connection, workspace_id, None, None);
+
+    // A worker under a new instance identity: the cursor describes another
+    // stream, so the answer is the catalog the client rebuilds its tree from.
+    let (events, catalog, head) = read_lifecycle_feed(
+        &connection,
+        workspace_id,
+        Some(cursor),
+        Some("a-previous-node".to_owned()),
+    );
+    assert!(events.is_empty(), "a resync repeats no events: {events:?}");
+    let catalog = catalog.expect("a resync carries the catalog");
+    assert!(catalog.iter().any(|session| session.id == first));
+    assert!(head >= cursor);
+
+    // A connection that did not negotiate the workspace event capability may
+    // not read the feed at all.
+    let limited = backend.connect();
+    let negotiated = limited.request(RequestEnvelope::with_version(
+        CURRENT_PROTOCOL_VERSION,
+        ClientRequest::Control(ControlRequest::Negotiate {
+            client_version: CURRENT_PROTOCOL_VERSION,
+            capabilities: CapabilitySet::new([Capability::SubscribeSessionEvents]),
+        }),
+    ));
+    assert!(negotiated.result.is_ok());
+    let refused = limited.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetWorkspaceSessionEvents {
+            workspace_id,
+            after_sequence: None,
+            stream_epoch: None,
+        },
+    )));
+    assert_eq!(
+        refused.result.unwrap_err().code,
+        ErrorCode::CapabilityDenied,
+        "the lifecycle feed must need the workspace event capability"
+    );
+
+    backend.shutdown().unwrap();
+}
+
+/// The events a session tree is built from, as the feed reports them.
+fn lifecycle_event_is_reported(event: &loom_protocol::ServerEvent) -> bool {
+    matches!(
+        event,
+        loom_protocol::ServerEvent::AgentSessionCreated { .. }
+            | loom_protocol::ServerEvent::AgentSessionStateChanged { .. }
+            | loom_protocol::ServerEvent::AgentSessionForked { .. }
+            | loom_protocol::ServerEvent::AgentSessionRenamed { .. }
+            | loom_protocol::ServerEvent::AgentSessionGoalChanged { .. }
+            | loom_protocol::ServerEvent::AgentSessionTitleSourceChanged { .. }
+            | loom_protocol::ServerEvent::AgentSessionArchived { .. }
+            | loom_protocol::ServerEvent::AgentSessionRestored { .. }
+            | loom_protocol::ServerEvent::ProjectAgentCreated { .. }
+            | loom_protocol::ServerEvent::ProjectAgentUpdated { .. }
+            | loom_protocol::ServerEvent::ProjectTaskUpdated { .. }
+            | loom_protocol::ServerEvent::ProjectChildWorktreeUpdated { .. }
+    )
+}

@@ -324,6 +324,269 @@ impl LoomView {
         }
     }
 
+    /// Applies a batch of the workspace session lifecycle feed to the tree.
+    ///
+    /// The feed is the only source that tells this client about work another
+    /// client did: a session `loom-cli` created, renamed, re-stated, archived, or
+    /// restored, and the project records a delegated child changed. A local
+    /// action and a remote one therefore land in the same state, because both
+    /// end up applying the same events.
+    ///
+    /// Returns whether the session list has to be read in full, which is only
+    /// the case for a restored session: the event names the session but carries
+    /// no snapshot, and this client dropped the row when it was archived.
+    pub(crate) fn apply_workspace_lifecycle_events(
+        &mut self,
+        node_id: &str,
+        events: Vec<loom_protocol::ServerEventEnvelope>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut reload = false;
+        for envelope in events {
+            let session_id = envelope.session_id;
+            match envelope.event {
+                ServerEvent::AgentSessionCreated { snapshot }
+                | ServerEvent::AgentSessionForked { snapshot, .. } => {
+                    if self.remember_workspace_session(node_id, snapshot) {
+                        // A session the tree has never listed may belong to a
+                        // project, so read it: a delegated child has to nest
+                        // under the project that delegated it instead of
+                        // appearing as a project of its own.
+                        self.refresh_missing_project_snapshots(cx);
+                    }
+                }
+                ServerEvent::AgentSessionStateChanged { current, .. } => {
+                    self.apply_workspace_session_state(session_id, current);
+                }
+                ServerEvent::AgentSessionRenamed {
+                    session_id,
+                    name,
+                    source,
+                } => {
+                    self.update_workspace_session(session_id, &|session| {
+                        session.name = name.clone();
+                        session.title_source = source;
+                    });
+                }
+                ServerEvent::AgentSessionTitleSourceChanged { session_id, source } => {
+                    self.update_workspace_session(session_id, &|session| {
+                        session.title_source = source;
+                    });
+                }
+                ServerEvent::AgentSessionGoalChanged { session_id, goal } => {
+                    self.update_workspace_session(session_id, &|session| {
+                        session.goal = goal.clone();
+                    });
+                }
+                ServerEvent::AgentSessionArchived { session_id } => {
+                    // A cascade archives a project's descendants as well, and
+                    // every one of them arrives as its own event, so each is
+                    // applied to the session it names.
+                    if session_id == self.active_session.id {
+                        self.session_state = AgentSessionState::Archived;
+                        self.active_session.state = AgentSessionState::Archived;
+                        self.update_session_list();
+                    } else {
+                        self.forget_archived_session(session_id);
+                    }
+                }
+                // The event names the session but carries no snapshot, and the
+                // row was dropped when it was archived, so the catalog is read
+                // again rather than guessed at.
+                ServerEvent::AgentSessionRestored { .. } => reload = true,
+                ServerEvent::ProjectAgentCreated { agent }
+                | ServerEvent::ProjectAgentUpdated { agent } => {
+                    self.invalidate_project_snapshot(agent.project_id);
+                }
+                ServerEvent::ProjectTaskUpdated { task } => {
+                    self.invalidate_project_snapshot(task.project_id);
+                }
+                ServerEvent::ProjectChildWorktreeUpdated { worktree } => {
+                    self.invalidate_project_snapshot(worktree.project_id);
+                }
+                // The rest of the workspace feed is run content: it belongs to
+                // the session-scoped stream of the one session that renders it.
+                _ => {}
+            }
+        }
+        self.refresh_stale_project_snapshots(cx);
+        reload
+    }
+
+    /// Inserts or replaces one session of the workspace catalog.
+    ///
+    /// The feed is workspace-scoped and the node that reported it owns the
+    /// session it names, so the owner is recorded with the row: a session the
+    /// tree has never seen has to be routable to the worker that reported it.
+    /// Returns whether the row was added or changed.
+    pub(crate) fn remember_workspace_session(
+        &mut self,
+        node_id: &str,
+        mut snapshot: AgentSessionSnapshot,
+    ) -> bool {
+        // The catalog the tree renders excludes archived sessions, and an
+        // archive arrives as its own event, so a created session that is
+        // already archived was archived before this client ever saw it.
+        if snapshot.state == AgentSessionState::Archived {
+            return false;
+        }
+        if snapshot.id == self.active_session.id {
+            // The open session's own event stream owns its state, so an older
+            // catalog entry must not regress it.
+            snapshot.state = self.active_session.state;
+        }
+        self.session_node_ids
+            .insert(snapshot.id, node_id.to_owned());
+        match self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == snapshot.id)
+        {
+            Some(existing) => {
+                let changed = *existing != snapshot;
+                *existing = snapshot;
+                changed
+            }
+            None => {
+                self.sessions.push(snapshot);
+                true
+            }
+        }
+    }
+
+    /// Applies `change` to the catalog entry of one session, and to the open
+    /// session when it is that session.
+    ///
+    /// Reading the catalog and reading the open session are two copies of the
+    /// same session, so an event has to reach both or the sidebar row and the
+    /// open pane would disagree. Returns whether anything changed.
+    pub(crate) fn update_workspace_session(
+        &mut self,
+        session_id: AgentSessionId,
+        change: &dyn Fn(&mut AgentSessionSnapshot),
+    ) -> bool {
+        let mut changed = false;
+        if let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        {
+            let before = session.clone();
+            change(session);
+            changed = *session != before;
+        }
+        if self.active_session.id == session_id {
+            let before = self.active_session.clone();
+            change(&mut self.active_session);
+            if self.active_session != before {
+                self.session_state = self.active_session.state;
+                self.update_session_list();
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Applies a session state the feed reports, in the catalog and in the
+    /// project snapshots that name the session as a delegated agent.
+    ///
+    /// A project row summarises its agents from the snapshot, so updating only
+    /// the sessions would leave the row reporting the state it held when the
+    /// snapshot was read.
+    pub(crate) fn apply_workspace_session_state(
+        &mut self,
+        session_id: AgentSessionId,
+        state: AgentSessionState,
+    ) -> bool {
+        let changed = self.update_workspace_session(session_id, &|session| session.state = state);
+        let mut snapshot_changed = false;
+        for project in self
+            .project_tree_snapshots
+            .iter_mut()
+            .chain(self.project_snapshot.iter_mut())
+        {
+            for agent in project
+                .agents
+                .iter_mut()
+                .filter(|agent| agent.session_id == session_id)
+            {
+                if agent.state != state {
+                    agent.state = state;
+                    snapshot_changed = true;
+                }
+            }
+        }
+        changed || snapshot_changed
+    }
+
+    /// Replaces one worker workspace's rows with the catalog the feed reported.
+    ///
+    /// A catalog arrives when this client cannot be brought up to date from
+    /// events alone: on the first poll, after the worker restarted under a new
+    /// instance identity, and after retention carried the cursor's window away.
+    /// It is authoritative for the workspace it names, so a session another
+    /// client archived or deleted disappears here — including a deletion, which
+    /// has no event of its own.
+    ///
+    /// Only the sessions of that one workspace on that one node are replaced:
+    /// the tree lists several workers and several workspaces, and the catalog of
+    /// one must not drop the rows of another.
+    pub(crate) fn apply_workspace_session_catalog(
+        &mut self,
+        node_id: &str,
+        workspace_id: WorkspaceId,
+        catalog: Vec<AgentSessionSnapshot>,
+    ) -> bool {
+        let signature = |sessions: &[AgentSessionSnapshot]| {
+            sessions
+                .iter()
+                .map(|session| {
+                    (
+                        session.id,
+                        session.name.clone(),
+                        session.state,
+                        session.updated_at,
+                        session.goal.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = signature(&self.sessions);
+        let previous = std::mem::take(&mut self.sessions);
+        for session in previous {
+            let in_scope = session.workspace_id == workspace_id
+                && self.session_node_ids.get(&session.id).map(String::as_str) == Some(node_id);
+            if !in_scope {
+                self.sessions.push(session);
+            }
+        }
+        // Archived sessions are not listed in this client's tree; the archive
+        // has either an event of its own or a catalog that omits the row.
+        let active_session = self.active_session.clone();
+        for session in catalog
+            .into_iter()
+            .filter(|session| session.state != AgentSessionState::Archived)
+            .map(|mut session| {
+                if session.id == active_session.id {
+                    // The open session's stream owns its state.
+                    session.state = active_session.state;
+                }
+                session
+            })
+        {
+            self.session_node_ids.insert(session.id, node_id.to_owned());
+            self.sessions.push(session);
+        }
+        let present = self
+            .sessions
+            .iter()
+            .map(|session| session.id)
+            .collect::<BTreeSet<_>>();
+        self.session_node_ids
+            .retain(|session_id, _| present.contains(session_id));
+        *signature(&self.sessions) != before
+    }
+
     pub(crate) fn consume_agent_event(&mut self, event: &AgentEvent) {
         match event {
             AgentEvent::RunStarted { snapshot } => {

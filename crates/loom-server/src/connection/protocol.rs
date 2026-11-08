@@ -731,6 +731,10 @@ impl InProcessConnection {
                 workspace_id: Some(requested_workspace),
                 ..
             }) => workspace_id = Some(*requested_workspace),
+            ClientRequest::Events(EventsRequest::GetWorkspaceSessionEvents {
+                workspace_id: requested_workspace,
+                ..
+            }) => workspace_id = Some(*requested_workspace),
             ClientRequest::Events(EventsRequest::GetRecentSessionEvents {
                 session_id: requested_session,
                 ..

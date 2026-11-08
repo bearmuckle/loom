@@ -186,7 +186,7 @@ fn applying_a_project_snapshot_stops_the_project_row_activity(cx: &mut TestAppCo
             }
             // A poll would replace the snapshot with one this backend cannot
             // answer, so keep the pane on the scenario it was given.
-            view.project_poll_scheduled = true;
+            view.workspace_feed_poll_scheduled = true;
             view
         });
         *rendered_for_window.borrow_mut() = Some(view.clone());
@@ -274,7 +274,7 @@ fn applying_a_project_snapshot_keeps_activity_while_a_child_runs(cx: &mut TestAp
                 .find(|session| session.id == worker_id)
                 .expect("the worker owns a session")
                 .state = AgentSessionState::Executing;
-            view.project_poll_scheduled = true;
+            view.workspace_feed_poll_scheduled = true;
             view
         });
         *rendered_for_window.borrow_mut() = Some(view.clone());

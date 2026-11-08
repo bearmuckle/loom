@@ -59,8 +59,7 @@ use loom_protocol::{
     RepositoryResponse, RequestEnvelope, ResponseEnvelope, RunRequest, RunResponse, ServerEvent,
     ServerResponse, SessionDirectory, SessionRepository, SessionRequest, SessionResponse,
     TaskRequest, TerminalRequest, ToolResult, UsageRequest, UsageResponse, WorkerNodeConfig,
-    WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, WorkspaceFeedEvent, WorkspaceRequest,
-    WorkspaceResponse,
+    WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, WorkspaceRequest, WorkspaceResponse,
 };
 #[cfg(not(target_family = "wasm"))]
 #[cfg(not(target_family = "wasm"))]
@@ -560,12 +559,16 @@ pub(crate) struct LoomView {
         loom_protocol::GitDiff,
     )>,
     project_snapshot_stale: bool,
+    /// Projects a feed event invalidated, read back one at a time. A set, so a
+    /// burst of events for one project leaves one read behind.
+    stale_project_snapshots: BTreeSet<loom_core::ProjectId>,
+    stale_project_snapshots_refreshing: bool,
     /// At most one active-pane snapshot request, across selection changes.
     project_snapshot_refreshing: Option<AgentSessionId>,
     missing_project_snapshots_refreshing: bool,
-    project_feed_after_sequence: Option<EventSequence>,
-    project_feed_epoch: Option<String>,
-    project_poll_scheduled: bool,
+    workspace_feed_after_sequence: Option<EventSequence>,
+    workspace_feed_epoch: Option<String>,
+    workspace_feed_poll_scheduled: bool,
     /// The left pane's project list: one row per project, in one scrolling
     /// region shared by every worker section.
     project_list: Option<Entity<ListState<render::sidebar::ProjectListDelegate>>>,
@@ -1893,37 +1896,6 @@ pub(crate) fn landing_session(
     )
 }
 
-fn workspace_feed_event_sequence(event: &WorkspaceFeedEvent) -> EventSequence {
-    match event {
-        WorkspaceFeedEvent::Session(event) => event.sequence,
-        WorkspaceFeedEvent::Workspace(event) => event.sequence,
-    }
-}
-
-fn is_project_workspace_event(
-    event: &WorkspaceFeedEvent,
-    project_id: loom_core::ProjectId,
-    member_ids: &BTreeSet<AgentSessionId>,
-) -> bool {
-    let WorkspaceFeedEvent::Session(event) = event else {
-        return false;
-    };
-    match &event.event {
-        ServerEvent::ProjectTaskUpdated { task } => task.project_id == project_id,
-        ServerEvent::ProjectChildWorktreeUpdated { worktree } => worktree.project_id == project_id,
-        ServerEvent::ProjectAgentMessageAccepted { message } => message.project_id == project_id,
-        ServerEvent::ProjectAgentCreated { agent } | ServerEvent::ProjectAgentUpdated { agent } => {
-            agent.project_id == project_id
-        }
-        ServerEvent::AgentSessionCreated { .. }
-        | ServerEvent::AgentSessionStateChanged { .. }
-        | ServerEvent::AgentSessionRenamed { .. }
-        | ServerEvent::AgentSessionGoalChanged { .. }
-        | ServerEvent::AgentSessionArchived { .. } => member_ids.contains(&event.session_id),
-        _ => false,
-    }
-}
-
 fn project_child_control_actions(
     state: AgentSessionState,
     status: loom_core::DelegatedTaskStatus,
@@ -2138,11 +2110,13 @@ impl LoomView {
             project_tree_snapshots: Vec::new(),
             project_child_review: None,
             project_snapshot_stale: false,
+            stale_project_snapshots: BTreeSet::new(),
+            stale_project_snapshots_refreshing: false,
             project_snapshot_refreshing: None,
             missing_project_snapshots_refreshing: false,
-            project_feed_after_sequence: None,
-            project_feed_epoch: None,
-            project_poll_scheduled: false,
+            workspace_feed_after_sequence: None,
+            workspace_feed_epoch: None,
+            workspace_feed_poll_scheduled: false,
             project_list: None,
             project_list_subscription: None,
             project_list_view: None,

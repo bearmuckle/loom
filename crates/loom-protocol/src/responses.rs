@@ -263,6 +263,31 @@ pub enum EventsResponse {
         #[serde(default)]
         stream_epoch: Option<String>,
     },
+
+    /// One page of a workspace's session lifecycle feed; see
+    /// [`EventsRequest::GetWorkspaceSessionEvents`].
+    ///
+    /// `sessions` carries the workspace's session catalog when the client has
+    /// to resynchronize its view of the tree: on a first read, after the
+    /// backend's stream epoch changed, and when the cursor no longer reaches
+    /// back far enough. Such a response carries no events, because the catalog
+    /// already is the state those events would have built.
+    ///
+    /// `latest_sequence` is the workspace feed head, so a client that received
+    /// no event still advances past the ones this subscription filters out.
+    /// `next_after_sequence` names the next page when the page was bounded to a
+    /// response frame, exactly like the other feeds.
+    WorkspaceSessionEvents {
+        workspace_id: WorkspaceId,
+        events: Vec<ServerEventEnvelope>,
+        #[serde(default)]
+        sessions: Option<Vec<AgentSessionSnapshot>>,
+        latest_sequence: EventSequence,
+        #[serde(default)]
+        next_after_sequence: Option<EventSequence>,
+        #[serde(default)]
+        stream_epoch: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

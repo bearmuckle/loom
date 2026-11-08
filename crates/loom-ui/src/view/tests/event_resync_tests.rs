@@ -33,7 +33,7 @@ fn event_page_continuations_keep_poll_ownership(cx: &mut TestAppContext) {
                 worktrees: Vec::new(),
             });
             if project_feed {
-                view.poll_project_once(cx);
+                view.poll_workspace_feed_once(cx);
             } else {
                 view.poll_run_once(cx);
             }
@@ -42,11 +42,13 @@ fn event_page_continuations_keep_poll_ownership(cx: &mut TestAppContext) {
         let workspace_id = view.read_with(cx, |view, _| view.active_session.workspace_id);
         let page = |next_after_sequence| {
             ServerResponse::Events(if project_feed {
-                EventsResponse::WorkspaceEvents {
+                EventsResponse::WorkspaceSessionEvents {
                     workspace_id,
                     events: Vec::new(),
-                    stream_epoch: Some("test".to_owned()),
+                    sessions: None,
+                    latest_sequence: EventSequence::new(1),
                     next_after_sequence,
+                    stream_epoch: Some("test".to_owned()),
                 }
             } else {
                 EventsResponse::SessionEvents {
@@ -68,8 +70,8 @@ fn event_page_continuations_keep_poll_ownership(cx: &mut TestAppContext) {
         let second = requests.try_recv().expect("the next page starts promptly");
         view.update(cx, |view, cx| {
             if project_feed {
-                assert!(view.project_poll_scheduled);
-                view.schedule_project_poll(cx);
+                assert!(view.workspace_feed_poll_scheduled);
+                view.schedule_workspace_feed_poll(cx);
             } else {
                 assert!(view.run_poll_scheduled);
                 view.schedule_run_poll(cx);
@@ -91,7 +93,7 @@ fn event_page_continuations_keep_poll_ownership(cx: &mut TestAppContext) {
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert!(!view.run_poll_scheduled);
-            assert!(!view.project_poll_scheduled);
+            assert!(!view.workspace_feed_poll_scheduled);
         });
         assert!(requests.try_recv().is_err());
     }
@@ -923,54 +925,58 @@ fn event_pages_are_followed_and_merged_into_one_batch() {
     );
 }
 
-/// The project feed is bounded the same way a session batch is, so the rule the
-/// project poll follows is the same one: a page names a cursor that moves
+/// The lifecycle feed is bounded the same way a session batch is, so the rule
+/// the tree poll follows is the same one: a page names a cursor that moves
 /// forward, and a response that is not a feed page never continues.
 #[test]
-fn workspace_feed_pages_are_followed_by_the_cursor_they_name() {
+fn workspace_lifecycle_pages_are_followed_by_the_cursor_they_name() {
     let workspace_id = WorkspaceId::new();
-    let feed_event = |sequence: u64| {
-        loom_protocol::WorkspaceFeedEvent::Workspace(loom_protocol::WorkspaceEventEnvelope {
+    let lifecycle_event =
+        |sequence: u64, session_id: AgentSessionId| loom_protocol::ServerEventEnvelope {
             protocol_version: loom_core::CURRENT_PROTOCOL_VERSION,
             sequence: EventSequence::new(sequence),
-            workspace_id,
-            event: loom_protocol::WorkspaceEvent::Renamed {
-                name: format!("name {sequence}"),
-            },
-        })
-    };
+            session_id,
+            event: ServerEvent::AgentSessionArchived { session_id },
+        };
+    let session_id = AgentSessionId::new();
     let page = |events, next_after_sequence| {
         loom_protocol::ResponseEnvelope::success(
             loom_core::RequestId::new(),
-            ServerResponse::Events(EventsResponse::WorkspaceEvents {
+            ServerResponse::Events(EventsResponse::WorkspaceSessionEvents {
                 workspace_id,
                 events,
-                stream_epoch: Some("node".to_owned()),
+                sessions: None,
+                latest_sequence: EventSequence::new(9),
                 next_after_sequence,
+                stream_epoch: Some("node".to_owned()),
             }),
         )
     };
 
-    let first = page(vec![feed_event(1)], Some(EventSequence::new(1)));
+    let first = page(
+        vec![lifecycle_event(1, session_id)],
+        Some(EventSequence::new(1)),
+    );
     assert_eq!(
-        workspace_feed_page_continuation(&first, None),
+        workspace_lifecycle_page_continuation(&first, None),
         Some((EventSequence::new(1), Some("node".to_owned())))
     );
     // A cursor that does not move forward cannot be followed, so it stops the
     // loop instead of asking for the same page forever.
     assert_eq!(
-        workspace_feed_page_continuation(&first, Some(EventSequence::new(1))),
+        workspace_lifecycle_page_continuation(&first, Some(EventSequence::new(1))),
         None
     );
-    // A page that reached the latest feed event names none.
-    let last = page(vec![feed_event(2)], None);
+    // A page that reached the latest event of the feed names none: the answer's
+    // head sequence carries the cursor instead.
+    let last = page(vec![lifecycle_event(2, session_id)], None);
     assert_eq!(
-        workspace_feed_page_continuation(&last, Some(EventSequence::new(1))),
+        workspace_lifecycle_page_continuation(&last, Some(EventSequence::new(1))),
         None
     );
     // A failure never continues.
     assert_eq!(
-        workspace_feed_page_continuation(
+        workspace_lifecycle_page_continuation(
             &loom_protocol::ResponseEnvelope::failure(
                 loom_core::RequestId::new(),
                 loom_core::LoomError::not_found("workspace", workspace_id),
@@ -981,53 +987,60 @@ fn workspace_feed_pages_are_followed_by_the_cursor_they_name() {
     );
 }
 
-/// The project poll answers a feed page and leaves the feed cursor where the
-/// answer reached, so a later poll continues from it instead of replaying the
-/// page. The fixture has no live child on purpose: a project with one re-arms the
-/// poll on a timer, which a synchronous test cannot wait out.
+/// The feed reports only catalog events, so a poll that carried none still has to
+/// move past the ones it filtered out: the answer's head sequence is the cursor,
+/// and the next poll asks from there instead of reading the same window again.
 #[cfg(not(target_family = "wasm"))]
 #[gpui_kit::test]
-fn a_project_poll_answers_a_feed_page_without_rewinding_the_cursor(cx: &mut TestAppContext) {
-    cx.update(gpui_kit::init);
-    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+fn a_feed_poll_advances_the_cursor_past_the_events_it_filtered(cx: &mut TestAppContext) {
+    let (backend, requests) = crate::backend_host::BackendWorker::deferred_for_test();
+    let view = cx.new(|cx| {
         let mut view = LoomView::new_for_test(cx.focus_handle());
-        let root = view.active_session.id;
-        let project_id = loom_core::ProjectId::from_uuid(*root.as_uuid());
-        view.project_snapshot = Some(loom_core::ProjectSnapshot {
-            project_id,
-            root_session_id: root,
-            parent_project_id: None,
-            agents: vec![loom_core::ProjectAgentRecord {
-                session_id: root,
-                project_id,
-                parent_session_id: None,
-                depth: 1,
-                state: AgentSessionState::Idle,
-                task_summary: None,
-                output_cursor: EventSequence::default(),
-                updated_at: Timestamp::from_unix_millis(1),
-            }],
-            tasks: Vec::new(),
-            worktrees: Vec::new(),
-        });
-        view.project_feed_after_sequence = Some(EventSequence::new(3));
-        view.poll_project_once(cx);
+        view.backend = backend.clone();
+        view.node_backends
+            .insert(view.default_backend_node_id.clone(), backend);
+        view.sessions = vec![view.active_session.clone()];
+        view.session_node_ids
+            .insert(view.active_session.id, view.default_backend_node_id.clone());
+        view.workspace_feed_after_sequence = Some(EventSequence::new(3));
+        view.poll_workspace_feed_once(cx);
         view
     });
+    let workspace_id = view.read_with(cx, |view, _| view.active_session.workspace_id);
+    let poll = requests.try_recv().expect("the tree poll reads the feed");
+    assert!(
+        matches!(
+            poll.request.request,
+            ClientRequest::Events(EventsRequest::GetWorkspaceSessionEvents {
+                workspace_id: polled,
+                after_sequence: Some(EventSequence { .. }),
+                ..
+            }) if polled == workspace_id
+        ),
+        "the poll must read the workspace's lifecycle feed"
+    );
+    poll.reply
+        .send(ResponseEnvelope::success(
+            poll.request.request_id,
+            ServerResponse::Events(EventsResponse::WorkspaceSessionEvents {
+                workspace_id,
+                events: Vec::new(),
+                sessions: None,
+                latest_sequence: EventSequence::new(7),
+                next_after_sequence: None,
+                stream_epoch: Some("test".to_owned()),
+            }),
+        ))
+        .unwrap();
     cx.run_until_parked();
-    cx.update_window(handle.into(), |_, window, cx| {
-        let view = window
-            .root::<LoomView>()
-            .flatten()
-            .expect("the view is mounted");
-        assert!(
-            view.read(cx)
-                .project_feed_after_sequence
-                .is_some_and(|cursor| cursor >= EventSequence::new(3)),
-            "the poll must leave the feed cursor at or past where it asked from"
+    view.read_with(cx, |view, _| {
+        assert_eq!(
+            view.workspace_feed_after_sequence,
+            Some(EventSequence::new(7)),
+            "the cursor advances to the head even when the page carried no event"
         );
-    })
-    .unwrap();
+        assert_eq!(view.workspace_feed_epoch, Some("test".to_owned()));
+    });
 }
 
 /// A poll that finds more events than one bounded response carries keeps asking

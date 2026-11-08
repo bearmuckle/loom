@@ -468,6 +468,30 @@ pub(crate) fn order_session_nodes(
     nodes
 }
 
+/// The cursor and stream epoch a bounded workspace session lifecycle page names
+/// for the page after it.
+///
+/// The lifecycle feed is bounded to one response frame like every other events
+/// response, so a backlog larger than that arrives as pages: every page after the
+/// first is named by the continuation cursor of the page before it, and a page
+/// that reached the latest event of the feed names none — the answer's
+/// `latest_sequence` then carries the cursor past the events this subscription
+/// filters out. A cursor that does not move forward cannot be followed, so it
+/// stops the caller's loop instead of asking for the same page forever.
+pub(crate) fn workspace_lifecycle_page_continuation(
+    response: &ResponseEnvelope,
+    cursor: Option<EventSequence>,
+) -> Option<(EventSequence, Option<String>)> {
+    match &response.result {
+        Ok(ServerResponse::Events(EventsResponse::WorkspaceSessionEvents {
+            next_after_sequence: Some(next),
+            stream_epoch,
+            ..
+        })) if Some(*next) > cursor => Some((*next, stream_epoch.clone())),
+        _ => None,
+    }
+}
+
 /// The cursor and stream epoch a bounded events page names for the page after
 /// it.
 ///
@@ -483,29 +507,6 @@ pub(crate) fn events_page_continuation(
 ) -> Option<(EventSequence, Option<String>)> {
     match &response.result {
         Ok(ServerResponse::Events(EventsResponse::SessionEvents {
-            next_after_sequence: Some(next),
-            stream_epoch,
-            ..
-        })) if Some(*next) > cursor => Some((*next, stream_epoch.clone())),
-        _ => None,
-    }
-}
-
-/// The cursor and stream epoch a bounded workspace feed page names for the page
-/// after it.
-///
-/// The project feed is bounded to one response frame for the same reason a
-/// session batch is, so a backlog larger than that arrives as pages: every page
-/// after the first is named by the continuation cursor of the page before it, and
-/// a page that reached the latest event of the feed names none. A cursor that
-/// does not move forward cannot be followed, so it stops the caller's loop
-/// instead of asking for the same page forever.
-pub(crate) fn workspace_feed_page_continuation(
-    response: &ResponseEnvelope,
-    cursor: Option<EventSequence>,
-) -> Option<(EventSequence, Option<String>)> {
-    match &response.result {
-        Ok(ServerResponse::Events(EventsResponse::WorkspaceEvents {
             next_after_sequence: Some(next),
             stream_epoch,
             ..

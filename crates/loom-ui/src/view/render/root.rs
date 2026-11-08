@@ -320,7 +320,7 @@ impl Render for LoomView {
         self.refresh_session_source_labels(cx);
         self.sync_model_select_states(window, cx);
         self.schedule_run_poll(cx);
-        self.schedule_project_poll(cx);
+        self.schedule_workspace_feed_poll(cx);
         let view = cx.entity();
         let layout = responsive_layout(window.bounds().size.width);
         // The left pane's rows are derived from the sessions and project
