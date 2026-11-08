@@ -2195,6 +2195,20 @@ impl LoomView {
             cx.notify();
             return;
         }
+        if is_ssh_worker_url(&url) {
+            // SSH provisions a worker; it is not a transport a browser can
+            // open. The deploy belongs to the native client, which tunnels to
+            // the worker it installed.
+            self.set_worker_node_connection_failure(
+                id,
+                &url,
+                "SSH deployment is only available in the native client. Connect the browser to a \
+                 ws:// or wss:// worker instead."
+                    .to_owned(),
+            );
+            cx.notify();
+            return;
+        }
         // Without a token the browser connects unsigned and signs in with
         // GitHub; with one it is an operator connection as before.
         let token = parts.next().map(str::to_owned).unwrap_or_default();

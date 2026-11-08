@@ -107,6 +107,13 @@ loom --ssh-remove user@host --delete-data
 
 `--ssh-identity <path>` and `--ssh-jump <host>` map to `ssh -i` and `ssh -J`.
 
+SSH is a deploy step, not a connection type. The native client provisions the
+host, starts the worker on the host's loopback, and reaches it through a local
+`ssh -L` tunnel; the `ssh://` address is never stored as a shared worker-node
+URL, because a browser client cannot open an SSH tunnel. A browser reaches a
+worker only over `ws://` (loopback) or `wss://` (network, with TLS); expose an
+SSH-deployed worker accordingly, or use the native client.
+
 What happens, using only the system `ssh` and no root on the host:
 
 1. `uname -sm` picks the release platform (Linux x86_64 or aarch64, or macOS).

@@ -5,9 +5,9 @@ use super::{
     WorkerConnectionStage, WorkerConnectionState, WorkerNodeEntry, adjusted_cpu_pulse_threshold,
     adjusted_project_agent_concurrency, assigned_node_id, classify_connectivity_failure,
     connection_placeholder, endpoint_is_remote, format_worker_node_resources,
-    format_worker_node_resources_compact, initial_worker_nodes, local_source_available,
-    mark_worker_connection_failed, merge_node_sessions, next_severe_load_streak,
-    order_session_nodes, project_child_control_actions,
+    format_worker_node_resources_compact, initial_worker_nodes, is_ssh_worker_url,
+    local_source_available, mark_worker_connection_failed, merge_node_sessions,
+    next_severe_load_streak, order_session_nodes, project_child_control_actions,
     project_snapshot_has_unloaded_agent_sessions, remove_worker_node_entry, safe_worker_url_label,
     session_id_for_request, session_status_pill, source_choice_is_allowed,
     source_dialog_initial_state, transition_worker_connection_to_connecting, uncovered_session_ids,
@@ -248,6 +248,15 @@ fn connectivity_copy_reuses_the_worker_connection_vocabulary_without_codes() {
 }
 
 #[test]
+fn ssh_worker_urls_are_deploy_targets_not_transports() {
+    assert!(is_ssh_worker_url("ssh://dev@box"));
+    assert!(is_ssh_worker_url("ssh://dev@box:2222"));
+    assert!(!is_ssh_worker_url("wss://worker.example/ws"));
+    assert!(!is_ssh_worker_url("ws://127.0.0.1:8765/ws"));
+    assert!(!is_ssh_worker_url("dev@box"));
+}
+
+#[test]
 fn duplicate_connection_attempts_are_blocked_and_url_labels_hide_credentials() {
     let mut state = WorkerConnectionState::Connecting;
     assert!(transition_worker_connection_to_connecting(&mut state, false).is_err());
@@ -338,6 +347,11 @@ fn worker_node_fixtures_preserve_local_connection_and_hide_url_credentials() {
             loom_protocol::WorkerNodeConfig {
                 url: "wss://remote-worker/ws".to_owned(),
             },
+            // A legacy shared config could carry an ssh:// deploy target; it is
+            // not a worker node and must not be restored as one.
+            loom_protocol::WorkerNodeConfig {
+                url: "ssh://deploy@host".to_owned(),
+            },
         ],
         ..loom_protocol::WorkspaceConfig::default()
     };
@@ -348,6 +362,11 @@ fn worker_node_fixtures_preserve_local_connection_and_hide_url_credentials() {
         Some("ws://local-worker/ws"),
     );
     assert_eq!(nodes.len(), 2);
+    assert!(nodes.iter().all(|node| {
+        node.url
+            .as_deref()
+            .is_none_or(|url| !url.starts_with("ssh://"))
+    }));
     assert!(nodes[0].is_local);
     assert!(nodes[0].remote_startup);
     assert_eq!(nodes[0].connection_state, WorkerConnectionState::Connected);

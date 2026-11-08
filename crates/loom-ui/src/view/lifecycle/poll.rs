@@ -520,7 +520,13 @@ impl LoomView {
                     && node.connection.is_none()
                     && node.connection_state != WorkerConnectionState::Connecting
             })
-            .filter_map(|node| node.url.as_ref().map(|url| (node.id, url.clone())))
+            .filter_map(|node| {
+                let url = node.url.as_ref()?;
+                // An ssh:// node is a deploy target, not a transport: only the
+                // native client can provision it, so a saved one from an older
+                // client is not reconnected here.
+                (!is_ssh_worker_url(url)).then(|| (node.id, url.clone()))
+            })
             .collect::<Vec<_>>();
         if candidates.is_empty() {
             return;

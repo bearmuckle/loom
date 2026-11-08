@@ -396,6 +396,16 @@ fn format_bytes_compact(value: Option<u64>) -> String {
     }
 }
 
+/// Whether `url` names an SSH deploy target rather than a WebSocket endpoint.
+///
+/// SSH installs and starts a worker; it is not a transport. Only the native
+/// client can use it (it provisions the host and tunnels to the worker), so an
+/// `ssh://` URL must never become a shared worker-node address that a browser
+/// client would try to open.
+pub(crate) fn is_ssh_worker_url(url: &str) -> bool {
+    url.starts_with("ssh://")
+}
+
 pub(crate) fn worker_node_display_name(node: &WorkerNodeEntry) -> String {
     if node.is_local && !node.remote_startup {
         // The worker on this machine needs no identity line: its address and
@@ -3351,6 +3361,13 @@ pub(crate) fn initial_worker_nodes(
     }];
     for configured in &config.worker_nodes {
         if local_url == Some(configured.url.as_str()) {
+            continue;
+        }
+        // An ssh:// entry is a deploy target, not an endpoint (older clients
+        // persisted them into the shared config). Browsers cannot open it and
+        // the native client deploys it explicitly, so it is not restored as a
+        // worker node.
+        if is_ssh_worker_url(&configured.url) {
             continue;
         }
         nodes.push(connection_placeholder(

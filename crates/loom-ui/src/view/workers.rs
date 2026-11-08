@@ -79,6 +79,7 @@ impl LoomView {
             .worker_nodes
             .iter()
             .any(|node| node.url == url)
+            && !is_ssh_worker_url(&url)
         {
             self.workspace_config
                 .worker_nodes

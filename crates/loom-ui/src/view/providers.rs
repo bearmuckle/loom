@@ -781,7 +781,13 @@ impl LoomView {
         cx: &mut Context<Self>,
     ) {
         let home_workspace_id = self.workspace_id;
-        let config = self.workspace_config.clone();
+        let mut config = self.workspace_config.clone();
+        // An ssh:// entry is a deploy target, not a worker endpoint. Older
+        // clients shared them in this config; drop them so a browser client is
+        // never handed an address it cannot open.
+        config
+            .worker_nodes
+            .retain(|node| !is_ssh_worker_url(&node.url));
         let source = self.connection.clone();
         let peers = self
             .worker_nodes
