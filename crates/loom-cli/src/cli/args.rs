@@ -1156,6 +1156,10 @@ Examples:
 
 Print the newest events of a session, without following it.
 
+Each text line is <seq> <time> <kind> <body>. <time> is the time the event
+records for itself when it records one (activities and run start/completion) and
+the time this read saw it otherwise, as RFC 3339 UTC with milliseconds.
+
 Flags:
   --session <id>              the session to read (required)
   --lines <n>                 how many events to ask for (200 by default)
@@ -1358,7 +1362,9 @@ Examples:
         "status",
         r#"Usage: loom-cli status --session <id> [--format text|verb] [--tree]
 
-Report the session and its latest run.
+Report the session and its latest run, and the tool call the run is executing
+right now: its name, its id, how long it has been running, and its arguments
+with credentials redacted and an over-long payload bounded.
 
 Flags:
   --session <id>              the session to report (required)

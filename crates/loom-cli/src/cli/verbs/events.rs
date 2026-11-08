@@ -30,7 +30,7 @@
 
 use std::{io::Write, path::Path, time::Duration};
 
-use loom_core::EventSequence;
+use loom_core::{EventSequence, Timestamp};
 use loom_protocol::{
     ActivityDetail, ClientRequest, EventsRequest, EventsResponse, ServerEvent, ServerEventEnvelope,
     ServerResponse,
@@ -178,6 +178,7 @@ pub(super) async fn events<C: Client>(
                 envelope,
                 page.stream_epoch.as_deref(),
                 &projected,
+                None,
             )?;
             floor = Some(sequence);
             printed += 1;
@@ -305,8 +306,13 @@ pub(super) async fn peek<C: Client>(
         _ => return Err(Failure::unexpected(request_id, "recent session events")),
     };
     let mut rendered = Vec::new();
+    // The wire envelope carries no timestamp of its own, so an event that records
+    // a time is named by it and every other event is named by the moment this
+    // read saw it.
+    let read_at = Timestamp::now();
     for envelope in &events {
         let projected = text::render(&envelope.event, args.max_bytes);
+        let at = text::event_time(&envelope.event).unwrap_or(read_at);
         emit_event(
             out,
             &mut rendered,
@@ -315,6 +321,7 @@ pub(super) async fn peek<C: Client>(
             envelope,
             stream_epoch.as_deref(),
             &projected,
+            Some(at),
         )?;
     }
     Ok(Outcome::new(json!({ "events": rendered }), caller.primary))
@@ -377,6 +384,10 @@ impl Gap {
 
 /// Prints one event as its text line or its JSON line, and records the JSON form
 /// for a `--json` envelope.
+///
+/// `at` is the time `peek` reports for the line: text carries it before the kind
+/// and JSON adds it as `at`. `events` passes `None` and keeps its documented
+/// `<seq> <kind> <body>` shape.
 #[allow(clippy::too_many_arguments)]
 fn emit_event(
     out: &mut dyn Write,
@@ -386,33 +397,52 @@ fn emit_event(
     envelope: &ServerEventEnvelope,
     stream_epoch: Option<&str>,
     projected: &Rendered,
+    at: Option<Timestamp>,
 ) -> Result<(), Failure> {
+    let at_text = at.map(text::format_timestamp);
     if json_output {
-        rendered.push(text::json_line(
-            envelope.sequence,
+        rendered.push(json_event(
+            envelope,
             stream_epoch,
-            &envelope.session_id.to_string(),
             projected,
-            &envelope.event,
+            at_text.as_deref(),
         ));
         return Ok(());
     }
     match format {
-        Format::Text => emit(out, &text::line(envelope.sequence, projected)),
+        Format::Text => match at {
+            Some(at) => emit(out, &text::line_at(envelope.sequence, at, projected)),
+            None => emit(out, &text::line(envelope.sequence, projected)),
+        },
         Format::Jsonl => emit(
             out,
             &format!(
                 "{}\n",
-                text::json_line(
-                    envelope.sequence,
-                    stream_epoch,
-                    &envelope.session_id.to_string(),
-                    projected,
-                    &envelope.event,
-                )
+                json_event(envelope, stream_epoch, projected, at_text.as_deref())
             ),
         ),
     }
+}
+
+/// The JSON object one event becomes, carrying the time `peek` reports as `at`
+/// when it reports one.
+fn json_event(
+    envelope: &ServerEventEnvelope,
+    stream_epoch: Option<&str>,
+    projected: &Rendered,
+    at: Option<&str>,
+) -> Value {
+    let mut line = text::json_line(
+        envelope.sequence,
+        stream_epoch,
+        &envelope.session_id.to_string(),
+        projected,
+        &envelope.event,
+    );
+    if let Some(at) = at {
+        line["at"] = json!(at);
+    }
+    line
 }
 
 fn write_cursor(
