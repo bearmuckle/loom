@@ -1022,6 +1022,12 @@ impl Verb {
             | Verb::RetentionSet(_)
             | Verb::ProvidersList
             | Verb::ProvidersSetKey(_)
+            | Verb::ProvidersAdd(_)
+            | Verb::ProvidersRemove { .. }
+            | Verb::ProvidersDiscover { .. }
+            | Verb::JevStatus(_)
+            | Verb::JevAsk(_)
+            | Verb::JevTriage(_)
             | Verb::ModelsList { .. }
             | Verb::Send { .. }
             | Verb::Answer { .. }

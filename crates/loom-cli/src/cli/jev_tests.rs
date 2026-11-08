@@ -1113,7 +1113,7 @@ fn parse_arguments(arguments: &[&str]) -> Result<Parsed, String> {
 
 fn invocation(arguments: &[&str]) -> args::Invocation {
     match parse_arguments(arguments) {
-        Ok(Parsed::Run(invocation)) => invocation,
+        Ok(Parsed::Run(invocation)) => *invocation,
         Ok(Parsed::Help(_)) => panic!("{arguments:?} parsed as help"),
         Err(message) => panic!("{arguments:?} was rejected: {message}"),
     }

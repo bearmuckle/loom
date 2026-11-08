@@ -12220,7 +12220,9 @@ fn a_unique_short_session_id_names_the_session_it_prefixes() {
     assert_eq!(events.code, exit::OK, "{}", events.stderr);
     let peek = run(&mut client, &["peek", "--session", &short, "--lines", "5"]);
     assert_eq!(peek.code, exit::OK, "{}", peek.stderr);
-    assert_eq!(peek.stdout, events.stdout);
+    let peek_full = run(&mut client, &["peek", "--session", &full, "--lines", "5"]);
+    assert_eq!(peek_full.code, exit::OK, "{}", peek_full.stderr);
+    assert_eq!(peek.stdout, peek_full.stdout);
     let liveness = run(&mut client, &["liveness", "--session", &short]);
     assert_eq!(liveness.code, exit::OK, "{}", liveness.stderr);
     assert_eq!(liveness.stdout, format!("liveness alive {session_id}\n"));
