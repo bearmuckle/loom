@@ -33,11 +33,30 @@ const QUESTION: &str = "Which branch should I use for the release? I can cut the
 /// The answers the call offers. A click on one sends exactly its text.
 const CHOICES: [&str; 2] = ["Cut it from main now", "Wait for the documentation fixes"];
 
+/// An option long enough that it cannot fit on one line of the question card at
+/// a narrow width, where a one-line button used to ellipsise it.
+const LONG_CHOICE: &str = "Cut the release from the branch that already carries every \
+    documentation fix, tag it, publish the notes and wait for the mirror to catch up";
+
+/// An option with no space to break at, so wrapping has to split the word
+/// itself instead of letting it run past the card.
+const LONG_WORD: &str =
+    "release-candidate-2026-10-26-documentation-and-changelog-verification-branch-with-notes";
+
 fn question_call() -> ToolCall {
     ToolCall {
         id: ToolCallId::new(),
         name: ASK_USER_TOOL.to_owned(),
         arguments: serde_json::json!({"prompt": QUESTION, "options": CHOICES}),
+    }
+}
+
+/// A question call that offers `choices`, so a test can pick the option text.
+fn question_call_with(choices: &[&str]) -> ToolCall {
+    ToolCall {
+        id: ToolCallId::new(),
+        name: ASK_USER_TOOL.to_owned(),
+        arguments: serde_json::json!({"prompt": QUESTION, "options": choices}),
     }
 }
 
@@ -160,6 +179,42 @@ fn open_question_view(
     (handle, view, call)
 }
 
+/// Opens the view on a question that offers `choices` instead of the fixture's
+/// own options.
+fn open_choice_view(
+    cx: &mut TestAppContext,
+    window_size: gpui_kit::Size<gpui_kit::Pixels>,
+    choices: &[&str],
+) -> (AnyWindowHandle, Entity<LoomView>) {
+    let call = question_call_with(choices);
+    open_timeline_view(
+        cx,
+        window_size,
+        question_timeline(&call),
+        vec![question_activity(&call)],
+        Some(QUESTION.to_owned()),
+    )
+}
+
+/// The bounds of the first choice row and of the text it paints.
+fn choice_text_bounds(
+    cx: &mut TestAppContext,
+    handle: AnyWindowHandle,
+) -> (
+    gpui_kit::Bounds<gpui_kit::Pixels>,
+    gpui_kit::Bounds<gpui_kit::Pixels>,
+) {
+    cx.update_window(handle, |_, window, cx| {
+        window.render_frame(cx);
+        let row = window.find(("agent-question-choice", question_choice_id(0, 0, 0)));
+        let text = window.find(("agent-question-choice-text", question_choice_id(0, 0, 0)));
+        assert!(row.visible(), "the choice must render");
+        assert!(text.visible(), "the choice text must render");
+        (row.bounds(), text.bounds())
+    })
+    .unwrap()
+}
+
 /// The height of the question text block in a freshly opened window.
 fn question_text_height(
     cx: &mut TestAppContext,
@@ -228,6 +283,9 @@ fn the_call_renders_the_whole_question_with_its_choices(cx: &mut TestAppContext)
             assert!(button.visible(), "the choice {choice} must render");
             let announced = format!("Answer the agent question with {choice}");
             assert_eq!(button.label(), Some(announced.as_str()));
+            // A choice the open question offers is an active target: the
+            // snapshot reports a disabled flag only when one is set.
+            assert_eq!(button.disabled(), None);
         }
         assert!(window.find(("agent-question-answer", key)).visible());
 
@@ -244,6 +302,68 @@ fn the_call_renders_the_whole_question_with_its_choices(cx: &mut TestAppContext)
         );
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_long_choice_wraps_onto_more_lines_instead_of_clipping(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    // The same long option at a phone width and at a desktop width: where it
+    // does not fit, the text wraps and the row grows instead of ellipsising.
+    let (phone_handle, _phone_view) =
+        open_choice_view(cx, size(px(360.), px(844.)), &[LONG_CHOICE]);
+    let (phone_row, phone_text) = choice_text_bounds(cx, phone_handle);
+
+    let (desktop_handle, _desktop_view) =
+        open_choice_view(cx, size(px(1280.), px(800.)), &[LONG_CHOICE]);
+    let (desktop_row, desktop_text) = choice_text_bounds(cx, desktop_handle);
+
+    assert!(
+        desktop_text.size.height < phone_text.size.height,
+        "the long option must fit on fewer lines when there is room: {desktop_text:?} vs {phone_text:?}"
+    );
+    assert!(
+        phone_text.size.height > desktop_text.size.height * 2.,
+        "the long option must wrap onto several lines at a phone width: {phone_text:?} vs {desktop_text:?}"
+    );
+    // Wrapping the text grows the row, so no line is pushed outside it.
+    assert!(
+        phone_row.size.height > desktop_row.size.height,
+        "the row must grow with its wrapped text: {phone_row:?} vs {desktop_row:?}"
+    );
+    assert!(
+        phone_text.bottom() <= phone_row.bottom() + px(1.),
+        "the wrapped text runs below its choice: {phone_text:?} in {phone_row:?}"
+    );
+    assert!(
+        phone_row.right() <= px(360.),
+        "the choice runs off the phone screen: {phone_row:?}"
+    );
+}
+
+#[gpui_kit::test]
+fn a_long_unbroken_word_stays_inside_the_choice(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    // A word with no space to break at still has to stay inside the row rather
+    // than overflow the question card.
+    let (narrow_handle, _narrow_view) =
+        open_choice_view(cx, size(px(320.), px(844.)), &[LONG_WORD]);
+    let (narrow_row, narrow_text) = choice_text_bounds(cx, narrow_handle);
+
+    let (wide_handle, _wide_view) = open_choice_view(cx, size(px(1280.), px(800.)), &[LONG_WORD]);
+    let (_wide_row, wide_text) = choice_text_bounds(cx, wide_handle);
+
+    assert!(
+        narrow_text.size.height > wide_text.size.height,
+        "the long word must break onto more lines at a narrow width: {narrow_text:?} vs {wide_text:?}"
+    );
+    assert!(
+        narrow_text.right() <= narrow_row.right() + px(1.),
+        "the long word runs past its choice: {narrow_text:?} in {narrow_row:?}"
+    );
+    assert!(
+        narrow_text.bottom() <= narrow_row.bottom() + px(1.),
+        "the long word runs below its choice: {narrow_text:?} in {narrow_row:?}"
+    );
 }
 
 #[gpui_kit::test]
@@ -382,6 +502,13 @@ fn a_choice_sends_nothing_once_the_question_is_answered(cx: &mut TestAppContext)
             window
                 .find(("agent-question", tool_element_id(0, 0)))
                 .visible()
+        );
+        assert_eq!(
+            window
+                .find(("agent-question-choice", question_choice_id(0, 0, 0)))
+                .disabled(),
+            Some(true),
+            "the choices of a question the run moved past are shut"
         );
         window.click(("agent-question-choice", question_choice_id(0, 0, 0)), cx);
         window.render_frame(cx);
