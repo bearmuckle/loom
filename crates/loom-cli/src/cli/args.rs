@@ -111,6 +111,13 @@ Verbs:
                 [--sub-agent <duration>]
                                     store a worker-wide archive-retention
                                     policy; the next sweep applies it
+  cache prune [--yes] [--cache-root <path>]
+                                    list the per-session build caches of the
+                                    connected worker's instance with their
+                                    sizes and the state of the session that
+                                    owns each one; --yes removes the caches of
+                                    archived and of deleted sessions, never
+                                    those of a session that still exists
   providers list                    list configured providers and whether
                                     each has a credential; prints no secrets
   providers add --id <id> --kind openai-compatible --endpoint <url>
@@ -364,6 +371,24 @@ call is one of the read tools (`read_file`, `list_files`, `search_text`,
 reports. Anything else is reported as a skip and nothing is approved. A
 suggestion is always advisory: it is this client's reading of one model answer
 and never a substitute for `approve`.
+
+`cache prune` is the repair tool for the build output agents leave behind. Each
+session's build output lives outside its checkout in
+`<state dir>/<host>_<port>/state.build-cache/<session-id>`, so archiving or
+deleting a session reclaims it and a start sweeps the caches of sessions that no
+longer exist. `cache prune` lists what is still there, with the size of each
+cache and the state the worker reports for the session that owns it, and never
+removes anything without `--yes`. Even with `--yes` it only removes a cache
+whose session is archived or gone: a cache of a living session is listed and
+kept, because that session may still be building, and an entry the worker's
+catalog knows nothing about is only removed while its name is a session id. The
+worker is asked first and is the authority on the states, so the verb needs a
+reachable worker even though it reads the directory itself. The directory is
+derived from the connected URL exactly like the default token file, which is
+what lets the verb find the instance of a worker on this machine;
+`--cache-root <path>` names the directory instead, and is required when the
+worker is not a loopback address, because then the caches are not on this
+machine at a path this client can derive.
 
 Global flags, accepted anywhere as --flag value or --flag=value:
   --connect <url>             worker WebSocket URL (fallback LOOM_URL, then
@@ -714,6 +739,18 @@ pub(crate) struct RetentionSetArgs {
     pub sub_agent_ms: Option<Option<u64>>,
 }
 
+/// The flags of `cache prune`.
+///
+/// `yes` is what turns the listing into a removal. `root` names the build-cache
+/// directory instead of the one derived from the connected URL, which is what a
+/// worker behind `--instance-name` or an explicit `--persistence`, or one on
+/// another host, needs.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CachePruneArgs {
+    pub yes: bool,
+    pub root: Option<PathBuf>,
+}
+
 /// Where the `jev` verbs find their key and which endpoint and model they call.
 ///
 /// The secret is never stored here: the verb reads the file when it runs, so a
@@ -847,6 +884,9 @@ pub(crate) enum Verb {
     },
     RetentionGet,
     RetentionSet(RetentionSetArgs),
+    /// `cache prune`: list the per-session build caches, and remove the ones of
+    /// archived or vanished sessions under `--yes`.
+    CachePrune(CachePruneArgs),
     ProvidersList,
     ProvidersSetKey(ProviderSetKeyArgs),
     /// `providers add`: register an OpenAI-compatible provider.
@@ -1020,6 +1060,7 @@ impl Verb {
             | Verb::Ls { .. }
             | Verb::RetentionGet
             | Verb::RetentionSet(_)
+            | Verb::CachePrune(_)
             | Verb::ProvidersList
             | Verb::ProvidersSetKey(_)
             | Verb::ProvidersAdd(_)
@@ -1146,6 +1187,7 @@ pub(crate) fn verb_name(verb: &Verb) -> &'static str {
         Verb::Result { .. } => "result",
         Verb::RetentionGet => "retention get",
         Verb::RetentionSet(_) => "retention set",
+        Verb::CachePrune(_) => "cache prune",
         Verb::ProvidersList => "providers list",
         Verb::ProvidersSetKey(_) => "providers set-key",
         Verb::ProvidersAdd(_) => "providers add",
@@ -1222,6 +1264,7 @@ pub(crate) fn named_verb(arguments: &[String]) -> &'static str {
             "liveness" => "liveness",
             "result" => "result",
             "retention" => "retention",
+            "cache" => "cache",
             "providers" => "providers",
             "jev" => "jev",
             "models" => "models",
@@ -2447,6 +2490,55 @@ Examples:
   loom-cli jev triage --session <session-id> --apply --threshold 0.95 --json
 "#,
     ),
+    (
+        "cache",
+        r#"Usage: loom-cli cache prune [--yes] [--cache-root <path>]
+
+List the per-session build caches of the connected worker's instance, or remove
+the ones no session can use again.
+
+Sub-verbs:
+  prune                       list the caches, or remove the reclaimable ones
+
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli cache prune
+  loom-cli cache prune --yes
+"#,
+    ),
+    (
+        "cache prune",
+        r#"Usage: loom-cli cache prune [--yes] [--cache-root <path>]
+
+List every per-session build cache of the connected worker's instance with its
+size and the state of the session that owns it. The command is a dry run unless
+--yes is given, and even then it only removes a cache whose session is archived
+or no longer exists: a cache of a session that still exists is always kept, and
+an entry named by something that is not a session id is never removed.
+
+Archiving a session and deleting one already reclaim its cache, and a worker
+sweeps the caches of vanished sessions when it starts, so this is the repair
+tool for what a failed removal or an interrupted process left behind. Reaching
+the worker is required because the worker reports the session states.
+
+Flags:
+  --yes                       remove the reclaimable caches instead of only
+                              listing them
+  --cache-root <path>         the build-cache directory to inspect; by default
+                              <state dir>/<host>_<port>/state.build-cache is
+                              derived from the connected URL, which only names
+                              a directory on this machine, so a non-loopback
+                              worker needs this flag
+  --json                      print one JSON envelope instead of text
+Global flags are accepted anywhere; see 'loom-cli --help'.
+
+Examples:
+  loom-cli cache prune
+  loom-cli cache prune --cache-root ~/.local/state/loom/worker/state.build-cache
+  loom-cli cache prune --yes --json
+"#,
+    ),
 ];
 
 /// The help text a command line asking for help prints: the named verb's page
@@ -2499,6 +2591,7 @@ fn arity(name: &str) -> Option<bool> {
         | "--as-directory" | "--approval-policy" | "--request-id" | "--text-file" => true,
         "--run" | "--text" | "--tool-call" | "--reason" | "--until" | "--timeout" => true,
         "--window" | "--force-discard" | "--sub-agent" => true,
+        "--cache-root" => true,
         "--provider" | "--from-env" | "--key-file" | "--key" | "--api-key" => true,
         "--id" | "--kind" | "--endpoint" | "--default-model" => true,
         "--expected-parent-revision" | "--project" => true,
@@ -2838,6 +2931,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
             }
         }
         "retention" => parse_retention(&mut flags, rest)?,
+        "cache" => parse_cache(&mut flags, rest)?,
         "providers" => parse_providers(&mut flags, rest)?,
         "models" => parse_models(&mut flags, rest)?,
         "jev" => parse_jev(&mut flags, rest)?,
@@ -3004,6 +3098,32 @@ fn parse_retention(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String>
         other => Err(format!(
             "unknown retention sub-verb '{other}'; use get or set"
         )),
+    }
+}
+
+/// The `cache` sub-verbs. `prune` is the one: it lists the per-session build
+/// caches and, with `--yes`, removes the caches no session can use again.
+fn parse_cache(flags: &mut FlagSet, rest: &[String]) -> Result<Verb, String> {
+    let Some(sub_verb) = rest.first() else {
+        return Err("cache requires 'prune'".to_owned());
+    };
+    if rest.len() > 1 {
+        return Err(format!("cache takes one sub-verb, got '{}'", rest[1]));
+    }
+    flags.verb = format!("cache {sub_verb}");
+    match sub_verb.as_str() {
+        "prune" => {
+            let root = match flags.value("--cache-root") {
+                Some(value) if !value.trim().is_empty() => Some(PathBuf::from(value)),
+                Some(_) => return Err("--cache-root requires a path".to_owned()),
+                None => None,
+            };
+            Ok(Verb::CachePrune(CachePruneArgs {
+                yes: flags.flag("--yes"),
+                root,
+            }))
+        }
+        other => Err(format!("unknown cache sub-verb '{other}'; use prune")),
     }
 }
 
@@ -3933,7 +4053,7 @@ pub(crate) fn resolve_token_file(
 /// between `scheme://` and the first `/`, `?`, or `#`, minus any user
 /// information. `None` means the URL names no authority this client can address,
 /// and the caller reports that instead of guessing a token path.
-fn ws_authority(url: &str) -> Option<(String, u16)> {
+pub(crate) fn ws_authority(url: &str) -> Option<(String, u16)> {
     let (scheme, rest) = url.split_once("://")?;
     let default_port = match scheme.trim().to_ascii_lowercase().as_str() {
         "ws" => 80,
@@ -3967,7 +4087,7 @@ fn ws_authority(url: &str) -> Option<(String, u16)> {
 /// The instance-directory key of a host and port: the same transform
 /// [`loom_core::bind_key`] applies to a socket address, so a hostname maps the
 /// same way a literal address does.
-fn authority_key(host: &str, port: u16) -> String {
+pub(crate) fn authority_key(host: &str, port: u16) -> String {
     format!("{host}:{port}")
         .chars()
         .filter(|value| !matches!(value, '[' | ']'))
@@ -3975,11 +4095,22 @@ fn authority_key(host: &str, port: u16) -> String {
         .collect()
 }
 
+/// Whether `host` names a loopback address, so a worker the URL names runs on
+/// this machine. An IPv6 literal arrives bracketed from [`ws_authority`].
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    host == "localhost"
+        || host == "::1"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 /// Expands a leading `~/` (or a bare `~`) with `home`. Any other path, including
 /// `~user` and a path with no `~` at all, is returned unchanged, and a path whose
 /// home is unknown is returned unchanged as well so the error names what the
 /// caller wrote.
-fn expand_home(path: PathBuf, home: Option<&Path>) -> PathBuf {
+pub(crate) fn expand_home(path: PathBuf, home: Option<&Path>) -> PathBuf {
     let mut components = path.components();
     if !matches!(components.next(), Some(Component::Normal(first)) if first == "~") {
         return path;

@@ -68,6 +68,7 @@ error invalid_request could not read the token file \
 | `result --session <id> [--task <id>]` | Branch, head, diffstat, changed paths, and task evidence. |
 | `retention get` | The worker-wide archive-retention policy, with a disabled window as `off`. |
 | `retention set [--window <duration>] [--force-discard <bool>] [--sub-agent <duration>]` | Merge the given fields into the stored worker-wide archive-retention policy. |
+| `cache prune [--yes] [--cache-root <path>]` | The worker's per-session build caches with their sizes and the state of the session that owns each; `--yes` removes only the caches of archived or deleted sessions. |
 | `providers list` | Configured providers, and whether each has a credential. No secrets. |
 | `providers add --id <id> --kind openai-compatible --endpoint <url> [--model <id>]... [--default-model <id>]` | Register an OpenAI-compatible provider the worker did not seed, such as OpenCode Go. |
 | `providers remove --id <id>` | Drop an OpenAI-compatible provider and the key stored for it. A built-in provider is refused. |
@@ -97,10 +98,11 @@ error invalid_request could not read the token file \
 | `project worktree integrate <session-id> --task <task-id> [--expected-parent-revision <rev>] [--request-id <uuid>]` | Fast-forward the parent with the task's result revision; a conflict is reported, never retried. |
 | `project worktree cleanup <session-id> --task <task-id> (--keep \| --remove \| --discard) [--yes] [--request-id <uuid>]` | Keep or remove the checkout recorded for one delegated task. |
 
-`node`, `whoami`, `ls`, `get`, `events`, `peek`, `retention get`, `providers
-list`, `providers discover`, `models list`, and every `project` read are
-read-only, issue no mutation, and work with a read-only-scoped token. `run`
-starts a run; `send`,
+`node`, `whoami`, `ls`, `get`, `events`, `peek`, `retention get`, `cache
+prune`, `providers list`, `providers discover`, `models list`, and every
+`project` read are read-only, issue no mutation, and work with a read-only-scoped
+token. `cache prune` sends only reads, but `--yes` removes build output on the
+worker's machine. `run` starts a run; `send`,
 `project send`, `answer`, `approve`, `deny`, and `stop` control one; `wait`,
 `status`, `liveness`, and `result` read one. `retention set`, `providers
 set-key`, `providers add`, `providers remove`, `session archive`, `session
@@ -666,6 +668,41 @@ stored policy plus `applies_from: "next_sweep"`.
 
 `node` and `retention get` are reads. `retention set` needs
 `configure_archive_retention`; a token without it exits `3`.
+
+## Build-cache pruning
+
+`cache prune` reports the per-session build caches of the connected worker's
+instance: one line per cache with its size and the state of the session that
+owns it, then the totals, and either a `dry-run; pass --yes` trailer or the
+`removed` line of the round.
+
+```text
+root /state/loom/127.0.0.1_8765/state.build-cache
+cache 0190d4f2-6a1c-7c3e-8b1e-2a1b7f0e5d11 missing 734003200 remove
+cache 0190d4f2-1c07-7c3e-9e0a-4c9f3a7b2d05 archived 96468992 remove
+cache 0190d4f2-88aa-7c3e-8f21-77c14d0e6b93 idle 120586240 keep
+total caches 3 bytes 951582632
+reclaimable 2 bytes 830472192
+dry-run; pass --yes to remove 2 caches
+```
+
+Without `--yes` nothing is removed. With it, the verb removes only a cache
+whose session is archived or no longer exists: the cache of a session that
+still exists is listed and kept, because that session may still be building,
+and a directory whose name is not a session id is listed as `unrecognized` and
+kept. Archiving a session, deleting one, and a worker start already reclaim the
+caches they reach, so this is the repair tool for what a failed removal or an
+interrupted process left behind. A cache the process cannot remove is reported
+on a `failed` line and the command exits `1`.
+
+The session states come from `Workspace/ListWorkspaces` and
+`Workspace/ListWorkspaceSessions` with archived sessions included, so the
+worker stays the authority on which caches are dead and the verb needs a
+reachable worker. The directory itself is read by this client, because it is
+ordinary build output on the worker's machine. Without `--cache-root` it is
+derived from the connected URL exactly like the default token file
+(`<state dir>/<host>_<port>/state.build-cache`), which only names a path on
+this machine, so a non-loopback worker needs `--cache-root`.
 
 ## Providers
 
