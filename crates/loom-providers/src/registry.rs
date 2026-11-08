@@ -881,6 +881,16 @@ impl ProviderRegistry {
 
     /// Resolve once against configured providers, including unavailable ones:
     /// a missing credential must never silently reroute an explicit selection.
+    ///
+    /// A model id is read three ways, in this order:
+    ///
+    /// 1. The versioned `loom:model:v1:` selector pins one provider.
+    /// 2. A raw id a provider offers is used as it is, so an id that contains a
+    ///    slash (`deterministic/demo`) keeps its meaning and a raw id two
+    ///    providers offer stays the ambiguity it always was.
+    /// 3. Only when no provider offers the whole value, `provider/model` names
+    ///    that provider's own model, which is how a person types a selection
+    ///    (`loom-cli run --model opencode-go/gpt-6-luna`).
     fn resolve_model(&self, model: &ModelId) -> Result<(ProviderConfig, ModelDescriptor)> {
         let configurations = self
             .configurations
@@ -898,10 +908,17 @@ impl ProviderRegistry {
                     .find(|item| &item.id == raw)
                     .map(|descriptor| (config, descriptor))
             });
-        let Some((config, descriptor)) = matches.next() else {
+        let mut chosen = matches.next();
+        if chosen.is_none()
+            && selection.is_none()
+            && let Some((config, descriptor)) = qualified_selection(&configurations, model.as_str())
+        {
+            chosen = Some((config, descriptor));
+        }
+        let Some((config, descriptor)) = chosen else {
             return Err(LoomError::new(
                 ErrorCode::ProviderUnavailable,
-                format!("model '{}' is not configured", model.as_str()),
+                not_configured_message(&configurations, model),
                 false,
             ));
         };
@@ -1436,6 +1453,46 @@ fn configured_gateway_descriptor(model: &str) -> ModelDescriptor {
     }
 }
 
+/// The provider and model a `provider/model` spelling names, when no provider
+/// offers the whole value as one model id. A model a provider lists keeps its
+/// raw spelling, so the reading only applies to a value nothing claims.
+fn qualified_selection<'a>(
+    configurations: &'a BTreeMap<ProviderId, ProviderConfig>,
+    value: &str,
+) -> Option<(&'a ProviderConfig, &'a ModelDescriptor)> {
+    let (provider, raw) = value.split_once('/')?;
+    let config = configurations.get(&ProviderId::new(provider))?;
+    config
+        .models
+        .iter()
+        .find(|item| item.id.as_str() == raw)
+        .map(|descriptor| (config, descriptor))
+}
+
+/// Why `model` matched no provider, naming the half a `provider/model`
+/// spelling got wrong so a typo is not reported as one unknown model id.
+fn not_configured_message(
+    configurations: &BTreeMap<ProviderId, ProviderConfig>,
+    model: &ModelId,
+) -> String {
+    let value = model.as_str();
+    let qualified = model
+        .provider_model()
+        .is_none()
+        .then(|| value.split_once('/'))
+        .flatten()
+        .filter(|(provider, _)| !provider.is_empty());
+    match qualified {
+        Some((provider, raw)) if configurations.contains_key(&ProviderId::new(provider)) => {
+            format!("provider '{provider}' has no model '{raw}'")
+        }
+        Some((provider, _)) => {
+            format!("model '{value}' is not configured; no provider '{provider}' is configured")
+        }
+        None => format!("model '{value}' is not configured"),
+    }
+}
+
 /// The name a provider kind is reported under, for an error that names the
 /// provider a command refused to redefine or remove.
 fn provider_kind_name(kind: ProviderKind) -> &'static str {
@@ -1594,6 +1651,104 @@ mod selection_tests {
             &ModelId::new("missing"),
         );
         assert!(registry.create_provider(&missing).is_err());
+    }
+
+    /// A caller may spell an explicit selection as `provider/model`, which is
+    /// what `loom-cli run --model opencode-go/gpt-6-luna` lets a person type.
+    /// The prefix names the provider and the rest is that provider's own model
+    /// id, so the selection reaches the provider the caller named instead of
+    /// failing as one unknown raw model.
+    #[test]
+    fn a_slash_qualified_id_selects_the_provider_it_names() {
+        let registry = shared_registry();
+        let raw = ModelId::new("gpt-4o");
+        for (id, window, pricing) in [
+            (OPENAI_PROVIDER_ID, 128_000, (100, 200)),
+            (GITHUB_COPILOT_PROVIDER_ID, 64_000, (300, 400)),
+        ] {
+            let provider_id = ProviderId::new(id);
+            let typed = ModelId::new(format!("{id}/{}", raw.as_str()));
+            let (config, descriptor) = registry.resolve_model(&typed).unwrap();
+            assert_eq!(config.id, provider_id, "{}", typed.as_str());
+            assert_eq!(descriptor.provider, provider_id, "{}", typed.as_str());
+            assert_eq!(
+                descriptor.context_window,
+                Some(window),
+                "{}",
+                typed.as_str()
+            );
+            assert_eq!(
+                registry.pricing(&typed).unwrap(),
+                pricing,
+                "{}",
+                typed.as_str()
+            );
+            // The adapter serves the provider the caller named, exactly as the
+            // versioned selector for the same pair does.
+            let selector = ModelId::for_provider(&provider_id, &raw);
+            let typed_adapter = registry.create_provider(&typed).unwrap();
+            let selector_adapter = registry.create_provider(&selector).unwrap();
+            // Both spellings reach the same provider and the same raw model;
+            // only the id the caller wrote is echoed back.
+            assert_eq!(typed_adapter.descriptor().provider, provider_id);
+            assert_eq!(typed_adapter.descriptor().id.as_str(), typed.as_str());
+            assert_eq!(
+                typed_adapter.descriptor().context_window,
+                selector_adapter.descriptor().context_window
+            );
+        }
+        // A bare id offered by two providers stays ambiguous: the qualified
+        // spelling is how a caller resolves that, and nothing is rerouted.
+        let error = registry.describe_model(&raw).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains("ambiguous"), "{}", error.message);
+    }
+
+    /// A slash-qualified id that names a configured provider with no such
+    /// model, or no configured provider at all, says which part is missing
+    /// instead of reporting the whole spelling as one unknown model.
+    #[test]
+    fn a_slash_qualified_id_names_the_provider_or_model_that_is_missing() {
+        let registry = shared_registry();
+        let missing_model = registry
+            .describe_model(&ModelId::new("openai/absent-model"))
+            .unwrap_err();
+        assert_eq!(missing_model.code, ErrorCode::ProviderUnavailable);
+        assert_eq!(
+            missing_model.message,
+            "provider 'openai' has no model 'absent-model'"
+        );
+        let missing_provider = registry
+            .describe_model(&ModelId::new("opencode-go/gpt-6-luna"))
+            .unwrap_err();
+        assert_eq!(missing_provider.code, ErrorCode::ProviderUnavailable);
+        assert_eq!(
+            missing_provider.message,
+            "model 'opencode-go/gpt-6-luna' is not configured; \
+             no provider 'opencode-go' is configured"
+        );
+        // The plain raw id keeps the plain report it always had.
+        assert_eq!(
+            registry
+                .describe_model(&ModelId::new("absent"))
+                .unwrap_err()
+                .message,
+            "model 'absent' is not configured"
+        );
+    }
+
+    /// The demo catalog ships raw ids that contain a slash
+    /// (`deterministic/demo`). A raw id a provider actually offers keeps its
+    /// meaning, so the spelling is only read as `provider/model` when the whole
+    /// value names no configured model.
+    #[test]
+    fn a_raw_id_a_provider_offers_is_never_read_as_a_provider_qualifier() {
+        let registry = ProviderRegistry::demo();
+        for raw in ["deterministic/demo", "openai-compatible/demo"] {
+            let (config, descriptor) = registry.resolve_model(&ModelId::new(raw)).unwrap();
+            assert_eq!(descriptor.id.as_str(), raw);
+            assert_eq!(descriptor.provider, config.id);
+        }
     }
 
     #[test]

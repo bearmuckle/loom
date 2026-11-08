@@ -1451,18 +1451,23 @@ repositories, the way loom-ui's "New sub project" does, unless --repo or
 warning on stderr, not a failure. The output gains a third line,
 `parent <project-id>`, and --json reports `project.parent_id`.
 
---model is the model of this run. --child-model and --child-model-for choose
-the models the run's delegated children use, stored on the session's project
-before the run starts: a child of a mapped kind runs on that kind's model, any
-other child on --child-model, and without either it reuses the run's model.
-They change only the entries they name; 'project models set' edits the rest.
+--model is the model of this run: a bare model id, `provider/model` (such
+as opencode-go/gpt-6-luna), or a `loom:model:v1:` selector. A bare id two
+providers offer is still ambiguous and is refused with the selectors that would
+resolve it; a `provider/model` that names no configured provider, or a model
+that provider does not offer, is refused naming that half. --child-model and
+--child-model-for choose the models the run's delegated children use, stored on
+the session's project before the run starts: a child of a mapped kind runs on
+that kind's model, any other child on --child-model, and without either it
+reuses the run's model. They change only the entries they name;
+'project models set' edits the rest.
 
 Flags:
   --workspace <id>            the workspace the session belongs to (required)
   --task <text>               the task text
   --task-file <path>          read the task text from a file instead
   --name <name>               reuse or create the session with that name
-  --model <id>                the model to start
+  --model <id>                the model to start, or provider/model
   --repo <source>             clone a repository into a new session
   --as-directory <path>       the local folder the run works in (new session)
   --revision <rev>            the revision to clone (with --repo)
@@ -1486,6 +1491,8 @@ Examples:
     --child-model-for vision=<vision-model-id>
   loom-cli run --workspace <workspace-id> --task-file task.md \
     --repo https://github.com/acme/widgets.git --approval-policy auto
+  loom-cli run --workspace <workspace-id> --task 'summarise the diff' \
+    --model opencode-go/gpt-6-luna --json
   loom-cli run --workspace <workspace-id> --task 'summarise the diff' \
     --model 'loom:model:v1:["deepseek","deepseek-flash"]' --json
 "#,

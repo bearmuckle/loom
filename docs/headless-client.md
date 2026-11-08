@@ -293,6 +293,16 @@ credential, or when the worker refuses the catalog read as a missing capability,
 failure is still a failure, because the worker was never reached. An explicit
 `--model` always wins and never reads the catalog.
 
+An explicit `--model` is sent as written, and the worker resolves it three ways
+in this order. A `loom:model:v1:["<provider-id>","<model>"]` selector pins one
+provider. A bare model id is used as it is, so an id that contains a slash
+(`deterministic/demo`) keeps its meaning and an id two providers offer stays
+the ambiguity it was. Only when no provider offers the whole value, a
+`<provider-id>/<model>` spelling names that provider's own model, which is how
+a person writes `--model opencode-go/gpt-6-luna`; a spelling whose provider is
+not configured, or whose provider does not offer that model, is refused naming
+that half of the value.
+
 The approval policy is set before the run starts, because a run resolves its
 policy once when it is created. A created session is pinned to
 `--approval-policy` (`default` when the flag is absent); a reused session is
