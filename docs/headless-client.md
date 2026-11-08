@@ -679,12 +679,15 @@ owns it, then the totals, and either a `dry-run; pass --yes` trailer or the
 ```text
 root /state/loom/127.0.0.1_8765/state.build-cache
 cache 0190d4f2-6a1c-7c3e-8b1e-2a1b7f0e5d11 missing 734003200 remove
-cache 0190d4f2-1c07-7c3e-9e0a-4c9f3a7b2d05 archived 96468992 remove
 cache 0190d4f2-88aa-7c3e-8f21-77c14d0e6b93 idle 120586240 keep
-total caches 3 bytes 951582632
+cache 0190d4f2-1c07-7c3e-9e0a-4c9f3a7b2d05 archived 96468992 remove
+total caches 3 bytes 951058432
 reclaimable 2 bytes 830472192
 dry-run; pass --yes to remove 2 caches
 ```
+
+Every line after `root` is ordered by size, largest first, so the listing
+answers what is taking the space before it answers which of it is dead.
 
 Without `--yes` nothing is removed. With it, the verb removes only a cache
 whose session is archived or no longer exists: the cache of a session that
