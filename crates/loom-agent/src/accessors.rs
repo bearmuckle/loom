@@ -211,16 +211,35 @@ impl AgentRuntime {
         self.last_project_message_sequence = self.last_project_message_sequence.max(sequence);
     }
 
+    /// Whether a tool call or project join still owns the next transcript turn.
+    ///
+    /// Appending a conversation turn before it would put a message between an
+    /// assistant `tool_calls` turn and the tool messages that answer each call,
+    /// and a chat-completions route rejects that whole request instead of
+    /// answering it.
+    fn owes_a_tool_turn(&self) -> bool {
+        self.pending_tool_execution.is_some()
+            || self.pending_project_join.is_some()
+            || self.pending_approval.is_some()
+    }
+
+    /// Whether a tool turn or an open input prompt owns the next transcript
+    /// turn.
+    ///
+    /// A tool result, a project join, an approval, or an input prompt owns the
+    /// next turn; the model reads an unrelated turn appended before it out of
+    /// order, and a split tool call is refused by the provider outright.
+    fn owes_a_pending_turn(&self) -> bool {
+        self.owes_a_tool_turn() || self.pending_input.is_some()
+    }
+
     /// Injects one durable project message at a safe model-turn boundary.
     /// Returns false when it was already delivered or the runtime is blocked.
     pub fn append_project_message(&mut self, message: &AgentMessageRecord) -> Result<bool> {
         if message.project_sequence <= self.last_project_message_sequence {
             return Ok(false);
         }
-        if self.pending_tool_execution.is_some()
-            || self.pending_project_join.is_some()
-            || self.pending_approval.is_some()
-            || self.pending_input.is_some()
+        if self.owes_a_pending_turn()
             || !matches!(
                 self.run.state,
                 AgentRunState::Planning
@@ -260,14 +279,22 @@ impl AgentRuntime {
 
     /// Appends a system-generated project notification turn.
     ///
-    /// Used to wake a manager that finished its turn when a child finished
-    /// without sending its own result. The message is framed like a project
-    /// message so it is treated as collaborator input, not a user instruction.
-    pub fn notify_project_child_finished(&mut self, body: String) -> Result<()> {
+    /// Used to tell a manager that a child finished without sending its own
+    /// result. The message is framed like a project message so it is treated as
+    /// collaborator input, not a user instruction.
+    ///
+    /// Returns whether the turn was appended. A run that still owes a tool
+    /// result, a project join, an approval, or an input answer refuses it: the
+    /// caller keeps the notice owed and offers it again at the next safe
+    /// model-turn boundary, exactly like a durable project message.
+    pub fn notify_project_child_finished(&mut self, body: String) -> bool {
+        if self.owes_a_pending_turn() {
+            return false;
+        }
         let mut message = ModelMessage::new(MessageRole::User, body);
         message.name = Some("loom_project_message".to_owned());
         self.push_message(message);
-        Ok(())
+        true
     }
 
     /// Delivers one user direction that was queued while the run was executing.
@@ -281,9 +308,7 @@ impl AgentRuntime {
         if sequence <= self.last_queued_direction_sequence {
             return Ok(true);
         }
-        if self.pending_tool_execution.is_some()
-            || self.pending_project_join.is_some()
-            || self.pending_approval.is_some()
+        if self.owes_a_tool_turn()
             || matches!(
                 self.run.state,
                 AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled

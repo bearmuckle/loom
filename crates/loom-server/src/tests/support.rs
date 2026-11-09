@@ -1689,6 +1689,48 @@ pub(super) fn request_has_tool(request: &serde_json::Value, name: &str) -> bool 
         .any(|tool| tool["function"]["name"] == name)
 }
 
+/// Asserts the pairing every OpenAI-compatible channel enforces: an assistant
+/// message that carries tool calls is followed by exactly one tool message per
+/// call, before any other turn. A model that receives a split pair is not the
+/// problem; the channel rejects the whole request with HTTP 400
+/// ("insufficient tool messages following tool_calls message") and the run
+/// fails.
+pub(super) fn assert_tool_calls_are_paired(request: &serde_json::Value) {
+    let messages = request["messages"]
+        .as_array()
+        .expect("a scripted request carries a message list");
+    let mut violations = Vec::new();
+    let mut index = 0;
+    while index < messages.len() {
+        let message = &messages[index];
+        index += 1;
+        if message["role"] == "tool" {
+            violations.push(format!(
+                "tool message {:?} answers no open tool call",
+                message["tool_call_id"]
+            ));
+            continue;
+        }
+        for call in message["tool_calls"].as_array().into_iter().flatten() {
+            let answered = messages
+                .get(index)
+                .is_some_and(|next| next["role"] == "tool" && next["tool_call_id"] == call["id"]);
+            if answered {
+                index += 1;
+            } else {
+                violations.push(format!(
+                    "call {:?} ({}) has no tool message directly after it",
+                    call["id"], call["function"]["name"]
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "the provider would refuse this request: {violations:?}\n{request}"
+    );
+}
+
 pub(super) fn request_has_project_message(request: &serde_json::Value, kind: &str) -> bool {
     request["messages"]
         .as_array()
