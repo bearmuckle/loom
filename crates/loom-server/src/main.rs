@@ -534,13 +534,13 @@ fn help_text() -> String {
          the risk of sending the bearer token and all traffic in plaintext instead.\n\
          \n\
          Every run_command call is a command action, so the approval policy gates it. \
-         --read-only-commands on adds a conservative allowlist (git log, status, diff, \
-         show, grep, ls, cat, head, tail, rg, grep, file, stat, pwd, tree, du and wc) to \
-         the read dimension, and only for a call that matches one of them exactly: an \
-         option that could write, a shell metacharacter in any argument, or a path \
-         outside the workspace leaves the call a command. The value is 1/true/yes/on or \
-         0/false/no/off; anything else fails the start, and it is never persisted, so a \
-         restart without it returns to the default.\n\
+         --read-only-commands on adds a conservative allowlist (the git log, status, \
+         diff, show and grep reads; ls, cat, head, tail, wc, rg, grep, file, stat, pwd, \
+         tree and du) to the read dimension, and only for a call that matches one of \
+         them exactly: an option that could write, a shell metacharacter in any \
+         argument, or a path outside the workspace leaves the call a command. The value \
+         is 1/true/yes/on or 0/false/no/off; anything else fails the start, and it is \
+         never persisted, so a restart without it returns to the default.\n\
          \n\
          A worker running from a Loom-managed install \
          (<state-dir>/server/<tag>/loom-server) checks for a newer stable release every six \
