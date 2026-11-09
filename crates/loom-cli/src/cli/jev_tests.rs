@@ -75,8 +75,11 @@ impl MockJev {
             while !stopping.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        if let Some(request) = read_request(stream, status, &body) {
+                        if let Some((stream, request)) = read_request(stream) {
+                            // Record before answering: a client that already has
+                            // the answer must always see the request it made.
                             recorded.lock().expect("the request log").push(request);
+                            answer(stream, status, &body);
                         }
                     }
                     Err(_) => thread::sleep(Duration::from_millis(2)),
@@ -112,9 +115,8 @@ impl Drop for MockJev {
     }
 }
 
-/// Reads one request, answers it with `status` and `body`, and returns what
-/// arrived.
-fn read_request(mut stream: TcpStream, status: u16, answer: &str) -> Option<Recorded> {
+/// Reads one request and returns it with its stream, without answering it yet.
+fn read_request(mut stream: TcpStream) -> Option<(TcpStream, Recorded)> {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -157,12 +159,6 @@ fn read_request(mut stream: TcpStream, status: u16, answer: &str) -> Option<Reco
         buffer.extend_from_slice(&chunk[..read]);
     }
     let body = String::from_utf8_lossy(&buffer[head_end..]).into_owned();
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\nconnection: close\r\n\
-         content-length: {length}\r\n\r\n{answer}",
-        reason = if status == 200 { "OK" } else { "Error" },
-        length = answer.len(),
-    );
     let recorded = Recorded {
         method,
         path,
@@ -170,9 +166,19 @@ fn read_request(mut stream: TcpStream, status: u16, answer: &str) -> Option<Reco
         user_agent,
         body,
     };
+    Some((stream, recorded))
+}
+
+/// Answers one read request with `status` and `answer`.
+fn answer(mut stream: TcpStream, status: u16, answer: &str) {
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\nconnection: close\r\n\
+         content-length: {length}\r\n\r\n{answer}",
+        reason = if status == 200 { "OK" } else { "Error" },
+        length = answer.len(),
+    );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
-    Some(recorded)
 }
 
 /// A backend with one workspace and one session, plus a direct connection the

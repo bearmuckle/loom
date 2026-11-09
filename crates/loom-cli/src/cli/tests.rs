@@ -244,13 +244,39 @@ fn journal(
     }
 }
 
+/// Whether every run of the fixture's backend has finished, including the
+/// work a run's event observer does after its last event: the observer appends
+/// the `session_renamed` event of an automatic project title after it journals
+/// `RunCompleted`, and the worker counts as in flight until all of it is done.
+fn run_workers_finished(fixture: &Fixture) -> bool {
+    fixture.backend.active_runs() == 0
+}
+
+/// Waits until no run of the fixture's backend is in flight, so a test that
+/// started runs reads state their workers are no longer changing.
+fn settled_runs(fixture: &Fixture) {
+    for _ in 0..600 {
+        if run_workers_finished(fixture) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    panic!("the fixture's runs did not settle");
+}
+
 /// Waits for the deterministic run to finish, then for the journal to stop
 /// changing, and returns it. No sleep is used as a synchronisation primitive:
-/// the settle loop only ends once two consecutive reads agree.
-fn settled_journal(
-    connection: &InProcessConnection,
-    session_id: AgentSessionId,
-) -> Vec<ServerEventEnvelope> {
+/// the settle loop only ends once the worker is gone and two consecutive reads
+/// agree.
+///
+/// Two reads agreeing is not enough on its own: the run worker journals
+/// `RunCompleted` from its event observer and only then chooses the session's
+/// project title, which appends a `session_renamed` event. Waiting for the
+/// worker to finish is the barrier for that work, because the observer runs
+/// inside the run worker.
+fn settled_journal(fixture: &Fixture) -> Vec<ServerEventEnvelope> {
+    let connection = &fixture.control;
+    let session_id = fixture.session.id;
     let mut previous = journal(connection, session_id);
     let completed = |events: &[ServerEventEnvelope]| {
         events.iter().any(|envelope| {
@@ -263,7 +289,7 @@ fn settled_journal(
         })
     };
     for _ in 0..600 {
-        if completed(&previous) {
+        if completed(&previous) && run_workers_finished(fixture) {
             let current = journal(connection, session_id);
             if current == previous {
                 return current;
@@ -592,7 +618,7 @@ fn worker_node(connection: &InProcessConnection) -> loom_protocol::WorkerNodeSta
 fn replaying_the_same_journal_produces_identical_bytes() {
     let fixture = fixture();
     start_run(&fixture.control, fixture.session.id);
-    settled_journal(&fixture.control, fixture.session.id);
+    settled_journal(&fixture);
     let session = fixture.session.id.to_string();
 
     let mut client = InProcessClient::new(&fixture.backend);
@@ -1140,7 +1166,7 @@ fn project_events_carry_the_typed_payload_in_jsonl() {
 /// lines the CLI prints for the whole journal.
 fn settled_lines(fixture: &Fixture) -> Vec<String> {
     start_run(&fixture.control, fixture.session.id);
-    settled_journal(&fixture.control, fixture.session.id);
+    settled_journal(fixture);
     let session = fixture.session.id.to_string();
     let mut client = InProcessClient::new(&fixture.backend);
     let full = run(
@@ -11461,7 +11487,13 @@ fn run_project_creates_a_sub_project_that_the_project_tree_names_and_reuses_it_b
             "--json",
         ],
     );
-    assert_eq!(created.code, exit::OK, "{}", created.stderr);
+    assert_eq!(
+        created.code,
+        exit::OK,
+        "stdout: {} stderr: {}",
+        created.stdout,
+        created.stderr
+    );
     assert_eq!(
         created.stderr, "",
         "inheriting a folder warns about nothing"
@@ -11486,7 +11518,10 @@ fn run_project_creates_a_sub_project_that_the_project_tree_names_and_reuses_it_b
     );
 
     // The worker records the session as a sub project of the project, which is
-    // the link loom-ui nests the row by, and `status --tree` prints it.
+    // the link loom-ui nests the row by, and `status --tree` prints it. Every
+    // run this test starts is awaited before the next read, so the projection
+    // and the journal are never read from a worker that is still writing them.
+    settled_runs(&fixture);
     let snapshot = project_of(&fixture.control, child);
     assert_eq!(snapshot.root_session_id, child);
     assert_eq!(
@@ -11597,6 +11632,7 @@ fn run_project_creates_a_sub_project_that_the_project_tree_names_and_reuses_it_b
         .unwrap();
     assert_ne!(second, child);
     assert_eq!(fresh_envelope["data"]["project"]["parent_id"], project_text);
+    settled_runs(&fixture);
     assert_eq!(
         project_of(&fixture.control, second)
             .parent_project_id
@@ -11604,7 +11640,9 @@ fn run_project_creates_a_sub_project_that_the_project_tree_names_and_reuses_it_b
         Some(*project.as_uuid())
     );
 
-    // A plain run without --project still never lands under the project.
+    // A plain run without --project still never lands under the project, and it
+    // starts only once the sub project runs above have stopped.
+    settled_runs(&fixture);
     let plain = run(
         &mut client,
         &[
@@ -11620,7 +11658,13 @@ fn run_project_creates_a_sub_project_that_the_project_tree_names_and_reuses_it_b
             "--json",
         ],
     );
-    assert_eq!(plain.code, exit::OK, "{}", plain.stderr);
+    assert_eq!(
+        plain.code,
+        exit::OK,
+        "stdout: {} stderr: {}",
+        plain.stdout,
+        plain.stderr
+    );
     let plain_envelope = json_envelope(&plain);
     assert_eq!(plain_envelope["data"]["project"], serde_json::Value::Null);
     let standalone: AgentSessionId = plain_envelope["data"]["session"]["id"]
