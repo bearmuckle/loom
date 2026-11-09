@@ -330,12 +330,13 @@ impl InProcessBackend {
 
     /// Notifies a child task's parent that the child has produced something.
     ///
-    /// Any durable inbox messages are delivered first. When a child finishes
-    /// without a result the manager has consumed, a project notification turn is
-    /// added so the parent is never left uninformed, whether the child reported
-    /// nothing at all or its stored result never reached the parent. The parent
-    /// is woken if its run is idle, so background children genuinely wake the
-    /// manager instead of requiring it to hold a wait open.
+    /// A child that finished while its own result never reached the manager is
+    /// woken even with an empty inbox, and the run worker appends the notice that
+    /// tells the manager to retrieve it at its next safe model-turn boundary. The
+    /// parent is woken if its run is idle, so background children genuinely wake
+    /// the manager instead of requiring it to hold a wait open. A notice is never
+    /// appended here: a woken manager may be blocked on a tool approval, and a
+    /// turn appended there would split its tool call from the tool result.
     pub(crate) fn notify_parent_of_child_activity(
         self: &Arc<Self>,
         child_session_id: AgentSessionId,
@@ -347,19 +348,23 @@ impl InProcessBackend {
             return Ok(());
         };
         let connection = self.connect();
-        let notification = if matches!(
+        let terminal = matches!(
             task.status,
             loom_core::DelegatedTaskStatus::Completed
                 | loom_core::DelegatedTaskStatus::Failed
                 | loom_core::DelegatedTaskStatus::Cancelled
-        ) {
-            connection.project_child_finished_notification(persistence.as_ref(), &task)?
-        } else {
-            None
-        };
-        if let Err(error) =
-            connection.wake_project_recipient(task.requester_session_id, notification)
+        );
+        let wake = if terminal
+            && connection
+                .project_child_result_delivery(persistence.as_ref(), &task)?
+                .state(true)
+                .needs_retrieval()
         {
+            ProjectWake::OnChildFinished
+        } else {
+            ProjectWake::OnInboxMessage
+        };
+        if let Err(error) = connection.wake_project_recipient(task.requester_session_id, wake) {
             log::debug!(
                 "could not wake parent {} for child {}: {}",
                 task.requester_session_id,
@@ -638,7 +643,7 @@ impl InProcessBackend {
         // the message is waiting instead of that the send failed.
         let connection = self.connect();
         let routing = if wakes_recipient {
-            connection.wake_project_recipient(draft.target_session_id, None)
+            connection.wake_project_recipient(draft.target_session_id, ProjectWake::OnInboxMessage)
         } else {
             connection.project_message_route(draft.target_session_id)
         };

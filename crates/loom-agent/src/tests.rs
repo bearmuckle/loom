@@ -1371,7 +1371,8 @@ fn tool_pairing_violations(messages: &[ModelMessage]) -> Vec<String> {
 
 /// A child finishing while the manager waits for a tool approval must not add a
 /// turn between the assistant's tool call and its result: the provider rejects
-/// the whole request when that pair is split.
+/// the whole request when that pair is split. The notice is owed instead, and is
+/// appended once the call it waited behind is answered.
 #[test]
 fn a_project_child_notice_waits_for_a_pending_tool_result() {
     let (mut runtime, root) = destructive_tool_runtime(loom_core::PolicyDecision::RequireApproval);
@@ -1385,19 +1386,24 @@ fn a_project_child_notice_waits_for_a_pending_tool_result() {
         .expect("the gated call waits for approval");
     assert_eq!(runtime.snapshot().state, AgentRunState::AwaitingApproval);
 
-    runtime
-        .notify_project_child_finished(
-            "[Project notification] Direct child task 'worker' finished with status \
-             Completed without reporting a result."
-                .to_owned(),
-        )
-        .unwrap();
+    let notice = "[Project notification] Direct child task 'worker' (task 6f1f) finished \
+                  with status Completed without reporting a result."
+        .to_owned();
+    assert!(
+        !runtime.notify_project_child_finished(notice.clone()),
+        "a notice waits while an approved call has no result yet"
+    );
+    assert!(!runtime.messages().iter().any(|message| {
+        message.role == MessageRole::User && message.content.contains("Project notification")
+    }));
 
     let approved = runtime.approve(call_id).unwrap();
     assert!(approved.iter().any(|event| matches!(
         event,
         AgentEvent::RunCompleted { snapshot } if snapshot.state == AgentRunState::Completed
     )));
+    // The call it waited behind now has its result, so the notice is delivered.
+    assert!(runtime.notify_project_child_finished(notice));
 
     let request = runtime.model_request().unwrap().0;
     assert_eq!(

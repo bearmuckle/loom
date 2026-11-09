@@ -1057,18 +1057,21 @@ impl InProcessConnection {
 
     /// Wakes a project member whose run is idle so it can consume its inbox.
     ///
-    /// Pending inbox messages are delivered first. When there are none and a
-    /// `notification` body is supplied (for example, a child finished without
-    /// reporting), it is appended as a project message turn so the member has
-    /// something to react to. No-op when the member is already running or parked
-    /// on a durable wait, because its worker or the wait scheduler delivers.
+    /// Pending inbox messages are delivered first. A [`ProjectWake::OnChildFinished`]
+    /// wake also resumes a member whose inbox is empty, so that the run worker
+    /// reads the child-finish state the member still owes and appends the notice
+    /// at its safe model-turn boundary. This function therefore never appends a
+    /// turn itself: a wake can find the run blocked on a tool approval, and a
+    /// turn appended there would split the assistant's tool call from its result.
+    /// No-op when the member is already running or parked on a durable wait,
+    /// because its worker or the wait scheduler delivers.
     /// The returned route states how the member's pending inbox will be read, so
     /// a caller that just accepted a durable message can report its delivery
     /// honestly instead of assuming a wake happened.
     pub(crate) fn wake_project_recipient(
         &self,
         session_id: AgentSessionId,
-        notification: Option<String>,
+        wake: ProjectWake,
     ) -> Result<ProjectMessageRoute> {
         let Some(persistence) = self.backend.persistence.as_ref().cloned() else {
             return Ok(ProjectMessageRoute::Queued);
@@ -1088,7 +1091,7 @@ impl InProcessConnection {
         if handle.is_running() {
             return Ok(ProjectMessageRoute::LiveTurn);
         }
-        if notification.is_none() {
+        if wake == ProjectWake::OnInboxMessage {
             let (project_id, cursor) = project_member_inbox_position(&persistence, session_id)?;
             if persistence
                 .list_agent_messages(project_id, session_id, cursor, 1)?
@@ -1101,17 +1104,8 @@ impl InProcessConnection {
             }
         }
         self.continue_run(run_id, move |run| {
-            if deliver_project_agent_messages(&persistence, run)? {
-                return run.resume_for_project_inbox();
-            }
-            if let Some(notification) = notification {
-                run.notify_project_child_finished(notification)?;
-                return run.resume_for_project_inbox();
-            }
-            Ok(RunProgress {
-                events: Vec::new(),
-                continues: false,
-            })
+            deliver_project_agent_messages(&persistence, run)?;
+            run.resume_for_project_inbox()
         })?;
         Ok(ProjectMessageRoute::Woken)
     }

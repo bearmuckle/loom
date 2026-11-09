@@ -174,10 +174,15 @@ impl InProcessBackend {
                             .runtime
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner);
+                        // This is the run's safe model-turn boundary: the inbox,
+                        // queued directions, and owed child-finish notices are
+                        // appended here and nowhere else, so no turn can land
+                        // between an assistant tool call and its result.
                         let project = deliver_project_agent_messages(persistence, &mut runtime);
                         let directions = deliver_queued_run_directions(persistence, &mut runtime);
+                        let notices = deliver_project_child_notices(persistence, &mut runtime);
                         let mut delivered = false;
-                        for result in [project, directions] {
+                        for result in [project, directions, notices] {
                             match result {
                                 Ok(true) => delivered = true,
                                 Ok(false) => {}

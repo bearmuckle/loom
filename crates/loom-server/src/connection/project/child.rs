@@ -3,7 +3,7 @@ use super::*;
 mod control;
 mod create;
 mod recovery;
-mod result;
+pub(crate) mod result;
 mod schedule;
 mod worktree;
 
