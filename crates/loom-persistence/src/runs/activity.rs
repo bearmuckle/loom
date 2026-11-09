@@ -1,20 +1,19 @@
 use super::*;
 
+/// Writes the activities a runtime holds for one or more runs.
+///
+/// The list is authoritative only for the activities it names. A full state
+/// save snapshots the runtime vectors while run workers keep appending
+/// activities through [`save_run_activity_deltas`], so the snapshot can be older
+/// than the stored rows; the write is therefore append-only. Every listed
+/// activity is written at its position in the list, an existing row must keep
+/// the ordinal it was stored at (a changed order is refused), and a row the list
+/// does not name is left alone, because deleting it would lose an activity the
+/// runtime still holds and free its ordinal for a different one.
 pub(crate) fn save_run_activity_rows(
     transaction: &Transaction<'_>,
     activities_by_run: &DurableRunActivities,
 ) -> Result<()> {
-    transaction
-        .execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_run_activities (
-                run_id BLOB NOT NULL, activity_id BLOB NOT NULL,
-                PRIMARY KEY(run_id, activity_id)
-             ) WITHOUT ROWID, STRICT;
-             DELETE FROM _loom_wanted_run_activities;",
-        )
-        .map_err(|error| {
-            persistence_error(format!("could not stage run activities: {error}"), true)
-        })?;
     for (run_id, activities) in activities_by_run {
         let run_id_bytes = run_id.as_uuid().as_bytes();
         let session_id: Vec<u8> = transaction
@@ -180,29 +179,7 @@ pub(crate) fn save_run_activity_rows(
                 .map_err(|error| {
                     persistence_error(format!("could not save run activity: {error}"), true)
                 })?;
-            transaction
-                .execute(
-                    "INSERT INTO _loom_wanted_run_activities(run_id, activity_id)
-                     VALUES (?1, ?2)",
-                    params![run_id_bytes.as_slice(), activity_id.as_slice()],
-                )
-                .map_err(|error| {
-                    persistence_error(format!("could not stage run activity: {error}"), true)
-                })?;
         }
-        transaction
-            .execute(
-                "DELETE FROM run_activities
-                 WHERE run_id=?1 AND NOT EXISTS (
-                    SELECT 1 FROM _loom_wanted_run_activities wanted
-                    WHERE wanted.run_id=run_activities.run_id
-                      AND wanted.activity_id=run_activities.activity_id
-                 )",
-                [run_id_bytes.as_slice()],
-            )
-            .map_err(|error| {
-                persistence_error(format!("could not prune run activities: {error}"), true)
-            })?;
     }
     Ok(())
 }
@@ -606,22 +583,18 @@ pub(crate) fn restore_activity_tool_data(
     })
 }
 
+/// Writes the logical tool calls and their attempts for the activities a
+/// runtime holds.
+///
+/// Like [`save_run_activity_rows`] this list can be older than the stored rows,
+/// so the write is append-only: a call the list does not name keeps its row and
+/// its attempts instead of being pruned, because the activity that owns it stays
+/// stored and would otherwise be restored without its logical call.
 pub(crate) fn save_run_tool_rows(
     transaction: &Transaction<'_>,
     activities_by_run: &DurableRunActivities,
     summaries: Option<&BTreeMap<RunId, DurableRunSummary>>,
 ) -> Result<()> {
-    transaction
-        .execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_run_tool_calls (
-                run_id BLOB NOT NULL, tool_call_id BLOB NOT NULL,
-                PRIMARY KEY(run_id, tool_call_id)
-             ) WITHOUT ROWID, STRICT;
-             DELETE FROM _loom_wanted_run_tool_calls;",
-        )
-        .map_err(|error| {
-            persistence_error(format!("could not stage run tool rows: {error}"), true)
-        })?;
     for (run_id, activities) in activities_by_run {
         let run_id_bytes = run_id.as_uuid().as_bytes();
         let session_id: Vec<u8> = transaction
@@ -734,18 +707,6 @@ pub(crate) fn save_run_tool_rows(
                             )
                         })?;
                 }
-                transaction
-                    .execute(
-                        "INSERT INTO _loom_wanted_run_tool_calls(run_id, tool_call_id)
-                         VALUES (?1, ?2)",
-                        params![
-                            run_id_bytes.as_slice(),
-                            call.id.as_uuid().as_bytes().as_slice()
-                        ],
-                    )
-                    .map_err(|error| {
-                        persistence_error(format!("could not stage tool call: {error}"), true)
-                    })?;
             }
             let state = tool_attempt_state_for(activity, call, execution);
             let started_at = encode_timestamp(activity.started_at)?;
@@ -788,22 +749,6 @@ pub(crate) fn save_run_tool_rows(
                     )
                 })?;
         }
-        transaction
-            .execute(
-                "DELETE FROM run_tool_calls
-                 WHERE run_id=?1 AND NOT EXISTS (
-                    SELECT 1 FROM _loom_wanted_run_tool_calls wanted
-                    WHERE wanted.run_id=run_tool_calls.run_id
-                      AND wanted.tool_call_id=run_tool_calls.tool_call_id
-                 )",
-                [run_id_bytes.as_slice()],
-            )
-            .map_err(|error| {
-                persistence_error(
-                    format!("could not prune tool calls for {run_id}: {error}"),
-                    true,
-                )
-            })?;
     }
     Ok(())
 }

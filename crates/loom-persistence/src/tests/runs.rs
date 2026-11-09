@@ -1172,3 +1172,189 @@ fn a_tool_result_without_arguments_keeps_the_stored_call() {
     };
     assert!(save(activity(rewritten, AgentActivityStatus::Started)).is_err());
 }
+
+/// A full state save snapshots a run's activities while that run's worker
+/// keeps appending activities through the delta checkpoint. The snapshot is
+/// then older than the stored rows, so the save must neither delete what the
+/// checkpoint already committed nor shift what it writes: the runtime keeps
+/// every appended activity in its vector, and the next save hands that vector
+/// back in the same order. A save that pruned its own snapshot would drop the
+/// activity and free its ordinal for a different one, which is how a durable
+/// save started failing with "persisted activity order cannot be changed".
+#[test]
+fn a_stale_state_save_keeps_the_activities_a_checkpoint_appended() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+    let persistence = FilePersistence::open(&path).unwrap();
+    let mut sessions = SessionManager::default();
+    let (session, _) = sessions
+        .create_in_workspace(WorkspaceId::new(), "Activity order race")
+        .unwrap();
+    let run_id = RunId::new();
+    let started_at = Timestamp::from_unix_millis(1000);
+    let summary = DurableRunSummary {
+        snapshot: AgentRunSnapshot {
+            id: run_id,
+            attempt_id: RunAttemptId::new(),
+            control_revision: 0,
+            session_id: session.id,
+            task: "append activities while saving state".to_owned(),
+            jev: None,
+            model: ModelId::new("deterministic-model"),
+            state: AgentRunState::Executing,
+            started_at,
+            updated_at: started_at,
+            completed_at: None,
+            summary: None,
+            evidence: Vec::new(),
+            approval_policy: None,
+        },
+        usage: UsageSnapshot::default(),
+        attempts: None,
+        execution_state: None,
+        interactions: None,
+    };
+    let summaries = BTreeMap::from([(run_id, summary.clone())]);
+    let runtime_config = DurableRunRuntimeConfig {
+        system_instructions: None,
+        repository_instructions: None,
+        approval_policy: ApprovalPolicy::default(),
+        limits: loom_core::SessionLimits::default(),
+        context_options: ContextAssemblyOptions::default(),
+        checkpoint_id: None,
+        input_cost_micros_per_1k: 0,
+        output_cost_micros_per_1k: 0,
+        context_inspection: None,
+        project_delegation_enabled: false,
+        project_messaging_enabled: false,
+        project_inspection_enabled: false,
+        project_child_control_enabled: false,
+        project_worktree_enabled: false,
+        project_review_enabled: false,
+        project_integration_enabled: false,
+        project_branch_messaging_enabled: false,
+    };
+    let plan = loom_model::AgentPlan {
+        steps: Vec::new(),
+        title: None,
+    };
+    let feed = DurableFeedState {
+        next_sequence: EventSequence::new(1),
+        retention_limit: 250,
+        events: Vec::new(),
+        workspace_events: Vec::new(),
+    };
+    let activity = |timeline_ordinal: u64| AgentActivityRecord {
+        id: ActivityId::new(),
+        run_id,
+        timeline_ordinal,
+        parent_id: None,
+        step_id: None,
+        kind: AgentActivityKind::ModelTurn,
+        status: AgentActivityStatus::Completed,
+        started_at: Timestamp::from_unix_millis(1000 + timeline_ordinal),
+        completed_at: Some(Timestamp::from_unix_millis(1001 + timeline_ordinal)),
+        elapsed_ms: Some(1),
+        data: AgentActivityData::ModelTurn {
+            model: ModelId::new("deterministic-model"),
+        },
+    };
+    let first = activity(0);
+    let second = activity(1);
+    let appended_by_the_checkpoint = activity(2);
+    let appended_after_the_save = activity(3);
+    let state_save = |activities: &[AgentActivityRecord]| {
+        let activities = BTreeMap::from([(run_id, activities.to_vec())]);
+        persistence.save_state(DurableStateWrite {
+            sessions: &sessions.export_state(),
+            workspaces: None,
+            settings: None,
+            workspace_configs: None,
+            providers: None,
+            usage: None,
+            idempotency: None,
+            run_summaries: Some(&summaries),
+            run_runtime_configs: None,
+            run_context_checkpoints: None,
+            run_plans: None,
+            run_messages: None,
+            run_activities: Some(&activities),
+            filesystem_records: None,
+            feed: None,
+        })
+    };
+    let checkpoint = |deltas: &[AgentActivityRecord]| {
+        persistence.save_run_checkpoint(DurableRunCheckpointWrite {
+            session: &session,
+            session_next_sequence: EventSequence::new(1),
+            prune_feed: false,
+            summary: &summary,
+            runtime_config: &runtime_config,
+            context_checkpoint: None,
+            plan: &plan,
+            messages: &[],
+            message_delta: None,
+            activities: &[],
+            activity_deltas: Some(deltas),
+            filesystem: None,
+            feed: &feed,
+        })
+    };
+
+    state_save(&[first.clone(), second.clone()]).unwrap();
+    // The worker appends a third activity and checkpoints it without
+    // enumerating the run, so the row lands at the next ordinal.
+    checkpoint(std::slice::from_ref(&appended_by_the_checkpoint)).unwrap();
+    let persisted = vec![
+        first.clone(),
+        second.clone(),
+        appended_by_the_checkpoint.clone(),
+    ];
+    assert_eq!(persistence.load_run_activities(run_id).unwrap(), persisted);
+    // The state save that was already running still carries the older
+    // snapshot of two activities.
+    state_save(&[first.clone(), second.clone()]).unwrap();
+    assert_eq!(
+        persistence.load_run_activities(run_id).unwrap(),
+        persisted,
+        "a state save must not drop an activity a checkpoint already persisted"
+    );
+    // The next append must extend the stored order instead of taking the
+    // ordinal the dropped activity would have reused.
+    checkpoint(std::slice::from_ref(&appended_after_the_save)).unwrap();
+    let runtime_vector = vec![
+        first.clone(),
+        second.clone(),
+        appended_by_the_checkpoint.clone(),
+        appended_after_the_save.clone(),
+    ];
+    assert_eq!(
+        persistence.load_run_activities(run_id).unwrap(),
+        runtime_vector
+    );
+    // The backend hands the runtime vector to the next state save, whose
+    // positions have to agree with the stored ordinals.
+    state_save(&runtime_vector).unwrap();
+    assert_eq!(
+        persistence.load_run_activities(run_id).unwrap(),
+        runtime_vector,
+        "a successful state save keeps every activity in its stored order"
+    );
+
+    // A genuine reorder is still refused and leaves the stored order alone.
+    let reordered = vec![
+        second.clone(),
+        first.clone(),
+        appended_by_the_checkpoint,
+        appended_after_the_save,
+    ];
+    assert_eq!(
+        state_save(&reordered).unwrap_err().code,
+        ErrorCode::MalformedPayload
+    );
+    assert_eq!(
+        persistence.load_run_activities(run_id).unwrap(),
+        runtime_vector
+    );
+    drop(persistence);
+    fs::remove_file(path).unwrap();
+}
