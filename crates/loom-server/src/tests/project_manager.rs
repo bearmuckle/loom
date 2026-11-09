@@ -2612,6 +2612,23 @@ fn a_child_finishing_while_the_manager_awaits_approval_keeps_its_tool_calls_pair
         AgentRunState::Completed
     );
 
+    // The durable transcript, not only the assembled request, keeps the pair in
+    // order: that is what every later turn and every restart reads.
+    let durable = persistence.load_run_messages(root_run_id).unwrap();
+    let call_index = durable
+        .iter()
+        .position(|message| message.tool_calls.iter().any(|call| call.id == pending.id))
+        .expect("the approved command call is in the durable transcript");
+    assert_eq!(
+        durable[call_index + 1].tool_call_id,
+        Some(pending.id),
+        "the approved call keeps its result directly after it: {:?}",
+        durable
+            .iter()
+            .map(|message| (message.role, message.name.clone(), message.tool_call_id))
+            .collect::<Vec<_>>()
+    );
+
     drop(connection);
     backend.shutdown().unwrap();
     drop(backend);

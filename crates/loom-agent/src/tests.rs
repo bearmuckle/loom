@@ -56,6 +56,53 @@ fn repairs_unpaired_tool_messages_for_provider_requests() {
     assert_eq!(repaired[1].content, "archive implementation");
 }
 
+/// A result that an older transcript stored behind an intervening turn is moved
+/// back to its call. This is the shape a run could persist when a child-finish
+/// notice was appended while a tool approval was pending, and a channel refuses
+/// it when a session is resumed on it.
+#[test]
+fn repairs_a_tool_result_that_sits_behind_an_intervening_turn() {
+    let call = ToolCall {
+        id: loom_core::ToolCallId::new(),
+        name: "run_command".to_owned(),
+        arguments: serde_json::json!({"command": "git status"}),
+    };
+    let tool_result = ModelMessage {
+        role: MessageRole::Tool,
+        content: "clean".to_owned(),
+        name: Some(call.name.clone()),
+        tool_call_id: Some(call.id),
+        tool_calls: Vec::new(),
+        reasoning_content: None,
+    };
+    let mut notice = ModelMessage::new(
+        MessageRole::User,
+        "[Project notification] Direct child task 'worker' finished",
+    );
+    notice.name = Some("loom_project_message".to_owned());
+    let source = vec![
+        ModelMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            name: None,
+            tool_call_id: None,
+            tool_calls: vec![call.clone()],
+            reasoning_content: None,
+        },
+        notice.clone(),
+        tool_result.clone(),
+    ];
+
+    let repaired = repair_tool_transcript(source.clone(), &source);
+
+    assert_eq!(repaired.len(), 3);
+    assert_eq!(repaired[1].tool_call_id, Some(call.id));
+    assert_eq!(repaired[1].content, "clean");
+    assert_eq!(repaired[2].content, notice.content);
+    // Repairing twice keeps the same order instead of duplicating the result.
+    assert_eq!(repair_tool_transcript(repaired.clone(), &source), repaired);
+}
+
 /// Provider that blocks in the middle of a completion until it is released
 /// or cancelled, so control requests can be exercised against a busy run.
 struct BlockingProvider {
