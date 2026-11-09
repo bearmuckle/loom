@@ -295,18 +295,10 @@ impl AgentRuntime {
     fn flush_tool_calls(&mut self, calls: Vec<ToolCall>, events: &mut Vec<AgentEvent>) {
         let mut index = 0;
         while index < calls.len() {
-            let is_read_only = self
-                .tools
-                .action_kind(&calls[index])
-                .is_some_and(|kind| kind == loom_core::ActionKind::Read);
+            let is_read_only = self.tools.joins_read_batch(&calls[index]);
             if is_read_only {
                 let mut end = index;
-                while end < calls.len()
-                    && self
-                        .tools
-                        .action_kind(&calls[end])
-                        .is_some_and(|kind| kind == loom_core::ActionKind::Read)
-                {
+                while end < calls.len() && self.tools.joins_read_batch(&calls[end]) {
                     end += 1;
                 }
                 let batch = calls[index..end].to_vec();

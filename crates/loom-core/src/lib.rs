@@ -68,7 +68,10 @@ pub use participant::{
 pub use paths::{
     bind_key, config_dir, create_private_dir, instance_dir, state_dir, state_root, token_path,
 };
-pub use policy::{ActionKind, ApprovalPolicy, PolicyDecision, PolicyEvaluation};
+pub use policy::{
+    ActionKind, ApprovalPolicy, PolicyDecision, PolicyEvaluation, READ_ONLY_COMMANDS_ENV,
+    ReadOnlyCommandPolicy,
+};
 pub use process::{
     TaskArtifact, TaskEvent, TaskEventRecord, TaskEvidenceLink, TaskKind, TaskSnapshot, TaskSpec,
     TaskStatus, TerminalEvent, TerminalEventRecord, TerminalSnapshot, TerminalStatus,
