@@ -15,7 +15,7 @@ use std::{
 use globset::Glob;
 use loom_core::{
     ActionKind, AgentSessionId, ApprovalPolicy, PolicyEvaluation, ProjectWorktreeBaseRefresh,
-    Result, Timestamp,
+    ReadOnlyCommandPolicy, Result, Timestamp,
 };
 pub use loom_model::ToolResult;
 use loom_model::{
@@ -557,6 +557,10 @@ pub struct ToolExecutor {
     extension: Option<Arc<dyn ToolExtension>>,
     /// Per-session Cargo target directory, when the server owns a build cache.
     build_cache: Option<PathBuf>,
+    /// Whether a command that provably only reads is classified as a read
+    /// action instead of a command action. Disabled unless the operator opted
+    /// in, so the default policy gates every command.
+    read_only_commands: ReadOnlyCommandPolicy,
 }
 
 impl ToolExecutor {
@@ -581,7 +585,21 @@ impl ToolExecutor {
             github_api_base: DEFAULT_GITHUB_API_BASE.to_owned(),
             extension: None,
             build_cache: None,
+            read_only_commands: ReadOnlyCommandPolicy::disabled(),
         }
+    }
+
+    /// Lets a command that provably only reads be evaluated under the read
+    /// dimension of the approval policy instead of the command dimension.
+    ///
+    /// The caller is the operator opt-in: the default keeps every command a
+    /// command, and an enabled policy only moves the commands the allowlist in
+    /// [`loom_core::ReadOnlyCommandPolicy`] recognises. A classified call is
+    /// still executed by this executor as the same program with the same
+    /// arguments; the classification decides only whether it needs approval.
+    pub fn with_read_only_commands(mut self, policy: ReadOnlyCommandPolicy) -> Self {
+        self.read_only_commands = policy;
+        self
     }
 
     /// Directs this session's Cargo build output to a Loom-owned cache
@@ -696,13 +714,59 @@ impl ToolExecutor {
     }
 
     pub fn action_kind(&self, call: &ToolCall) -> Option<ActionKind> {
-        ToolKind::from_name(&call.name)
-            .map(ToolKind::action_kind)
-            .or_else(|| {
-                self.extension
-                    .as_ref()
-                    .and_then(|extension| extension.action_kind(call))
-            })
+        match ToolKind::from_name(&call.name) {
+            Some(ToolKind::RunCommand) => Some(self.run_command_kind(call)),
+            Some(kind) => Some(kind.action_kind()),
+            None => self
+                .extension
+                .as_ref()
+                .and_then(|extension| extension.action_kind(call)),
+        }
+    }
+
+    /// The action kind one `run_command` call is evaluated under.
+    ///
+    /// `run_command` is the one tool whose kind depends on its call: a disabled
+    /// read-only policy keeps it a command, and an enabled one moves only the
+    /// calls the allowlist recognises to `Read`. A call whose arguments do not
+    /// have the shape the tool executes is never a read, so a malformed call
+    /// cannot slip past approval and only fail afterwards.
+    fn run_command_kind(&self, call: &ToolCall) -> ActionKind {
+        let Some(command) = call
+            .arguments
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return ActionKind::Command;
+        };
+        let args = match call.arguments.get("args") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::Array(args)) => {
+                let mut collected = Vec::with_capacity(args.len());
+                for arg in args {
+                    let Some(arg) = arg.as_str() else {
+                        return ActionKind::Command;
+                    };
+                    collected.push(arg.to_owned());
+                }
+                collected
+            }
+            Some(_) => return ActionKind::Command,
+        };
+        self.read_only_commands.classify(command, &args)
+    }
+
+    /// Whether this call may join the concurrent batch of read-only calls in a
+    /// model turn.
+    ///
+    /// A command classified as a read still runs in model order and on its own:
+    /// commands can touch shared state even when they only read (`git status`
+    /// refreshes the index stat cache), and a caller reading the transcript sees
+    /// the calls in the order the model made them.
+    pub fn joins_read_batch(&self, call: &ToolCall) -> bool {
+        self.action_kind(call)
+            .is_some_and(|kind| kind == ActionKind::Read)
+            && ToolKind::from_name(&call.name) != Some(ToolKind::RunCommand)
     }
 
     /// Returns the stable continuation key for an extension tool that must
@@ -9200,6 +9264,110 @@ mod tests {
             "{}",
             result.output
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The executor default is the shipped policy: every `run_command` call is a
+    /// command, even one the allowlist would recognise, so nothing widens
+    /// without the operator handing in an enabled policy.
+    #[test]
+    fn the_executor_default_keeps_a_reading_command_a_command() {
+        let root = workspace();
+        let executor = ToolExecutor::new_with_workspace(
+            Workspace::open(AgentSessionId::new(), &root).unwrap(),
+        );
+        let status = call(
+            "run_command",
+            serde_json::json!({"command": "git", "args": ["status", "--short"]}),
+        );
+        assert_eq!(executor.action_kind(&status), Some(ActionKind::Command));
+        let evaluation = executor
+            .policy_evaluation(&status, &ApprovalPolicy::default())
+            .expect("run_command is classified");
+        assert_eq!(evaluation.action, ActionKind::Command);
+        assert_eq!(
+            evaluation.decision,
+            loom_core::PolicyDecision::RequireApproval
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// With the explicit opt-in the same call is evaluated under the read
+    /// dimension, which the default policy allows, while a call the allowlist
+    /// does not recognise keeps prompting.
+    #[test]
+    fn an_opted_in_executor_moves_only_allowlisted_commands_to_reads() {
+        let root = workspace();
+        let executor = ToolExecutor::new_with_workspace(
+            Workspace::open(AgentSessionId::new(), &root).unwrap(),
+        )
+        .with_read_only_commands(ReadOnlyCommandPolicy::enabled());
+        let reads = [
+            serde_json::json!({"command": "git", "args": ["log", "--oneline", "-n", "3"]}),
+            serde_json::json!({"command": "git", "args": ["diff", "--stat"]}),
+            serde_json::json!({"command": "rg", "args": ["-n", "pattern", "crates"]}),
+            serde_json::json!({"command": "cat", "args": ["Cargo.toml"]}),
+        ];
+        for arguments in reads {
+            let read = call("run_command", arguments.clone());
+            assert_eq!(
+                executor.action_kind(&read),
+                Some(ActionKind::Read),
+                "{arguments} reads"
+            );
+            let evaluation = executor
+                .policy_evaluation(&read, &ApprovalPolicy::default())
+                .expect("run_command is classified");
+            assert_eq!(evaluation.decision, loom_core::PolicyDecision::Allow);
+        }
+
+        let commands = [
+            serde_json::json!({"command": "cargo", "args": ["test"]}),
+            serde_json::json!({"command": "git", "args": ["push"]}),
+            serde_json::json!({"command": "git", "args": ["diff", "--output=patch.diff"]}),
+            serde_json::json!({"command": "sh", "args": ["-c", "git log"]}),
+            serde_json::json!({"command": "cat", "args": ["/etc/passwd"]}),
+            // A malformed call is never a read, so it cannot slip past approval
+            // and only fail at execution.
+            serde_json::json!({"command": "git", "args": ["log", 1]}),
+            serde_json::json!({"command": 1, "args": ["log"]}),
+        ];
+        for arguments in commands {
+            let command = call("run_command", arguments.clone());
+            assert_eq!(
+                executor.action_kind(&command),
+                Some(ActionKind::Command),
+                "{arguments} stays a command"
+            );
+            let evaluation = executor
+                .policy_evaluation(&command, &ApprovalPolicy::default())
+                .expect("run_command is classified");
+            assert_eq!(
+                evaluation.decision,
+                loom_core::PolicyDecision::RequireApproval
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A classified read command still runs on its own instead of joining the
+    /// concurrent read batch, because a command can touch shared state (a `git
+    /// status` refreshes the index) and its output belongs in model order.
+    #[test]
+    fn a_classified_read_command_does_not_join_the_concurrent_read_batch() {
+        let root = workspace();
+        let executor = ToolExecutor::new_with_workspace(
+            Workspace::open(AgentSessionId::new(), &root).unwrap(),
+        )
+        .with_read_only_commands(ReadOnlyCommandPolicy::enabled());
+        let command = call(
+            "run_command",
+            serde_json::json!({"command": "git", "args": ["status"]}),
+        );
+        assert_eq!(executor.action_kind(&command), Some(ActionKind::Read));
+        assert!(!executor.joins_read_batch(&command));
+        let read = call("read_file", serde_json::json!({"path": "Cargo.toml"}));
+        assert!(executor.joins_read_batch(&read));
         fs::remove_dir_all(root).unwrap();
     }
 }

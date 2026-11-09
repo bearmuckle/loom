@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::RunId;
+use crate::{LoomError, Result, RunId};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -78,6 +78,632 @@ impl ApprovalPolicy {
     }
 }
 
+/// Operator opt-in that lets a command which provably only reads be classified
+/// as [`ActionKind::Read`] instead of [`ActionKind::Command`].
+///
+/// `run_command` runs an arbitrary program, so the default policy gates it as a
+/// command and the operator has to approve it. Some runs are dominated by
+/// read-only inspection (`git log`, `git diff`, `rg`, `cat`) that repeats the
+/// reads the file tools already perform unapproved, and an operator who knows
+/// their checkouts may let exactly those run as reads.
+///
+/// The opt-in is off unless an operator turns it on, first by choosing the
+/// configuration value (see [`ReadOnlyCommandPolicy::from_setting`]) and then
+/// by handing the enabled policy to the tool executor. Disabled, the policy
+/// classifies every command as a command, so nothing about the shipped default
+/// policy widens on its own.
+///
+/// The allowlist is conservative in the only direction that is safe: a command
+/// it does not recognise stays a command and still prompts. A missed entry costs
+/// an approval; a wrongly allowed one would run unapproved.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReadOnlyCommandPolicy {
+    enabled: bool,
+}
+
+/// The environment variable an operator sets to opt in to classifying
+/// read-only commands as reads. Turning it on is a deliberate deployment
+/// decision, never a default.
+pub const READ_ONLY_COMMANDS_ENV: &str = "LOOM_READ_ONLY_COMMANDS";
+
+impl ReadOnlyCommandPolicy {
+    /// The shipped behaviour: every command is a command action.
+    pub const fn disabled() -> Self {
+        Self { enabled: false }
+    }
+
+    /// Classification of provably read-only commands is turned on.
+    pub const fn enabled() -> Self {
+        Self { enabled: true }
+    }
+
+    pub const fn is_enabled(self) -> bool {
+        self.enabled
+    }
+
+    /// Resolves the operator setting.
+    ///
+    /// An absent or blank value keeps the policy disabled, `1`/`true`/`yes`/`on`
+    /// enables it, `0`/`false`/`no`/`off` disables it explicitly, and any other
+    /// value is an error instead of being read as one of the two: a typo must not
+    /// silently leave the opt-in on or off.
+    pub fn from_setting(value: Option<&str>) -> Result<Self> {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::disabled());
+        };
+        match value.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(Self::enabled()),
+            "0" | "false" | "no" | "off" => Ok(Self::disabled()),
+            _ => Err(LoomError::invalid_request(format!(
+                "{READ_ONLY_COMMANDS_ENV} must be one of 1, true, yes, on, 0, false, no, off, but was '{value}'"
+            ))),
+        }
+    }
+
+    /// The action kind one `run_command` call is evaluated under.
+    ///
+    /// `program` is the executable and `args` its arguments, as the tool
+    /// receives them. A disabled policy answers [`ActionKind::Command`] without
+    /// inspecting the call at all.
+    pub fn classify(self, program: &str, args: &[String]) -> ActionKind {
+        if self.enabled && command_only_reads(program, args) {
+            ActionKind::Read
+        } else {
+            ActionKind::Command
+        }
+    }
+}
+
+/// One program the read-only allowlist accepts, with the arguments it may carry.
+struct ReadOnlyProgram {
+    program: &'static str,
+    /// Long options accepted without the leading `--`. An option's value is its
+    /// own argument, which is then checked as a positional argument.
+    long_options: &'static [&'static str],
+    /// Short-option characters accepted, possibly combined in one argument.
+    short_options: &'static [char],
+    /// Subcommands accepted as the first positional argument; empty when the
+    /// program takes none and every positional argument is a path or a pattern.
+    subcommands: &'static [&'static str],
+    /// Whether a bare number is accepted as an option (`git log -3`,
+    /// `head -20`), which those programs read as their count option.
+    numeric_shorthand: bool,
+}
+
+impl ReadOnlyProgram {
+    fn accepts_option(&self, argument: &str) -> bool {
+        if let Some(long) = argument.strip_prefix("--") {
+            let name = long.split('=').next().unwrap_or(long);
+            return self.long_options.contains(&name);
+        }
+        let short = argument.trim_start_matches('-');
+        if short.is_empty() {
+            return false;
+        }
+        if short.chars().all(|character| character.is_ascii_digit()) {
+            return self.numeric_shorthand;
+        }
+        // A short option may carry its value attached (`-n5`), so trailing
+        // digits are stripped before the characters are checked.
+        let flags = short.trim_end_matches(|character: char| character.is_ascii_digit());
+        !flags.is_empty()
+            && flags
+                .chars()
+                .all(|character| self.short_options.contains(&character))
+    }
+}
+
+/// Characters a shell reads as structure: chaining, redirection, substitution,
+/// globbing, quoting, or a comment.
+///
+/// `run_command` does not run a shell, so these are literal bytes to the
+/// program. They are still refused here, because a classified read must stay a
+/// read even if a future caller passes the same string through a shell, and
+/// because each of them makes a command's effect depend on parsing rules the
+/// allowlist would have to model.
+const SHELL_STRUCTURE: &[char] = &[
+    '|', '&', ';', '<', '>', '`', '$', '(', ')', '{', '}', '*', '?', '[', ']', '\\', '"', '\'',
+    '#', '!', '\n', '\r',
+];
+
+/// Whether one argument names something outside the session tree or carries
+/// shell structure, which keeps a classified read inside the tree the file tools
+/// are scoped to.
+fn argument_is_scoped(argument: &str) -> bool {
+    if argument
+        .chars()
+        .any(|character| SHELL_STRUCTURE.contains(&character))
+    {
+        return false;
+    }
+    // An absolute path (POSIX, or a Windows drive or UNC path) leaves the tree
+    // the command runs in, and `..` may do the same, so both stay unapproved.
+    if argument.starts_with('/') || argument.starts_with('\\') {
+        return false;
+    }
+    if argument.len() > 2 && argument.as_bytes()[1] == b':' {
+        return false;
+    }
+    !argument.split(['/', '\\']).any(|segment| segment == "..")
+}
+
+/// Whether `program` with `args` provably only reads.
+fn command_only_reads(program: &str, args: &[String]) -> bool {
+    let Some(spec) = READ_ONLY_PROGRAMS
+        .iter()
+        .find(|spec| spec.program == program)
+    else {
+        return false;
+    };
+    let mut options_ended = false;
+    let mut subcommand_seen = spec.subcommands.is_empty();
+    for argument in args {
+        if !argument_is_scoped(argument) {
+            return false;
+        }
+        if options_ended {
+            continue;
+        }
+        if argument == "--" {
+            options_ended = true;
+            continue;
+        }
+        if argument.starts_with('-') {
+            if !spec.accepts_option(argument) {
+                return false;
+            }
+            continue;
+        }
+        if !subcommand_seen {
+            if !spec.subcommands.contains(&argument.as_str()) {
+                return false;
+            }
+            subcommand_seen = true;
+        }
+    }
+    // A program that dispatches on a subcommand is only classified when the
+    // call actually selects one of the reading subcommands; `git` with no
+    // subcommand prints usage and is not a read.
+    subcommand_seen
+}
+
+/// The programs and options a classified read may use.
+///
+/// Every entry was chosen against two questions: can this option write a file,
+/// run another program, or change configuration, and can the program write at
+/// all with the options listed? An option that is not listed is refused, so a
+/// newly added tool option prompts until it is deliberately allowlisted here.
+const READ_ONLY_PROGRAMS: &[ReadOnlyProgram] = &[
+    ReadOnlyProgram {
+        program: "git",
+        numeric_shorthand: true,
+        // `git log`, `status`, `diff`, `show`, `grep`, and the plumbing reads
+        // below only write the index stat cache. The options that would write a
+        // file (`--output`), run an external program (`--ext-diff`, `--textconv`,
+        // a pager through `--paginate`), or take configuration (`-c`, `-O`) are
+        // deliberately absent, which is also why `-c`, `-O`, and `--exec-path`
+        // are not accepted as global options.
+        long_options: &[
+            "abbrev",
+            "abbrev-commit",
+            "abbrev-ref",
+            "after",
+            "all",
+            "all-match",
+            "author",
+            "basic-regexp",
+            "before",
+            "binary",
+            "branch",
+            "branches",
+            "cached",
+            "color",
+            "color-moved",
+            "color-words",
+            "column",
+            "committer",
+            "count",
+            "date",
+            "decorate",
+            "decorate-refs",
+            "dense",
+            "diff-algorithm",
+            "diff-filter",
+            "exit-code",
+            "extended-regexp",
+            "files-with-matches",
+            "find-copies",
+            "find-renames",
+            "first-parent",
+            "fixed-strings",
+            "follow",
+            "format",
+            "full-index",
+            "full-name",
+            "graph",
+            "grep",
+            "heading",
+            "histogram",
+            "ignore-all-space",
+            "ignore-blank-lines",
+            "ignore-case",
+            "ignore-space-at-eol",
+            "ignore-space-change",
+            "ignored",
+            "invert-grep",
+            "line-number",
+            "line-prefix",
+            "long",
+            "max-count",
+            "merges",
+            "minimal",
+            "name-only",
+            "name-status",
+            "no-color",
+            "no-ext-diff",
+            "no-merges",
+            "no-pager",
+            "no-patch",
+            "no-renames",
+            "no-textconv",
+            "not",
+            "numstat",
+            "oneline",
+            "patch",
+            "patch-with-raw",
+            "patch-with-stat",
+            "patience",
+            "porcelain",
+            "pretty",
+            "quiet",
+            "raw",
+            "regexp-ignore-case",
+            "relative",
+            "relative-date",
+            "remotes",
+            "reverse",
+            "short",
+            "shortstat",
+            "show-signature",
+            "since",
+            "skip",
+            "source",
+            "stat",
+            "stat-count",
+            "stat-width",
+            "submodule",
+            "summary",
+            "tags",
+            "topo-order",
+            "unified",
+            "unified-context",
+            "untracked-files",
+            "verbose",
+            "with-filename",
+            "word-diff",
+            "word-diff-regex",
+            "z",
+        ],
+        short_options: &[
+            'b', 'C', 'E', 'F', 'G', 'i', 'L', 'M', 'm', 'n', 'p', 'S', 's', 'U', 'u', 'w', 'z',
+        ],
+        subcommands: &[
+            "blame",
+            "describe",
+            "diff",
+            "grep",
+            "log",
+            "ls-files",
+            "rev-parse",
+            "shortlog",
+            "show",
+            "status",
+            "whatchanged",
+        ],
+    },
+    ReadOnlyProgram {
+        program: "ls",
+        numeric_shorthand: false,
+        long_options: &[
+            "all",
+            "almost-all",
+            "block-size",
+            "classify",
+            "color",
+            "directory",
+            "dereference",
+            "file-type",
+            "format",
+            "full-time",
+            "group-directories-first",
+            "hide",
+            "human-readable",
+            "ignore",
+            "inode",
+            "literal",
+            "long",
+            "no-group",
+            "numeric-uid-gid",
+            "quote-name",
+            "recursive",
+            "reverse",
+            "si",
+            "size",
+            "sort",
+            "time",
+            "time-style",
+        ],
+        short_options: &[
+            '1', 'A', 'a', 'B', 'C', 'd', 'F', 'G', 'g', 'h', 'i', 'k', 'l', 'm', 'n', 'o', 'p',
+            'Q', 'q', 'R', 'r', 'S', 's', 't', 'U', 'u', 'v', 'X', 'x',
+        ],
+        subcommands: &[],
+    },
+    ReadOnlyProgram {
+        program: "cat",
+        numeric_shorthand: false,
+        long_options: &[
+            "number",
+            "number-nonblank",
+            "show-all",
+            "show-ends",
+            "show-nonprinting",
+            "show-tabs",
+            "squeeze-blank",
+        ],
+        short_options: &['A', 'b', 'E', 'e', 'n', 's', 'T', 't', 'u', 'v'],
+        subcommands: &[],
+    },
+    ReadOnlyProgram {
+        program: "head",
+        numeric_shorthand: true,
+        long_options: &[
+            "bytes",
+            "lines",
+            "quiet",
+            "silent",
+            "verbose",
+            "zero-terminated",
+        ],
+        short_options: &['c', 'n', 'q', 'v', 'z'],
+        subcommands: &[],
+    },
+    ReadOnlyProgram {
+        // `--follow`/`-f` is absent: it never ends on its own, so it is not a
+        // read the tool can bound without the caller's timeout.
+        program: "tail",
+        numeric_shorthand: true,
+        long_options: &[
+            "bytes",
+            "lines",
+            "quiet",
+            "silent",
+            "sleep-interval",
+            "verbose",
+            "zero-terminated",
+        ],
+        short_options: &['c', 'n', 'q', 's', 'v', 'z'],
+        subcommands: &[],
+    },
+    ReadOnlyProgram {
+        program: "wc",
+        numeric_shorthand: false,
+        long_options: &["bytes", "chars", "lines", "max-line-length", "words"],
+        short_options: &['c', 'L', 'l', 'm', 'w'],
+        subcommands: &[],
+    },
+    ReadOnlyProgram {
+        program: "rg",
+        numeric_shorthand: false,
+        // `--pre`, `--pre-glob`, `--hostname-bin`, and `--search-zip` run or
+        // decompress through another program, so none of them is accepted.
+        long_options: &[
+            "after-context",
+            "before-context",
+            "binary",
+            "case-sensitive",
+            "column",
+            "context",
+            "count",
+            "count-matches",
+            "crlf",
+            "encoding",
+            "files",
+            "files-with-matches",
+            "files-without-match",
+            "fixed-strings",
+            "glob",
+            "glob-case-insensitive",
+            "heading",
+            "hidden",
+            "iglob",
+            "ignore-case",
+            "json",
+            "line-number",
+            "max-count",
+            "max-depth",
+            "max-filesize",
+            "multiline",
+            "multiline-dotall",
+            "no-config",
+            "no-filename",
+            "no-heading",
+            "no-ignore",
+            "no-ignore-global",
+            "no-ignore-vcs",
+            "no-line-number",
+            "no-messages",
+            "no-require-git",
+            "no-unicode",
+            "null",
+            "null-data",
+            "only-matching",
+            "passthru",
+            "pretty",
+            "quiet",
+            "regexp",
+            "replace",
+            "smart-case",
+            "sort",
+            "sortr",
+            "stats",
+            "text",
+            "threads",
+            "trim",
+            "type",
+            "type-not",
+            "type-list",
+            "unicode",
+            "unrestricted",
+            "vimgrep",
+            "with-filename",
+            "word-regexp",
+        ],
+        short_options: &[
+            '0', 'A', 'a', 'B', 'b', 'C', 'c', 'E', 'e', 'F', 'f', 'g', 'H', 'h', 'I', 'i', 'j',
+            'L', 'l', 'M', 'm', 'N', 'n', 'o', 'p', 'q', 'r', 'S', 's', 'T', 't', 'U', 'u', 'v',
+            'w', 'x',
+        ],
+        subcommands: &[],
+    },
+    ReadOnlyProgram {
+        program: "grep",
+        numeric_shorthand: false,
+        long_options: &[
+            "after-context",
+            "basic-regexp",
+            "before-context",
+            "binary-files",
+            "byte-offset",
+            "color",
+            "colour",
+            "context",
+            "count",
+            "dereference-recursive",
+            "directories",
+            "exclude",
+            "exclude-dir",
+            "exclude-from",
+            "extended-regexp",
+            "file",
+            "files-with-matches",
+            "files-without-match",
+            "fixed-strings",
+            "ignore-case",
+            "include",
+            "invert-match",
+            "line-buffered",
+            "line-number",
+            "line-regexp",
+            "max-count",
+            "no-filename",
+            "no-ignore-case",
+            "no-messages",
+            "null",
+            "null-data",
+            "only-matching",
+            "perl-regexp",
+            "quiet",
+            "recursive",
+            "regexp",
+            "silent",
+            "text",
+            "with-filename",
+            "word-regexp",
+        ],
+        short_options: &[
+            'A', 'a', 'B', 'b', 'C', 'c', 'E', 'e', 'F', 'f', 'G', 'H', 'h', 'I', 'i', 'L', 'l',
+            'm', 'n', 'o', 'q', 'r', 's', 'v', 'w', 'x', 'z',
+        ],
+        subcommands: &[],
+    },
+    ReadOnlyProgram {
+        // `-C`/`--compile` writes a compiled magic file, so it is absent.
+        program: "file",
+        numeric_shorthand: false,
+        long_options: &[
+            "brief",
+            "dereference",
+            "exclude",
+            "extension",
+            "mime",
+            "mime-encoding",
+            "mime-type",
+            "no-dereference",
+            "print0",
+            "separator",
+        ],
+        short_options: &['0', 'b', 'f', 'h', 'i', 'k', 'L', 'N', 's', 'z'],
+        subcommands: &[],
+    },
+    ReadOnlyProgram {
+        program: "stat",
+        numeric_shorthand: false,
+        long_options: &["dereference", "file-system", "format", "printf", "terse"],
+        short_options: &['c', 'f', 'L', 't'],
+        subcommands: &[],
+    },
+    ReadOnlyProgram {
+        program: "pwd",
+        numeric_shorthand: false,
+        long_options: &["logical", "physical"],
+        short_options: &['L', 'P'],
+        subcommands: &[],
+    },
+    ReadOnlyProgram {
+        // `-o`/`--output` writes a file, so it is absent.
+        program: "tree",
+        numeric_shorthand: false,
+        long_options: &[
+            "all",
+            "dirsfirst",
+            "du",
+            "filelimit",
+            "gitignore",
+            "human-readable",
+            "ignore-case",
+            "level",
+            "matchdirs",
+            "noreport",
+            "prune",
+            "size",
+        ],
+        short_options: &[
+            'a', 'C', 'D', 'd', 'F', 'f', 'h', 'I', 'i', 'J', 'l', 'L', 'N', 'n', 'P', 'p', 'Q',
+            'q', 'R', 'r', 's', 't', 'U', 'u', 'v', 'X', 'x',
+        ],
+        subcommands: &[],
+    },
+    ReadOnlyProgram {
+        program: "du",
+        numeric_shorthand: false,
+        long_options: &[
+            "all",
+            "apparent-size",
+            "block-size",
+            "bytes",
+            "count-links",
+            "dereference",
+            "disk-usage",
+            "exclude",
+            "human-readable",
+            "inodes",
+            "max-depth",
+            "null",
+            "one-file-system",
+            "separate-dirs",
+            "summarize",
+            "threshold",
+            "time",
+            "total",
+        ],
+        short_options: &[
+            '0', 'a', 'b', 'c', 'd', 'h', 'k', 'L', 'm', 'P', 's', 'S', 'x',
+        ],
+        subcommands: &[],
+    },
+];
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PolicyEvaluation {
     pub action: ActionKind,
@@ -127,6 +753,191 @@ impl PolicyEvaluation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Classifies one call the way the tool executor does, from a program and
+    /// its arguments.
+    fn classify(policy: ReadOnlyCommandPolicy, program: &str, args: &[&str]) -> ActionKind {
+        policy.classify(
+            program,
+            &args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>(),
+        )
+    }
+
+    /// Every positive case is a command a run actually issues to inspect a
+    /// workspace: the git reads, plus the file and search reads the file tools
+    /// already perform unapproved.
+    #[test]
+    fn opted_in_policy_classifies_reading_commands_as_reads() {
+        let policy = ReadOnlyCommandPolicy::enabled();
+        let cases: &[(&str, &[&str])] = &[
+            ("git", &["log", "--oneline", "-n", "5"]),
+            ("git", &["log", "--format=%h %s", "-n5"]),
+            ("git", &["status", "--short", "--branch"]),
+            ("git", &["diff", "--stat", "HEAD~1"]),
+            ("git", &["diff", "--cached", "--name-only"]),
+            ("git", &["show", "--no-patch", "HEAD"]),
+            ("git", &["rev-parse", "--abbrev-ref", "HEAD"]),
+            ("git", &["grep", "-n", "pattern", "crates"]),
+            ("git", &["--no-pager", "log", "-3"]),
+            ("ls", &["-la", "crates"]),
+            ("ls", &["--long", "--human-readable"]),
+            ("cat", &["Cargo.toml"]),
+            ("head", &["-n", "20", "README.md"]),
+            ("tail", &["-n", "20", "README.md"]),
+            ("wc", &["-l", "Cargo.toml"]),
+            ("rg", &["-n", "--type", "rust", "pattern", "crates"]),
+            ("grep", &["-rn", "pattern", "crates"]),
+            ("pwd", &[]),
+            ("stat", &["-c", "%s", "Cargo.toml"]),
+            ("file", &["-b", "Cargo.toml"]),
+            ("du", &["-sh", "crates"]),
+        ];
+        for (program, args) in cases {
+            assert_eq!(
+                classify(policy, program, args),
+                ActionKind::Read,
+                "{program} {args:?} should read"
+            );
+        }
+    }
+
+    /// The security regression: nothing that can write, run another program, or
+    /// leave the tree may pass as a read, however it is spelled.
+    #[test]
+    fn opted_in_policy_keeps_every_writing_or_escaping_command_a_command() {
+        let policy = ReadOnlyCommandPolicy::enabled();
+        let cases: &[(&str, &[&str])] = &[
+            // A program that can write, or a shell that would run anything one
+            // argument names.
+            ("rm", &["-rf", "crates"]),
+            ("sh", &["-c", "ls"]),
+            ("bash", &["-c", "git log"]),
+            ("env", &["ls"]),
+            ("sudo", &["ls"]),
+            ("cargo", &["test"]),
+            ("git", &["commit", "-m", "x"]),
+            ("git", &["push"]),
+            ("git", &["checkout", "--", "."]),
+            ("git", &[]),
+            // Options that write a file or run an external program.
+            ("git", &["diff", "--output=patch.diff"]),
+            ("git", &["diff", "--output", "patch.diff"]),
+            ("git", &["diff", "--ext-diff"]),
+            ("git", &["diff", "--textconv"]),
+            ("git", &["log", "--paginate"]),
+            ("git", &["-c", "core.pager=cat", "log"]),
+            ("git", &["-O", "orderfile", "log"]),
+            ("git", &["log", "-O", "orderfile"]),
+            ("git", &["grep", "-O", "pattern"]),
+            ("rg", &["--pre", "cat", "pattern"]),
+            ("rg", &["--pre-glob", "*.rs", "pattern"]),
+            ("rg", &["--hostname-bin", "hostname", "pattern"]),
+            ("rg", &["-z", "pattern"]),
+            ("file", &["-C", "-m", "magic"]),
+            ("tail", &["-f", "log"]),
+            ("tree", &["-o", "listing.txt"]),
+            // Shell structure: chaining, redirection, substitution, globbing.
+            ("ls", &["| tee", "out.txt"]),
+            ("cat", &["a;rm b"]),
+            ("cat", &["$(id)"]),
+            ("cat", &["`id`"]),
+            ("cat", &["a&&rm b"]),
+            ("ls", &[">out.txt"]),
+            ("ls", &["*.rs"]),
+            ("rg", &["a|b", "crates"]),
+            // A glob metacharacter stays a command everywhere, including in an
+            // option value: the argument would change meaning if it ever reached
+            // a shell, so the allowlist does not model glob parsing.
+            ("rg", &["--glob", "*.rs", "pattern", "crates"]),
+            ("rg", &["--glob=*.rs", "pattern", "crates"]),
+            ("cat", &["a\nb"]),
+            // Paths that leave the session tree.
+            ("cat", &["/etc/passwd"]),
+            ("cat", &["../outside.txt"]),
+            ("cat", &["crates/../../outside.txt"]),
+            ("ls", &["\\\\server\\share"]),
+        ];
+        for (program, args) in cases {
+            assert_eq!(
+                classify(policy, program, args),
+                ActionKind::Command,
+                "{program} {args:?} must stay a command"
+            );
+        }
+    }
+
+    /// The opt-in is the only thing that changes the classification, and the
+    /// shipped default keeps every command a command.
+    #[test]
+    fn the_shipped_default_policy_keeps_even_a_reading_command_a_command() {
+        let policy = ReadOnlyCommandPolicy::default();
+        assert_eq!(policy, ReadOnlyCommandPolicy::disabled());
+        assert!(!policy.is_enabled());
+        assert_eq!(
+            classify(policy, "git", &["status", "--short"]),
+            ActionKind::Command
+        );
+        assert_eq!(classify(policy, "pwd", &[]), ActionKind::Command);
+        assert_eq!(
+            ApprovalPolicy::default().decision(classify(policy, "git", &["status"])),
+            PolicyDecision::RequireApproval
+        );
+    }
+
+    /// The opt-in changes only the read dimension: a classified read runs under
+    /// the read decision, and every command the allowlist refuses keeps the
+    /// command decision.
+    #[test]
+    fn the_opt_in_only_moves_allowlisted_commands_to_the_read_decision() {
+        let policy = ReadOnlyCommandPolicy::enabled();
+        let approvals = ApprovalPolicy::default();
+        assert_eq!(
+            approvals.decision(classify(policy, "git", &["log", "--oneline"])),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            approvals.decision(classify(policy, "git", &["push"])),
+            PolicyDecision::RequireApproval
+        );
+        // A read dimension that still gates reads keeps gating a classified
+        // command: the opt-in moves the kind, it never grants the action.
+        let gated = ApprovalPolicy {
+            read: PolicyDecision::Deny,
+            ..Default::default()
+        };
+        assert_eq!(
+            gated.decision(classify(policy, "ls", &["-l"])),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn the_setting_accepts_the_documented_values_and_refuses_the_rest() {
+        for value in ["1", "true", "TRUE", " yes ", "on"] {
+            assert_eq!(
+                ReadOnlyCommandPolicy::from_setting(Some(value)).unwrap(),
+                ReadOnlyCommandPolicy::enabled(),
+                "{value} enables"
+            );
+        }
+        for value in ["0", "false", "no", "off"] {
+            assert_eq!(
+                ReadOnlyCommandPolicy::from_setting(Some(value)).unwrap(),
+                ReadOnlyCommandPolicy::disabled(),
+                "{value} disables"
+            );
+        }
+        for value in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                ReadOnlyCommandPolicy::from_setting(value).unwrap(),
+                ReadOnlyCommandPolicy::disabled(),
+                "{value:?} keeps the default"
+            );
+        }
+        let error = ReadOnlyCommandPolicy::from_setting(Some("maybe")).unwrap_err();
+        assert!(error.message.contains(READ_ONLY_COMMANDS_ENV));
+        assert!(error.message.contains("maybe"));
+    }
 
     #[test]
     fn default_policy_allows_reads_and_destructive_actions() {
