@@ -50,7 +50,8 @@ default keeps every command a command.
 - `d11ab02` feat(core,tools): classify a provably read-only command as a read
   behind an opt-in
 - `da3f5e5` feat(server): add --read-only-commands as the operator opt-in
-- The docs/STATUS commit follows after this file.
+- `e24345e` docs(read-only): document the opt-in and record the worktree status
+- `e5f0291` docs(server): name the git reads once in the help text
 
 ## Tests
 
@@ -62,6 +63,9 @@ default keeps every command a command.
 - `cargo check --workspace --all-targets`, `cargo fmt --all`,
   `cargo clippy --all-targets -p loom-core -p loom-tools -p loom-agent
   -p loom-server -- -D warnings` — clean.
+- Manual check: `loom-server --help` prints the new option, and
+  `loom-server --read-only-commands maybe --bind 127.0.0.1:8899` exits non-zero
+  with `--read-only-commands must be one of …` before it binds anything.
 
 Positive and negative security regression tests live in
 `policy::tests::{opted_in_policy_classifies_reading_commands_as_reads,
