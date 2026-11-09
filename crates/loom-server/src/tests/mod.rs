@@ -53,6 +53,7 @@ mod project_misc;
 mod project_sub_project;
 mod project_workspace;
 mod providers;
+mod read_only_commands;
 mod resources;
 mod retention;
 mod runs;

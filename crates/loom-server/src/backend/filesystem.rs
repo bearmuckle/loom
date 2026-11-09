@@ -635,6 +635,7 @@ impl InProcessBackend {
                 .with_github_token(self.providers.github_account_token().ok())
                 .with_github_write_access(self.providers.github_write_access())
                 .with_github_repository_access(self.providers.github_repository_token().is_ok());
+            let tools = self.with_read_only_command_policy(tools);
             let tools = self.with_project_agent_tools(
                 tools,
                 runtime_state.session_id,

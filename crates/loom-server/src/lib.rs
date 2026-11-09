@@ -24,9 +24,10 @@ use loom_core::{
     Capability, CapabilitySet, DelegatedTaskSpec, ErrorCode, EventSequence, JevPolicy, LoomError,
     MAX_PROJECT_AGENT_DEPTH, ProjectAgentRecord, ProjectId, ProjectJevPolicy, ProjectSnapshot,
     ProjectWorktreeBaseRefresh, ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord,
-    ProjectWorktreeStatus, ProtocolVersion, RepositoryId, RequestId, Result, RunAttemptId,
-    SessionEventRecord, SessionJevPolicy, SessionTitleSource, TaskContextReference, Timestamp,
-    UsageSnapshot, WorkspaceId, WorkspaceRecord, sanitize_title, title_from_goal, titles_diverge,
+    ProjectWorktreeStatus, ProtocolVersion, ReadOnlyCommandPolicy, RepositoryId, RequestId, Result,
+    RunAttemptId, SessionEventRecord, SessionJevPolicy, SessionTitleSource, TaskContextReference,
+    Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord, sanitize_title, title_from_goal,
+    titles_diverge,
 };
 use loom_model::{
     ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId, ToolCall, ToolDefinition,
@@ -405,6 +406,14 @@ pub struct InProcessBackend {
     /// loaded when this backend opened or written by a later change; read
     /// through [`InProcessBackend::archive_retention_is_stored`].
     archive_retention_stored: AtomicBool,
+    /// Whether a `run_command` call that provably only reads is classified as a
+    /// read action instead of a command action; read through
+    /// [`InProcessBackend::read_only_commands`].
+    ///
+    /// This is the operator opt-in from `--read-only-commands` or
+    /// `LOOM_READ_ONLY_COMMANDS`, never a default: the shipped value keeps every
+    /// command a command.
+    read_only_commands: AtomicBool,
     idempotency_store: IdempotencyStore,
     admissions: AdmissionService,
     /// Participant directory, session grants, and connection presence.
