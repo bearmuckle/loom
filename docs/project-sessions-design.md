@@ -176,6 +176,21 @@ parent-child exchange; routing between branches is added after direct-child
 coordination is reliable. Membership and policy are checked on every send and
 read.
 
+The same boundary governs the turns the backend synthesizes itself: a
+child-finish notice is appended by the run worker at its safe model-turn
+boundary, next to inbox delivery and queued user directions, and never by the
+wake that reports the child. Waking a member only resumes it, because a wake can
+find the run blocked on a tool approval with an assistant `tool_calls` turn that
+has no tool messages yet, and a turn appended there splits that pair: an
+OpenAI-compatible route rejects the whole request, so the run fails instead of
+answering. A turn is appended only when the transcript owes no tool result,
+project join, approval, or input answer. Because a notice is derived from
+child-task state rather than accepted as a durable message, it is offered at
+every boundary until the transcript carries it, and it names the task id so the
+transcript is the record of delivery; it stays suppressed when the child's own
+result message arrived or when a claimed `wait_for_project_children` already
+handed the outcome to the manager.
+
 Human review remains available at consequential decisions, particularly code
 integration and policy-sensitive actions. Projects are flexible coordinators,
 not mandatory plan-document-to-issue-to-build pipelines.
