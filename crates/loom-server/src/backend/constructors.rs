@@ -380,6 +380,7 @@ impl InProcessBackend {
             build_cache_base,
             archive_retention: Mutex::new(loom_protocol::ArchiveRetentionPolicy::disabled()),
             archive_retention_stored: AtomicBool::new(false),
+            read_only_commands: AtomicBool::new(false),
             idempotency_store: IdempotencyStore::new(),
             admissions: AdmissionService::new(),
             access: Arc::new(AccessService::new()),

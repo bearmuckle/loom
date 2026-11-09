@@ -80,6 +80,7 @@ impl InProcessConnection {
             .with_github_repository_access(
                 self.backend.providers.github_repository_token().is_ok(),
             );
+        let tools = self.backend.with_read_only_command_policy(tools);
         let tools = self.backend.with_project_agent_tools(
             tools,
             state.session_id,
@@ -739,6 +740,7 @@ impl InProcessConnection {
             .with_github_repository_access(
                 self.backend.providers.github_repository_token().is_ok(),
             );
+        let tools = self.backend.with_read_only_command_policy(tools);
         let tools = self.backend.with_project_agent_tools(
             tools,
             session.id,

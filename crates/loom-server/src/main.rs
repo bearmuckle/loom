@@ -16,7 +16,7 @@ use std::{
     sync::Arc,
 };
 
-use loom_core::{ErrorCode, LoomError};
+use loom_core::{ErrorCode, LoomError, READ_ONLY_COMMANDS_ENV, ReadOnlyCommandPolicy};
 use loom_protocol::ArchiveRetentionPolicy;
 use loom_server::{
     ARCHIVE_RETENTION_ENV, ARCHIVE_RETENTION_FORCE_DISCARD_ENV, ARCHIVE_RETENTION_SUB_AGENT_ENV,
@@ -116,6 +116,10 @@ struct ServerOptions {
     github_oauth_client_id: Option<String>,
     /// Which provider registry this worker serves, from `--providers`.
     providers: ProviderRegistryChoice,
+    /// The operator answer to `--read-only-commands`, kept as written so an
+    /// unusable value is refused with the flag named. `None` falls back to
+    /// [`READ_ONLY_COMMANDS_ENV`].
+    read_only_commands: Option<String>,
 }
 
 impl Default for ServerOptions {
@@ -141,6 +145,7 @@ impl Default for ServerOptions {
             no_github_sign_in: false,
             github_oauth_client_id: None,
             providers: ProviderRegistryChoice::Configured,
+            read_only_commands: None,
         }
     }
 }
@@ -182,6 +187,22 @@ impl ServerOptions {
             self.node_name.as_deref(),
             env::var(NODE_NAME_ENV).ok().as_deref(),
         )
+    }
+
+    /// Whether a `run_command` call that provably only reads is classified as a
+    /// read action: `--read-only-commands`, `LOOM_READ_ONLY_COMMANDS`, or the
+    /// shipped default that keeps every command a command.
+    ///
+    /// The classification never widens on its own: without an explicit value
+    /// here or in the environment, every command still needs approval.
+    fn read_only_commands(&self) -> Result<ReadOnlyCommandPolicy, LoomError> {
+        match self.read_only_commands.as_deref() {
+            Some(value) => ReadOnlyCommandPolicy::from_setting("--read-only-commands", Some(value)),
+            None => ReadOnlyCommandPolicy::from_setting(
+                READ_ONLY_COMMANDS_ENV,
+                env::var(READ_ONLY_COMMANDS_ENV).ok().as_deref(),
+            ),
+        }
     }
 
     /// The GitHub sign-in policy these flags ask for.
@@ -307,6 +328,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
                 options.providers =
                     ProviderRegistryChoice::parse(&required_value(&mut args, "--providers")?)?;
             }
+            "--read-only-commands" => {
+                options.read_only_commands =
+                    Some(required_value(&mut args, "--read-only-commands")?);
+            }
             "--help" | "-h" => return Ok(ParsedArgs::Help),
             "--version" | "-V" => return Ok(ParsedArgs::Version),
             value if value.starts_with("--bind=") => {
@@ -362,6 +387,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<ParsedArgs, Loom
             }
             value if value.starts_with("--providers=") => {
                 options.providers = ProviderRegistryChoice::parse(&value["--providers=".len()..])?;
+            }
+            value if value.starts_with("--read-only-commands=") => {
+                options.read_only_commands =
+                    Some(value["--read-only-commands=".len()..].to_owned());
             }
             unknown => {
                 return Err(LoomError::invalid_request(format!(
@@ -426,7 +455,8 @@ fn help_text() -> String {
          [--tls-cert <pem> --tls-key <pem>] \
          [--allow-insecure-remote] [--no-auto-update] [--diagnostics] \
          [--allow-github-login <login> ...] [--no-github-sign-in] \
-         [--github-oauth-client-id <id>] [--providers configured|demo]\n\
+         [--github-oauth-client-id <id>] [--providers configured|demo] \
+        [--read-only-commands <bool>]\n\
          \n\
          A standalone Loom backend that serves the remote WebSocket protocol.\n\
          \n\
@@ -470,6 +500,10 @@ fn help_text() -> String {
          \x20 --providers configured|demo\n\
          \x20                        serve this provider registry: configured (default) or \
          the deterministic demo for tests and local automation\n\
+         \x20 --read-only-commands <bool>\n\
+         \x20                        classify a run_command call that provably only reads as \
+         a read, so it runs without an approval prompt; off unless asked for \
+         (LOOM_READ_ONLY_COMMANDS is the fallback)\n\
          \x20 --diagnostics         print the resolved deployment context and exit\n\
          \x20 -h, --help            print this help and exit\n\
          \x20 -V, --version         print the version and exit\n\
@@ -498,6 +532,15 @@ fn help_text() -> String {
          \n\
          A bind address that is not loopback needs TLS; --allow-insecure-remote accepts \
          the risk of sending the bearer token and all traffic in plaintext instead.\n\
+         \n\
+         Every run_command call is a command action, so the approval policy gates it. \
+         --read-only-commands on adds a conservative allowlist (git log, status, diff, \
+         show, grep, ls, cat, head, tail, rg, grep, file, stat, pwd, tree, du and wc) to \
+         the read dimension, and only for a call that matches one of them exactly: an \
+         option that could write, a shell metacharacter in any argument, or a path \
+         outside the workspace leaves the call a command. The value is 1/true/yes/on or \
+         0/false/no/off; anything else fails the start, and it is never persisted, so a \
+         restart without it returns to the default.\n\
          \n\
          A worker running from a Loom-managed install \
          (<state-dir>/server/<tag>/loom-server) checks for a newer stable release every six \
@@ -662,8 +705,11 @@ async fn serve_in(
     }
     // The node name is validated before preparation, which can wipe an
     // incompatible database under `--reset-state` and generate a token file, so
-    // a bad value fails the start without changing state.
+    // a bad value fails the start without changing state. The read-only command
+    // opt-in is resolved here for the same reason: an unusable value fails the
+    // start instead of leaving the classification to a guess.
     let node_name = options.node_name()?;
+    let read_only_commands = options.read_only_commands()?;
     let instance = prepare_instance(&options, state_directory)?;
     let instance_options = options.instance_options()?;
     let settings = diagnostics_settings(
@@ -675,6 +721,15 @@ async fn serve_in(
     log::info!("{}", startup_summary(&ProcessContext::detect(), &settings));
     let backend =
         open_backend_named_with(options.providers, instance.state_db(), node_name.as_deref())?;
+    // The opt-in is applied before the listener accepts clients, so the first run
+    // already follows it. It is never persisted: a restart that does not ask for
+    // it again classifies every command as a command.
+    backend.set_read_only_commands(read_only_commands);
+    if read_only_commands.is_enabled() {
+        log::info!(
+            "Read-only commands: a run_command call that provably only reads is classified as a read"
+        );
+    }
     // An explicit flag or variable wins over the persisted policy and is
     // persisted in turn; otherwise the policy loaded when the durable state was
     // opened applies; otherwise retention stays disabled. Either way the
@@ -1935,5 +1990,54 @@ mod tests {
         assert!(error.message.contains("could not wait for shutdown"));
         assert_eq!(error.code, loom_core::ErrorCode::Internal);
         assert!(!error.retryable);
+    }
+
+    /// The read-only command opt-in is off unless an operator asks for it, and
+    /// the value they write is the only thing that turns it on.
+    #[test]
+    fn read_only_commands_is_an_explicit_opt_in() {
+        // Without the flag the classification stays off, unless this process was
+        // started with the variable that carries the same setting.
+        let defaults = serve_options(&[]);
+        assert_eq!(defaults.read_only_commands, None);
+        if std::env::var(loom_core::READ_ONLY_COMMANDS_ENV).is_err() {
+            assert!(
+                !defaults.read_only_commands().unwrap().is_enabled(),
+                "the shipped default keeps every command a command"
+            );
+        }
+        for value in ["on", "true", "1", "yes"] {
+            let enabled = serve_options(&["--read-only-commands", value]);
+            assert!(
+                enabled.read_only_commands().unwrap().is_enabled(),
+                "--read-only-commands {value} enables the classification"
+            );
+            let equals = serve_options(&[&format!("--read-only-commands={value}")]);
+            assert!(equals.read_only_commands().unwrap().is_enabled());
+        }
+        for value in ["off", "false", "0", "no"] {
+            let disabled = serve_options(&["--read-only-commands", value]);
+            assert!(!disabled.read_only_commands().unwrap().is_enabled());
+        }
+        // A typo fails the start and names the flag, instead of silently leaving
+        // the classification on or off.
+        let error = serve_options(&["--read-only-commands", "maybe"])
+            .read_only_commands()
+            .expect_err("an unusable value must fail the start");
+        assert!(
+            error.message.contains("--read-only-commands"),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains("maybe"), "{}", error.message);
+    }
+
+    /// The help text names the opt-in and the variable that carries it, so an
+    /// operator can find the setting without reading the source.
+    #[test]
+    fn help_documents_the_read_only_command_opt_in() {
+        let help = help_text();
+        assert!(help.contains("--read-only-commands <bool>"), "{help}");
+        assert!(help.contains(loom_core::READ_ONLY_COMMANDS_ENV), "{help}");
     }
 }

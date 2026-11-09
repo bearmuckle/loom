@@ -103,7 +103,8 @@ pub struct ReadOnlyCommandPolicy {
 
 /// The environment variable an operator sets to opt in to classifying
 /// read-only commands as reads. Turning it on is a deliberate deployment
-/// decision, never a default.
+/// decision, never a default. `loom-server` reads it as the fallback for
+/// `--read-only-commands`.
 pub const READ_ONLY_COMMANDS_ENV: &str = "LOOM_READ_ONLY_COMMANDS";
 
 impl ReadOnlyCommandPolicy {
@@ -123,11 +124,14 @@ impl ReadOnlyCommandPolicy {
 
     /// Resolves the operator setting.
     ///
+    /// `source` names the input the value came from — a flag or an environment
+    /// variable — so a refused value names what to fix.
+    ///
     /// An absent or blank value keeps the policy disabled, `1`/`true`/`yes`/`on`
     /// enables it, `0`/`false`/`no`/`off` disables it explicitly, and any other
     /// value is an error instead of being read as one of the two: a typo must not
     /// silently leave the opt-in on or off.
-    pub fn from_setting(value: Option<&str>) -> Result<Self> {
+    pub fn from_setting(source: &str, value: Option<&str>) -> Result<Self> {
         let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
             return Ok(Self::disabled());
         };
@@ -135,7 +139,7 @@ impl ReadOnlyCommandPolicy {
             "1" | "true" | "yes" | "on" => Ok(Self::enabled()),
             "0" | "false" | "no" | "off" => Ok(Self::disabled()),
             _ => Err(LoomError::invalid_request(format!(
-                "{READ_ONLY_COMMANDS_ENV} must be one of 1, true, yes, on, 0, false, no, off, but was '{value}'"
+                "{source} must be one of 1, true, yes, on, 0, false, no, off, but was '{value}'"
             ))),
         }
     }
@@ -915,28 +919,34 @@ mod tests {
     fn the_setting_accepts_the_documented_values_and_refuses_the_rest() {
         for value in ["1", "true", "TRUE", " yes ", "on"] {
             assert_eq!(
-                ReadOnlyCommandPolicy::from_setting(Some(value)).unwrap(),
+                ReadOnlyCommandPolicy::from_setting(READ_ONLY_COMMANDS_ENV, Some(value)).unwrap(),
                 ReadOnlyCommandPolicy::enabled(),
                 "{value} enables"
             );
         }
         for value in ["0", "false", "no", "off"] {
             assert_eq!(
-                ReadOnlyCommandPolicy::from_setting(Some(value)).unwrap(),
+                ReadOnlyCommandPolicy::from_setting(READ_ONLY_COMMANDS_ENV, Some(value)).unwrap(),
                 ReadOnlyCommandPolicy::disabled(),
                 "{value} disables"
             );
         }
         for value in [None, Some(""), Some("  ")] {
             assert_eq!(
-                ReadOnlyCommandPolicy::from_setting(value).unwrap(),
+                ReadOnlyCommandPolicy::from_setting(READ_ONLY_COMMANDS_ENV, value).unwrap(),
                 ReadOnlyCommandPolicy::disabled(),
                 "{value:?} keeps the default"
             );
         }
-        let error = ReadOnlyCommandPolicy::from_setting(Some("maybe")).unwrap_err();
+        // A refused value names the input that carried it, so an operator can
+        // tell a bad flag from a bad variable.
+        let error =
+            ReadOnlyCommandPolicy::from_setting(READ_ONLY_COMMANDS_ENV, Some("maybe")).unwrap_err();
         assert!(error.message.contains(READ_ONLY_COMMANDS_ENV));
         assert!(error.message.contains("maybe"));
+        let error =
+            ReadOnlyCommandPolicy::from_setting("--read-only-commands", Some("maybe")).unwrap_err();
+        assert!(error.message.contains("--read-only-commands"));
     }
 
     #[test]

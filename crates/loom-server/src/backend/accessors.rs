@@ -483,6 +483,38 @@ impl InProcessBackend {
         self.archive_retention_stored.load(Ordering::SeqCst)
     }
 
+    /// Whether a `run_command` call that provably only reads is classified as a
+    /// read action instead of a command action.
+    ///
+    /// The shipped value is [`ReadOnlyCommandPolicy::disabled`], so every
+    /// command prompts; only an operator opt-in turns the classification on.
+    /// Each run reads this when it builds its tool executor, so a change applies
+    /// from the next run and never rewrites a run already in flight.
+    pub fn read_only_commands(&self) -> ReadOnlyCommandPolicy {
+        if self.read_only_commands.load(Ordering::SeqCst) {
+            ReadOnlyCommandPolicy::enabled()
+        } else {
+            ReadOnlyCommandPolicy::disabled()
+        }
+    }
+
+    /// Records the operator opt-in for every run this backend starts from now
+    /// on. The value is never persisted: a restart that does not ask for it
+    /// again falls back to the shipped default.
+    pub fn set_read_only_commands(&self, policy: ReadOnlyCommandPolicy) {
+        self.read_only_commands
+            .store(policy.is_enabled(), Ordering::SeqCst);
+    }
+
+    /// Hands a tool executor the operator's read-only command policy.
+    ///
+    /// Every place that builds an executor for a run goes through here, so the
+    /// classification can neither be forgotten on one path nor be turned on by
+    /// anything but the backend's own setting.
+    pub(crate) fn with_read_only_command_policy(&self, tools: ToolExecutor) -> ToolExecutor {
+        tools.with_read_only_commands(self.read_only_commands())
+    }
+
     /// Loads the policy stored in durable state, when this backend has a durable
     /// database that holds one.
     ///
