@@ -742,7 +742,10 @@ fn detach_from_client(_: &mut Command) {}
 
 /// Stops a worker this module started.
 fn stop_service(paths: &LocalWorkerPaths) {
-    if user_systemd_available() && systemd_user_dir().join(SERVICE_NAME).is_file() {
+    if env::var_os(NO_SYSTEMD_ENV).is_none()
+        && user_systemd_available()
+        && systemd_user_dir().join(SERVICE_NAME).is_file()
+    {
         let _ = run_systemctl(&["stop", SERVICE_NAME]);
     }
     kill_pidfile(&paths.pid());

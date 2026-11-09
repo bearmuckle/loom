@@ -105,6 +105,8 @@ fn the_generated_scripts_are_valid_shell() {
         install_script("v1.2.3"),
         install_check_script("v1.2.3"),
         wait_healthy_script(8765),
+        remove_script(false),
+        remove_script(true),
         TOKEN_SCRIPT.to_owned(),
     ] {
         let mut child = Command::new("sh")
@@ -126,6 +128,17 @@ fn the_generated_scripts_are_valid_shell() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[test]
+fn the_remove_script_only_disables_this_homes_unit() {
+    let script = remove_script(false);
+    assert!(script.contains("LOOM_NO_SYSTEMD"), "{script}");
+    assert!(script.contains("FragmentPath"), "{script}");
+    assert!(
+        script.contains("if [ \"$loaded\" = \"$unit\" ]"),
+        "{script}"
+    );
 }
 
 #[test]

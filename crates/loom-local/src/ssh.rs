@@ -519,22 +519,34 @@ fn internal(message: impl Into<String>) -> LoomError {
 /// Stops the worker on `target` and removes its install. `delete_data` also
 /// removes the token and the state database.
 pub fn remove(runner: &dyn SshRunner, target: &SshTarget, delete_data: bool) -> Result<()> {
+    let script = remove_script(delete_data);
+    run_checked(runner, target, "Removing the worker", &script, &[]).map(|_| ())
+}
+
+/// The removal script. It only disables the user unit when that unit is the one
+/// this `HOME` installed: `systemctl --user` always talks to the invoking user's
+/// manager, so a test or a client running with another `HOME` must not stop the
+/// worker supervising it.
+fn remove_script(delete_data: bool) -> String {
     let delete = if delete_data {
         "rm -rf \"$home\""
     } else {
         "rm -rf \"$home/server\" \"$home/current\" \"$home/supervisor\" \"$home/server.pid\""
     };
-    let script = format!(
+    format!(
         "home=\"$HOME/.loom\"\n\
-         if systemctl --user show-environment >/dev/null 2>&1; then\n\
-           systemctl --user disable --now loom-server.service >/dev/null 2>&1 || true\n\
-           rm -f \"$HOME/.config/systemd/user/loom-server.service\"\n\
-           systemctl --user daemon-reload >/dev/null 2>&1 || true\n\
+         unit=\"$HOME/.config/systemd/user/loom-server.service\"\n\
+         if [ -z \"$LOOM_NO_SYSTEMD\" ] && systemctl --user show-environment >/dev/null 2>&1; then\n\
+           loaded=\"$(systemctl --user show loom-server.service -p FragmentPath 2>/dev/null | cut -d= -f2-)\"\n\
+           if [ \"$loaded\" = \"$unit\" ]; then\n\
+             systemctl --user disable --now loom-server.service >/dev/null 2>&1 || true\n\
+             systemctl --user daemon-reload >/dev/null 2>&1 || true\n\
+           fi\n\
          fi\n\
+         rm -f \"$unit\"\n\
          if [ -f \"$home/server.pid\" ]; then kill \"$(cat \"$home/server.pid\")\" 2>/dev/null || true; fi\n\
          {delete}\n"
-    );
-    run_checked(runner, target, "Removing the worker", &script, &[]).map(|_| ())
+    )
 }
 
 /// A local port forwarded to the remote worker. Dropping it closes the tunnel.
