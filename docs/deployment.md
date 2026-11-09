@@ -623,6 +623,24 @@ session with the `SetSessionApprovalPolicy` request, which then prompts per
 instance, or to `Deny` for a hard refusal; `run_command` stays a command action
 so builds and tests keep working under both policies.
 
+A run dominated by read-only inspection repeats the reads the file tools already
+perform unapproved: `git log`, `git diff`, `rg`, `cat`. `loom-server
+--read-only-commands on`, or `LOOM_READ_ONLY_COMMANDS=on`, moves a `run_command`
+call that provably only reads to the read dimension, so it runs without an
+approval prompt. The opt-in is off unless an operator asks for it, and it only
+moves a call that matches a conservative allowlist (`git` reads, `ls`, `cat`,
+`head`, `tail`, `wc`, `rg`, `grep`, `file`, `stat`, `pwd`, `tree`, `du`) with
+options that cannot write a file, run another program, or change configuration.
+Anything else stays a command: an unlisted program or option, a shell
+metacharacter in any argument, a glob, a path that leaves the workspace, or a
+malformed call. A value that is not one of `1`/`true`/`yes`/`on` or
+`0`/`false`/`no`/`off` fails the start instead of guessing, and the setting is
+never persisted, so a restart that does not repeat it returns to the default of
+every command prompting. A classified call still runs on its own rather than in
+the concurrent read batch, because a command can touch shared state and its
+output belongs in model order. Approval is only skipped when the session's read
+dimension allows it: a policy that gates reads keeps gating it.
+
 An operator can verify the policy inside the execution context:
 
 ```sh
