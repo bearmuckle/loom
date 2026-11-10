@@ -300,7 +300,7 @@ fn retention_durations_parse_every_unit_and_reject_junk() {
 }
 
 #[test]
-fn sub_agent_window_resolves_from_flag_env_and_defaults_to_ten_minutes() {
+fn sub_agent_window_resolves_from_flag_env_and_defaults_to_seven_days() {
     use crate::retention::resolve_archive_retention_with_sub_agent as resolve;
     let policy = resolve(None, None, Some("2m"), None, None, Some("9m"))
         .unwrap()
@@ -313,7 +313,7 @@ fn sub_agent_window_resolves_from_flag_env_and_defaults_to_ten_minutes() {
     let policy = resolve(Some("1h"), None, None, None, None, None)
         .unwrap()
         .unwrap();
-    assert_eq!(policy.sub_agent_retention_ms, Some(600_000));
+    assert_eq!(policy.sub_agent_retention_ms, Some(604_800_000));
     let policy = resolve(None, None, Some("off"), None, None, None)
         .unwrap()
         .unwrap();
@@ -332,14 +332,14 @@ fn flags_win_over_the_environment_and_off_disables_retention() {
     assert_eq!(
         resolve_archive_retention(Some("14d"), Some("1"), Some("1ms"), Some("no")).unwrap(),
         Some(ArchiveRetentionPolicy {
-            sub_agent_retention_ms: Some(600_000),
+            sub_agent_retention_ms: Some(604_800_000),
             ..enabled_retention(1_209_600_000, true)
         })
     );
     assert_eq!(
         resolve_archive_retention(Some("30m"), Some("no"), None, Some("yes")).unwrap(),
         Some(ArchiveRetentionPolicy {
-            sub_agent_retention_ms: Some(600_000),
+            sub_agent_retention_ms: Some(604_800_000),
             ..enabled_retention(1_800_000, false)
         })
     );
@@ -347,7 +347,7 @@ fn flags_win_over_the_environment_and_off_disables_retention() {
     assert_eq!(
         resolve_archive_retention(None, None, Some("30m"), Some("YES")).unwrap(),
         Some(ArchiveRetentionPolicy {
-            sub_agent_retention_ms: Some(600_000),
+            sub_agent_retention_ms: Some(604_800_000),
             ..enabled_retention(1_800_000, true)
         })
     );
@@ -577,7 +577,7 @@ fn a_sweep_skips_a_session_archived_inside_the_window() {
     );
     assert!(session_is_present(&backend, session.id));
 
-    // Retention stays disabled by default, so the selected window is what acts.
+    // Turning general retention off leaves the archived session in place.
     backend
         .set_archive_retention(ArchiveRetentionPolicy::disabled())
         .unwrap();
@@ -810,15 +810,18 @@ fn a_persistent_backend_with_a_policy_sweeps_at_startup_before_serving() {
     backend.shutdown().unwrap();
     drop(backend);
 
-    // A restart restores the archived session and disables retention until the
-    // operator's policy is applied, which is why the binaries sweep after
-    // construction and before they bind the listener.
+    // A restart restores the archived session and applies the 7 day default
+    // until the operator's policy is applied, which is why the binaries sweep
+    // after construction and before they bind the listener.
     let backend = InProcessBackend::new_persistent(&database).unwrap();
     assert_eq!(
         session_state(&backend, session.id),
         Some(AgentSessionState::Archived)
     );
-    assert!(backend.sweep_archive_retention().unwrap().is_empty());
+    let report = backend.sweep_archive_retention().unwrap();
+    assert!(report.deleted_sessions.is_empty());
+    assert_eq!(report.skipped.len(), 1);
+    assert!(session_is_present(&backend, session.id));
     backend
         .set_archive_retention(enabled_retention(1, false))
         .unwrap();
@@ -849,7 +852,7 @@ fn the_protocol_stores_the_policy_it_reports() {
     negotiate(&connection);
     assert_eq!(
         archive_retention_policy(&connection),
-        ArchiveRetentionPolicy::disabled()
+        ArchiveRetentionPolicy::default()
     );
 
     let requested = enabled_retention(1_800_000, true);
@@ -922,7 +925,7 @@ fn a_stored_policy_survives_rebuilding_the_backend() {
     assert!(!ephemeral.archive_retention_is_stored());
     assert_eq!(
         ephemeral.archive_retention(),
-        ArchiveRetentionPolicy::disabled()
+        ArchiveRetentionPolicy::default()
     );
     let ephemeral_roots = ephemeral.session_root_base.clone();
     drop(ephemeral);
@@ -986,14 +989,14 @@ fn an_explicit_retention_input_overrides_a_stored_policy() {
 }
 
 #[test]
-fn retention_stays_disabled_without_input_or_a_stored_policy() {
+fn retention_defaults_to_seven_days_without_input_or_a_stored_policy() {
     use crate::retention::ArchiveRetentionSource;
 
     let (temp, _database, backend) = persistent_backend("default-policy");
     assert!(!backend.archive_retention_is_stored());
     assert_eq!(
         backend.archive_retention(),
-        ArchiveRetentionPolicy::disabled()
+        ArchiveRetentionPolicy::default()
     );
     assert_eq!(
         apply_startup_archive_retention(&backend, None).unwrap(),
@@ -1001,7 +1004,11 @@ fn retention_stays_disabled_without_input_or_a_stored_policy() {
     );
     assert_eq!(
         backend.archive_retention(),
-        ArchiveRetentionPolicy::disabled()
+        ArchiveRetentionPolicy::default()
+    );
+    assert_eq!(
+        backend.archive_retention().retention(),
+        Some(std::time::Duration::from_secs(7 * 24 * 60 * 60))
     );
     backend.shutdown().unwrap();
     drop(backend);
@@ -1036,7 +1043,7 @@ fn an_in_memory_backend_refuses_to_store_a_policy() {
     );
     assert_eq!(
         ephemeral.archive_retention(),
-        ArchiveRetentionPolicy::disabled()
+        ArchiveRetentionPolicy::default()
     );
     let roots = ephemeral.session_root_base.clone();
     drop(connection);
@@ -1075,7 +1082,7 @@ fn a_connection_without_the_capability_cannot_change_the_policy() {
     // Reading stays available to a status-only client; writing is refused.
     assert_eq!(
         archive_retention_policy(&connection),
-        ArchiveRetentionPolicy::disabled()
+        ArchiveRetentionPolicy::default()
     );
     let error = set_archive_retention_policy_error(&connection, enabled_retention(1_000, true));
     assert_eq!(error.code, ErrorCode::CapabilityDenied);
@@ -1085,7 +1092,7 @@ fn a_connection_without_the_capability_cannot_change_the_policy() {
     );
     assert_eq!(
         backend.archive_retention(),
-        ArchiveRetentionPolicy::disabled()
+        ArchiveRetentionPolicy::default()
     );
 
     // A connection that negotiated the capability still writes it.

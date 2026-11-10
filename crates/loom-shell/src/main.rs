@@ -1970,7 +1970,7 @@ mod tests {
             Some(ArchiveRetentionPolicy {
                 retention_ms: Some(1_209_600_000),
                 force_discard_worktrees: true,
-                sub_agent_retention_ms: Some(600_000),
+                sub_agent_retention_ms: Some(604_800_000),
             })
         );
 
@@ -1987,7 +1987,7 @@ mod tests {
             Some(ArchiveRetentionPolicy {
                 retention_ms: Some(1_800_000),
                 force_discard_worktrees: false,
-                sub_agent_retention_ms: Some(600_000),
+                sub_agent_retention_ms: Some(604_800_000),
             })
         );
 
@@ -2001,7 +2001,7 @@ mod tests {
             Some(ArchiveRetentionPolicy {
                 retention_ms: Some(3_600_000),
                 force_discard_worktrees: true,
-                sub_agent_retention_ms: Some(600_000),
+                sub_agent_retention_ms: Some(604_800_000),
             })
         );
         if std::env::var("LOOM_ARCHIVE_RETENTION").is_err()

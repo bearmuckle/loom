@@ -103,13 +103,16 @@ pub struct ArchiveRetentionPolicy {
     pub force_discard_worktrees: bool,
     /// Window in milliseconds after which an archived sub-agent session is
     /// deleted on its own; `None` or zero disables it. Absent in older payloads,
-    /// which then get the 10 minute default.
+    /// which then get the 7 day default.
     #[serde(default = "default_sub_agent_retention_ms")]
     pub sub_agent_retention_ms: Option<u64>,
 }
 
-/// Default archived sub-agent retention: 10 minutes.
-pub const DEFAULT_SUB_AGENT_RETENTION_MS: u64 = 600_000;
+/// Default archive retention: 7 days.
+pub const DEFAULT_ARCHIVE_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
+/// Default archived sub-agent retention: 7 days.
+pub const DEFAULT_SUB_AGENT_RETENTION_MS: u64 = DEFAULT_ARCHIVE_RETENTION_MS;
 
 fn default_sub_agent_retention_ms() -> Option<u64> {
     Some(DEFAULT_SUB_AGENT_RETENTION_MS)
@@ -117,7 +120,11 @@ fn default_sub_agent_retention_ms() -> Option<u64> {
 
 impl Default for ArchiveRetentionPolicy {
     fn default() -> Self {
-        Self::disabled()
+        Self {
+            retention_ms: Some(DEFAULT_ARCHIVE_RETENTION_MS),
+            force_discard_worktrees: false,
+            sub_agent_retention_ms: Some(DEFAULT_SUB_AGENT_RETENTION_MS),
+        }
     }
 }
 
@@ -158,21 +165,34 @@ mod archive_retention_policy_tests {
     use super::ArchiveRetentionPolicy;
 
     #[test]
-    fn disabled_policy_reports_no_retention_window() {
-        let policy = ArchiveRetentionPolicy::disabled();
-        assert_eq!(policy, ArchiveRetentionPolicy::default());
-        assert!(!policy.is_enabled());
-        assert_eq!(policy.retention(), None);
+    fn default_policy_retains_archived_sessions_for_seven_days() {
+        let policy = ArchiveRetentionPolicy::default();
+        assert!(policy.is_enabled());
+        assert_eq!(
+            policy.retention(),
+            Some(std::time::Duration::from_secs(7 * 24 * 60 * 60))
+        );
         assert_eq!(
             policy.sub_agent_retention(),
-            Some(std::time::Duration::from_secs(600))
+            Some(std::time::Duration::from_secs(7 * 24 * 60 * 60))
         );
     }
 
     #[test]
-    fn old_payload_defaults_sub_agent_window_to_ten_minutes() {
+    fn disabled_policy_reports_no_retention_window() {
+        let policy = ArchiveRetentionPolicy::disabled();
+        assert!(!policy.is_enabled());
+        assert_eq!(policy.retention(), None);
+        assert_eq!(
+            policy.sub_agent_retention(),
+            Some(std::time::Duration::from_secs(7 * 24 * 60 * 60))
+        );
+    }
+
+    #[test]
+    fn old_payload_defaults_sub_agent_window_to_seven_days() {
         let policy: ArchiveRetentionPolicy = serde_json::from_str(r#"{"retention_ms":5}"#).unwrap();
-        assert_eq!(policy.sub_agent_retention_ms, Some(600_000));
+        assert_eq!(policy.sub_agent_retention_ms, Some(604_800_000));
         let off: ArchiveRetentionPolicy =
             serde_json::from_str(r#"{"sub_agent_retention_ms":null}"#).unwrap();
         assert_eq!(off.sub_agent_retention_ms, None);

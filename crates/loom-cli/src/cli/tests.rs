@@ -6269,7 +6269,7 @@ fn retention_get_and_set_report_and_persist_the_worker_policy() {
         assert_eq!(default.code, exit::OK, "{}", default.stderr);
         assert_eq!(
             default.stdout,
-            "window off\nforce-discard false\nsub-agent 10m\n"
+            "window 7d\nforce-discard false\nsub-agent 7d\n"
         );
 
         let set = run(

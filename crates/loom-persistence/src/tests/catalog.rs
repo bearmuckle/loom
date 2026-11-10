@@ -186,8 +186,8 @@ fn archive_retention_policy_round_trips_through_state_saves() {
     let persistence = FilePersistence::open(&path).unwrap();
     let sessions = SessionManager::default().export_state();
 
-    // A database that never stored a policy has no row, which means retention
-    // is disabled.
+    // A database that never stored a policy has no row, so the built-in 7 day
+    // policy applies.
     assert_eq!(persistence.load_archive_retention_policy().unwrap(), None);
     assert_eq!(
         persistence
@@ -224,14 +224,15 @@ fn archive_retention_policy_round_trips_through_state_saves() {
 
     // Turning retention off stores a disabled policy instead of deleting the
     // row, so a later start can tell "off" from "never set".
-    save_archive_retention(
-        &persistence,
-        &sessions,
-        DurableArchiveRetentionPolicy::default(),
-    );
+    let disabled = DurableArchiveRetentionPolicy {
+        retention_ms: None,
+        force_discard_worktrees: false,
+        sub_agent_retention_ms: Some(604_800_000),
+    };
+    save_archive_retention(&persistence, &sessions, disabled);
     assert_eq!(
         persistence.load_archive_retention_policy().unwrap(),
-        Some(DurableArchiveRetentionPolicy::default())
+        Some(disabled)
     );
     let connection = Connection::open(&path).unwrap();
     let stored: (Option<i64>, i64, Option<i64>) = connection
@@ -241,7 +242,7 @@ fn archive_retention_policy_round_trips_through_state_saves() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(stored, (None, 0, Some(600_000)));
+    assert_eq!(stored, (None, 0, Some(604_800_000)));
     drop(connection);
     fs::remove_file(path).unwrap();
 }

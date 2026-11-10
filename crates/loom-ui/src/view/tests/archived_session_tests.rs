@@ -458,7 +458,7 @@ fn retention_window_choices_offer_presets_and_a_custom_entry() {
 fn sub_agent_window_choices_offer_minutes_and_edit_the_draft() {
     let policy = ArchiveRetentionPolicy::disabled();
     let (choices, selected) = sub_agent_retention_window_choices(policy);
-    assert_eq!(selected, "10 minutes");
+    assert_eq!(selected, "7 days");
     assert!(choices.contains(&"1 minute".to_owned()));
     assert_eq!(choices.first().map(String::as_str), Some("Off"));
     assert_eq!(
@@ -1779,7 +1779,7 @@ fn applying_a_window_stores_it_and_the_card_shows_the_stored_policy(cx: &mut Tes
     let expected = ArchiveRetentionPolicy {
         retention_ms: Some(7 * 86_400_000),
         force_discard_worktrees: true,
-        sub_agent_retention_ms: Some(600_000),
+        sub_agent_retention_ms: Some(604_800_000),
     };
     cx.update(|cx| {
         let view = view.read(cx);

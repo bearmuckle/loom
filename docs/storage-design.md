@@ -182,8 +182,8 @@ and retries later. The node-level repository clone cache
 deleted with a session.
 
 The archive-retention policy the sweep applies is one `archive_retention_policy`
-row per database: a `retention_ms` window (`NULL` when retention is disabled)
-and the `force_discard_worktrees` flag. It is written in the same transaction as
+row per database: a `retention_ms` window (`NULL` when retention is disabled,
+7 days when unset) and the `force_discard_worktrees` flag. It is written in the same transaction as
 the session settings, so a startup flag that overrides the stored policy, or a
 `SetArchiveRetentionPolicy` request, is durable as soon as it is answered. A
 restart applies the stored policy unless an explicit

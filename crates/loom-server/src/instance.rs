@@ -43,7 +43,7 @@ pub struct InstanceOptions {
     /// or `None` when neither the flags nor their variables were given, in which
     /// case the policy stored in durable state applies. It is a startup default
     /// rather than the policy itself: the server stores it and a client can
-    /// change it later. Retention is disabled by default.
+    /// change it later. Retention defaults to 7 days.
     pub archive_retention: Option<ArchiveRetentionPolicy>,
 }
 

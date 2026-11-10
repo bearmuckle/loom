@@ -378,7 +378,7 @@ impl InProcessBackend {
             run_executor: RunExecutor::with_defaults(),
             session_root_base,
             build_cache_base,
-            archive_retention: Mutex::new(loom_protocol::ArchiveRetentionPolicy::disabled()),
+            archive_retention: Mutex::new(loom_protocol::ArchiveRetentionPolicy::default()),
             archive_retention_stored: AtomicBool::new(false),
             read_only_commands: AtomicBool::new(false),
             idempotency_store: IdempotencyStore::new(),

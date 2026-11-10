@@ -14,7 +14,9 @@
 use std::{sync::Arc, time::Duration};
 
 use loom_core::{AgentSessionId, ErrorCode, LoomError, Result};
-use loom_protocol::{ArchiveRetentionPolicy, DEFAULT_SUB_AGENT_RETENTION_MS};
+use loom_protocol::{
+    ArchiveRetentionPolicy, DEFAULT_ARCHIVE_RETENTION_MS, DEFAULT_SUB_AGENT_RETENTION_MS,
+};
 
 /// The duration and force-discard grammars live in `loom-core` so the server
 /// flags and the CLI share one parser; this module re-exports them for the
@@ -69,9 +71,9 @@ impl ArchiveSweepReport {
 ///
 /// An explicit flag always wins over the variable it falls back to. `None`
 /// means this start gave no retention input at all, so the policy stored in
-/// durable state applies; a returned policy is the startup default, and a
-/// missing, `off`, `never`, or zero window in it keeps retention disabled.
-/// Either way an absent value never auto-deletes anything.
+/// durable state applies; a returned policy is the startup input, and a
+/// missing window uses the 7 day default while `off`, `never`, or zero keeps
+/// retention disabled.
 pub fn resolve_archive_retention(
     flag: Option<&str>,
     force_flag: Option<&str>,
@@ -82,7 +84,7 @@ pub fn resolve_archive_retention(
 }
 
 /// [`resolve_archive_retention`] with the archived sub-agent window input. An
-/// unset window keeps the 10 minute default; `off`, `never`, or zero disables it.
+/// unset window keeps the 7 day default; `off`, `never`, or zero disables it.
 pub fn resolve_archive_retention_with_sub_agent(
     flag: Option<&str>,
     force_flag: Option<&str>,
@@ -111,7 +113,7 @@ pub fn resolve_archive_retention_with_sub_agent(
         Some(value) => parse_retention_window(value, ARCHIVE_RETENTION_FLAG)?,
         None => match env {
             Some(value) => parse_retention_window(value, ARCHIVE_RETENTION_ENV)?,
-            None => None,
+            None => Some(DEFAULT_ARCHIVE_RETENTION_MS),
         },
     };
     let force_discard_worktrees = match force_flag {
@@ -136,7 +138,7 @@ pub enum ArchiveRetentionSource {
     Explicit,
     /// The policy stored in durable state by an earlier start or by a client.
     Persisted,
-    /// Neither: retention is disabled.
+    /// Neither: the built-in 7 day policy applies.
     Default,
 }
 
@@ -177,7 +179,7 @@ pub(crate) fn describe_archive_retention(policy: ArchiveRetentionPolicy) -> Stri
 /// force-discard flag or variable) wins over the persisted policy and is
 /// persisted in turn, so the next start keeps it. Without explicit input the
 /// policy loaded when the durable state was opened applies. Without either,
-/// retention is disabled.
+/// the built-in 7 day policy applies.
 pub fn apply_startup_archive_retention(
     backend: &InProcessBackend,
     explicit: Option<ArchiveRetentionPolicy>,

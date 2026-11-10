@@ -477,7 +477,7 @@ CREATE TABLE IF NOT EXISTS archive_retention_policy (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     retention_ms INTEGER CHECK(retention_ms IS NULL OR retention_ms > 0),
     force_discard_worktrees INTEGER NOT NULL CHECK(force_discard_worktrees IN (0, 1)),
-    sub_agent_retention_ms INTEGER DEFAULT 600000
+    sub_agent_retention_ms INTEGER DEFAULT 604800000
         CHECK(sub_agent_retention_ms IS NULL OR sub_agent_retention_ms > 0)
 ) STRICT;
 -- The archived subtree a project root archived as one unit. A member row
@@ -1248,7 +1248,7 @@ fn migrate_schema_transaction(connection: &Connection, from_version: u32) -> Res
                 {
                     transaction
                         .execute_batch(
-                            "ALTER TABLE archive_retention_policy ADD COLUMN sub_agent_retention_ms INTEGER DEFAULT 600000
+                            "ALTER TABLE archive_retention_policy ADD COLUMN sub_agent_retention_ms INTEGER DEFAULT 604800000
                                  CHECK(sub_agent_retention_ms IS NULL OR sub_agent_retention_ms > 0);",
                         )
                         .map_err(|error| {

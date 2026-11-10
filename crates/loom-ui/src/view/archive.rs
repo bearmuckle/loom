@@ -259,7 +259,7 @@ pub(crate) fn retention_window_choices(policy: ArchiveRetentionPolicy) -> (Vec<S
 }
 
 /// The windows the editor offers for archived sub-agent sessions, "Off" first.
-pub(crate) const SUB_AGENT_RETENTION_WINDOW_PRESETS: [Option<Duration>; 7] = [
+pub(crate) const SUB_AGENT_RETENTION_WINDOW_PRESETS: [Option<Duration>; 8] = [
     None,
     Some(Duration::from_secs(60)),
     Some(Duration::from_secs(5 * 60)),
@@ -267,6 +267,7 @@ pub(crate) const SUB_AGENT_RETENTION_WINDOW_PRESETS: [Option<Duration>; 7] = [
     Some(Duration::from_secs(30 * 60)),
     Some(Duration::from_secs(3_600)),
     Some(Duration::from_secs(86_400)),
+    Some(Duration::from_secs(7 * 86_400)),
 ];
 
 /// The sub-agent window choices and the one a policy selects; a stored window

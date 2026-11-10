@@ -394,8 +394,8 @@ Worker-node management adds workspace-scoped
 requests. The persisted config contains a revision,
 worker WebSocket URLs, a CPU pulse threshold for session-card node indicators
 (default 5%), the parallel project-agent limit, the auto-archive-completed-agents
-switch, the automatic-project-titles switch (default on), and the run queue
-timeout (default 30 minutes); credentials, workspace
+switch (default on), the automatic-project-titles switch (default on), and the
+run queue timeout (default 30 minutes); credentials, workspace
 files, and session state are not included. Connected peers receive the updated config when nodes join or
 are removed. Sessions remain owned by the node that created them; config
 distribution does not migrate sessions.
@@ -420,9 +420,11 @@ short ID suffix so separate backend processes on one host remain distinguishable
 Clients should render unavailable values as `n/a`.
 
 `GetArchiveRetentionPolicy` is read-only and returns
-`archive_retention_policy { retention_ms, force_discard_worktrees }`. It
-requires the `read_worker_node_status` capability. `retention_ms` is `null` or
-zero when retention is disabled.
+`archive_retention_policy { retention_ms, force_discard_worktrees,
+sub_agent_retention_ms }`. It requires the `read_worker_node_status`
+capability. Both windows default to 7 days; `retention_ms` is `null` or zero
+when general retention is disabled, and `sub_agent_retention_ms` is `null` or
+zero when archived sub-agents are kept.
 
 `SetArchiveRetentionPolicy { policy }` replaces that policy and answers with the
 normalized policy that was stored, so the caller sees exactly what the worker
@@ -439,8 +441,8 @@ A worker resolves its retention policy at startup in one order: an explicit
 `--archive-retention`/`LOOM_ARCHIVE_RETENTION` window (with
 `--archive-retention-force-discard`/`LOOM_ARCHIVE_RETENTION_FORCE_DISCARD`) wins
 over the persisted policy and is persisted in turn, otherwise the policy loaded
-when the durable state was opened applies, otherwise retention is disabled. The
-startup log names the source that won. Automatic deletion itself remains an
+when the durable state was opened applies, otherwise the built-in 7 day policy
+applies. The startup log names the source that won. Automatic deletion itself remains an
 internal backend operation rather than a client request: a client reads or sets
 the active policy and observes the resulting session removals.
 

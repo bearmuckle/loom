@@ -30,7 +30,7 @@
 >   transcript and keeps manager-scoped controls, and no longer offers manual
 >   rename or archive.
 > - **Auto-archive (implemented).** `WorkspaceConfig.auto_archive_completed_agents`
->   gates it, off by default and toggled from Settings → Agents. When on, a
+>   gates it, on by default and toggled from Settings → Agents. When on, a
 >   delegated agent is archived once its task is `Completed` and any code result
 >   is integrated; failures and un-integrated code stay visible.
 
@@ -179,10 +179,9 @@ field in the sidebar**:
   auto-archived; it stays visible so the manager or user can recover it.
 - The automatic archive is the same durable archive transition as today, so
   retention-based deletion still reclaims it later.
-- The behavior is gated by a workspace setting — proposal: **Auto-archive
-  completed sub agents: off / immediately / after a delay** — so users who want
-  to inspect finished agents can keep them around. The mockup surfaces this in
-  the project detail pane.
+- The behavior is gated by a workspace setting, **Auto-archive completed sub
+  agents**, which defaults on. A workspace that wants to inspect finished
+  agents can opt out. The mockup surfaces this in the project detail pane.
 
 ## Open questions
 

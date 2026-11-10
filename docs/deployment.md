@@ -511,9 +511,9 @@ is shared and is never deleted with a session.
 
 `--archive-retention <duration>`, or `LOOM_ARCHIVE_RETENTION`, automatically
 deletes archived projects once they are older than the duration, measured from
-the archive time. It is disabled by default, so an absent or zero value never
-auto-deletes. A duration is `<n><unit>` with unit `ms`, `s`, `m`, `h`, `d`, or
-`w`; a bare integer means seconds, and `off` and `never` mean disabled:
+the archive time. It defaults to **7 days**; an absent value keeps that default,
+while zero, `off`, and `never` disable it. A duration is `<n><unit>` with unit
+`ms`, `s`, `m`, `h`, `d`, or `w`; a bare integer means seconds:
 
 ```sh
 ./loom-server --bind 127.0.0.1:8765 --archive-retention 14d

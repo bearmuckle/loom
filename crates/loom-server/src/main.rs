@@ -519,10 +519,10 @@ fn help_text() -> String {
          like the credential store. The path is always logged; the value is printed only \
          when stdout is a terminal.\n\
          \n\
-         Archive retention is disabled by default, so an absent or zero value never \
-         auto-deletes. A duration is <n><unit> with unit ms, s, m, h, d, or w; a bare \
-         integer means seconds, and off and never mean disabled. The sweep runs once at \
-         startup and every {} minutes while the server runs.\n\
+         Archive retention deletes archived sessions after 7 days by default. An \
+         absent value keeps that default, while zero and off disable it. A duration is \
+         <n><unit> with unit ms, s, m, h, d, or w; a bare integer means seconds. The \
+         sweep runs once at startup and every {} minutes while the server runs.\n\
          \n\
          One WebSocket frame is limited to {} bytes ({} MiB) by default; \
          --max-frame-bytes or LOOM_MAX_FRAME_BYTES raises or lowers that bound for this \
@@ -1122,7 +1122,7 @@ mod tests {
             Some(ArchiveRetentionPolicy {
                 retention_ms: Some(1_209_600_000),
                 force_discard_worktrees: true,
-                sub_agent_retention_ms: Some(600_000),
+                sub_agent_retention_ms: Some(604_800_000),
             })
         );
 
@@ -1132,7 +1132,7 @@ mod tests {
             Some(ArchiveRetentionPolicy {
                 retention_ms: Some(7_200_000),
                 force_discard_worktrees: true,
-                sub_agent_retention_ms: Some(600_000),
+                sub_agent_retention_ms: Some(604_800_000),
             })
         );
         let disabled = serve_options(&[

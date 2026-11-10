@@ -19,9 +19,9 @@ pub struct WorkspaceConfig {
     #[serde(default = "default_project_agent_concurrency")]
     pub project_agent_concurrency: u8,
     /// Archive a delegated agent automatically once its task completes and any
-    /// code result is integrated. Disabled by default so finished agents stay
-    /// visible for inspection until the workspace opts in.
-    #[serde(default)]
+    /// code result is integrated. Enabled by default; a workspace can opt out
+    /// to keep finished agents out of the archive.
+    #[serde(default = "default_auto_archive_completed_agents")]
     pub auto_archive_completed_agents: bool,
     /// Seconds a fresh run may wait for a free concurrency slot before it is
     /// rejected. This is the backpressure bound that keeps an overloaded
@@ -56,6 +56,11 @@ const fn default_project_agent_concurrency() -> u8 {
     4
 }
 
+/// Completed delegated agents are archived unless a workspace opts out.
+const fn default_auto_archive_completed_agents() -> bool {
+    true
+}
+
 const fn default_cpu_pulse_threshold_percent() -> u8 {
     5
 }
@@ -76,7 +81,7 @@ impl Default for WorkspaceConfig {
             worker_nodes: Vec::new(),
             cpu_pulse_threshold_percent: default_cpu_pulse_threshold_percent(),
             project_agent_concurrency: default_project_agent_concurrency(),
-            auto_archive_completed_agents: false,
+            auto_archive_completed_agents: default_auto_archive_completed_agents(),
             run_admission_timeout_secs: default_run_admission_timeout_secs(),
             auto_title_projects: default_auto_title_projects(),
             jev: JevSettings::default(),
@@ -266,7 +271,8 @@ mod tests {
         assert_eq!(config.revision, 3);
         assert_eq!(config.cpu_pulse_threshold_percent, 15);
         assert_eq!(config.project_agent_concurrency, 4);
-        assert!(!config.auto_archive_completed_agents);
+        // Auto-archive is opt-out, so an older workspace config gets it too.
+        assert!(config.auto_archive_completed_agents);
         assert_eq!(
             config.run_admission_timeout_secs,
             DEFAULT_RUN_ADMISSION_TIMEOUT_SECS

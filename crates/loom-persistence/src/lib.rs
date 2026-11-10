@@ -207,16 +207,19 @@ pub struct DurableArchiveRetentionPolicy {
     /// Whether an automatic sweep may discard dirty or locked worktrees.
     pub force_discard_worktrees: bool,
     /// Window in milliseconds for archived sub-agent sessions; `None` disables
-    /// it. Defaults to 10 minutes.
+    /// it. Defaults to 7 days.
     pub sub_agent_retention_ms: Option<u64>,
 }
+
+/// The built-in archive retention window: 7 days.
+const DEFAULT_ARCHIVE_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 impl Default for DurableArchiveRetentionPolicy {
     fn default() -> Self {
         Self {
-            retention_ms: None,
+            retention_ms: Some(DEFAULT_ARCHIVE_RETENTION_MS),
             force_discard_worktrees: false,
-            sub_agent_retention_ms: Some(600_000),
+            sub_agent_retention_ms: Some(DEFAULT_ARCHIVE_RETENTION_MS),
         }
     }
 }
