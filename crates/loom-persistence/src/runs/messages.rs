@@ -432,6 +432,35 @@ pub(crate) fn delete_run_message_fragments(
     Ok(())
 }
 
+/// Writes the transcript rows of one or more runs.
+///
+/// Two writers persist a transcript. A full state save names every row by its
+/// position in the runtime vector and prunes the rows it does not name, because
+/// its snapshot is the only description of the run's transcript it holds. A run
+/// checkpoint writes the tail of the same vector, and the streaming fragment
+/// writer appends to the assistant message being produced. The save snapshots
+/// the runtime before it writes, so that snapshot can be older than the stored
+/// rows.
+///
+/// Neither writer can lose or move a row the other committed:
+///
+/// - The prune only deletes a row whose `fragments` is `'[]'`, and
+///   `append_run_message_fragment` creates its row and commits its descriptors
+///   in one transaction. A streamed row is therefore never empty and survives a
+///   save whose snapshot does not name it, including a streamed turn that sits at
+///   the ordinal one past the snapshot's last message.
+/// - A checkpoint row is a position of the same runtime vector, and the backend
+///   holds the write side of `state_persist_gate` from the snapshot to the commit
+///   while every run checkpoint holds the read side, so no checkpoint commits
+///   inside the snapshot window. Every row a checkpoint committed is named by the
+///   next snapshot.
+/// - Where a save's content disagrees with the stored fragments of a named row,
+///   the stored base is kept and the fragments stay, so older or partial content
+///   never replaces text the stream already committed. A row is consolidated only
+///   when its content matches the fragments.
+///
+/// A vector that shrank is the one case that deletes rows, and it is a new
+/// attempt, whose checkpoint resets the transcript explicitly.
 pub(crate) fn save_run_message_rows(
     transaction: &Transaction<'_>,
     messages_by_run: &BTreeMap<RunId, Vec<DurableRunMessage>>,

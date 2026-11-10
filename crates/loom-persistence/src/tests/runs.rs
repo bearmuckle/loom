@@ -1566,3 +1566,169 @@ fn a_state_save_repairs_an_activity_ordinal_a_checkpoint_reused() {
     drop(persistence);
     fs::remove_file(path).unwrap();
 }
+
+/// The transcript half of the race the activity tests above pin. A full state
+/// save numbers transcript rows by their position in the runtime vector and
+/// prunes every row its snapshot does not name, while the streaming fragment
+/// writer commits the assistant message that is being produced. The stream
+/// reaches storage before the runtime adds the finished message to its vector,
+/// so its row is newer than the save's snapshot and sits at the ordinal one past
+/// the last message the snapshot names.
+///
+/// The prune cannot take that row: it only deletes rows whose `fragments` is
+/// `'[]'`, and the fragment writer creates the row and commits its descriptors in
+/// one transaction. The save also cannot replace text the stream already
+/// committed: while a row carries fragments that disagree with the save's
+/// content, the stored base is kept and the fragments stay. This test drives both
+/// defences without concurrency, and pins that no ordinal changes and no row is
+/// duplicated or lost while the saves and the stream interleave.
+#[test]
+fn a_stale_state_save_keeps_the_streamed_message_the_fragment_writer_committed() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+    let persistence = FilePersistence::open(&path).unwrap();
+    let mut sessions = SessionManager::default();
+    let (session, _) = sessions
+        .create_in_workspace(WorkspaceId::new(), "Streamed transcript race")
+        .unwrap();
+    let run_id = RunId::new();
+    let started_at = Timestamp::from_unix_millis(1000);
+    let summary = DurableRunSummary {
+        snapshot: AgentRunSnapshot {
+            id: run_id,
+            attempt_id: RunAttemptId::new(),
+            control_revision: 0,
+            session_id: session.id,
+            task: "stream a reply while saving state".to_owned(),
+            jev: None,
+            model: ModelId::new("deterministic-model"),
+            state: AgentRunState::Executing,
+            started_at,
+            updated_at: started_at,
+            completed_at: None,
+            summary: None,
+            evidence: Vec::new(),
+            approval_policy: None,
+        },
+        usage: UsageSnapshot::default(),
+        attempts: None,
+        execution_state: None,
+        interactions: None,
+    };
+    let summaries = BTreeMap::from([(run_id, summary)]);
+    let message = |role: loom_model::MessageRole, content: &str| DurableRunMessage {
+        timeline_ordinal: 0,
+        role,
+        content: content.to_owned(),
+        name: None,
+        tool_call_id: None,
+        tool_calls: Vec::new(),
+        reasoning_content: None,
+    };
+    let state_save = |messages: Vec<DurableRunMessage>| {
+        let messages = BTreeMap::from([(run_id, messages)]);
+        persistence.save_state(DurableStateWrite {
+            sessions: &sessions.export_state(),
+            workspaces: None,
+            settings: None,
+            workspace_configs: None,
+            providers: None,
+            usage: None,
+            idempotency: None,
+            run_summaries: Some(&summaries),
+            run_runtime_configs: None,
+            run_context_checkpoints: None,
+            run_plans: None,
+            run_messages: Some(&messages),
+            run_activities: None,
+            filesystem_records: None,
+            feed: None,
+        })
+    };
+    let transcript = || {
+        persistence
+            .load_run_messages(run_id)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.content)
+            .collect::<Vec<_>>()
+    };
+    let user = || message(loom_model::MessageRole::User, "question");
+    let assistant = |content: &str| message(loom_model::MessageRole::Assistant, content);
+
+    // The runtime holds the user message when the model turn starts streaming.
+    state_save(vec![user()]).unwrap();
+    // The first streamed text reaches storage before the finished message joins
+    // the runtime vector, so the save that follows still carries a snapshot of
+    // one message and must not prune the row the stream committed.
+    persistence
+        .append_run_message_fragment(run_id, session.id, 1, 0, 0, b"partial")
+        .unwrap();
+    state_save(vec![user()]).unwrap();
+    assert_eq!(
+        transcript(),
+        vec!["question", "partial"],
+        "a state save must not prune the row the fragment writer committed"
+    );
+    assert_eq!(
+        persistence
+            .load_run_message_content_range(run_id, 1, 0, 7)
+            .unwrap(),
+        b"partial"
+    );
+
+    // The runtime commits the finished message with exactly the streamed text,
+    // which consolidates the row: the content is stored and the descriptors go.
+    state_save(vec![user(), assistant("partial")]).unwrap();
+    assert_eq!(transcript(), vec!["question", "partial"]);
+    assert_eq!(
+        stored_fragment_count(&path, run_id),
+        0,
+        "content that matches the fragments consolidates them"
+    );
+
+    // The same assistant message keeps streaming after that consolidation. The
+    // next save still carries the shorter content, and must keep the stored base
+    // and the newer fragment instead of writing the older text over them.
+    persistence
+        .append_run_message_fragment(run_id, session.id, 1, 0, 7, b" more")
+        .unwrap();
+    state_save(vec![user(), assistant("partial")]).unwrap();
+    assert_eq!(
+        transcript(),
+        vec!["question", "partial more"],
+        "a state save must not replace a base that carries newer fragments"
+    );
+    assert_eq!(stored_fragment_count(&path, run_id), 1);
+    assert_eq!(
+        persistence
+            .load_run_message_content_range(run_id, 1, 7, 5)
+            .unwrap(),
+        b" more"
+    );
+
+    // When the runtime's vector finally holds the assembled text, the save
+    // consolidates it. Nothing was renumbered or duplicated along the way.
+    state_save(vec![user(), assistant("partial more")]).unwrap();
+    assert_eq!(transcript(), vec!["question", "partial more"]);
+    assert_eq!(stored_fragment_count(&path, run_id), 0);
+    let ordinals = {
+        let connection = Connection::open(&path).unwrap();
+        let mut statement = connection
+            .prepare("SELECT ordinal FROM run_messages WHERE run_id=?1 ORDER BY ordinal")
+            .unwrap();
+        statement
+            .query_map([run_id.as_uuid().as_bytes().as_slice()], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        ordinals,
+        vec![0, 1],
+        "the streamed message keeps the ordinal the save named for it"
+    );
+    drop(persistence);
+    fs::remove_file(path).unwrap();
+}
