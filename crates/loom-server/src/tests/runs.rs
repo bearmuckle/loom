@@ -1502,3 +1502,71 @@ fn a_completed_run_continues_with_the_switched_model_and_rejects_an_unknown_one(
     assert_eq!(completed.state, AgentRunState::Completed);
     assert_eq!(completed.model, second_model);
 }
+
+/// A full state save snapshots every run's activity, transcript and tool-call
+/// rows and then commits them in one transaction. A run checkpoint that commits
+/// inside that window is newer than the snapshot, so the save would write rows
+/// older than the checkpoint's and (before the activity write became
+/// append-only) prune the checkpoint's rows, freeing an activity ordinal for a
+/// different activity. The persistence gate closes the window: the save holds
+/// its exclusive side from the snapshot to the commit, and every checkpoint
+/// waits on the shared side.
+#[test]
+fn a_run_checkpoint_cannot_commit_inside_a_full_state_save() {
+    let path = std::env::temp_dir().join(format!("loom-checkpoint-gate-{}.db", WorkspaceId::new()));
+    let backend = InProcessBackend::new_persistent(&path).unwrap();
+    let session = {
+        let mut sessions = backend.sessions().unwrap();
+        sessions
+            .create_in_workspace(WorkspaceId::new(), "checkpoint gate")
+            .unwrap()
+            .0
+    };
+    let root =
+        std::env::temp_dir().join(format!("loom-checkpoint-gate-{}.work", WorkspaceId::new()));
+    fs::create_dir_all(&root).unwrap();
+    let runtime = AgentRuntime::new(
+        session.id,
+        AgentTask::new("checkpoint gate", ModelId::new("deterministic/demo")).unwrap(),
+        Box::new(loom_providers::DeterministicProvider::demo()),
+        ToolExecutor::new(&root).unwrap(),
+    );
+    let handle = backend.register_runtime(runtime);
+    // The first checkpoint writes the run's durable summary.
+    backend.persist_run_checkpoint(&handle).unwrap();
+
+    // Stand in for a full state save that is between its snapshot and its
+    // commit.
+    let state_save_guard = backend.state_persist_gate.write().unwrap();
+    let (started, started_rx) = std::sync::mpsc::channel();
+    let (finished, finished_rx) = std::sync::mpsc::channel();
+    let checkpoint = {
+        let backend = std::sync::Arc::clone(&backend);
+        let handle = std::sync::Arc::clone(&handle);
+        thread::spawn(move || {
+            started.send(()).unwrap();
+            let saved = backend.persist_run_checkpoint(&handle);
+            finished.send(saved.is_ok()).unwrap();
+        })
+    };
+    started_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the checkpoint thread did not start");
+    assert!(
+        finished_rx
+            .recv_timeout(Duration::from_millis(250))
+            .is_err(),
+        "a run checkpoint committed inside a full state save"
+    );
+    drop(state_save_guard);
+    assert!(
+        finished_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the checkpoint did not resume after the state save released the gate"),
+        "the checkpoint failed after the state save released the gate"
+    );
+    checkpoint.join().unwrap();
+    fs::remove_dir_all(&root).unwrap();
+    drop(backend);
+    fs::remove_file(&path).unwrap();
+}

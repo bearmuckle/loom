@@ -107,6 +107,16 @@ impl InProcessBackend {
         let Some(persistence) = &self.persistence else {
             return Ok(());
         };
+        // A checkpoint must not commit between a full state save's snapshot and
+        // its transaction: the save would then write rows older than this
+        // checkpoint's. The save holds the write side for exactly that window.
+        let _state_persist_guard = self.state_persist_gate.read().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "state persistence lock was poisoned",
+                true,
+            )
+        })?;
         let _event_guard = handle
             .event_gate
             .lock()
@@ -428,7 +438,7 @@ impl InProcessBackend {
         let Some(persistence) = &self.persistence else {
             return Ok(());
         };
-        let _state_persist_guard = self.state_persist_gate.lock().map_err(|_| {
+        let _state_persist_guard = self.state_persist_gate.write().map_err(|_| {
             LoomError::new(
                 ErrorCode::Internal,
                 "state persistence lock was poisoned",
@@ -540,6 +550,11 @@ impl InProcessBackend {
             );
             durable_run_activities.insert(*run_id, std::mem::take(&mut state.activities));
         }
+        log::debug!(
+            "[loom-server] durable state save: runs {}, activities {}",
+            durable_run_activities.len(),
+            durable_run_activities.values().map(Vec::len).sum::<usize>()
+        );
         let loaded_repositories = self.session_repositories()?.clone();
         let mut filesystem_records = Vec::new();
         let mut filesystem_generations = Vec::new();

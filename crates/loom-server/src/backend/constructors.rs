@@ -389,7 +389,7 @@ impl InProcessBackend {
             self_reference: Mutex::new(Weak::new()),
             request_lifecycle: RwLock::new(0),
             persistence_failed: AtomicBool::new(false),
-            state_persist_gate: Mutex::new(()),
+            state_persist_gate: RwLock::new(()),
             archive_gate: Mutex::new(()),
             #[cfg(test)]
             fail_next_state_save: AtomicBool::new(false),

@@ -1340,20 +1340,228 @@ fn a_stale_state_save_keeps_the_activities_a_checkpoint_appended() {
         "a successful state save keeps every activity in its stored order"
     );
 
-    // A genuine reorder is still refused and leaves the stored order alone.
+    // A list in a different order changes no stored place: every activity
+    // keeps the ordinal it was first written at, and the save succeeds instead
+    // of refusing an order it can no longer change.
     let reordered = vec![
         second.clone(),
         first.clone(),
         appended_by_the_checkpoint,
         appended_after_the_save,
     ];
-    assert_eq!(
-        state_save(&reordered).unwrap_err().code,
-        ErrorCode::MalformedPayload
-    );
+    state_save(&reordered).unwrap();
     assert_eq!(
         persistence.load_run_activities(run_id).unwrap(),
-        runtime_vector
+        runtime_vector,
+        "a save never renumbers an activity that is already stored"
+    );
+    drop(persistence);
+    fs::remove_file(path).unwrap();
+}
+
+/// The database state the old state save left behind when it resolved its
+/// activities by vector position and pruned every row its snapshot did not
+/// name: it deleted an activity a checkpoint had just committed (the runtime
+/// kept the activity and never re-sent it), and the next checkpoint handed the
+/// freed ordinal to a different activity.
+///
+/// A state save has to repair that state instead of refusing the runtime
+/// vector: an activity that is already stored keeps its ordinal, an activity
+/// the save has not stored yet takes the next free ordinal, and no order is
+/// ever refused. Before this rule the save returned the non-retryable
+/// `MalformedPayload` "persisted activity order cannot be changed", which
+/// latched the worker-wide fail-stop and exited the process. The test recreates
+/// the pruned row directly, so it reproduces that refusal without any
+/// concurrency.
+#[test]
+fn a_state_save_repairs_an_activity_ordinal_a_checkpoint_reused() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+    let persistence = FilePersistence::open(&path).unwrap();
+    let mut sessions = SessionManager::default();
+    let (session, _) = sessions
+        .create_in_workspace(WorkspaceId::new(), "Activity ordinal repair")
+        .unwrap();
+    let run_id = RunId::new();
+    let started_at = Timestamp::from_unix_millis(1000);
+    let summary = DurableRunSummary {
+        snapshot: AgentRunSnapshot {
+            id: run_id,
+            attempt_id: RunAttemptId::new(),
+            control_revision: 0,
+            session_id: session.id,
+            task: "repair a reused activity ordinal".to_owned(),
+            jev: None,
+            model: ModelId::new("deterministic-model"),
+            state: AgentRunState::Executing,
+            started_at,
+            updated_at: started_at,
+            completed_at: None,
+            summary: None,
+            evidence: Vec::new(),
+            approval_policy: None,
+        },
+        usage: UsageSnapshot::default(),
+        attempts: None,
+        execution_state: None,
+        interactions: None,
+    };
+    let summaries = BTreeMap::from([(run_id, summary.clone())]);
+    let runtime_config = DurableRunRuntimeConfig {
+        system_instructions: None,
+        repository_instructions: None,
+        approval_policy: ApprovalPolicy::default(),
+        limits: loom_core::SessionLimits::default(),
+        context_options: ContextAssemblyOptions::default(),
+        checkpoint_id: None,
+        input_cost_micros_per_1k: 0,
+        output_cost_micros_per_1k: 0,
+        context_inspection: None,
+        project_delegation_enabled: false,
+        project_messaging_enabled: false,
+        project_inspection_enabled: false,
+        project_child_control_enabled: false,
+        project_worktree_enabled: false,
+        project_review_enabled: false,
+        project_integration_enabled: false,
+        project_branch_messaging_enabled: false,
+    };
+    let plan = loom_model::AgentPlan {
+        steps: Vec::new(),
+        title: None,
+    };
+    let feed = DurableFeedState {
+        next_sequence: EventSequence::new(1),
+        retention_limit: 250,
+        events: Vec::new(),
+        workspace_events: Vec::new(),
+    };
+    let activity = |timeline_ordinal: u64| AgentActivityRecord {
+        id: ActivityId::new(),
+        run_id,
+        timeline_ordinal,
+        parent_id: None,
+        step_id: None,
+        kind: AgentActivityKind::ModelTurn,
+        status: AgentActivityStatus::Completed,
+        started_at: Timestamp::from_unix_millis(1000 + timeline_ordinal),
+        completed_at: Some(Timestamp::from_unix_millis(1001 + timeline_ordinal)),
+        elapsed_ms: Some(1),
+        data: AgentActivityData::ModelTurn {
+            model: ModelId::new("deterministic-model"),
+        },
+    };
+    let first = activity(0);
+    let second = activity(1);
+    let pruned_by_the_state_save = activity(2);
+    let taken_the_freed_ordinal = activity(3);
+    let state_save = |activities: &[AgentActivityRecord]| {
+        let activities = BTreeMap::from([(run_id, activities.to_vec())]);
+        persistence.save_state(DurableStateWrite {
+            sessions: &sessions.export_state(),
+            workspaces: None,
+            settings: None,
+            workspace_configs: None,
+            providers: None,
+            usage: None,
+            idempotency: None,
+            run_summaries: Some(&summaries),
+            run_runtime_configs: None,
+            run_context_checkpoints: None,
+            run_plans: None,
+            run_messages: None,
+            run_activities: Some(&activities),
+            filesystem_records: None,
+            feed: None,
+        })
+    };
+    let checkpoint = |deltas: &[AgentActivityRecord]| {
+        persistence.save_run_checkpoint(DurableRunCheckpointWrite {
+            session: &session,
+            session_next_sequence: EventSequence::new(1),
+            prune_feed: false,
+            summary: &summary,
+            runtime_config: &runtime_config,
+            context_checkpoint: None,
+            plan: &plan,
+            messages: &[],
+            message_delta: None,
+            activities: &[],
+            activity_deltas: Some(deltas),
+            filesystem: None,
+            feed: &feed,
+        })
+    };
+    let stored_ordinal = |activity: &AgentActivityRecord| -> i64 {
+        Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT ordinal FROM run_activities WHERE run_id=?1 AND activity_id=?2",
+                [
+                    run_id.as_uuid().as_bytes().as_slice(),
+                    activity.id.as_uuid().as_bytes().as_slice(),
+                ],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+
+    state_save(&[first.clone(), second.clone()]).unwrap();
+    checkpoint(std::slice::from_ref(&pruned_by_the_state_save)).unwrap();
+    assert_eq!(stored_ordinal(&first), 0);
+    assert_eq!(stored_ordinal(&second), 1);
+    assert_eq!(stored_ordinal(&pruned_by_the_state_save), 2);
+
+    // The state save that pruned the checkpoint's activity deleted this row;
+    // the runtime kept the activity, so it is never sent again.
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "DELETE FROM run_activities WHERE run_id=?1 AND activity_id=?2",
+            [
+                run_id.as_uuid().as_bytes().as_slice(),
+                pruned_by_the_state_save.id.as_uuid().as_bytes().as_slice(),
+            ],
+        )
+        .unwrap();
+    // The next activity the worker records takes the ordinal the deleted row
+    // freed.
+    checkpoint(std::slice::from_ref(&taken_the_freed_ordinal)).unwrap();
+    assert_eq!(stored_ordinal(&taken_the_freed_ordinal), 2);
+
+    // The runtime still holds every activity it recorded, in order, and hands
+    // that vector to the next state save.
+    let runtime_vector = vec![
+        first.clone(),
+        second.clone(),
+        pruned_by_the_state_save.clone(),
+        taken_the_freed_ordinal.clone(),
+    ];
+    state_save(&runtime_vector).unwrap_or_else(|error| {
+        panic!("a state save must repair the reused ordinal instead of refusing it: {error:?}")
+    });
+    assert_eq!(stored_ordinal(&first), 0);
+    assert_eq!(stored_ordinal(&second), 1);
+    assert_eq!(
+        stored_ordinal(&taken_the_freed_ordinal),
+        2,
+        "an activity that is already stored keeps its ordinal"
+    );
+    assert_eq!(
+        stored_ordinal(&pruned_by_the_state_save),
+        3,
+        "an activity the save has not stored yet takes the next free ordinal"
+    );
+    // The repair is stable: the same vector saved again changes nothing.
+    state_save(&runtime_vector).unwrap();
+    assert_eq!(
+        persistence.load_run_activities(run_id).unwrap(),
+        vec![
+            first,
+            second,
+            taken_the_freed_ordinal,
+            pruned_by_the_state_save,
+        ],
+        "the stored order is the order each activity was first written in"
     );
     drop(persistence);
     fs::remove_file(path).unwrap();

@@ -316,7 +316,7 @@ impl InProcessConnection {
                 true,
             )
         })?;
-        let state_persist_guard = self.backend.state_persist_gate.lock().map_err(|_| {
+        let state_persist_guard = self.backend.state_persist_gate.read().map_err(|_| {
             LoomError::new(
                 ErrorCode::Internal,
                 "state persistence lock was poisoned",
