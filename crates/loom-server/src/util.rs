@@ -1,6 +1,6 @@
 use super::*;
 use crate::connection::project::child::result::{
-    ProjectChildResultDelivery, manager_was_notified_of_child,
+    PROJECT_MESSAGE_NAME, ProjectChildResultDelivery, manager_was_notified_of_child,
 };
 
 pub(crate) fn json_value<T: Serialize>(value: T) -> Result<Value> {
@@ -321,16 +321,25 @@ pub(crate) struct AcceptedProjectMessage {
     pub(crate) route: ProjectMessageRoute,
 }
 
+/// The project a member belongs to: the project of the task that delegated it,
+/// or the member's own session as the root of a project it coordinates.
+pub(crate) fn project_member_project_id(
+    persistence: &dyn Persistence,
+    session_id: AgentSessionId,
+) -> Result<ProjectId> {
+    Ok(persistence
+        .load_delegated_task_for_target(session_id)?
+        .map(|task| task.project_id)
+        .unwrap_or_else(|| ProjectId::from_uuid(*session_id.as_uuid())))
+}
+
 /// The project a member belongs to and the message sequence its durable inbox is
 /// read from: everything after the delivered cursor of its newest run.
 pub(crate) fn project_member_inbox_position(
     persistence: &dyn Persistence,
     session_id: AgentSessionId,
 ) -> Result<(ProjectId, u64)> {
-    let project_id = persistence
-        .load_delegated_task_for_target(session_id)?
-        .map(|task| task.project_id)
-        .unwrap_or_else(|| ProjectId::from_uuid(*session_id.as_uuid()));
+    let project_id = project_member_project_id(persistence, session_id)?;
     let cursor = match persistence.load_latest_run_summary_for_session(session_id)? {
         Some(summary) => persistence
             .load_run_execution_state(summary.snapshot.id)?
@@ -373,7 +382,7 @@ pub(crate) fn deliver_project_agent_messages(
     runtime: &mut AgentRuntime,
 ) -> Result<bool> {
     let session_id = runtime.session_id();
-    let (project_id, _) = project_member_inbox_position(persistence, session_id)?;
+    let project_id = project_member_project_id(persistence, session_id)?;
     let messages = persistence.list_agent_messages(
         project_id,
         session_id,
@@ -430,13 +439,22 @@ pub(crate) fn deliver_project_child_notices(
     runtime: &mut AgentRuntime,
 ) -> Result<bool> {
     let session_id = runtime.session_id();
-    let (project_id, _) = project_member_inbox_position(persistence, session_id)?;
+    let project_id = project_member_project_id(persistence, session_id)?;
+    // One borrowed pass over the project turns in the transcript: each candidate
+    // task is then checked against those contents instead of copying the whole
+    // transcript once per task at every model-turn boundary.
+    let project_turns: Vec<String> = runtime
+        .transcript()
+        .iter()
+        .filter(|message| message.name.as_deref() == Some(PROJECT_MESSAGE_NAME))
+        .map(|message| message.content.clone())
+        .collect();
     let mut delivered = false;
     for task in persistence.list_project_tasks(project_id)? {
         if task.requester_session_id != session_id {
             continue;
         }
-        if manager_was_notified_of_child(&runtime.messages(), task.task_id) {
+        if manager_was_notified_of_child(&project_turns, task.task_id) {
             continue;
         }
         let delivery = ProjectChildResultDelivery {

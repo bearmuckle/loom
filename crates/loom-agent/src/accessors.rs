@@ -198,6 +198,14 @@ impl AgentRuntime {
         self.messages.clone()
     }
 
+    /// Borrowed view of the transcript for a caller that must not copy it.
+    ///
+    /// The run worker reads this at every model-turn boundary, where copying the
+    /// whole transcript would cost more than the check itself.
+    pub fn transcript(&self) -> &[ModelMessage] {
+        &self.messages
+    }
+
     pub fn last_project_message_sequence(&self) -> u64 {
         self.last_project_message_sequence
     }
