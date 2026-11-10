@@ -5,11 +5,19 @@ use super::*;
 /// The list is authoritative only for the activities it names. A full state
 /// save snapshots the runtime vectors while run workers keep appending
 /// activities through [`save_run_activity_deltas`], so the snapshot can be older
-/// than the stored rows; the write is therefore append-only. Every listed
-/// activity is written at its position in the list, an existing row must keep
-/// the ordinal it was stored at (a changed order is refused), and a row the list
-/// does not name is left alone, because deleting it would lose an activity the
+/// than the stored rows; the write is therefore append-only. A row the list does
+/// not name is left alone, because deleting it would lose an activity the
 /// runtime still holds and free its ordinal for a different one.
+///
+/// The ordinal of an activity is decided by the database, not by the position of
+/// the activity in the list: an activity that is already stored keeps the
+/// ordinal it was first written at, and an activity the save has not stored yet
+/// is appended at `MAX(ordinal) + 1`, the same rule the run-checkpoint delta
+/// writer uses. That keeps the stored order equal to the order the activities
+/// were recorded in, and it makes a save repair a database whose ordinals
+/// disagree with the runtime vector instead of refusing it: an order refusal is
+/// non-retryable, so it would latch the worker-wide persistence fail-stop and
+/// exit the process for every run, not just the affected one.
 pub(crate) fn save_run_activity_rows(
     transaction: &Transaction<'_>,
     activities_by_run: &DurableRunActivities,
@@ -29,7 +37,11 @@ pub(crate) fn save_run_activity_rows(
                 )
             })?;
         let mut seen = BTreeSet::new();
-        for (ordinal, activity) in activities.iter().enumerate() {
+        // The ordinal the next activity this save appends takes. It is read
+        // once per run and advanced for every appended activity, so a save that
+        // writes several new activities keeps their recorded order.
+        let mut next_ordinal: Option<i64> = None;
+        for (position, activity) in activities.iter().enumerate() {
             if activity.run_id != *run_id || !seen.insert(activity.id) {
                 return Err(LoomError::invalid_request(
                     "run activity keys must be unique and match their owning run",
@@ -40,13 +52,6 @@ pub(crate) fn save_run_activity_rows(
                     "run activity kind does not match its data",
                 ));
             }
-            let ordinal = i64::try_from(ordinal).map_err(|_| {
-                LoomError::new(
-                    ErrorCode::Persistence,
-                    "run has too many activity records",
-                    false,
-                )
-            })?;
             let timeline_ordinal = i64::try_from(activity.timeline_ordinal).map_err(|_| {
                 LoomError::new(
                     ErrorCode::Persistence,
@@ -66,33 +71,32 @@ pub(crate) fn save_run_activity_rows(
                 .map_err(|error| {
                     persistence_error(format!("could not read activity position: {error}"), true)
                 })?;
-            if existing_ordinal.is_some_and(|existing| existing != ordinal) {
-                return Err(LoomError::new(
-                    ErrorCode::MalformedPayload,
-                    "persisted activity order cannot be changed",
-                    false,
-                ));
-            }
-            let occupant: Option<Vec<u8>> = transaction
-                .query_row(
-                    "SELECT activity_id FROM run_activities WHERE run_id=?1 AND ordinal=?2",
-                    params![run_id_bytes.as_slice(), ordinal],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|error| {
-                    persistence_error(format!("could not verify activity order: {error}"), true)
-                })?;
-            if occupant
-                .as_ref()
-                .is_some_and(|existing| existing.as_slice() != activity_id.as_slice())
-            {
-                return Err(LoomError::new(
-                    ErrorCode::MalformedPayload,
-                    "persisted activity order cannot be changed",
-                    false,
-                ));
-            }
+            let ordinal = match existing_ordinal {
+                // A stored activity keeps the ordinal it was first written at.
+                // The runtime vector holds the same activities in that order,
+                // so a save updates their state and never their place.
+                Some(ordinal) => {
+                    if usize::try_from(ordinal).ok() != Some(position) {
+                        log::warn!(
+                            "[loom-persistence] run {run_id} activity {} is stored at ordinal \
+                             {ordinal}, but its position in the saved activity list is {position}; \
+                             keeping the stored ordinal",
+                            activity.id
+                        );
+                    }
+                    ordinal
+                }
+                // An activity the save has not stored yet is appended after
+                // every stored activity of the run.
+                None => {
+                    let ordinal = match next_ordinal {
+                        Some(ordinal) => ordinal,
+                        None => next_activity_ordinal(transaction, run_id_bytes)?,
+                    };
+                    next_ordinal = Some(ordinal + 1);
+                    ordinal
+                }
+            };
 
             let normalized_data = normalize_activity_tool_data(&activity.data);
             let data = serde_json::to_vec(&normalized_data).map_err(|error| {
@@ -184,6 +188,26 @@ pub(crate) fn save_run_activity_rows(
     Ok(())
 }
 
+/// The ordinal that appends an activity after every stored activity of a run.
+///
+/// Both writers allocate new activities here, so a save and a run checkpoint
+/// cannot disagree about where the next activity belongs, and an activity that
+/// is already stored is never renumbered.
+fn next_activity_ordinal(transaction: &Transaction<'_>, run_id: &[u8]) -> Result<i64> {
+    transaction
+        .query_row(
+            "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM run_activities WHERE run_id=?1",
+            [run_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not allocate activity ordinal: {error}"),
+                true,
+            )
+        })
+}
+
 /// Persist only worker-reported activity changes. Existing activity ordinals
 /// are recovered by stable ID; new activities receive the next ordinal. This
 /// path deliberately does not stage or prune the run's complete activity set.
@@ -232,18 +256,7 @@ pub(crate) fn save_run_activity_deltas(
         let ordinal = if let Some(ordinal) = existing {
             ordinal
         } else {
-            transaction
-                .query_row(
-                    "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM run_activities WHERE run_id=?1",
-                    [run_id_bytes.as_slice()],
-                    |row| row.get::<_, i64>(0),
-                )
-                .map_err(|error| {
-                    persistence_error(
-                        format!("could not allocate activity ordinal: {error}"),
-                        true,
-                    )
-                })?
+            next_activity_ordinal(transaction, run_id_bytes)?
         };
         let timeline_ordinal = i64::try_from(activity.timeline_ordinal).map_err(|_| {
             LoomError::new(

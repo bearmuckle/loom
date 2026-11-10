@@ -420,7 +420,14 @@ pub struct InProcessBackend {
     self_reference: Mutex<Weak<InProcessBackend>>,
     request_lifecycle: RwLock<u8>,
     persistence_failed: AtomicBool,
-    state_persist_gate: Mutex<()>,
+    /// Serialises a full state save against run checkpoints. The save holds the
+    /// write side from the snapshot it takes to the transaction it commits, and
+    /// a run checkpoint holds the read side, so no checkpoint can commit a row
+    /// inside a save's snapshot window: a save would otherwise write an older
+    /// activity, transcript or tool-call set over the rows the checkpoint had
+    /// just committed. Writers that must not interleave with a save (child
+    /// creation, sign-in credentials) hold the read side too.
+    state_persist_gate: RwLock<()>,
     /// Serializes session deletion with the retention sweep, so no caller ever
     /// observes a partially deleted session.
     archive_gate: Mutex<()>,

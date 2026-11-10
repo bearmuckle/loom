@@ -115,7 +115,7 @@ impl InProcessBackend {
             let saved = {
                 let _gate = self
                     .state_persist_gate
-                    .lock()
+                    .read()
                     .unwrap_or_else(PoisonError::into_inner);
                 persistence.save_person_token(&stored)
             };
@@ -275,7 +275,7 @@ impl InProcessBackend {
         };
         let _gate = self
             .state_persist_gate
-            .lock()
+            .read()
             .unwrap_or_else(PoisonError::into_inner);
         match persistence.delete_person_token(stored_id) {
             Ok(_) => {}
