@@ -1335,6 +1335,80 @@ fn project_messages_append_once_and_advance_the_inbox_cursor() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// Describes every place a wire transcript would be rejected: an assistant tool
+/// call whose result is not the next message, or a tool message that answers no
+/// open call. OpenAI-compatible routes answer such a request with
+/// "insufficient tool messages following tool_calls message".
+fn tool_pairing_violations(messages: &[ModelMessage]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut index = 0;
+    while index < messages.len() {
+        let message = &messages[index];
+        index += 1;
+        if message.role == MessageRole::Tool {
+            violations.push(format!(
+                "tool message for {:?} answers no open tool call",
+                message.tool_call_id
+            ));
+            continue;
+        }
+        for call in &message.tool_calls {
+            match messages.get(index) {
+                Some(next)
+                    if next.role == MessageRole::Tool && next.tool_call_id == Some(call.id) =>
+                {
+                    index += 1;
+                }
+                _ => violations.push(format!(
+                    "tool call {} ({}) has no tool message directly after it",
+                    call.id, call.name
+                )),
+            }
+        }
+    }
+    violations
+}
+
+/// A child finishing while the manager waits for a tool approval must not add a
+/// turn between the assistant's tool call and its result: the provider rejects
+/// the whole request when that pair is split.
+#[test]
+fn a_project_child_notice_waits_for_a_pending_tool_result() {
+    let (mut runtime, root) = destructive_tool_runtime(loom_core::PolicyDecision::RequireApproval);
+    let events = runtime.start().unwrap();
+    let call_id = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolApprovalRequired { call, .. } => Some(call.id),
+            _ => None,
+        })
+        .expect("the gated call waits for approval");
+    assert_eq!(runtime.snapshot().state, AgentRunState::AwaitingApproval);
+
+    runtime
+        .notify_project_child_finished(
+            "[Project notification] Direct child task 'worker' finished with status \
+             Completed without reporting a result."
+                .to_owned(),
+        )
+        .unwrap();
+
+    let approved = runtime.approve(call_id).unwrap();
+    assert!(approved.iter().any(|event| matches!(
+        event,
+        AgentEvent::RunCompleted { snapshot } if snapshot.state == AgentRunState::Completed
+    )));
+
+    let request = runtime.model_request().unwrap().0;
+    assert_eq!(
+        tool_pairing_violations(&request.messages),
+        Vec::<String>::new(),
+        "the notice must not separate a tool call from its result: {:?}",
+        request.messages,
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn queued_user_directions_deliver_at_a_safe_boundary() {
     let root = workspace();
