@@ -1942,6 +1942,40 @@ fn auto_archive_policy_archives_a_completed_child_agent() {
         "an opted-out workspace keeps a finished child visible"
     );
 
+    // Turning the switch on reaches the agents that finished while it was off:
+    // the maintenance pass archives them without waiting for a new checkpoint.
+    backend
+        .set_workspace_config(
+            workspace.id,
+            WorkspaceConfig {
+                revision: 3,
+                auto_archive_completed_agents: true,
+                ..WorkspaceConfig::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        backend.reconcile_auto_archive_completed_children().unwrap(),
+        vec![visible_child]
+    );
+    assert_eq!(
+        backend
+            .sessions()
+            .unwrap()
+            .get(visible_child)
+            .unwrap()
+            .state,
+        AgentSessionState::Archived,
+        "the reconcile pass archives a child that completed while opted out"
+    );
+    // A second pass has nothing left to do.
+    assert!(
+        backend
+            .reconcile_auto_archive_completed_children()
+            .unwrap()
+            .is_empty()
+    );
+
     drop(connection);
     drop(backend);
     let _ = fs::remove_dir_all(&temp);
@@ -2084,12 +2118,27 @@ fn auto_archive_waits_for_code_integration() {
         AgentSessionState::Completed,
         "an un-integrated code result must stay visible"
     );
+    // The maintenance pass applies the same guard, so it cannot reclaim it
+    // either.
+    assert!(
+        backend
+            .reconcile_auto_archive_completed_children()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        backend.sessions().unwrap().get(child_id).unwrap().state,
+        AgentSessionState::Completed
+    );
 
     // Once integrated, the policy reclaims it.
     worktree.status = loom_core::ProjectWorktreeStatus::Integrated;
     worktree.integrated_revision = Some("fedcba9876543210fedcba9876543210fedcba98".into());
     persistence.save_project_worktree(&worktree).unwrap();
-    backend.auto_archive_completed_child(child_id).unwrap();
+    assert_eq!(
+        backend.reconcile_auto_archive_completed_children().unwrap(),
+        vec![child_id]
+    );
     assert_eq!(
         backend.sessions().unwrap().get(child_id).unwrap().state,
         AgentSessionState::Archived

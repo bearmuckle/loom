@@ -186,26 +186,28 @@ impl InProcessBackend {
     /// Archiving a session also reclaims its build cache, which is why this path
     /// removes it here: it archives through the catalog rather than through the
     /// connection's archive request, so nothing else would.
-    pub(crate) fn auto_archive_completed_child(&self, session_id: AgentSessionId) -> Result<()> {
+    ///
+    /// Returns whether this call archived the session.
+    pub(crate) fn auto_archive_completed_child(&self, session_id: AgentSessionId) -> Result<bool> {
         let Some(persistence) = self.persistence.as_ref() else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(task) = persistence.load_delegated_task_for_target(session_id)? else {
-            return Ok(());
+            return Ok(false);
         };
         if task.status != loom_core::DelegatedTaskStatus::Completed {
-            return Ok(());
+            return Ok(false);
         }
         let session = self.sessions()?.get(session_id)?;
         if session.state == AgentSessionState::Archived {
-            return Ok(());
+            return Ok(false);
         }
         let enabled = self
             .workspace_configs()?
             .get(&session.workspace_id)
             .is_some_and(|config| config.auto_archive_completed_agents);
         if !enabled {
-            return Ok(());
+            return Ok(false);
         }
         if task.code_change
             && !persistence
@@ -216,7 +218,7 @@ impl InProcessBackend {
         {
             // The code result still needs review and integration, so the agent
             // stays visible until the manager lands it.
-            return Ok(());
+            return Ok(false);
         }
         match self.sessions()?.archive(session_id) {
             Ok((_snapshot, record)) => {
@@ -226,15 +228,47 @@ impl InProcessBackend {
                 // build output is reclaimed with the archive, exactly as the
                 // archive request does it.
                 self.remove_build_cache(session_id);
+                Ok(true)
             }
             Err(error) => {
                 log::warn!(
                     "[loom-server] could not auto-archive completed sub agent {session_id}: {}",
                     error.message
                 );
+                Ok(false)
             }
         }
-        Ok(())
+    }
+
+    /// Archives every completed delegated sub agent that has become eligible
+    /// since its own completion or integration checkpoint.
+    ///
+    /// Auto-archive normally runs when a run finishes and when a code result is
+    /// integrated. A workspace that enables the setting afterwards, or a worker
+    /// that missed one of those moments, would otherwise keep its finished
+    /// agents forever. The periodic maintenance pass calls this so the setting
+    /// also reaches work that finished before it was turned on.
+    ///
+    /// Returns the sessions this pass archived.
+    pub(crate) fn reconcile_auto_archive_completed_children(&self) -> Result<Vec<AgentSessionId>> {
+        if self.persistence.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut completed = self
+            .sessions()?
+            .list_in_workspace(None, true)
+            .into_iter()
+            .filter(|session| session.state == AgentSessionState::Completed)
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        completed.sort_unstable();
+        let mut archived = Vec::new();
+        for session_id in completed {
+            if self.auto_archive_completed_child(session_id)? {
+                archived.push(session_id);
+            }
+        }
+        Ok(archived)
     }
 
     /// Titles a project automatically from the work its root agent is doing.

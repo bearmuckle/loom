@@ -200,6 +200,29 @@ pub fn apply_startup_archive_retention(
     Ok(source)
 }
 
+/// Archives completed sub agents that became eligible apart from a run
+/// checkpoint, then sweeps expired archives.
+///
+/// The reconcile pass is what makes the workspace's auto-archive switch
+/// retroactive and catches a code result that was integrated after its child
+/// completed. A failure to reconcile is logged and never stops retention.
+pub(crate) fn run_archive_maintenance(backend: &InProcessBackend) -> Result<ArchiveSweepReport> {
+    match backend.reconcile_auto_archive_completed_children() {
+        Ok(archived) if !archived.is_empty() => log::info!(
+            "[loom-server] archive maintenance auto-archived {} completed sub agent(s)",
+            archived.len()
+        ),
+        Ok(_) => {
+            log::debug!("[loom-server] archive maintenance found no completed sub agent to archive")
+        }
+        Err(error) => log::warn!(
+            "[loom-server] archive maintenance could not reconcile completed sub agents: {}",
+            error.message
+        ),
+    }
+    backend.sweep_archive_retention()
+}
+
 /// Sweeps once before a server starts accepting clients, logging the active
 /// policy and any failure instead of aborting the start.
 pub fn sweep_archive_retention_at_startup(backend: &InProcessBackend) {
@@ -208,7 +231,7 @@ pub fn sweep_archive_retention_at_startup(backend: &InProcessBackend) {
         "[loom-server] archive retention at startup: {}",
         describe_archive_retention(policy)
     );
-    match backend.sweep_archive_retention() {
+    match run_archive_maintenance(backend) {
         Ok(report) => log::info!(
             "[loom-server] archive retention startup sweep deleted {} session(s) and skipped {} candidate(s)",
             report.deleted_sessions.len(),
@@ -232,7 +255,7 @@ pub fn sweep_archive_retention_at_startup(backend: &InProcessBackend) {
 /// thread: run inline it would stall the runtime worker that also polls the
 /// shutdown signal and the remote listener.
 pub async fn run_archive_retention_sweeps(backend: Arc<InProcessBackend>, interval: Duration) {
-    run_periodic_sweeps(interval, move || backend.sweep_archive_retention()).await;
+    run_periodic_sweeps(interval, move || run_archive_maintenance(&backend)).await;
 }
 
 /// Owns the periodic archive-retention sweep on a dedicated thread.
@@ -283,7 +306,7 @@ impl ArchiveRetentionSweepDriver {
                 // This runtime is private to the thread, so the sweep may run
                 // inline on it.
                 runtime.block_on(run_periodic_sweeps_until(interval, stop_rx, move || {
-                    std::future::ready(sweep_backend.sweep_archive_retention())
+                    std::future::ready(run_archive_maintenance(&sweep_backend))
                 }));
             })
             .map_err(|error| {
