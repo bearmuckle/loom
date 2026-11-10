@@ -101,15 +101,17 @@ impl ProjectChildResultDelivery {
 /// A finish notice is not a durable message record: it is derived from the
 /// child's task state and offered at every safe model-turn boundary until it is
 /// appended. The transcript is therefore the record of delivery, and the task
-/// id inside the notice is the marker that identifies it.
+/// id inside the notice is the marker that identifies it. The caller passes the
+/// contents of the transcript's project turns once, so checking every candidate
+/// task does not copy the transcript.
 pub(crate) fn manager_was_notified_of_child(
-    messages: &[loom_model::ModelMessage],
+    project_turns: &[String],
     task_id: loom_core::TaskId,
 ) -> bool {
     let marker = format!("(task {task_id})");
-    messages.iter().any(|message| {
-        message.name.as_deref() == Some(PROJECT_MESSAGE_NAME) && message.content.contains(&marker)
-    })
+    project_turns
+        .iter()
+        .any(|content| content.contains(&marker))
 }
 
 /// The participant name every project turn carries on the wire and in the
