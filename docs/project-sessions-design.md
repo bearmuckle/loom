@@ -443,8 +443,9 @@ restart. Existing run-recovery behavior remains covered by its restart tests.
    blocked, or running; after tasks are terminal, archive the descendant
    sessions with the root.
 6. **Implemented:** the left pane lists one row per project and summarises that
-   project's delegated agents on the row; an agent's transcript and child
-   controls are reached through the row's agent summary menu.
+   project's delegated agents on the row; an agent's transcript is reached from
+   the row's agent status panel, and its child controls from the panel's own
+   menu.
 
 **Exit:** users can inspect, message through the manager, and control each
 child independently; project state reconstructs after reconnect.

@@ -2,12 +2,14 @@
 //! them.
 //!
 //! Sub agents work autonomously, so they never get a row of their own. A
-//! project row summarises its agents on one line and lists them behind that
-//! summary's menu.
+//! project row summarises its agents on one line and lists them in the panel
+//! that line opens.
 
 use super::*;
 
+use gpui_kit::Anchor;
 use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::component::popover::{Popover, PopoverState};
 
 /// Prefix of a worker section heading's element id, which the render tests and
 /// the pane agree on.
@@ -411,28 +413,14 @@ fn render_project_row(
         .gap_1()
         .overflow_hidden();
     if let (Some(summary), Some(view)) = (row.summary.clone(), view) {
-        let menu_view = view.clone();
-        let menu_data = data.clone();
-        let agents = row.agents.clone();
-        let root_session_id = row.session_id;
-        detail_trailing = detail_trailing.child(
-            Button::new(("project-agents", row_index))
-                .label(summary.clone())
-                .ghost()
-                .small()
-                .accessibility_label(summary)
-                .dropdown_menu(move |menu, window, cx| {
-                    project_agent_menu(
-                        menu,
-                        &agents,
-                        root_session_id,
-                        &menu_data,
-                        &menu_view,
-                        window,
-                        cx,
-                    )
-                }),
-        );
+        detail_trailing = detail_trailing.child(project_agents_summary(
+            row_index,
+            summary,
+            row.agents.clone(),
+            row.session_id,
+            data,
+            view,
+        ));
     }
     if let (true, Some(view)) = (layout.phone, view) {
         let menu_view = view.clone();
@@ -502,44 +490,204 @@ fn project_session_menu(
     LoomView::build_project_session_context_menu(menu, session, project, view.clone())
 }
 
-/// The dropdown menu of a project row: one submenu per delegated agent, built
-/// from that agent's child controls so the row's summary still reaches them.
-fn project_agent_menu(
-    mut menu: PopupMenu,
+/// The agent summary chip on a project row's second line, and the status panel
+/// it opens.
+///
+/// The panel is a popover, not a menu. A menu draws its items in the menu type,
+/// which is larger than the row's own subtitle, so an agent's status could
+/// never read like the line it belongs to. Only the status left the menu; an
+/// agent's actions keep theirs.
+fn project_agents_summary(
+    row_index: usize,
+    summary: String,
+    agents: Vec<ProjectAgentRow>,
+    root_session_id: AgentSessionId,
+    data: &Rc<ProjectListData>,
+    view: &Entity<LoomView>,
+) -> Popover {
+    let panel_data = data.clone();
+    let panel_view = view.clone();
+    Popover::new(("project-agents-popover", row_index))
+        // Above the chip and right-aligned with it, so the panel grows into the
+        // list instead of past the pane's right edge.
+        .anchor(Anchor::BottomRight)
+        .offset(px(4.))
+        .arrow(false)
+        // The panel draws its own surface in the row's palette, so it does not
+        // take the component library's roomier popover padding.
+        .appearance(false)
+        // The panel dismisses itself instead of using `overlay_closable`: a
+        // click on one of an agent's child controls is outside these bounds but
+        // belongs to that menu, so the panel must be able to tell them apart.
+        .overlay_closable(false)
+        .trigger(
+            Button::new(("project-agents", row_index))
+                .label(summary.clone())
+                .ghost()
+                .small()
+                .accessibility_label(summary),
+        )
+        .content(move |_, window, cx| {
+            let popover = cx.entity();
+            // Whether the panel's child-control menu is on screen. It renders
+            // outside the panel's bounds, so the panel must not read a click on
+            // one of its items as a click away from the panel.
+            let actions_menu_open =
+                window
+                    .use_keyed_state(("project-agents-actions-open", row_index), cx, |_, _| false);
+            project_agent_status_panel(
+                row_index,
+                &agents,
+                root_session_id,
+                &panel_data,
+                &panel_view,
+                &popover,
+                &actions_menu_open,
+            )
+        })
+}
+
+/// The delegated agents of one project, as the row's summary opens them: one
+/// compact row per agent, in the row's own type and colours.
+///
+/// A row opens that agent's transcript. Its trailing ellipsis opens the agent's
+/// child controls, which stay a menu because a menu is the right control for
+/// actions.
+fn project_agent_status_panel(
+    row_index: usize,
     agents: &[ProjectAgentRow],
     root_session_id: AgentSessionId,
     data: &Rc<ProjectListData>,
     view: &Entity<LoomView>,
-    window: &mut Window,
-    cx: &mut Context<PopupMenu>,
-) -> PopupMenu {
-    for agent in agents {
-        let agent_session_id = agent.session_id;
-        let menu_data = data.clone();
-        let menu_view = view.clone();
-        let label = format!(
-            "{} · {}",
-            agent.name,
-            session_status_pill(agent.state, None).label
-        );
-        // The agent's menu is the child-control menu, which opens with
-        // "Open transcript" for a delegated session.
-        menu = menu.submenu(label, window, cx, move |menu, _, _| {
-            let (Some(session), Some(project)) = (
-                menu_data.sessions.get(&agent_session_id).cloned(),
-                menu_data.projects.get(&root_session_id).cloned(),
-            ) else {
-                return menu;
-            };
-            LoomView::build_project_session_context_menu(
-                menu,
-                session,
-                Some(project),
-                menu_view.clone(),
-            )
+    popover: &Entity<PopoverState>,
+    actions_menu_open: &Entity<bool>,
+) -> gpui_kit::AnyElement {
+    let dismiss = popover.clone();
+    let menu_open = actions_menu_open.clone();
+    let mut panel = div()
+        .id(("project-agents-panel", row_index))
+        .test_support()
+        .flex()
+        .flex_col()
+        .gap_0p5()
+        .p_1()
+        .w(px(220.))
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(0x242833))
+        .bg(rgb(0x171c25))
+        // A click anywhere else closes the panel. The child-control menu is a
+        // popup of its own, drawn beyond these bounds, so its items are excepted.
+        .on_mouse_down_out(move |_, window, cx| {
+            if *menu_open.read(cx) {
+                return;
+            }
+            dismiss.update(cx, |state, cx| state.dismiss(window, cx));
         });
+    for (index, agent) in agents.iter().enumerate() {
+        let pill = session_status_pill(agent.state, None);
+        let agent_session_id = agent.session_id;
+        let row_data = data.clone();
+        let row_view = view.clone();
+        let row_popover = popover.clone();
+        let actions_data = data.clone();
+        let actions_view = view.clone();
+        let actions_popover = popover.clone();
+        let actions_menu = actions_menu_open.clone();
+        panel = panel.child(
+            div()
+                .id(("project-agent-row", index))
+                .test_support()
+                .aria_label(format!("{} · {}", agent.name, pill.label))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_1()
+                .py_0p5()
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|row| row.bg(rgb(0x1b1d24)))
+                .on_click(move |_, window, cx| {
+                    // The row is the agent's transcript action; the panel has
+                    // done its job once the agent is on screen.
+                    row_popover.update(cx, |state, cx| state.dismiss(window, cx));
+                    let Some(session) = row_data.sessions.get(&agent_session_id).cloned() else {
+                        return;
+                    };
+                    row_view.update(cx, |view, cx| view.open_agent_transcript(session, cx));
+                })
+                .child(
+                    div()
+                        .w(px(8.))
+                        .h(px(8.))
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .bg(rgb(pill.foreground)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_xs()
+                        .text_color(rgb(0xe5e7eb))
+                        .child(agent.name.clone()),
+                )
+                .child(
+                    div()
+                        .id(("project-agent-status", index))
+                        .test_support()
+                        .aria_label(pill.label)
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(rgb(0x8f98a6))
+                        .child(pill.label),
+                )
+                .child(
+                    Button::new(("project-agent-actions", index))
+                        .icon(Icon::new(IconName::Ellipsis))
+                        .ghost()
+                        .small()
+                        .accessibility_label("Agent actions")
+                        .dropdown_menu(move |menu, _, _| {
+                            project_agent_actions_menu(
+                                menu,
+                                agent_session_id,
+                                root_session_id,
+                                &actions_data,
+                                &actions_view,
+                            )
+                        })
+                        .on_open_change(move |open, window, cx| {
+                            actions_menu.update(cx, |state, _| *state = *open);
+                            if !*open {
+                                // The action ran or was abandoned, so the
+                                // status panel has nothing left to say.
+                                actions_popover.update(cx, |state, cx| state.dismiss(window, cx));
+                            }
+                        }),
+                ),
+        );
     }
-    menu
+    panel.into_any_element()
+}
+
+/// The child-control menu of one delegated agent, which opens with that
+/// agent's transcript and keeps the controls a status row has no room for.
+fn project_agent_actions_menu(
+    menu: PopupMenu,
+    agent_session_id: AgentSessionId,
+    root_session_id: AgentSessionId,
+    data: &Rc<ProjectListData>,
+    view: &Entity<LoomView>,
+) -> PopupMenu {
+    let (Some(session), Some(project)) = (
+        data.sessions.get(&agent_session_id).cloned(),
+        data.projects.get(&root_session_id).cloned(),
+    ) else {
+        return menu;
+    };
+    LoomView::build_project_session_context_menu(menu, session, Some(project), view.clone())
 }
 
 impl LoomView {

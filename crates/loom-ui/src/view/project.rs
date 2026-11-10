@@ -560,6 +560,22 @@ impl LoomView {
         );
     }
 
+    /// Opens one delegated agent's transcript, which is what the agent's status
+    /// row and its child-control menu both mean by "Open transcript".
+    pub(crate) fn open_agent_transcript(
+        &mut self,
+        session: AgentSessionSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        self.session_drawer_open = false;
+        if self.active_session.id != session.id {
+            self.select_session(session, cx);
+        } else {
+            self.dismiss_surfaces();
+        }
+        cx.notify();
+    }
+
     pub(crate) fn build_project_session_context_menu(
         mut menu: PopupMenu,
         session: AgentSessionSnapshot,
@@ -605,13 +621,7 @@ impl LoomView {
                 PopupMenuItem::new("Open transcript").on_click(move |_, _, cx| {
                     let open_session = open_session.clone();
                     open_view.update(cx, |view, cx| {
-                        view.session_drawer_open = false;
-                        if view.active_session.id != open_session.id {
-                            view.select_session(open_session, cx);
-                        } else {
-                            view.dismiss_surfaces();
-                        }
-                        cx.notify();
+                        view.open_agent_transcript(open_session, cx);
                     });
                 }),
             );

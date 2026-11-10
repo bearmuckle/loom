@@ -878,7 +878,8 @@ pub(crate) enum SessionSourceChoice {
     GitHub,
 }
 
-/// One delegated agent of a project, as listed in that project row's menu.
+/// One delegated agent of a project, as listed in that project row's agent
+/// status panel.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProjectAgentRow {
     pub(crate) session_id: AgentSessionId,
@@ -889,7 +890,7 @@ pub(crate) struct ProjectAgentRow {
 /// One row of the left pane: a project, built from its root session.
 ///
 /// Delegated agents never get their own row; they are summarised on the row's
-/// second line and listed behind that summary's menu.
+/// second line and listed in the status panel behind that summary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProjectListRow {
     /// The session the row selects: the project's root, or the session itself
@@ -902,7 +903,8 @@ pub(crate) struct ProjectListRow {
     /// The project's main source when known, otherwise `updated <when>`. Work
     /// in flight replaces it, because it is what the row is doing right now.
     pub(crate) detail: String,
-    /// The one-line agent summary, omitted when the project has no agents.
+    /// The one-line agent summary, omitted when the project has no agents. It
+    /// opens the panel that lists them.
     pub(crate) summary: Option<String>,
     pub(crate) agents: Vec<ProjectAgentRow>,
     /// Whether the project or one of its agents has work in flight.

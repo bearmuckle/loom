@@ -1002,8 +1002,8 @@ fn the_phone_drawer_closes_when_a_project_row_is_selected(cx: &mut TestAppContex
     .unwrap();
 }
 
-/// Opens the first project row's agent summary menu.
-fn open_summary_menu(cx: &mut TestAppContext, handle: gpui_kit::WindowHandle<Root>) {
+/// Opens the first project row's agent status panel.
+fn open_agent_status_panel(cx: &mut TestAppContext, handle: gpui_kit::WindowHandle<Root>) {
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
         window.click(("project-agents", 0usize), cx);
@@ -1014,71 +1014,179 @@ fn open_summary_menu(cx: &mut TestAppContext, handle: gpui_kit::WindowHandle<Roo
         .unwrap();
 }
 
-/// Opens the submenu of the agent at `agent_index` in the summary menu that is
-/// already open. The submenu is where that agent's transcript and child
-/// controls live.
-fn open_agent_submenu(
-    cx: &mut TestAppContext,
-    handle: gpui_kit::WindowHandle<Root>,
-    agent_index: usize,
-) {
-    cx.update_window(handle.into(), |_, window, cx| {
-        window.within("popup-menu").hover(agent_index, cx);
+/// The agent summary opens a panel listing the project's agents, one row each,
+/// in the same type and colours as the row's own subtitle.
+#[gpui_kit::test]
+fn the_agent_summary_lists_its_agents_in_the_rows_typography(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (handle, _view) = open_nested_project(cx);
+    open_agent_status_panel(cx, handle);
+    cx.update_window(handle.into(), |_, window, _| {
+        assert_eq!(
+            window.find(("project-agent-row", 0usize)).label(),
+            Some("Manager · Working")
+        );
+        assert_eq!(
+            window.find(("project-agent-row", 1usize)).label(),
+            Some("Worker · Done")
+        );
+        assert_eq!(
+            window.find(("project-agent-status", 0usize)).label(),
+            Some("Working")
+        );
+        assert_eq!(
+            window.find(("project-agent-status", 1usize)).label(),
+            Some("Done")
+        );
+        // The status reads like the row's repository subtitle: the panel
+        // replaced the menu's larger type with the row's own.
+        let detail = window.find(("project-detail", 0usize)).bounds();
+        for index in [0usize, 1] {
+            let status = window.find(("project-agent-status", index)).bounds();
+            let delta = (status.size.height - detail.size.height).abs();
+            assert!(
+                delta <= px(1.),
+                "agent status {index} is not the row's subtitle size: {status:?} vs {detail:?}"
+            );
+        }
     })
     .unwrap();
-    cx.run_until_parked();
-    cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
-        .unwrap();
 }
 
-/// The agent summary is a menu: it lists the project's agents and each agent's
-/// submenu opens that agent's transcript.
+/// Clicking an agent in the status panel opens that agent's transcript and
+/// closes the panel.
 #[gpui_kit::test]
-fn the_agent_summary_opens_an_agents_transcript(cx: &mut TestAppContext) {
+fn clicking_an_agent_in_the_status_panel_opens_its_transcript(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let (handle, view) = open_nested_project(cx);
-    open_summary_menu(cx, handle);
-    cx.update_window(handle.into(), |_, window, _| {
-        let menu = window.within("popup-menu");
-        assert_eq!(menu.find(0usize).label(), Some("Manager · Working"));
-        assert_eq!(menu.find(1usize).label(), Some("Worker · Done"));
-    })
-    .unwrap();
-
-    open_agent_submenu(cx, handle, 1);
+    open_agent_status_panel(cx, handle);
     cx.update_window(handle.into(), |_, window, cx| {
-        window.within("submenu").click(0usize, cx);
+        window.click(("project-agent-row", 1usize), cx);
     })
     .unwrap();
     cx.run_until_parked();
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
-        assert_eq!(
-            view.read(cx).active_session.name,
-            "Worker",
-            "the agent submenu opens that agent's transcript"
+        assert_eq!(view.read(cx).active_session.name, "Worker");
+        assert!(
+            window.try_find(("project-agent-row", 0usize)).is_none(),
+            "opening an agent closes the status panel"
         );
     })
     .unwrap();
 }
 
-/// Summarising an agent on its project row must not hide its child controls:
-/// the agent's submenu carries the same control menu a child row used to.
+/// Summarising an agent in the status panel must not hide its child controls:
+/// the row's ellipsis opens the same control menu a child row used to, and the
+/// menu's own action still runs.
 #[gpui_kit::test]
-fn an_agent_submenu_keeps_the_child_controls_reachable(cx: &mut TestAppContext) {
+fn an_agent_status_row_keeps_the_child_controls_reachable(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
-    let (handle, _view) = open_nested_project(cx);
-    open_summary_menu(cx, handle);
-    // The manager is running for its project root, so it can be paused.
-    open_agent_submenu(cx, handle, 0);
-    cx.update_window(handle.into(), |_, window, _| {
-        let submenu = window.within("submenu");
+    let (handle, view) = open_nested_project(cx);
+    open_agent_status_panel(cx, handle);
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click(("project-agent-actions", 0usize), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let menu = window.within("popup-menu");
         assert_eq!(
-            submenu.find(0usize).label(),
+            menu.find(0usize).label(),
             Some("Open transcript"),
             "the agent's transcript stays the first item"
         );
-        assert_eq!(submenu.find(1usize).label(), Some("Pause child"));
+        assert_eq!(menu.find(1usize).label(), Some("Pause child"));
+        // The item is the menu's, so running it must not be read as a click
+        // away from the panel.
+        window.within("popup-menu").click(0usize, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).active_session.name, "Manager");
+        assert!(
+            window.try_find(("project-agent-row", 0usize)).is_none(),
+            "the panel closes once an agent's action runs"
+        );
+    })
+    .unwrap();
+}
+
+/// A click anywhere else closes the status panel, including the summary that
+/// opened it.
+#[gpui_kit::test]
+fn clicking_outside_closes_the_agent_status_panel(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (handle, _view) = open_nested_project(cx);
+    open_agent_status_panel(cx, handle);
+    cx.update_window(handle.into(), |_, window, cx| {
+        assert!(window.try_find(("project-agent-row", 0usize)).is_some());
+        window.click(("project-name", 0usize), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find(("project-agent-row", 0usize)).is_none(),
+            "a click outside the panel closes it"
+        );
+    })
+    .unwrap();
+
+    // The summary that opened the panel opens and closes it.
+    open_agent_status_panel(cx, handle);
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.click(("project-agents", 0usize), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find(("project-agent-row", 0usize)).is_none(),
+            "the summary toggles its own panel closed"
+        );
+    })
+    .unwrap();
+}
+
+/// The status panel must fit inside the phone drawer's pane.
+#[gpui_kit::test]
+fn the_agent_status_panel_stays_inside_the_phone_pane(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(390.), px(844.)), |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = nested_project_view(cx.focus_handle());
+            view.workspace_feed_poll_scheduled = true;
+            view.session_drawer_open = true;
+            view
+        });
+        Root::new(view, window, cx)
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window
+            .within("mobile-session-drawer")
+            .click(("project-agents", 0usize), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let panel = window.find(("project-agents-panel", 0usize));
+        let drawer = window.find("mobile-session-drawer");
+        let panel_bounds = panel.bounds();
+        let drawer_bounds = drawer.bounds();
+        assert!(
+            panel_bounds.origin.x >= drawer_bounds.origin.x
+                && panel_bounds.origin.x + panel_bounds.size.width
+                    <= drawer_bounds.origin.x + drawer_bounds.size.width,
+            "the agent panel overflows the phone pane: {panel_bounds:?} vs {drawer_bounds:?}"
+        );
     })
     .unwrap();
 }
