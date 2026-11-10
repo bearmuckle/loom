@@ -61,6 +61,229 @@ pub(super) fn github_repository_json(name: &str) -> serde_json::Value {
     })
 }
 
+/// One scripted page of the GitHub repository listing fixture.
+pub(super) struct GitHubListingPage {
+    status: &'static str,
+    headers: Vec<(&'static str, String)>,
+    body: String,
+    delay: Duration,
+}
+
+impl GitHubListingPage {
+    pub(super) fn ok(repositories: &[serde_json::Value]) -> Self {
+        Self {
+            status: "200 OK",
+            headers: Vec::new(),
+            body: serde_json::Value::Array(repositories.to_vec()).to_string(),
+            delay: Duration::ZERO,
+        }
+    }
+
+    /// A failing page, with the headers GitHub sends alongside a rate limit.
+    pub(super) fn failure(status: &'static str, headers: &[(&'static str, String)]) -> Self {
+        Self {
+            status,
+            headers: headers.to_vec(),
+            body: "{}".to_owned(),
+            delay: Duration::ZERO,
+        }
+    }
+
+    pub(super) fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+}
+
+/// One request the GitHub repository listing fixture received.
+pub(super) struct GitHubListingRequest {
+    pub(super) page: usize,
+    /// The credential the request carried, without its `Bearer ` prefix.
+    pub(super) token: String,
+}
+
+/// A scripted `GET /user/repos` endpoint that serves pages by number, counts
+/// the requests it receives, and records which credential each one used.
+///
+/// Each connection serves exactly one request and is handled on its own
+/// thread, so a client that fetches pages concurrently is served concurrently.
+/// A page past the scripted list is an empty page, which ends a listing walk.
+pub(super) struct GitHubListingFixture {
+    address: std::net::SocketAddr,
+    requests: Arc<Mutex<Vec<GitHubListingRequest>>>,
+    stopped: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl GitHubListingFixture {
+    pub(super) fn start(pages: Vec<GitHubListingPage>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests: Arc<Mutex<Vec<GitHubListingRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let worker_requests = Arc::clone(&requests);
+        let worker_stopped = Arc::clone(&stopped);
+        let pages = Arc::new(pages);
+        let worker = thread::spawn(move || {
+            while !worker_stopped.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let requests = Arc::clone(&worker_requests);
+                        let pages = Arc::clone(&pages);
+                        thread::spawn(move || {
+                            serve_github_listing_request(stream, &pages, &requests);
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            address,
+            requests,
+            stopped,
+            worker: Some(worker),
+        }
+    }
+
+    pub(super) fn endpoint(&self) -> String {
+        format!("http://{}/user/repos", self.address)
+    }
+
+    pub(super) fn requests(&self) -> Vec<GitHubListingRequest> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| GitHubListingRequest {
+                page: request.page,
+                token: request.token.clone(),
+            })
+            .collect()
+    }
+
+    pub(super) fn requested_pages(&self) -> Vec<usize> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.page)
+            .collect()
+    }
+
+    pub(super) fn request_count(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+}
+
+impl Drop for GitHubListingFixture {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.address);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn serve_github_listing_request(
+    mut stream: TcpStream,
+    pages: &Arc<Vec<GitHubListingPage>>,
+    requests: &Arc<Mutex<Vec<GitHubListingRequest>>>,
+) {
+    let mut headers = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        if stream.read_exact(&mut byte).is_err() {
+            return;
+        }
+        headers.push(byte[0]);
+        if headers.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if headers.len() > 16 * 1024 {
+            return;
+        }
+    }
+    let headers = String::from_utf8_lossy(&headers).to_string();
+    let page = github_listing_page_number(&headers);
+    let token = headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        .map(|(_, value)| {
+            value
+                .trim()
+                .strip_prefix("Bearer ")
+                .or_else(|| value.trim().strip_prefix("bearer "))
+                .unwrap_or(value.trim())
+                .to_owned()
+        })
+        .unwrap_or_default();
+    requests
+        .lock()
+        .unwrap()
+        .push(GitHubListingRequest { page, token });
+
+    let empty = GitHubListingPage::ok(&[]);
+    let response = pages.get(page.saturating_sub(1)).unwrap_or(&empty);
+    if !response.delay.is_zero() {
+        thread::sleep(response.delay);
+    }
+    let mut head = format!(
+        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+        response.status,
+        response.body.len()
+    );
+    for (name, value) in &response.headers {
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(value);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(response.body.as_bytes());
+    let _ = stream.flush();
+}
+
+/// Reads the `page` query parameter from a fixture request's request line.
+fn github_listing_page_number(headers: &str) -> usize {
+    headers
+        .lines()
+        .next()
+        .and_then(|request_line| request_line.split_whitespace().nth(1))
+        .and_then(|target| target.split_once('?').map(|(_, query)| query))
+        .and_then(|query| query.split('&').find_map(|pair| pair.strip_prefix("page=")))
+        .and_then(|page| page.parse().ok())
+        .unwrap_or(1)
+}
+
+/// Builds one listing page whose first `matching` repositories contain the
+/// query a test searches for, followed by `filler` repositories that do not.
+pub(super) fn github_repository_page(
+    prefix: &str,
+    matching: usize,
+    filler: usize,
+) -> Vec<serde_json::Value> {
+    let mut repositories = Vec::new();
+    for index in 0..matching {
+        repositories.push(github_repository_json(&format!(
+            "{prefix}/the-needle-{index:03}"
+        )));
+    }
+    for index in 0..filler {
+        repositories.push(github_repository_json(&format!(
+            "{prefix}/other-{index:03}"
+        )));
+    }
+    repositories
+}
+
 /// Waits until a run stops needing the model, because a run is now driven by
 /// its own worker rather than by the request that started it.
 pub(super) fn await_settled_run(

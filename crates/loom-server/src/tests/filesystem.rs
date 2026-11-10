@@ -185,6 +185,234 @@ fn github_repository_search_filters_accessible_repositories_by_rank() {
 }
 
 #[test]
+fn github_repository_search_stops_after_the_first_page_with_enough_matches() {
+    let fixture = GitHubListingFixture::start(vec![
+        GitHubListingPage::ok(&github_repository_page("acme", 50, 50)),
+        GitHubListingPage::ok(&github_repository_page("beta", 0, 100)),
+        GitHubListingPage::ok(&github_repository_page("gamma", 0, 100)),
+    ]);
+
+    let repositories =
+        search_github_repositories_at("fixture-token", "needle", &fixture.endpoint()).unwrap();
+
+    assert_eq!(repositories.len(), 50);
+    // The first page already holds the 50 results the picker shows, so a
+    // multi-page listing is never walked further.
+    assert_eq!(fixture.requested_pages(), vec![1]);
+}
+
+#[test]
+fn github_repository_search_reuses_a_cached_listing_for_an_identical_query() {
+    let fixture = GitHubListingFixture::start(vec![
+        GitHubListingPage::ok(&github_repository_page("acme", 3, 97)),
+        GitHubListingPage::ok(&github_repository_page("beta", 2, 98)),
+        GitHubListingPage::ok(&github_repository_page("gamma", 0, 10)),
+    ]);
+    let cache = GitHubRepositoryListingCache::default();
+    let options = GitHubRepositorySearchOptions {
+        page_concurrency: 1,
+        listing_ttl: Duration::from_secs(60),
+        ..GitHubRepositorySearchOptions::default()
+    };
+
+    let first = search_github_repositories_with(
+        "fixture-token",
+        "needle",
+        &fixture.endpoint(),
+        options,
+        &cache,
+    )
+    .unwrap();
+    let requests_after_first = fixture.request_count();
+    assert_eq!(first.len(), 5);
+    assert_eq!(requests_after_first, 3);
+
+    let second = search_github_repositories_with(
+        "fixture-token",
+        "needle",
+        &fixture.endpoint(),
+        options,
+        &cache,
+    )
+    .unwrap();
+
+    // The second identical search filters the cached listing: no HTTP request,
+    // and the same results in the same order.
+    assert_eq!(fixture.request_count(), requests_after_first);
+    assert_eq!(second, first);
+}
+
+#[test]
+fn github_repository_search_does_not_reuse_another_credentials_listing() {
+    let fixture = GitHubListingFixture::start(vec![
+        GitHubListingPage::ok(&github_repository_page("acme", 3, 97)),
+        GitHubListingPage::ok(&github_repository_page("beta", 2, 98)),
+        GitHubListingPage::ok(&github_repository_page("gamma", 0, 10)),
+    ]);
+    let cache = GitHubRepositoryListingCache::default();
+    let options = GitHubRepositorySearchOptions {
+        page_concurrency: 1,
+        ..GitHubRepositorySearchOptions::default()
+    };
+
+    search_github_repositories_with(
+        "fixture-token",
+        "needle",
+        &fixture.endpoint(),
+        options,
+        &cache,
+    )
+    .unwrap();
+    let requests_for_first_credential = fixture.request_count();
+    assert_eq!(requests_for_first_credential, 3);
+
+    search_github_repositories_with(
+        "other-token",
+        "needle",
+        &fixture.endpoint(),
+        options,
+        &cache,
+    )
+    .unwrap();
+
+    // A second credential lists the account again instead of being served the
+    // first credential's cached listing.
+    assert_eq!(
+        fixture.request_count(),
+        requests_for_first_credential * 2,
+        "a different token must not reuse another credential's listing"
+    );
+    let tokens = fixture
+        .requests()
+        .into_iter()
+        .map(|request| request.token)
+        .collect::<Vec<_>>();
+    assert!(tokens.iter().any(|token| token == "fixture-token"));
+    assert!(tokens.iter().any(|token| token == "other-token"));
+}
+
+#[test]
+fn github_repository_search_keeps_matches_when_a_later_page_fails() {
+    let fixture = GitHubListingFixture::start(vec![
+        GitHubListingPage::ok(&github_repository_page("acme", 2, 98)),
+        GitHubListingPage::failure("500 Internal Server Error", &[]),
+    ]);
+    let cache = GitHubRepositoryListingCache::default();
+    let options = GitHubRepositorySearchOptions {
+        page_concurrency: 1,
+        ..GitHubRepositorySearchOptions::default()
+    };
+
+    let repositories = search_github_repositories_with(
+        "fixture-token",
+        "needle",
+        &fixture.endpoint(),
+        options,
+        &cache,
+    )
+    .unwrap();
+
+    // The first page held two matches, so the failing second page degrades the
+    // result instead of failing the search.
+    assert_eq!(repositories.len(), 2);
+    assert_eq!(fixture.requested_pages(), vec![1, 2]);
+}
+
+#[test]
+fn github_repository_search_reports_rate_limiting_distinctly() {
+    let fixture = GitHubListingFixture::start(vec![GitHubListingPage::failure(
+        "403 Forbidden",
+        &[
+            ("x-ratelimit-remaining", "0".to_owned()),
+            ("x-ratelimit-reset", "0".to_owned()),
+            ("retry-after", "42".to_owned()),
+        ],
+    )]);
+
+    let error =
+        search_github_repositories_at("fixture-token", "needle", &fixture.endpoint()).unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::ProviderRateLimited);
+    assert!(error.retryable);
+    assert_eq!(error.retry_after, Some(Duration::from_secs(42)));
+    assert!(error.message.contains("rate limited"), "{}", error.message);
+    assert!(
+        error.message.contains("retry after 42 s"),
+        "{}",
+        error.message
+    );
+    assert!(!error.message.contains("fixture-token"));
+}
+
+#[test]
+fn github_repository_search_stops_after_the_listing_deadline() {
+    let page_delay = Duration::from_millis(200);
+    let fixture = GitHubListingFixture::start(vec![
+        GitHubListingPage::ok(&github_repository_page("acme", 0, 100)).with_delay(page_delay),
+        GitHubListingPage::ok(&github_repository_page("beta", 0, 100)).with_delay(page_delay),
+    ]);
+    let cache = GitHubRepositoryListingCache::default();
+    let options = GitHubRepositorySearchOptions {
+        page_concurrency: 1,
+        listing_deadline: Duration::from_millis(50),
+        ..GitHubRepositorySearchOptions::default()
+    };
+
+    let repositories = search_github_repositories_with(
+        "fixture-token",
+        "nonexistent",
+        &fixture.endpoint(),
+        options,
+        &cache,
+    )
+    .unwrap();
+
+    // The first page alone outlasted the deadline, so the search returns what
+    // it has instead of reading the rest of the listing.
+    assert!(repositories.is_empty());
+    assert_eq!(fixture.requested_pages(), vec![1]);
+}
+
+#[test]
+fn github_repository_search_rejects_an_unusable_endpoint() {
+    let error = search_github_repositories_at("fixture-token", "needle", "not a url").unwrap_err();
+
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert!(!error.message.contains("fixture-token"));
+}
+
+#[test]
+fn github_repository_search_pages_a_large_listing_concurrently() {
+    let page_delay = Duration::from_millis(150);
+    let mut pages =
+        vec![GitHubListingPage::ok(&github_repository_page("acme", 0, 100)).with_delay(page_delay)];
+    for _ in 2..=10 {
+        pages.push(
+            GitHubListingPage::ok(&github_repository_page("acme", 0, 100)).with_delay(page_delay),
+        );
+    }
+    // The last page is short, which ends the listing.
+    pages
+        .push(GitHubListingPage::ok(&github_repository_page("acme", 0, 50)).with_delay(page_delay));
+    let fixture = GitHubListingFixture::start(pages);
+
+    let started = Instant::now();
+    let repositories =
+        search_github_repositories_at("fixture-token", "nonexistent", &fixture.endpoint()).unwrap();
+    let elapsed = started.elapsed();
+
+    // Every page had to be read, and the 10 pages fit in one first page plus
+    // three concurrent batches of four. Reading them one at a time would take
+    // at least the ten page delays.
+    assert!(repositories.is_empty());
+    assert_eq!(fixture.request_count(), 10);
+    assert!(
+        elapsed < page_delay * 6,
+        "10 pages took {elapsed:?}, so they were not fetched concurrently"
+    );
+}
+
+#[test]
 fn github_account_identity_uses_the_verified_noreply_address() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();

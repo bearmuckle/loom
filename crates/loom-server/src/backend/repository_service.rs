@@ -11,6 +11,9 @@ pub(crate) struct RepositoryService {
     records: Mutex<BTreeMap<AgentSessionId, BTreeMap<RepositoryId, SessionRepository>>>,
     vcs: Mutex<BTreeMap<(AgentSessionId, RepositoryId), GitService>>,
     cache: Mutex<RepositoryCache>,
+    /// The short-lived per-credential GitHub repository listings the source
+    /// picker's search filters, kept beside the other repository caches.
+    github_repository_listings: GitHubRepositoryListingCache,
 }
 
 /// A repository mirror cached on this worker node, keyed by its normalized
@@ -165,7 +168,14 @@ impl RepositoryService {
             records: Mutex::new(BTreeMap::new()),
             vcs: Mutex::new(BTreeMap::new()),
             cache: Mutex::new(RepositoryCache::load(clone_cache_base)),
+            github_repository_listings: GitHubRepositoryListingCache::default(),
         }
+    }
+
+    /// The cache of the listings the source picker's GitHub repository search
+    /// filters.
+    pub(crate) fn github_repository_listings(&self) -> &GitHubRepositoryListingCache {
+        &self.github_repository_listings
     }
 
     pub(crate) fn records(

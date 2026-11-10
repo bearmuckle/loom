@@ -132,7 +132,7 @@ const MAX_NONTERMINAL_PROJECT_TASKS: usize = 50;
 /// cannot grow the store without bound.
 const MAX_PERSON_TOKENS: usize = 8;
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct GitHubApiRepository {
     full_name: String,
     description: Option<String>,

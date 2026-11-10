@@ -44,8 +44,7 @@ fn mirror_satisfies_revision(mirror: &Path, revision: Option<&str>) -> bool {
 
 impl InProcessConnection {
     pub(crate) fn search_github_repositories(&self, query: &str) -> Result<ServerResponse> {
-        let token = self.backend.providers.github_account_token()?;
-        let repositories = search_github_repositories(&token, query)?;
+        let repositories = self.backend.search_github_repositories(query)?;
         Ok(ServerResponse::Repository(
             RepositoryResponse::GitHubRepositories { repositories },
         ))
