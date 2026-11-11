@@ -1,4 +1,5 @@
 use super::*;
+use crate::connection::project::child::pause::run_failure_reason;
 
 impl InProcessBackend {
     pub(crate) fn restore_session_filesystem(
@@ -516,6 +517,7 @@ impl InProcessBackend {
                     })?;
                     execution.state = AgentRunState::Paused;
                     let mut attempts = persistence.load_run_attempts(run_id)?;
+                    let attempt_count = attempts.len();
                     let attempt = attempts
                         .iter_mut()
                         .find(|attempt| attempt.id == snapshot.attempt_id)
@@ -528,6 +530,36 @@ impl InProcessBackend {
                         })?;
                     attempt.state = AgentRunState::Paused;
                     attempt.completed_at = None;
+                    // A run the restore parks has no worker to report its stop,
+                    // so its reason would reach the tools but never the log.
+                    // The evidence here is the durable state the tools read, so
+                    // the two lines agree; the tool call it stopped at is the
+                    // failed step the execution state recorded, if any.
+                    let parked = ProjectChildParkEvidence {
+                        run_state: snapshot.state,
+                        failure: snapshot
+                            .summary
+                            .as_deref()
+                            .and_then(run_failure_reason)
+                            .map(str::to_owned),
+                        usage: usage.clone(),
+                        limits: None,
+                        pending_approval: execution.pending_approval.clone(),
+                        pending_input: execution.pending_input.clone(),
+                        pending_question: None,
+                        last_failed_call: execution.last_failed_call.clone(),
+                        attempts: u32::try_from(attempt_count).unwrap_or(u32::MAX),
+                    };
+                    log_parked_run(
+                        run_id,
+                        snapshot.session_id,
+                        &parked,
+                        parked_run_last_tool_call(
+                            parked.last_failed_call.as_ref(),
+                            parked.pending_approval.as_ref(),
+                            None,
+                        ),
+                    );
                     summary.snapshot = snapshot.clone();
                     summary.attempts = Some(attempts);
                     summary.execution_state = execution_state;
@@ -663,11 +695,30 @@ impl InProcessBackend {
                     false,
                 ));
             }
+            let state_before_recovery = runtime.snapshot().state;
             let mut recovery_events = runtime.recover_after_restart()?;
             if let Some(reason) = recovery_reason {
                 recovery_events.push(AgentEvent::RecoveryRequired { run_id, reason });
             }
+            let recovered_state = runtime.snapshot().state;
             let handle = self.register_runtime(runtime);
+            // A run the restore re-parks has no worker to report its stop, so
+            // its reason would reach the tools but never the log.
+            if state_before_recovery != AgentRunState::Paused
+                && recovered_state == AgentRunState::Paused
+            {
+                let restored = handle.state();
+                log_parked_run(
+                    run_id,
+                    session.id,
+                    &ProjectChildParkEvidence::from_runtime_state(&restored),
+                    parked_run_last_tool_call(
+                        restored.last_failed_call.as_ref(),
+                        restored.pending_approval.as_ref(),
+                        restored.pending_tool_execution.as_ref(),
+                    ),
+                );
+            }
             if !recovery_events.is_empty()
                 && let Some(summary) = run_summaries.get_mut(&run_id)
             {

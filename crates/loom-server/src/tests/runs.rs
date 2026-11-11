@@ -5,6 +5,34 @@ use super::support::*;
 use super::*;
 
 #[test]
+fn a_parked_run_names_the_tool_call_it_stopped_at() {
+    use crate::backend::parked_run_last_tool_call;
+
+    let call = |name: &str| loom_model::ToolCall {
+        id: loom_core::ToolCallId::new(),
+        name: name.to_owned(),
+        arguments: serde_json::json!({}),
+    };
+    let failed = call("run_command");
+    let approval = call("apply_patch");
+    let execution = call("read_file");
+    assert_eq!(parked_run_last_tool_call(None, None, None), None);
+    assert_eq!(
+        parked_run_last_tool_call(Some(&failed), Some(&approval), Some(&execution)),
+        Some("run_command"),
+        "the failed step is the step the run stopped at"
+    );
+    assert_eq!(
+        parked_run_last_tool_call(None, Some(&approval), Some(&execution)),
+        Some("apply_patch")
+    );
+    assert_eq!(
+        parked_run_last_tool_call(None, None, Some(&execution)),
+        Some("read_file")
+    );
+}
+
+#[test]
 fn resumable_runs_without_pending_tool_intent_are_deferred_on_restore() {
     for state in [
         AgentRunState::Planning,

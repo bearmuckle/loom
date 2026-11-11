@@ -333,23 +333,16 @@ impl InProcessBackend {
                                 // stopped at, so reading the log and reading the
                                 // manager's tool output agree.
                                 let state = task_handle.state();
-                                if let Some(reason) = project_child_pause_reason(
+                                log_parked_run(
+                                    run_id,
+                                    task_handle.session_id,
                                     &ProjectChildParkEvidence::from_runtime_state(&state),
-                                ) {
-                                    let last_tool_call = state
-                                        .last_failed_call
-                                        .as_ref()
-                                        .or(state.pending_approval.as_ref())
-                                        .or(state.pending_tool_execution.as_ref())
-                                        .map(|call| call.name.as_str())
-                                        .unwrap_or("none");
-                                    log::info!(
-                                        "run {run_id} in session {} stopped in state {:?}: {}; last tool call: {last_tool_call}",
-                                        task_handle.session_id,
-                                        state.run.state,
-                                        reason.summary()
-                                    );
-                                }
+                                    parked_run_last_tool_call(
+                                        state.last_failed_call.as_ref(),
+                                        state.pending_approval.as_ref(),
+                                        state.pending_tool_execution.as_ref(),
+                                    ),
+                                );
                                 // A direction queued as the run stopped (for
                                 // example while it was asking for input) is
                                 // delivered here so it is not stranded until
@@ -416,5 +409,44 @@ impl InProcessBackend {
         );
         *handle.worker.lock().unwrap_or_else(PoisonError::into_inner) = Some(worker);
         Ok(())
+    }
+}
+
+/// The tool call a parked run names, or `None` when it has no call to name.
+///
+/// The failed step is named first because it is the step the run stopped at; a
+/// run waiting on an approval, or on a tool execution that was interrupted,
+/// names that call instead.
+pub(crate) fn parked_run_last_tool_call<'a>(
+    last_failed_call: Option<&'a ToolCall>,
+    pending_approval: Option<&'a ToolCall>,
+    pending_tool_execution: Option<&'a ToolCall>,
+) -> Option<&'a str> {
+    last_failed_call
+        .or(pending_approval)
+        .or(pending_tool_execution)
+        .map(|call| call.name.as_str())
+}
+
+/// Logs one line for a run that is parked, naming the run, its session, the
+/// state it is parked in, the reason the project tools report, and the last tool
+/// call.
+///
+/// The run worker's stop path and the backend restore path both park runs; one
+/// helper keeps their lines identical, so reading the log and reading the
+/// manager's tool output agree. A run with no tool call to name logs `none`.
+pub(crate) fn log_parked_run(
+    run_id: loom_core::RunId,
+    session_id: AgentSessionId,
+    evidence: &ProjectChildParkEvidence,
+    last_tool_call: Option<&str>,
+) {
+    if let Some(reason) = project_child_pause_reason(evidence) {
+        log::info!(
+            "run {run_id} in session {session_id} stopped in state {:?}: {}; last tool call: {}",
+            evidence.run_state,
+            reason.summary(),
+            last_tool_call.unwrap_or("none")
+        );
     }
 }
