@@ -618,7 +618,11 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
                 },
                 context: ContextAssemblyOptions {
                     context_window: Some(8_192),
-                    max_input_tokens: Some(4_096),
+                    // A project manager's tool surface (delegation, review,
+                    // control, and the exact child file read) leaves too little
+                    // of a 4096-token input budget for a second exchange, so the
+                    // test pins a budget that still leaves the window bounded.
+                    max_input_tokens: Some(6_000),
                     reserved_output_tokens: Some(1_024),
                 },
             },

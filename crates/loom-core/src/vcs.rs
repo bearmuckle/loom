@@ -80,6 +80,62 @@ pub enum GitDiffLineKind {
     Removed,
 }
 
+/// How one path differs between a base revision and a checkout's working
+/// tree, as a review summary reports it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitRevisionChangeKind {
+    New,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+}
+
+/// One path of a reviewed change, without its patch body.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitRevisionFileStat {
+    pub path: String,
+    /// The path the file had before a rename or copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_path: Option<String>,
+    pub change: GitRevisionChangeKind,
+    #[serde(default)]
+    pub additions: u32,
+    #[serde(default)]
+    pub deletions: u32,
+    #[serde(default)]
+    pub binary: bool,
+}
+
+/// The rendered patch of one path of a reviewed change.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitRevisionFileDiff {
+    pub path: String,
+    /// The patch text, or a one-line notice for a binary file. A patch this
+    /// render cut short ends with a line saying so.
+    pub patch: String,
+    #[serde(default)]
+    pub binary: bool,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub additions: u32,
+    #[serde(default)]
+    pub deletions: u32,
+}
+
+/// A bounded patch of a reviewed change.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitRevisionDiff {
+    /// The paths whose patch is included, in the order the render visited them.
+    pub files: Vec<GitRevisionFileDiff>,
+    /// Paths whose patch was cut short by the byte budget.
+    pub truncated_paths: Vec<String>,
+    /// Paths the render did not include at all because the budget was spent.
+    pub omitted_paths: Vec<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GitBranch {
     pub name: String,

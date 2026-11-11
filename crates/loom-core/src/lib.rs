@@ -95,7 +95,8 @@ pub use title::{
 };
 pub use vcs::{
     GitBranch, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,
-    GitFileStatusKind, GitRepositoryStatus,
+    GitFileStatusKind, GitRepositoryStatus, GitRevisionChangeKind, GitRevisionDiff,
+    GitRevisionFileDiff, GitRevisionFileStat,
 };
 pub use version::{CURRENT_PROTOCOL_VERSION, ProtocolVersion};
 pub use workspace::{WorkspaceManagerState, WorkspaceRecord};

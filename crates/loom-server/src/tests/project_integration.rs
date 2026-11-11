@@ -2587,6 +2587,345 @@ fn listing_a_code_child_restores_a_lazy_filesystem_without_deadlocking() {
     fixture.shutdown();
 }
 
+/// A manager's review tools for one code child fixture: the review grant
+/// carries `review_project_child` and `read_child_file`.
+fn reviewing_code_child_manager_tools(fixture: &ProjectCodeChildFixture) -> ToolExecutor {
+    let extension = fixture
+        .backend
+        .project_agent_tools(
+            fixture.root_id,
+            ModelId::new("deterministic/demo"),
+            ProjectAgentToolGrants {
+                review: true,
+                ..ProjectAgentToolGrants::default()
+            },
+        )
+        .unwrap()
+        .expect("manager review tools");
+    ToolExecutor::new_with_workspace(
+        fixture
+            .connection
+            .session_filesystem(fixture.root_id)
+            .unwrap(),
+    )
+    .with_extension(extension)
+}
+
+#[test]
+fn reviewing_a_large_addition_summarises_it_within_a_budget() {
+    let fixture = project_code_child_fixture();
+    let module = (1..=3_000)
+        .map(|line| format!("pub fn line_{line}() -> usize {{ {line} }}\n"))
+        .collect::<String>();
+    fs::create_dir_all(fixture.child_checkout.join("src")).unwrap();
+    commit_file(
+        &fixture.child_checkout,
+        "src/large_module.rs",
+        &module,
+        "feat: add a large module",
+    );
+    complete_project_code_child(&fixture);
+    let tools = reviewing_code_child_manager_tools(&fixture);
+
+    // The default review is a summary, so a three thousand line addition costs
+    // its path, its counts, and its commit name instead of its whole patch.
+    let summary = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "review_project_child".to_owned(),
+        arguments: serde_json::json!({"task_id": fixture.task_id}),
+    });
+    assert!(summary.success, "{}", summary.output);
+    assert!(
+        summary.output.len() < DEFAULT_REVIEW_MAX_BYTES,
+        "a stat review of a 3000 line addition must stay under the {} byte budget, got {} bytes",
+        DEFAULT_REVIEW_MAX_BYTES,
+        summary.output.len()
+    );
+    assert!(
+        !summary.output.contains("pub fn line_1()"),
+        "a stat review must not carry patch bodies"
+    );
+    let summary: serde_json::Value = serde_json::from_str(&summary.output).unwrap();
+    let data = &summary["data"];
+    assert_eq!(data["mode"], serde_json::json!("stat"));
+    assert!(data.get("diff").is_none(), "no patch body is rendered");
+    assert_eq!(data["truncated"], serde_json::json!(false));
+    assert_eq!(data["totals"]["files"], serde_json::json!(1));
+    assert_eq!(data["totals"]["additions"], serde_json::json!(3_000));
+    assert_eq!(data["totals"]["commits"], serde_json::json!(1));
+    let files = data["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"], serde_json::json!("src/large_module.rs"));
+    assert_eq!(files[0]["change"], serde_json::json!("new"));
+    assert_eq!(files[0]["additions"], serde_json::json!(3_000));
+    assert_eq!(files[0]["deletions"], serde_json::json!(0));
+    let commits = data["commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(
+        commits[0]["subject"],
+        serde_json::json!("feat: add a large module")
+    );
+    assert_eq!(
+        commits[0]["revision"],
+        serde_json::json!(data["head_revision"].as_str().unwrap()),
+        "the summary names the commit the review sees"
+    );
+    assert_eq!(
+        commits[0]["patch_id"].as_str().map(str::len),
+        Some(16),
+        "each commit reports its patch identity: {summary}"
+    );
+
+    // A diff review of the same change is bounded per file and in total, and
+    // the cut is named in the patch and in the machine-readable lists.
+    let patch = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "review_project_child".to_owned(),
+        arguments: serde_json::json!({
+            "task_id": fixture.task_id,
+            "mode": "diff",
+            "paths": ["src/large_module.rs"],
+            "max_bytes": 512,
+            "context": 0,
+        }),
+    });
+    assert!(patch.success, "{}", patch.output);
+    let patch: serde_json::Value = serde_json::from_str(&patch.output).unwrap();
+    let data = &patch["data"];
+    assert_eq!(data["mode"], serde_json::json!("diff"));
+    assert_eq!(data["context"], serde_json::json!(0));
+    assert_eq!(data["max_bytes"], serde_json::json!(512));
+    let files = data["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"], serde_json::json!("src/large_module.rs"));
+    assert_eq!(files[0]["truncated"], serde_json::json!(true));
+    let text = files[0]["patch"].as_str().unwrap();
+    assert!(
+        text.contains("[loom: patch truncated after "),
+        "the cut must be marked in the patch itself: {text}"
+    );
+    assert!(
+        text.len() <= 512 + 256,
+        "the per-file budget bounds the patch, got {} bytes",
+        text.len()
+    );
+    assert_eq!(
+        data["truncated_files"],
+        serde_json::json!(["src/large_module.rs"])
+    );
+    assert_eq!(data["omitted_files"], serde_json::json!([]));
+    assert_eq!(data["truncated"], serde_json::json!(true));
+    assert!(
+        data["patch_bytes"].as_u64().unwrap() <= 512 + 256,
+        "the returned patch stays near the per-file budget"
+    );
+    assert!(
+        data["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("read_child_file")),
+        "a bounded review points the reader at the exact read"
+    );
+
+    // A path filter limits the render to the named files, and an unchanged
+    // path renders nothing at all.
+    let filtered = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "review_project_child".to_owned(),
+        arguments: serde_json::json!({
+            "task_id": fixture.task_id,
+            "mode": "diff",
+            "paths": ["README.md"],
+        }),
+    });
+    assert!(filtered.success, "{}", filtered.output);
+    let filtered: serde_json::Value = serde_json::from_str(&filtered.output).unwrap();
+    assert_eq!(
+        filtered["data"]["files"].as_array().map(Vec::len),
+        Some(0),
+        "the path filter keeps the unchanged file out: {filtered}"
+    );
+    assert_eq!(filtered["data"]["truncated"], serde_json::json!(false));
+    fixture.shutdown();
+}
+
+#[test]
+fn reviewing_a_rename_and_a_deletion_names_each_change_without_patches() {
+    let fixture = project_code_child_fixture();
+    // The parent advances so the reviewed base holds a file the child removes.
+    // The child worktree shares the parent repository's object store, so it can
+    // start from that revision once it is recorded as the base.
+    commit_file(
+        fixture.parent_git.root(),
+        "remove.txt",
+        "gone\n",
+        "parent file to remove",
+    );
+    let parent_head = fixture.parent_git.status().unwrap().head.unwrap();
+    git_in(
+        &fixture.child_checkout,
+        &["reset", "-q", "--hard", &parent_head],
+    );
+    let mut worktree = integrated_worktree(&fixture);
+    worktree.base_revision = parent_head;
+    fixture
+        .connection
+        .save_project_worktree_state(&worktree)
+        .unwrap();
+    fs::create_dir_all(fixture.child_checkout.join("docs")).unwrap();
+    git_in(
+        &fixture.child_checkout,
+        &["mv", "README.md", "docs/README.md"],
+    );
+    git_in(&fixture.child_checkout, &["rm", "-q", "remove.txt"]);
+    commit_file(
+        &fixture.child_checkout,
+        "docs/notes.txt",
+        "notes\n",
+        "docs: keep notes beside the readme",
+    );
+    complete_project_code_child(&fixture);
+    let tools = reviewing_code_child_manager_tools(&fixture);
+
+    let review = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "review_project_child".to_owned(),
+        arguments: serde_json::json!({"task_id": fixture.task_id}),
+    });
+    assert!(review.success, "{}", review.output);
+    let output = review.output.clone();
+    let review: serde_json::Value = serde_json::from_str(&review.output).unwrap();
+    let data = &review["data"];
+    let file = |path: &str| {
+        data["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == serde_json::json!(path))
+            .unwrap_or_else(|| panic!("the summary should name {path}: {review}"))
+            .clone()
+    };
+    let renamed = file("docs/README.md");
+    assert_eq!(renamed["change"], serde_json::json!("renamed"));
+    assert_eq!(renamed["original_path"], serde_json::json!("README.md"));
+    assert_eq!(renamed["additions"], serde_json::json!(0));
+    assert_eq!(renamed["deletions"], serde_json::json!(0));
+    let deleted = file("remove.txt");
+    assert_eq!(deleted["change"], serde_json::json!("deleted"));
+    assert_eq!(deleted["deletions"], serde_json::json!(1));
+    assert_eq!(file("docs/notes.txt")["change"], serde_json::json!("new"));
+    assert!(
+        !output.contains("+notes") && !output.contains("-gone"),
+        "the summary must not carry patch bodies: {review}"
+    );
+    fixture.shutdown();
+}
+
+#[test]
+fn reading_a_child_file_returns_the_exact_range_and_refuses_escapes() {
+    let fixture = project_code_child_fixture();
+    let content = (1..=50)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    fs::create_dir_all(fixture.child_checkout.join("src")).unwrap();
+    commit_file(
+        &fixture.child_checkout,
+        "src/module.rs",
+        &content,
+        "feat: add a module",
+    );
+    complete_project_code_child(&fixture);
+    let tools = reviewing_code_child_manager_tools(&fixture);
+
+    let range = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "read_child_file".to_owned(),
+        arguments: serde_json::json!({
+            "task_id": fixture.task_id,
+            "path": "src/module.rs",
+            "line_start": 10,
+            "line_end": 12,
+        }),
+    });
+    assert!(range.success, "{}", range.output);
+    let range: serde_json::Value = serde_json::from_str(&range.output).unwrap();
+    assert_eq!(range["data"]["path"], serde_json::json!("src/module.rs"));
+    assert_eq!(range["data"]["line_start"], serde_json::json!(10));
+    assert_eq!(range["data"]["line_end"], serde_json::json!(12));
+    assert_eq!(range["data"]["total_lines"], serde_json::json!(50));
+    assert_eq!(range["data"]["truncated"], serde_json::json!(false));
+    assert_eq!(
+        range["data"]["lines"],
+        serde_json::json!([
+            {"line": 10, "text": "line 10"},
+            {"line": 11, "text": "line 11"},
+            {"line": 12, "text": "line 12"},
+        ])
+    );
+
+    // A start near the end still returns the rest of the file, and the default
+    // range is clamped to the file instead of failing past it.
+    let whole = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "read_child_file".to_owned(),
+        arguments: serde_json::json!({
+            "task_id": fixture.task_id,
+            "path": "src/module.rs",
+            "line_start": 45,
+        }),
+    });
+    assert!(whole.success, "{}", whole.output);
+    let whole: serde_json::Value = serde_json::from_str(&whole.output).unwrap();
+    assert_eq!(whole["data"]["line_start"], serde_json::json!(45));
+    assert_eq!(whole["data"]["line_end"], serde_json::json!(50));
+    assert_eq!(whole["data"]["lines"].as_array().map(Vec::len), Some(6));
+
+    // Ranges outside the file, reversed ranges, and ranges over the line cap
+    // are refused instead of silently shortened.
+    for arguments in [
+        serde_json::json!({"task_id": fixture.task_id, "path": "src/module.rs", "line_start": 51}),
+        serde_json::json!({"task_id": fixture.task_id, "path": "src/module.rs", "line_start": 10, "line_end": 5}),
+        serde_json::json!({"task_id": fixture.task_id, "path": "src/module.rs", "line_start": 1, "line_end": 401}),
+    ] {
+        let refused = tools.execute(&ToolCall {
+            id: ToolCallId::new(),
+            name: "read_child_file".to_owned(),
+            arguments,
+        });
+        assert!(
+            !refused.success,
+            "an out-of-range read must be refused: {}",
+            refused.output
+        );
+    }
+
+    // A path that leaves the checkout is refused: absolute, parent traversal,
+    // and a symlink that resolves outside.
+    let outside = fixture.temp.join("outside.txt");
+    fs::write(&outside, "secret\n").unwrap();
+    std::os::unix::fs::symlink(&outside, fixture.child_checkout.join("escape.txt")).unwrap();
+    for path in ["/etc/passwd", "../outside.txt", "escape.txt"] {
+        let refused = tools.execute(&ToolCall {
+            id: ToolCallId::new(),
+            name: "read_child_file".to_owned(),
+            arguments: serde_json::json!({
+                "task_id": fixture.task_id,
+                "path": path,
+            }),
+        });
+        assert!(
+            !refused.success,
+            "'{path}' must not be read: {}",
+            refused.output
+        );
+        assert!(
+            !refused.output.contains("secret"),
+            "'{path}' must not leak the target's content: {}",
+            refused.output
+        );
+    }
+    fixture.shutdown();
+}
+
 /// The manager's child-control, inspection, and integration tools for one code
 /// child fixture, so a test acts through the same surface a manager uses.
 fn code_child_manager_tools(fixture: &ProjectCodeChildFixture) -> ToolExecutor {

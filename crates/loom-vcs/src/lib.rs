@@ -16,7 +16,8 @@ use git2::{
 use loom_core::{ErrorCode, LoomError, Result, Timestamp};
 pub use loom_core::{
     GitBranch, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,
-    GitFileStatusKind, GitRepositoryStatus,
+    GitFileStatusKind, GitRepositoryStatus, GitRevisionChangeKind, GitRevisionDiff,
+    GitRevisionFileDiff, GitRevisionFileStat,
 };
 
 #[derive(Clone, Debug)]
@@ -70,6 +71,9 @@ pub const MAX_CHANGE_CARRY_PATHS: usize = 4096;
 pub struct GitCommitPatch {
     /// The commit the identity belongs to.
     pub revision: String,
+    /// The commit's subject line, so a review can name the work without
+    /// rendering its patch.
+    pub summary: String,
     /// Identity of the change this commit introduces. It is comparable only
     /// with identities computed by this crate, never with a persisted value.
     pub patch_id: u64,
@@ -92,6 +96,20 @@ impl GitChangeCarry {
     pub fn is_carried(&self) -> bool {
         !self.changed_paths.is_empty() && self.mismatched_paths.is_empty()
     }
+}
+
+/// How [`GitService::review_diff_from_revision`] renders a change.
+pub struct GitReviewDiffRequest<'a> {
+    /// Paths to limit the render to. Empty means every changed path.
+    pub paths: &'a [String],
+    /// Unified context lines around each change.
+    pub context: u32,
+    /// Byte budget for one file's patch.
+    pub max_bytes_per_file: usize,
+    /// Byte budget for every included patch together. Each truncation marker
+    /// is one extra line, so the rendered patches stay within this budget and
+    /// the markers add a bounded line per truncated file.
+    pub max_total_bytes: usize,
 }
 
 /// Outcome of [`GitService::create_mirror`].
@@ -668,6 +686,168 @@ impl GitService {
             .diff_tree_to_workdir_with_index(Some(&tree), Some(&mut options))
             .map_err(|error| git_error("could not create Git diff from base revision", error))?;
         render_git_diff(diff, None, false, Some(max_bytes))
+    }
+
+    /// Summarises the change between a base commit and the current index and
+    /// working tree: one entry per path with its kind of change and line
+    /// counts, and no patch body.
+    ///
+    /// The entry order is the render order of the underlying diff, so a caller
+    /// that also renders patches sees the same paths in the same order.
+    pub fn review_stat_from_revision(
+        &self,
+        base_revision: &str,
+    ) -> Result<Vec<GitRevisionFileStat>> {
+        let base_oid = Oid::from_str(base_revision).map_err(|error| {
+            LoomError::invalid_request(format!(
+                "invalid Git base revision '{base_revision}': {error}"
+            ))
+        })?;
+        let repository = self.repository()?;
+        let base = repository
+            .find_commit(base_oid)
+            .map_err(|error| git_error("could not resolve Git stat base commit", error))?;
+        let tree = base
+            .tree()
+            .map_err(|error| git_error("could not read Git stat base tree", error))?;
+        let mut options = DiffOptions::new();
+        options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .show_untracked_content(true);
+        let mut diff = repository
+            .diff_tree_to_workdir_with_index(Some(&tree), Some(&mut options))
+            .map_err(|error| git_error("could not create Git stat from base revision", error))?;
+        detect_review_renames(&mut diff)?;
+        let mut stats = Vec::new();
+        for index in 0..diff.deltas().len() {
+            let Some(delta) = diff.get_delta(index) else {
+                continue;
+            };
+            let Some((path, original_path, change)) = review_change(&delta) else {
+                continue;
+            };
+            let binary = delta.old_file().is_binary() || delta.new_file().is_binary();
+            let (additions, deletions) =
+                match git2::Patch::from_diff(&diff, index).map_err(|error| {
+                    git_error("could not read a Git patch for its line counts", error)
+                })? {
+                    Some(patch) => {
+                        let (_, additions, deletions) = patch
+                            .line_stats()
+                            .map_err(|error| git_error("could not count Git patch lines", error))?;
+                        (
+                            u32::try_from(additions).unwrap_or(u32::MAX),
+                            u32::try_from(deletions).unwrap_or(u32::MAX),
+                        )
+                    }
+                    None => (0, 0),
+                };
+            stats.push(GitRevisionFileStat {
+                path,
+                original_path,
+                change,
+                additions,
+                deletions,
+                binary,
+            });
+        }
+        Ok(stats)
+    }
+
+    /// Renders a bounded patch of the change between a base commit and the
+    /// current index and working tree.
+    ///
+    /// `request.paths` limits the render to those paths, `context` sets the
+    /// unified context, and the two byte budgets cut both one file and the
+    /// whole render at a line boundary. A cut file ends with a line saying it
+    /// was cut and how to read the rest, and the result lists every truncated
+    /// path apart, so no truncation is silent.
+    pub fn review_diff_from_revision(
+        &self,
+        base_revision: &str,
+        request: &GitReviewDiffRequest<'_>,
+    ) -> Result<GitRevisionDiff> {
+        let base_oid = Oid::from_str(base_revision).map_err(|error| {
+            LoomError::invalid_request(format!(
+                "invalid Git base revision '{base_revision}': {error}"
+            ))
+        })?;
+        let repository = self.repository()?;
+        let base = repository
+            .find_commit(base_oid)
+            .map_err(|error| git_error("could not resolve Git review base commit", error))?;
+        let tree = base
+            .tree()
+            .map_err(|error| git_error("could not read Git review base tree", error))?;
+        let mut options = DiffOptions::new();
+        options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .show_untracked_content(true)
+            .context_lines(request.context);
+        for path in request.paths {
+            options.pathspec(self.validate_path(path)?);
+        }
+        let mut diff = repository
+            .diff_tree_to_workdir_with_index(Some(&tree), Some(&mut options))
+            .map_err(|error| git_error("could not create Git review from base revision", error))?;
+        detect_review_renames(&mut diff)?;
+        let mut rendered = GitRevisionDiff::default();
+        let mut used = 0usize;
+        for index in 0..diff.deltas().len() {
+            let Some(delta) = diff.get_delta(index) else {
+                continue;
+            };
+            let Some((path, _, _)) = review_change(&delta) else {
+                continue;
+            };
+            let remaining = request.max_total_bytes.saturating_sub(used);
+            if remaining == 0 {
+                rendered.omitted_paths.push(path);
+                continue;
+            }
+            let binary = delta.old_file().is_binary() || delta.new_file().is_binary();
+            let patch = git2::Patch::from_diff(&diff, index)
+                .map_err(|error| git_error("could not read a Git patch for review", error))?;
+            let (additions, deletions, full) = match patch {
+                Some(mut patch) => {
+                    let (_, additions, deletions) = patch
+                        .line_stats()
+                        .map_err(|error| git_error("could not count Git patch lines", error))?;
+                    let buffer = patch
+                        .to_buf()
+                        .map_err(|error| git_error("could not render a Git patch", error))?;
+                    (
+                        u32::try_from(additions).unwrap_or(u32::MAX),
+                        u32::try_from(deletions).unwrap_or(u32::MAX),
+                        String::from_utf8_lossy(buffer.as_ref()).into_owned(),
+                    )
+                }
+                None => (
+                    0,
+                    0,
+                    format!(
+                        "Binary file {path} differs; read_child_file cannot show its content\n"
+                    ),
+                ),
+            };
+            let limit = request.max_bytes_per_file.min(remaining);
+            let (text, truncated) = bound_patch_text(&full, limit, &path);
+            if truncated {
+                rendered.truncated_paths.push(path.clone());
+            }
+            used += text.len();
+            rendered.files.push(GitRevisionFileDiff {
+                path,
+                patch: text,
+                binary,
+                truncated,
+                additions,
+                deletions,
+            });
+        }
+        Ok(rendered)
     }
 
     pub fn branches(&self) -> Result<Vec<GitBranch>> {
@@ -1383,6 +1563,12 @@ impl GitService {
                 .map_err(|error| git_error("could not read a walked commit", error))?;
             commits.push(GitCommitPatch {
                 revision: revision.to_string(),
+                summary: commit
+                    .summary()
+                    .ok()
+                    .flatten()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| commit.id().to_string()),
                 patch_id: commit_patch_id(&repository, &commit)?,
             });
             if commits.len() > MAX_PATCH_ID_COMMITS {
@@ -2314,6 +2500,70 @@ impl PatchIdHasher {
     fn finish(self) -> u64 {
         self.0
     }
+}
+
+/// Detects renames and copies in a review diff, so a moved path is reported as
+/// one rename instead of a deletion plus an addition.
+fn detect_review_renames(diff: &mut git2::Diff<'_>) -> Result<()> {
+    let mut options = git2::DiffFindOptions::new();
+    options.renames(true).copies(true);
+    diff.find_similar(Some(&mut options))
+        .map_err(|error| git_error("could not detect renames in a Git review", error))
+}
+
+/// The reviewed path, the path it came from, and the kind of change.
+fn review_change(
+    delta: &git2::DiffDelta<'_>,
+) -> Option<(String, Option<String>, GitRevisionChangeKind)> {
+    match delta.status() {
+        git2::Delta::Deleted => {
+            path_of(&delta.old_file()).map(|path| (path, None, GitRevisionChangeKind::Deleted))
+        }
+        git2::Delta::Renamed | git2::Delta::Copied => path_of(&delta.new_file()).map(|path| {
+            let original = path_of(&delta.old_file()).filter(|original| *original != path);
+            let change = if delta.status() == git2::Delta::Renamed {
+                GitRevisionChangeKind::Renamed
+            } else {
+                GitRevisionChangeKind::Copied
+            };
+            (path, original, change)
+        }),
+        git2::Delta::Added | git2::Delta::Untracked => {
+            path_of(&delta.new_file()).map(|path| (path, None, GitRevisionChangeKind::New))
+        }
+        git2::Delta::Unmodified
+        | git2::Delta::Ignored
+        | git2::Delta::Conflicted
+        | git2::Delta::Typechange
+        | git2::Delta::Unreadable
+        | git2::Delta::Modified => {
+            path_of(&delta.new_file()).map(|path| (path, None, GitRevisionChangeKind::Modified))
+        }
+    }
+}
+
+fn path_of(file: &git2::DiffFile<'_>) -> Option<String> {
+    file.path()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+}
+
+/// Cuts a patch at a whole line within `limit` bytes and names the cut, so a
+/// reader cannot mistake a short patch for the whole change.
+fn bound_patch_text(patch: &str, limit: usize, path: &str) -> (String, bool) {
+    if patch.len() <= limit {
+        return (patch.to_owned(), false);
+    }
+    let mut end = limit.min(patch.len());
+    while end > 0 && !patch.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = patch[..end].rfind('\n').map_or(0, |index| index + 1);
+    let mut text = patch[..cut].to_owned();
+    text.push_str(&format!(
+        "... [loom: patch truncated after {cut} of {} bytes; read the rest with read_child_file(task_id, {path:?}, line_start, line_end)]\n",
+        patch.len()
+    ));
+    (text, true)
 }
 
 fn render_git_diff(
@@ -4497,6 +4747,171 @@ mod tests {
     }
 
     #[test]
+    fn review_stat_names_every_change_without_patch_bodies() {
+        let (git, root) = repository();
+        fs::write(root.join("removed.txt"), "gone\n").unwrap();
+        run(&root, &["add", "--", "removed.txt"]);
+        run(&root, &["commit", "-qm", "file to remove later"]);
+        let base = git.status().unwrap().head.unwrap();
+
+        fs::remove_file(root.join("removed.txt")).unwrap();
+        fs::write(root.join("added.txt"), "one\ntwo\nthree\n").unwrap();
+        fs::create_dir(root.join("moved")).unwrap();
+        run(&root, &["mv", "README.md", "moved/README.md"]);
+        fs::write(root.join("untracked.txt"), "untracked\n").unwrap();
+        run(
+            &root,
+            &["add", "--", "removed.txt", "added.txt", "moved/README.md"],
+        );
+        run(&root, &["commit", "-qm", "remove, add, and move"]);
+        // The review covers the working tree, so an uncommitted line counts.
+        fs::write(root.join("added.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+
+        let stats = git.review_stat_from_revision(&base).unwrap();
+        let find = |path: &str| {
+            stats
+                .iter()
+                .find(|stat| stat.path == path)
+                .unwrap_or_else(|| panic!("review stat should name {path}: {stats:?}"))
+        };
+        let added = find("added.txt");
+        assert_eq!(added.change, GitRevisionChangeKind::New);
+        assert_eq!((added.additions, added.deletions), (4, 0));
+        let removed = find("removed.txt");
+        assert_eq!(removed.change, GitRevisionChangeKind::Deleted);
+        assert_eq!(removed.deletions, 1);
+        let moved = find("moved/README.md");
+        assert_eq!(moved.change, GitRevisionChangeKind::Renamed);
+        assert_eq!(moved.original_path.as_deref(), Some("README.md"));
+        assert_eq!(find("untracked.txt").change, GitRevisionChangeKind::New);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn review_diff_honours_paths_context_and_byte_budgets() {
+        let (git, root) = repository();
+        let lines = (1..=10)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        fs::write(root.join("lines.txt"), &lines).unwrap();
+        run(&root, &["add", "--", "lines.txt"]);
+        run(&root, &["commit", "-qm", "lines to change"]);
+        let base = git.status().unwrap().head.unwrap();
+        fs::write(
+            root.join("lines.txt"),
+            lines.replace("line 5\n", "changed line 5\n"),
+        )
+        .unwrap();
+        fs::write(root.join("other.txt"), "other\n").unwrap();
+        fs::write(root.join("untracked.txt"), "untracked\n").unwrap();
+
+        let only_lines = vec!["lines.txt".to_owned()];
+        let filtered = git
+            .review_diff_from_revision(
+                &base,
+                &GitReviewDiffRequest {
+                    paths: &only_lines,
+                    context: 0,
+                    max_bytes_per_file: 4096,
+                    max_total_bytes: 64 * 1024,
+                },
+            )
+            .unwrap();
+        assert_eq!(filtered.files.len(), 1);
+        assert_eq!(filtered.files[0].path, "lines.txt");
+        assert_eq!(
+            (filtered.files[0].additions, filtered.files[0].deletions),
+            (1, 1)
+        );
+        assert!(filtered.files[0].patch.contains("+changed line 5"));
+        assert!(
+            !filtered.files[0].patch.contains("\n line 4"),
+            "zero context lines carry no unchanged neighbour: {}",
+            filtered.files[0].patch
+        );
+        assert!(!filtered.files[0].patch.contains("untracked"));
+        assert!(filtered.truncated_paths.is_empty());
+        assert!(filtered.omitted_paths.is_empty());
+
+        // Context lines around the change are what the caller asks for.
+        let with_context = git
+            .review_diff_from_revision(
+                &base,
+                &GitReviewDiffRequest {
+                    paths: &only_lines,
+                    context: 2,
+                    max_bytes_per_file: 4096,
+                    max_total_bytes: 64 * 1024,
+                },
+            )
+            .unwrap();
+        assert!(with_context.files[0].patch.contains("\n line 4"));
+        assert!(with_context.files[0].patch.contains("\n line 6"));
+
+        // A per-file budget cuts at a line boundary and names the cut.
+        let everything = Vec::new();
+        let bounded = git
+            .review_diff_from_revision(
+                &base,
+                &GitReviewDiffRequest {
+                    paths: &everything,
+                    context: 0,
+                    max_bytes_per_file: 120,
+                    max_total_bytes: 64 * 1024,
+                },
+            )
+            .unwrap();
+        let lines_file = bounded
+            .files
+            .iter()
+            .find(|file| file.path == "lines.txt")
+            .expect("a bounded render still names every path it visited");
+        assert!(lines_file.truncated);
+        assert!(
+            lines_file
+                .patch
+                .ends_with("read_child_file(task_id, \"lines.txt\", line_start, line_end)]\n"),
+            "the cut is named where it happened: {}",
+            lines_file.patch
+        );
+        assert!(bounded.truncated_paths.contains(&"lines.txt".to_owned()));
+
+        // A spent total budget omits the files it never reached, and every
+        // path is accounted for either way.
+        let omitted = git
+            .review_diff_from_revision(
+                &base,
+                &GitReviewDiffRequest {
+                    paths: &everything,
+                    context: 0,
+                    max_bytes_per_file: 64,
+                    max_total_bytes: 32,
+                },
+            )
+            .unwrap();
+        assert!(!omitted.omitted_paths.is_empty());
+        assert_eq!(omitted.files.len() + omitted.omitted_paths.len(), 3);
+
+        // A path outside the checkout is refused instead of read.
+        let escaping = vec!["../secret".to_owned()];
+        assert_eq!(
+            git.review_diff_from_revision(
+                &base,
+                &GitReviewDiffRequest {
+                    paths: &escaping,
+                    context: 0,
+                    max_bytes_per_file: 4096,
+                    max_total_bytes: 64 * 1024,
+                },
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::WorkspaceAccessDenied
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn separate_changes_produce_navigable_hunks() {
         let (git, root) = repository();
         let before = (1..=30)
@@ -5190,6 +5605,10 @@ mod tests {
         let reviewed = git.patch_commits_since(&base, &reviewed_tip).unwrap();
         assert_eq!(reviewed.len(), 2);
         assert_eq!(reviewed[0].revision, reviewed_tip, "walks newest first");
+        assert_eq!(
+            reviewed[0].summary, "child follow-up",
+            "a review can name the work without its patch"
+        );
         assert_ne!(
             reviewed[0].patch_id, reviewed[1].patch_id,
             "separate changes have separate identities"

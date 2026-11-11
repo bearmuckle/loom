@@ -228,13 +228,32 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_review_children {
             definitions.push(ToolDefinition {
                 name: "review_project_child".to_owned(),
-                description: "Review a code child by task_id. Returns its checkout status and a bounded diff from the revision where its worktree was created.".to_owned(),
+                description: "Review a code child by task_id. The default `stat` mode returns its checkout status, each changed path with its kind of change and line counts, and its commits with subjects and patch ids, so a large or move-only change is reviewed without its patch. `mode: \"diff\"` returns a bounded patch instead: `paths` limits it, `max_bytes` caps each file, `context` sets context lines, and every truncation is marked. Read the rest of a file with `read_child_file`.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "task_id": {"type": "string", "format": "uuid"}
+                        "task_id": {"type": "string", "format": "uuid"},
+                        "mode": {"type": "string", "enum": ["stat", "diff"], "description": "`stat` (default) or `diff`."},
+                        "paths": {"type": "array", "maxItems": MAX_REVIEW_PATHS, "items": {"type": "string", "minLength": 1, "maxLength": 4096}, "description": "Paths a diff review is limited to."},
+                        "max_bytes": {"type": "integer", "minimum": 1, "maximum": MAX_REVIEW_REQUEST_BYTES, "description": "Byte budget for one file in diff mode."},
+                        "context": {"type": "integer", "minimum": 0, "maximum": MAX_REVIEW_CONTEXT_LINES, "description": "Unified context lines."}
                     },
                     "required": ["task_id"],
+                    "additionalProperties": false
+                }),
+            });
+            definitions.push(ToolDefinition {
+                name: "read_child_file".to_owned(),
+                description: "Read an exact line range of one file in a reviewed code child's checkout, with line numbers. The path must stay inside the checkout and a range is at most 400 lines. Use it for the rest of a file a review truncated.".to_owned(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "task_id": {"type": "string", "format": "uuid"},
+                        "path": {"type": "string", "minLength": 1, "maxLength": 4096, "description": "Path relative to the checkout root."},
+                        "line_start": {"type": "integer", "minimum": 1, "description": "First line, from 1."},
+                        "line_end": {"type": "integer", "minimum": 1, "description": "Last line; defaults to a 400 line range."}
+                    },
+                    "required": ["task_id", "path"],
                     "additionalProperties": false
                 }),
             });
@@ -282,7 +301,9 @@ impl ToolExtension for ProjectAgentTools {
             "control_project_child" if self.can_control_children => {
                 Some(loom_core::ActionKind::Write)
             }
-            "review_project_child" if self.can_review_children => Some(loom_core::ActionKind::Read),
+            "review_project_child" | "read_child_file" if self.can_review_children => {
+                Some(loom_core::ActionKind::Read)
+            }
             "integrate_project_child" if self.can_integrate_children => {
                 Some(loom_core::ActionKind::Write)
             }
@@ -312,6 +333,7 @@ impl ToolExtension for ProjectAgentTools {
                 self.execute_control_child(call)
             }
             "review_project_child" if self.can_review_children => self.execute_review_child(call),
+            "read_child_file" if self.can_review_children => self.execute_read_child_file(call),
             "integrate_project_child" if self.can_integrate_children => {
                 self.execute_integrate_child(call)
             }
@@ -1446,19 +1468,52 @@ impl ProjectAgentTools {
                     );
                 }
             };
+        let max_bytes = match arguments.max_bytes {
+            None => DEFAULT_REVIEW_MAX_BYTES,
+            Some(0) => {
+                return ToolResult::failure(call, "max_bytes must be at least 1 byte");
+            }
+            Some(bytes) => match usize::try_from(bytes) {
+                Ok(bytes) if bytes <= MAX_REVIEW_REQUEST_BYTES => bytes,
+                _ => {
+                    return ToolResult::failure(
+                        call,
+                        format!("max_bytes must be at most {MAX_REVIEW_REQUEST_BYTES} bytes"),
+                    );
+                }
+            },
+        };
+        let context = match arguments.context {
+            None => 0,
+            Some(context) if context > MAX_REVIEW_CONTEXT_LINES => {
+                return ToolResult::failure(
+                    call,
+                    format!("context must be at most {MAX_REVIEW_CONTEXT_LINES} lines"),
+                );
+            }
+            Some(context) => u32::try_from(context).unwrap_or(0),
+        };
+        if arguments.paths.len() > MAX_REVIEW_PATHS {
+            return ToolResult::failure(
+                call,
+                format!("a review may name at most {MAX_REVIEW_PATHS} paths"),
+            );
+        }
         let Some(connection) = self.connection() else {
             return ToolResult::failure(call, "project backend is no longer available");
         };
-        match connection.get_project_child_review(
+        match connection.get_project_child_review_view(
             self.project_id,
             self.session_id,
             arguments.task_id,
+            &ProjectChildReviewRequest {
+                mode: arguments.mode,
+                paths: &arguments.paths,
+                max_bytes,
+                context,
+            },
         ) {
-            Ok(ServerResponse::Project(ProjectResponse::ProjectChildReview {
-                worktree,
-                status,
-                diff,
-            })) => {
+            Ok(view) => {
                 // Include the durable run state and summary so a failed child's
                 // reason is visible alongside its retained (uncommitted) work.
                 let run = connection
@@ -1467,7 +1522,7 @@ impl ProjectAgentTools {
                     .as_ref()
                     .and_then(|persistence| {
                         persistence
-                            .load_delegated_task(worktree.task_id)
+                            .load_delegated_task(view.worktree.task_id)
                             .ok()
                             .flatten()
                             .and_then(|task| {
@@ -1477,16 +1532,7 @@ impl ProjectAgentTools {
                                     .flatten()
                             })
                     });
-                let output = serde_json::json!({
-                    "type": "project_child_review",
-                    "data": {
-                        "worktree": worktree,
-                        "status": status,
-                        "diff": diff,
-                        "run_state": run.as_ref().map(|summary| summary.snapshot.state),
-                        "run_summary": run.as_ref().and_then(|summary| summary.snapshot.summary.clone()),
-                    }
-                });
+                let output = project_child_review_output(&view, max_bytes, context, run.as_ref());
                 ToolResult {
                     tool_call_id: call.id,
                     name: call.name.clone(),
@@ -1495,8 +1541,83 @@ impl ProjectAgentTools {
                         .unwrap_or_else(|error| format!("could not encode child review: {error}")),
                 }
             }
-            Ok(_) => {
-                ToolResult::failure(call, "project child review returned an unexpected result")
+            Err(error) => ToolResult::failure(call, error.message),
+        }
+    }
+
+    pub(crate) fn execute_read_child_file(&self, call: &ToolCall) -> ToolResult {
+        let arguments =
+            match serde_json::from_value::<ReadProjectChildFileArguments>(call.arguments.clone()) {
+                Ok(arguments) => arguments,
+                Err(error) => {
+                    return ToolResult::failure(
+                        call,
+                        format!("invalid child file read arguments: {error}"),
+                    );
+                }
+            };
+        let line_start = match arguments.line_start {
+            None => None,
+            Some(line_start) => match usize::try_from(line_start) {
+                Ok(line_start) => Some(line_start),
+                Err(_) => {
+                    return ToolResult::failure(call, "line_start does not fit this platform");
+                }
+            },
+        };
+        let line_end = match arguments.line_end {
+            None => None,
+            Some(line_end) => match usize::try_from(line_end) {
+                Ok(line_end) => Some(line_end),
+                Err(_) => {
+                    return ToolResult::failure(call, "line_end does not fit this platform");
+                }
+            },
+        };
+        let Some(connection) = self.connection() else {
+            return ToolResult::failure(call, "project backend is no longer available");
+        };
+        match connection.read_project_child_file(
+            self.project_id,
+            self.session_id,
+            arguments.task_id,
+            &arguments.path,
+            line_start,
+            line_end,
+        ) {
+            Ok(slice) => {
+                let lines = slice
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, text)| {
+                        serde_json::json!({
+                            "line": slice.line_start + offset,
+                            "text": text,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let output = serde_json::json!({
+                    "type": "project_child_file",
+                    "data": {
+                        "task_id": arguments.task_id,
+                        "path": slice.path,
+                        "line_start": slice.line_start,
+                        "line_end": slice.line_end,
+                        "total_lines": slice.total_lines,
+                        "truncated": slice.truncated,
+                        "lines": lines,
+                        "note": "Line numbers count from 1. Request the next range with read_child_file when truncated is true or when the file is longer than this range."
+                    }
+                });
+                ToolResult {
+                    tool_call_id: call.id,
+                    name: call.name.clone(),
+                    success: true,
+                    output: serde_json::to_string(&output).unwrap_or_else(|error| {
+                        format!("could not encode child file read: {error}")
+                    }),
+                }
             }
             Err(error) => ToolResult::failure(call, error.message),
         }
@@ -1552,6 +1673,100 @@ impl ProjectAgentTools {
             Err(error) => ToolResult::failure(call, error.message),
         }
     }
+}
+
+/// The tool result body of one child review.
+///
+/// A `stat` review never carries a patch body, and its file and commit listings
+/// are bounded by the caller's budget. A `diff` review carries only the patch
+/// the service already bounded, and names every path whose patch it cut short
+/// or never reached.
+fn project_child_review_output(
+    view: &ProjectChildReviewView,
+    max_bytes: usize,
+    context: u32,
+    run: Option<&loom_persistence::DurableRunSummary>,
+) -> serde_json::Value {
+    let mut data = serde_json::json!({
+        "worktree": &view.worktree,
+        "status": &view.status,
+        "base_revision": view.worktree.base_revision,
+        "head_revision": view.status.head,
+        "run_state": run.map(|summary| summary.snapshot.state),
+        "run_summary": run.and_then(|summary| summary.snapshot.summary.clone()),
+    });
+    if let Some(diff) = view.diff.as_ref() {
+        data["mode"] = serde_json::json!("diff");
+        data["max_bytes"] = serde_json::json!(max_bytes);
+        data["context"] = serde_json::json!(context);
+        data["files"] = serde_json::to_value(&diff.files).unwrap_or_default();
+        data["truncated_files"] = serde_json::json!(diff.truncated_paths);
+        data["omitted_files"] = serde_json::json!(diff.omitted_paths);
+        data["patch_bytes"] = serde_json::json!(
+            diff.files
+                .iter()
+                .map(|file| file.patch.len())
+                .sum::<usize>()
+        );
+        data["truncated"] =
+            serde_json::json!(!diff.truncated_paths.is_empty() || !diff.omitted_paths.is_empty());
+        data["note"] = serde_json::json!(
+            "Each patch is bounded per file and in total. A cut patch ends with a marker line and its path is listed in truncated_files, while omitted_files names every path the budget never reached. Read any part of a file with read_child_file(task_id, path, line_start, line_end)."
+        );
+        return serde_json::json!({"type": "project_child_review", "data": data});
+    }
+    data["mode"] = serde_json::json!("stat");
+    data["totals"] = serde_json::json!({
+        "files": view.stat.len(),
+        "additions": view.stat.iter().map(|stat| u64::from(stat.additions)).sum::<u64>(),
+        "deletions": view.stat.iter().map(|stat| u64::from(stat.deletions)).sum::<u64>(),
+        "commits": view.commits.len(),
+    });
+    // The listings are the only part of a summary that grows with the change,
+    // so the caller's budget trims them and the status stays whole: a review
+    // that named no path would be unable to say what changed at all.
+    data["files"] = serde_json::json!([]);
+    data["commits"] = serde_json::json!([]);
+    let mut remaining = max_bytes.saturating_sub(
+        serde_json::to_string(&data)
+            .map(|encoded| encoded.len())
+            .unwrap_or(0),
+    );
+    let mut files = Vec::new();
+    for stat in &view.stat {
+        let entry = serde_json::to_value(stat).unwrap_or_default();
+        let length = serde_json::to_string(&entry).map_or(0, |encoded| encoded.len() + 1);
+        if length > remaining {
+            break;
+        }
+        remaining -= length;
+        files.push(entry);
+    }
+    let mut commits = Vec::new();
+    for commit in &view.commits {
+        let entry = serde_json::json!({
+            "revision": commit.revision,
+            "subject": commit.summary,
+            "patch_id": format!("{:016x}", commit.patch_id),
+        });
+        let length = serde_json::to_string(&entry).map_or(0, |encoded| encoded.len() + 1);
+        if length > remaining {
+            break;
+        }
+        remaining -= length;
+        commits.push(entry);
+    }
+    let omitted_files = view.stat.len() - files.len();
+    let omitted_commits = view.commits.len() - commits.len();
+    data["files"] = serde_json::json!(files);
+    data["commits"] = serde_json::json!(commits);
+    data["omitted_files"] = serde_json::json!(omitted_files);
+    data["omitted_commits"] = serde_json::json!(omitted_commits);
+    data["truncated"] = serde_json::json!(omitted_files > 0 || omitted_commits > 0);
+    data["note"] = serde_json::json!(
+        "A stat review carries no patch bodies: each path reports its kind of change and line counts, and each commit its subject and patch id. The file and commit listings are bounded by max_bytes, while the worktree record and checkout status are always returned. Pass mode `diff` with paths, max_bytes, and context for a bounded patch, or read an exact line range with read_child_file(task_id, path, line_start, line_end)."
+    );
+    serde_json::json!({"type": "project_child_review", "data": data})
 }
 
 /// The sentence a delegation tool description ends with: how this project

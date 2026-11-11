@@ -200,6 +200,34 @@ const MAX_REVIEW_DIFF_BYTES: usize = 64 * 1024;
 const MAX_REVIEW_FILE_BYTES: usize = 128 * 1024;
 const MAX_RUN_MESSAGE_BYTES: usize = 32 * 1024;
 
+/// Default byte budget of one review: the patch of one file in `diff` mode,
+/// and the file and commit listings in `stat` mode.
+const DEFAULT_REVIEW_MAX_BYTES: usize = 16 * 1024;
+
+/// Most a caller may raise the per-file review budget to. The whole patch a
+/// `diff` review returns is bounded by [`MAX_REVIEW_DIFF_BYTES`] regardless of
+/// how many files it visits.
+const MAX_REVIEW_REQUEST_BYTES: usize = MAX_REVIEW_DIFF_BYTES;
+
+/// Most paths a review may limit its diff to.
+const MAX_REVIEW_PATHS: usize = 128;
+
+/// Most unified context lines a review may ask for.
+const MAX_REVIEW_CONTEXT_LINES: u64 = 10;
+
+/// Most lines one `read_child_file` call returns.
+const MAX_CHILD_FILE_LINES: usize = 400;
+
+/// Byte budget for the text one `read_child_file` call returns, so a range of
+/// very long lines stays bounded too.
+const MAX_CHILD_FILE_BYTES: usize = 32 * 1024;
+
+/// Most characters one line of a `read_child_file` result carries.
+const MAX_CHILD_FILE_LINE_CHARS: usize = 300;
+
+/// Largest file `read_child_file` reads at all.
+const MAX_CHILD_FILE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct EventJournal {
     next_sequence: EventSequence,
@@ -532,6 +560,74 @@ struct ControlProjectChildArguments {
 #[serde(deny_unknown_fields)]
 struct ReviewProjectChildArguments {
     task_id: loom_core::TaskId,
+    /// How to render the reviewed checkout. A review that names no mode asks
+    /// for the summary, which is small whatever the size of the change.
+    #[serde(default)]
+    mode: ProjectChildReviewMode,
+    #[serde(default)]
+    paths: Vec<String>,
+    #[serde(default)]
+    max_bytes: Option<u64>,
+    #[serde(default)]
+    context: Option<u64>,
+}
+
+/// How `review_project_child` renders a reviewed child checkout.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ProjectChildReviewMode {
+    /// Paths, line counts, commit subjects and patch ids, without patch bodies.
+    #[default]
+    Stat,
+    /// A bounded patch that names every truncation.
+    Diff,
+}
+
+/// What one review of a child checkout asks for.
+pub(crate) struct ProjectChildReviewRequest<'a> {
+    pub(crate) mode: ProjectChildReviewMode,
+    /// Paths a `diff` review is limited to; empty means every changed path.
+    pub(crate) paths: &'a [String],
+    /// Byte budget of one file's patch, and of a `stat` review's listings.
+    pub(crate) max_bytes: usize,
+    /// Unified context lines around each change in a `diff` review.
+    pub(crate) context: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadProjectChildFileArguments {
+    task_id: loom_core::TaskId,
+    path: String,
+    #[serde(default)]
+    line_start: Option<u64>,
+    #[serde(default)]
+    line_end: Option<u64>,
+}
+
+/// What one review of a child checkout found.
+///
+/// A `stat` review fills `stat` and `commits` and leaves `diff` empty; a `diff`
+/// review fills `diff` and leaves `stat` and `commits` empty. Either way the
+/// worktree record and checkout status stay, so a caller keeps the context it
+/// had before the review grew a mode.
+pub(crate) struct ProjectChildReviewView {
+    pub(crate) worktree: ProjectWorktreeRecord,
+    pub(crate) status: loom_core::GitRepositoryStatus,
+    pub(crate) stat: Vec<loom_core::GitRevisionFileStat>,
+    pub(crate) commits: Vec<loom_vcs::GitCommitPatch>,
+    pub(crate) diff: Option<loom_core::GitRevisionDiff>,
+}
+
+/// An exact line range of one file in a reviewed child checkout.
+pub(crate) struct ProjectChildFileSlice {
+    pub(crate) path: String,
+    pub(crate) line_start: usize,
+    pub(crate) line_end: usize,
+    pub(crate) total_lines: usize,
+    pub(crate) lines: Vec<String>,
+    /// Whether the byte budget ended the range before its last requested line.
+    pub(crate) truncated: bool,
 }
 
 #[derive(Deserialize)]

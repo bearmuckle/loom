@@ -1,5 +1,14 @@
 use super::*;
 
+/// Cuts one line of a child file to [`MAX_CHILD_FILE_LINE_CHARS`] and marks the
+/// cut, so one minified line cannot dominate a bounded read.
+fn bound_child_file_line(line: &str) -> String {
+    match line.char_indices().nth(MAX_CHILD_FILE_LINE_CHARS) {
+        Some((end, _)) => format!("{}… [loom: line truncated]", &line[..end]),
+        None => line.to_owned(),
+    }
+}
+
 impl InProcessConnection {
     pub(crate) fn load_project_child_worktree(
         &self,
@@ -141,12 +150,24 @@ impl InProcessConnection {
         Ok(service)
     }
 
-    pub(crate) fn get_project_child_review(
+    /// Runs `review` against a code child's opened checkout under the project
+    /// lock, after checking the review grant and keeping the recorded result
+    /// revision current.
+    ///
+    /// Every review path shares this setup, so requesting a summary, a bounded
+    /// patch, or one file's line range can never see a checkout the grant does
+    /// not cover or a record another operation is changing.
+    fn with_reviewed_child_checkout<T>(
         &self,
         project_id: ProjectId,
         manager_session_id: AgentSessionId,
         task_id: loom_core::TaskId,
-    ) -> Result<ServerResponse> {
+        review: impl FnOnce(
+            &ProjectWorktreeRecord,
+            &GitService,
+            &loom_core::GitRepositoryStatus,
+        ) -> Result<T>,
+    ) -> Result<T> {
         let admission = self.backend.admissions.project(project_id)?;
         let _admission = admission.lock().map_err(|_| {
             LoomError::new(
@@ -181,12 +202,32 @@ impl InProcessConnection {
         }
         let service = self.open_project_child_worktree(&worktree)?;
         let status = service.status()?;
-        let diff = service.diff_from_revision(&worktree.base_revision, MAX_REVIEW_DIFF_BYTES)?;
         if worktree.result_revision != status.head {
             worktree.result_revision = status.head.clone();
             worktree.updated_at = Timestamp::now();
             self.save_project_worktree_state(&worktree)?;
         }
+        review(&worktree, &service, &status)
+    }
+
+    pub(crate) fn get_project_child_review(
+        &self,
+        project_id: ProjectId,
+        manager_session_id: AgentSessionId,
+        task_id: loom_core::TaskId,
+    ) -> Result<ServerResponse> {
+        let (worktree, status, diff) = self.with_reviewed_child_checkout(
+            project_id,
+            manager_session_id,
+            task_id,
+            |worktree, service, status| {
+                Ok((
+                    worktree.clone(),
+                    status.clone(),
+                    service.diff_from_revision(&worktree.base_revision, MAX_REVIEW_DIFF_BYTES)?,
+                ))
+            },
+        )?;
         Ok(ServerResponse::Project(
             ProjectResponse::ProjectChildReview {
                 worktree: Box::new(worktree),
@@ -194,6 +235,167 @@ impl InProcessConnection {
                 diff,
             },
         ))
+    }
+
+    /// Reviews a code child as a summary or as a bounded patch.
+    ///
+    /// The summary names every path with its kind of change and line counts,
+    /// together with the commits the child made and the identity of each. The
+    /// patch honours a path filter, a context size, and a per-file byte budget,
+    /// and `MAX_REVIEW_DIFF_BYTES` bounds the whole patch whatever the caller
+    /// asks for, so neither mode can return a change of any size.
+    pub(crate) fn get_project_child_review_view(
+        &self,
+        project_id: ProjectId,
+        manager_session_id: AgentSessionId,
+        task_id: loom_core::TaskId,
+        request: &ProjectChildReviewRequest<'_>,
+    ) -> Result<ProjectChildReviewView> {
+        self.with_reviewed_child_checkout(
+            project_id,
+            manager_session_id,
+            task_id,
+            |worktree, service, status| {
+                let mut view = ProjectChildReviewView {
+                    worktree: worktree.clone(),
+                    status: status.clone(),
+                    stat: Vec::new(),
+                    commits: Vec::new(),
+                    diff: None,
+                };
+                match request.mode {
+                    ProjectChildReviewMode::Stat => {
+                        view.stat = service.review_stat_from_revision(&worktree.base_revision)?;
+                        // A child that has not committed yet has no commits to
+                        // name, and its uncommitted work is the summary.
+                        if let Some(head) = status.head.as_deref()
+                            && head != worktree.base_revision
+                        {
+                            view.commits =
+                                service.patch_commits_since(&worktree.base_revision, head)?;
+                        }
+                    }
+                    ProjectChildReviewMode::Diff => {
+                        view.diff = Some(service.review_diff_from_revision(
+                            &worktree.base_revision,
+                            &loom_vcs::GitReviewDiffRequest {
+                                paths: request.paths,
+                                context: request.context,
+                                max_bytes_per_file: request.max_bytes,
+                                max_total_bytes: MAX_REVIEW_DIFF_BYTES,
+                            },
+                        )?);
+                    }
+                }
+                Ok(view)
+            },
+        )
+    }
+
+    /// Reads an exact line range of one file in a code child's checkout.
+    ///
+    /// The path must stay inside the checkout: an absolute path, a parent
+    /// traversal, and a symlink that resolves outside the checkout are all
+    /// refused. The range must be inside the file, a range longer than
+    /// [`MAX_CHILD_FILE_LINES`] is refused rather than silently shortened, and
+    /// the returned text is bounded by [`MAX_CHILD_FILE_BYTES`].
+    pub(crate) fn read_project_child_file(
+        &self,
+        project_id: ProjectId,
+        manager_session_id: AgentSessionId,
+        task_id: loom_core::TaskId,
+        path: &str,
+        line_start: Option<usize>,
+        line_end: Option<usize>,
+    ) -> Result<ProjectChildFileSlice> {
+        self.with_reviewed_child_checkout(
+            project_id,
+            manager_session_id,
+            task_id,
+            |_worktree, service, _status| {
+                let file = checked_session_path(service.root(), path)?;
+                let metadata = fs::metadata(&file).map_err(|error| {
+                    LoomError::invalid_request(format!(
+                        "could not read '{path}' in the child checkout: {error}"
+                    ))
+                })?;
+                if !metadata.is_file() {
+                    return Err(LoomError::invalid_request(format!(
+                        "'{path}' is not a file in the child checkout"
+                    )));
+                }
+                if metadata.len() > MAX_CHILD_FILE_SIZE_BYTES {
+                    return Err(LoomError::invalid_request(format!(
+                        "'{path}' is {} bytes; read_child_file reads files up to {MAX_CHILD_FILE_SIZE_BYTES} bytes",
+                        metadata.len()
+                    )));
+                }
+                let content = fs::read(&file).map_err(|error| {
+                    LoomError::invalid_request(format!(
+                        "could not read '{path}' in the child checkout: {error}"
+                    ))
+                })?;
+                let content = String::from_utf8(content).map_err(|_| {
+                    LoomError::invalid_request(format!(
+                        "'{path}' is not a UTF-8 text file, so read_child_file cannot show it"
+                    ))
+                })?;
+                let all = content.lines().collect::<Vec<_>>();
+                let total_lines = all.len();
+                if total_lines == 0 {
+                    return Err(LoomError::invalid_request(format!("'{path}' is empty")));
+                }
+                let start = line_start.unwrap_or(1);
+                if start == 0 {
+                    return Err(LoomError::invalid_request(
+                        "line_start must be at least 1",
+                    ));
+                }
+                if start > total_lines {
+                    return Err(LoomError::invalid_request(format!(
+                        "line_start {start} is past the {total_lines} lines of '{path}'"
+                    )));
+                }
+                let end = match line_end {
+                    Some(end) if end < start => {
+                        return Err(LoomError::invalid_request(format!(
+                            "line_end {end} is before line_start {start}"
+                        )));
+                    }
+                    Some(end) => end,
+                    None => start.saturating_add(MAX_CHILD_FILE_LINES - 1),
+                };
+                if end - start + 1 > MAX_CHILD_FILE_LINES {
+                    return Err(LoomError::invalid_request(format!(
+                        "a range of {} lines exceeds the {MAX_CHILD_FILE_LINES} line cap; request a smaller range",
+                        end - start + 1
+                    )));
+                }
+                let end = end.min(total_lines);
+                let mut lines = Vec::new();
+                let mut used = 0usize;
+                let mut truncated = false;
+                for line in &all[start - 1..end] {
+                    let text = bound_child_file_line(line);
+                    if used + text.len() + 1 > MAX_CHILD_FILE_BYTES {
+                        truncated = true;
+                        break;
+                    }
+                    used += text.len() + 1;
+                    lines.push(text);
+                }
+                Ok(ProjectChildFileSlice {
+                    path: path.to_owned(),
+                    line_start: start,
+                    // The last line actually returned, which the byte budget
+                    // can cut short of the requested range.
+                    line_end: start + lines.len().saturating_sub(1),
+                    total_lines,
+                    lines,
+                    truncated,
+                })
+            },
+        )
     }
 
     pub(crate) fn integrate_project_child(
