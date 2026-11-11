@@ -643,7 +643,7 @@ impl InProcessConnection {
                     instructions.push_str(" Review child code with `review_project_child` before deciding whether to integrate.");
                 }
                 if input.options.project_integration_enabled {
-                    instructions.push_str(" Use `integrate_project_child` only after reviewing the completed child, supplying the base revision from review. Integration fast-forwards when possible and otherwise merges the reviewed revision into your clean checkout; you may keep committing while children run, and a conflict is refused with paths preserved.");
+                    instructions.push_str(" Use `integrate_project_child` only after reviewing the completed child, supplying the base revision from review. Integration defaults to a fast-forward and is refused when the child's commits do not descend from your clean checkout; pass strategy `rebase` to replay the child's own commits onto your tip, which keeps history linear. You may keep committing while children run, and a conflict is refused with paths preserved.");
                 }
                 if input.options.project_messaging_enabled {
                     instructions.push_str(" Use `send_project_agent_message` with `target_session_id` to direct a child or reply to questions and blockers; `task_id` is optional context only. Message delivery is durable: a running child reads the message at its next safe model-turn boundary, and a `direction`, `question`, or `answer` also wakes an idle or finished child so it can act instead of leaving the message unread. The result reports whether the message reached a live turn, woke the child, or is still queued, and `list_project_children` reports each child's undelivered inbox messages.");
@@ -698,7 +698,7 @@ impl InProcessConnection {
                         instructions.push_str(" Review a completed code child with `review_project_child` before deciding whether to integrate.");
                     }
                     if input.options.project_integration_enabled {
-                        instructions.push_str(" Use `integrate_project_child` only after review, supplying the base revision from review. Integration fast-forwards when possible and otherwise merges the reviewed revision into your clean checkout, so you may keep committing to your branch while children run.");
+                        instructions.push_str(" Use `integrate_project_child` only after review, supplying the base revision from review. Integration defaults to a fast-forward and is refused when the child's commits do not descend from your clean checkout; pass strategy `rebase` to replay them onto your tip, so you may keep committing to your branch while children run.");
                     }
                     if input.options.project_child_control_enabled {
                         instructions.push_str(" Use `control_project_child` with a direct child's task_id only when lifecycle intervention is needed.");

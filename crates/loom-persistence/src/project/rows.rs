@@ -99,7 +99,7 @@ pub(crate) fn load_project_worktree(
                     worktree_name, branch_name, base_revision, result_revision,
                     integrated_revision, status, error, cleanup_disposition,
                     base_refresh, landed_by, landed_evidence, scope, scope_override,
-                    rebase, created_at, updated_at
+                    rebase, integration, created_at, updated_at
              FROM project_worktrees WHERE task_id=?1",
             [task_id.as_bytes().as_slice()],
             |row| {
@@ -125,8 +125,9 @@ pub(crate) fn load_project_worktree(
                     row.get::<_, Option<String>>(18)?,
                     row.get::<_, Option<String>>(19)?,
                     row.get::<_, Option<String>>(20)?,
-                    row.get::<_, i64>(21)?,
+                    row.get::<_, Option<String>>(21)?,
                     row.get::<_, i64>(22)?,
+                    row.get::<_, i64>(23)?,
                 ))
             },
         )
@@ -156,6 +157,7 @@ pub(crate) fn load_project_worktree(
         scope,
         scope_override,
         rebase,
+        integration,
         created_at,
         updated_at,
     )) = row
@@ -224,6 +226,7 @@ pub(crate) fn load_project_worktree(
         scope: decode_project_child_scope(scope)?,
         scope_override: decode_project_worktree_scope_override(scope_override)?,
         rebase: decode_project_worktree_rebase(rebase)?,
+        integration: decode_project_worktree_integration(integration)?,
         landed_by: landed_by
             .as_deref()
             .map(parse_project_worktree_landed_by)
@@ -816,6 +819,38 @@ pub(crate) fn decode_project_worktree_rebase(
             serde_json::from_str(&payload).map_err(|error| {
                 persistence_error(
                     format!("persisted project worktree rebase is invalid: {error}"),
+                    false,
+                )
+            })
+        })
+        .transpose()
+}
+
+/// Encodes the recorded integration of a reviewed child result as the
+/// versioned JSON payload the worktree row stores.
+pub(crate) fn encode_project_worktree_integration(
+    integration: Option<&ProjectWorktreeIntegration>,
+) -> Result<Option<String>> {
+    integration
+        .map(|integration| {
+            serde_json::to_string(integration).map_err(|error| {
+                persistence_error(
+                    format!("could not encode the project worktree integration: {error}"),
+                    false,
+                )
+            })
+        })
+        .transpose()
+}
+
+pub(crate) fn decode_project_worktree_integration(
+    payload: Option<String>,
+) -> Result<Option<ProjectWorktreeIntegration>> {
+    payload
+        .map(|payload| {
+            serde_json::from_str(&payload).map_err(|error| {
+                persistence_error(
+                    format!("persisted project worktree integration is invalid: {error}"),
                     false,
                 )
             })

@@ -410,12 +410,14 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_integrate_children {
             definitions.push(ToolDefinition {
                 name: "integrate_project_child".to_owned(),
-                description: "Integrate a completed, reviewed code child's committed revision into your clean parent checkout. Supply the base revision reported by review. Integration fast-forwards when possible and otherwise creates a merge commit, so your checkout may have advanced. A conflict is refused with its paths preserved; nothing is force-applied or partially landed. A commit that touches a path outside the file scope its delegation declared is refused and the offending paths are named; pass `allow_out_of_scope` with a `reason` to land it anyway, which records the reason and the accepted paths on the child's record.".to_owned(),
+                description: "Integrate a completed, reviewed code child's committed revision into your clean parent checkout. Supply the base revision reported by review. `strategy` chooses how: `fast-forward` (the default) advances your checkout to the child's own commits and is refused when they do not already descend from your current revision, `rebase` replays the child's own commits onto your current revision — keeping each commit's author and message and creating no merge commit — runs the same bounded checks as control_project_child `rebase`, and then advances to the result, while `merge` creates a merge commit only when the repository's own instructions permit one. A merge is refused by default when the parent checkout's `AGENTS.md` forbids merge commits, and `allow_merge` overrides that rule explicitly. A conflict is refused with its paths preserved and neither checkout modified; nothing is force-applied or partially landed. A commit that touches a path outside the file scope its delegation declared is refused and the offending paths are named; pass `allow_out_of_scope` with a `reason` to land it anyway, which records the reason and the accepted paths on the child's record.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "task_id": {"type": "string", "format": "uuid"},
                         "expected_parent_revision": {"type": "string", "minLength": 1, "maxLength": 64},
+                        "strategy": {"type": "string", "enum": ["fast-forward", "rebase", "merge"], "description": "How the reviewed result lands: `fast-forward` (the default, refused when not applicable), `rebase` to replay the child's own commits onto your current revision, or `merge` when the repository permits a merge commit."},
+                        "allow_merge": {"type": "boolean", "description": "Land a merge even when the parent checkout's AGENTS.md forbids merge commits."},
                         "allow_out_of_scope": {"type": "boolean", "description": "Land a commit that touches paths outside the declared file scope."},
                         "reason": {"type": "string", "minLength": 1, "maxLength": loom_core::MAX_PROJECT_CHILD_SCOPE_REASON_BYTES, "description": "Why the out-of-scope commit is landed; required with allow_out_of_scope and recorded with the override."}
                     },
@@ -2287,10 +2289,15 @@ impl ProjectAgentTools {
             self.project_id,
             self.session_id,
             arguments.task_id,
-            arguments.expected_parent_revision,
-            scope_override,
+            ProjectChildIntegrationRequest {
+                expected_parent_revision: arguments.expected_parent_revision,
+                scope_override,
+                strategy: arguments.strategy,
+                allow_merge: arguments.allow_merge,
+            },
         ) {
             Ok(ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(worktree))) => {
+                let integration = worktree.integration.clone();
                 ToolResult {
                     tool_call_id: call.id,
                     name: call.name.clone(),
@@ -2299,8 +2306,16 @@ impl ProjectAgentTools {
                         "task_id": worktree.task_id,
                         "status": worktree.status,
                         "integrated_revision": worktree.integrated_revision,
+                        "landed_by": worktree.landed_by,
+                        "strategy": integration.as_ref().map(|integration| integration.strategy),
+                        "previous_revision": integration.as_ref().map(|integration| integration.previous_revision.as_str()),
+                        "parent_revision": integration.as_ref().map(|integration| integration.parent_revision.as_str()),
+                        "commits": integration.as_ref().map(|integration| integration.commits),
+                        "history_rewritten": integration.as_ref().map(|integration| integration.history_rewritten),
+                        "checks": integration.as_ref().map(|integration| integration.checks.clone()),
                         "scope": worktree.scope,
                         "scope_override": worktree.scope_override,
+                        "note": "The reviewed result is recorded as integrated at integrated_revision, reached with the reported strategy; landed_by stays `integrated` for every strategy Loom performed. `checks` lists each bounded check the replay ran or skipped, and is empty for a strategy that ran none.",
                     }))
                     .unwrap_or_else(|error| format!("could not encode child integration: {error}")),
                 }

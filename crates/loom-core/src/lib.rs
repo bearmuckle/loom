@@ -84,7 +84,8 @@ pub use project::{
     MAX_PROJECT_CHILD_SCOPE_REASON_BYTES, ProjectAgentPermissions, ProjectAgentRecord,
     ProjectChildPauseReason, ProjectChildScope, ProjectChildScopeMode, ProjectManagerWaitRecord,
     ProjectManagerWaitStatus, ProjectSnapshot, ProjectWorktreeBaseRefresh,
-    ProjectWorktreeCleanupDisposition, ProjectWorktreeLandedBy, ProjectWorktreeRebase,
+    ProjectWorktreeCleanupDisposition, ProjectWorktreeIntegration,
+    ProjectWorktreeIntegrationStrategy, ProjectWorktreeLandedBy, ProjectWorktreeRebase,
     ProjectWorktreeRecord, ProjectWorktreeScopeOverride, ProjectWorktreeStatus,
     TaskContextReference, normalize_project_child_scope_path,
 };

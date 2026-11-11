@@ -252,6 +252,7 @@ fn project_child_worktree_can_be_reviewed_fast_forwarded_and_cleaned_up() {
         scope: None,
         scope_override: None,
         rebase: None,
+        integration: None,
         status: ProjectWorktreeStatus::Creating,
         conflict_paths: Vec::new(),
         error: None,
@@ -400,6 +401,19 @@ fn project_child_worktree_can_be_reviewed_fast_forwarded_and_cleaned_up() {
         parent_git.status().unwrap().head,
         integrated.integrated_revision
     );
+    let recorded = integrated
+        .integration
+        .clone()
+        .expect("the integration should be recorded");
+    assert_eq!(
+        recorded.strategy,
+        loom_core::ProjectWorktreeIntegrationStrategy::FastForward
+    );
+    assert!(!recorded.history_rewritten);
+    assert_eq!(
+        integrated.landed_by,
+        Some(loom_core::ProjectWorktreeLandedBy::Integrated)
+    );
     assert_eq!(completion_guard.completion_blocker(), None);
 
     let cleanup = connection.request(RequestEnvelope::new(ClientRequest::Project(
@@ -449,23 +463,52 @@ fn project_child_replays_its_own_commit_onto_an_advanced_parent() {
     );
     let parent_advanced = fixture.parent_git.status().unwrap().head.unwrap();
 
-    let integration = fixture
-        .connection
-        .request(RequestEnvelope::new(ClientRequest::Project(
-            ProjectRequest::IntegrateProjectChild {
-                project_id: fixture.project_id,
-                manager_session_id: fixture.root_id,
-                task_id: fixture.task_id,
-                expected_parent_revision: fixture.worktree.base_revision.clone(),
-            },
-        )));
-    let ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(integrated)) =
-        integration.result.unwrap()
-    else {
-        panic!("unexpected child integration response");
-    };
+    let integration = integrate_child_with_tools(
+        &code_child_manager_tools(&fixture),
+        &fixture,
+        serde_json::json!({"strategy": "rebase"}),
+    );
+    assert!(integration.success, "{}", integration.output);
+    let integration: serde_json::Value = serde_json::from_str(&integration.output).unwrap();
+    assert_eq!(integration["strategy"], serde_json::json!("rebase"));
+    assert_eq!(
+        integration["previous_revision"],
+        serde_json::json!(child_revision),
+        "the report names the reviewed revision the replay moved"
+    );
+    assert_eq!(
+        integration["parent_revision"],
+        serde_json::json!(parent_advanced),
+        "the report names the parent revision the replay started from"
+    );
+    assert_eq!(integration["commits"], serde_json::json!(1));
+    assert_eq!(integration["history_rewritten"], serde_json::json!(true));
+    let checks = integration["checks"]
+        .as_array()
+        .expect("the checks the replay ran are reported");
+    assert!(
+        checks.iter().any(|check| check == "fmt: skipped"),
+        "the fixture checkout is not a Cargo workspace, so fmt is reported as skipped: {checks:?}"
+    );
+    assert_eq!(integration["landed_by"], serde_json::json!("integrated"));
+    let integrated = integrated_worktree(&fixture);
     assert_eq!(integrated.status, ProjectWorktreeStatus::Integrated);
     let integrated_revision = integrated.integrated_revision.clone().unwrap();
+    assert_eq!(
+        integration["integrated_revision"],
+        serde_json::json!(integrated_revision),
+        "the report names the revision the parent ended on"
+    );
+    let recorded = integrated
+        .integration
+        .clone()
+        .expect("the integration should be recorded");
+    assert_eq!(
+        recorded.strategy,
+        loom_core::ProjectWorktreeIntegrationStrategy::Rebase
+    );
+    assert_eq!(recorded.previous_revision, child_revision);
+    assert_eq!(recorded.integrated_revision, integrated_revision);
     // The parent tip is the child's own replayed commit: neither Loom's
     // bookkeeping commit nor a merge commit of Loom's own.
     assert_ne!(integrated_revision, parent_advanced);
@@ -583,21 +626,17 @@ fn project_child_with_a_merge_in_its_branch_carries_its_own_message() {
     );
     let parent_advanced = fixture.parent_git.status().unwrap().head.unwrap();
 
-    let integration = fixture
-        .connection
-        .request(RequestEnvelope::new(ClientRequest::Project(
-            ProjectRequest::IntegrateProjectChild {
-                project_id: fixture.project_id,
-                manager_session_id: fixture.root_id,
-                task_id: fixture.task_id,
-                expected_parent_revision: fixture.worktree.base_revision.clone(),
-            },
-        )));
-    let ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(integrated)) =
-        integration.result.unwrap()
-    else {
-        panic!("unexpected child integration response");
-    };
+    let integration = integrate_child_with_tools(
+        &code_child_manager_tools(&fixture),
+        &fixture,
+        serde_json::json!({"strategy": "merge"}),
+    );
+    assert!(integration.success, "{}", integration.output);
+    let integration: serde_json::Value = serde_json::from_str(&integration.output).unwrap();
+    assert_eq!(integration["strategy"], serde_json::json!("merge"));
+    assert_eq!(integration["history_rewritten"], serde_json::json!(false));
+    assert_eq!(integration["landed_by"], serde_json::json!("integrated"));
+    let integrated = integrated_worktree(&fixture);
     assert_eq!(integrated.status, ProjectWorktreeStatus::Integrated);
     let integrated_revision = integrated.integrated_revision.clone().unwrap();
     assert_ne!(integrated_revision, parent_advanced);
@@ -630,6 +669,161 @@ fn project_child_with_a_merge_in_its_branch_carries_its_own_message() {
 }
 
 #[test]
+fn a_fast_forward_integration_is_refused_when_the_parent_has_advanced() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "feat: child change",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+    commit_file(
+        fixture.parent_git.root(),
+        "README.md",
+        "parent advanced\n",
+        "parent change",
+    );
+    let parent_advanced = fixture.parent_git.status().unwrap().head.unwrap();
+    let integrator = code_child_manager_tools(&fixture);
+
+    // The default strategy is a fast-forward, and one that cannot be applied is
+    // refused rather than escalated to a replay or a merge.
+    let refused = integrate_child_with_tools(&integrator, &fixture, serde_json::json!({}));
+    assert!(!refused.success, "{}", refused.output);
+    assert!(
+        refused
+            .output
+            .contains("fast-forward integration is not applicable"),
+        "the refusal says the fast-forward does not apply: {}",
+        refused.output
+    );
+    assert!(
+        refused.output.contains("strategy `rebase`"),
+        "the refusal names the strategy that does apply: {}",
+        refused.output
+    );
+    assert_eq!(
+        fixture.parent_git.status().unwrap().head.as_deref(),
+        Some(parent_advanced.as_str()),
+        "a refused fast-forward must not move the parent"
+    );
+    assert_eq!(
+        git_output(&fixture.child_checkout, &["rev-parse", "HEAD"]),
+        child_revision,
+        "a refused fast-forward must not move the child"
+    );
+    let worktree = integrated_worktree(&fixture);
+    assert_eq!(worktree.status, ProjectWorktreeStatus::Ready);
+    assert_eq!(worktree.integrated_revision, None);
+
+    // The same call with the rebase strategy lands the child linearly.
+    let integrated = integrate_child_with_tools(
+        &integrator,
+        &fixture,
+        serde_json::json!({"strategy": "rebase"}),
+    );
+    assert!(integrated.success, "{}", integrated.output);
+    let worktree = integrated_worktree(&fixture);
+    assert_eq!(worktree.status, ProjectWorktreeStatus::Integrated);
+    assert_eq!(
+        git_output(
+            fixture.parent_git.root(),
+            &[
+                "rev-list",
+                "--parents",
+                "-n1",
+                &worktree.integrated_revision.clone().unwrap()
+            ]
+        ),
+        format!(
+            "{} {parent_advanced}",
+            worktree.integrated_revision.clone().unwrap()
+        ),
+        "a rebase integration creates no merge commit"
+    );
+    fixture.shutdown();
+}
+
+#[test]
+fn a_merge_integration_is_refused_when_the_repository_forbids_merge_commits() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "feat: child change",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+    // The parent repository states the rule this repository states.
+    commit_file(
+        fixture.parent_git.root(),
+        "AGENTS.md",
+        "# Agent instructions\n\n- Do not create merge commits. Keep history linear.\n",
+        "docs: state the history rule",
+    );
+    commit_file(
+        fixture.parent_git.root(),
+        "README.md",
+        "parent advanced\n",
+        "parent change",
+    );
+    let parent_advanced = fixture.parent_git.status().unwrap().head.unwrap();
+    let integrator = code_child_manager_tools(&fixture);
+
+    let refused = integrate_child_with_tools(
+        &integrator,
+        &fixture,
+        serde_json::json!({"strategy": "merge"}),
+    );
+    assert!(!refused.success, "{}", refused.output);
+    assert!(
+        refused.output.contains("Do not create merge commits"),
+        "the refusal names the repository's rule: {}",
+        refused.output
+    );
+    assert!(
+        refused.output.contains("allow_merge"),
+        "the refusal names the explicit override: {}",
+        refused.output
+    );
+    assert_eq!(
+        fixture.parent_git.status().unwrap().head.as_deref(),
+        Some(parent_advanced.as_str()),
+        "a refused merge must not move the parent"
+    );
+
+    // Only the explicit override lands a merge under that rule.
+    let merged = integrate_child_with_tools(
+        &integrator,
+        &fixture,
+        serde_json::json!({"strategy": "merge", "allow_merge": true}),
+    );
+    assert!(merged.success, "{}", merged.output);
+    let worktree = integrated_worktree(&fixture);
+    let merged_revision = worktree.integrated_revision.clone().unwrap();
+    assert_eq!(
+        git_output(
+            fixture.parent_git.root(),
+            &["rev-list", "--parents", "-n1", &merged_revision]
+        ),
+        format!("{merged_revision} {parent_advanced} {child_revision}"),
+        "the override lands a two-parent merge commit"
+    );
+    let recorded = worktree
+        .integration
+        .expect("the integration should be recorded");
+    assert_eq!(
+        recorded.strategy,
+        loom_core::ProjectWorktreeIntegrationStrategy::Merge
+    );
+    assert_eq!(recorded.integrated_revision, merged_revision);
+    fixture.shutdown();
+}
+
+#[test]
 fn project_child_completion_guard_explains_why_a_reviewed_result_is_unintegrated() {
     let fixture = project_code_child_fixture();
     commit_file(
@@ -656,22 +850,16 @@ fn project_child_completion_guard_explains_why_a_reviewed_result_is_unintegrated
         "parent advanced\n",
         "parent change",
     );
-    let integration = fixture
-        .connection
-        .request(RequestEnvelope::new(ClientRequest::Project(
-            ProjectRequest::IntegrateProjectChild {
-                project_id: fixture.project_id,
-                manager_session_id: fixture.root_id,
-                task_id: fixture.task_id,
-                expected_parent_revision: fixture.worktree.base_revision.clone(),
-            },
-        )));
-    let ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(integrated)) =
-        integration.result.unwrap()
-    else {
-        panic!("unexpected child integration response");
-    };
-    assert_eq!(integrated.status, ProjectWorktreeStatus::Integrated);
+    let integration = integrate_child_with_tools(
+        &code_child_manager_tools(&fixture),
+        &fixture,
+        serde_json::json!({"strategy": "rebase"}),
+    );
+    assert!(integration.success, "{}", integration.output);
+    assert_eq!(
+        integrated_worktree(&fixture).status,
+        ProjectWorktreeStatus::Integrated
+    );
     assert_eq!(completion_guard.completion_blocker(), None);
 
     // A child that advances after integration is un-integrated again; the guard
@@ -1042,21 +1230,22 @@ fn project_child_replay_conflict_is_refused_and_preserved() {
     );
     let parent_advanced = fixture.parent_git.status().unwrap().head.unwrap();
 
-    let integration = fixture
-        .connection
-        .request(RequestEnvelope::new(ClientRequest::Project(
-            ProjectRequest::IntegrateProjectChild {
-                project_id: fixture.project_id,
-                manager_session_id: fixture.root_id,
-                task_id: fixture.task_id,
-                expected_parent_revision: fixture.worktree.base_revision.clone(),
-            },
-        )));
-    let Err(error) = integration.result else {
-        panic!("conflicting integration should be refused");
-    };
-    assert_eq!(error.code, ErrorCode::Conflict);
-    assert!(error.message.contains("README.md"));
+    let integration = integrate_child_with_tools(
+        &code_child_manager_tools(&fixture),
+        &fixture,
+        serde_json::json!({"strategy": "rebase"}),
+    );
+    assert!(!integration.success, "{}", integration.output);
+    assert!(
+        integration.output.contains("README.md"),
+        "the refusal names the conflicting path: {}",
+        integration.output
+    );
+    assert!(
+        integration.output.contains("left unchanged"),
+        "the refusal says both sides were preserved: {}",
+        integration.output
+    );
 
     let worktree = integrated_worktree(&fixture);
     assert_eq!(worktree.status, ProjectWorktreeStatus::Conflict);

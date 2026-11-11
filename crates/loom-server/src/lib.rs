@@ -24,7 +24,8 @@ use loom_core::{
     Capability, CapabilitySet, DelegatedTaskSpec, ErrorCode, EventSequence, JevPolicy, LoomError,
     MAX_PROJECT_AGENT_DEPTH, ProjectAgentRecord, ProjectChildPauseReason, ProjectId,
     ProjectJevPolicy, ProjectSnapshot, ProjectWorktreeBaseRefresh,
-    ProjectWorktreeCleanupDisposition, ProjectWorktreeLandedBy, ProjectWorktreeRecord,
+    ProjectWorktreeCleanupDisposition, ProjectWorktreeIntegration,
+    ProjectWorktreeIntegrationStrategy, ProjectWorktreeLandedBy, ProjectWorktreeRecord,
     ProjectWorktreeStatus, ProtocolVersion, ReadOnlyCommandPolicy, RepositoryId, RequestId, Result,
     RunAttemptId, SessionEventRecord, SessionJevPolicy, SessionTitleSource, TaskContextReference,
     Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord, sanitize_title, title_from_goal,
@@ -686,11 +687,30 @@ pub(crate) struct ProjectChildScopeOverrideRequest {
     pub(crate) reason: String,
 }
 
+/// What one integration of a reviewed child is asked to land.
+///
+/// The strategy and the merge override are the manager's tool-level choices, so
+/// a wire request that names neither integrates with the default fast-forward
+/// and never overrides a repository rule.
+pub(crate) struct ProjectChildIntegrationRequest {
+    pub(crate) expected_parent_revision: String,
+    pub(crate) scope_override: Option<ProjectChildScopeOverrideRequest>,
+    pub(crate) strategy: loom_core::ProjectWorktreeIntegrationStrategy,
+    pub(crate) allow_merge: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IntegrateProjectChildArguments {
     task_id: loom_core::TaskId,
     expected_parent_revision: String,
+    /// The strategy the integration uses; a fast-forward when omitted.
+    #[serde(default)]
+    strategy: loom_core::ProjectWorktreeIntegrationStrategy,
+    /// Whether a merge may override a repository rule that forbids merge
+    /// commits.
+    #[serde(default)]
+    allow_merge: bool,
     /// Whether a commit outside the declared file scope may land anyway.
     #[serde(default)]
     allow_out_of_scope: bool,

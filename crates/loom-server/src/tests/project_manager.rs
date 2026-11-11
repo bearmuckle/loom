@@ -1938,6 +1938,7 @@ fn an_action_request_to_a_completed_code_child_is_refused() {
                 scope: None,
                 scope_override: None,
                 rebase: None,
+                integration: None,
                 status: ProjectWorktreeStatus::Creating,
                 conflict_paths: Vec::new(),
                 error: None,

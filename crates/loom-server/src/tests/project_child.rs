@@ -3128,6 +3128,7 @@ fn auto_archive_waits_for_code_integration() {
         scope: None,
         scope_override: None,
         rebase: None,
+        integration: None,
         status: loom_core::ProjectWorktreeStatus::Creating,
         conflict_paths: vec![],
         error: None,

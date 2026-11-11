@@ -251,6 +251,40 @@ pub enum ProjectWorktreeLandedBy {
     Replay,
 }
 
+/// The strategy one integration used to land a reviewed code result.
+///
+/// The default is a fast-forward: it never rewrites a commit and never creates
+/// a merge, and an integration that cannot be a fast-forward is refused instead
+/// of escalating to another strategy the caller did not ask for.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum ProjectWorktreeIntegrationStrategy {
+    /// Advance the parent to the child's own commits, which must already
+    /// descend from the parent tip.
+    #[default]
+    #[serde(rename = "fast-forward", alias = "fast_forward")]
+    FastForward,
+    /// Replay the child's own commits onto the parent tip, keeping each
+    /// commit's author and message and creating no merge commit.
+    #[serde(rename = "rebase")]
+    Rebase,
+    /// Merge the child's commits into the parent with a merge commit, which a
+    /// repository whose own instructions forbid merge commits accepts only
+    /// through an explicit override.
+    #[serde(rename = "merge")]
+    Merge,
+}
+
+impl ProjectWorktreeIntegrationStrategy {
+    /// The stable name recorded and reported for this strategy.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FastForward => "fast-forward",
+            Self::Rebase => "rebase",
+            Self::Merge => "merge",
+        }
+    }
+}
+
 /// How a declared file scope reads its paths.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -505,6 +539,32 @@ pub struct ProjectWorktreeRebase {
     pub rebased_at: Timestamp,
 }
 
+/// How one integration landed a reviewed code result.
+///
+/// The record states the strategy that was used and the revision the parent
+/// checkout ended on, so a manager can tell a fast-forward, a replay, and a
+/// merge apart afterwards, and can see which revisions the integration moved
+/// between.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectWorktreeIntegration {
+    pub strategy: ProjectWorktreeIntegrationStrategy,
+    /// The reviewed revision the child held before the integration.
+    pub previous_revision: String,
+    /// The parent revision the integration started from.
+    pub parent_revision: String,
+    /// The parent revision the integration left the checkout on.
+    pub integrated_revision: String,
+    /// The commits the integration landed.
+    pub commits: u32,
+    /// Whether the integration moved the child's commits to new ids, which is
+    /// what a replay that rewrites history does and a fast-forward does not.
+    pub history_rewritten: bool,
+    /// One bounded line per bounded check the integration ran or skipped, for
+    /// example `fmt: passed`. Empty when the strategy ran no checks.
+    pub checks: Vec<String>,
+    pub integrated_at: Timestamp,
+}
+
 /// Durable identity and disposition of the isolated code checkout assigned to
 /// a delegated task. The path is relative to the child's session filesystem.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -547,6 +607,11 @@ pub struct ProjectWorktreeRecord {
     /// written before a rebase was recorded.
     #[serde(default)]
     pub rebase: Option<ProjectWorktreeRebase>,
+    /// How the reviewed result was integrated, naming the strategy used and the
+    /// revisions it moved between. `None` only for records written before
+    /// integrations were recorded.
+    #[serde(default)]
+    pub integration: Option<ProjectWorktreeIntegration>,
     pub status: ProjectWorktreeStatus,
     pub conflict_paths: Vec<String>,
     pub error: Option<String>,
@@ -863,6 +928,7 @@ mod tests {
     fn worktree_base_refresh_summarizes_drift_from_a_fetch() {
         use super::{
             ProjectChildScope, ProjectChildScopeMode, ProjectWorktreeBaseRefresh,
+            ProjectWorktreeIntegration, ProjectWorktreeIntegrationStrategy,
             ProjectWorktreeLandedBy, ProjectWorktreeRebase, ProjectWorktreeRecord,
             ProjectWorktreeStatus,
         };
@@ -945,6 +1011,16 @@ mod tests {
                 result_revision: base.into(),
                 rebased_at: fetched_at,
             }),
+            integration: Some(ProjectWorktreeIntegration {
+                strategy: ProjectWorktreeIntegrationStrategy::Rebase,
+                previous_revision: tip.into(),
+                parent_revision: base.into(),
+                integrated_revision: tip.into(),
+                commits: 1,
+                history_rewritten: true,
+                checks: vec!["fmt: passed".into()],
+                integrated_at: fetched_at,
+            }),
             status: ProjectWorktreeStatus::Ready,
             conflict_paths: vec![],
             error: None,
@@ -957,6 +1033,8 @@ mod tests {
         assert_eq!(encoded["base_refresh"]["behind"], 15);
         assert_eq!(encoded["landed_by"], "replay");
         assert_eq!(encoded["rebase"]["base_revision"], tip);
+        assert_eq!(encoded["integration"]["strategy"], "rebase");
+        assert_eq!(encoded["integration"]["history_rewritten"], true);
         assert_eq!(
             serde_json::from_value::<ProjectWorktreeRecord>(encoded).unwrap(),
             record
@@ -971,6 +1049,7 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("scope");
         legacy.as_object_mut().unwrap().remove("scope_override");
         legacy.as_object_mut().unwrap().remove("rebase");
+        legacy.as_object_mut().unwrap().remove("integration");
         let legacy: ProjectWorktreeRecord = serde_json::from_value(legacy).unwrap();
         assert_eq!(legacy.base_refresh, None);
         assert_eq!(legacy.landed_by, None);
@@ -978,6 +1057,10 @@ mod tests {
         assert_eq!(
             legacy.rebase, None,
             "a worktree written before a rebase was recorded reports none"
+        );
+        assert_eq!(
+            legacy.integration, None,
+            "a worktree written before an integration was recorded reports none"
         );
         assert_eq!(
             legacy.scope, None,

@@ -64,7 +64,7 @@ impl ProjectChildRebaseCheckState {
     }
 
     /// Whether this outcome means the rebased result was not validated.
-    fn is_failure(self) -> bool {
+    pub(super) fn is_failure(self) -> bool {
         matches!(self, Self::Failed | Self::TimedOut | Self::Unavailable)
     }
 }
@@ -344,7 +344,7 @@ impl InProcessConnection {
     ///
     /// A restore that fails is logged with the recovery-required state: the
     /// branch then holds the replayed revision, which the manager can see.
-    fn restore_project_child_rebase(&self, child_git: &GitService, revision: &str) {
+    pub(super) fn restore_project_child_rebase(&self, child_git: &GitService, revision: &str) {
         if let Err(error) = child_git.restore_branch_to_revision(revision) {
             log::error!(
                 "could not restore a project child checkout to {revision} after a refused rebase; it holds the replayed revision: {}",
@@ -441,7 +441,7 @@ impl InProcessConnection {
     }
 
     /// Runs every check the rebase reports, in order, each within its bound.
-    fn run_project_child_rebase_checks(
+    pub(super) fn run_project_child_rebase_checks(
         &self,
         child_git: &GitService,
     ) -> Vec<ProjectChildRebaseCheckOutcome> {
@@ -454,7 +454,7 @@ impl InProcessConnection {
 }
 
 /// The sorted, de-duplicated paths a change touches from `base_revision`.
-fn project_child_rebase_stat_paths(
+pub(super) fn project_child_rebase_stat_paths(
     child_git: &GitService,
     base_revision: &str,
 ) -> Result<Vec<String>> {
@@ -488,7 +488,7 @@ fn project_child_rebase_target(parent_git: &GitService, onto: &str) -> Result<St
 }
 
 /// A bounded, sorted, de-duplicated list of changed paths.
-fn project_child_rebase_paths<'a>(paths: impl Iterator<Item = &'a String>) -> String {
+pub(super) fn project_child_rebase_paths<'a>(paths: impl Iterator<Item = &'a String>) -> String {
     let mut paths = paths.cloned().collect::<Vec<_>>();
     paths.sort();
     paths.dedup();
@@ -507,7 +507,7 @@ fn project_child_rebase_paths<'a>(paths: impl Iterator<Item = &'a String>) -> St
 
 /// The paths of `candidate` that `known` does not carry, in the order of
 /// `candidate`.
-fn paths_outside_set(candidate: &[String], known: &[String]) -> Vec<String> {
+pub(super) fn paths_outside_set(candidate: &[String], known: &[String]) -> Vec<String> {
     candidate
         .iter()
         .filter(|path| !known.contains(*path))

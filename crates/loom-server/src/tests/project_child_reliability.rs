@@ -368,18 +368,22 @@ fn integration_ignores_ignored_build_output_in_the_parent_checkout() {
     fs::create_dir_all(parent_git.root().join("target")).unwrap();
     fs::write(parent_git.root().join("target/artifact"), "build output\n").unwrap();
 
-    let integration = fixture
-        .connection
-        .request(RequestEnvelope::new(ClientRequest::Project(
-            ProjectRequest::IntegrateProjectChild {
-                project_id: fixture.project_id,
-                manager_session_id: fixture.root_id,
-                task_id: fixture.task_id,
-                expected_parent_revision: fixture.worktree.base_revision.clone(),
-            },
-        )));
+    // The parent advanced by the .gitignore commit, so the reviewed child is
+    // landed by replaying its own commit onto the parent tip.
+    let integration = fixture.connection.integrate_project_child(
+        RequestId::new(),
+        fixture.project_id,
+        fixture.root_id,
+        fixture.task_id,
+        ProjectChildIntegrationRequest {
+            expected_parent_revision: fixture.worktree.base_revision.clone(),
+            scope_override: None,
+            strategy: loom_core::ProjectWorktreeIntegrationStrategy::Rebase,
+            allow_merge: false,
+        },
+    );
     let ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(integrated)) =
-        integration.result.unwrap()
+        integration.unwrap()
     else {
         panic!("unexpected child integration response");
     };

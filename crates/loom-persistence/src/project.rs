@@ -455,8 +455,8 @@ impl FilePersistence {
                     worktree_name, branch_name, base_revision, result_revision,
                     integrated_revision, status, error, cleanup_disposition,
                     base_refresh, landed_by, landed_evidence, scope, scope_override,
-                    rebase, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+                    rebase, integration, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
                  ON CONFLICT(task_id) DO UPDATE SET
                     project_id=excluded.project_id,
                     parent_session_id=excluded.parent_session_id,
@@ -478,6 +478,7 @@ impl FilePersistence {
                     scope=excluded.scope,
                     scope_override=excluded.scope_override,
                     rebase=excluded.rebase,
+                    integration=excluded.integration,
                     created_at=excluded.created_at,
                     updated_at=excluded.updated_at",
                 params![
@@ -502,6 +503,7 @@ impl FilePersistence {
                     encode_project_child_scope(worktree.scope.as_ref())?,
                     encode_project_worktree_scope_override(worktree.scope_override.as_ref())?,
                     encode_project_worktree_rebase(worktree.rebase.as_ref())?,
+                    encode_project_worktree_integration(worktree.integration.as_ref())?,
                     encode_timestamp(worktree.created_at)?,
                     encode_timestamp(worktree.updated_at)?,
                 ],

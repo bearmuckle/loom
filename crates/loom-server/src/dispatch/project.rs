@@ -88,11 +88,18 @@ impl InProcessConnection {
                 project_id,
                 manager_session_id,
                 task_id,
-                expected_parent_revision,
-                // The wire request carries no scope override, so a client that
-                // is not the manager's tool surface can never land a commit its
-                // child's declaration leaves out of scope.
-                None,
+                ProjectChildIntegrationRequest {
+                    expected_parent_revision,
+                    // The wire request carries no scope override, so a client
+                    // that is not the manager's tool surface can never land a
+                    // commit its child's declaration leaves out of scope. It
+                    // also chooses no integration strategy, so it gets the
+                    // default fast-forward and a refusal when one is not
+                    // applicable.
+                    scope_override: None,
+                    strategy: loom_core::ProjectWorktreeIntegrationStrategy::FastForward,
+                    allow_merge: false,
+                },
             ),
             ClientRequest::Project(ProjectRequest::CleanupProjectChildWorktree {
                 project_id,

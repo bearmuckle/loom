@@ -171,6 +171,7 @@ fn add_code_child(
         scope: None,
         scope_override: None,
         rebase: None,
+        integration: None,
         status: ProjectWorktreeStatus::Creating,
         conflict_paths: Vec::new(),
         error: None,

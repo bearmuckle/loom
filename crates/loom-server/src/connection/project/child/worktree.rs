@@ -1,3 +1,6 @@
+use super::rebase::{
+    paths_outside_set, project_child_rebase_paths, project_child_rebase_stat_paths,
+};
 use super::*;
 
 /// Cuts one line of a child file to [`MAX_CHILD_FILE_LINE_CHARS`] and marks the
@@ -407,9 +410,14 @@ impl InProcessConnection {
         project_id: ProjectId,
         manager_session_id: AgentSessionId,
         task_id: loom_core::TaskId,
-        expected_parent_revision: String,
-        scope_override: Option<ProjectChildScopeOverrideRequest>,
+        request: ProjectChildIntegrationRequest,
     ) -> Result<ServerResponse> {
+        let ProjectChildIntegrationRequest {
+            expected_parent_revision,
+            scope_override,
+            strategy,
+            allow_merge,
+        } = request;
         if !self.project_agent_permission_enabled_for_session(
             manager_session_id,
             Capability::IntegrateProjectChild,
@@ -617,9 +625,18 @@ impl InProcessConnection {
         // record is idempotent and never replays the merge.
         if parent_git.is_ancestor_revision(&child_revision, &parent_revision)? {
             worktree.status = ProjectWorktreeStatus::Integrated;
-            worktree.result_revision = Some(child_revision);
-            worktree.integrated_revision = Some(parent_revision);
+            worktree.result_revision = Some(child_revision.clone());
+            worktree.integrated_revision = Some(parent_revision.clone());
             worktree.landed_by = Some(ProjectWorktreeLandedBy::Integrated);
+            worktree.integration = Some(project_child_integration_record(
+                strategy,
+                &child_revision,
+                &parent_revision,
+                &parent_revision,
+                0,
+                false,
+                Vec::new(),
+            ));
             worktree.conflict_paths.clear();
             worktree.error = None;
             worktree.updated_at = Timestamp::now();
@@ -628,6 +645,29 @@ impl InProcessConnection {
             return Ok(ServerResponse::Project(
                 ProjectResponse::ProjectChildWorktreeUpdated(Box::new(worktree)),
             ));
+        }
+
+        // The strategy decides what an integration may do, so a request it
+        // cannot satisfy is refused before either checkout moves instead of
+        // escalating to a strategy the caller did not ask for.
+        match strategy {
+            ProjectWorktreeIntegrationStrategy::FastForward => {
+                if !parent_git.is_ancestor_revision(&parent_revision, &child_revision)? {
+                    return Err(LoomError::invalid_state(format!(
+                        "a fast-forward integration is not applicable: parent checkout {parent_revision} is not an ancestor of the reviewed child revision {child_revision}; integrate with strategy `rebase` to replay the child's commits onto the parent tip, or land the change yourself and record it with mark_landed"
+                    )));
+                }
+            }
+            ProjectWorktreeIntegrationStrategy::Rebase => {}
+            ProjectWorktreeIntegrationStrategy::Merge => {
+                if let Some(rule) = merge_commits_forbidden(parent_git.root())
+                    && !allow_merge
+                {
+                    return Err(LoomError::invalid_state(format!(
+                        "the parent repository's own instructions forbid merge commits, so a merge integration is refused: {rule}; integrate with strategy `rebase` to keep history linear, or pass allow_merge to override that rule"
+                    )));
+                }
+            }
         }
 
         worktree.result_revision = Some(child_revision.clone());
@@ -639,48 +679,87 @@ impl InProcessConnection {
 
         let message = project_child_integration_message(&child_git, &child_revision, &task);
 
-        // The parent must end up holding the child's own commit rather than a
-        // bookkeeping commit of Loom's own. When the child does not already
-        // descend from the parent tip, its own commits are replayed onto the
-        // parent tip first, so the parent fast-forwards to them.
-        let outcome = if parent_git.is_ancestor_revision(&parent_revision, &child_revision)? {
-            parent_git.integrate_merge_revisions(&parent_revision, &child_revision, &message)
-        } else {
-            match child_git.rebase_onto_revision(&parent_revision) {
-                Ok(loom_vcs::RebaseIntegrationOutcome::Rebased(revision)) => {
-                    let revision = revision.to_string();
-                    if revision != child_revision {
-                        // The child's branch now points at the replayed revision,
-                        // so the reviewed revision recorded for recovery and for
-                        // the completion guard follows it.
-                        worktree.result_revision = Some(revision.clone());
+        // A fast-forward advances the parent straight to the child's own
+        // commits. A merge lets Git decide, and only a rebase replays the
+        // child's commits onto the parent tip first, keeping each commit's
+        // author and message and creating no merge commit.
+        let mut replay = None;
+        let outcome = match strategy {
+            ProjectWorktreeIntegrationStrategy::FastForward
+            | ProjectWorktreeIntegrationStrategy::Merge => {
+                parent_git.integrate_merge_revisions(&parent_revision, &child_revision, &message)
+            }
+            ProjectWorktreeIntegrationStrategy::Rebase => {
+                match self.replay_project_child_for_integration(
+                    &mut worktree,
+                    &child_git,
+                    &parent_revision,
+                    &child_revision,
+                ) {
+                    Ok(replayed) => {
+                        let outcome = parent_git.integrate_merge_revisions(
+                            &parent_revision,
+                            &replayed.revision,
+                            &message,
+                        );
+                        replay = Some(replayed);
+                        outcome
+                    }
+                    Err(error) => {
+                        // The replay refused before the parent moved, so the
+                        // record names what stopped it and stays retryable.
+                        worktree.status = project_child_integration_refusal_status(error.code);
+                        worktree.error = Some(error.message.clone());
                         worktree.updated_at = Timestamp::now();
                         self.save_project_worktree_state(&worktree)?;
+                        return Err(error);
                     }
-                    parent_git.integrate_merge_revisions(&parent_revision, &revision, &message)
                 }
-                // A child branch whose own commits contain a merge cannot be
-                // replayed without dropping that merge, so it is integrated
-                // with a merge that carries the child's own message.
-                Ok(loom_vcs::RebaseIntegrationOutcome::MergeRequired) => parent_git
-                    .integrate_merge_revisions(&parent_revision, &child_revision, &message),
-                // A conflicted replay never touched the child checkout, so it is
-                // reported exactly like a conflicted merge.
-                Ok(loom_vcs::RebaseIntegrationOutcome::Conflicted(paths)) => {
-                    Ok(loom_vcs::MergeIntegrationOutcome::Conflicted(paths))
-                }
-                Err(error) => Err(error),
             }
         };
 
         match outcome {
             Ok(loom_vcs::MergeIntegrationOutcome::AlreadyPresent) => {
-                self.finish_project_child_integration(&mut worktree, &parent_revision)
+                let integration = project_child_integration_record(
+                    strategy,
+                    &child_revision,
+                    &parent_revision,
+                    &parent_revision,
+                    0,
+                    false,
+                    Vec::new(),
+                );
+                self.finish_project_child_integration(&mut worktree, &parent_revision, integration)
             }
             Ok(loom_vcs::MergeIntegrationOutcome::FastForward(revision))
             | Ok(loom_vcs::MergeIntegrationOutcome::Merged(revision)) => {
                 let revision = revision.to_string();
-                self.finish_project_child_integration(&mut worktree, &revision)
+                let (commits, history_rewritten, checks) = match replay.as_ref() {
+                    Some(replayed) => (
+                        replayed.commits,
+                        replayed.history_rewritten,
+                        replayed.checks.clone(),
+                    ),
+                    None => (
+                        project_child_integration_commit_count(
+                            &child_git,
+                            &parent_revision,
+                            &revision,
+                        ),
+                        false,
+                        Vec::new(),
+                    ),
+                };
+                let integration = project_child_integration_record(
+                    strategy,
+                    &child_revision,
+                    &parent_revision,
+                    &revision,
+                    commits,
+                    history_rewritten,
+                    checks,
+                );
+                self.finish_project_child_integration(&mut worktree, &revision, integration)
             }
             Ok(loom_vcs::MergeIntegrationOutcome::Conflicted(paths)) => {
                 worktree.status = ProjectWorktreeStatus::Conflict;
@@ -711,14 +790,95 @@ impl InProcessConnection {
         }
     }
 
+    /// Replays a finished child's own commits onto the parent tip for an
+    /// integration, reusing the rebase action's bounded checks.
+    ///
+    /// The parent checkout is not touched here: the replay happens in the
+    /// child's checkout and the caller fast-forwards the parent to the replayed
+    /// revision afterwards. A conflicted replay is refused with its conflicting
+    /// paths recorded and both checkouts unchanged. A replay that would touch a
+    /// path the reviewed change never touched, or whose bounded check fails,
+    /// restores the child's branch to the reviewed revision.
+    fn replay_project_child_for_integration(
+        &self,
+        worktree: &mut ProjectWorktreeRecord,
+        child_git: &GitService,
+        parent_revision: &str,
+        child_revision: &str,
+    ) -> Result<ProjectChildReplayIntegration> {
+        let reviewed_paths = project_child_rebase_stat_paths(child_git, &worktree.base_revision)?;
+        let replayed = match child_git.rebase_onto_revision(parent_revision)? {
+            loom_vcs::RebaseIntegrationOutcome::Rebased(revision) => revision.to_string(),
+            loom_vcs::RebaseIntegrationOutcome::MergeRequired => {
+                return Err(LoomError::invalid_state(
+                    "the child's own commits contain a merge, so they cannot be replayed without dropping it; integrate it with strategy `merge` if the repository permits merge commits, or land it yourself and record it with mark_landed",
+                ));
+            }
+            loom_vcs::RebaseIntegrationOutcome::Conflicted(paths) => {
+                let mut conflict_paths = paths.clone();
+                conflict_paths.sort();
+                conflict_paths.dedup();
+                worktree.conflict_paths = conflict_paths;
+                return Err(LoomError::conflict(format!(
+                    "the child's commits do not replay onto {parent_revision} cleanly; the child checkout and the parent were left unchanged, and the conflicting paths are: {}",
+                    project_child_rebase_paths(paths.iter())
+                )));
+            }
+        };
+        let replay_paths = project_child_rebase_stat_paths(child_git, parent_revision)?;
+        let gained = paths_outside_set(&replay_paths, &reviewed_paths);
+        if !gained.is_empty() {
+            self.restore_project_child_rebase(child_git, child_revision);
+            return Err(LoomError::invalid_state(format!(
+                "the replay would change paths the reviewed commit never touched: {}; the child checkout was restored to {child_revision}",
+                project_child_rebase_paths(gained.iter())
+            )));
+        }
+        let checks = self.run_project_child_rebase_checks(child_git);
+        let failed = checks
+            .iter()
+            .filter(|check| check.outcome.is_failure())
+            .map(|check| format!("{} ({})", check.name, check.outcome.as_str()))
+            .collect::<Vec<_>>();
+        if !failed.is_empty() {
+            self.restore_project_child_rebase(child_git, child_revision);
+            return Err(LoomError::conflict(format!(
+                "the replayed commits did not pass their checks: {}; the child checkout was restored to {child_revision}, so nothing was integrated",
+                failed.join(", ")
+            )));
+        }
+        let commits = project_child_integration_commit_count(child_git, parent_revision, &replayed);
+        // The child's branch now holds the replayed revision, so the reviewed
+        // revision recorded for recovery and for the completion guard follows
+        // it.
+        worktree.result_revision = Some(replayed.clone());
+        worktree.updated_at = Timestamp::now();
+        self.save_project_worktree_state(worktree)?;
+        log::info!(
+            "[loom-server] integrating project child task {} by replaying {child_revision} onto {parent_revision}: {replayed}",
+            worktree.task_id
+        );
+        Ok(ProjectChildReplayIntegration {
+            revision: replayed.clone(),
+            commits,
+            history_rewritten: replayed != child_revision,
+            checks: checks
+                .iter()
+                .map(|check| format!("{}: {}", check.name, check.outcome.as_str()))
+                .collect(),
+        })
+    }
+
     fn finish_project_child_integration(
         &self,
         worktree: &mut ProjectWorktreeRecord,
         integrated_revision: &str,
+        integration: ProjectWorktreeIntegration,
     ) -> Result<ServerResponse> {
         worktree.status = ProjectWorktreeStatus::Integrated;
         worktree.integrated_revision = Some(integrated_revision.to_owned());
         worktree.landed_by = Some(ProjectWorktreeLandedBy::Integrated);
+        worktree.integration = Some(integration);
         worktree.conflict_paths.clear();
         worktree.error = None;
         worktree.updated_at = Timestamp::now();
@@ -1237,6 +1397,127 @@ impl InProcessConnection {
     }
 }
 
+/// What one replay of a child's own commits contributed to an integration.
+struct ProjectChildReplayIntegration {
+    /// The revision the child's branch holds after the replay.
+    revision: String,
+    commits: u32,
+    history_rewritten: bool,
+    /// One bounded line per check the rebase ran or skipped.
+    checks: Vec<String>,
+}
+
+/// The worktree state a refused integration leaves behind.
+///
+/// A conflict is recorded as one so a later review names the paths, a checkout
+/// that needs explicit attention stays recovery-required, and every other
+/// refusal leaves the child ready to retry.
+fn project_child_integration_refusal_status(code: ErrorCode) -> ProjectWorktreeStatus {
+    match code {
+        ErrorCode::Conflict => ProjectWorktreeStatus::Conflict,
+        ErrorCode::RecoveryRequired => ProjectWorktreeStatus::RecoveryRequired,
+        _ => ProjectWorktreeStatus::Ready,
+    }
+}
+
+/// The record of one integration, named by the strategy it used and the
+/// revisions it moved between.
+fn project_child_integration_record(
+    strategy: ProjectWorktreeIntegrationStrategy,
+    previous_revision: &str,
+    parent_revision: &str,
+    integrated_revision: &str,
+    commits: u32,
+    history_rewritten: bool,
+    checks: Vec<String>,
+) -> ProjectWorktreeIntegration {
+    ProjectWorktreeIntegration {
+        strategy,
+        previous_revision: previous_revision.to_owned(),
+        parent_revision: parent_revision.to_owned(),
+        integrated_revision: integrated_revision.to_owned(),
+        commits,
+        history_rewritten,
+        checks,
+        integrated_at: Timestamp::now(),
+    }
+}
+
+/// How many commits an integration landed.
+///
+/// A count that cannot be read is reported as zero with a warning instead of
+/// failing an integration the parent already accepted.
+fn project_child_integration_commit_count(
+    child_git: &GitService,
+    parent_revision: &str,
+    integrated_revision: &str,
+) -> u32 {
+    match child_git.patch_commits_since(parent_revision, integrated_revision) {
+        Ok(commits) => u32::try_from(commits.len()).unwrap_or(u32::MAX),
+        Err(error) => {
+            log::warn!(
+                "could not count the commits an integration landed from {parent_revision} to {integrated_revision}: {}",
+                error.message
+            );
+            0
+        }
+    }
+}
+
+/// Most bytes of a repository's own instructions that the merge policy reads.
+const MAX_REPOSITORY_POLICY_BYTES: u64 = 64 * 1024;
+
+/// Longest instruction line the merge policy reads, so one minified line cannot
+/// make the check expensive.
+const MAX_REPOSITORY_POLICY_LINE_BYTES: usize = 240;
+
+/// Why the parent checkout's own instructions forbid merge commits, if they do.
+///
+/// The detection is deliberately narrow: it reads only `AGENTS.md` at the
+/// checkout root, and only a line that names a `merge commit` and a prohibition
+/// (`no`, `never`, `do not`, `must not`, `forbid`, or `without`). A repository
+/// that states the rule some other way, or names no `AGENTS.md`, is treated as
+/// permitting a merge, so this never invents a rule and only refuses a merge the
+/// repository itself forbids. The line is returned so a refusal can name it.
+fn merge_commits_forbidden(parent_root: &Path) -> Option<String> {
+    let path = parent_root.join("AGENTS.md");
+    let metadata = fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_REPOSITORY_POLICY_BYTES {
+        return None;
+    }
+    let instructions = fs::read_to_string(&path).ok()?;
+    merge_commit_prohibition(&instructions)
+}
+
+/// The first instruction line in `instructions` that forbids merge commits.
+fn merge_commit_prohibition(instructions: &str) -> Option<String> {
+    instructions
+        .lines()
+        .map(str::trim)
+        .map(|line| line.trim_start_matches(['-', '*']).trim())
+        .find(|line| line.len() <= MAX_REPOSITORY_POLICY_LINE_BYTES && forbids_merge_commits(line))
+        .map(str::to_owned)
+}
+
+/// Whether one instruction line forbids merge commits.
+fn forbids_merge_commits(line: &str) -> bool {
+    let line = line.to_ascii_lowercase();
+    if !line.contains("merge commit") {
+        return false;
+    }
+    [
+        "no merge commit",
+        "never",
+        "do not",
+        "don't",
+        "must not",
+        "forbid",
+        "without merge",
+    ]
+    .iter()
+    .any(|prohibition| line.contains(prohibition))
+}
+
 /// Message for an integration that has to create a commit of its own.
 ///
 /// The child's own message describes the change, so the commit carries it
@@ -1268,5 +1549,45 @@ fn project_child_integration_message(
         )
     } else {
         format!("{child_message}\n\n{trailer}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{forbids_merge_commits, merge_commit_prohibition};
+
+    #[test]
+    fn the_merge_policy_reads_only_a_prohibition_that_names_merge_commits() {
+        assert_eq!(
+            merge_commit_prohibition(
+                "# Agent instructions\n\n- Do not create merge commits. Keep history linear.\n"
+            ),
+            Some("Do not create merge commits. Keep history linear.".to_owned())
+        );
+        assert_eq!(
+            merge_commit_prohibition("Never add a merge commit.\n"),
+            Some("Never add a merge commit.".to_owned())
+        );
+        // A line that mentions a merge without forbidding one states no rule,
+        // and neither does an instruction about something else.
+        for instructions in [
+            "",
+            "Merge commits are described here.",
+            "Do not create bookkeeping commits.",
+            "History stays linear.",
+        ] {
+            assert_eq!(
+                merge_commit_prohibition(instructions),
+                None,
+                "{instructions:?}"
+            );
+        }
+        assert!(!forbids_merge_commits("merge commits are welcome"));
+        assert!(forbids_merge_commits("A merge commit is forbidden here"));
+        assert!(forbids_merge_commits("land it without merge commits"));
+
+        // One minified line cannot make the policy check expensive.
+        let long = format!("Do not create merge commits. {}", "x".repeat(240));
+        assert_eq!(merge_commit_prohibition(&long), None);
     }
 }
