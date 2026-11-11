@@ -966,6 +966,79 @@ fn migrates_a_v17_database_by_adding_the_worktree_landing_columns() {
 }
 
 #[test]
+fn migrates_a_v18_database_by_adding_the_child_scope_columns() {
+    let path = std::env::temp_dir().join(format!(
+        "loom-persistence-migrate-v18-{}.db",
+        Uuid::new_v4()
+    ));
+    {
+        let connection = Connection::open(&path).unwrap();
+        // A v18 database holds the worktree table without the scope columns,
+        // and pre-existing rows must survive the upgrade.
+        connection
+            .execute_batch(
+                "CREATE TABLE project_worktrees (
+                     task_id BLOB PRIMARY KEY NOT NULL,
+                     project_id BLOB NOT NULL,
+                     status TEXT NOT NULL,
+                     updated_at INTEGER NOT NULL,
+                     base_revision TEXT NOT NULL,
+                     result_revision TEXT,
+                     UNIQUE(project_id, task_id)
+                 ) STRICT;
+                 INSERT INTO project_worktrees(
+                     task_id, project_id, status, updated_at, base_revision, result_revision)
+                     VALUES (x'00000000000000000000000000000001',
+                             x'00000000000000000000000000000002', 'ready', 0, 'base-sha',
+                             'result-sha');
+                 PRAGMA user_version = 18;",
+            )
+            .unwrap();
+    }
+
+    let store = FilePersistence::open(&path).unwrap();
+    // Opening is lazy; the first read runs the migration ladder.
+    assert!(store.load_sessions().unwrap().is_none());
+    drop(store);
+
+    let connection = Connection::open(&path).unwrap();
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, DATABASE_SCHEMA_VERSION);
+    for column in ["scope", "scope_override"] {
+        let has_column: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('project_worktrees')
+                 WHERE name=?1)",
+                [column],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_column, "the v19 migration adds the {column} column");
+    }
+    let (base_revision, result_revision, scope, scope_override): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = connection
+        .query_row(
+            "SELECT base_revision, result_revision, scope, scope_override
+             FROM project_worktrees WHERE task_id = x'00000000000000000000000000000001'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(base_revision, "base-sha", "a migration keeps existing rows");
+    assert_eq!(result_revision.as_deref(), Some("result-sha"));
+    assert_eq!(scope, None, "an older child declares no file scope");
+    assert_eq!(scope_override, None);
+    drop(connection);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn schema_status_detects_incompatible_state_and_resets_only_on_request() {
     let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
     assert_eq!(

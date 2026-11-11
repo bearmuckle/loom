@@ -248,6 +248,8 @@ fn project_child_worktree_can_be_reviewed_fast_forwarded_and_cleaned_up() {
         integrated_revision: None,
         landed_by: None,
         landed_evidence: None,
+        scope: None,
+        scope_override: None,
         status: ProjectWorktreeStatus::Creating,
         conflict_paths: Vec::new(),
         error: None,
@@ -1573,6 +1575,7 @@ fn nested_code_child_worktree_integrates_through_parent_to_root() {
                 dependencies: vec![],
                 code_change: true,
                 permissions: manager_permissions,
+                scope: None,
             },
         )
         .unwrap()
@@ -1632,6 +1635,7 @@ fn nested_code_child_worktree_integrates_through_parent_to_root() {
                 dependencies: vec![],
                 code_change: true,
                 permissions: loom_core::ProjectAgentPermissions::default(),
+                scope: None,
             },
         )
         .unwrap()
@@ -1947,6 +1951,7 @@ fn read_only_child_receives_an_isolated_checkout() {
                 dependencies: vec![],
                 code_change: false,
                 permissions: loom_core::ProjectAgentPermissions::default(),
+                scope: None,
             },
         )
         .unwrap()
@@ -2117,6 +2122,7 @@ fn a_provider_failed_code_child_resumes_and_its_work_is_landed() {
                 dependencies: vec![],
                 code_change: true,
                 permissions: loom_core::ProjectAgentPermissions::default(),
+                scope: None,
             },
         )
         .unwrap()
@@ -2923,6 +2929,453 @@ fn reading_a_child_file_returns_the_exact_range_and_refuses_escapes() {
             refused.output
         );
     }
+    fixture.shutdown();
+}
+
+/// Declares the file scope one fixture's delegation would have declared, so a
+/// test reads the same declaration review and integration read.
+fn declare_child_file_scope(
+    fixture: &ProjectCodeChildFixture,
+    scope: loom_core::ProjectChildScope,
+) {
+    let persistence = fixture.backend.persistence.as_ref().unwrap();
+    let mut worktree = persistence
+        .load_project_worktree_by_task(fixture.task_id)
+        .unwrap()
+        .expect("child worktree should be durable");
+    worktree.scope = Some(scope);
+    persistence.save_project_worktree(&worktree).unwrap();
+}
+
+/// The manager's delegation tools for one code child fixture, so a test can
+/// declare a scope the way a delegation does.
+fn code_delegating_manager_tools(fixture: &ProjectCodeChildFixture) -> ToolExecutor {
+    let extension = fixture
+        .backend
+        .project_agent_tools(
+            fixture.root_id,
+            ModelId::new("deterministic/demo"),
+            ProjectAgentToolGrants {
+                delegation: true,
+                worktree: true,
+                ..ProjectAgentToolGrants::default()
+            },
+        )
+        .unwrap()
+        .expect("manager delegation tools");
+    ToolExecutor::new_with_workspace(
+        fixture
+            .connection
+            .session_filesystem(fixture.root_id)
+            .unwrap(),
+    )
+    .with_extension(extension)
+}
+
+fn review_child_with_tools(
+    tools: &ToolExecutor,
+    fixture: &ProjectCodeChildFixture,
+) -> serde_json::Value {
+    let review = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "review_project_child".to_owned(),
+        arguments: serde_json::json!({"task_id": fixture.task_id}),
+    });
+    assert!(review.success, "{}", review.output);
+    serde_json::from_str::<serde_json::Value>(&review.output).unwrap()["data"].clone()
+}
+
+fn integrate_child_with_tools(
+    tools: &ToolExecutor,
+    fixture: &ProjectCodeChildFixture,
+    arguments: serde_json::Value,
+) -> ToolResult {
+    let mut arguments = arguments;
+    arguments["task_id"] = serde_json::json!(fixture.task_id);
+    arguments["expected_parent_revision"] = serde_json::json!(fixture.worktree.base_revision);
+    tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "integrate_project_child".to_owned(),
+        arguments,
+    })
+}
+
+#[test]
+fn a_code_child_that_stays_inside_its_declared_scope_reports_in_scope() {
+    let fixture = project_code_child_fixture();
+    fs::create_dir_all(fixture.child_checkout.join("src")).unwrap();
+    commit_file(
+        &fixture.child_checkout,
+        "src/inside.rs",
+        "pub fn added() -> usize { 1 }\n",
+        "feat: add an in-scope module",
+    );
+    complete_project_code_child(&fixture);
+    declare_child_file_scope(
+        &fixture,
+        loom_core::ProjectChildScope::new(
+            loom_core::ProjectChildScopeMode::Paths,
+            &["src".to_owned()],
+        )
+        .unwrap(),
+    );
+
+    let tools = reviewing_code_child_manager_tools(&fixture);
+    let review = review_child_with_tools(&tools, &fixture);
+    let scope = &review["scope"];
+    assert_eq!(scope["declared"], serde_json::json!(true));
+    assert_eq!(scope["mode"], serde_json::json!("paths"));
+    assert_eq!(scope["paths"], serde_json::json!(["src"]));
+    assert_eq!(scope["in_scope"], serde_json::json!(true));
+    assert_eq!(scope["out_of_scope"], serde_json::json!([]));
+    assert_eq!(scope["new_out_of_scope_files"], serde_json::json!([]));
+
+    // The same declaration lets the commit land without an override.
+    let integrator = code_child_manager_tools(&fixture);
+    let integration = integrate_child_with_tools(&integrator, &fixture, serde_json::json!({}));
+    assert!(integration.success, "{}", integration.output);
+    let integration: serde_json::Value = serde_json::from_str(&integration.output).unwrap();
+    assert_eq!(integration["status"], serde_json::json!("integrated"));
+    assert_eq!(integration["scope_override"], serde_json::Value::Null);
+    assert_eq!(integrated_worktree(&fixture).scope_override, None);
+    fixture.shutdown();
+}
+
+#[test]
+fn a_commit_outside_the_declared_scope_is_reported_with_its_line_counts() {
+    let fixture = project_code_child_fixture();
+    fs::create_dir_all(fixture.child_checkout.join("src")).unwrap();
+    commit_file(
+        &fixture.child_checkout,
+        "src/inside.rs",
+        "pub fn added() -> usize { 1 }\n",
+        "feat: add an in-scope module",
+    );
+    commit_file(
+        &fixture.child_checkout,
+        "docs/notes.md",
+        "# Notes\n\nAdded outside the scope.\n",
+        "docs: add a note",
+    );
+    complete_project_code_child(&fixture);
+    declare_child_file_scope(
+        &fixture,
+        loom_core::ProjectChildScope::new(
+            loom_core::ProjectChildScopeMode::Paths,
+            &["src".to_owned()],
+        )
+        .unwrap(),
+    );
+
+    let tools = reviewing_code_child_manager_tools(&fixture);
+    let review = review_child_with_tools(&tools, &fixture);
+    let scope = &review["scope"];
+    assert_eq!(scope["in_scope"], serde_json::json!(false));
+    let out_of_scope = scope["out_of_scope"].as_array().unwrap();
+    assert_eq!(
+        out_of_scope.len(),
+        1,
+        "only the outside path is reported: {scope}"
+    );
+    assert_eq!(out_of_scope[0]["path"], serde_json::json!("docs/notes.md"));
+    assert_eq!(out_of_scope[0]["change"], serde_json::json!("new"));
+    assert_eq!(out_of_scope[0]["additions"], serde_json::json!(3));
+    assert_eq!(out_of_scope[0]["deletions"], serde_json::json!(0));
+    assert_eq!(out_of_scope[0]["new"], serde_json::json!(true));
+    assert_eq!(
+        scope["new_out_of_scope_files"],
+        serde_json::json!(["docs/notes.md"]),
+        "a new file outside the scope is reported as new"
+    );
+
+    // A patch review costs the same check, so the deviation is reported there
+    // too.
+    let patch = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "review_project_child".to_owned(),
+        arguments: serde_json::json!({"task_id": fixture.task_id, "mode": "diff", "paths": ["src/inside.rs"]}),
+    });
+    assert!(patch.success, "{}", patch.output);
+    let patch: serde_json::Value = serde_json::from_str(&patch.output).unwrap();
+    assert_eq!(patch["data"]["mode"], serde_json::json!("diff"));
+    assert_eq!(patch["data"]["scope"]["in_scope"], serde_json::json!(false));
+    assert_eq!(
+        patch["data"]["scope"]["out_of_scope"][0]["path"],
+        serde_json::json!("docs/notes.md")
+    );
+    fixture.shutdown();
+}
+
+#[test]
+fn integration_refuses_an_out_of_scope_commit_until_the_override_records_the_reason() {
+    let fixture = project_code_child_fixture();
+    fs::create_dir_all(fixture.child_checkout.join("src")).unwrap();
+    commit_file(
+        &fixture.child_checkout,
+        "src/inside.rs",
+        "pub fn added() -> usize { 1 }\n",
+        "feat: add an in-scope module",
+    );
+    commit_file(
+        &fixture.child_checkout,
+        "tests/support.rs",
+        "pub fn fixture() -> usize { 2 }\n",
+        "test: fix a test import",
+    );
+    complete_project_code_child(&fixture);
+    declare_child_file_scope(
+        &fixture,
+        loom_core::ProjectChildScope::new(
+            loom_core::ProjectChildScopeMode::Paths,
+            &["src".to_owned()],
+        )
+        .unwrap(),
+    );
+    let reviewing = reviewing_code_child_manager_tools(&fixture);
+    review_child_with_tools(&reviewing, &fixture);
+    let parent_before = fixture.parent_git.status().unwrap().head;
+    let integrator = code_child_manager_tools(&fixture);
+
+    // The default integration refuses the commit and names the offending path.
+    let refused = integrate_child_with_tools(&integrator, &fixture, serde_json::json!({}));
+    assert!(!refused.success, "{}", refused.output);
+    assert!(
+        refused.output.contains("tests/support.rs"),
+        "the refusal names the out-of-scope path: {}",
+        refused.output
+    );
+    assert!(
+        refused.output.contains("allow_out_of_scope"),
+        "the refusal names the override: {}",
+        refused.output
+    );
+    assert_eq!(
+        fixture.parent_git.status().unwrap().head,
+        parent_before,
+        "a refused integration must not move the parent"
+    );
+    assert_eq!(integrated_worktree(&fixture).integrated_revision, None);
+
+    // The override without a reason is refused, because nothing would record
+    // why the deviation was accepted.
+    let unreasoned = integrate_child_with_tools(
+        &integrator,
+        &fixture,
+        serde_json::json!({"allow_out_of_scope": true}),
+    );
+    assert!(!unreasoned.success, "{}", unreasoned.output);
+    assert!(
+        unreasoned.output.contains("reason"),
+        "the refusal asks for the reason: {}",
+        unreasoned.output
+    );
+
+    let reason = "the test import fix belongs with this change";
+    let integrated = integrate_child_with_tools(
+        &integrator,
+        &fixture,
+        serde_json::json!({"allow_out_of_scope": true, "reason": reason}),
+    );
+    assert!(integrated.success, "{}", integrated.output);
+    let integrated: serde_json::Value = serde_json::from_str(&integrated.output).unwrap();
+    assert_eq!(integrated["status"], serde_json::json!("integrated"));
+    assert_eq!(
+        integrated["scope_override"]["reason"],
+        serde_json::json!(reason)
+    );
+    assert_eq!(
+        integrated["scope_override"]["paths"],
+        serde_json::json!(["tests/support.rs"])
+    );
+
+    // The record stays readable after the integration, so the deviation is
+    // traceable rather than implicit.
+    let worktree = integrated_worktree(&fixture);
+    let scope_override = worktree
+        .scope_override
+        .expect("the override should be recorded on the worktree");
+    assert_eq!(scope_override.reason, reason);
+    assert_eq!(scope_override.paths, vec!["tests/support.rs".to_owned()]);
+    let listing = code_child_manager_tools(&fixture).execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "list_project_children".to_owned(),
+        arguments: serde_json::json!({}),
+    });
+    assert!(listing.success, "{}", listing.output);
+    let listing: serde_json::Value = serde_json::from_str(&listing.output).unwrap();
+    let child = listing["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["task_id"] == serde_json::json!(fixture.task_id))
+        .expect("the child should be listed");
+    assert_eq!(child["scope_override"]["reason"], serde_json::json!(reason));
+    assert_eq!(child["scope"]["paths"], serde_json::json!(["src"]));
+    fixture.shutdown();
+}
+
+#[test]
+fn a_child_without_a_declared_scope_keeps_todays_behaviour_and_says_so() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "docs/notes.md",
+        "# Notes\n",
+        "docs: add a note",
+    );
+    complete_project_code_child(&fixture);
+    let tools = reviewing_code_child_manager_tools(&fixture);
+    let review = review_child_with_tools(&tools, &fixture);
+    let scope = &review["scope"];
+    assert_eq!(scope["declared"], serde_json::json!(false));
+    assert_eq!(
+        scope.get("in_scope"),
+        None,
+        "an undeclared scope must not report the change in scope: {scope}"
+    );
+    assert!(
+        scope["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("No file scope was declared")),
+        "the review says no scope was declared: {scope}"
+    );
+
+    let integrator = code_child_manager_tools(&fixture);
+    let integration = integrate_child_with_tools(&integrator, &fixture, serde_json::json!({}));
+    assert!(integration.success, "{}", integration.output);
+    let integration: serde_json::Value = serde_json::from_str(&integration.output).unwrap();
+    assert_eq!(integration["status"], serde_json::json!("integrated"));
+    assert_eq!(integration["scope_override"], serde_json::Value::Null);
+    fixture.shutdown();
+}
+
+#[test]
+fn an_out_of_scope_declaration_reads_as_the_inverse_of_paths() {
+    let fixture = project_code_child_fixture();
+    fs::create_dir_all(fixture.child_checkout.join("src")).unwrap();
+    commit_file(
+        &fixture.child_checkout,
+        "src/inside.rs",
+        "pub fn added() -> usize { 1 }\n",
+        "feat: add a module",
+    );
+    commit_file(
+        &fixture.child_checkout,
+        "docs/notes.md",
+        "# Notes\n",
+        "docs: add a note",
+    );
+    complete_project_code_child(&fixture);
+    declare_child_file_scope(
+        &fixture,
+        loom_core::ProjectChildScope::new(
+            loom_core::ProjectChildScopeMode::OutOfScope,
+            &["docs".to_owned()],
+        )
+        .unwrap(),
+    );
+
+    let tools = reviewing_code_child_manager_tools(&fixture);
+    let review = review_child_with_tools(&tools, &fixture);
+    let scope = &review["scope"];
+    assert_eq!(scope["mode"], serde_json::json!("out_of_scope"));
+    assert_eq!(scope["in_scope"], serde_json::json!(false));
+    assert_eq!(
+        scope["out_of_scope"],
+        serde_json::json!([{
+            "path": "docs/notes.md",
+            "change": "new",
+            "additions": 1,
+            "deletions": 0,
+            "binary": false,
+            "new": true,
+        }]),
+        "a deny list names only the paths it covers"
+    );
+    fixture.shutdown();
+}
+
+#[test]
+fn delegating_a_code_child_records_the_declared_file_scope() {
+    let fixture = project_code_child_fixture();
+    let tools = code_delegating_manager_tools(&fixture);
+    let delegated = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "delegate_project_code_task".to_owned(),
+        arguments: serde_json::json!({
+            "child_name": "scoped-worker",
+            "intent": "Change only the declared module.",
+            "paths": ["./src/", "Cargo.toml"],
+        }),
+    });
+    assert!(delegated.success, "{}", delegated.output);
+    let delegated: serde_json::Value = serde_json::from_str(&delegated.output).unwrap();
+    assert_eq!(delegated["scope"]["mode"], serde_json::json!("paths"));
+    assert_eq!(
+        delegated["scope"]["paths"],
+        serde_json::json!(["src", "Cargo.toml"]),
+        "the declared paths are normalised before they are recorded"
+    );
+    let task_id: loom_core::TaskId = serde_json::from_value(delegated["task_id"].clone()).unwrap();
+    let worktree = fixture
+        .backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .load_project_worktree_by_task(task_id)
+        .unwrap()
+        .expect("the delegated child should have a worktree");
+    let scope = worktree
+        .scope
+        .expect("the declared scope should be recorded");
+    assert_eq!(scope.mode, loom_core::ProjectChildScopeMode::Paths);
+    assert_eq!(scope.paths, vec!["src".to_owned(), "Cargo.toml".to_owned()]);
+
+    // A declaration is either an allowlist or a deny list, never both, and it
+    // must stay inside the repository.
+    for arguments in [
+        serde_json::json!({
+            "child_name": "both",
+            "intent": "Declare both lists.",
+            "paths": ["src"],
+            "out_of_scope": ["docs"],
+        }),
+        serde_json::json!({
+            "child_name": "escaping",
+            "intent": "Declare an escaping path.",
+            "paths": ["../outside"],
+        }),
+        serde_json::json!({
+            "child_name": "empty",
+            "intent": "Declare no path.",
+            "paths": [],
+        }),
+    ] {
+        let refused = tools.execute(&ToolCall {
+            id: ToolCallId::new(),
+            name: "delegate_project_code_task".to_owned(),
+            arguments,
+        });
+        assert!(!refused.success, "{}", refused.output);
+    }
+
+    // A read-only child has no commit to check, so a scope declared on one is
+    // refused instead of recorded and ignored.
+    let read_only = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "delegate_project_task".to_owned(),
+        arguments: serde_json::json!({
+            "child_name": "reader",
+            "intent": "Read the module.",
+            "paths": ["src"],
+        }),
+    });
+    assert!(!read_only.success, "{}", read_only.output);
+    assert!(
+        read_only.output.contains("code child"),
+        "the refusal says a scope applies to a code child: {}",
+        read_only.output
+    );
     fixture.shutdown();
 }
 

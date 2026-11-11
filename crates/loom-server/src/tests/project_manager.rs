@@ -312,6 +312,7 @@ fn delegated_children_and_direct_messages_are_durable_and_bounded() {
         dependencies: vec![],
         code_change: false,
         permissions: loom_core::ProjectAgentPermissions::default(),
+        scope: None,
     };
     let request_id = RequestId::new();
     let response =
@@ -508,6 +509,7 @@ fn delegated_children_and_direct_messages_are_durable_and_bounded() {
             dependencies: vec![],
             code_change: true,
             permissions: loom_core::ProjectAgentPermissions::default(),
+            scope: None,
         },
     );
     assert!(matches!(
@@ -529,6 +531,7 @@ fn delegated_children_and_direct_messages_are_durable_and_bounded() {
                 dependencies: vec![],
                 code_change: false,
                 permissions: loom_core::ProjectAgentPermissions::default(),
+                scope: None,
             },
         ),
         Err(error) if error.code == ErrorCode::InvalidRequest
@@ -1493,6 +1496,7 @@ fn scripted_project_message_setup(prefix: &str) -> ScriptedProjectMessageSetup {
                 dependencies: Vec::new(),
                 code_change: false,
                 permissions: loom_core::ProjectAgentPermissions::default(),
+                scope: None,
             },
         )
         .unwrap()
@@ -1930,6 +1934,8 @@ fn an_action_request_to_a_completed_code_child_is_refused() {
                 integrated_revision: None,
                 landed_by: None,
                 landed_evidence: None,
+                scope: None,
+                scope_override: None,
                 status: ProjectWorktreeStatus::Creating,
                 conflict_paths: Vec::new(),
                 error: None,
@@ -2980,6 +2986,7 @@ fn durable_manager_wait_releases_workspace_slot_and_resumes_once() {
                 dependencies: vec![],
                 code_change: false,
                 permissions: loom_core::ProjectAgentPermissions::default(),
+                scope: None,
             },
         )
         .unwrap();
@@ -3228,6 +3235,7 @@ fn durable_manager_wait_recovers_after_restart_and_resumes_once() {
                     inspection: true,
                     ..loom_core::ProjectAgentPermissions::default()
                 },
+                scope: None,
             },
         )
         .unwrap()
@@ -3262,6 +3270,7 @@ fn durable_manager_wait_recovers_after_restart_and_resumes_once() {
                 dependencies: vec![],
                 code_change: false,
                 permissions: loom_core::ProjectAgentPermissions::default(),
+                scope: None,
             },
         )
         .unwrap();

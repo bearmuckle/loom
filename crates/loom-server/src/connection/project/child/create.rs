@@ -446,6 +446,8 @@ impl InProcessConnection {
                         branch_name: format!("loom/project-child-{task_id}"),
                         base_revision,
                         base_refresh: Some(base_refresh),
+                        scope: spec.scope.clone(),
+                        scope_override: None,
                         result_revision: None,
                         integrated_revision: None,
                         landed_by: None,

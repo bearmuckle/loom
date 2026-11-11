@@ -236,6 +236,19 @@ directories or multi-repository tasks, define whether each child receives an
 independent clone/worktree per repository and how local in-place attachments
 are handled; a child must never inherit a mutable attachment accidentally.
 
+A delegation may declare the files its child's commit may touch, with `paths` as
+an allowlist or `out_of_scope` as its inverse, when an allowlist is impractical.
+A declared path is repository-relative and covers itself and everything below
+it, so a directory declaration covers the files in it; a declaration that names
+nothing, repeats a path, or escapes the repository is refused. Review reports
+whether the change stays inside the declaration, names every out-of-scope path
+with its line counts, and states whether the child created it, and it says that
+no scope was declared rather than reporting an undeclared change in scope.
+Integration refuses a commit that touches an out-of-scope path unless the
+manager passes `allow_out_of_scope` with a reason; that reason and the accepted
+paths are recorded on the child's worktree, so the deviation is traceable
+instead of implicit.
+
 ## Project deletion and archived sessions
 
 Archiving a project retains everything: it makes the root and its descendants

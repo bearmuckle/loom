@@ -500,6 +500,13 @@ struct DelegateProjectTaskArguments {
     dependencies: Vec<loom_core::TaskId>,
     #[serde(default)]
     permissions: loom_core::ProjectAgentPermissions,
+    /// The files a code child's commit may touch, as an allowlist.
+    #[serde(default)]
+    paths: Option<Vec<String>>,
+    /// The files a code child's commit may not touch, which is the inverse of
+    /// `paths`.
+    #[serde(default)]
+    out_of_scope: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -630,11 +637,27 @@ pub(crate) struct ProjectChildFileSlice {
     pub(crate) truncated: bool,
 }
 
+/// Why a manager lands a child commit its declaration leaves out of scope.
+///
+/// The reason is stored on the worktree record together with the accepted
+/// out-of-scope paths, so a deviation from the declared scope is traceable
+/// instead of implicit.
+pub(crate) struct ProjectChildScopeOverrideRequest {
+    pub(crate) reason: String,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IntegrateProjectChildArguments {
     task_id: loom_core::TaskId,
     expected_parent_revision: String,
+    /// Whether a commit outside the declared file scope may land anyway.
+    #[serde(default)]
+    allow_out_of_scope: bool,
+    /// Why a commit outside the declared file scope is landed; required with
+    /// `allow_out_of_scope` and recorded with the override.
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Default)]

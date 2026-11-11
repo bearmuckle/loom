@@ -106,6 +106,7 @@ fn child_creation_recovers_a_stranded_cancellation_cascade() {
                 dependencies: vec![],
                 code_change: false,
                 permissions: loom_core::ProjectAgentPermissions::default(),
+                scope: None,
             },
         )
         .unwrap()
@@ -155,6 +156,7 @@ fn child_creation_recovers_a_stranded_cancellation_cascade() {
                 dependencies: vec![],
                 code_change: false,
                 permissions: loom_core::ProjectAgentPermissions::default(),
+                scope: None,
             },
         )
         .unwrap()
@@ -238,6 +240,7 @@ fn code_delegation_spec() -> loom_core::DelegatedTaskSpec {
         dependencies: vec![],
         code_change: true,
         permissions: loom_core::ProjectAgentPermissions::default(),
+        scope: None,
     }
 }
 
@@ -483,6 +486,7 @@ fn failed_child_reports_its_reason_to_the_manager() {
                 dependencies: vec![],
                 code_change: false,
                 permissions: loom_core::ProjectAgentPermissions::default(),
+                scope: None,
             },
         )
         .unwrap()

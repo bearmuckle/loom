@@ -263,9 +263,12 @@ impl InProcessConnection {
                     commits: Vec::new(),
                     diff: None,
                 };
+                // The file list is what the declared scope is checked against,
+                // so both modes build it: a summary lists it, and a patch
+                // review still reports whether the change stays in scope.
+                view.stat = service.review_stat_from_revision(&worktree.base_revision)?;
                 match request.mode {
                     ProjectChildReviewMode::Stat => {
-                        view.stat = service.review_stat_from_revision(&worktree.base_revision)?;
                         // A child that has not committed yet has no commits to
                         // name, and its uncommitted work is the summary.
                         if let Some(head) = status.head.as_deref()
@@ -405,6 +408,7 @@ impl InProcessConnection {
         manager_session_id: AgentSessionId,
         task_id: loom_core::TaskId,
         expected_parent_revision: String,
+        scope_override: Option<ProjectChildScopeOverrideRequest>,
     ) -> Result<ServerResponse> {
         if !self.project_agent_permission_enabled_for_session(
             manager_session_id,
@@ -512,6 +516,53 @@ impl InProcessConnection {
             return Err(LoomError::invalid_state(
                 "review the current committed child revision before integration",
             ));
+        }
+        // The reviewed commit has to stay inside the file scope its delegation
+        // declared. A commit that does not is refused with its offending paths
+        // named, unless the manager explicitly overrides the declaration and
+        // states why, which is recorded on the worktree.
+        if let Some(scope) = worktree.scope.clone() {
+            let stat = child_git.review_stat_from_revision(&worktree.base_revision)?;
+            let mut out_of_scope = scope
+                .out_of_scope(&stat)
+                .map(|stat| stat.path.clone())
+                .collect::<Vec<_>>();
+            out_of_scope.sort();
+            out_of_scope.dedup();
+            if !out_of_scope.is_empty() {
+                // The refusal names the offending paths, bounded the same way
+                // a blocked parent checkout names its paths, so a wide change
+                // cannot turn one error into pages of text.
+                const MAX_NAMED_PATHS: usize = 20;
+                let named = out_of_scope
+                    .iter()
+                    .take(MAX_NAMED_PATHS)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let remaining = out_of_scope.len().saturating_sub(MAX_NAMED_PATHS);
+                let named = if remaining > 0 {
+                    format!("{named} and {remaining} more")
+                } else {
+                    named
+                };
+                match scope_override.as_ref() {
+                    Some(scope_override) => {
+                        worktree.scope_override = Some(loom_core::ProjectWorktreeScopeOverride {
+                            reason: scope_override.reason.clone(),
+                            paths: out_of_scope.clone(),
+                            recorded_at: Timestamp::now(),
+                        });
+                        worktree.updated_at = Timestamp::now();
+                        self.save_project_worktree_state(&worktree)?;
+                    }
+                    None => {
+                        return Err(LoomError::invalid_state(format!(
+                            "the reviewed commit changes paths the child's delegation left out of scope: {named}; review them, then integrate with allow_out_of_scope and a reason to land it anyway"
+                        )));
+                    }
+                }
+            }
         }
 
         let parent_git =

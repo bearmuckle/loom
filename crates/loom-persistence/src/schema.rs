@@ -857,6 +857,8 @@ CREATE TABLE IF NOT EXISTS project_worktrees (
     )),
     error TEXT CHECK(error IS NULL OR length(error) <= 8192),
     base_refresh TEXT CHECK(base_refresh IS NULL OR length(base_refresh) <= 8192),
+    scope TEXT CHECK(scope IS NULL OR length(CAST(scope AS BLOB)) <= 16384),
+    scope_override TEXT CHECK(scope_override IS NULL OR length(CAST(scope_override AS BLOB)) <= 16384),
     cleanup_disposition TEXT CHECK(cleanup_disposition IS NULL OR cleanup_disposition IN (
         'retain', 'remove_clean', 'discard_changes'
     )),
@@ -1365,6 +1367,33 @@ fn migrate_schema_transaction(connection: &Connection, from_version: u32) -> Res
                         })?;
                 }
                 version = 18;
+            }
+            // v19 records the file scope a delegation declared for its child's
+            // commit and the override recorded when a commit outside it lands.
+            // A database from an older revision may not have the worktree table
+            // yet; the baseline batches add it with the new columns, so the
+            // ALTER applies only where needed. A missing column reads as no
+            // declared scope, which keeps today's behavior for old children.
+            18 => {
+                if migration_table_exists(&transaction, "project_worktrees")?
+                    && !migration_column_exists(&transaction, "project_worktrees", "scope")?
+                {
+                    transaction
+                        .execute_batch(
+                            "ALTER TABLE project_worktrees ADD COLUMN scope TEXT
+                                 CHECK(scope IS NULL OR length(CAST(scope AS BLOB)) <= 16384);
+                             ALTER TABLE project_worktrees ADD COLUMN scope_override TEXT
+                                 CHECK(scope_override IS NULL
+                                     OR length(CAST(scope_override AS BLOB)) <= 16384);",
+                        )
+                        .map_err(|error| {
+                            persistence_error(
+                                format!("could not migrate persistence schema to v19: {error}"),
+                                true,
+                            )
+                        })?;
+                }
+                version = 19;
             }
             other => return Err(unsupported_database_error(other)),
         }

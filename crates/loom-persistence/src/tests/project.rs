@@ -3,6 +3,7 @@
 #[allow(unused_imports)]
 use super::support::*;
 use super::*;
+use loom_core::ProjectChildScopeMode;
 
 #[test]
 fn session_projection_reader_keeps_run_and_cursor_on_one_sqlite_snapshot() {
@@ -351,6 +352,11 @@ fn project_child_and_agent_messages_are_atomic_ordered_and_request_idempotent() 
         integrated_revision: None,
         landed_by: None,
         landed_evidence: None,
+        scope: Some(ProjectChildScope {
+            mode: ProjectChildScopeMode::Paths,
+            paths: vec!["src/main.rs".to_owned(), "docs".to_owned()],
+        }),
+        scope_override: None,
         status: ProjectWorktreeStatus::Creating,
         conflict_paths: Vec::new(),
         error: None,
@@ -374,6 +380,11 @@ fn project_child_and_agent_messages_are_atomic_ordered_and_request_idempotent() 
         integrated_revision: Some("landed-sha".to_owned()),
         landed_by: Some(ProjectWorktreeLandedBy::Replay),
         landed_evidence: Some("squashed into the parent tip".to_owned()),
+        scope_override: Some(ProjectWorktreeScopeOverride {
+            reason: "the test import fix belongs with this change".to_owned(),
+            paths: vec!["docs/plan.md".to_owned()],
+            recorded_at: child_snapshot.created_at,
+        }),
         status: ProjectWorktreeStatus::Conflict,
         conflict_paths: vec!["src/main.rs".to_owned(), "docs/plan.md".to_owned()],
         error: Some("integration found conflicts".to_owned()),
@@ -417,6 +428,7 @@ fn project_child_and_agent_messages_are_atomic_ordered_and_request_idempotent() 
         dependencies: task.dependencies.clone(),
         code_change: task.code_change,
         permissions: task.permissions,
+        scope: None,
     };
     assert_eq!(
         persistence
@@ -715,6 +727,7 @@ fn project_task_queries_and_cancellation_cover_lifecycle_paths() {
         dependencies: Vec::new(),
         code_change: false,
         permissions: task.permissions,
+        scope: None,
     };
     assert_eq!(
         persistence

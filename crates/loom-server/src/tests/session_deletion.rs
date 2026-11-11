@@ -168,6 +168,8 @@ fn add_code_child(
         integrated_revision: None,
         landed_by: None,
         landed_evidence: None,
+        scope: None,
+        scope_override: None,
         status: ProjectWorktreeStatus::Creating,
         conflict_paths: Vec::new(),
         error: None,
@@ -1304,6 +1306,7 @@ fn live_project_child_fixture(
                 dependencies: Vec::new(),
                 code_change: false,
                 permissions: loom_core::ProjectAgentPermissions::default(),
+                scope: None,
             },
         )
         .unwrap()

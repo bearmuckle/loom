@@ -79,10 +79,13 @@ pub use process::{
 };
 pub use project::{
     AgentMessageDraft, AgentMessageKind, AgentMessageRecord, DelegatedTaskRecord,
-    DelegatedTaskSpec, DelegatedTaskStatus, MAX_PROJECT_AGENT_DEPTH, ProjectAgentPermissions,
-    ProjectAgentRecord, ProjectManagerWaitRecord, ProjectManagerWaitStatus, ProjectSnapshot,
-    ProjectWorktreeBaseRefresh, ProjectWorktreeCleanupDisposition, ProjectWorktreeLandedBy,
-    ProjectWorktreeRecord, ProjectWorktreeStatus, TaskContextReference,
+    DelegatedTaskSpec, DelegatedTaskStatus, MAX_PROJECT_AGENT_DEPTH,
+    MAX_PROJECT_CHILD_SCOPE_PATH_BYTES, MAX_PROJECT_CHILD_SCOPE_PATHS,
+    MAX_PROJECT_CHILD_SCOPE_REASON_BYTES, ProjectAgentPermissions, ProjectAgentRecord,
+    ProjectChildScope, ProjectChildScopeMode, ProjectManagerWaitRecord, ProjectManagerWaitStatus,
+    ProjectSnapshot, ProjectWorktreeBaseRefresh, ProjectWorktreeCleanupDisposition,
+    ProjectWorktreeLandedBy, ProjectWorktreeRecord, ProjectWorktreeScopeOverride,
+    ProjectWorktreeStatus, TaskContextReference, normalize_project_child_scope_path,
 };
 pub use session::{
     AgentSessionSnapshot, AgentSessionState, MAX_AGENT_SESSION_GOAL_BYTES, SessionEvent,

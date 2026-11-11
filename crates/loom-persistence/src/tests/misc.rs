@@ -74,6 +74,7 @@ fn persistence_trait_object_forwards_read_paths_on_an_empty_store() {
             dependencies: Vec::new(),
             code_change: false,
             permissions: ProjectAgentPermissions::default(),
+            scope: None,
         },
     );
     let _ = store.load_project_manager_wait(ProjectManagerWaitId::new());

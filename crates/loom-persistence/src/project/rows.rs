@@ -98,7 +98,8 @@ pub(crate) fn load_project_worktree(
                     parent_repository_id, child_repository_id, relative_path,
                     worktree_name, branch_name, base_revision, result_revision,
                     integrated_revision, status, error, cleanup_disposition,
-                    base_refresh, landed_by, landed_evidence, created_at, updated_at
+                    base_refresh, landed_by, landed_evidence, scope, scope_override,
+                    created_at, updated_at
              FROM project_worktrees WHERE task_id=?1",
             [task_id.as_bytes().as_slice()],
             |row| {
@@ -121,8 +122,10 @@ pub(crate) fn load_project_worktree(
                     row.get::<_, Option<String>>(15)?,
                     row.get::<_, Option<String>>(16)?,
                     row.get::<_, Option<String>>(17)?,
-                    row.get::<_, i64>(18)?,
-                    row.get::<_, i64>(19)?,
+                    row.get::<_, Option<String>>(18)?,
+                    row.get::<_, Option<String>>(19)?,
+                    row.get::<_, i64>(20)?,
+                    row.get::<_, i64>(21)?,
                 ))
             },
         )
@@ -149,6 +152,8 @@ pub(crate) fn load_project_worktree(
         base_refresh,
         landed_by,
         landed_evidence,
+        scope,
+        scope_override,
         created_at,
         updated_at,
     )) = row
@@ -214,6 +219,8 @@ pub(crate) fn load_project_worktree(
         conflict_paths,
         error,
         base_refresh: decode_project_worktree_base_refresh(base_refresh)?,
+        scope: decode_project_child_scope(scope)?,
+        scope_override: decode_project_worktree_scope_override(scope_override)?,
         landed_by: landed_by
             .as_deref()
             .map(parse_project_worktree_landed_by)
@@ -651,9 +658,10 @@ pub(crate) fn persist_initial_project_worktree(
                 parent_repository_id, child_repository_id, relative_path,
                 worktree_name, branch_name, base_revision, result_revision,
                 integrated_revision, status, error, cleanup_disposition,
-                base_refresh, landed_by, landed_evidence, created_at, updated_at
+                base_refresh, landed_by, landed_evidence, scope, scope_override,
+                created_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL,
-                       'creating', NULL, NULL, ?11, NULL, NULL, ?12, ?13)",
+                       'creating', NULL, NULL, ?11, NULL, NULL, ?12, NULL, ?13, ?14)",
             params![
                 worktree.task_id.as_uuid().as_bytes().as_slice(),
                 worktree.project_id.as_uuid().as_bytes().as_slice(),
@@ -670,6 +678,7 @@ pub(crate) fn persist_initial_project_worktree(
                 worktree.branch_name,
                 worktree.base_revision,
                 encode_project_worktree_base_refresh(worktree.base_refresh.as_ref())?,
+                encode_project_child_scope(worktree.scope.as_ref())?,
                 encode_timestamp(worktree.created_at)?,
                 encode_timestamp(worktree.updated_at)?,
             ],
@@ -693,6 +702,70 @@ pub(crate) fn encode_project_worktree_base_refresh(
             serde_json::to_string(refresh).map_err(|error| {
                 persistence_error(
                     format!("could not encode the project worktree base refresh: {error}"),
+                    false,
+                )
+            })
+        })
+        .transpose()
+}
+
+/// Encodes the file scope a delegation declared for a child's commit as the
+/// versioned JSON payload the worktree row stores.
+pub(crate) fn encode_project_child_scope(
+    scope: Option<&ProjectChildScope>,
+) -> Result<Option<String>> {
+    scope
+        .map(|scope| {
+            serde_json::to_string(scope).map_err(|error| {
+                persistence_error(
+                    format!("could not encode the project child file scope: {error}"),
+                    false,
+                )
+            })
+        })
+        .transpose()
+}
+
+pub(crate) fn decode_project_child_scope(
+    payload: Option<String>,
+) -> Result<Option<ProjectChildScope>> {
+    payload
+        .map(|payload| {
+            serde_json::from_str(&payload).map_err(|error| {
+                persistence_error(
+                    format!("persisted project child file scope is invalid: {error}"),
+                    false,
+                )
+            })
+        })
+        .transpose()
+}
+
+/// Encodes the recorded override of a declared file scope as the versioned JSON
+/// payload the worktree row stores.
+pub(crate) fn encode_project_worktree_scope_override(
+    scope_override: Option<&ProjectWorktreeScopeOverride>,
+) -> Result<Option<String>> {
+    scope_override
+        .map(|scope_override| {
+            serde_json::to_string(scope_override).map_err(|error| {
+                persistence_error(
+                    format!("could not encode the project worktree scope override: {error}"),
+                    false,
+                )
+            })
+        })
+        .transpose()
+}
+
+pub(crate) fn decode_project_worktree_scope_override(
+    payload: Option<String>,
+) -> Result<Option<ProjectWorktreeScopeOverride>> {
+    payload
+        .map(|payload| {
+            serde_json::from_str(&payload).map_err(|error| {
+                persistence_error(
+                    format!("persisted project worktree scope override is invalid: {error}"),
                     false,
                 )
             })
@@ -948,6 +1021,7 @@ pub(crate) fn delegated_task_request_fingerprint(task: &DelegatedTaskRecord) -> 
             dependencies: task.dependencies.clone(),
             code_change: task.code_change,
             permissions: task.permissions,
+            scope: None,
         },
     )
 }
@@ -959,8 +1033,23 @@ pub(crate) fn delegated_task_spec_fingerprint(
     spec: &DelegatedTaskSpec,
 ) -> Result<Vec<u8>> {
     // Preserve the pre-v48 fingerprint for permission-free tasks so retries of
-    // requests created by older servers remain idempotent after migration.
-    let payload = if spec.permissions == ProjectAgentPermissions::default() {
+    // requests created by older servers remain idempotent after migration. A
+    // declared file scope is part of the request only when one is declared, so
+    // a retry that adds or drops it is not mistaken for the same request.
+    let payload = if spec.scope.is_some() {
+        serde_json::to_vec(&(
+            project_id,
+            requester_session_id,
+            child_name,
+            &spec.intent,
+            &spec.model_id,
+            &spec.context_references,
+            &spec.dependencies,
+            spec.code_change,
+            spec.permissions,
+            &spec.scope,
+        ))
+    } else if spec.permissions == ProjectAgentPermissions::default() {
         serde_json::to_vec(&(
             project_id,
             requester_session_id,

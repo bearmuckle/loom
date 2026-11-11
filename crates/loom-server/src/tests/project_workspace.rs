@@ -22,6 +22,7 @@ fn delegate(
                 dependencies: Vec::new(),
                 code_change: false,
                 permissions: loom_core::ProjectAgentPermissions::default(),
+                scope: None,
             },
         )
         .unwrap();

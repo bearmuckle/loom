@@ -31,6 +31,7 @@ fn delegated_model_selector_size_matches_durable_storage() {
                     dependencies: Vec::new(),
                     code_change: false,
                     permissions: Default::default(),
+                    scope: None,
                 },
             )
             .unwrap_err();
@@ -510,6 +511,7 @@ fn project_concurrency_limit_queues_additional_children() {
                 dependencies: vec![],
                 code_change: false,
                 permissions: loom_core::ProjectAgentPermissions::default(),
+                scope: None,
             },
         )
     };
@@ -1315,6 +1317,7 @@ fn cancelling_project_child_cascades_deepest_first_and_survives_restart() {
                     delegation: true,
                     ..loom_core::ProjectAgentPermissions::default()
                 },
+                scope: None,
             },
         )
         .unwrap()
@@ -1344,6 +1347,7 @@ fn cancelling_project_child_cascades_deepest_first_and_survives_restart() {
                 dependencies: vec![],
                 code_change: false,
                 permissions: loom_core::ProjectAgentPermissions::default(),
+                scope: None,
             },
         )
         .unwrap()
@@ -2063,6 +2067,8 @@ fn auto_archive_waits_for_code_integration() {
         integrated_revision: None,
         landed_by: None,
         landed_evidence: None,
+        scope: None,
+        scope_override: None,
         status: loom_core::ProjectWorktreeStatus::Creating,
         conflict_paths: vec![],
         error: None,

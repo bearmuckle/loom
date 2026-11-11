@@ -78,6 +78,10 @@ impl InProcessConnection {
                 manager_session_id,
                 task_id,
                 expected_parent_revision,
+                // The wire request carries no scope override, so a client that
+                // is not the manager's tool surface can never land a commit its
+                // child's declaration leaves out of scope.
+                None,
             ),
             ClientRequest::Project(ProjectRequest::CleanupProjectChildWorktree {
                 project_id,

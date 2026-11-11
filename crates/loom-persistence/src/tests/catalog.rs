@@ -1457,6 +1457,8 @@ fn deleted_sessions_lose_their_rows_and_unused_content_in_one_transaction() {
         integrated_revision: None,
         landed_by: None,
         landed_evidence: None,
+        scope: None,
+        scope_override: None,
         status: ProjectWorktreeStatus::Creating,
         conflict_paths: Vec::new(),
         error: None,

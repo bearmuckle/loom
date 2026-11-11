@@ -7,6 +7,15 @@ use serde::{Deserialize, Serialize};
 /// Maximum hierarchy depth; the project manager is level one.
 pub const MAX_PROJECT_AGENT_DEPTH: u8 = 3;
 
+/// Paths one delegation may declare as a child's file scope.
+pub const MAX_PROJECT_CHILD_SCOPE_PATHS: usize = 64;
+
+/// Bytes of one declared scope path.
+pub const MAX_PROJECT_CHILD_SCOPE_PATH_BYTES: usize = 4096;
+
+/// Bytes of the reason recorded when a commit outside a declared scope lands.
+pub const MAX_PROJECT_CHILD_SCOPE_REASON_BYTES: usize = 4096;
+
 /// A session's position and client-visible status within a project hierarchy.
 /// Depth is one for the project root, two for its direct children, and three
 /// for the final supported level.
@@ -72,6 +81,10 @@ pub struct DelegatedTaskSpec {
     /// Independent project-agent capabilities granted to the child task.
     #[serde(default)]
     pub permissions: ProjectAgentPermissions,
+    /// The files a code child's commit may touch. `None` declares no scope, so
+    /// the child's commit is not checked against one.
+    #[serde(default)]
+    pub scope: Option<ProjectChildScope>,
 }
 
 /// Capabilities independently granted to one delegated project agent.
@@ -149,6 +162,132 @@ pub enum ProjectWorktreeLandedBy {
     /// The manager landed the change itself and named the revision and the
     /// evidence that carry it.
     Replay,
+}
+
+/// How a declared file scope reads its paths.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectChildScopeMode {
+    /// The listed paths are the allowlist a commit may touch.
+    Paths,
+    /// The listed paths are the only paths a commit may not touch.
+    OutOfScope,
+}
+
+/// The files a delegated code child's commit may touch, as its delegation
+/// declared them.
+///
+/// A path is repository-relative and matches itself and everything below it, so
+/// `crates/loom-vcs/src` covers `crates/loom-vcs/src/lib.rs` while
+/// `crates/loom-vcs/src/lib.rs` covers no other file. A scope declared in
+/// [`ProjectChildScopeMode::Paths`] is an allowlist; one declared in
+/// [`ProjectChildScopeMode::OutOfScope`] is the inverse and names what the child
+/// must leave alone.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectChildScope {
+    pub mode: ProjectChildScopeMode,
+    pub paths: Vec<String>,
+}
+
+/// Normalises one repository-relative scope path.
+///
+/// A leading `./` and a trailing `/` are dropped, so a caller can name a
+/// directory either way. An empty path, an absolute path, and a path that
+/// climbs out of the repository are refused rather than silently reinterpreted,
+/// because a scope that matches nothing would report every path out of scope.
+pub fn normalize_project_child_scope_path(path: &str) -> crate::Result<String> {
+    let path = path.trim();
+    let path = path.strip_prefix("./").unwrap_or(path);
+    let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        return Err(crate::LoomError::invalid_request(
+            "a declared scope path must not be empty",
+        ));
+    }
+    if path.len() > MAX_PROJECT_CHILD_SCOPE_PATH_BYTES {
+        return Err(crate::LoomError::invalid_request(format!(
+            "a declared scope path must be at most {MAX_PROJECT_CHILD_SCOPE_PATH_BYTES} bytes"
+        )));
+    }
+    if path.starts_with('/') || path.contains('\\') || path.contains('\0') {
+        return Err(crate::LoomError::invalid_request(format!(
+            "the declared scope path '{path}' must be repository-relative"
+        )));
+    }
+    if path
+        .split('/')
+        .any(|component| component == ".." || component.is_empty())
+    {
+        return Err(crate::LoomError::invalid_request(format!(
+            "the declared scope path '{path}' must stay inside the repository"
+        )));
+    }
+    Ok(path.to_owned())
+}
+
+impl ProjectChildScope {
+    /// Normalises a declaration, refusing duplicates and an empty path list.
+    ///
+    /// A declaration that named no path would put every changed path out of
+    /// scope, which is never what a manager means, so it is refused instead of
+    /// read as a stricter scope than intended.
+    pub fn new(mode: ProjectChildScopeMode, paths: &[String]) -> crate::Result<Self> {
+        if paths.is_empty() || paths.len() > MAX_PROJECT_CHILD_SCOPE_PATHS {
+            return Err(crate::LoomError::invalid_request(format!(
+                "a declared file scope names 1 to {MAX_PROJECT_CHILD_SCOPE_PATHS} paths"
+            )));
+        }
+        let mut normalized = Vec::with_capacity(paths.len());
+        for path in paths {
+            let path = normalize_project_child_scope_path(path)?;
+            if normalized.contains(&path) {
+                return Err(crate::LoomError::invalid_request(format!(
+                    "the declared scope path '{path}' is repeated"
+                )));
+            }
+            normalized.push(path);
+        }
+        Ok(Self {
+            mode,
+            paths: normalized,
+        })
+    }
+
+    /// Whether one changed path falls inside this declaration.
+    pub fn covers(&self, path: &str) -> bool {
+        let listed = self.paths.iter().any(|declared| {
+            path == declared
+                || path
+                    .strip_prefix(declared.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        });
+        match self.mode {
+            ProjectChildScopeMode::Paths => listed,
+            ProjectChildScopeMode::OutOfScope => !listed,
+        }
+    }
+
+    /// The changed paths this declaration leaves out of scope, in the order the
+    /// review reported them.
+    pub fn out_of_scope<'a>(
+        &'a self,
+        stats: &'a [crate::GitRevisionFileStat],
+    ) -> impl Iterator<Item = &'a crate::GitRevisionFileStat> {
+        stats.iter().filter(move |stat| !self.covers(&stat.path))
+    }
+}
+
+/// The override a manager recorded to land a commit its declaration leaves out
+/// of scope.
+///
+/// The accepted paths and the reason are stored together, so the record states
+/// what was landed outside the declaration and why instead of leaving the
+/// deviation implicit.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectWorktreeScopeOverride {
+    pub reason: String,
+    pub paths: Vec<String>,
+    pub recorded_at: Timestamp,
 }
 
 /// The revision a checkout was created from, together with how far that
@@ -279,6 +418,14 @@ pub struct ProjectWorktreeRecord {
     /// records written before the refresh existed.
     #[serde(default)]
     pub base_refresh: Option<ProjectWorktreeBaseRefresh>,
+    /// The files this child's commit may touch, as its delegation declared
+    /// them. `None` means the delegation declared no scope.
+    #[serde(default)]
+    pub scope: Option<ProjectChildScope>,
+    /// The override recorded when a commit outside the declared scope was
+    /// integrated, naming the accepted paths and the manager's reason.
+    #[serde(default)]
+    pub scope_override: Option<ProjectWorktreeScopeOverride>,
     pub result_revision: Option<String>,
     pub integrated_revision: Option<String>,
     /// How the reviewed result reached the parent history. `None` only for
@@ -421,7 +568,8 @@ mod tests {
     fn delegated_task_and_durable_message_contracts_round_trip() {
         use super::{
             AgentMessageDraft, AgentMessageKind, AgentMessageRecord, DelegatedTaskRecord,
-            DelegatedTaskSpec, DelegatedTaskStatus, ProjectAgentPermissions, TaskContextReference,
+            DelegatedTaskSpec, DelegatedTaskStatus, ProjectAgentPermissions, ProjectChildScope,
+            ProjectChildScopeMode, TaskContextReference,
         };
         use crate::{AgentMessageId, AgentSessionId, ProjectId, TaskId, Timestamp};
 
@@ -447,6 +595,10 @@ mod tests {
                 review: true,
                 integration: false,
             },
+            scope: Some(ProjectChildScope {
+                mode: ProjectChildScopeMode::Paths,
+                paths: vec!["crates/loom-vcs/src".into()],
+            }),
         };
         let task = DelegatedTaskRecord {
             task_id,
@@ -500,13 +652,17 @@ mod tests {
         });
         let legacy_spec: DelegatedTaskSpec = serde_json::from_value(legacy_spec).unwrap();
         assert_eq!(legacy_spec.permissions, ProjectAgentPermissions::default());
+        assert_eq!(
+            legacy_spec.scope, None,
+            "a task written before scopes existed declares none"
+        );
     }
 
     #[test]
     fn worktree_base_refresh_summarizes_drift_from_a_fetch() {
         use super::{
-            ProjectWorktreeBaseRefresh, ProjectWorktreeLandedBy, ProjectWorktreeRecord,
-            ProjectWorktreeStatus,
+            ProjectChildScope, ProjectChildScopeMode, ProjectWorktreeBaseRefresh,
+            ProjectWorktreeLandedBy, ProjectWorktreeRecord, ProjectWorktreeStatus,
         };
         use crate::{RepositoryId, TaskId};
 
@@ -571,6 +727,11 @@ mod tests {
             branch_name: "loom/project-child".into(),
             base_revision: base.into(),
             base_refresh: Some(fetched(0, 15)),
+            scope: Some(ProjectChildScope {
+                mode: ProjectChildScopeMode::OutOfScope,
+                paths: vec!["docs/".into()],
+            }),
+            scope_override: None,
             result_revision: None,
             integrated_revision: None,
             landed_by: Some(ProjectWorktreeLandedBy::Replay),
@@ -597,9 +758,112 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("base_refresh");
         legacy.as_object_mut().unwrap().remove("landed_by");
         legacy.as_object_mut().unwrap().remove("landed_evidence");
+        legacy.as_object_mut().unwrap().remove("scope");
+        legacy.as_object_mut().unwrap().remove("scope_override");
         let legacy: ProjectWorktreeRecord = serde_json::from_value(legacy).unwrap();
         assert_eq!(legacy.base_refresh, None);
         assert_eq!(legacy.landed_by, None);
         assert_eq!(legacy.landed_evidence, None);
+        assert_eq!(
+            legacy.scope, None,
+            "a worktree written before scopes declares none"
+        );
+        assert_eq!(legacy.scope_override, None);
+    }
+
+    #[test]
+    fn child_scope_covers_exact_paths_and_directories_and_reads_out_of_scope_as_the_inverse() {
+        use super::{
+            MAX_PROJECT_CHILD_SCOPE_PATHS, ProjectChildScope, ProjectChildScopeMode,
+            normalize_project_child_scope_path,
+        };
+        use crate::{GitRevisionChangeKind, GitRevisionFileStat};
+
+        let allowlist = ProjectChildScope::new(
+            ProjectChildScopeMode::Paths,
+            &["./crates/loom-vcs/src/".to_owned(), "Cargo.toml".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(
+            allowlist.paths,
+            vec!["crates/loom-vcs/src".to_owned(), "Cargo.toml".to_owned()]
+        );
+        assert!(allowlist.covers("crates/loom-vcs/src/lib.rs"));
+        assert!(allowlist.covers("crates/loom-vcs/src"));
+        assert!(allowlist.covers("Cargo.toml"));
+        assert!(
+            !allowlist.covers("crates/loom-vcs/srcs/lib.rs"),
+            "a directory prefix matches only a whole path component"
+        );
+        assert!(!allowlist.covers("crates/loom-server/src/lib.rs"));
+
+        let stats = vec![
+            GitRevisionFileStat {
+                path: "crates/loom-vcs/src/lib.rs".to_owned(),
+                original_path: None,
+                change: GitRevisionChangeKind::Modified,
+                additions: 4,
+                deletions: 1,
+                binary: false,
+            },
+            GitRevisionFileStat {
+                path: "crates/loom-server/src/new.rs".to_owned(),
+                original_path: None,
+                change: GitRevisionChangeKind::New,
+                additions: 9,
+                deletions: 0,
+                binary: false,
+            },
+        ];
+        assert_eq!(
+            allowlist
+                .out_of_scope(&stats)
+                .map(|stat| stat.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["crates/loom-server/src/new.rs"]
+        );
+
+        // The inverse declaration names what the child must leave alone, so the
+        // same commit is reported for the opposite reason.
+        let deny = ProjectChildScope::new(
+            ProjectChildScopeMode::OutOfScope,
+            &["crates/loom-server/src/new.rs".to_owned()],
+        )
+        .unwrap();
+        assert!(deny.covers("crates/loom-vcs/src/lib.rs"));
+        assert!(!deny.covers("crates/loom-server/src/new.rs"));
+        assert_eq!(
+            deny.out_of_scope(&stats)
+                .map(|stat| stat.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["crates/loom-server/src/new.rs"]
+        );
+
+        // A declaration that names nothing, repeats a path, or escapes the
+        // repository is refused instead of matching nothing.
+        assert!(ProjectChildScope::new(ProjectChildScopeMode::Paths, &[]).is_err());
+        assert!(
+            ProjectChildScope::new(
+                ProjectChildScopeMode::Paths,
+                &["src/lib.rs".to_owned(), "./src/lib.rs".to_owned()],
+            )
+            .is_err()
+        );
+        let too_many = (0..=MAX_PROJECT_CHILD_SCOPE_PATHS)
+            .map(|index| format!("src/{index}.rs"))
+            .collect::<Vec<_>>();
+        assert!(ProjectChildScope::new(ProjectChildScopeMode::Paths, &too_many).is_err());
+        for refused in [
+            "/etc/passwd",
+            "../outside",
+            "src/../lib.rs",
+            "src//lib.rs",
+            "",
+        ] {
+            assert!(
+                normalize_project_child_scope_path(refused).is_err(),
+                "'{refused}' must be refused"
+            );
+        }
     }
 }

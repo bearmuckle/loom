@@ -103,7 +103,7 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_delegate_code {
             definitions.push(ToolDefinition {
                 name: "delegate_project_code_task".to_owned(),
-                description: "Create a bounded code-changing child task in an isolated Git worktree based on the project's clean current revision. The child must commit its result and report the commit. Only use this for source changes; the child cannot access the parent checkout. Describe the intended change rather than quoting code, because the child reads its own checkout.".to_owned() + &child_model_guidance,
+                description: "Create a bounded code-changing child task in an isolated Git worktree based on the project's clean current revision. The child must commit its result and report the commit. Only use this for source changes; the child cannot access the parent checkout. Describe the intended change rather than quoting code, because the child reads its own checkout. Pass `paths` to declare the files its commit may touch, or `out_of_scope` to name the files it must leave alone; both are repository-relative, and a path covers itself and every path below it, so `crates/loom-vcs/src` covers `crates/loom-vcs/src/lib.rs`. Review and integration compare the child's commit with the declaration.".to_owned() + &child_model_guidance,
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -128,6 +128,18 @@ impl ToolExtension for ProjectAgentTools {
                             "type": "array",
                             "maxItems": 128,
                             "items": {"type": "string", "format": "uuid"}
+                        },
+                        "paths": {
+                            "type": "array",
+                            "maxItems": loom_core::MAX_PROJECT_CHILD_SCOPE_PATHS,
+                            "items": {"type": "string", "minLength": 1, "maxLength": loom_core::MAX_PROJECT_CHILD_SCOPE_PATH_BYTES},
+                            "description": "Repository-relative paths the child's commit may touch. A declared path covers itself and every path below it."
+                        },
+                        "out_of_scope": {
+                            "type": "array",
+                            "maxItems": loom_core::MAX_PROJECT_CHILD_SCOPE_PATHS,
+                            "items": {"type": "string", "minLength": 1, "maxLength": loom_core::MAX_PROJECT_CHILD_SCOPE_PATH_BYTES},
+                            "description": "Repository-relative paths the child's commit must leave alone; the inverse of `paths`, for when an allowlist is impractical. A declared path covers itself and every path below it."
                         },
                         "permissions": {
                             "type": "object",
@@ -228,7 +240,7 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_review_children {
             definitions.push(ToolDefinition {
                 name: "review_project_child".to_owned(),
-                description: "Review a code child by task_id. The default `stat` mode returns its checkout status, each changed path with its kind of change and line counts, and its commits with subjects and patch ids, so a large or move-only change is reviewed without its patch. `mode: \"diff\"` returns a bounded patch instead: `paths` limits it, `max_bytes` caps each file, `context` sets context lines, and every truncation is marked. Read the rest of a file with `read_child_file`.".to_owned(),
+                description: "Review a code child by task_id. The default `stat` mode returns its checkout status, each changed path with its kind of change and line counts, and its commits with subjects and patch ids, so a large or move-only change is reviewed without its patch. It also reports whether the change stays inside the file scope the delegation declared: `in_scope` is true or false, every out-of-scope path is named with its line counts and whether it is a new file, and a child whose delegation declared no scope says so instead of reporting it in scope. `mode: \"diff\"` returns a bounded patch instead: `paths` limits it, `max_bytes` caps each file, `context` sets context lines, and every truncation is marked. Read the rest of a file with `read_child_file`.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -261,12 +273,14 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_integrate_children {
             definitions.push(ToolDefinition {
                 name: "integrate_project_child".to_owned(),
-                description: "Integrate a completed, reviewed code child's committed revision into your clean parent checkout. Supply the base revision reported by review. Integration fast-forwards when possible and otherwise creates a merge commit, so your checkout may have advanced. A conflict is refused with its paths preserved; nothing is force-applied or partially landed.".to_owned(),
+                description: "Integrate a completed, reviewed code child's committed revision into your clean parent checkout. Supply the base revision reported by review. Integration fast-forwards when possible and otherwise creates a merge commit, so your checkout may have advanced. A conflict is refused with its paths preserved; nothing is force-applied or partially landed. A commit that touches a path outside the file scope its delegation declared is refused and the offending paths are named; pass `allow_out_of_scope` with a `reason` to land it anyway, which records the reason and the accepted paths on the child's record.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "task_id": {"type": "string", "format": "uuid"},
-                        "expected_parent_revision": {"type": "string", "minLength": 1, "maxLength": 64}
+                        "expected_parent_revision": {"type": "string", "minLength": 1, "maxLength": 64},
+                        "allow_out_of_scope": {"type": "boolean", "description": "Land a commit that touches paths outside the declared file scope."},
+                        "reason": {"type": "string", "minLength": 1, "maxLength": loom_core::MAX_PROJECT_CHILD_SCOPE_REASON_BYTES, "description": "Why the out-of-scope commit is landed; required with allow_out_of_scope and recorded with the override."}
                     },
                     "required": ["task_id", "expected_parent_revision"],
                     "additionalProperties": false
@@ -993,6 +1007,36 @@ impl ProjectAgentTools {
             .kind
             .as_deref()
             .and_then(|kind| loom_core::normalize_child_model_kind(kind).ok());
+        // A declared file scope is the allowlist or the explicit deny list the
+        // child's commit is checked against at review and integration time. An
+        // explicitly empty declaration is refused rather than read as none.
+        let declared_scope = match (
+            arguments.paths.as_deref(),
+            arguments.out_of_scope.as_deref(),
+        ) {
+            (None, None) => None,
+            (Some(_), Some(_)) => {
+                return ToolResult::failure(
+                    call,
+                    "declare a child's file scope with `paths` or `out_of_scope`, not both",
+                );
+            }
+            (Some(paths), None) => Some((loom_core::ProjectChildScopeMode::Paths, paths)),
+            (None, Some(paths)) => Some((loom_core::ProjectChildScopeMode::OutOfScope, paths)),
+        };
+        let scope = match declared_scope {
+            Some((mode, paths)) => match loom_core::ProjectChildScope::new(mode, paths) {
+                Ok(scope) => Some(scope),
+                Err(error) => return ToolResult::failure(call, error.message),
+            },
+            None => None,
+        };
+        if scope.is_some() && !code_change {
+            return ToolResult::failure(
+                call,
+                "a declared file scope applies to a code child's commit; declare it on a code task",
+            );
+        }
         let request_id = RequestId::from_uuid(*call.id.as_uuid());
         let spec = DelegatedTaskSpec {
             intent: arguments.intent,
@@ -1001,6 +1045,7 @@ impl ProjectAgentTools {
             dependencies: arguments.dependencies,
             code_change,
             permissions: arguments.permissions,
+            scope: scope.clone(),
         };
         match connection.create_project_child(
             request_id,
@@ -1022,6 +1067,7 @@ impl ProjectAgentTools {
                         "model_id": task.model_id,
                         "model_source": choice.source,
                         "kind": kind,
+                        "scope": scope,
                         "checkout_base": self.child_checkout_base(task.task_id),
                     }))
                     .unwrap_or_else(|error| format!("could not encode delegation result: {error}")),
@@ -1329,6 +1375,8 @@ impl ProjectAgentTools {
                 "result_revision": worktree.as_ref().and_then(|worktree| worktree.result_revision.clone()),
                 "result_revision_is_base": worktree.as_ref().map(|worktree| worktree.result_revision.as_deref().is_none_or(|revision| revision == worktree.base_revision)),
                 "integrated_revision": worktree.as_ref().and_then(|worktree| worktree.integrated_revision.clone()),
+                "scope": worktree.as_ref().and_then(|worktree| worktree.scope.clone()),
+                "scope_override": worktree.as_ref().and_then(|worktree| worktree.scope_override.clone()),
                 "landed_by": worktree.as_ref().and_then(|worktree| worktree.landed_by),
                 "worktree_uncommitted_path_count": checkout_state.as_ref().map(|state| state.uncommitted_paths),
                 "worktree_uncommitted_line_delta": checkout_state.as_ref().map(|state| serde_json::json!({
@@ -1643,6 +1691,26 @@ impl ProjectAgentTools {
                 "expected_parent_revision must contain 1 to 64 bytes",
             );
         }
+        // An out-of-scope landing is recorded with the manager's reason, so it is
+        // refused here when the reason is missing rather than landing silently.
+        let scope_override = if arguments.allow_out_of_scope {
+            let reason = arguments.reason.unwrap_or_default();
+            let reason = reason.trim();
+            if reason.is_empty() || reason.len() > loom_core::MAX_PROJECT_CHILD_SCOPE_REASON_BYTES {
+                return ToolResult::failure(
+                    call,
+                    format!(
+                        "allow_out_of_scope requires a reason of 1 to {} bytes stating why the out-of-scope commit is landed",
+                        loom_core::MAX_PROJECT_CHILD_SCOPE_REASON_BYTES
+                    ),
+                );
+            }
+            Some(ProjectChildScopeOverrideRequest {
+                reason: reason.to_owned(),
+            })
+        } else {
+            None
+        };
         let Some(connection) = self.connection() else {
             return ToolResult::failure(call, "project backend is no longer available");
         };
@@ -1652,6 +1720,7 @@ impl ProjectAgentTools {
             self.session_id,
             arguments.task_id,
             arguments.expected_parent_revision,
+            scope_override,
         ) {
             Ok(ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(worktree))) => {
                 ToolResult {
@@ -1662,6 +1731,8 @@ impl ProjectAgentTools {
                         "task_id": worktree.task_id,
                         "status": worktree.status,
                         "integrated_revision": worktree.integrated_revision,
+                        "scope": worktree.scope,
+                        "scope_override": worktree.scope_override,
                     }))
                     .unwrap_or_else(|error| format!("could not encode child integration: {error}")),
                 }
@@ -1694,6 +1765,7 @@ fn project_child_review_output(
         "head_revision": view.status.head,
         "run_state": run.map(|summary| summary.snapshot.state),
         "run_summary": run.and_then(|summary| summary.snapshot.summary.clone()),
+        "scope": project_child_scope_report(view.worktree.scope.as_ref(), &view.stat),
     });
     if let Some(diff) = view.diff.as_ref() {
         data["mode"] = serde_json::json!("diff");
@@ -1767,6 +1839,60 @@ fn project_child_review_output(
         "A stat review carries no patch bodies: each path reports its kind of change and line counts, and each commit its subject and patch id. The file and commit listings are bounded by max_bytes, while the worktree record and checkout status are always returned. Pass mode `diff` with paths, max_bytes, and context for a bounded patch, or read an exact line range with read_child_file(task_id, path, line_start, line_end)."
     );
     serde_json::json!({"type": "project_child_review", "data": data})
+}
+
+/// The scope part of a child review.
+///
+/// A review that names no declaration says so instead of reporting the change
+/// in scope, because an undeclared scope checks nothing. A declared one reports
+/// whether the change stays inside it, and names every out-of-scope path with
+/// its line counts and whether the child created it.
+fn project_child_scope_report(
+    scope: Option<&loom_core::ProjectChildScope>,
+    stat: &[loom_core::GitRevisionFileStat],
+) -> serde_json::Value {
+    let Some(scope) = scope else {
+        return serde_json::json!({
+            "declared": false,
+            "note": "No file scope was declared for this child, so its change is not checked against one. A delegation declares one with `paths` or `out_of_scope`.",
+        });
+    };
+    let out_of_scope = scope.out_of_scope(stat).collect::<Vec<_>>();
+    let total = out_of_scope.len();
+    let new_files = out_of_scope
+        .iter()
+        .filter(|stat| stat.change == loom_core::GitRevisionChangeKind::New)
+        .map(|stat| stat.path.clone())
+        .collect::<Vec<_>>();
+    // A review is bounded whatever the size of the change, so the named paths
+    // stop at the same bound a diff review accepts and the rest are counted.
+    let truncated = out_of_scope.len() > MAX_REVIEW_PATHS;
+    let out_of_scope = out_of_scope
+        .iter()
+        .take(MAX_REVIEW_PATHS)
+        .map(|stat| {
+            serde_json::json!({
+                "path": stat.path,
+                "change": stat.change,
+                "additions": stat.additions,
+                "deletions": stat.deletions,
+                "binary": stat.binary,
+                "new": stat.change == loom_core::GitRevisionChangeKind::New,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "declared": true,
+        "mode": scope.mode,
+        "paths": scope.paths,
+        "in_scope": total == 0,
+        "out_of_scope": out_of_scope,
+        "out_of_scope_total": total,
+        "new_out_of_scope_files": new_files.iter().take(MAX_REVIEW_PATHS).cloned().collect::<Vec<_>>(),
+        "new_out_of_scope_files_total": new_files.len(),
+        "truncated": truncated,
+        "note": "A declared path covers itself and every path below it, so a directory declaration covers the files in it. The out-of-scope paths are the ones this review would refuse at integration, and they stop at the review's path bound while out_of_scope_total stays exact.",
+    })
 }
 
 /// The sentence a delegation tool description ends with: how this project

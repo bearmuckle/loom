@@ -342,6 +342,7 @@ fn a_delegated_child_session_is_never_auto_titled() {
                 dependencies: Vec::new(),
                 code_change: false,
                 permissions: loom_core::ProjectAgentPermissions::default(),
+                scope: None,
             },
         )
         .unwrap()

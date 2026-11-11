@@ -474,6 +474,9 @@ pub(super) fn git_output(dir: &Path, arguments: &[&str]) -> String {
 }
 
 pub(super) fn commit_file(dir: &Path, file: &str, content: &str, message: &str) {
+    if let Some(parent) = Path::new(file).parent() {
+        fs::create_dir_all(dir.join(parent)).unwrap();
+    }
     fs::write(dir.join(file), content).unwrap();
     git_in(dir, &["config", "user.name", "Loom Test"]);
     git_in(dir, &["config", "user.email", "loom@example.test"]);
@@ -590,6 +593,8 @@ pub(super) fn pending_project_code_child_fixture() -> ProjectCodeChildFixture {
         integrated_revision: None,
         landed_by: None,
         landed_evidence: None,
+        scope: None,
+        scope_override: None,
         status: ProjectWorktreeStatus::Creating,
         conflict_paths: Vec::new(),
         error: None,
@@ -799,6 +804,7 @@ pub(super) fn dependency_failure_blocks_child_and_releases_manager_wait_once(
                     inspection: true,
                     ..loom_core::ProjectAgentPermissions::default()
                 },
+                scope: None,
             },
         )
         .unwrap()
@@ -832,6 +838,7 @@ pub(super) fn dependency_failure_blocks_child_and_releases_manager_wait_once(
                 dependencies: vec![],
                 code_change: false,
                 permissions: loom_core::ProjectAgentPermissions::default(),
+                scope: None,
             },
         )
         .unwrap();
