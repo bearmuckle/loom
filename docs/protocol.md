@@ -623,7 +623,9 @@ the session goal field, request, response, and event; 11.13 adds clearing it.
 11.14 adds the one-time sign-in credential; 11.15 adds `RestoreAgentSession`
 with its response and `AgentSessionRestored` event; 11.16 adds `SetAgentRunModel`
 and the `ModelChanged` run event; 11.17 adds `GetProjectChildModels` and
-`SetProjectChildModels` with the `ProjectChildModels` response. Every addition is a new enum
+`SetProjectChildModels` with the `ProjectChildModels` response; 11.19 adds the
+`mark_landed` project child control action, which records a reviewed result the
+manager landed itself and reports `landed_by` on the worktree. Every addition is a new enum
 variant, a capability, or a field with a compatible default (an omitted field
 keeps the older behavior), so clients of an older 11.x minor keep working; they
 simply never send the new requests, negotiate the new capability, or ask for
