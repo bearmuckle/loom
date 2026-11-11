@@ -57,6 +57,43 @@ pub enum RebaseIntegrationOutcome {
 /// remote refresh.
 pub const DEFAULT_REMOTE_REFRESH_DEADLINE: Duration = Duration::from_secs(30);
 
+/// Most commits one patch-identity comparison examines, so a caller that runs
+/// the comparison on every turn stays bounded.
+pub const MAX_PATCH_ID_COMMITS: usize = 512;
+
+/// Most paths one change-containment comparison examines.
+pub const MAX_CHANGE_CARRY_PATHS: usize = 4096;
+
+/// One commit of a range together with the identity of the change it
+/// introduces.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitCommitPatch {
+    /// The commit the identity belongs to.
+    pub revision: String,
+    /// Identity of the change this commit introduces. It is comparable only
+    /// with identities computed by this crate, never with a persisted value.
+    pub patch_id: u64,
+}
+
+/// The result of comparing one revision with the change another commit range
+/// introduces.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitChangeCarry {
+    /// Paths the change touches, sorted.
+    pub changed_paths: Vec<String>,
+    /// Paths whose resulting content at the compared revision differs from the
+    /// content the change gives them.
+    pub mismatched_paths: Vec<String>,
+}
+
+impl GitChangeCarry {
+    /// Whether the compared revision holds the whole change. A change that
+    /// touches no path is not carried by anything, so it never counts.
+    pub fn is_carried(&self) -> bool {
+        !self.changed_paths.is_empty() && self.mismatched_paths.is_empty()
+    }
+}
+
 /// Outcome of [`GitService::create_mirror`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MirrorCreation {
@@ -1310,6 +1347,110 @@ impl GitService {
         self.is_ancestor(ancestor, descendant)
     }
 
+    /// The commits `tip` has that `base` does not, newest first, each with the
+    /// identity of the change it introduces.
+    ///
+    /// The identity is the commit's diff against its first parent with hunk
+    /// headers dropped and whitespace removed, so the same change applied under
+    /// another commit id, message, author, or line offset keeps its identity:
+    /// a cherry-pick, a replay, and a squash of one commit are recognised as
+    /// carrying the same work. It is only comparable with identities this crate
+    /// produced, never with a persisted value.
+    ///
+    /// A range larger than [`MAX_PATCH_ID_COMMITS`] is refused instead of
+    /// walking an unbounded history.
+    pub fn patch_commits_since(&self, base: &str, tip: &str) -> Result<Vec<GitCommitPatch>> {
+        let repository = self.repository()?;
+        let base_commit = resolve_commit(&repository, base, "base")?.id();
+        let tip_commit = resolve_commit(&repository, tip, "tip")?.id();
+        let mut walk = repository
+            .revwalk()
+            .map_err(|error| git_error("could not walk Git history for patch identities", error))?;
+        walk.push(tip_commit)
+            .map_err(|error| git_error("could not walk from the reviewed revision", error))?;
+        walk.hide(base_commit).map_err(|error| {
+            git_error(
+                "could not exclude the history of the compared base revision",
+                error,
+            )
+        })?;
+        let mut commits = Vec::new();
+        for revision in walk {
+            let revision =
+                revision.map_err(|error| git_error("could not walk Git history", error))?;
+            let commit = repository
+                .find_commit(revision)
+                .map_err(|error| git_error("could not read a walked commit", error))?;
+            commits.push(GitCommitPatch {
+                revision: revision.to_string(),
+                patch_id: commit_patch_id(&repository, &commit)?,
+            });
+            if commits.len() > MAX_PATCH_ID_COMMITS {
+                return Err(LoomError::invalid_state(format!(
+                    "the history between {base} and {tip} has more than {MAX_PATCH_ID_COMMITS} commits to compare"
+                )));
+            }
+        }
+        Ok(commits)
+    }
+
+    /// Compares `revision` with the change `base..tip` introduces.
+    ///
+    /// The change is described by the content it gives every path it touches,
+    /// so a revision that already holds that content carries the change even
+    /// when it is a different commit with a different message.
+    pub fn change_carry(&self, base: &str, tip: &str, revision: &str) -> Result<GitChangeCarry> {
+        let repository = self.repository()?;
+        let base_commit = resolve_commit(&repository, base, "base")?;
+        let tip_commit = resolve_commit(&repository, tip, "tip")?;
+        let compared_commit = resolve_commit(&repository, revision, "revision")?;
+        let base_tree = base_commit
+            .tree()
+            .map_err(|error| git_error("could not read the compared base tree", error))?;
+        let tip_tree = tip_commit
+            .tree()
+            .map_err(|error| git_error("could not read the reviewed tree", error))?;
+        let compared_tree = compared_commit
+            .tree()
+            .map_err(|error| git_error("could not read the compared revision tree", error))?;
+        let diff = repository
+            .diff_tree_to_tree(Some(&base_tree), Some(&tip_tree), None)
+            .map_err(|error| git_error("could not diff the reviewed change", error))?;
+        let mut changed_paths = Vec::new();
+        let mut mismatched_paths = Vec::new();
+        for delta in diff.deltas() {
+            let (path, resulting) = match delta.status() {
+                git2::Delta::Deleted => (delta.old_file().path(), None),
+                git2::Delta::Unmodified
+                | git2::Delta::Ignored
+                | git2::Delta::Untracked
+                | git2::Delta::Conflicted => continue,
+                _ => (delta.new_file().path(), Some(delta.new_file().id())),
+            };
+            let Some(path) = path else { continue };
+            let path = path.to_string_lossy().replace('\\', "/");
+            let held = compared_tree
+                .get_path(Path::new(&path))
+                .ok()
+                .map(|e| e.id());
+            if held != resulting {
+                mismatched_paths.push(path.clone());
+            }
+            changed_paths.push(path);
+            if changed_paths.len() > MAX_CHANGE_CARRY_PATHS {
+                return Err(LoomError::invalid_state(format!(
+                    "the change between {base} and {tip} touches more than {MAX_CHANGE_CARRY_PATHS} paths to compare"
+                )));
+            }
+        }
+        changed_paths.sort();
+        mismatched_paths.sort();
+        Ok(GitChangeCarry {
+            changed_paths,
+            mismatched_paths,
+        })
+    }
+
     /// Integrates a reviewed child commit into the clean checked-out branch at
     /// `expected_parent`.
     ///
@@ -2067,6 +2208,111 @@ impl GitService {
     fn repository(&self) -> Result<Repository> {
         Repository::open(&self.root)
             .map_err(|error| git_error("could not open Git repository", error))
+    }
+}
+
+/// Resolves a revision string to the commit it names, reporting a malformed
+/// revision as an invalid request rather than a VCS failure.
+fn resolve_commit<'repo>(
+    repository: &'repo Repository,
+    revision: &str,
+    role: &str,
+) -> Result<git2::Commit<'repo>> {
+    let oid = Oid::from_str(revision).map_err(|error| {
+        LoomError::invalid_request(format!("invalid Git {role} revision '{revision}': {error}"))
+    })?;
+    repository
+        .find_commit(oid)
+        .map_err(|error| git_error(&format!("could not resolve Git {role} revision"), error))
+}
+
+/// Identity of the change one commit introduces against its first parent.
+///
+/// Hunk headers, line numbers, the commit message, and all whitespace are left
+/// out, so the same change keeps its identity wherever it is applied. A
+/// binary change carries no patch lines, so its resulting content is hashed
+/// instead, and a change that only moves a file mode is identified by the
+/// modes alone.
+fn commit_patch_id(repository: &Repository, commit: &git2::Commit<'_>) -> Result<u64> {
+    let tree = commit
+        .tree()
+        .map_err(|error| git_error("could not read a commit tree for its patch identity", error))?;
+    let parent_tree = match commit.parents().next() {
+        Some(parent) => Some(
+            parent
+                .tree()
+                .map_err(|error| git_error("could not read a commit parent tree", error))?,
+        ),
+        // A commit without a parent introduces its whole tree.
+        None => None,
+    };
+    let diff = repository
+        .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)
+        .map_err(|error| git_error("could not diff a commit for its patch identity", error))?;
+    let mut id = PatchIdHasher::new();
+    for delta in diff.deltas() {
+        id.write(b"\0file\0");
+        id.write(format!("{:?}", delta.status()).as_bytes());
+        id.write(b"\0");
+        write_optional_path(&mut id, delta.old_file().path());
+        id.write(b"\0");
+        write_optional_path(&mut id, delta.new_file().path());
+        id.write(b"\0");
+        id.write(&u32::from(delta.old_file().mode()).to_le_bytes());
+        id.write(&u32::from(delta.new_file().mode()).to_le_bytes());
+        if delta.old_file().is_binary() || delta.new_file().is_binary() {
+            id.write(delta.new_file().id().as_bytes());
+        }
+    }
+    diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+        let origin = line.origin();
+        if matches!(origin, ' ' | '+' | '-') {
+            id.write(&[origin as u8]);
+            id.write(&strip_patch_whitespace(line.content()));
+            id.write(b"\0");
+        }
+        true
+    })
+    .map_err(|error| git_error("could not render a commit patch identity", error))?;
+    Ok(id.finish())
+}
+
+/// Writes one optional patch path, so a delta without a side stays distinct
+/// from one whose path is literally empty.
+fn write_optional_path(id: &mut PatchIdHasher, path: Option<&Path>) {
+    match path {
+        Some(path) => id.write(path.to_string_lossy().as_bytes()),
+        None => id.write(b"-"),
+    }
+}
+
+/// The bytes of one patch line without any whitespace, so an identity does not
+/// depend on indentation, line endings, or trailing whitespace.
+fn strip_patch_whitespace(content: &[u8]) -> Vec<u8> {
+    content
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect()
+}
+
+/// A small deterministic 64-bit FNV-1a accumulator for patch identities.
+struct PatchIdHasher(u64);
+
+impl PatchIdHasher {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn finish(self) -> u64 {
+        self.0
     }
 }
 
@@ -4925,6 +5171,89 @@ mod tests {
         assert_eq!(
             fs::read_to_string(root.join("target/artifact")).unwrap(),
             "build output\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn patch_identities_recognise_a_cherry_picked_change() {
+        let (git, root) = repository();
+        let base = git.status().unwrap().head.unwrap();
+        let parent_branch = git.current_branch().unwrap().unwrap();
+        let child_branch = format!("codex/patch-{}", loom_core::RepositoryId::new());
+        run(&root, &["checkout", "-qb", &child_branch]);
+        write_commit(&root, "child.txt", "child\n", "child change");
+        write_commit(&root, "child2.txt", "second\n", "child follow-up");
+        let reviewed_tip = git.status().unwrap().head.unwrap();
+        run(&root, &["checkout", "-q", &parent_branch]);
+
+        let reviewed = git.patch_commits_since(&base, &reviewed_tip).unwrap();
+        assert_eq!(reviewed.len(), 2);
+        assert_eq!(reviewed[0].revision, reviewed_tip, "walks newest first");
+        assert_ne!(
+            reviewed[0].patch_id, reviewed[1].patch_id,
+            "separate changes have separate identities"
+        );
+
+        // The same change applied as another commit with another message and
+        // author keeps its identity. The follow-up commit is replayed first
+        // because replaying a commit onto its own parent produces the very same
+        // commit.
+        run(&root, &["cherry-pick", &reviewed[0].revision]);
+        let picked = git.status().unwrap().head.unwrap();
+        assert_ne!(picked, reviewed[0].revision);
+        let landed = git.patch_commits_since(&base, &picked).unwrap();
+        assert_eq!(landed[0].revision, picked);
+        assert_eq!(landed[0].patch_id, reviewed[0].patch_id);
+
+        // Only one of the two reviewed changes is present, so the reviewed set
+        // is only partly carried.
+        let carry = git.change_carry(&base, &reviewed_tip, &picked).unwrap();
+        assert_eq!(
+            carry.changed_paths,
+            vec!["child.txt".to_owned(), "child2.txt".to_owned()]
+        );
+        assert_eq!(carry.mismatched_paths, vec!["child.txt".to_owned()]);
+        assert!(!carry.is_carried());
+
+        run(&root, &["cherry-pick", &reviewed[1].revision]);
+        let landed_both = git.status().unwrap().head.unwrap();
+        assert!(
+            git.change_carry(&base, &reviewed_tip, &landed_both)
+                .unwrap()
+                .is_carried()
+        );
+        let landed = git.patch_commits_since(&base, &landed_both).unwrap();
+        let landed_ids = landed
+            .iter()
+            .map(|commit| commit.patch_id)
+            .collect::<Vec<_>>();
+        assert!(
+            reviewed
+                .iter()
+                .all(|commit| landed_ids.contains(&commit.patch_id)),
+            "every reviewed patch is now part of the parent history"
+        );
+
+        // A range with no commits and a change that touches no path are both
+        // reported as carrying nothing.
+        assert!(git.patch_commits_since(&base, &base).unwrap().is_empty());
+        assert!(
+            !git.change_carry(&base, &base, &landed_both)
+                .unwrap()
+                .is_carried()
+        );
+        assert_eq!(
+            git.patch_commits_since("not-a-revision", &reviewed_tip)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            git.change_carry(&base, &reviewed_tip, &"0".repeat(40))
+                .unwrap_err()
+                .code,
+            ErrorCode::Vcs
         );
         fs::remove_dir_all(root).unwrap();
     }

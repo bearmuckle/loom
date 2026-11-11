@@ -1928,6 +1928,8 @@ fn an_action_request_to_a_completed_code_child_is_refused() {
                 base_refresh: None,
                 result_revision: None,
                 integrated_revision: None,
+                landed_by: None,
+                landed_evidence: None,
                 status: ProjectWorktreeStatus::Creating,
                 conflict_paths: Vec::new(),
                 error: None,

@@ -847,6 +847,10 @@ CREATE TABLE IF NOT EXISTS project_worktrees (
     base_revision TEXT NOT NULL CHECK(length(trim(base_revision)) > 0 AND length(base_revision) <= 256),
     result_revision TEXT CHECK(result_revision IS NULL OR length(result_revision) <= 256),
     integrated_revision TEXT CHECK(integrated_revision IS NULL OR length(integrated_revision) <= 256),
+    landed_by TEXT CHECK(landed_by IS NULL OR landed_by IN (
+        'integrated', 'already_present', 'replay'
+    )),
+    landed_evidence TEXT CHECK(landed_evidence IS NULL OR length(CAST(landed_evidence AS BLOB)) <= 4096),
     status TEXT NOT NULL CHECK(status IN (
         'creating', 'ready', 'stale', 'conflict', 'integrating', 'integrated', 'recovery_required',
         'cleanup_pending', 'retained', 'removed'
@@ -1334,6 +1338,33 @@ fn migrate_schema_transaction(connection: &Connection, from_version: u32) -> Res
             // every delegated child keeps reusing its parent's model.
             16 => {
                 version = 17;
+            }
+            // v18 records how a reviewed child result reached the parent
+            // history, so a landing the manager performed itself can be
+            // recorded instead of refused. A database from an older revision
+            // may not have the worktree table yet; the baseline batches add it
+            // with the new columns, so the ALTER applies only where needed.
+            17 => {
+                if migration_table_exists(&transaction, "project_worktrees")?
+                    && !migration_column_exists(&transaction, "project_worktrees", "landed_by")?
+                {
+                    transaction
+                        .execute_batch(
+                            "ALTER TABLE project_worktrees ADD COLUMN landed_by TEXT
+                                 CHECK(landed_by IS NULL OR landed_by IN (
+                                     'integrated', 'already_present', 'replay'));
+                             ALTER TABLE project_worktrees ADD COLUMN landed_evidence TEXT
+                                 CHECK(landed_evidence IS NULL
+                                     OR length(CAST(landed_evidence AS BLOB)) <= 4096);",
+                        )
+                        .map_err(|error| {
+                            persistence_error(
+                                format!("could not migrate persistence schema to v18: {error}"),
+                                true,
+                            )
+                        })?;
+                }
+                version = 18;
             }
             other => return Err(unsupported_database_error(other)),
         }

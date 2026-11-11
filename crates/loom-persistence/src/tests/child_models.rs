@@ -213,7 +213,7 @@ fn migrates_a_v16_database_by_adding_the_child_model_table() {
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     assert_eq!(version, DATABASE_SCHEMA_VERSION);
-    assert_eq!(DATABASE_SCHEMA_VERSION, 17);
+    assert_eq!(DATABASE_SCHEMA_VERSION, 18);
     let sessions: i64 = connection
         .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
         .unwrap();

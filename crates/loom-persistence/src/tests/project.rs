@@ -349,6 +349,8 @@ fn project_child_and_agent_messages_are_atomic_ordered_and_request_idempotent() 
         }),
         result_revision: None,
         integrated_revision: None,
+        landed_by: None,
+        landed_evidence: None,
         status: ProjectWorktreeStatus::Creating,
         conflict_paths: Vec::new(),
         error: None,
@@ -369,7 +371,9 @@ fn project_child_and_agent_messages_are_atomic_ordered_and_request_idempotent() 
     assert_eq!(created, task);
     let worktree = ProjectWorktreeRecord {
         result_revision: Some("result-sha".to_owned()),
-        integrated_revision: None,
+        integrated_revision: Some("landed-sha".to_owned()),
+        landed_by: Some(ProjectWorktreeLandedBy::Replay),
+        landed_evidence: Some("squashed into the parent tip".to_owned()),
         status: ProjectWorktreeStatus::Conflict,
         conflict_paths: vec!["src/main.rs".to_owned(), "docs/plan.md".to_owned()],
         error: Some("integration found conflicts".to_owned()),

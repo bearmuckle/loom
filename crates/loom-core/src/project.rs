@@ -131,6 +131,26 @@ pub enum ProjectWorktreeCleanupDisposition {
     DiscardChanges,
 }
 
+/// How a reviewed code result reached the parent history.
+///
+/// A manager that lands the reviewed change itself — by cherry-picking,
+/// replaying, or squashing the child's commits — leaves no integration for
+/// Loom to perform, so the record has to state which way the change arrived
+/// instead of leaving the completion guard to refuse the result.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectWorktreeLandedBy {
+    /// Loom integrated the reviewed revision: a fast-forward, a merge, or a
+    /// completed record for a result the parent already contained.
+    Integrated,
+    /// The parent history already carried the child's patch, which was matched
+    /// by patch identity rather than by commit identity.
+    AlreadyPresent,
+    /// The manager landed the change itself and named the revision and the
+    /// evidence that carry it.
+    Replay,
+}
+
 /// The revision a checkout was created from, together with how far that
 /// revision is from the default branch of the remote that was fetched for it.
 ///
@@ -261,6 +281,14 @@ pub struct ProjectWorktreeRecord {
     pub base_refresh: Option<ProjectWorktreeBaseRefresh>,
     pub result_revision: Option<String>,
     pub integrated_revision: Option<String>,
+    /// How the reviewed result reached the parent history. `None` only for
+    /// records written before landings were recorded.
+    #[serde(default)]
+    pub landed_by: Option<ProjectWorktreeLandedBy>,
+    /// The manager's note recorded by the explicit `mark_landed` action, so a
+    /// landing Loom did not perform is never silent.
+    #[serde(default)]
+    pub landed_evidence: Option<String>,
     pub status: ProjectWorktreeStatus,
     pub conflict_paths: Vec<String>,
     pub error: Option<String>,
@@ -476,7 +504,10 @@ mod tests {
 
     #[test]
     fn worktree_base_refresh_summarizes_drift_from_a_fetch() {
-        use super::{ProjectWorktreeBaseRefresh, ProjectWorktreeRecord, ProjectWorktreeStatus};
+        use super::{
+            ProjectWorktreeBaseRefresh, ProjectWorktreeLandedBy, ProjectWorktreeRecord,
+            ProjectWorktreeStatus,
+        };
         use crate::{RepositoryId, TaskId};
 
         let base = "0123456789abcdef0123456789abcdef01234567";
@@ -542,6 +573,8 @@ mod tests {
             base_refresh: Some(fetched(0, 15)),
             result_revision: None,
             integrated_revision: None,
+            landed_by: Some(ProjectWorktreeLandedBy::Replay),
+            landed_evidence: Some("replayed onto the parent tip".into()),
             status: ProjectWorktreeStatus::Ready,
             conflict_paths: vec![],
             error: None,
@@ -552,14 +585,21 @@ mod tests {
         let encoded = serde_json::to_value(&record).unwrap();
         assert_eq!(encoded["base_refresh"]["state"], "fetched");
         assert_eq!(encoded["base_refresh"]["behind"], 15);
+        assert_eq!(encoded["landed_by"], "replay");
         assert_eq!(
             serde_json::from_value::<ProjectWorktreeRecord>(encoded).unwrap(),
             record
         );
 
+        // A record written before a landing was recorded decodes with no
+        // landing rather than failing to load.
         let mut legacy = serde_json::to_value(&record).unwrap();
         legacy.as_object_mut().unwrap().remove("base_refresh");
+        legacy.as_object_mut().unwrap().remove("landed_by");
+        legacy.as_object_mut().unwrap().remove("landed_evidence");
         let legacy: ProjectWorktreeRecord = serde_json::from_value(legacy).unwrap();
         assert_eq!(legacy.base_refresh, None);
+        assert_eq!(legacy.landed_by, None);
+        assert_eq!(legacy.landed_evidence, None);
     }
 }

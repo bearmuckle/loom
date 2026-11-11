@@ -2061,6 +2061,8 @@ fn auto_archive_waits_for_code_integration() {
         base_refresh: None,
         result_revision: None,
         integrated_revision: None,
+        landed_by: None,
+        landed_evidence: None,
         status: loom_core::ProjectWorktreeStatus::Creating,
         conflict_paths: vec![],
         error: None,

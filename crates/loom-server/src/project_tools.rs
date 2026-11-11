@@ -8,6 +8,21 @@ const PROJECT_CHILD_RESULT_EXCERPT_CHARS: usize = 512;
 /// that no integration can satisfy is never a dead end.
 const PROJECT_CHILD_COMPLETION_ESCAPE: &str = " If the child's work cannot be landed, close the task with control_project_child action `abandon`, which reports its uncommitted paths and releases this guard.";
 
+/// Whether the reviewed result of a code child reached the parent history.
+///
+/// A manager can land a reviewed change itself, so an absent integration record
+/// is not proof that the work is unlanded. The guard therefore distinguishes a
+/// recorded or ancestral integration from a patch that the parent history
+/// already carries, and blocks only when neither holds.
+enum ReviewedResultIntegration {
+    /// The recorded integration contains the reviewed revision.
+    Integrated,
+    /// The parent history carries every reviewed patch at this revision.
+    AlreadyPresent { revision: String },
+    /// Nothing recorded or present in the parent history carries the result.
+    Missing,
+}
+
 /// Whether a delegated task has reached a state that produces no further
 /// result.
 fn delegated_task_is_terminal(status: loom_core::DelegatedTaskStatus) -> bool {
@@ -196,12 +211,14 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_control_children {
             definitions.push(ToolDefinition {
                 name: "control_project_child".to_owned(),
-                description: "Continue a paused child, retry a failed child run, cancel a live child, or abandon a finished child whose work you will not land. Address children only by delegated task_id. Retry re-runs the failed tool step when a tool step is what failed; when the model or provider call is what failed there is no step to re-run, so the run resumes from its checkpoint and the child can finish and commit the work its checkout already holds. Abandon closes a finished child as failed, reports any uncommitted paths it left in its checkout, states that this work will not be landed, and releases the completion guard for that child; the checkout is preserved for inspection.".to_owned(),
+                description: "Continue a paused child, retry a failed child run, cancel a live child, abandon a finished child whose work you will not land, or record that you landed a reviewed result yourself. Address children only by delegated task_id. Retry re-runs the failed tool step when a tool step is what failed; when the model or provider call is what failed there is no step to re-run, so the run resumes from its checkpoint and the child can finish and commit the work its checkout already holds. Abandon closes a finished child as failed, reports any uncommitted paths it left in its checkout, states that this work will not be landed, and releases the completion guard for that child; the checkout is preserved for inspection. mark_landed records a reviewed result you landed yourself — by cherry-picking, replaying, or squashing the child's commits — with the revision that carries the reviewed change and evidence of how it landed; the revision is checked against the reviewed content, so a revision that does not hold it is refused.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "task_id": {"type": "string", "format": "uuid"},
-                        "action": {"type": "string", "enum": ["continue", "retry_failed_step", "cancel", "abandon"]}
+                        "action": {"type": "string", "enum": ["continue", "retry_failed_step", "cancel", "abandon", "mark_landed"]},
+                        "revision": {"type": "string", "minLength": 1, "maxLength": 64, "description": "Revision in the parent repository that carries the reviewed change; required by mark_landed."},
+                        "evidence": {"type": "string", "minLength": 1, "maxLength": 4096, "description": "How the reviewed change was landed, for example the cherry-pick or squash commit you made; required by mark_landed."}
                     },
                     "required": ["task_id", "action"],
                     "additionalProperties": false
@@ -403,8 +420,19 @@ impl ToolExtension for ProjectAgentTools {
                         }
                         if result_revision != worktree.base_revision {
                             match self.reviewed_result_is_integrated(&worktree, result_revision) {
-                                Ok(true) => {}
-                                Ok(false) => {
+                                Ok(ReviewedResultIntegration::Integrated) => {}
+                                Ok(ReviewedResultIntegration::AlreadyPresent { revision }) => {
+                                    // The manager landed the reviewed change
+                                    // itself, so the guard records that instead
+                                    // of refusing work that is already in the
+                                    // parent history.
+                                    self.record_project_child_patch_landing(
+                                        &worktree,
+                                        result_revision,
+                                        &revision,
+                                    );
+                                }
+                                Ok(ReviewedResultIntegration::Missing) => {
                                     let detail = match worktree.integrated_revision.as_deref() {
                                         Some(integrated_revision) => format!(
                                             "its recorded integration at {integrated_revision} does not contain the reviewed result {result_revision}"
@@ -521,31 +549,26 @@ impl ProjectAgentTools {
         )))
     }
 
-    /// Reports whether the reviewed result revision is contained in the parent
-    /// revision recorded for the child's integration.
+    /// Reports whether the reviewed result revision reached the parent history.
     ///
     /// Integration records the parent revision after integration, not
     /// necessarily the child revision: a fast-forward records the child
     /// revision, while a merge records the merge commit and the "already
     /// present" path records the parent HEAD. The guard's intent is that the
-    /// reviewed revision is contained in what was integrated, so ancestry
-    /// rather than equality decides the outcome.
+    /// reviewed change is in the parent history, so ancestry rather than
+    /// equality decides a recorded integration, and a landing the manager
+    /// performed itself is recognised by the reviewed content the recorded
+    /// revision holds or by the same patch appearing in the parent history.
     ///
-    /// `Ok(false)` means no integration is recorded, or the recorded revision
-    /// does not contain the result. `Err` means the parent repository could not
-    /// be inspected, so the guard can report that state instead of asserting
-    /// the result is un-integrated.
+    /// [`ReviewedResultIntegration::Missing`] means none of those checks holds,
+    /// and `Err` means the parent repository could not be inspected, so the
+    /// guard can report that state instead of asserting the result is
+    /// un-integrated.
     fn reviewed_result_is_integrated(
         &self,
         worktree: &ProjectWorktreeRecord,
         result_revision: &str,
-    ) -> Result<bool> {
-        let Some(integrated_revision) = worktree.integrated_revision.as_deref() else {
-            return Ok(false);
-        };
-        if integrated_revision == result_revision {
-            return Ok(true);
-        }
+    ) -> Result<ReviewedResultIntegration> {
         let connection = self.connection().ok_or_else(|| {
             LoomError::new(
                 ErrorCode::RecoveryRequired,
@@ -553,9 +576,105 @@ impl ProjectAgentTools {
                 true,
             )
         })?;
-        connection
-            .session_git(worktree.parent_session_id, worktree.parent_repository_id)?
-            .is_ancestor_revision(result_revision, integrated_revision)
+        let parent_git =
+            connection.session_git(worktree.parent_session_id, worktree.parent_repository_id)?;
+        if let Some(integrated_revision) = worktree.integrated_revision.as_deref() {
+            if integrated_revision == result_revision
+                || parent_git.is_ancestor_revision(result_revision, integrated_revision)?
+            {
+                return Ok(ReviewedResultIntegration::Integrated);
+            }
+            // A landing Loom did not perform — a replay or a squash the manager
+            // recorded — is identified by the reviewed content its revision
+            // holds. A child that advanced after that landing no longer matches,
+            // so the record cannot stand in for an integration that never
+            // happened.
+            if parent_git
+                .change_carry(
+                    &worktree.base_revision,
+                    result_revision,
+                    integrated_revision,
+                )?
+                .is_carried()
+            {
+                return Ok(ReviewedResultIntegration::Integrated);
+            }
+        }
+        let Some(parent_revision) = parent_git.status()?.head else {
+            return Ok(ReviewedResultIntegration::Missing);
+        };
+        // A parent that contains the reviewed revision already carries the
+        // whole result, whatever the record says.
+        if parent_git.is_ancestor_revision(result_revision, &parent_revision)? {
+            return Ok(ReviewedResultIntegration::AlreadyPresent {
+                revision: parent_revision,
+            });
+        }
+        // A manager who cherry-picks or replays the reviewed change leaves no
+        // integration and no record of its own, so the parent history is
+        // searched for the same patches. Every reviewed commit has to be
+        // present: a result that landed only partly is reported as missing, so
+        // it still blocks and the manager is pushed to the integrate or abandon
+        // path.
+        let reviewed = parent_git.patch_commits_since(&worktree.base_revision, result_revision)?;
+        if reviewed.is_empty() {
+            return Ok(ReviewedResultIntegration::Missing);
+        }
+        let landed = parent_git.patch_commits_since(&worktree.base_revision, &parent_revision)?;
+        let mut landed_by_patch = BTreeMap::new();
+        for commit in &landed {
+            landed_by_patch
+                .entry(commit.patch_id)
+                .or_insert(commit.revision.as_str());
+        }
+        // The walks are newest first, so the first match is the parent commit
+        // that carries the reviewed tip of the child.
+        let mut carried = None;
+        for commit in &reviewed {
+            let Some(revision) = landed_by_patch.get(&commit.patch_id) else {
+                return Ok(ReviewedResultIntegration::Missing);
+            };
+            carried.get_or_insert((*revision).to_owned());
+        }
+        match carried {
+            Some(revision) => Ok(ReviewedResultIntegration::AlreadyPresent { revision }),
+            None => Ok(ReviewedResultIntegration::Missing),
+        }
+    }
+
+    /// Records that the parent history already carries a reviewed result.
+    ///
+    /// This is bookkeeping for a landing the manager performed itself: nothing
+    /// is applied to any checkout and no child is archived from here, because
+    /// the manager has not asked for either. A write that fails is logged and
+    /// never turns a genuinely landed result into a refusal.
+    fn record_project_child_patch_landing(
+        &self,
+        worktree: &ProjectWorktreeRecord,
+        result_revision: &str,
+        landed_revision: &str,
+    ) {
+        let Some(backend) = self.backend.upgrade() else {
+            return;
+        };
+        let Some(persistence) = backend.persistence.as_ref() else {
+            return;
+        };
+        let mut landed = worktree.clone();
+        landed.status = ProjectWorktreeStatus::Integrated;
+        landed.result_revision = Some(result_revision.to_owned());
+        landed.integrated_revision = Some(landed_revision.to_owned());
+        landed.landed_by = Some(ProjectWorktreeLandedBy::AlreadyPresent);
+        landed.conflict_paths.clear();
+        landed.error = None;
+        landed.updated_at = Timestamp::now();
+        if let Err(error) = persistence.save_project_worktree(&landed) {
+            log::warn!(
+                "could not record that the parent history already carries the reviewed result of code child task {}: {}",
+                landed.task_id,
+                error.message
+            );
+        }
     }
 
     /// Manager-facing summary of the revision a delegated child checkout was
@@ -1187,6 +1306,8 @@ impl ProjectAgentTools {
                 "worktree_status": worktree.as_ref().map(|worktree| worktree.status),
                 "result_revision": worktree.as_ref().and_then(|worktree| worktree.result_revision.clone()),
                 "result_revision_is_base": worktree.as_ref().map(|worktree| worktree.result_revision.as_deref().is_none_or(|revision| revision == worktree.base_revision)),
+                "integrated_revision": worktree.as_ref().and_then(|worktree| worktree.integrated_revision.clone()),
+                "landed_by": worktree.as_ref().and_then(|worktree| worktree.landed_by),
                 "worktree_uncommitted_path_count": checkout_state.as_ref().map(|state| state.uncommitted_paths),
                 "worktree_uncommitted_line_delta": checkout_state.as_ref().map(|state| serde_json::json!({
                     "additions": state.additions,
@@ -1227,7 +1348,7 @@ impl ProjectAgentTools {
             output: serde_json::to_string(&serde_json::json!({
                 "children": children,
                 "truncated": truncated,
-                "note": "result_state reports whether each child's stored result reached this session: delivered, undelivered (accepted for delivery but not yet in your transcript), missing (a finished child never reported a result), or pending. undelivered_messages counts the durable inbox messages the child has not read yet, so a message you sent that still waits is distinguishable from one the child consumed. For a code child whose run is not progressing — finished, paused, or blocked waiting for input or approval — worktree_uncommitted_path_count and worktree_uncommitted_line_delta report what its checkout still holds uncommitted, worktree_head_is_base says whether that checkout has no commit of its own yet, and result_revision_is_base says whether no reviewed result revision other than its base has been recorded. A child whose run is still running reports none of them, because its checkout is in motion. Work that is never reviewed and integrated, or abandoned, is not landed. Pass a child's task_id to return its whole stored result."
+                "note": "result_state reports whether each child's stored result reached this session: delivered, undelivered (accepted for delivery but not yet in your transcript), missing (a finished child never reported a result), or pending. undelivered_messages counts the durable inbox messages the child has not read yet, so a message you sent that still waits is distinguishable from one the child consumed. For a code child whose run is not progressing — finished, paused, or blocked waiting for input or approval — worktree_uncommitted_path_count and worktree_uncommitted_line_delta report what its checkout still holds uncommitted, worktree_head_is_base says whether that checkout has no commit of its own yet, and result_revision_is_base says whether no reviewed result revision other than its base has been recorded. integrated_revision names the revision its reviewed result landed at, and landed_by says how it got there: integrated (Loom fast-forwarded, merged, or completed the record), already_present (the parent history already carried the reviewed patch), or replay (you recorded the landing yourself). A child whose run is still running reports none of the checkout fields, because its checkout is in motion. Work that is never reviewed and integrated, or abandoned, is not landed. Pass a child's task_id to return its whole stored result."
             }))
             .unwrap_or_else(|error| format!("could not encode project child status: {error}")),
         }
@@ -1247,11 +1368,32 @@ impl ProjectAgentTools {
         let Some(connection) = self.connection() else {
             return ToolResult::failure(call, "project backend is no longer available");
         };
+        // A landing names the revision that carries the reviewed change and the
+        // manager's evidence for it; every other action carries neither.
+        let landing = match arguments.action {
+            ProjectChildControlAction::MarkLanded => {
+                let Some(revision) = arguments.revision else {
+                    return ToolResult::failure(
+                        call,
+                        "mark_landed requires the revision that carries the reviewed change",
+                    );
+                };
+                let Some(evidence) = arguments.evidence else {
+                    return ToolResult::failure(
+                        call,
+                        "mark_landed requires evidence of how the reviewed change was landed",
+                    );
+                };
+                Some(ProjectChildLanding { revision, evidence })
+            }
+            _ => None,
+        };
         match connection.control_project_child(
             self.session_id,
             self.project_id,
             arguments.task_id,
             arguments.action,
+            landing,
         ) {
             Ok(outcome) => {
                 let mut output = serde_json::json!({
@@ -1268,6 +1410,16 @@ impl ProjectAgentTools {
                     output["uncommitted_paths"] = serde_json::json!(outcome.uncommitted_paths);
                     output["note"] = serde_json::json!(
                         "The child was closed as failed without landing its work, so these uncommitted paths will not be integrated; its checkout is preserved for inspection and the completion guard no longer requires this result."
+                    );
+                }
+                if let Some(worktree) = outcome.worktree.as_ref() {
+                    // A landing names the revision that now carries the
+                    // reviewed change, so the manager can confirm what was
+                    // recorded without listing the child again.
+                    output["integrated_revision"] = serde_json::json!(worktree.integrated_revision);
+                    output["landed_by"] = serde_json::json!(worktree.landed_by);
+                    output["note"] = serde_json::json!(
+                        "The reviewed result is recorded as landed at this revision, so the completion guard no longer requires this child; nothing was applied to your checkout."
                     );
                 }
                 ToolResult {

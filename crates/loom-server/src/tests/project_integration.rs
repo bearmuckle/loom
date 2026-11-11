@@ -246,6 +246,8 @@ fn project_child_worktree_can_be_reviewed_fast_forwarded_and_cleaned_up() {
         base_refresh: None,
         result_revision: None,
         integrated_revision: None,
+        landed_by: None,
+        landed_evidence: None,
         status: ProjectWorktreeStatus::Creating,
         conflict_paths: Vec::new(),
         error: None,
@@ -707,6 +709,312 @@ fn project_child_completion_guard_explains_why_a_reviewed_result_is_unintegrated
         blocker.contains("could not be confirmed"),
         "the blocker should report the unconfirmable state: {blocker}"
     );
+    fixture.shutdown();
+}
+
+#[test]
+fn project_child_completion_guard_accepts_a_landed_patch_with_the_same_message() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+
+    // The manager cherry-picks the reviewed commit onto an advanced parent, so
+    // the landed commit keeps the child's message but is a different commit.
+    commit_file(
+        fixture.parent_git.root(),
+        "parent.txt",
+        "parent\n",
+        "parent change",
+    );
+    git_in(fixture.parent_git.root(), &["cherry-pick", &child_revision]);
+    let landed = git_output(fixture.parent_git.root(), &["rev-parse", "HEAD"]);
+    assert_ne!(landed, child_revision);
+    assert_eq!(
+        git_output(
+            fixture.parent_git.root(),
+            &["log", "-1", "--format=%s", &landed]
+        ),
+        "child change",
+        "the cherry-pick keeps the child's own message"
+    );
+
+    let completion_guard = project_completion_guard(&fixture);
+    assert_eq!(
+        completion_guard.completion_blocker(),
+        None,
+        "a reviewed patch the parent history carries must not block completion"
+    );
+    let worktree = integrated_worktree(&fixture);
+    assert_eq!(worktree.status, ProjectWorktreeStatus::Integrated);
+    assert_eq!(
+        worktree.integrated_revision.as_deref(),
+        Some(landed.as_str())
+    );
+    assert_eq!(
+        worktree.landed_by,
+        Some(loom_core::ProjectWorktreeLandedBy::AlreadyPresent),
+        "the guard records that it found the patch rather than integrating it"
+    );
+
+    // The listing says how the result landed, so an already-present landing is
+    // distinguishable from one Loom performed.
+    let listing = code_child_manager_tools(&fixture).execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "list_project_children".to_owned(),
+        arguments: serde_json::json!({}),
+    });
+    assert!(listing.success, "{}", listing.output);
+    let listing: serde_json::Value = serde_json::from_str(&listing.output).unwrap();
+    let child = listing["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["task_id"] == serde_json::json!(fixture.task_id))
+        .expect("the child should be listed");
+    assert_eq!(child["landed_by"], "already_present");
+    assert_eq!(child["integrated_revision"], serde_json::json!(landed));
+    fixture.shutdown();
+}
+
+#[test]
+fn project_child_completion_guard_matches_a_patch_under_another_message() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+
+    // The manager lands the reviewed change with a message of its own, so the
+    // commit id and the message both differ while the patch is the same.
+    commit_file(
+        fixture.parent_git.root(),
+        "parent.txt",
+        "parent\n",
+        "parent change",
+    );
+    git_in(fixture.parent_git.root(), &["cherry-pick", &child_revision]);
+    git_in(
+        fixture.parent_git.root(),
+        &["commit", "--amend", "-q", "-m", "landed by hand"],
+    );
+    let landed = git_output(fixture.parent_git.root(), &["rev-parse", "HEAD"]);
+    assert_ne!(landed, child_revision);
+
+    let completion_guard = project_completion_guard(&fixture);
+    assert_eq!(
+        completion_guard.completion_blocker(),
+        None,
+        "patch identity, not commit identity, decides whether the result landed"
+    );
+    assert_eq!(
+        integrated_worktree(&fixture).integrated_revision.as_deref(),
+        Some(landed.as_str())
+    );
+    fixture.shutdown();
+}
+
+#[test]
+fn project_child_completion_guard_blocks_an_absent_patch() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    complete_project_code_child(&fixture);
+    review_project_code_child(&fixture);
+
+    // The parent advanced with unrelated work, so nothing in its history
+    // carries the reviewed patch.
+    commit_file(
+        fixture.parent_git.root(),
+        "parent.txt",
+        "parent\n",
+        "parent change",
+    );
+    let completion_guard = project_completion_guard(&fixture);
+    let blocker = completion_guard
+        .completion_blocker()
+        .expect("an absent patch must still block completion");
+    assert!(
+        blocker.contains("still needs integration"),
+        "unexpected blocker: {blocker}"
+    );
+    assert_eq!(integrated_worktree(&fixture).landed_by, None);
+    fixture.shutdown();
+}
+
+#[test]
+fn project_child_completion_guard_blocks_a_partly_landed_patch_set() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    let first_revision = git_output(&fixture.child_checkout, &["rev-parse", "HEAD"]);
+    commit_file(
+        &fixture.child_checkout,
+        "child2.txt",
+        "second\n",
+        "child follow-up",
+    );
+    complete_project_code_child(&fixture);
+    let result_revision = review_project_code_child(&fixture);
+    assert_ne!(first_revision, result_revision);
+
+    // Only the first reviewed commit reached the parent history, so the
+    // reviewed result as a whole is still unlanded.
+    commit_file(
+        fixture.parent_git.root(),
+        "parent.txt",
+        "parent\n",
+        "parent change",
+    );
+    git_in(fixture.parent_git.root(), &["cherry-pick", &first_revision]);
+    let completion_guard = project_completion_guard(&fixture);
+    let blocker = completion_guard
+        .completion_blocker()
+        .expect("a partly landed result must still block completion");
+    assert!(
+        blocker.contains("still needs integration"),
+        "unexpected blocker: {blocker}"
+    );
+    assert_eq!(integrated_worktree(&fixture).landed_by, None);
+    fixture.shutdown();
+}
+
+#[test]
+fn marking_a_child_landed_rejects_a_revision_that_does_not_carry_the_patch() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+    let tools = code_child_manager_tools(&fixture);
+
+    // The reviewed revision itself is the only place the change exists; the
+    // base revision the parent still sits on does not carry it.
+    let refusal = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "control_project_child".to_owned(),
+        arguments: serde_json::json!({
+            "task_id": fixture.task_id,
+            "action": "mark_landed",
+            "revision": fixture.worktree.base_revision,
+            "evidence": "squashed into the parent tip",
+        }),
+    });
+    assert!(!refusal.success, "{}", refusal.output);
+    assert!(
+        refusal
+            .output
+            .contains("does not carry the reviewed result"),
+        "the refusal must name the revision's missing content: {}",
+        refusal.output
+    );
+    let unchanged = integrated_worktree(&fixture);
+    assert_eq!(unchanged.landed_by, None);
+    assert_eq!(unchanged.integrated_revision, None);
+    assert_eq!(
+        unchanged.result_revision.as_deref(),
+        Some(child_revision.as_str())
+    );
+
+    // A revision the parent repository does not hold is refused too.
+    let unknown = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "control_project_child".to_owned(),
+        arguments: serde_json::json!({
+            "task_id": fixture.task_id,
+            "action": "mark_landed",
+            "revision": "f".repeat(40),
+            "evidence": "squashed into the parent tip",
+        }),
+    });
+    assert!(!unknown.success, "{}", unknown.output);
+    fixture.shutdown();
+}
+
+#[test]
+fn marking_a_child_landed_records_a_replay_that_holds_the_reviewed_change() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+
+    // The manager squashes the reviewed change together with work of its own,
+    // so no single parent commit carries the child's patch identity while the
+    // reviewed content is still there.
+    git_in(
+        fixture.parent_git.root(),
+        &["cherry-pick", "--no-commit", &child_revision],
+    );
+    commit_file(
+        fixture.parent_git.root(),
+        "manager.txt",
+        "more\n",
+        "landed the child work with extra changes",
+    );
+    let landed = git_output(fixture.parent_git.root(), &["rev-parse", "HEAD"]);
+    assert_eq!(
+        fs::read_to_string(fixture.parent_git.root().join("child.txt")).unwrap(),
+        "child\n"
+    );
+
+    // The guard cannot match the squashed patch, so it blocks until the
+    // manager records the landing it performed.
+    let completion_guard = project_completion_guard(&fixture);
+    assert!(completion_guard.completion_blocker().is_some());
+
+    let landing = code_child_manager_tools(&fixture).execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "control_project_child".to_owned(),
+        arguments: serde_json::json!({
+            "task_id": fixture.task_id,
+            "action": "mark_landed",
+            "revision": landed,
+            "evidence": "squashed the reviewed commit into the parent tip with extra changes",
+        }),
+    });
+    assert!(landing.success, "{}", landing.output);
+    let landing: serde_json::Value = serde_json::from_str(&landing.output).unwrap();
+    assert_eq!(landing["landed_by"], "replay");
+    assert_eq!(landing["integrated_revision"], serde_json::json!(landed));
+
+    let worktree = integrated_worktree(&fixture);
+    assert_eq!(worktree.status, ProjectWorktreeStatus::Integrated);
+    assert_eq!(worktree.landed_by, Some(ProjectWorktreeLandedBy::Replay));
+    assert_eq!(
+        worktree.integrated_revision.as_deref(),
+        Some(landed.as_str())
+    );
+    assert_eq!(
+        worktree.landed_evidence.as_deref(),
+        Some("squashed the reviewed commit into the parent tip with extra changes")
+    );
+    assert_eq!(completion_guard.completion_blocker(), None);
     fixture.shutdown();
 }
 
@@ -2279,8 +2587,8 @@ fn listing_a_code_child_restores_a_lazy_filesystem_without_deadlocking() {
     fixture.shutdown();
 }
 
-/// The manager's child-control and inspection tools for one code child fixture,
-/// so a test acts through the same surface a manager uses.
+/// The manager's child-control, inspection, and integration tools for one code
+/// child fixture, so a test acts through the same surface a manager uses.
 fn code_child_manager_tools(fixture: &ProjectCodeChildFixture) -> ToolExecutor {
     let extension = fixture
         .backend
@@ -2290,6 +2598,7 @@ fn code_child_manager_tools(fixture: &ProjectCodeChildFixture) -> ToolExecutor {
             ProjectAgentToolGrants {
                 inspection: true,
                 child_control: true,
+                integration: true,
                 ..ProjectAgentToolGrants::default()
             },
         )

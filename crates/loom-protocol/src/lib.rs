@@ -66,6 +66,13 @@ pub enum ProjectChildControlAction {
     /// records the uncommitted paths, marks the task failed, and releases the
     /// guard while preserving the checkout.
     Abandon,
+    /// Records that the manager landed a reviewed result itself.
+    ///
+    /// A manager that cherry-picks, replays, or squashes the reviewed change
+    /// leaves Loom nothing to integrate, so the result has to be recorded as
+    /// landed together with the revision and the evidence that carry it. The
+    /// tool surface supplies both; a bare control request is refused.
+    MarkLanded,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -6,6 +6,8 @@ pub(crate) struct ProjectChildControlOutcome {
     pub(crate) run: Option<AgentRunSnapshot>,
     /// Paths a finished code child left uncommitted when it was abandoned.
     pub(crate) uncommitted_paths: Vec<String>,
+    /// The worktree record a landing action updated.
+    pub(crate) worktree: Option<ProjectWorktreeRecord>,
 }
 
 impl InProcessConnection {
@@ -15,6 +17,7 @@ impl InProcessConnection {
         project_id: ProjectId,
         task_id: loom_core::TaskId,
         action: ProjectChildControlAction,
+        landing: Option<ProjectChildLanding>,
     ) -> Result<ProjectChildControlOutcome> {
         if !self.project_agent_permission_enabled_for_session(
             manager_session_id,
@@ -76,6 +79,7 @@ impl InProcessConnection {
             })
             .transpose()?;
         let mut uncommitted_paths = Vec::new();
+        let mut worktree = None;
 
         match action {
             ProjectChildControlAction::Continue => {
@@ -306,6 +310,21 @@ impl InProcessConnection {
             ProjectChildControlAction::Abandon => {
                 uncommitted_paths = self.abandon_project_child_task(persistence, &mut task)?;
             }
+            ProjectChildControlAction::MarkLanded => {
+                // The landing is recorded by the integration path, which owns
+                // the grant for it and verifies the named revision.
+                let landing = landing.ok_or_else(|| {
+                    LoomError::invalid_request(
+                        "mark_landed requires the revision that carries the reviewed change and the evidence for it",
+                    )
+                })?;
+                worktree = Some(self.mark_project_child_landed(
+                    project_id,
+                    manager_session_id,
+                    task_id,
+                    landing,
+                )?);
+            }
         }
         task = persistence
             .load_delegated_task(task_id)?
@@ -314,6 +333,7 @@ impl InProcessConnection {
             task,
             run,
             uncommitted_paths,
+            worktree,
         })
     }
 

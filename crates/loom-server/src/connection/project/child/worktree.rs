@@ -366,6 +366,7 @@ impl InProcessConnection {
             worktree.status = ProjectWorktreeStatus::Integrated;
             worktree.result_revision = Some(child_revision);
             worktree.integrated_revision = Some(parent_revision);
+            worktree.landed_by = Some(ProjectWorktreeLandedBy::Integrated);
             worktree.conflict_paths.clear();
             worktree.error = None;
             worktree.updated_at = Timestamp::now();
@@ -464,6 +465,7 @@ impl InProcessConnection {
     ) -> Result<ServerResponse> {
         worktree.status = ProjectWorktreeStatus::Integrated;
         worktree.integrated_revision = Some(integrated_revision.to_owned());
+        worktree.landed_by = Some(ProjectWorktreeLandedBy::Integrated);
         worktree.conflict_paths.clear();
         worktree.error = None;
         worktree.updated_at = Timestamp::now();
@@ -472,6 +474,113 @@ impl InProcessConnection {
         Ok(ServerResponse::Project(
             ProjectResponse::ProjectChildWorktreeUpdated(Box::new(worktree.clone())),
         ))
+    }
+
+    /// Records that the manager landed a reviewed child result itself.
+    ///
+    /// A manager that cherry-picks, replays, or squashes the reviewed change
+    /// leaves Loom nothing to integrate, so without this the completion guard
+    /// refuses a result that is already in the parent history. The named
+    /// revision has to hold the whole reviewed change — every path the change
+    /// touches, with the content the review gave it — so a wrong revision is
+    /// refused instead of recorded. What landed is recorded with the evidence
+    /// the manager gave, and the checkout is archived like an integration.
+    pub(crate) fn mark_project_child_landed(
+        &self,
+        project_id: ProjectId,
+        manager_session_id: AgentSessionId,
+        task_id: loom_core::TaskId,
+        landing: ProjectChildLanding,
+    ) -> Result<ProjectWorktreeRecord> {
+        if !self.project_agent_permission_enabled_for_session(
+            manager_session_id,
+            Capability::IntegrateProjectChild,
+            ProjectAgentPermission::Integration,
+        )? {
+            return Err(LoomError::new(
+                ErrorCode::AuthorizationDenied,
+                "project child integration grant is no longer valid",
+                false,
+            ));
+        }
+        let evidence = landing.evidence.trim();
+        if evidence.is_empty() || evidence.len() > MAX_PROJECT_CHILD_LANDED_EVIDENCE_BYTES {
+            return Err(LoomError::invalid_request(format!(
+                "mark_landed requires 1 to {MAX_PROJECT_CHILD_LANDED_EVIDENCE_BYTES} bytes of evidence stating how the reviewed change was landed"
+            )));
+        }
+        let admission = self.backend.admissions.project(project_id)?;
+        let _admission = admission.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "project worktree lock was poisoned",
+                true,
+            )
+        })?;
+        let (task, mut worktree) =
+            self.load_project_child_worktree(project_id, manager_session_id, task_id)?;
+        if !task.code_change {
+            return Err(LoomError::not_found("project child code task", task_id));
+        }
+        if task.status != loom_core::DelegatedTaskStatus::Completed {
+            return Err(LoomError::invalid_state(
+                "a project child can be marked landed only after its task completes",
+            ));
+        }
+        if worktree.status == ProjectWorktreeStatus::Removed {
+            return Err(LoomError::invalid_state(
+                "a removed project child checkout has no result left to mark landed",
+            ));
+        }
+        let Some(result_revision) = worktree.result_revision.clone() else {
+            return Err(LoomError::invalid_state(
+                "review the project child's committed result before marking it landed",
+            ));
+        };
+        if result_revision == worktree.base_revision {
+            return Err(LoomError::invalid_state(
+                "project child has no committed change to mark landed",
+            ));
+        }
+        let revision = landing.revision.trim();
+        if revision.is_empty() {
+            return Err(LoomError::invalid_request(
+                "mark_landed requires the revision that carries the reviewed change",
+            ));
+        }
+        let parent_git =
+            self.session_git(worktree.parent_session_id, worktree.parent_repository_id)?;
+        let carry = parent_git
+            .change_carry(&worktree.base_revision, &result_revision, revision)
+            .map_err(|error| {
+                LoomError::invalid_request(format!(
+                    "revision '{revision}' could not be verified against the parent repository: {}",
+                    error.message
+                ))
+            })?;
+        if carry.changed_paths.is_empty() {
+            return Err(LoomError::invalid_state(
+                "the reviewed result changes no paths, so no revision can be shown to carry it",
+            ));
+        }
+        if !carry.mismatched_paths.is_empty() {
+            return Err(LoomError::invalid_state(format!(
+                "revision {revision} does not carry the reviewed result {result_revision}: these paths still differ from the reviewed content: {}",
+                carry.mismatched_paths.join(", "),
+            )));
+        }
+
+        worktree.status = ProjectWorktreeStatus::Integrated;
+        worktree.result_revision = Some(result_revision);
+        worktree.integrated_revision = Some(revision.to_owned());
+        worktree.landed_by = Some(ProjectWorktreeLandedBy::Replay);
+        worktree.landed_evidence = Some(evidence.to_owned());
+        worktree.conflict_paths.clear();
+        worktree.error = None;
+        worktree.updated_at = Timestamp::now();
+        self.save_project_worktree_state(&worktree)?;
+        self.auto_archive_integrated_child(worktree.child_session_id);
+        Ok(worktree)
     }
 
     /// Best-effort auto-archive of a code child once its result is integrated.
@@ -688,6 +797,7 @@ impl InProcessConnection {
             if parent_git.is_ancestor_revision(&child_revision, &parent_revision)? {
                 worktree.status = ProjectWorktreeStatus::Integrated;
                 worktree.integrated_revision = Some(parent_revision);
+                worktree.landed_by = Some(ProjectWorktreeLandedBy::Integrated);
                 worktree.conflict_paths.clear();
                 worktree.error = None;
                 worktree.updated_at = Timestamp::now();

@@ -173,6 +173,8 @@ pub(super) fn nested_project_view(focus_handle: gpui_kit::FocusHandle) -> LoomVi
         base_refresh: None,
         result_revision: Some("child-result".to_owned()),
         integrated_revision: None,
+        landed_by: None,
+        landed_evidence: None,
         status: ProjectWorktreeStatus::Ready,
         conflict_paths: Vec::new(),
         error: None,

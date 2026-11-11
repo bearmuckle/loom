@@ -98,7 +98,7 @@ pub(crate) fn load_project_worktree(
                     parent_repository_id, child_repository_id, relative_path,
                     worktree_name, branch_name, base_revision, result_revision,
                     integrated_revision, status, error, cleanup_disposition,
-                    base_refresh, created_at, updated_at
+                    base_refresh, landed_by, landed_evidence, created_at, updated_at
              FROM project_worktrees WHERE task_id=?1",
             [task_id.as_bytes().as_slice()],
             |row| {
@@ -119,8 +119,10 @@ pub(crate) fn load_project_worktree(
                     row.get::<_, Option<String>>(13)?,
                     row.get::<_, Option<String>>(14)?,
                     row.get::<_, Option<String>>(15)?,
-                    row.get::<_, i64>(16)?,
-                    row.get::<_, i64>(17)?,
+                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<String>>(17)?,
+                    row.get::<_, i64>(18)?,
+                    row.get::<_, i64>(19)?,
                 ))
             },
         )
@@ -145,6 +147,8 @@ pub(crate) fn load_project_worktree(
         error,
         cleanup_disposition,
         base_refresh,
+        landed_by,
+        landed_evidence,
         created_at,
         updated_at,
     )) = row
@@ -210,6 +214,11 @@ pub(crate) fn load_project_worktree(
         conflict_paths,
         error,
         base_refresh: decode_project_worktree_base_refresh(base_refresh)?,
+        landed_by: landed_by
+            .as_deref()
+            .map(parse_project_worktree_landed_by)
+            .transpose()?,
+        landed_evidence,
         cleanup_disposition: cleanup_disposition
             .as_deref()
             .map(parse_project_worktree_cleanup)
@@ -642,9 +651,9 @@ pub(crate) fn persist_initial_project_worktree(
                 parent_repository_id, child_repository_id, relative_path,
                 worktree_name, branch_name, base_revision, result_revision,
                 integrated_revision, status, error, cleanup_disposition,
-                base_refresh, created_at, updated_at
+                base_refresh, landed_by, landed_evidence, created_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL,
-                       'creating', NULL, NULL, ?11, ?12, ?13)",
+                       'creating', NULL, NULL, ?11, NULL, NULL, ?12, ?13)",
             params![
                 worktree.task_id.as_uuid().as_bytes().as_slice(),
                 worktree.project_id.as_uuid().as_bytes().as_slice(),
@@ -765,6 +774,27 @@ pub(crate) fn project_worktree_cleanup_name(
         ProjectWorktreeCleanupDisposition::Retain => "retain",
         ProjectWorktreeCleanupDisposition::RemoveClean => "remove_clean",
         ProjectWorktreeCleanupDisposition::DiscardChanges => "discard_changes",
+    }
+}
+
+pub(crate) fn project_worktree_landed_by_name(landed_by: ProjectWorktreeLandedBy) -> &'static str {
+    match landed_by {
+        ProjectWorktreeLandedBy::Integrated => "integrated",
+        ProjectWorktreeLandedBy::AlreadyPresent => "already_present",
+        ProjectWorktreeLandedBy::Replay => "replay",
+    }
+}
+
+pub(crate) fn parse_project_worktree_landed_by(landed_by: &str) -> Result<ProjectWorktreeLandedBy> {
+    match landed_by {
+        "integrated" => Ok(ProjectWorktreeLandedBy::Integrated),
+        "already_present" => Ok(ProjectWorktreeLandedBy::AlreadyPresent),
+        "replay" => Ok(ProjectWorktreeLandedBy::Replay),
+        _ => Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted project worktree landing is invalid",
+            false,
+        )),
     }
 }
 

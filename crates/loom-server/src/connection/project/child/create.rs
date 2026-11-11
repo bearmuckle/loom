@@ -448,6 +448,8 @@ impl InProcessConnection {
                         base_refresh: Some(base_refresh),
                         result_revision: None,
                         integrated_revision: None,
+                        landed_by: None,
+                        landed_evidence: None,
                         status: ProjectWorktreeStatus::Creating,
                         conflict_paths: Vec::new(),
                         error: None,

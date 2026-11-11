@@ -23,11 +23,11 @@ use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy,
     Capability, CapabilitySet, DelegatedTaskSpec, ErrorCode, EventSequence, JevPolicy, LoomError,
     MAX_PROJECT_AGENT_DEPTH, ProjectAgentRecord, ProjectId, ProjectJevPolicy, ProjectSnapshot,
-    ProjectWorktreeBaseRefresh, ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord,
-    ProjectWorktreeStatus, ProtocolVersion, ReadOnlyCommandPolicy, RepositoryId, RequestId, Result,
-    RunAttemptId, SessionEventRecord, SessionJevPolicy, SessionTitleSource, TaskContextReference,
-    Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord, sanitize_title, title_from_goal,
-    titles_diverge,
+    ProjectWorktreeBaseRefresh, ProjectWorktreeCleanupDisposition, ProjectWorktreeLandedBy,
+    ProjectWorktreeRecord, ProjectWorktreeStatus, ProtocolVersion, ReadOnlyCommandPolicy,
+    RepositoryId, RequestId, Result, RunAttemptId, SessionEventRecord, SessionJevPolicy,
+    SessionTitleSource, TaskContextReference, Timestamp, UsageSnapshot, WorkspaceId,
+    WorkspaceRecord, sanitize_title, title_from_goal, titles_diverge,
 };
 use loom_model::{
     ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId, ToolCall, ToolDefinition,
@@ -505,11 +505,27 @@ struct WaitForProjectChildrenArguments {
     task_ids: Vec<loom_core::TaskId>,
 }
 
+/// What a manager reports when it lands a reviewed child result itself.
+///
+/// The revision is where the reviewed change now lives in the parent
+/// repository and the evidence says how it got there; both are recorded, so a
+/// landing Loom did not perform is traceable instead of implicit.
+pub(crate) struct ProjectChildLanding {
+    pub(crate) revision: String,
+    pub(crate) evidence: String,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ControlProjectChildArguments {
     task_id: loom_core::TaskId,
     action: ProjectChildControlAction,
+    /// The revision that carries the reviewed change, required by `mark_landed`.
+    #[serde(default)]
+    revision: Option<String>,
+    /// The manager's note on how it landed the reviewed change.
+    #[serde(default)]
+    evidence: Option<String>,
 }
 
 #[derive(Deserialize)]

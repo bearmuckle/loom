@@ -216,6 +216,20 @@ status, conflict state, and cleanup state. Cleanup preserves unmerged work or
 records an explicit disposition. Never silently overwrite parent or sibling
 changes.
 
+A manager that lands the reviewed change itself — by cherry-picking, replaying,
+or squashing the child's commits — leaves Loom nothing to integrate, so the
+landing is recorded instead of performed. The completion guard first looks for
+the child's patches in the parent history since the child's base: when every
+reviewed commit's patch is present, the parent commit that carries the reviewed
+tip is recorded as the integration with `landed_by = already_present` and no
+history is touched. A partly present result still blocks like an absent one.
+For a landing that changes the patch — a squash that also carries the manager's
+own edits — the manager records the revision that holds the reviewed content
+with `control_project_child` action `mark_landed`, giving the evidence for it;
+the revision is checked against the reviewed content before
+`landed_by = replay` and that evidence are stored, so a wrong revision is
+refused rather than recorded.
+
 The first implementation should support repositories already represented by
 the session repository service. Before extending this to attached native
 directories or multi-repository tasks, define whether each child receives an

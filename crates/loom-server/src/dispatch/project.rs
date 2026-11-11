@@ -48,8 +48,13 @@ impl InProcessConnection {
                 task_id,
                 action,
             }) => {
-                let outcome =
-                    self.control_project_child(manager_session_id, project_id, task_id, action)?;
+                let outcome = self.control_project_child(
+                    manager_session_id,
+                    project_id,
+                    task_id,
+                    action,
+                    None,
+                )?;
                 Ok(ServerResponse::Project(
                     ProjectResponse::ProjectChildControlled {
                         task: Box::new(outcome.task),

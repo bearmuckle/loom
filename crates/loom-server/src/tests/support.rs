@@ -588,6 +588,8 @@ pub(super) fn pending_project_code_child_fixture() -> ProjectCodeChildFixture {
         base_refresh: None,
         result_revision: None,
         integrated_revision: None,
+        landed_by: None,
+        landed_evidence: None,
         status: ProjectWorktreeStatus::Creating,
         conflict_paths: Vec::new(),
         error: None,

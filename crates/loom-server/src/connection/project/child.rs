@@ -19,6 +19,10 @@ pub(crate) const CHILD_WORKTREE_REFRESH_DEADLINE: Duration = Duration::from_secs
 /// checkout.
 pub(crate) const CHILD_WORKTREE_REFRESH_REUSE: Duration = Duration::from_secs(60);
 
+/// Most UTF-8 bytes of evidence a manager may record for a landing it
+/// performed itself, matching the bound the worktree record stores.
+pub(crate) const MAX_PROJECT_CHILD_LANDED_EVIDENCE_BYTES: usize = 4096;
+
 /// Reports whether a recorded base refresh is recent enough to be reused
 /// instead of fetching again.
 pub(crate) fn base_refresh_is_recent(
