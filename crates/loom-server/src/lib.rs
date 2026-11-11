@@ -472,6 +472,11 @@ pub struct InProcessBackend {
     fail_next_state_save: AtomicBool,
     #[cfg(test)]
     project_cancellation_failpoint: AtomicUsize,
+    /// A check a test substitutes for the rebase's documented check set, so the
+    /// test does not invoke a real toolchain.
+    #[cfg(test)]
+    pub(crate) project_child_rebase_check:
+        Mutex<Option<(String, Vec<String>, std::time::Duration)>>,
 }
 
 /// The sign-in credentials this worker hands out, and the store that
@@ -561,6 +566,9 @@ struct ControlProjectChildArguments {
     /// The manager's note on how it landed the reviewed change.
     #[serde(default)]
     evidence: Option<String>,
+    /// The revision a `rebase` action replays the child's own commits onto.
+    #[serde(default)]
+    onto: Option<String>,
 }
 
 #[derive(Deserialize)]

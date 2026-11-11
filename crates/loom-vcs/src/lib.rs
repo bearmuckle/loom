@@ -2057,6 +2057,121 @@ impl GitService {
         Ok(RebaseIntegrationOutcome::Rebased(tip))
     }
 
+    /// The full commit id `revision` names in this checkout.
+    ///
+    /// A malformed revision is reported as an invalid request and a well-formed
+    /// one that names no commit here as a VCS failure, so a caller can refuse a
+    /// target before acting on it instead of failing half-way.
+    pub fn resolve_revision(&self, revision: &str) -> Result<String> {
+        let repository = self.repository()?;
+        let commit = resolve_commit(&repository, revision, "target")?;
+        Ok(commit.id().to_string())
+    }
+
+    /// Moves the checked-out branch back to a revision it held before.
+    ///
+    /// A caller uses this to undo commits it just created, for example a replay
+    /// whose result failed validation. The checkout has to be clean and free of
+    /// another Git operation; the target revision is checked out with Git's safe
+    /// strategy, so a checkout that would overwrite a tracked file is refused
+    /// with the blocking paths and nothing is moved.
+    pub fn restore_branch_to_revision(&self, revision: &str) -> Result<()> {
+        let repository = self.repository()?;
+        if repository.state() != RepositoryState::Clean {
+            return Err(LoomError::new(
+                ErrorCode::RecoveryRequired,
+                "cannot restore a revision while another Git operation is in progress",
+                true,
+            ));
+        }
+        let head = repository
+            .head()
+            .map_err(|error| git_error("could not read Git HEAD", error))?;
+        if !head.is_branch() {
+            return Err(LoomError::invalid_state(
+                "cannot restore the revision of a detached or non-local Git HEAD",
+            ));
+        }
+        let branch_refname = head
+            .name()
+            .map_err(|error| git_error("could not read the Git branch name", error))?
+            .to_owned();
+        let head_target = head.target().ok_or_else(|| {
+            LoomError::invalid_state("the checked-out Git branch does not point to a commit")
+        })?;
+        let blocking = blocking_parent_checkout_paths(&repository)?;
+        if !blocking.is_empty() {
+            return Err(LoomError::conflict(format!(
+                "cannot restore a revision in a Git checkout with staged, modified, untracked, or unreadable files: {}",
+                blocking.join(", ")
+            )));
+        }
+        let commit = resolve_commit(&repository, revision, "restore target")?;
+        if commit.id() == head_target {
+            return Ok(());
+        }
+
+        let mut transaction = repository
+            .transaction()
+            .map_err(|error| git_error("could not start the restore branch update", error))?;
+        transaction
+            .lock_ref(&branch_refname)
+            .map_err(|error| git_error("could not lock the branch for the restore", error))?;
+        let locked_target = repository
+            .find_reference(&branch_refname)
+            .map_err(|error| git_error("could not re-read the locked branch", error))?
+            .target()
+            .ok_or_else(|| LoomError::invalid_state("the locked branch has no target commit"))?;
+        if locked_target != head_target {
+            return Err(LoomError::conflict(format!(
+                "Git branch changed before the restore: expected {head_target}, found {locked_target}"
+            )));
+        }
+
+        let mut checkout = CheckoutBuilder::new();
+        checkout.safe().update_index(true);
+        repository
+            .checkout_tree(commit.as_object(), Some(&mut checkout))
+            .map_err(|error| {
+                LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    format!(
+                        "safe checkout of the restored revision {} failed; the branch remains at {head_target} and checkout state was preserved: {error}",
+                        commit.id()
+                    ),
+                    true,
+                )
+            })?;
+        transaction
+            .set_target(
+                &branch_refname,
+                commit.id(),
+                None,
+                "loom: restore the checkout to the revision it held before",
+            )
+            .map_err(|error| {
+                LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    format!(
+                        "could not update the branch to the restored revision {}; checkout state was preserved for recovery: {error}",
+                        commit.id()
+                    ),
+                    true,
+                )
+            })?;
+        transaction.commit().map_err(|error| {
+            LoomError::new(
+                ErrorCode::RecoveryRequired,
+                format!(
+                    "could not commit the branch update to the restored revision {}; checkout state was preserved for recovery: {error}",
+                    commit.id()
+                ),
+                true,
+            )
+        })?;
+        Ok(())
+    }
+
     /// Creates a linked worktree at `path`, based on `base_commit`, and checks
     /// out a newly created local branch in it.
     ///
@@ -5486,6 +5601,70 @@ mod tests {
             Some(base)
         );
         assert!(git.status().unwrap().clean);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_replayed_branch_can_be_restored_to_the_revision_it_held() {
+        let (git, root) = repository();
+        let parent_branch = git.current_branch().unwrap().unwrap();
+        let child_branch = format!("codex/restore-{}", loom_core::RepositoryId::new());
+        run(&root, &["checkout", "-qb", &child_branch]);
+        write_commit(&root, "child.txt", "child\n", "child change");
+        let child = git.repository().unwrap().head().unwrap().target().unwrap();
+        run(&root, &["checkout", "-q", &parent_branch]);
+        write_commit(&root, "parent.txt", "parent\n", "parent change");
+        let parent_advanced = git.repository().unwrap().head().unwrap().target().unwrap();
+        run(&root, &["checkout", "-q", &child_branch]);
+
+        // A revision is resolved to the commit it names, and an unknown one is
+        // refused before anything moves.
+        assert_eq!(
+            git.resolve_revision(&parent_advanced.to_string()).unwrap(),
+            parent_advanced.to_string()
+        );
+        assert_eq!(
+            git.resolve_revision("not-a-revision").unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            git.resolve_revision(&"0".repeat(40)).unwrap_err().code,
+            ErrorCode::Vcs
+        );
+
+        let RebaseIntegrationOutcome::Rebased(replayed) = git
+            .rebase_onto_revision(&parent_advanced.to_string())
+            .unwrap()
+        else {
+            panic!("expected the child commit to be replayed");
+        };
+        assert_ne!(replayed, child);
+
+        git.restore_branch_to_revision(&child.to_string()).unwrap();
+        assert_eq!(
+            git.repository().unwrap().head().unwrap().target(),
+            Some(child)
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("child.txt")).unwrap(),
+            "child\n"
+        );
+        assert!(!root.join("parent.txt").exists());
+        assert!(git.status().unwrap().clean);
+
+        // A dirty checkout keeps its changes instead of being restored over.
+        fs::write(root.join("README.md"), "local change\n").unwrap();
+        assert_eq!(
+            git.restore_branch_to_revision(&parent_advanced.to_string())
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("README.md")).unwrap(),
+            "local change\n"
+        );
+        assert!(root.join("child.txt").exists());
         fs::remove_dir_all(root).unwrap();
     }
 

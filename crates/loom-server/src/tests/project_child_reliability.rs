@@ -127,6 +127,7 @@ fn child_creation_recovers_a_stranded_cancellation_cascade() {
             manager_session_id: root,
             task_id: manager_task.task_id,
             action: ProjectChildControlAction::Cancel,
+            onto: None,
         },
     )));
     assert_eq!(

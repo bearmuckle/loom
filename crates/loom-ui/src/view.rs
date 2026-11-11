@@ -1961,6 +1961,7 @@ fn project_child_control_label(action: ProjectChildControlAction) -> &'static st
         ProjectChildControlAction::Cancel => "Cancel child and descendants",
         ProjectChildControlAction::Abandon => "Abandon completed result",
         ProjectChildControlAction::MarkLanded => "Mark reviewed result landed",
+        ProjectChildControlAction::Rebase => "Rebase child onto a newer base",
     }
 }
 

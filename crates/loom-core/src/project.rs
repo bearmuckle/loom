@@ -400,6 +400,24 @@ fn commit_count(count: u32) -> String {
     }
 }
 
+/// A rebase of a finished code child's own commits onto a newer base.
+///
+/// The record says what the child's branch held before and after the replay, so
+/// a manager reading the worktree later can tell that the reviewed revision
+/// changed under it and which base it now descends from.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectWorktreeRebase {
+    /// The base the replayed commits were created from.
+    pub previous_base_revision: String,
+    /// The revision the child's branch held before the replay.
+    pub previous_result_revision: String,
+    /// The base the replayed commits now descend from.
+    pub base_revision: String,
+    /// The revision the child's branch holds after the replay.
+    pub result_revision: String,
+    pub rebased_at: Timestamp,
+}
+
 /// Durable identity and disposition of the isolated code checkout assigned to
 /// a delegated task. The path is relative to the child's session filesystem.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -436,6 +454,12 @@ pub struct ProjectWorktreeRecord {
     /// landing Loom did not perform is never silent.
     #[serde(default)]
     pub landed_evidence: Option<String>,
+    /// The newest rebase of this child's own commits onto a moved base, so a
+    /// checkout whose revision changed under the manager is never silent.
+    /// `None` for a checkout that was never rebased, including every record
+    /// written before a rebase was recorded.
+    #[serde(default)]
+    pub rebase: Option<ProjectWorktreeRebase>,
     pub status: ProjectWorktreeStatus,
     pub conflict_paths: Vec<String>,
     pub error: Option<String>,
@@ -662,7 +686,8 @@ mod tests {
     fn worktree_base_refresh_summarizes_drift_from_a_fetch() {
         use super::{
             ProjectChildScope, ProjectChildScopeMode, ProjectWorktreeBaseRefresh,
-            ProjectWorktreeLandedBy, ProjectWorktreeRecord, ProjectWorktreeStatus,
+            ProjectWorktreeLandedBy, ProjectWorktreeRebase, ProjectWorktreeRecord,
+            ProjectWorktreeStatus,
         };
         use crate::{RepositoryId, TaskId};
 
@@ -736,6 +761,13 @@ mod tests {
             integrated_revision: None,
             landed_by: Some(ProjectWorktreeLandedBy::Replay),
             landed_evidence: Some("replayed onto the parent tip".into()),
+            rebase: Some(ProjectWorktreeRebase {
+                previous_base_revision: base.into(),
+                previous_result_revision: tip.into(),
+                base_revision: tip.into(),
+                result_revision: base.into(),
+                rebased_at: fetched_at,
+            }),
             status: ProjectWorktreeStatus::Ready,
             conflict_paths: vec![],
             error: None,
@@ -747,6 +779,7 @@ mod tests {
         assert_eq!(encoded["base_refresh"]["state"], "fetched");
         assert_eq!(encoded["base_refresh"]["behind"], 15);
         assert_eq!(encoded["landed_by"], "replay");
+        assert_eq!(encoded["rebase"]["base_revision"], tip);
         assert_eq!(
             serde_json::from_value::<ProjectWorktreeRecord>(encoded).unwrap(),
             record
@@ -760,10 +793,15 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("landed_evidence");
         legacy.as_object_mut().unwrap().remove("scope");
         legacy.as_object_mut().unwrap().remove("scope_override");
+        legacy.as_object_mut().unwrap().remove("rebase");
         let legacy: ProjectWorktreeRecord = serde_json::from_value(legacy).unwrap();
         assert_eq!(legacy.base_refresh, None);
         assert_eq!(legacy.landed_by, None);
         assert_eq!(legacy.landed_evidence, None);
+        assert_eq!(
+            legacy.rebase, None,
+            "a worktree written before a rebase was recorded reports none"
+        );
         assert_eq!(
             legacy.scope, None,
             "a worktree written before scopes declares none"

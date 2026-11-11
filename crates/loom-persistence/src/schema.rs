@@ -859,6 +859,7 @@ CREATE TABLE IF NOT EXISTS project_worktrees (
     base_refresh TEXT CHECK(base_refresh IS NULL OR length(base_refresh) <= 8192),
     scope TEXT CHECK(scope IS NULL OR length(CAST(scope AS BLOB)) <= 16384),
     scope_override TEXT CHECK(scope_override IS NULL OR length(CAST(scope_override AS BLOB)) <= 16384),
+    rebase TEXT CHECK(rebase IS NULL OR length(CAST(rebase AS BLOB)) <= 1024),
     cleanup_disposition TEXT CHECK(cleanup_disposition IS NULL OR cleanup_disposition IN (
         'retain', 'remove_clean', 'discard_changes'
     )),
@@ -1394,6 +1395,31 @@ fn migrate_schema_transaction(connection: &Connection, from_version: u32) -> Res
                         })?;
                 }
                 version = 19;
+            }
+            // v20 records the latest rebase of a finished child's own commits
+            // onto a newer base, so a checkout whose revision changed under the
+            // manager is readable later. A database from an older revision may
+            // not have the worktree table yet; the baseline batches add it with
+            // the new column, so the ALTER applies only where it is needed. A
+            // missing column reads as no recorded rebase.
+            19 => {
+                if migration_table_exists(&transaction, "project_worktrees")?
+                    && !migration_column_exists(&transaction, "project_worktrees", "rebase")?
+                {
+                    transaction
+                        .execute_batch(
+                            "ALTER TABLE project_worktrees ADD COLUMN rebase TEXT
+                                 CHECK(rebase IS NULL
+                                     OR length(CAST(rebase AS BLOB)) <= 1024);",
+                        )
+                        .map_err(|error| {
+                            persistence_error(
+                                format!("could not migrate persistence schema to v20: {error}"),
+                                true,
+                            )
+                        })?;
+                }
+                version = 20;
             }
             other => return Err(unsupported_database_error(other)),
         }

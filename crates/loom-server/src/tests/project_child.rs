@@ -667,6 +667,7 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
                 manager_session_id,
                 task_id,
                 action,
+                onto: None,
             },
         )))
     };
@@ -774,6 +775,7 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
                 manager_session_id,
                 task_id: resumable_task.task_id,
                 action: ProjectChildControlAction::Continue,
+                onto: None,
             },
         )))
     };
@@ -847,6 +849,7 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
             manager_session_id,
             task_id: resumable_task.task_id,
             action: ProjectChildControlAction::Pause,
+            onto: None,
         },
     )));
     let ServerResponse::Project(ProjectResponse::ProjectChildControlled { run, .. }) =
@@ -946,6 +949,7 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
                         manager_session_id,
                         task_id: resumable_task.task_id,
                         action,
+                        onto: None,
                     }
                 )))
                 .result
@@ -1013,6 +1017,7 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
             manager_session_id: child_session_id,
             task_id: grandchild_task.task_id,
             action: ProjectChildControlAction::Cancel,
+            onto: None,
         },
     )));
     assert_eq!(
@@ -1186,6 +1191,7 @@ fn cancelling_a_child_running_a_sleep_command_stops_promptly() {
                 manager_session_id: root,
                 task_id: child_task.task_id,
                 action: ProjectChildControlAction::Cancel,
+                onto: None,
             },
         )))
         .result
@@ -1434,6 +1440,7 @@ fn cancelling_project_child_cascades_deepest_first_and_survives_restart() {
             manager_session_id: root,
             task_id: manager_task.task_id,
             action: ProjectChildControlAction::Cancel,
+            onto: None,
         },
     )));
     assert_eq!(
@@ -2069,6 +2076,7 @@ fn auto_archive_waits_for_code_integration() {
         landed_evidence: None,
         scope: None,
         scope_override: None,
+        rebase: None,
         status: loom_core::ProjectWorktreeStatus::Creating,
         conflict_paths: vec![],
         error: None,

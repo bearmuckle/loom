@@ -223,14 +223,15 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_control_children {
             definitions.push(ToolDefinition {
                 name: "control_project_child".to_owned(),
-                description: "Continue a paused child, retry a failed child run, cancel a live child, abandon a finished child whose work you will not land, or record that you landed a reviewed result yourself. Address children only by delegated task_id. Retry re-runs the failed tool step when a tool step is what failed; when the model or provider call is what failed there is no step to re-run, so the run resumes from its checkpoint and the child can finish and commit the work its checkout already holds. Abandon closes a finished child as failed, reports any uncommitted paths it left in its checkout, states that this work will not be landed, and releases the completion guard for that child; the checkout is preserved for inspection. mark_landed records a reviewed result you landed yourself — by cherry-picking, replaying, or squashing the child's commits — with the revision that carries the reviewed change and evidence of how it landed; the revision is checked against the reviewed content, so a revision that does not hold it is refused.".to_owned(),
+                description: "Continue a paused child, retry a failed child run, cancel a live child, abandon a finished child whose work you will not land, record that you landed a reviewed result yourself, or rebase a finished child's own commits onto a newer base. Address children only by delegated task_id. Retry re-runs the failed tool step when a tool step is what failed; when the model or provider call is what failed there is no step to re-run, so the run resumes from its checkpoint and the child can finish and commit the work its checkout already holds. Abandon closes a finished child as failed, reports any uncommitted paths it left in its checkout, states that this work will not be landed, and releases the completion guard for that child; the checkout is preserved for inspection. mark_landed records a reviewed result you landed yourself — by cherry-picking, replaying, or squashing the child's commits — with the revision that carries the reviewed change and evidence of how it landed; the revision is checked against the reviewed content, so a revision that does not hold it is refused. rebase replays a finished child's own commits onto the revision you name, keeping each commit's author and message and creating no merge commit, then runs its bounded checks and records the new base and result revision; it refuses a dirty child checkout, a commit already contained in the target, a target that does not descend from the child's base, a conflicted replay, and a replay that would touch a file the reviewed change never touched, and restores the child's branch when a check fails.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "task_id": {"type": "string", "format": "uuid"},
-                        "action": {"type": "string", "enum": ["continue", "retry_failed_step", "cancel", "abandon", "mark_landed"]},
+                        "action": {"type": "string", "enum": ["continue", "retry_failed_step", "cancel", "abandon", "mark_landed", "rebase"]},
                         "revision": {"type": "string", "minLength": 1, "maxLength": 64, "description": "Revision in the parent repository that carries the reviewed change; required by mark_landed."},
-                        "evidence": {"type": "string", "minLength": 1, "maxLength": 4096, "description": "How the reviewed change was landed, for example the cherry-pick or squash commit you made; required by mark_landed."}
+                        "evidence": {"type": "string", "minLength": 1, "maxLength": 4096, "description": "How the reviewed change was landed, for example the cherry-pick or squash commit you made; required by mark_landed."},
+                        "onto": {"type": "string", "minLength": 1, "maxLength": 64, "description": "Where rebase replays the child's own commits: a commit id of the parent repository, or `main` for the parent checkout's current head. Required by rebase and never merged with a new parent checkout."}
                     },
                     "required": ["task_id", "action"],
                     "additionalProperties": false
@@ -1464,6 +1465,7 @@ impl ProjectAgentTools {
             arguments.task_id,
             arguments.action,
             landing,
+            arguments.onto,
         ) {
             Ok(outcome) => {
                 let mut output = serde_json::json!({
@@ -1491,6 +1493,32 @@ impl ProjectAgentTools {
                     output["note"] = serde_json::json!(
                         "The reviewed result is recorded as landed at this revision, so the completion guard no longer requires this child; nothing was applied to your checkout."
                     );
+                }
+                if let Some(rebase) = outcome.rebase.as_ref() {
+                    // A rebase changed the child's own revision, so the report
+                    // names both pairs and what ran to validate the result.
+                    output = serde_json::json!({
+                        "task_id": outcome.task.task_id,
+                        "status": outcome.task.status,
+                        "child_session_id": outcome.task.target_session_id,
+                        "run_state": outcome.run.as_ref().map(|snapshot| snapshot.state),
+                        "run_summary": outcome.run.as_ref().and_then(|snapshot| snapshot.summary.clone()),
+                        "previous_base_revision": &rebase.previous_base_revision,
+                        "previous_result_revision": &rebase.previous_result_revision,
+                        "base_revision": &rebase.base_revision,
+                        "result_revision": &rebase.result_revision,
+                        "commit_ids_changed": rebase.commit_ids_changed,
+                        "commits_before": rebase.commits_before,
+                        "commits_after": rebase.commits_after,
+                        "checks": rebase.checks.iter().map(|check| serde_json::json!({
+                            "name": &check.name,
+                            "command": &check.command,
+                            "outcome": check.outcome.as_str(),
+                            "detail": &check.detail,
+                        })).collect::<Vec<_>>(),
+                        "check_timeout_secs": rebase.check_timeout_secs,
+                        "note": "The child's own commits were replayed onto base_revision and its branch now points at result_revision; it keeps each commit's author and message and created no merge commit. The checks above ran in the child checkout: a check reported as skipped did not run and says why. Review the child again before integrating it, because its result revision changed."
+                    });
                 }
                 ToolResult {
                     tool_call_id: call.id,

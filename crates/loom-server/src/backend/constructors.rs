@@ -396,6 +396,8 @@ impl InProcessBackend {
             fail_next_state_save: AtomicBool::new(false),
             #[cfg(test)]
             project_cancellation_failpoint: AtomicUsize::new(0),
+            #[cfg(test)]
+            project_child_rebase_check: Mutex::new(None),
         });
         *backend
             .self_reference

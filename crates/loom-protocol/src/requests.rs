@@ -656,6 +656,11 @@ pub enum ProjectRequest {
         manager_session_id: AgentSessionId,
         task_id: loom_core::TaskId,
         action: ProjectChildControlAction,
+        /// The revision a `rebase` action replays the child's own commits onto:
+        /// a full commit id, or `main` for the parent checkout's current head.
+        /// Every other action carries none, and an older client omits it.
+        #[serde(default)]
+        onto: Option<String>,
     },
 
     GetProjectChildReview {

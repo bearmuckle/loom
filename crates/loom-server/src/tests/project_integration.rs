@@ -125,6 +125,7 @@ fn abandoning_a_live_child_is_refused() {
                 manager_session_id: fixture.root_id,
                 task_id: fixture.task_id,
                 action: ProjectChildControlAction::Abandon,
+                onto: None,
             },
         )));
     let Err(error) = abandon.result else {
@@ -250,6 +251,7 @@ fn project_child_worktree_can_be_reviewed_fast_forwarded_and_cleaned_up() {
         landed_evidence: None,
         scope: None,
         scope_override: None,
+        rebase: None,
         status: ProjectWorktreeStatus::Creating,
         conflict_paths: Vec::new(),
         error: None,
@@ -3403,4 +3405,716 @@ fn code_child_manager_tools(fixture: &ProjectCodeChildFixture) -> ToolExecutor {
             .unwrap(),
     )
     .with_extension(extension)
+}
+
+/// Runs one `control_project_child` action through the manager's own tools.
+fn control_child_with_tools(
+    fixture: &ProjectCodeChildFixture,
+    action: &str,
+    onto: Option<&str>,
+) -> ToolResult {
+    let mut arguments = serde_json::json!({
+        "task_id": fixture.task_id,
+        "action": action,
+    });
+    if let Some(onto) = onto {
+        arguments["onto"] = serde_json::json!(onto);
+    }
+    code_child_manager_tools(fixture).execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "control_project_child".to_owned(),
+        arguments,
+    })
+}
+
+/// Replaces the rebase's documented check set so a test does not run a real
+/// toolchain: an empty `args` runs `program` on its own, and `timeout` bounds
+/// that run.
+fn set_rebase_check(
+    fixture: &ProjectCodeChildFixture,
+    program: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+) {
+    *fixture
+        .backend
+        .project_child_rebase_check
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((
+        program.to_owned(),
+        args.iter().map(|argument| (*argument).to_owned()).collect(),
+        timeout,
+    ));
+}
+
+/// Clears the rebase check override, so a test reads the documented default.
+fn clear_rebase_check(fixture: &ProjectCodeChildFixture) {
+    *fixture
+        .backend
+        .project_child_rebase_check
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+#[test]
+fn a_finished_child_is_rebased_onto_an_advanced_parent() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "feat: child change\n\nwhy the child changed",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+    commit_file(
+        fixture.parent_git.root(),
+        "README.md",
+        "parent advanced\n",
+        "parent change",
+    );
+    let parent_advanced = fixture.parent_git.status().unwrap().head.unwrap();
+    set_rebase_check(&fixture, "true", &[], std::time::Duration::from_secs(5));
+
+    let rebase = control_child_with_tools(&fixture, "rebase", Some("main"));
+    assert!(rebase.success, "{}", rebase.output);
+    let rebase: serde_json::Value = serde_json::from_str(&rebase.output).unwrap();
+    assert_eq!(
+        rebase["previous_base_revision"],
+        serde_json::json!(fixture.worktree.base_revision)
+    );
+    assert_eq!(
+        rebase["previous_result_revision"],
+        serde_json::json!(child_revision)
+    );
+    assert_eq!(
+        rebase["base_revision"],
+        serde_json::json!(parent_advanced),
+        "`main` names the parent checkout's current head"
+    );
+    let rebased_revision = rebase["result_revision"]
+        .as_str()
+        .expect("the rebase names the new revision")
+        .to_owned();
+    assert_ne!(rebased_revision, child_revision);
+    assert_eq!(rebase["commit_ids_changed"], serde_json::json!(true));
+    assert_eq!(rebase["commits_before"], serde_json::json!(1));
+    assert_eq!(rebase["commits_after"], serde_json::json!(1));
+    let checks = rebase["checks"]
+        .as_array()
+        .expect("the checks are reported");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0]["name"], serde_json::json!("override"));
+    assert_eq!(checks[0]["outcome"], serde_json::json!("passed"));
+    assert_eq!(checks[0]["command"], serde_json::json!("true"));
+
+    // The child keeps its own commit content, author, and message, and the
+    // replay created no merge commit.
+    assert_eq!(
+        git_output(&fixture.child_checkout, &["rev-parse", "HEAD"]),
+        rebased_revision
+    );
+    assert_eq!(
+        git_output(
+            &fixture.child_checkout,
+            &["log", "-1", "--format=%B", &rebased_revision]
+        ),
+        "feat: child change\n\nwhy the child changed"
+    );
+    assert_eq!(
+        git_output(
+            &fixture.child_checkout,
+            &["log", "-1", "--format=%an <%ae>", &rebased_revision]
+        ),
+        "Loom Test <loom@example.test>"
+    );
+    assert_eq!(
+        git_output(
+            &fixture.child_checkout,
+            &["rev-list", "--parents", "-n1", &rebased_revision]
+        ),
+        format!("{rebased_revision} {parent_advanced}"),
+        "the replayed commit is a single-parent commit on the new base"
+    );
+    assert_eq!(
+        fixture.parent_git.status().unwrap().head.as_deref(),
+        Some(parent_advanced.as_str()),
+        "a rebase never touches the parent checkout"
+    );
+
+    // The record names the new pair and the rebase it performed.
+    let worktree = integrated_worktree(&fixture);
+    assert_eq!(worktree.base_revision, parent_advanced);
+    assert_eq!(
+        worktree.result_revision.as_deref(),
+        Some(rebased_revision.as_str())
+    );
+    let recorded = worktree.rebase.expect("the rebase should be recorded");
+    assert_eq!(
+        recorded.previous_base_revision,
+        fixture.worktree.base_revision
+    );
+    assert_eq!(recorded.previous_result_revision, child_revision);
+    assert_eq!(recorded.base_revision, parent_advanced);
+    assert_eq!(recorded.result_revision, rebased_revision);
+
+    // Review and integration keep working against the new pair: the replay is
+    // the reviewed revision and it fast-forwards the parent.
+    assert_eq!(
+        review_project_code_child(&fixture),
+        rebased_revision,
+        "the review follows the rebased revision"
+    );
+    let integration = fixture
+        .connection
+        .request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::IntegrateProjectChild {
+                project_id: fixture.project_id,
+                manager_session_id: fixture.root_id,
+                task_id: fixture.task_id,
+                expected_parent_revision: parent_advanced.clone(),
+            },
+        )));
+    let ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(integrated)) =
+        integration.result.unwrap()
+    else {
+        panic!("unexpected child integration response");
+    };
+    assert_eq!(integrated.status, ProjectWorktreeStatus::Integrated);
+    assert_eq!(
+        fixture.parent_git.status().unwrap().head.as_deref(),
+        Some(rebased_revision.as_str())
+    );
+    fixture.shutdown();
+}
+
+#[test]
+fn a_rebase_reports_the_checks_it_ran_and_the_ones_it_skipped() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    complete_project_code_child(&fixture);
+    commit_file(
+        fixture.parent_git.root(),
+        "README.md",
+        "parent advanced\n",
+        "parent change",
+    );
+    // The documented set is what runs when nothing replaces it. The fixture
+    // checkout is not a Cargo workspace, so formatting is reported as skipped
+    // instead of being attempted, and the compile and test checks never run.
+    clear_rebase_check(&fixture);
+
+    let rebase = control_child_with_tools(&fixture, "rebase", Some("main"));
+    assert!(rebase.success, "{}", rebase.output);
+    let rebase: serde_json::Value = serde_json::from_str(&rebase.output).unwrap();
+    let checks = rebase["checks"]
+        .as_array()
+        .expect("the checks are reported");
+    let names = checks
+        .iter()
+        .map(|check| check["name"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["fmt", "clippy", "test"]);
+    for check in checks {
+        assert_eq!(
+            check["outcome"],
+            serde_json::json!("skipped"),
+            "no check ran in this checkout: {check}"
+        );
+        assert!(
+            check["detail"]
+                .as_str()
+                .is_some_and(|detail| !detail.is_empty()),
+            "a skipped check says why: {check}"
+        );
+    }
+    assert!(
+        checks[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("no Cargo.toml")),
+        "formatting is skipped because the checkout is not a Cargo workspace: {}",
+        checks[0]
+    );
+    assert_eq!(rebase["check_timeout_secs"], serde_json::json!(120));
+    fixture.shutdown();
+}
+
+#[test]
+fn a_rebase_whose_check_fails_is_refused_and_restored() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+    commit_file(
+        fixture.parent_git.root(),
+        "README.md",
+        "parent advanced\n",
+        "parent change",
+    );
+    set_rebase_check(&fixture, "false", &[], std::time::Duration::from_secs(5));
+
+    let rebase = control_child_with_tools(&fixture, "rebase", Some("main"));
+    assert!(!rebase.success, "{}", rebase.output);
+    assert!(
+        rebase.output.contains("override (failed)"),
+        "the refusal names the check that failed: {}",
+        rebase.output
+    );
+    assert!(
+        rebase.output.contains("restored"),
+        "the refusal says the checkout was restored: {}",
+        rebase.output
+    );
+    // Nothing was rebased: the child is where it was and the record is
+    // unchanged.
+    assert_eq!(
+        git_output(&fixture.child_checkout, &["rev-parse", "HEAD"]),
+        child_revision
+    );
+    let worktree = integrated_worktree(&fixture);
+    assert_eq!(worktree.base_revision, fixture.worktree.base_revision);
+    assert_eq!(worktree.rebase, None);
+    assert!(
+        GitService::open(&fixture.child_checkout)
+            .unwrap()
+            .status()
+            .unwrap()
+            .clean
+    );
+    fixture.shutdown();
+}
+
+#[test]
+fn a_rebase_whose_check_times_out_is_refused_and_restored() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+    commit_file(
+        fixture.parent_git.root(),
+        "README.md",
+        "parent advanced\n",
+        "parent change",
+    );
+    set_rebase_check(
+        &fixture,
+        "sleep",
+        &["5"],
+        std::time::Duration::from_millis(100),
+    );
+
+    let rebase = control_child_with_tools(&fixture, "rebase", Some("main"));
+    assert!(!rebase.success, "{}", rebase.output);
+    assert!(
+        rebase.output.contains("override (timed_out)"),
+        "the refusal names the timed-out check: {}",
+        rebase.output
+    );
+    assert_eq!(
+        git_output(&fixture.child_checkout, &["rev-parse", "HEAD"]),
+        child_revision
+    );
+    assert_eq!(integrated_worktree(&fixture).rebase, None);
+    fixture.shutdown();
+}
+
+#[test]
+fn a_rebase_is_refused_for_a_live_run_a_closed_checkout_and_a_merged_branch() {
+    // A child whose run is still live has no finished result to rebase.
+    let live = project_code_child_fixture();
+    commit_file(&live.child_checkout, "child.txt", "child\n", "child change");
+    live.persist_child_run_state(loom_core::RunId::new(), AgentRunState::Executing);
+    let refused = control_child_with_tools(&live, "rebase", Some("main"));
+    assert!(!refused.success, "{}", refused.output);
+    assert!(
+        refused.output.contains("still running"),
+        "the refusal says the run is live: {}",
+        refused.output
+    );
+    live.shutdown();
+
+    // A checkout that is no longer ready has no result to rebase either.
+    let closed = project_code_child_fixture();
+    commit_file(
+        &closed.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    complete_project_code_child(&closed);
+    let mut worktree = integrated_worktree(&closed);
+    worktree.status = ProjectWorktreeStatus::Integrated;
+    closed
+        .backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .save_project_worktree(&worktree)
+        .unwrap();
+    let refused = control_child_with_tools(&closed, "rebase", Some("main"));
+    assert!(!refused.success, "{}", refused.output);
+    assert!(
+        refused.output.contains("cannot be rebased"),
+        "the refusal names the checkout state: {}",
+        refused.output
+    );
+    closed.shutdown();
+
+    // A branch whose own commits contain a merge cannot be replayed without
+    // dropping that merge.
+    let merged = project_code_child_fixture();
+    let side_branch = "child-side";
+    git_in(&merged.child_checkout, &["branch", side_branch]);
+    commit_file(
+        &merged.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    git_in(&merged.child_checkout, &["checkout", "-q", side_branch]);
+    commit_file(&merged.child_checkout, "side.txt", "side\n", "side change");
+    git_in(
+        &merged.child_checkout,
+        &["checkout", "-q", &merged.worktree.branch_name],
+    );
+    git_in(
+        &merged.child_checkout,
+        &["merge", "--no-ff", "-m", "merge side work", side_branch],
+    );
+    complete_project_code_child(&merged);
+    let child_revision = review_project_code_child(&merged);
+    set_rebase_check(&merged, "true", &[], std::time::Duration::from_secs(5));
+    let refused = control_child_with_tools(&merged, "rebase", Some("main"));
+    assert!(!refused.success, "{}", refused.output);
+    assert!(
+        refused.output.contains("contain a merge"),
+        "the refusal says the branch holds a merge: {}",
+        refused.output
+    );
+    assert_eq!(
+        git_output(&merged.child_checkout, &["rev-parse", "HEAD"]),
+        child_revision
+    );
+    assert_eq!(integrated_worktree(&merged).rebase, None);
+    merged.shutdown();
+}
+
+#[test]
+fn a_rebase_reports_a_check_it_could_not_start() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+    commit_file(
+        fixture.parent_git.root(),
+        "README.md",
+        "parent advanced\n",
+        "parent change",
+    );
+    set_rebase_check(
+        &fixture,
+        "loom-rebase-check-that-does-not-exist",
+        &[],
+        std::time::Duration::from_secs(5),
+    );
+
+    let rebase = control_child_with_tools(&fixture, "rebase", Some("main"));
+    assert!(!rebase.success, "{}", rebase.output);
+    assert!(
+        rebase.output.contains("override (unavailable)"),
+        "the refusal names the check it could not start: {}",
+        rebase.output
+    );
+    assert_eq!(
+        git_output(&fixture.child_checkout, &["rev-parse", "HEAD"]),
+        child_revision
+    );
+    fixture.shutdown();
+}
+
+#[test]
+fn a_rebase_that_conflicts_is_refused_and_both_sides_are_untouched() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "README.md",
+        "child result\n",
+        "child change",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+    commit_file(
+        fixture.parent_git.root(),
+        "README.md",
+        "parent version\n",
+        "parent change",
+    );
+    let parent_advanced = fixture.parent_git.status().unwrap().head.unwrap();
+    set_rebase_check(&fixture, "true", &[], std::time::Duration::from_secs(5));
+
+    let rebase = control_child_with_tools(&fixture, "rebase", Some("main"));
+    assert!(!rebase.success, "{}", rebase.output);
+    assert!(
+        rebase.output.contains("README.md"),
+        "the refusal names the conflicting path: {}",
+        rebase.output
+    );
+    assert!(
+        rebase.output.contains("left unchanged"),
+        "the refusal says nothing was changed: {}",
+        rebase.output
+    );
+    assert_eq!(
+        git_output(&fixture.child_checkout, &["rev-parse", "HEAD"]),
+        child_revision
+    );
+    assert_eq!(
+        git_output(&fixture.child_checkout, &["branch", "--show-current"]),
+        fixture.worktree.branch_name
+    );
+    let child_git = GitService::open(&fixture.child_checkout).unwrap();
+    assert!(child_git.status().unwrap().clean);
+    assert!(!child_git.operation_in_progress().unwrap());
+    assert_eq!(
+        fixture.parent_git.status().unwrap().head.as_deref(),
+        Some(parent_advanced.as_str())
+    );
+    assert!(fixture.parent_git.status().unwrap().clean);
+    let worktree = integrated_worktree(&fixture);
+    assert_eq!(worktree.base_revision, fixture.worktree.base_revision);
+    assert_eq!(
+        worktree.result_revision.as_deref(),
+        Some(child_revision.as_str()),
+        "the reviewed revision is still the one the record names"
+    );
+    assert_eq!(worktree.rebase, None);
+    fixture.shutdown();
+}
+
+#[test]
+fn a_rebase_of_a_dirty_child_checkout_is_refused_with_its_paths() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+    commit_file(
+        fixture.parent_git.root(),
+        "README.md",
+        "parent advanced\n",
+        "parent change",
+    );
+    fs::write(fixture.child_checkout.join("uncommitted.txt"), "work\n").unwrap();
+    set_rebase_check(&fixture, "true", &[], std::time::Duration::from_secs(5));
+
+    let rebase = control_child_with_tools(&fixture, "rebase", Some("main"));
+    assert!(!rebase.success, "{}", rebase.output);
+    assert!(
+        rebase.output.contains("uncommitted.txt"),
+        "the refusal names the uncommitted path: {}",
+        rebase.output
+    );
+    assert_eq!(
+        git_output(&fixture.child_checkout, &["rev-parse", "HEAD"]),
+        child_revision
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.child_checkout.join("uncommitted.txt")).unwrap(),
+        "work\n",
+        "a refused rebase leaves the uncommitted work in place"
+    );
+    assert_eq!(integrated_worktree(&fixture).rebase, None);
+    fixture.shutdown();
+}
+
+#[test]
+fn a_rebase_of_a_child_the_target_already_contains_is_refused() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+    // The parent fast-forwards to the child's own commit, so the target already
+    // contains everything there is to replay.
+    git_in(
+        fixture.parent_git.root(),
+        &["merge", "--ff-only", "-q", &fixture.worktree.branch_name],
+    );
+    assert_eq!(
+        fixture.parent_git.status().unwrap().head.as_deref(),
+        Some(child_revision.as_str())
+    );
+    set_rebase_check(&fixture, "true", &[], std::time::Duration::from_secs(5));
+
+    let rebase = control_child_with_tools(&fixture, "rebase", Some("main"));
+    assert!(!rebase.success, "{}", rebase.output);
+    assert!(
+        rebase.output.contains("already contained"),
+        "the refusal says there is nothing to rebase: {}",
+        rebase.output
+    );
+    let worktree = integrated_worktree(&fixture);
+    assert_eq!(worktree.base_revision, fixture.worktree.base_revision);
+    assert_eq!(worktree.rebase, None);
+    fixture.shutdown();
+}
+
+#[test]
+fn a_rebase_onto_an_unknown_or_incompatible_target_is_refused() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+    set_rebase_check(&fixture, "true", &[], std::time::Duration::from_secs(5));
+
+    // A revision the parent repository does not hold is refused by name.
+    let unknown = control_child_with_tools(&fixture, "rebase", Some(&"f".repeat(40)));
+    assert!(!unknown.success, "{}", unknown.output);
+    assert!(
+        unknown
+            .output
+            .contains("not a revision of the parent repository"),
+        "the refusal says the target is unknown: {}",
+        unknown.output
+    );
+
+    // A target that does not descend from the child's base would replay
+    // history the child was never created from, so it is refused too.
+    git_in(
+        fixture.parent_git.root(),
+        &["checkout", "-q", "--orphan", "unrelated"],
+    );
+    commit_file(
+        fixture.parent_git.root(),
+        "orphan.txt",
+        "orphan\n",
+        "unrelated history",
+    );
+    let unrelated = fixture.parent_git.status().unwrap().head.unwrap();
+    let refusal = control_child_with_tools(&fixture, "rebase", Some(&unrelated));
+    assert!(!refusal.success, "{}", refusal.output);
+    assert!(
+        refusal
+            .output
+            .contains("does not descend from the child's base"),
+        "the refusal says the target is not an ancestor-compatible base: {}",
+        refusal.output
+    );
+    assert_eq!(
+        git_output(&fixture.child_checkout, &["rev-parse", "HEAD"]),
+        child_revision
+    );
+    assert_eq!(integrated_worktree(&fixture).rebase, None);
+    // A rebase without a target names the missing argument.
+    let missing = control_child_with_tools(&fixture, "rebase", None);
+    assert!(!missing.success, "{}", missing.output);
+    assert!(
+        missing.output.contains("requires onto"),
+        "the refusal asks for a target: {}",
+        missing.output
+    );
+    fixture.shutdown();
+}
+
+#[test]
+fn a_rebase_of_a_live_child_is_refused() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    // The task is still queued, so the child has not finished.
+    let rebase = control_child_with_tools(&fixture, "rebase", Some("main"));
+    assert!(!rebase.success, "{}", rebase.output);
+    assert!(
+        rebase.output.contains("has not finished"),
+        "the refusal says the child is not finished: {}",
+        rebase.output
+    );
+    fixture.shutdown();
+}
+
+#[test]
+fn a_rebase_that_would_touch_an_unreviewed_path_is_refused() {
+    let fixture = project_code_child_fixture();
+    // The reviewed change modifies README.md only.
+    commit_file(
+        &fixture.child_checkout,
+        "README.md",
+        "child result\n",
+        "child change",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+    // The parent moves the same file, so a replay follows the rename and would
+    // change a path the reviewed commit never touched.
+    fs::create_dir_all(fixture.parent_git.root().join("docs")).unwrap();
+    git_in(
+        fixture.parent_git.root(),
+        &["mv", "README.md", "docs/README.md"],
+    );
+    git_in(
+        fixture.parent_git.root(),
+        &["commit", "-qm", "move the readme"],
+    );
+    let parent_advanced = fixture.parent_git.status().unwrap().head.unwrap();
+    set_rebase_check(&fixture, "true", &[], std::time::Duration::from_secs(5));
+
+    let rebase = control_child_with_tools(&fixture, "rebase", Some("main"));
+    assert!(!rebase.success, "{}", rebase.output);
+    assert!(
+        rebase.output.contains("docs/README.md"),
+        "the refusal names the unreviewed path: {}",
+        rebase.output
+    );
+    assert!(
+        rebase.output.contains("restored"),
+        "the refusal says the checkout was restored: {}",
+        rebase.output
+    );
+    assert_eq!(
+        git_output(&fixture.child_checkout, &["rev-parse", "HEAD"]),
+        child_revision
+    );
+    assert_eq!(
+        fixture.parent_git.status().unwrap().head.as_deref(),
+        Some(parent_advanced.as_str())
+    );
+    assert_eq!(integrated_worktree(&fixture).rebase, None);
+    fixture.shutdown();
 }

@@ -17,12 +17,12 @@ use loom_core::{
     ProjectAgentRecord, ProjectChildScope, ProjectId, ProjectManagerWaitId,
     ProjectManagerWaitRecord, ProjectManagerWaitStatus, ProjectSnapshot,
     ProjectWorktreeBaseRefresh, ProjectWorktreeCleanupDisposition, ProjectWorktreeLandedBy,
-    ProjectWorktreeRecord, ProjectWorktreeScopeOverride, ProjectWorktreeStatus, RepositoryId,
-    RequestId, Result, RunAttemptId, RunId, SessionAccessRequest, SessionDirectory,
-    SessionFilesystemChange, SessionGrant, SessionLimits, SessionManagerState, SessionRepository,
-    SessionRole, SessionTitleSource, StepId, TaskContextReference, TaskId, Timestamp, ToolCallId,
-    UsageSnapshot, WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl, WorkspaceId,
-    WorkspaceManagerState, WorkspaceRecord,
+    ProjectWorktreeRebase, ProjectWorktreeRecord, ProjectWorktreeScopeOverride,
+    ProjectWorktreeStatus, RepositoryId, RequestId, Result, RunAttemptId, RunId,
+    SessionAccessRequest, SessionDirectory, SessionFilesystemChange, SessionGrant, SessionLimits,
+    SessionManagerState, SessionRepository, SessionRole, SessionTitleSource, StepId,
+    TaskContextReference, TaskId, Timestamp, ToolCallId, UsageSnapshot, WorkspaceChangeKind,
+    WorkspaceConfig, WorkspaceControl, WorkspaceId, WorkspaceManagerState, WorkspaceRecord,
 };
 use loom_model::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
@@ -74,7 +74,7 @@ pub use schema::*;
 /// column where the payload column already exists. The upgrade path
 /// additionally re-applies the idempotent baseline batches, so a bump is what
 /// hands new baseline objects (such as indexes) to existing databases.
-const DATABASE_SCHEMA_VERSION: u32 = 19;
+const DATABASE_SCHEMA_VERSION: u32 = 20;
 /// Oldest schema version that the migration ladder can upgrade in place.
 const DATABASE_MIN_MIGRATABLE_VERSION: u32 = 2;
 /// Maximum UTF-8 bytes stored for a raw or provider-qualified model selector.

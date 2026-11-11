@@ -978,6 +978,7 @@ fn lifecycle_worktree(status: ProjectWorktreeStatus) -> ProjectWorktreeRecord {
         landed_evidence: None,
         scope: None,
         scope_override: None,
+        rebase: None,
         status,
         conflict_paths: vec![],
         error: None,
@@ -7353,6 +7354,7 @@ fn fake_worktree(
         landed_evidence: None,
         scope: None,
         scope_override: None,
+        rebase: None,
         status: ProjectWorktreeStatus::Ready,
         conflict_paths: Vec::new(),
         error: None,
@@ -10797,6 +10799,7 @@ fn project_child_controls_send_the_snapshot_manager() {
                     manager_session_id,
                     task_id,
                     action,
+                    ..
                 }) => Some((*project_id, *manager_session_id, *task_id, *action)),
                 _ => None,
             })

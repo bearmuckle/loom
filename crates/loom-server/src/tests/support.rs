@@ -595,6 +595,7 @@ pub(super) fn pending_project_code_child_fixture() -> ProjectCodeChildFixture {
         landed_evidence: None,
         scope: None,
         scope_override: None,
+        rebase: None,
         status: ProjectWorktreeStatus::Creating,
         conflict_paths: Vec::new(),
         error: None,
@@ -997,6 +998,7 @@ pub(super) fn dependency_failure_blocks_child_and_releases_manager_wait_once(
                 manager_session_id: root,
                 task_id: prerequisite_task.task_id,
                 action: loom_protocol::ProjectChildControlAction::Cancel,
+                onto: None,
             },
         )));
         let ServerResponse::Project(ProjectResponse::ProjectChildControlled {
@@ -1090,6 +1092,7 @@ pub(super) fn dependency_failure_blocks_child_and_releases_manager_wait_once(
             manager_session_id: root,
             task_id: manager_task.task_id,
             action: loom_protocol::ProjectChildControlAction::Cancel,
+            onto: None,
         },
     )));
     let ServerResponse::Project(ProjectResponse::ProjectChildControlled {

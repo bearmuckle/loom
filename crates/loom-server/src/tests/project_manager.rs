@@ -932,6 +932,7 @@ fn project_manager_tool_creates_an_idempotent_non_code_child() {
                 manager_session_id: root,
                 task_id: idle_task.task_id,
                 action: ProjectChildControlAction::Cancel,
+                onto: None,
             },
         )))
         .result
@@ -1936,6 +1937,7 @@ fn an_action_request_to_a_completed_code_child_is_refused() {
                 landed_evidence: None,
                 scope: None,
                 scope_override: None,
+                rebase: None,
                 status: ProjectWorktreeStatus::Creating,
                 conflict_paths: Vec::new(),
                 error: None,

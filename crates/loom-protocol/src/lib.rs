@@ -73,6 +73,13 @@ pub enum ProjectChildControlAction {
     /// landed together with the revision and the evidence that carry it. The
     /// tool surface supplies both; a bare control request is refused.
     MarkLanded,
+    /// Replays a finished code child's own commits onto a newer base.
+    ///
+    /// The named target comes from the request's `onto` field; a request that
+    /// names none is refused. A rebase never reopens the child to new work: it
+    /// moves the child's branch so the reviewed commit can be integrated from a
+    /// parent that moved after the child finished.
+    Rebase,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1424,7 +1431,7 @@ mod run_message_protocol_tests {
 
     #[test]
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 20));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 21));
         let project_id = ProjectId::new();
         let request = ClientRequest::Project(ProjectRequest::GetProjectSnapshot { project_id });
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));
@@ -1628,6 +1635,7 @@ mod run_message_protocol_tests {
             manager_session_id: parent,
             task_id: loom_core::TaskId::new(),
             action: ProjectChildControlAction::Pause,
+            onto: None,
         });
         assert_eq!(
             control_request.required_capability(),
@@ -1650,6 +1658,7 @@ mod run_message_protocol_tests {
             manager_session_id: parent,
             task_id: loom_core::TaskId::new(),
             action: ProjectChildControlAction::Abandon,
+            onto: None,
         });
         assert_eq!(
             abandon_request.required_capability(),
@@ -1663,6 +1672,44 @@ mod run_message_protocol_tests {
             .unwrap()
             .request,
             abandon_request
+        );
+
+        let rebase_task_id = loom_core::TaskId::new();
+        let renew_request = ClientRequest::Project(ProjectRequest::ControlProjectChild {
+            project_id,
+            manager_session_id: parent,
+            task_id: rebase_task_id,
+            action: ProjectChildControlAction::Rebase,
+            onto: Some("main".to_owned()),
+        });
+        assert_eq!(
+            renew_request.required_capability(),
+            Some(Capability::ControlProjectChild)
+        );
+        assert!(renew_request.is_retryable_mutation());
+        let encoded = encode_request(&RequestEnvelope::new(renew_request.clone())).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(json["request"]["data"]["data"]["action"], "rebase");
+        assert_eq!(json["request"]["data"]["data"]["onto"], "main");
+        assert_eq!(decode_request(&encoded).unwrap().request, renew_request);
+
+        // A peer that predates the action sends no `onto`, which reads as no
+        // target instead of failing to decode.
+        let mut without_onto = json.clone();
+        without_onto["request"]["data"]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("onto");
+        let decoded: RequestEnvelope = serde_json::from_value(without_onto).unwrap();
+        assert_eq!(
+            decoded.request,
+            ClientRequest::Project(ProjectRequest::ControlProjectChild {
+                project_id,
+                manager_session_id: parent,
+                task_id: rebase_task_id,
+                action: ProjectChildControlAction::Rebase,
+                onto: None,
+            })
         );
 
         let review_request = ClientRequest::Project(ProjectRequest::GetProjectChildReview {

@@ -47,6 +47,7 @@ impl InProcessConnection {
                 manager_session_id,
                 task_id,
                 action,
+                onto,
             }) => {
                 let outcome = self.control_project_child(
                     manager_session_id,
@@ -54,7 +55,17 @@ impl InProcessConnection {
                     task_id,
                     action,
                     None,
+                    onto,
                 )?;
+                // A rebase moves the child's own branch, so it answers with the
+                // worktree record that names the new base and result revision.
+                if action == ProjectChildControlAction::Rebase
+                    && let Some(worktree) = outcome.worktree
+                {
+                    return Ok(ServerResponse::Project(
+                        ProjectResponse::ProjectChildWorktreeUpdated(Box::new(worktree)),
+                    ));
+                }
                 Ok(ServerResponse::Project(
                     ProjectResponse::ProjectChildControlled {
                         task: Box::new(outcome.task),

@@ -401,6 +401,8 @@ pub(super) async fn child<C: Client>(
                 manager_session_id: task.requester_session_id,
                 task_id,
                 action: control_action(action),
+                // The CLI has no rebase sub-verb, so it never names a target.
+                onto: None,
             }),
         )
         .await?;

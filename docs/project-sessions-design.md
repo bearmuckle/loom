@@ -230,6 +230,20 @@ the revision is checked against the reviewed content before
 `landed_by = replay` and that evidence are stored, so a wrong revision is
 refused rather than recorded.
 
+A finished child whose base has moved is rebased instead of restarted, with
+`control_project_child` action `rebase` and an `onto` target (`main` names the
+parent checkout's current head, which is where integration would land). Loom
+replays the child's own commits (`base_revision..result_revision`) inside the
+child's checkout, so each keeps its author and message and no merge commit is
+created, then runs a bounded, documented check set and records the new base and
+result revision with the rebase it performed. It refuses a dirty checkout,
+commits the target already contains, a target that does not descend from the
+child's base, a conflicted replay, and a replay that would touch a path the
+reviewed change never touched; a failing or timed-out check restores the
+child's branch, so a rebase that was not validated is never reported as done.
+The child is never reopened to new work, and review and integration keep
+working against the new revision pair.
+
 The first implementation should support repositories already represented by
 the session repository service. Before extending this to attached native
 directories or multi-repository tasks, define whether each child receives an
@@ -323,7 +337,8 @@ The protocol includes versioned operations and projections for project
 snapshots, delegated tasks, addressed messages, agent controls, and worktree
 integration: `GetProjectSnapshot` (including lookup from any member session),
 `SendProjectAgentMessage`,
-`ListProjectAgentMessages`, `ControlProjectChild` (pause/resume/interrupt/cancel),
+`ListProjectAgentMessages`, `ControlProjectChild` (pause/resume/interrupt/cancel,
+plus `abandon`, `mark_landed`, and `rebase` with its `onto` target),
 `GetProjectChildReview`, `IntegrateProjectChild`, and
 `CleanupProjectChildWorktree`. Worktree operations require their negotiated
 capabilities and project membership checks.

@@ -84,8 +84,9 @@ pub use project::{
     MAX_PROJECT_CHILD_SCOPE_REASON_BYTES, ProjectAgentPermissions, ProjectAgentRecord,
     ProjectChildScope, ProjectChildScopeMode, ProjectManagerWaitRecord, ProjectManagerWaitStatus,
     ProjectSnapshot, ProjectWorktreeBaseRefresh, ProjectWorktreeCleanupDisposition,
-    ProjectWorktreeLandedBy, ProjectWorktreeRecord, ProjectWorktreeScopeOverride,
-    ProjectWorktreeStatus, TaskContextReference, normalize_project_child_scope_path,
+    ProjectWorktreeLandedBy, ProjectWorktreeRebase, ProjectWorktreeRecord,
+    ProjectWorktreeScopeOverride, ProjectWorktreeStatus, TaskContextReference,
+    normalize_project_child_scope_path,
 };
 pub use session::{
     AgentSessionSnapshot, AgentSessionState, MAX_AGENT_SESSION_GOAL_BYTES, SessionEvent,

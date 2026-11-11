@@ -628,7 +628,9 @@ and the `ModelChanged` run event; 11.17 adds `GetProjectChildModels` and
 manager landed itself and reports `landed_by` on the worktree; 11.20 adds the
 file scope a code delegation declared for its child's commit and the override
 recorded when a commit outside it lands, both reported on the project child
-worktree record. Every addition is a new enum
+worktree record; 11.21 adds the `rebase` project child control action and the
+optional `onto` target it replays a finished child's own commits onto. Every
+addition is a new enum
 variant, a capability, or a field with a compatible default (an omitted field
 keeps the older behavior), so clients of an older 11.x minor keep working; they
 simply never send the new requests, negotiate the new capability, or ask for

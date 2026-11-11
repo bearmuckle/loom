@@ -2,6 +2,7 @@ use super::*;
 
 mod control;
 mod create;
+mod rebase;
 mod recovery;
 mod result;
 mod schedule;

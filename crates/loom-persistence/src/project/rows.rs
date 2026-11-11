@@ -99,7 +99,7 @@ pub(crate) fn load_project_worktree(
                     worktree_name, branch_name, base_revision, result_revision,
                     integrated_revision, status, error, cleanup_disposition,
                     base_refresh, landed_by, landed_evidence, scope, scope_override,
-                    created_at, updated_at
+                    rebase, created_at, updated_at
              FROM project_worktrees WHERE task_id=?1",
             [task_id.as_bytes().as_slice()],
             |row| {
@@ -124,8 +124,9 @@ pub(crate) fn load_project_worktree(
                     row.get::<_, Option<String>>(17)?,
                     row.get::<_, Option<String>>(18)?,
                     row.get::<_, Option<String>>(19)?,
-                    row.get::<_, i64>(20)?,
+                    row.get::<_, Option<String>>(20)?,
                     row.get::<_, i64>(21)?,
+                    row.get::<_, i64>(22)?,
                 ))
             },
         )
@@ -154,6 +155,7 @@ pub(crate) fn load_project_worktree(
         landed_evidence,
         scope,
         scope_override,
+        rebase,
         created_at,
         updated_at,
     )) = row
@@ -221,6 +223,7 @@ pub(crate) fn load_project_worktree(
         base_refresh: decode_project_worktree_base_refresh(base_refresh)?,
         scope: decode_project_child_scope(scope)?,
         scope_override: decode_project_worktree_scope_override(scope_override)?,
+        rebase: decode_project_worktree_rebase(rebase)?,
         landed_by: landed_by
             .as_deref()
             .map(parse_project_worktree_landed_by)
@@ -659,9 +662,9 @@ pub(crate) fn persist_initial_project_worktree(
                 worktree_name, branch_name, base_revision, result_revision,
                 integrated_revision, status, error, cleanup_disposition,
                 base_refresh, landed_by, landed_evidence, scope, scope_override,
-                created_at, updated_at
+                rebase, created_at, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL,
-                       'creating', NULL, NULL, ?11, NULL, NULL, ?12, NULL, ?13, ?14)",
+                       'creating', NULL, NULL, ?11, NULL, NULL, ?12, NULL, NULL, ?13, ?14)",
             params![
                 worktree.task_id.as_uuid().as_bytes().as_slice(),
                 worktree.project_id.as_uuid().as_bytes().as_slice(),
@@ -781,6 +784,38 @@ pub(crate) fn decode_project_worktree_base_refresh(
             serde_json::from_str(&payload).map_err(|error| {
                 persistence_error(
                     format!("persisted project worktree base refresh is invalid: {error}"),
+                    false,
+                )
+            })
+        })
+        .transpose()
+}
+
+/// Encodes the recorded rebase of a child's own commits as the versioned JSON
+/// payload the worktree row stores.
+pub(crate) fn encode_project_worktree_rebase(
+    rebase: Option<&ProjectWorktreeRebase>,
+) -> Result<Option<String>> {
+    rebase
+        .map(|rebase| {
+            serde_json::to_string(rebase).map_err(|error| {
+                persistence_error(
+                    format!("could not encode the project worktree rebase: {error}"),
+                    false,
+                )
+            })
+        })
+        .transpose()
+}
+
+pub(crate) fn decode_project_worktree_rebase(
+    payload: Option<String>,
+) -> Result<Option<ProjectWorktreeRebase>> {
+    payload
+        .map(|payload| {
+            serde_json::from_str(&payload).map_err(|error| {
+                persistence_error(
+                    format!("persisted project worktree rebase is invalid: {error}"),
                     false,
                 )
             })

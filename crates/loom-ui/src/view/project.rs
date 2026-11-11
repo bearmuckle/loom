@@ -351,6 +351,8 @@ impl LoomView {
                 manager_session_id,
                 task_id,
                 action,
+                // The UI offers no rebase action, so it names no target.
+                onto: None,
             }),
             move |view, response, cx| match response.result {
                 Ok(ServerResponse::Project(ProjectResponse::ProjectChildControlled {

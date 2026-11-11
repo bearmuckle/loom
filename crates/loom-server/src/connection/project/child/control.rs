@@ -8,6 +8,8 @@ pub(crate) struct ProjectChildControlOutcome {
     pub(crate) uncommitted_paths: Vec<String>,
     /// The worktree record a landing action updated.
     pub(crate) worktree: Option<ProjectWorktreeRecord>,
+    /// What a rebase action changed, including the checks it ran.
+    pub(crate) rebase: Option<super::rebase::ProjectChildRebaseReport>,
 }
 
 impl InProcessConnection {
@@ -18,6 +20,7 @@ impl InProcessConnection {
         task_id: loom_core::TaskId,
         action: ProjectChildControlAction,
         landing: Option<ProjectChildLanding>,
+        onto: Option<String>,
     ) -> Result<ProjectChildControlOutcome> {
         if !self.project_agent_permission_enabled_for_session(
             manager_session_id,
@@ -80,6 +83,7 @@ impl InProcessConnection {
             .transpose()?;
         let mut uncommitted_paths = Vec::new();
         let mut worktree = None;
+        let mut rebase = None;
 
         match action {
             ProjectChildControlAction::Continue => {
@@ -325,6 +329,19 @@ impl InProcessConnection {
                     landing,
                 )?);
             }
+            ProjectChildControlAction::Rebase => {
+                // The replay runs in the child's own checkout, which owns the
+                // record of the new base and result revision.
+                let onto = onto.ok_or_else(|| {
+                    LoomError::invalid_request(
+                        "rebase requires onto: a commit id in the parent repository, or `main`",
+                    )
+                })?;
+                let (rebased, report) =
+                    self.rebase_project_child(project_id, manager_session_id, task_id, &onto)?;
+                worktree = Some(rebased);
+                rebase = Some(report);
+            }
         }
         task = persistence
             .load_delegated_task(task_id)?
@@ -334,6 +351,7 @@ impl InProcessConnection {
             run,
             uncommitted_paths,
             worktree,
+            rebase,
         })
     }
 
