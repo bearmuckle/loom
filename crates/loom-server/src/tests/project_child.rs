@@ -1811,6 +1811,8 @@ fn child_reporting_tools(fixture: &ProjectCodeChildFixture) -> ToolExecutor {
                 delegation: true,
                 inspection: true,
                 child_control: true,
+                worktree: true,
+                review: true,
                 ..ProjectAgentToolGrants::default()
             },
         )
@@ -2040,6 +2042,497 @@ fn waiting_for_children_distinguishes_attention_from_terminal() {
         serde_json::Value::Null
     );
     assert_eq!(waited["needs_attention"], serde_json::json!([]));
+    fixture.shutdown();
+}
+
+/// A terminal wait collects only the children that produced their final state,
+/// and names the parked ones separately so neither is lost.
+#[test]
+fn a_terminal_wait_separates_parked_children_from_terminal_ones() {
+    let fixture = project_code_child_fixture();
+    let tools = child_reporting_tools(&fixture);
+    let persistence = fixture.backend.persistence.as_ref().unwrap();
+    // The fixture child finished, and a sibling is parked waiting for approval.
+    fixture.persist_child_run(ParkedChildRun::new(AgentRunState::Completed));
+    complete_project_code_child(&fixture);
+    // The sibling is created through persistence so nothing schedules it: it is
+    // parked waiting for an approval, which is the state the wait must report.
+    let workspace_id = fixture
+        .backend
+        .sessions()
+        .unwrap()
+        .get(fixture.root_id)
+        .unwrap()
+        .workspace_id;
+    let parked_child_id = AgentSessionId::new();
+    let parked_task_id = loom_core::TaskId::new();
+    let created_at = Timestamp::now();
+    let parked_snapshot = AgentSessionSnapshot {
+        id: parked_child_id,
+        workspace_id,
+        name: "Parked child".to_owned(),
+        goal: None,
+        state: AgentSessionState::Idle,
+        created_at,
+        updated_at: created_at,
+        title_source: loom_core::SessionTitleSource::Auto,
+    };
+    let parked_task = loom_core::DelegatedTaskRecord {
+        task_id: parked_task_id,
+        project_id: fixture.project_id,
+        requester_session_id: fixture.root_id,
+        target_session_id: parked_child_id,
+        child_name: "Parked child".to_owned(),
+        intent: "Wait for an approval".to_owned(),
+        model_id: "deterministic/demo".to_owned(),
+        context_references: Vec::new(),
+        dependencies: Vec::new(),
+        code_change: false,
+        permissions: loom_core::ProjectAgentPermissions::default(),
+        status: loom_core::DelegatedTaskStatus::Queued,
+        created_at,
+        updated_at: created_at,
+    };
+    persistence
+        .create_project_child(
+            RequestId::new(),
+            &parked_snapshot,
+            fixture.backend.sessions().unwrap().next_sequence().next(),
+            &parked_task,
+        )
+        .unwrap();
+    let (_, created_event) = fixture
+        .backend
+        .sessions()
+        .unwrap()
+        .create_in_workspace_with_id(workspace_id, parked_child_id, "Parked child".to_owned())
+        .unwrap();
+    fixture
+        .backend
+        .journal()
+        .unwrap()
+        .append_session(created_event);
+    assert!(
+        persistence
+            .update_delegated_task_status(
+                parked_task_id,
+                loom_core::DelegatedTaskStatus::Blocked,
+                Timestamp::now(),
+            )
+            .unwrap()
+    );
+    let wait = |arguments: serde_json::Value| {
+        let waited = tools.execute(&ToolCall {
+            id: ToolCallId::new(),
+            name: "wait_for_project_children".to_owned(),
+            arguments,
+        });
+        assert!(waited.success, "{}", waited.output);
+        let waited: serde_json::Value = serde_json::from_str(&waited.output).unwrap();
+        waited
+    };
+    let task_ids = serde_json::json!([fixture.task_id, parked_task_id]);
+
+    // The default wait still collects everything that stopped.
+    let ready = wait(serde_json::json!({"task_ids": task_ids}));
+    assert_eq!(ready["until"], "ready");
+    assert_eq!(
+        ready["children"].as_array().map(|children| children.len()),
+        Some(2)
+    );
+    assert_eq!(ready["still_paused"], serde_json::json!([]));
+
+    // A terminal wait returns only the finished child and names the parked one.
+    let terminal = wait(serde_json::json!({"task_ids": task_ids, "until": "terminal"}));
+    assert_eq!(terminal["until"], "terminal");
+    assert_eq!(terminal["return_ready"], true);
+    let children = terminal["children"].as_array().unwrap();
+    assert_eq!(children.len(), 1, "{terminal}");
+    assert_eq!(children[0]["task_id"], serde_json::json!(fixture.task_id));
+    assert_eq!(children[0]["outcome"], "terminal");
+    let still_paused = terminal["still_paused"].as_array().unwrap();
+    assert_eq!(still_paused.len(), 1, "{terminal}");
+    assert_eq!(
+        still_paused[0]["task_id"],
+        serde_json::json!(parked_task_id)
+    );
+    assert_eq!(still_paused[0]["outcome"], "needs_attention");
+    assert!(
+        still_paused[0]["paused_reason"]["reason"]
+            .as_str()
+            .is_some(),
+        "the parked child keeps the reason it stopped: {terminal}"
+    );
+    assert!(
+        terminal["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("terminal children only")),
+        "the result says what it collected: {terminal}"
+    );
+    fixture.shutdown();
+}
+
+/// A code child's committed result is listed with its commit subject, patch ids
+/// and changed paths, so a manager can tell whether the work is already landed
+/// without running git in its own checkout.
+#[test]
+fn listing_a_committed_code_child_reports_its_commit_identity() {
+    let fixture = project_code_child_fixture();
+    let tools = child_reporting_tools(&fixture);
+    commit_file(
+        &fixture.child_checkout,
+        "src/result.txt",
+        "result\n",
+        "feat: add the result",
+    );
+    let reviewed = review_project_code_child(&fixture);
+    complete_project_code_child(&fixture);
+    let child = listed_child(&tools, fixture.task_id);
+    assert_eq!(child["result_revision"], serde_json::json!(reviewed));
+    assert_eq!(
+        child["base_revision"],
+        serde_json::json!(fixture.worktree.base_revision)
+    );
+    assert_eq!(child["commit_subject"], "feat: add the result");
+    let patch_ids = child["patch_ids"].as_array().unwrap();
+    assert_eq!(patch_ids.len(), 1, "{child}");
+    assert_eq!(child["patch_ids_total"], 1);
+    assert!(
+        patch_ids[0]
+            .as_str()
+            .is_some_and(|patch_id| patch_id.len() == 16),
+        "a patch id is reported in the form a review uses: {child}"
+    );
+    assert_eq!(
+        child["changed_paths"],
+        serde_json::json!(["src/result.txt"])
+    );
+    assert_eq!(child["changed_paths_total"], 1);
+    assert_eq!(child["commit_summary_truncated"], false);
+    assert_eq!(child["rebase"], serde_json::Value::Null);
+    fixture.shutdown();
+}
+
+/// A change wider than the listing's bound is cut short, and the entry says so
+/// with the exact total instead of dropping paths silently.
+#[test]
+fn listing_a_wide_change_marks_its_truncated_path_list() {
+    let fixture = project_code_child_fixture();
+    let tools = child_reporting_tools(&fixture);
+    fs::create_dir_all(fixture.child_checkout.join("bulk")).unwrap();
+    for index in 0..21 {
+        fs::write(
+            fixture
+                .child_checkout
+                .join(format!("bulk/file-{index:02}.txt")),
+            format!("{index}\n"),
+        )
+        .unwrap();
+    }
+    git_in(&fixture.child_checkout, &["add", "--", "bulk"]);
+    git_in(
+        &fixture.child_checkout,
+        &["commit", "-qm", "feat: add the bulk files"],
+    );
+    review_project_code_child(&fixture);
+    complete_project_code_child(&fixture);
+    let child = listed_child(&tools, fixture.task_id);
+    assert_eq!(child["commit_summary_truncated"], true);
+    assert_eq!(child["changed_paths_total"], 21);
+    assert_eq!(
+        child["changed_paths"].as_array().map(|paths| paths.len()),
+        Some(20),
+        "the path list stops at its bound: {child}"
+    );
+    fixture.shutdown();
+}
+
+/// A delegation can pin the revision its checkout is created from, and a base
+/// that is not a commit of the parent repository is refused.
+#[test]
+fn a_delegation_pins_its_base_and_refuses_an_unknown_one() {
+    let fixture = project_code_child_fixture();
+    let tools = child_reporting_tools(&fixture);
+    let base = fixture.worktree.base_revision.clone();
+    // The parent keeps committing after the delegation names its base.
+    commit_file(
+        fixture.parent_git.root(),
+        "parent.txt",
+        "parent\n",
+        "chore: move the parent on",
+    );
+    let parent_head = fixture.parent_git.status().unwrap().head.unwrap();
+    assert_ne!(
+        parent_head, base,
+        "the parent advanced past the pinned base"
+    );
+    let persisted = fixture.backend.persistence.as_ref().unwrap();
+
+    // The child's checkout starts at the pinned revision, not the parent head.
+    let created = fixture
+        .connection
+        .create_project_child_from_base(
+            RequestId::new(),
+            fixture.root_id,
+            "Pinned child".to_owned(),
+            loom_core::DelegatedTaskSpec {
+                intent: "Change one file".to_owned(),
+                model_id: "deterministic/demo".to_owned(),
+                context_references: Vec::new(),
+                dependencies: Vec::new(),
+                code_change: true,
+                permissions: Default::default(),
+                scope: None,
+            },
+            Some(&base),
+        )
+        .expect("a pinned base creates the child checkout");
+    let created = match created {
+        ServerResponse::Project(ProjectResponse::ProjectChildCreated { task, .. }) => *task,
+        other => panic!("unexpected child creation response: {other:?}"),
+    };
+    let worktree = persisted
+        .load_project_worktree_by_task(created.task_id)
+        .unwrap()
+        .expect("the pinned child has a durable checkout");
+    assert_eq!(worktree.base_revision, base);
+    persisted
+        .update_delegated_task_status(
+            created.task_id,
+            loom_core::DelegatedTaskStatus::Cancelled,
+            Timestamp::now(),
+        )
+        .unwrap();
+
+    // An unknown revision is refused before anything is persisted, and the tool
+    // reports that refusal.
+    let refused = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "delegate_project_code_task".to_owned(),
+        arguments: serde_json::json!({
+            "child_name": "Unknown base",
+            "intent": "Change one file",
+            "base": "0123456789abcdef0123456789abcdef01234567",
+        }),
+    });
+    assert!(!refused.success, "{}", refused.output);
+    assert!(
+        refused
+            .output
+            .contains("is not a commit of the parent repository"),
+        "the refusal names what the base has to be: {}",
+        refused.output
+    );
+    fixture.shutdown();
+}
+
+/// A replay asked for by a delegation is reported honestly: the result says one
+/// was requested, that none has happened yet, and where a replay Loom performs
+/// is recorded. A read-only delegation refuses both arguments.
+#[test]
+fn a_requested_replay_is_reported_and_refused_on_a_read_only_delegation() {
+    let fixture = project_code_child_fixture();
+    let tools = child_reporting_tools(&fixture);
+    let delegated = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "delegate_project_code_task".to_owned(),
+        arguments: serde_json::json!({
+            "child_name": "Replaying child",
+            "intent": "Change one file",
+            "rebase_before_report": true,
+        }),
+    });
+    assert!(delegated.success, "{}", delegated.output);
+    let delegated: serde_json::Value = serde_json::from_str(&delegated.output).unwrap();
+    assert_eq!(delegated["rebase_before_report"]["requested"], true);
+    assert_eq!(delegated["rebase_before_report"]["happened"], false);
+    assert!(
+        delegated["rebase_before_report"]["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("rebase")),
+        "the result says where a replay is reported: {delegated}"
+    );
+    assert!(
+        delegated["intent"]
+            .as_str()
+            .is_some_and(|intent| intent.contains("replay your own commits")),
+        "the child is told to replay before it reports: {delegated}"
+    );
+    let task_id: loom_core::TaskId = serde_json::from_value(delegated["task_id"].clone()).unwrap();
+    fixture
+        .backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .update_delegated_task_status(
+            task_id,
+            loom_core::DelegatedTaskStatus::Cancelled,
+            Timestamp::now(),
+        )
+        .unwrap();
+
+    // The same arguments are refused on a read-only delegation.
+    for arguments in [
+        serde_json::json!({
+            "child_name": "Read only",
+            "intent": "Read one file",
+            "rebase_before_report": true,
+        }),
+        serde_json::json!({
+            "child_name": "Read only",
+            "intent": "Read one file",
+            "base": "current",
+        }),
+    ] {
+        let refused = tools.execute(&ToolCall {
+            id: ToolCallId::new(),
+            name: "delegate_project_task".to_owned(),
+            arguments: arguments.clone(),
+        });
+        assert!(!refused.success, "{}: {}", arguments, refused.output);
+        assert!(
+            refused.output.contains("code task"),
+            "the refusal says where the argument applies: {}",
+            refused.output
+        );
+    }
+    fixture.shutdown();
+}
+
+/// Reviewing a paused child returns the uncommitted work it left behind, which
+/// is the cheapest way to triage a stalled child.
+#[test]
+fn reviewing_a_paused_child_returns_its_uncommitted_work() {
+    let fixture = project_code_child_fixture();
+    let tools = child_reporting_tools(&fixture);
+    fs::write(fixture.child_checkout.join("stalled.txt"), "half written\n").unwrap();
+    let mut run = ParkedChildRun::new(AgentRunState::AwaitingApproval);
+    run.pending_approval = Some(ToolCall {
+        id: ToolCallId::new(),
+        name: "apply_patch".to_owned(),
+        arguments: serde_json::json!({"path": "stalled.txt"}),
+    });
+    fixture.persist_child_run(run);
+    fixture
+        .backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .update_delegated_task_status(
+            fixture.task_id,
+            loom_core::DelegatedTaskStatus::Blocked,
+            Timestamp::now(),
+        )
+        .unwrap();
+
+    let review = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "review_project_child".to_owned(),
+        arguments: serde_json::json!({"task_id": fixture.task_id, "mode": "diff"}),
+    });
+    assert!(review.success, "{}", review.output);
+    let review: serde_json::Value = serde_json::from_str(&review.output).unwrap();
+    assert_eq!(review["type"], "project_child_review");
+    assert_eq!(review["data"]["mode"], "diff");
+    assert_eq!(review["data"]["run_state"], "awaiting_approval");
+    let files = review["data"]["files"].as_array().unwrap();
+    let stalled = files
+        .iter()
+        .find(|file| file["path"] == "stalled.txt")
+        .unwrap_or_else(|| panic!("the uncommitted path is reviewed: {review}"));
+    assert!(
+        stalled["patch"]
+            .as_str()
+            .is_some_and(|patch| patch.contains("half written")),
+        "the review carries the uncommitted content: {review}"
+    );
+    // A stat review names the same path without its patch.
+    let stat = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "review_project_child".to_owned(),
+        arguments: serde_json::json!({"task_id": fixture.task_id}),
+    });
+    assert!(stat.success, "{}", stat.output);
+    let stat: serde_json::Value = serde_json::from_str(&stat.output).unwrap();
+    assert!(
+        stat["data"]["files"]
+            .as_array()
+            .is_some_and(|files| files.iter().any(|file| file["path"] == "stalled.txt")),
+        "a stat review names the uncommitted path: {stat}"
+    );
+    fixture.shutdown();
+}
+
+/// A result that states which optional dependencies its checks reached is
+/// reported as stated, and one that stays silent is reported as unstated rather
+/// than as `no`.
+#[test]
+fn a_result_reports_which_dependencies_its_checks_ran_against() {
+    fn report(fixture: &ProjectCodeChildFixture, body: &str) {
+        fixture
+            .backend
+            .accept_project_agent_message(
+                RequestId::new(),
+                fixture.worktree.child_session_id,
+                true,
+                false,
+                loom_core::AgentMessageDraft {
+                    project_id: fixture.project_id,
+                    task_id: Some(fixture.task_id),
+                    sender_session_id: fixture.worktree.child_session_id,
+                    target_session_id: fixture.root_id,
+                    kind: loom_core::AgentMessageKind::Result,
+                    body: body.to_owned(),
+                },
+            )
+            .expect("a finished child reports its result");
+    }
+
+    // A silent result is reported as unstated, and the listing says so.
+    let fixture = project_code_child_fixture();
+    let tools = child_reporting_tools(&fixture);
+    fixture.persist_child_run(ParkedChildRun::new(AgentRunState::Completed));
+    complete_project_code_child(&fixture);
+    report(&fixture, "All green.");
+    let child = listed_child(&tools, fixture.task_id);
+    assert_eq!(child["checks_ran_against"]["live_db"], "not_stated");
+    assert_eq!(child["checks_ran_against"]["stated"], false);
+    let listing = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "list_project_children".to_owned(),
+        arguments: serde_json::json!({}),
+    });
+    let listing: serde_json::Value = serde_json::from_str(&listing.output).unwrap();
+    assert!(
+        listing["note"]
+            .as_str()
+            .is_some_and(|note| note.contains("did not state which optional dependencies")),
+        "the listing names the child whose result did not say: {listing}"
+    );
+    fixture.shutdown();
+
+    // A stated result is read back field by field, and the wait reports it too.
+    let fixture = project_code_child_fixture();
+    let tools = child_reporting_tools(&fixture);
+    fixture.persist_child_run(ParkedChildRun::new(AgentRunState::Completed));
+    complete_project_code_child(&fixture);
+    report(
+        &fixture,
+        "Checks passed.\nlive-db: yes\nkeychain: no\nnetwork: no\n",
+    );
+    let child = listed_child(&tools, fixture.task_id);
+    assert_eq!(child["checks_ran_against"]["live_db"], "yes");
+    assert_eq!(child["checks_ran_against"]["keychain"], "no");
+    assert_eq!(child["checks_ran_against"]["network"], "no");
+    assert_eq!(child["checks_ran_against"]["stated"], true);
+    let waited = wait_for_child(&tools, fixture.task_id);
+    assert!(waited.success, "{}", waited.output);
+    let waited: serde_json::Value = serde_json::from_str(&waited.output).unwrap();
+    assert_eq!(
+        waited["children"][0]["checks_ran_against"]["live_db"],
+        "yes"
+    );
+    assert_eq!(waited["children"][0]["checks_ran_against"]["stated"], true);
     fixture.shutdown();
 }
 

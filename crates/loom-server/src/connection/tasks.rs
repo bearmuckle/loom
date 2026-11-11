@@ -260,6 +260,11 @@ impl InProcessConnection {
             ),
             None => system_instructions,
         };
+        // Which optional dependencies a result's checks reached is material to
+        // reviewing them, so every child is told to state it in its result.
+        let system_instructions = format!(
+            "{system_instructions} Before you report your result, state which optional dependencies your checks ran against, one line each: `live-db: yes` or `live-db: no`, `keychain: yes` or `keychain: no`, and `network: yes` or `network: no`. Write `no` when a check did not reach that dependency, so your parent can tell a green result that exercised a database, a secret service, or the network from one that did not. Never print credentials, connection strings, or tokens."
+        );
         if !persistence.update_delegated_task_status_if_queued(
             task.task_id,
             loom_core::DelegatedTaskStatus::Running,

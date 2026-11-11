@@ -514,6 +514,15 @@ struct DelegateProjectTaskArguments {
     /// `paths`.
     #[serde(default)]
     out_of_scope: Option<Vec<String>>,
+    /// The revision a code child's checkout is created from: `current` (the
+    /// parent's current revision, the default) or a commit of the parent
+    /// repository.
+    #[serde(default)]
+    base: Option<String>,
+    /// Whether the child is told to replay its own commits onto the parent's
+    /// current revision before it reports.
+    #[serde(default)]
+    rebase_before_report: bool,
 }
 
 #[derive(Deserialize)]
@@ -545,6 +554,27 @@ struct ListProjectMessageRecipientsArguments {}
 #[serde(deny_unknown_fields)]
 struct WaitForProjectChildrenArguments {
     task_ids: Vec<loom_core::TaskId>,
+    /// What the wait collects: everything that stopped (`ready`, today's
+    /// behaviour), or only the children that reached a terminal state.
+    #[serde(default)]
+    until: ProjectChildWaitUntil,
+}
+
+/// What one `wait_for_project_children` call collects.
+///
+/// The wait itself ends at the same moment either way, because a child that is
+/// parked cannot finish without a person or a control action, so waiting past
+/// it would park the manager indefinitely. What changes is what the result
+/// lists: `terminal` returns only the children that produced their final
+/// state and names the parked ones separately.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ProjectChildWaitUntil {
+    /// Every child that stopped, terminal or parked.
+    #[default]
+    Ready,
+    /// Only children that completed, failed, or were cancelled.
+    Terminal,
 }
 
 /// What a manager reports when it lands a reviewed child result itself.

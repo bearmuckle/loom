@@ -774,7 +774,19 @@ pub(crate) fn project_manager_wait_result_summary(
     persistence: &dyn Persistence,
     wait: &loom_core::ProjectManagerWaitRecord,
 ) -> Result<Option<String>> {
+    // What the wait collects is what the parked call asked for, read from the
+    // continuation the run still holds, so a resumed wait answers the same way
+    // a direct call would.
+    let until_terminal = persistence
+        .load_run_execution_state(wait.run_id)?
+        .and_then(|execution| execution.pending_project_join)
+        .and_then(|continuation| {
+            serde_json::from_value::<WaitForProjectChildrenArguments>(continuation.call.arguments)
+                .ok()
+        })
+        .is_some_and(|arguments| arguments.until == ProjectChildWaitUntil::Terminal);
     let mut children = Vec::with_capacity(wait.child_task_ids.len());
+    let mut still_paused = Vec::new();
     for task_id in &wait.child_task_ids {
         let task = persistence
             .load_delegated_task(*task_id)?
@@ -789,19 +801,38 @@ pub(crate) fn project_manager_wait_result_summary(
             return Ok(None);
         }
         let worktree = persistence.load_project_worktree_by_task(task.task_id)?;
-        children.push(serde_json::json!({
+        let entry = serde_json::json!({
             "task_id": task.task_id,
             "child_name": task.child_name,
             "status": task.status,
             "code_change": task.code_change,
+            "outcome": if matches!(
+                task.status,
+                loom_core::DelegatedTaskStatus::Completed
+                    | loom_core::DelegatedTaskStatus::Failed
+                    | loom_core::DelegatedTaskStatus::Cancelled
+            ) {
+                "terminal"
+            } else {
+                "needs_attention"
+            },
             "result_revision": worktree.as_ref().and_then(|record| record.result_revision.as_ref()),
             "integrated_revision": worktree.as_ref().and_then(|record| record.integrated_revision.as_ref()),
-        }));
+        });
+        // A child that is only blocked has not produced its final state, so a
+        // terminal wait names it separately instead of collecting it.
+        if until_terminal && entry["outcome"] != "terminal" {
+            still_paused.push(entry);
+        } else {
+            children.push(entry);
+        }
     }
     let summary = serde_json::to_string(&serde_json::json!({
         "return_ready": true,
+        "until": if until_terminal { "terminal" } else { "ready" },
         "children": children,
-        "note": "Code child results still require review and integration before the manager reports completion."
+        "still_paused": still_paused,
+        "note": "Code child results still require review and integration before the manager reports completion. A terminal wait names the children that stopped without reaching a terminal state under still_paused, because they stay stopped until a person answers them or the manager takes a control action."
     }))
     .map_err(|error| {
         LoomError::new(

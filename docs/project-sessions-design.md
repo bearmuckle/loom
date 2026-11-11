@@ -250,6 +250,57 @@ directories or multi-repository tasks, define whether each child receives an
 independent clone/worktree per repository and how local in-place attachments
 are handled; a child must never inherit a mutable attachment accidentally.
 
+### Reviewing a child that stopped
+
+A child that paused, blocked on an approval, or hit a failure that stopped it
+has stopped moving its checkout, so `review_project_child` on it is supported
+and is the cheapest triage: the review returns the uncommitted work that child
+left behind, together with its checkout status, the paths and line counts it
+touched, and the run state and summary that say why it stopped. A `stat` review
+names the uncommitted paths without their patches, a `diff` review returns a
+bounded patch of them, and `read_child_file` reads any part of a file the review
+cut short. Nothing about the review writes to the child, so it can be repeated
+while the reason for the stop is worked out, and the manager decides from what
+it sees whether to continue the child, retry a failed step, or abandon it.
+
+### Tool surface for delegation, listing, and waiting
+
+A code delegation may pin the revision its checkout is created from with
+`base`, either `current` (the parent's current revision, and the default) or a
+commit of the parent repository; an unknown revision is refused before anything
+is persisted. This is what a manager does when it intends to keep committing on
+the parent while the child runs. `rebase_before_report` additionally tells the
+child to replay its own commits onto the parent's current revision before it
+reports, which it can do because its checkout is a linked worktree of the
+parent's repository. Neither applies to a read-only delegation, and both are
+refused there. The delegation result states whether a replay was asked for,
+whether one has happened, and where a replay Loom performed is reported: the
+child's record carries a `rebase` entry naming both revision pairs, and review
+reports the base and result revisions it observes, so a manager is never told
+that a replay happened when it did not.
+
+Each child in `list_project_children` carries the subject of its committed
+result, the patch ids of its own commits, and the paths that change touches, so
+a manager can recognise work whose patch is already in the parent history
+without running git in its own checkout. Both lists are bounded and carry their
+exact totals with a truncation flag, like a bounded review.
+`wait_for_project_children` takes `until`: `ready` (the default) collects every
+child that stopped, while `terminal` collects only the children that completed,
+failed, or were cancelled and names the stopped-but-parked ones under
+`still_paused`. The wait itself ends at the same moment either way, because a
+parked child cannot reach a terminal state without a person or a control
+action, so waiting past it would park the manager indefinitely.
+
+Which optional dependencies a result's checks actually reached is part of
+reviewing that result, so a delegated child is instructed to state it in its
+result — `live-db: yes|no`, `keychain: yes|no`, and `network: yes|no`, one line
+each — and the manager's listing and wait read those lines back as
+`checks_ran_against`. A result that stays silent is reported as `not_stated`
+rather than as `no`, and the note names the child whose result did not say.
+Loom does not probe a database, a secret service, or the network from the
+child's process: such a probe would have to handle credentials to answer, and a
+statement the child made about its own checks is auditable against them.
+
 A delegation may declare the files its child's commit may touch, with `paths` as
 an allowlist or `out_of_scope` as its inverse, when an allowlist is impractical.
 A declared path is repository-relative and covers itself and everything below

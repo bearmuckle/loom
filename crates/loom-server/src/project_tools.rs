@@ -34,6 +34,16 @@ fn delegated_task_is_terminal(status: loom_core::DelegatedTaskStatus) -> bool {
     )
 }
 
+/// Whether a delegated task has stopped, whether or not it finished.
+///
+/// A blocked child is parked: it cannot finish without a person or a control
+/// action, so a wait that kept sleeping on it would park the manager
+/// indefinitely. The wait therefore ends on it and reports it, and `until`
+/// decides whether it is collected or named separately.
+fn delegated_task_is_stopped(status: loom_core::DelegatedTaskStatus) -> bool {
+    delegated_task_is_terminal(status) || status == loom_core::DelegatedTaskStatus::Blocked
+}
+
 /// How a manager reads one child's current state, so a stopped child that needs
 /// a person's answer is not mistaken for one that finished, and a child waiting
 /// for a concurrency slot is not mistaken for one that is running.
@@ -57,6 +67,104 @@ fn project_child_outcome(
     } else {
         "running"
     }
+}
+
+/// The optional dependencies one result states its checks ran against.
+///
+/// A result that names none of them is reported as `not_stated` instead of as
+/// `no`, because a skipped dependency check and an unreported one are different
+/// facts about a green result.
+struct ProjectChildCheckEnvironment {
+    live_db: &'static str,
+    keychain: &'static str,
+    network: &'static str,
+}
+
+impl ProjectChildCheckEnvironment {
+    /// Whether the result stated every optional dependency.
+    fn is_stated(&self) -> bool {
+        [self.live_db, self.keychain, self.network]
+            .iter()
+            .all(|value| *value != "not_stated")
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "live_db": self.live_db,
+            "keychain": self.keychain,
+            "network": self.network,
+            "stated": self.is_stated(),
+        })
+    }
+
+    /// The sentence a listing or wait adds when a result does not say what its
+    /// checks ran against, so a green result is not read as covering them.
+    fn warning(&self, child_name: &str) -> Option<String> {
+        if self.is_stated() {
+            return None;
+        }
+        let mut missing = Vec::new();
+        for (label, value) in [
+            ("live-db", self.live_db),
+            ("keychain", self.keychain),
+            ("network", self.network),
+        ] {
+            if value == "not_stated" {
+                missing.push(label);
+            }
+        }
+        Some(format!(
+            "{child_name} did not state which optional dependencies its checks ran against ({}); the result is silent about whether those checks ran.",
+            missing.join(", ")
+        ))
+    }
+}
+
+/// Most characters of a result body scanned for the dependency lines, so a long
+/// result cannot make a listing expensive.
+const MAX_CHECK_ENVIRONMENT_SCAN_CHARS: usize = 16 * 1024;
+
+/// Reads the optional dependencies a child's result says its checks ran
+/// against.
+///
+/// The child is asked for three lines — `live-db: yes|no`, `keychain: yes|no`,
+/// and `network: yes|no` — so the manager learns what a green result covered
+/// without Loom probing a database, a secret service, or the network from the
+/// child's process, which would have to touch credentials to answer.
+fn project_child_check_environment(body: Option<&str>) -> ProjectChildCheckEnvironment {
+    let mut environment = ProjectChildCheckEnvironment {
+        live_db: "not_stated",
+        keychain: "not_stated",
+        network: "not_stated",
+    };
+    let Some(body) = body else {
+        return environment;
+    };
+    let bounded = body
+        .chars()
+        .take(MAX_CHECK_ENVIRONMENT_SCAN_CHARS)
+        .collect::<String>();
+    for line in bounded.lines() {
+        let line = line.trim().trim_start_matches(['-', '*', ' ']).trim();
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase().replace('_', "-");
+        let value = value.trim_start_matches(['*', ' ', '`']);
+        let value = value.split_whitespace().next().unwrap_or_default();
+        let value = match value.to_ascii_lowercase().as_str() {
+            "yes" | "y" | "true" => "yes",
+            "no" | "n" | "false" => "no",
+            _ => continue,
+        };
+        match key.as_str() {
+            "live-db" | "live db" | "database" => environment.live_db = value,
+            "keychain" | "secret-service" => environment.keychain = value,
+            "network" => environment.network = value,
+            _ => {}
+        }
+    }
+    environment
 }
 
 impl ToolExtension for ProjectAgentTools {
@@ -128,7 +236,7 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_delegate_code {
             definitions.push(ToolDefinition {
                 name: "delegate_project_code_task".to_owned(),
-                description: "Create a bounded code-changing child task in an isolated Git worktree based on the project's clean current revision. The child must commit its result and report the commit. Only use this for source changes; the child cannot access the parent checkout. Describe the intended change rather than quoting code, because the child reads its own checkout. Pass `paths` to declare the files its commit may touch, or `out_of_scope` to name the files it must leave alone; both are repository-relative, and a path covers itself and every path below it, so `crates/loom-vcs/src` covers `crates/loom-vcs/src/lib.rs`. Review and integration compare the child's commit with the declaration. A child beyond the workspace's project agent concurrency limit is accepted instead of refused: it reports status queued with its queue_position, queued_since, and the effective limit, and it starts by itself when a running child releases a slot.".to_owned() + &child_model_guidance,
+                description: "Create a bounded code-changing child task in an isolated Git worktree based on the project's clean current revision. The child must commit its result and report the commit. Only use this for source changes; the child cannot access the parent checkout. Describe the intended change rather than quoting code, because the child reads its own checkout. Pass `paths` to declare the files its commit may touch, or `out_of_scope` to name the files it must leave alone; both are repository-relative, and a path covers itself and every path below it, so `crates/loom-vcs/src` covers `crates/loom-vcs/src/lib.rs`. Review and integration compare the child's commit with the declaration. Pass `base` to create the checkout from a revision of the parent repository instead of its current revision, which is what to do when you intend to keep committing on the parent; pass `rebase_before_report` to tell the child to replay its own commits onto your current revision before it reports, and the result says whether a rebase was asked for, whether one happened, and where the recorded replay is reported. A child beyond the workspace's project agent concurrency limit is accepted instead of refused: it reports status queued with its queue_position, queued_since, and the effective limit, and it starts by itself when a running child releases a slot.".to_owned() + &child_model_guidance,
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -166,6 +274,8 @@ impl ToolExtension for ProjectAgentTools {
                             "items": {"type": "string", "minLength": 1, "maxLength": loom_core::MAX_PROJECT_CHILD_SCOPE_PATH_BYTES},
                             "description": "Repository-relative paths the child's commit must leave alone; the inverse of `paths`, for when an allowlist is impractical. A declared path covers itself and every path below it."
                         },
+                        "base": {"type": "string", "minLength": 1, "maxLength": 64, "description": "The revision this child's checkout is created from: `current` (the parent's current revision, the default) or a commit of the parent repository."},
+                        "rebase_before_report": {"type": "boolean", "description": "Tell the child to replay its own commits onto the parent's current revision before it reports."},
                         "permissions": {
                             "type": "object",
                             "properties": {
@@ -216,7 +326,7 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_inspect_children {
             definitions.push(ToolDefinition {
                 name: "list_project_children".to_owned(),
-                description: "Inspect the current status of your direct child agents and their delegated tasks in this project. Each child reports its stored result and whether that result reached this session, so a completed child whose result never arrived stays retrievable: pass its task_id to return the whole stored result instead of a bounded excerpt. Each child also reports how many durable inbox messages it has not read yet, so a message you sent can be told apart from one that is still undelivered. A stopped child reports its paused_reason and an outcome of needs_attention or terminal, so an approval wait is told apart from a provider outage, an exhausted budget, or a failed tool step before you choose a control action. A child that has not started because every project agent slot is busy reports an outcome of queued with its queue_position, queued_since, and project_agent_concurrency_limit, so a waiting child is told apart from a paused or running one.".to_owned(),
+                description: "Inspect the current status of your direct child agents and their delegated tasks in this project. Each child reports its stored result and whether that result reached this session, so a completed child whose result never arrived stays retrievable: pass its task_id to return the whole stored result instead of a bounded excerpt. Each child also reports how many durable inbox messages it has not read yet, so a message you sent can be told apart from one that is still undelivered. A stopped child reports its paused_reason and an outcome of needs_attention or terminal, so an approval wait is told apart from a provider outage, an exhausted budget, or a failed tool step before you choose a control action. A child that has not started because every project agent slot is busy reports an outcome of queued with its queue_position, queued_since, and project_agent_concurrency_limit, so a waiting child is told apart from a paused or running one. A code child with a committed result also reports that commit's subject, its patch ids, and the paths it changed, so you can tell whether the work is already landed without running git yourself; both lists are bounded and name their exact total. Each result that reached you also reports which optional dependencies its checks ran against, read from the `live-db:`, `keychain:`, and `network:` lines of the result, and a result that stayed silent about them says so.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -229,7 +339,7 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_wait_children {
             definitions.push(ToolDefinition {
                 name: "wait_for_project_children".to_owned(),
-                description: "Wait until the listed direct child tasks are return-ready, releasing this manager's agent slot while they run. The result includes terminal child states and whether each child's own result reached your transcript, and reports per child whether it is terminal or needs_attention: a child that stopped without a result reports a paused_reason, so an approval wait is told apart from a provider outage, an exhausted budget, or a failed tool step. Code results still need review and integration before the overall task is complete.".to_owned(),
+                description: "Wait until the listed direct child tasks are return-ready, releasing this manager's agent slot while they run. The result includes terminal child states and whether each child's own result reached your transcript, and reports per child whether it is terminal or needs_attention: a child that stopped without a result reports a paused_reason, so an approval wait is told apart from a provider outage, an exhausted budget, or a failed tool step. `until` selects what the result collects: `ready` (the default) lists every child that stopped, and `terminal` lists only the children that completed, failed, or were cancelled and names the parked ones under still_paused, because a parked child cannot finish without a person or a control action. The wait ends once every listed child has stopped, terminal or parked, so a parked child never sleeps the manager indefinitely. Code results still need review and integration before the overall task is complete.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -238,7 +348,8 @@ impl ToolExtension for ProjectAgentTools {
                             "minItems": 1,
                             "maxItems": 50,
                             "items": {"type": "string", "format": "uuid"}
-                        }
+                        },
+                        "until": {"type": "string", "enum": ["ready", "terminal"], "description": "`ready` (the default) collects every child that stopped; `terminal` collects only terminal children and names parked ones separately."}
                     },
                     "required": ["task_ids"],
                     "additionalProperties": false
@@ -266,7 +377,7 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_review_children {
             definitions.push(ToolDefinition {
                 name: "review_project_child".to_owned(),
-                description: "Review a code child by task_id. The default `stat` mode returns its checkout status, each changed path with its kind of change and line counts, and its commits with subjects and patch ids, so a large or move-only change is reviewed without its patch. It also reports whether the change stays inside the file scope the delegation declared: `in_scope` is true or false, every out-of-scope path is named with its line counts and whether it is a new file, and a child whose delegation declared no scope says so instead of reporting it in scope. `mode: \"diff\"` returns a bounded patch instead: `paths` limits it, `max_bytes` caps each file, `context` sets context lines, and every truncation is marked. Read the rest of a file with `read_child_file`.".to_owned(),
+                description: "Review a code child by task_id. The default `stat` mode returns its checkout status, each changed path with its kind of change and line counts, and its commits with subjects and patch ids, so a large or move-only change is reviewed without its patch. It also reports whether the change stays inside the file scope the delegation declared: `in_scope` is true or false, every out-of-scope path is named with its line counts and whether it is a new file, and a child whose delegation declared no scope says so instead of reporting it in scope. `mode: \"diff\"` returns a bounded patch instead: `paths` limits it, `max_bytes` caps each file, `context` sets context lines, and every truncation is marked. Reviewing a paused or blocked child is the cheapest triage: its checkout is no longer moving, so the review returns the uncommitted work it left behind, and the run_state and run_summary fields say why it stopped. Read the rest of a file with `read_child_file`.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -413,14 +524,10 @@ impl ToolExtension for ProjectAgentTools {
                     error.message,
                 );
             })?;
-        if tasks.iter().any(|task| {
-            !matches!(
-                task.status,
-                loom_core::DelegatedTaskStatus::Completed
-                    | loom_core::DelegatedTaskStatus::Failed
-                    | loom_core::DelegatedTaskStatus::Cancelled
-            )
-        }) {
+        if tasks
+            .iter()
+            .any(|task| !delegated_task_is_stopped(task.status))
+        {
             Ok(Some(call.id.to_string()))
         } else {
             Ok(None)
@@ -536,6 +643,26 @@ impl ToolExtension for ProjectAgentTools {
     }
 }
 
+/// Most commits and changed paths one listing entry names, so a listing of many
+/// children stays bounded and every cut is counted.
+const MAX_LISTED_CHILD_COMMITS: usize = 8;
+const MAX_LISTED_CHILD_PATHS: usize = 20;
+
+/// What a code child's committed result holds, as the manager listing reports
+/// it.
+struct ProjectChildCommitSummary {
+    /// The subject of the child's tip commit, which describes what it produced.
+    commit_subject: String,
+    /// Bounded identities of the child's own commits.
+    patch_ids: Vec<String>,
+    patch_ids_total: usize,
+    /// Bounded paths the committed change touches.
+    changed_paths: Vec<String>,
+    changed_paths_total: usize,
+    /// Whether either list was cut short of its exact total.
+    truncated: bool,
+}
+
 /// Live state of one finished code child's checkout, as the manager listing
 /// reports it.
 ///
@@ -609,6 +736,70 @@ impl ProjectAgentTools {
             &status,
             &worktree.base_revision,
         )))
+    }
+
+    /// Reads what a code child's committed result holds, so the manager listing
+    /// can say whether the work is already landed without the manager running
+    /// git in its own checkout.
+    ///
+    /// The commit subject, the patch ids, and the changed paths come from the
+    /// same helpers a review uses. Both lists are bounded and carry their exact
+    /// totals, so a large change cannot grow the listing, and a child that has
+    /// not committed anything or whose checkout is being removed reports
+    /// nothing instead of an empty result that reads like a landed change.
+    fn project_child_commit_summary(
+        &self,
+        worktree: &ProjectWorktreeRecord,
+    ) -> Result<Option<ProjectChildCommitSummary>> {
+        let Some(result_revision) = worktree.result_revision.as_deref() else {
+            return Ok(None);
+        };
+        if result_revision == worktree.base_revision
+            || matches!(
+                worktree.status,
+                ProjectWorktreeStatus::Removed | ProjectWorktreeStatus::CleanupPending
+            )
+        {
+            return Ok(None);
+        }
+        let service = self
+            .connection()
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::Internal,
+                    "project backend is no longer available",
+                    true,
+                )
+            })?
+            .open_project_child_worktree(worktree)?;
+        // The walk is newest first, so its first entry is the child's tip and
+        // its subject describes the result the manager would land.
+        let commits = service.patch_commits_since(&worktree.base_revision, result_revision)?;
+        let Some(tip) = commits.first() else {
+            return Ok(None);
+        };
+        let stat = service.review_stat_from_revision(&worktree.base_revision)?;
+        let patch_ids_total = commits.len();
+        let changed_paths_total = stat.len();
+        let patch_ids = commits
+            .iter()
+            .take(MAX_LISTED_CHILD_COMMITS)
+            .map(|commit| format!("{:016x}", commit.patch_id))
+            .collect::<Vec<_>>();
+        let changed_paths = stat
+            .iter()
+            .take(MAX_LISTED_CHILD_PATHS)
+            .map(|stat| stat.path.clone())
+            .collect::<Vec<_>>();
+        Ok(Some(ProjectChildCommitSummary {
+            commit_subject: tip.summary.clone(),
+            truncated: patch_ids_total > patch_ids.len()
+                || changed_paths_total > changed_paths.len(),
+            patch_ids,
+            patch_ids_total,
+            changed_paths,
+            changed_paths_total,
+        }))
     }
 
     /// Reports whether the reviewed result revision reached the parent history.
@@ -828,14 +1019,9 @@ impl ProjectAgentTools {
             };
         match self.load_wait_child_tasks(&arguments.task_ids) {
             Ok(tasks)
-                if tasks.iter().all(|task| {
-                    matches!(
-                        task.status,
-                        loom_core::DelegatedTaskStatus::Completed
-                            | loom_core::DelegatedTaskStatus::Failed
-                            | loom_core::DelegatedTaskStatus::Cancelled
-                    )
-                }) =>
+                if tasks
+                    .iter()
+                    .all(|task| delegated_task_is_stopped(task.status)) =>
             {
                 let Some(connection) = self.connection() else {
                     return ToolResult::failure(call, "project backend is no longer available");
@@ -865,6 +1051,15 @@ impl ProjectAgentTools {
                         Ok(reason) => reason,
                         Err(error) => return ToolResult::failure(call, error.message),
                     };
+                    // What the child's checks ran against is material to a green
+                    // result, so it is read from the result the child reported
+                    // and reported next to it.
+                    let checks = project_child_check_environment(
+                        delivery
+                            .message
+                            .as_ref()
+                            .map(|message| message.body.as_str()),
+                    );
                     let outcome = project_child_outcome(Some(task), true, paused_reason.as_ref());
                     children.push(serde_json::json!({
                         "task_id": task.task_id,
@@ -874,17 +1069,40 @@ impl ProjectAgentTools {
                         "outcome": outcome,
                         "paused_reason": paused_reason,
                         "result_state": state.as_str(),
+                        "checks_ran_against": checks.to_json(),
                         "result_message_id": delivery.message.as_ref().map(|message| message.message_id),
                         "result_project_sequence": delivery.message.as_ref().map(|message| message.project_sequence),
                         "result_accepted_at": delivery.message.as_ref().map(|message| message.accepted_at),
                     }));
                 }
+                // A terminal child produced its final state; a parked one only
+                // stopped, and cannot finish without a person or a control
+                // action. Which of the two the caller wants is what `until`
+                // selects, and a terminal wait names the parked children
+                // separately so neither is lost.
+                let (children, still_paused) = match arguments.until {
+                    ProjectChildWaitUntil::Ready => (children, Vec::new()),
+                    ProjectChildWaitUntil::Terminal => {
+                        let mut terminal = Vec::new();
+                        let mut paused = Vec::new();
+                        for child in children {
+                            if child["outcome"] == "terminal" {
+                                terminal.push(child);
+                            } else {
+                                paused.push(child);
+                            }
+                        }
+                        (terminal, paused)
+                    }
+                };
                 let missing = children
                     .iter()
+                    .chain(still_paused.iter())
                     .filter(|child| child["result_state"] == "missing")
                     .count();
                 let attention = children
                     .iter()
+                    .chain(still_paused.iter())
                     .filter(|child| child["outcome"] == "needs_attention")
                     .map(|child| {
                         let name = child["child_name"].as_str().unwrap_or_default();
@@ -894,6 +1112,12 @@ impl ProjectAgentTools {
                             .unwrap_or("unknown");
                         format!("{name} ({reason})")
                     })
+                    .collect::<Vec<_>>();
+                let unstated_checks = children
+                    .iter()
+                    .chain(still_paused.iter())
+                    .filter(|child| child["checks_ran_against"]["stated"] == false)
+                    .map(|child| child["child_name"].as_str().unwrap_or_default().to_owned())
                     .collect::<Vec<_>>();
                 let outcome = if attention.is_empty() {
                     "terminal"
@@ -905,16 +1129,35 @@ impl ProjectAgentTools {
                         "{missing} of the return-ready children never reported a result; read them with list_project_children before reporting completion. Code child results still require review and integration."
                     )
                 } else {
-                    "result_state reports whether each child's own result has already reached your transcript; an undelivered result is delivered when this wait resumes. outcome reports whether each child is terminal or needs_attention: a child that stopped without a result is not finished, and its paused_reason says why (an approval or a question needs a person in the child's own session, a provider or step failure is retried with retry_failed_step, and an exhausted budget stops again until the limits change). Code child results still require review and integration before the manager reports completion."
+                    "result_state reports whether each child's own result has already reached your transcript; an undelivered result is delivered when this wait resumes. outcome reports whether each child is terminal or needs_attention: a child that stopped without a result is not finished, and its paused_reason says why (an approval or a question needs a person in the child's own session, a provider or step failure is retried with retry_failed_step, and an exhausted budget stops again until the limits change). checks_ran_against reports the optional dependencies the child's result says its checks ran against, and `stated: false` means the result stayed silent about them. Code child results still require review and integration before the manager reports completion."
                         .to_owned()
+                };
+                let note = match arguments.until {
+                    ProjectChildWaitUntil::Ready => note,
+                    ProjectChildWaitUntil::Terminal => format!(
+                        "{note} This wait collected terminal children only: still_paused names the {} child(ren) that stopped without reaching a terminal state, and they stay stopped until a person answers them or you take a control action.",
+                        still_paused.len()
+                    ),
+                };
+                let note = match unstated_checks.is_empty() {
+                    true => note,
+                    false => format!(
+                        "{note} These children's results do not say which optional dependencies their checks reached: {}.",
+                        unstated_checks.join(", ")
+                    ),
                 };
                 ToolResult::success(
                     call,
                     serde_json::to_string(&serde_json::json!({
                         "return_ready": true,
+                        "until": match arguments.until {
+                            ProjectChildWaitUntil::Ready => "ready",
+                            ProjectChildWaitUntil::Terminal => "terminal",
+                        },
                         "outcome": outcome,
                         "needs_attention": attention,
                         "children": children,
+                        "still_paused": still_paused,
                         "note": note,
                     }))
                     .unwrap_or_else(|error| format!("could not encode child wait result: {error}")),
@@ -922,7 +1165,7 @@ impl ProjectAgentTools {
             }
             Ok(_) => ToolResult::failure(
                 call,
-                "child tasks are still active; retry through the durable wait continuation",
+                "child tasks are still running or queued; retry through the durable wait continuation",
             ),
             Err(error) => ToolResult::failure(call, error.message),
         }
@@ -1092,9 +1335,67 @@ impl ProjectAgentTools {
                 "a declared file scope applies to a code child's commit; declare it on a code task",
             );
         }
+        // A pinned base and a requested replay describe a code child's
+        // checkout, which a read-only child never has reviewed or landed, so
+        // both are refused on a non-code delegation instead of being ignored.
+        let base = match arguments.base.as_deref() {
+            None => None,
+            Some(_) if !code_change => {
+                return ToolResult::failure(
+                    call,
+                    "`base` selects the revision a code child's checkout is created from; declare it on a code task",
+                );
+            }
+            Some(base) => {
+                let base = base.trim();
+                if base.is_empty() || base.len() > 64 {
+                    return ToolResult::failure(
+                        call,
+                        "base must contain 1 to 64 bytes: `current` or a commit of the parent repository",
+                    );
+                }
+                if base == "current" {
+                    None
+                } else {
+                    Some(base.to_owned())
+                }
+            }
+        };
+        if arguments.rebase_before_report && !code_change {
+            return ToolResult::failure(
+                call,
+                "`rebase_before_report` directs a code child's own commits to be replayed before it reports; declare it on a code task",
+            );
+        }
+        // The requirement travels in the child's own task prompt, which is what
+        // the child reads when its run starts, so a delegation that asks for a
+        // replay is told to do it without a new persisted field.
+        let intent = if arguments.rebase_before_report {
+            format!(
+                "{}\n\nBefore you report your result, replay your own commits onto your parent's current revision so your work sits on top of it: your checkout is a linked worktree of your parent's repository, so the parent's branch is visible from it, and `git rebase <that branch>` replays your commits while keeping their authors and messages. Create no merge commit. If the replay conflicts, report the conflicting paths and your committed revision instead of forcing it.",
+                arguments.intent
+            )
+        } else {
+            arguments.intent.clone()
+        };
+        if intent.len() > 16 * 1024 {
+            return ToolResult::failure(
+                call,
+                "the delegation intent with the rebase requirement exceeds 16384 bytes; shorten the intent and retry",
+            );
+        }
+        let rebase_before_report = serde_json::json!({
+            "requested": arguments.rebase_before_report,
+            "happened": false,
+            "note": if arguments.rebase_before_report {
+                "The child was told to replay its own commits onto your current revision before it reports, and nothing has been replayed yet. `happened` becomes true only when a replay is recorded: the child's `rebase` record reports a replay Loom performed, and review_project_child reports the base and result revisions it observes, so you can tell whether the child's commits already sit on your revision."
+            } else {
+                "No replay was asked for, so the child reports the commits its checkout holds on the base it was created from."
+            },
+        });
         let request_id = RequestId::from_uuid(*call.id.as_uuid());
         let spec = DelegatedTaskSpec {
-            intent: arguments.intent,
+            intent,
             model_id: choice.model_id,
             context_references: arguments.context_references,
             dependencies: arguments.dependencies,
@@ -1102,11 +1403,12 @@ impl ProjectAgentTools {
             permissions: arguments.permissions,
             scope: scope.clone(),
         };
-        match connection.create_project_child(
+        match connection.create_project_child_from_base(
             request_id,
             self.session_id,
             arguments.child_name,
             spec,
+            base.as_deref(),
         ) {
             Ok(ServerResponse::Project(ProjectResponse::ProjectChildCreated { task, child })) => {
                 let mut output = serde_json::json!({
@@ -1119,6 +1421,8 @@ impl ProjectAgentTools {
                     "model_source": choice.source,
                     "kind": kind,
                     "scope": scope,
+                    "base": base,
+                    "rebase_before_report": rebase_before_report,
                     "checkout_base": self.child_checkout_base(task.task_id),
                 });
                 // A child beyond the workspace's concurrency limit is accepted
@@ -1356,6 +1660,7 @@ impl ProjectAgentTools {
                 .collect::<BTreeMap<_, _>>()
         };
         let mut children = Vec::new();
+        let mut check_warnings = Vec::new();
         for agent in project
             .agents
             .iter()
@@ -1403,19 +1708,18 @@ impl ProjectAgentTools {
             // a child that has not started a run at all. A checkout that cannot
             // be inspected is reported as such rather than claiming that the
             // child left nothing behind.
-            let (checkout_state, worktree_note) = match worktree.as_ref() {
+            let checkout_is_settled = worktree.is_some()
+                && (task.is_some_and(|task| delegated_task_is_terminal(task.status))
+                    || run.as_ref().is_some_and(|summary| {
+                        !matches!(
+                            summary.snapshot.state,
+                            AgentRunState::Planning
+                                | AgentRunState::Executing
+                                | AgentRunState::Evaluating
+                        )
+                    }));
+            let (checkout_state, mut worktree_note) = match worktree.as_ref() {
                 Some(worktree) => {
-                    let task_terminal =
-                        task.is_some_and(|task| delegated_task_is_terminal(task.status));
-                    let checkout_is_settled = task_terminal
-                        || run.as_ref().is_some_and(|summary| {
-                            !matches!(
-                                summary.snapshot.state,
-                                AgentRunState::Planning
-                                    | AgentRunState::Executing
-                                    | AgentRunState::Evaluating
-                            )
-                        });
                     match self.inspect_project_child_checkout(worktree, checkout_is_settled) {
                         Ok(state) => (state, None),
                         Err(error) => (
@@ -1428,6 +1732,26 @@ impl ProjectAgentTools {
                     }
                 }
                 None => (None, None),
+            };
+            // A code child that committed its result reports the commit's own
+            // identity, so the manager can recognise already-landed work from
+            // the listing instead of running git in its own checkout.
+            let commit_summary = match worktree.as_ref() {
+                Some(worktree)
+                    if task.is_some_and(|task| task.code_change) && checkout_is_settled =>
+                {
+                    match self.project_child_commit_summary(worktree) {
+                        Ok(summary) => summary,
+                        Err(error) => {
+                            worktree_note = Some(format!(
+                                "the child's committed result could not be read: {}",
+                                error.message
+                            ));
+                            None
+                        }
+                    }
+                }
+                _ => None,
             };
             // A completed child's result is durable whether or not it ever
             // reached this manager, so every child entry reports the stored
@@ -1494,7 +1818,15 @@ impl ProjectAgentTools {
                 },
                 None => (None, false),
             };
-            children.push(serde_json::json!({
+            // The optional dependency statement is read before the entry is
+            // built, so its nested object does not deepen the entry macro.
+            let checks = project_child_check_environment(
+                delivery
+                    .as_ref()
+                    .and_then(|(_, delivery)| delivery.message.as_ref())
+                    .map(|message| message.body.as_str()),
+            );
+            let mut entry = serde_json::json!({
                 "session_id": agent.session_id,
                 "name": name,
                 "state": agent.state,
@@ -1509,6 +1841,14 @@ impl ProjectAgentTools {
                 "queue_position": queue_position,
                 "queued_since": queued_since,
                 "worktree_status": worktree.as_ref().map(|worktree| worktree.status),
+                "base_revision": worktree.as_ref().map(|worktree| worktree.base_revision.as_str()),
+                "commit_subject": commit_summary.as_ref().map(|summary| summary.commit_subject.as_str()),
+                "patch_ids": commit_summary.as_ref().map(|summary| summary.patch_ids.clone()),
+                "patch_ids_total": commit_summary.as_ref().map(|summary| summary.patch_ids_total),
+                "changed_paths": commit_summary.as_ref().map(|summary| summary.changed_paths.clone()),
+                "changed_paths_total": commit_summary.as_ref().map(|summary| summary.changed_paths_total),
+                "commit_summary_truncated": commit_summary.as_ref().map(|summary| summary.truncated),
+                "rebase": worktree.as_ref().and_then(|worktree| worktree.rebase.clone()),
                 "result_revision": worktree.as_ref().and_then(|worktree| worktree.result_revision.clone()),
                 "result_revision_is_base": worktree.as_ref().map(|worktree| worktree.result_revision.as_deref().is_none_or(|revision| revision == worktree.base_revision)),
                 "integrated_revision": worktree.as_ref().and_then(|worktree| worktree.integrated_revision.clone()),
@@ -1531,7 +1871,14 @@ impl ProjectAgentTools {
                 "result_body_truncated": result_body_truncated,
                 "undelivered_messages": undelivered_messages,
                 "updated_at": agent.updated_at,
-            }));
+            });
+            entry["checks_ran_against"] = checks.to_json();
+            if let Some(warning) =
+                checks.warning(task.map_or(name.as_str(), |task| task.child_name.as_str()))
+            {
+                check_warnings.push(warning);
+            }
+            children.push(entry);
         }
         if let Some(selected) = arguments.task_id
             && children.is_empty()
@@ -1548,6 +1895,10 @@ impl ProjectAgentTools {
         });
         let truncated = children.len() > 50;
         children.truncate(50);
+        let note = format!(
+            "result_state reports whether each child's stored result reached this session: delivered, undelivered (accepted for delivery but not yet in your transcript), missing (a finished child never reported a result), or pending. outcome reports what the child means for you: queued (it has not started because every project agent slot in the workspace is busy), needs_attention (it is stopped and its paused_reason says why), terminal (it produced its final state), or running. A queued child also reports queue_position, its 1-based place in the workspace's waiting order, and queued_since, when it joined the queue; a position falls as the children ahead of it finish, stop, or are cancelled, and project_agent_concurrency_limit is the number of children the workspace runs at once. paused_reason is derived from the state the child's run already records: awaiting_approval (tool and input_digest), provider_error (kind, attempts, last_status), budget_exhausted (steps, tokens), step_failed (tool, error_kind), awaiting_input (question_id), or unknown when nothing recorded explains the stop. An approval or a question needs a person in the child's own session; a provider or step failure is retried with retry_failed_step. undelivered_messages counts the durable inbox messages the child has not read yet, so a message you sent that still waits is distinguishable from one the child consumed. For a code child whose run is not progressing — finished, paused, or blocked waiting for input or approval — worktree_uncommitted_path_count and worktree_uncommitted_line_delta report what its checkout still holds uncommitted, worktree_head_is_base says whether that checkout has no commit of its own yet, and result_revision_is_base says whether no reviewed result revision other than its base has been recorded. integrated_revision names the revision its reviewed result landed at, and landed_by says how it got there: integrated (Loom fast-forwarded, merged, or completed the record), already_present (the parent history already carried the reviewed patch), or replay (you recorded the landing yourself). A child whose run is still running reports none of the checkout fields, because its checkout is in motion. Work that is never reviewed and integrated, or abandoned, is not landed. Pass a child's task_id to return its whole stored result. A code child whose checkout is not in motion and whose committed result differs from its base also reports commit_subject, the patch_ids of its own commits and the changed_paths it touched, each bounded with its exact total and commit_summary_truncated set when either list was cut, and rebase, the record of a replay Loom performed, so work that is already landed is recognisable without running git yourself. checks_ran_against reports which optional dependencies the child's result says its checks ran against (live_db, keychain, network), read from its `live-db:`, `keychain:`, and `network:` lines, and stated is false when the result stayed silent about them. {}",
+            check_warnings.join(" ")
+        );
         ToolResult {
             tool_call_id: call.id,
             name: call.name.clone(),
@@ -1556,7 +1907,7 @@ impl ProjectAgentTools {
                 "children": children,
                 "truncated": truncated,
                 "project_agent_concurrency_limit": queue.concurrency_limit,
-                "note": "result_state reports whether each child's stored result reached this session: delivered, undelivered (accepted for delivery but not yet in your transcript), missing (a finished child never reported a result), or pending. outcome reports what the child means for you: queued (it has not started because every project agent slot in the workspace is busy), needs_attention (it is stopped and its paused_reason says why), terminal (it produced its final state), or running. A queued child also reports queue_position, its 1-based place in the workspace's waiting order, and queued_since, when it joined the queue; a position falls as the children ahead of it finish, stop, or are cancelled, and project_agent_concurrency_limit is the number of children the workspace runs at once. paused_reason is derived from the state the child's run already records: awaiting_approval (tool and input_digest), provider_error (kind, attempts, last_status), budget_exhausted (steps, tokens), step_failed (tool, error_kind), awaiting_input (question_id), or unknown when nothing recorded explains the stop. An approval or a question needs a person in the child's own session; a provider or step failure is retried with retry_failed_step. undelivered_messages counts the durable inbox messages the child has not read yet, so a message you sent that still waits is distinguishable from one the child consumed. For a code child whose run is not progressing — finished, paused, or blocked waiting for input or approval — worktree_uncommitted_path_count and worktree_uncommitted_line_delta report what its checkout still holds uncommitted, worktree_head_is_base says whether that checkout has no commit of its own yet, and result_revision_is_base says whether no reviewed result revision other than its base has been recorded. integrated_revision names the revision its reviewed result landed at, and landed_by says how it got there: integrated (Loom fast-forwarded, merged, or completed the record), already_present (the parent history already carried the reviewed patch), or replay (you recorded the landing yourself). A child whose run is still running reports none of the checkout fields, because its checkout is in motion. Work that is never reviewed and integrated, or abandoned, is not landed. Pass a child's task_id to return its whole stored result."
+                "note": note
             }))
             .unwrap_or_else(|error| format!("could not encode project child status: {error}")),
         }
@@ -2139,7 +2490,7 @@ pub(crate) fn child_model_guidance(policy: &loom_core::ProjectChildModelPolicy) 
 
 #[cfg(test)]
 mod tests {
-    use super::project_child_outcome;
+    use super::{project_child_check_environment, project_child_outcome};
     use crate::ProjectChildPauseReason;
     use loom_core::{
         AgentSessionId, DelegatedTaskRecord, DelegatedTaskStatus, ProjectId, TaskId, Timestamp,
@@ -2161,6 +2512,40 @@ mod tests {
             status,
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
+        }
+    }
+
+    #[test]
+    fn a_result_states_which_optional_dependencies_its_checks_reached() {
+        // The three lines are read in any order and with either spelling of
+        // each key, and an unrecognised value leaves the dependency unstated.
+        let stated = project_child_check_environment(Some(
+            "All checks passed.\nlive-db: yes\nkeychain: no\nnetwork: false\n",
+        ));
+        assert_eq!(stated.live_db, "yes");
+        assert_eq!(stated.keychain, "no");
+        assert_eq!(stated.network, "no");
+        assert!(stated.is_stated());
+        assert_eq!(stated.warning("child"), None);
+
+        let bulleted = project_child_check_environment(Some("- **database:** yes (postgres)\n"));
+        assert_eq!(bulleted.live_db, "yes");
+        assert!(!bulleted.is_stated());
+        assert_eq!(bulleted.to_json()["stated"], false);
+
+        // A silent or missing result is unstated, not `no`.
+        for body in [None, Some("All green."), Some("live-db: maybe\n")] {
+            let unstated = project_child_check_environment(body);
+            assert_eq!(unstated.live_db, "not_stated");
+            assert_eq!(unstated.keychain, "not_stated");
+            assert_eq!(unstated.network, "not_stated");
+            assert!(!unstated.is_stated());
+            let warning = unstated.warning("stalled child").unwrap();
+            assert!(
+                warning.starts_with("stalled child did not state"),
+                "{warning}"
+            );
+            assert!(warning.contains("live-db"), "{warning}");
         }
     }
 

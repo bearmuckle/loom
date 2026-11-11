@@ -1,12 +1,36 @@
 use super::*;
 
 impl InProcessConnection {
+    /// Creates a delegated child from the parent's current revision.
+    ///
+    /// This is the entry point that asks for no particular base; a delegation
+    /// that pins one calls [`Self::create_project_child_from_base`].
+    #[allow(dead_code)]
     pub(crate) fn create_project_child(
         &self,
         request_id: RequestId,
         parent_session_id: AgentSessionId,
         child_name: String,
         spec: loom_core::DelegatedTaskSpec,
+    ) -> Result<ServerResponse> {
+        self.create_project_child_from_base(request_id, parent_session_id, child_name, spec, None)
+    }
+
+    /// Creates a delegated child, optionally basing a code child's checkout on
+    /// a pinned revision of the parent repository instead of the parent's
+    /// current one.
+    ///
+    /// A pinned base names a commit of the parent repository, so the child's
+    /// branch starts there and the manager can keep committing on the parent
+    /// without the child inheriting those commits. An unknown revision is
+    /// refused before anything is persisted.
+    pub(crate) fn create_project_child_from_base(
+        &self,
+        request_id: RequestId,
+        parent_session_id: AgentSessionId,
+        child_name: String,
+        spec: loom_core::DelegatedTaskSpec,
+        base: Option<&str>,
     ) -> Result<ServerResponse> {
         let permissions = spec.permissions;
         let worktrees_supported = self
@@ -404,20 +428,33 @@ impl InProcessConnection {
             if let Some((parent_repository_id, _)) = repositories.into_iter().next() {
                 let parent_git = self.session_git(parent_session_id, parent_repository_id)?;
                 let parent_status = parent_git.status()?;
+                // A pinned base has to be a commit of the parent repository, so
+                // an unknown revision is refused here rather than producing a
+                // child whose checkout cannot be created.
+                let pinned_base = match base {
+                    Some(base) => Some(parent_git.resolve_revision(base).map_err(|error| {
+                        LoomError::invalid_request(format!(
+                            "base '{base}' is not a commit of the parent repository: {}",
+                            error.message
+                        ))
+                    })?),
+                    None => None,
+                };
                 match (
                     parent_status.branch.as_deref(),
                     parent_status.head.as_deref(),
                     parent_status.clean,
                 ) {
-                    (Some(_), Some(base_revision), true) => {
-                        // Refresh the remote before the child is created so the
-                        // base revision and its drift from the fetched
-                        // default-branch tip are recorded and reported to the
-                        // manager. A failed refresh is recorded as unknown.
+                    (Some(_), Some(parent_revision), true) => {
+                        // The declared base is what the child's branch starts
+                        // from, and the recorded refresh measures that base
+                        // against the fetched default-branch tip.
+                        let base_revision = pinned_base
+                            .clone()
+                            .unwrap_or_else(|| parent_revision.to_owned());
                         let base_refresh =
-                            self.refresh_checkout_base_revision(&parent_git, base_revision);
-                        checkout =
-                            Some((parent_repository_id, base_revision.to_owned(), base_refresh));
+                            self.refresh_checkout_base_revision(&parent_git, &base_revision);
+                        checkout = Some((parent_repository_id, base_revision, base_refresh));
                     }
                     _ if exactly_one_repository => {
                         checkout_blocker = Some(parent_checkout_blocker(&parent_status));
