@@ -295,18 +295,12 @@ impl InProcessConnection {
                                     && candidate.status == loom_core::DelegatedTaskStatus::Running
                             })
                             .count();
-                        let concurrency_limit = self
-                            .backend
-                            .workspace_configs()?
-                            .get(&workspace_id)
-                            .map(|config| config.project_agent_concurrency)
-                            .unwrap_or_else(|| {
-                                WorkspaceConfig::default().project_agent_concurrency
-                            });
+                        let concurrency_limit =
+                            self.workspace_project_agent_concurrency(workspace_id)?;
                         if !project_agent_capacity_available(running_tasks, concurrency_limit) {
-                            return Err(LoomError::conflict(
-                                "project agent concurrency limit reached; the child remains failed",
-                            ));
+                            return Err(LoomError::conflict(format!(
+                                "the workspace allows {concurrency_limit} running project agent(s) at once and all of them are busy; the child remains failed"
+                            )));
                         }
                         let response = self.continue_run(
                             snapshot.id,

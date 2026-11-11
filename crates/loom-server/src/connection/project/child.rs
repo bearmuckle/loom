@@ -3,6 +3,7 @@ use super::*;
 mod control;
 mod create;
 pub(crate) mod pause;
+mod queue;
 mod rebase;
 mod recovery;
 mod result;

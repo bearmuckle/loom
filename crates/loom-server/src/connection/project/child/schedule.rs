@@ -179,12 +179,8 @@ impl InProcessConnection {
                         .is_none_or(|manager_task| task.task_id != manager_task.task_id)
             })
             .count();
-        let concurrency_limit = self
-            .backend
-            .workspace_configs()?
-            .get(&manager_session.workspace_id)
-            .map(|config| config.project_agent_concurrency)
-            .unwrap_or_else(|| WorkspaceConfig::default().project_agent_concurrency);
+        let concurrency_limit =
+            self.workspace_project_agent_concurrency(manager_session.workspace_id)?;
         if !project_agent_capacity_available(running_tasks, concurrency_limit) {
             return Ok(());
         }

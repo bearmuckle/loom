@@ -190,12 +190,8 @@ impl InProcessConnection {
             }
             checkout = Some(worktree);
         }
-        let concurrency_limit = self
-            .backend
-            .workspace_configs()?
-            .get(&target_session.workspace_id)
-            .map(|config| config.project_agent_concurrency)
-            .unwrap_or_else(|| loom_protocol::WorkspaceConfig::default().project_agent_concurrency);
+        let concurrency_limit =
+            self.workspace_project_agent_concurrency(target_session.workspace_id)?;
         let running_tasks = self
             .workspace_project_tasks(target_session.workspace_id)?
             .iter()

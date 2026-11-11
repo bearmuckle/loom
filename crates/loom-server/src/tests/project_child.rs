@@ -558,6 +558,243 @@ fn project_concurrency_limit_queues_additional_children() {
     let _ = fs::remove_file(path.with_extension("credentials.json"));
 }
 
+/// A child beyond the concurrency limit reports that it is queued, where it
+/// waits, and the bound it waits on; cancelling it moves the children behind it
+/// forward without touching the running child.
+#[test]
+fn project_queue_reports_position_and_cancel_moves_the_rest_up() {
+    let (endpoint, request_seen) = slow_model_endpoint();
+    let path = std::env::temp_dir().join(format!("loom-project-queue-{}.db", uuid::Uuid::new_v4()));
+    let backend = InProcessBackend::with_openai_compatible_persistent(
+        endpoint,
+        "test-key",
+        ModelId::new("slow/model"),
+        &path,
+    )
+    .unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Project queue".into(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let root = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Manager".into(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    assert!(matches!(
+        connection
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::SetWorkspaceConfigForWorkspace {
+                    workspace_id: workspace.id,
+                    config: WorkspaceConfig {
+                        project_agent_concurrency: 1,
+                        ..WorkspaceConfig::default()
+                    },
+                }
+            ),))
+            .result,
+        Ok(ServerResponse::Workspace(
+            WorkspaceResponse::WorkspaceConfigUpdated
+        ))
+    ));
+
+    let create_child = |child_name: &str| match connection
+        .create_project_child(
+            RequestId::new(),
+            root,
+            child_name.to_owned(),
+            loom_core::DelegatedTaskSpec {
+                intent: format!("Review {child_name}"),
+                model_id: "slow/model".into(),
+                context_references: vec![],
+                dependencies: vec![],
+                code_change: false,
+                permissions: loom_core::ProjectAgentPermissions::default(),
+                scope: None,
+            },
+        )
+        .unwrap()
+    {
+        ServerResponse::Project(ProjectResponse::ProjectChildCreated { task, child }) => {
+            (*task, child)
+        }
+        response => panic!("unexpected child creation response: {response:?}"),
+    };
+
+    let first = create_child("worker-1");
+    request_seen
+        .recv_timeout(Duration::from_secs(3))
+        .expect("first child should begin its provider request");
+    let second = create_child("worker-2");
+    assert_eq!(first.0.status, loom_core::DelegatedTaskStatus::Running);
+    assert_eq!(second.0.status, loom_core::DelegatedTaskStatus::Queued);
+
+    let extension = backend
+        .project_agent_tools(
+            root,
+            ModelId::new("slow/model"),
+            ProjectAgentToolGrants {
+                delegation: true,
+                inspection: true,
+                child_control: true,
+                ..ProjectAgentToolGrants::default()
+            },
+        )
+        .unwrap()
+        .expect("manager child tools");
+    let tools = ToolExecutor::new_with_workspace(connection.session_filesystem(root).unwrap())
+        .with_extension(extension);
+    let listing = || {
+        let listing = tools.execute(&ToolCall {
+            id: ToolCallId::new(),
+            name: "list_project_children".to_owned(),
+            arguments: serde_json::json!({}),
+        });
+        assert!(listing.success, "{}", listing.output);
+        serde_json::from_str::<serde_json::Value>(&listing.output).unwrap()
+    };
+    let entry = |listing: &serde_json::Value, task_id: &serde_json::Value| {
+        listing["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| &entry["task_id"] == task_id)
+            .unwrap_or_else(|| panic!("child {task_id} should be listed: {listing}"))
+            .clone()
+    };
+    let child_tool = |name: &str, arguments: serde_json::Value| {
+        let result = tools.execute(&ToolCall {
+            id: ToolCallId::new(),
+            name: name.to_owned(),
+            arguments,
+        });
+        assert!(result.success, "{}", result.output);
+        serde_json::from_str::<serde_json::Value>(&result.output).unwrap()
+    };
+
+    // A delegation beyond the limit reports that the child is queued, its place
+    // in the waiting order, and the effective limit.
+    let third = child_tool(
+        "delegate_project_task",
+        serde_json::json!({
+            "child_name": "worker-3",
+            "intent": "Review worker-3",
+            "model_id": "slow/model",
+        }),
+    );
+    assert_eq!(third["status"], "queued");
+    assert_eq!(third["queue_position"], serde_json::json!(2));
+    assert_eq!(
+        third["project_agent_concurrency_limit"],
+        serde_json::json!(1)
+    );
+    assert!(
+        third["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("queued"),
+        "a queued delegation says it has not started: {third}"
+    );
+    let third_id = third["task_id"].clone();
+    let second_id = serde_json::json!(second.0.task_id);
+    let first_id = serde_json::json!(first.0.task_id);
+
+    let listed = listing();
+    assert_eq!(
+        listed["project_agent_concurrency_limit"],
+        serde_json::json!(1),
+        "the listing names the effective limit: {listed}"
+    );
+    let running = entry(&listed, &first_id);
+    assert_eq!(running["task_status"], "running");
+    assert_eq!(running["outcome"], "running");
+    assert!(running["queue_position"].is_null(), "{running}");
+    assert!(running["queued_since"].is_null(), "{running}");
+
+    let queued_second = entry(&listed, &second_id);
+    assert_eq!(queued_second["task_status"], "queued");
+    assert_eq!(queued_second["outcome"], "queued");
+    assert_eq!(queued_second["queue_position"], serde_json::json!(1));
+    assert!(
+        queued_second["queued_since"].as_u64().is_some(),
+        "a queued child reports when it joined the queue: {queued_second}"
+    );
+    assert!(
+        queued_second["paused_reason"].is_null(),
+        "a queued child is not paused: {queued_second}"
+    );
+    assert_eq!(
+        entry(&listed, &third_id)["queue_position"],
+        serde_json::json!(2)
+    );
+
+    // A control action that cannot start a queued child reports where it waits
+    // instead of doing nothing silently.
+    let continued = child_tool(
+        "control_project_child",
+        serde_json::json!({"task_id": third_id.clone(), "action": "continue"}),
+    );
+    assert_eq!(continued["status"], "queued");
+    assert_eq!(continued["queue_position"], serde_json::json!(2));
+    assert_eq!(
+        continued["project_agent_concurrency_limit"],
+        serde_json::json!(1)
+    );
+    assert!(
+        continued["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("queued at position 2"),
+        "a control action on a queued child names its place: {continued}"
+    );
+
+    // Cancelling the first queued child removes it before its run starts and
+    // leaves the child behind it first in line.
+    let cancelled = child_tool(
+        "control_project_child",
+        serde_json::json!({"task_id": second_id.clone(), "action": "cancel"}),
+    );
+    assert_eq!(cancelled["status"], "cancelled");
+
+    let listed = listing();
+    let cancelled_second = entry(&listed, &second_id);
+    assert_eq!(cancelled_second["task_status"], "cancelled");
+    assert_eq!(cancelled_second["outcome"], "terminal");
+    assert!(cancelled_second["queue_position"].is_null());
+    let moved_third = entry(&listed, &third_id);
+    assert_eq!(moved_third["task_status"], "queued");
+    assert_eq!(moved_third["queue_position"], serde_json::json!(1));
+    let still_running = entry(&listed, &first_id);
+    assert_eq!(still_running["task_status"], "running");
+    assert!(still_running["queue_position"].is_null());
+
+    backend.shutdown().unwrap();
+    drop(tools);
+    drop(connection);
+    drop(backend);
+    let _ = fs::remove_dir_all(path.with_extension("session-roots"));
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(path.with_extension("credentials.json"));
+}
+
 #[test]
 fn project_child_control_covers_lifecycle_and_parent_grants() {
     let temp = std::env::temp_dir().join(format!(
