@@ -3794,8 +3794,8 @@ fn a_rebase_reports_the_checks_it_ran_and_the_ones_it_skipped() {
         "parent change",
     );
     // The documented set is what runs when nothing replaces it. The fixture
-    // checkout is not a Cargo workspace, so formatting is reported as skipped
-    // instead of being attempted, and the compile and test checks never run.
+    // checkout is not a Cargo workspace, so formatting and the compile check
+    // are reported as skipped instead of being attempted.
     clear_rebase_check(&fixture);
 
     let rebase = control_child_with_tools(&fixture, "rebase", Some("main"));
@@ -3808,7 +3808,7 @@ fn a_rebase_reports_the_checks_it_ran_and_the_ones_it_skipped() {
         .iter()
         .map(|check| check["name"].as_str().unwrap_or_default())
         .collect::<Vec<_>>();
-    assert_eq!(names, vec!["fmt", "clippy", "test"]);
+    assert_eq!(names, vec!["fmt", "compile"]);
     for check in checks {
         assert_eq!(
             check["outcome"],
@@ -3821,15 +3821,74 @@ fn a_rebase_reports_the_checks_it_ran_and_the_ones_it_skipped() {
                 .is_some_and(|detail| !detail.is_empty()),
             "a skipped check says why: {check}"
         );
+        assert!(
+            check["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("no Cargo.toml")),
+            "a check that needs the workspace says the checkout is not one: {check}"
+        );
     }
-    assert!(
-        checks[0]["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("no Cargo.toml")),
-        "formatting is skipped because the checkout is not a Cargo workspace: {}",
-        checks[0]
-    );
     assert_eq!(rebase["check_timeout_secs"], serde_json::json!(120));
+    assert_eq!(checks[0]["timeout_secs"], serde_json::json!(120));
+    assert_eq!(
+        checks[1]["timeout_secs"],
+        serde_json::json!(300),
+        "a compile check reports the longer bound it was given"
+    );
+    fixture.shutdown();
+}
+
+#[test]
+fn a_rebase_whose_compile_check_fails_is_refused_and_restored() {
+    let fixture = project_code_child_fixture();
+    // The changed paths belong to one crate, so the rebase compiles it. The
+    // manifest is not a Cargo workspace manifest, which makes the compile fail
+    // quickly and for a reason that does not depend on a registry or network.
+    commit_file(
+        &fixture.child_checkout,
+        "Cargo.toml",
+        "this is not a Cargo manifest\n",
+        "chore: add a workspace manifest",
+    );
+    commit_file(
+        &fixture.child_checkout,
+        "crates/thing/Cargo.toml",
+        "[package]\nname = \"thing\"\nversion = \"0.1.0\"\n",
+        "chore: add the thing crate",
+    );
+    commit_file(
+        &fixture.child_checkout,
+        "crates/thing/src/lib.rs",
+        "pub fn thing() {}\n",
+        "feat: add the thing crate",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+    commit_file(
+        fixture.parent_git.root(),
+        "README.md",
+        "parent advanced\n",
+        "parent change",
+    );
+    clear_rebase_check(&fixture);
+
+    let rebase = control_child_with_tools(&fixture, "rebase", Some("main"));
+    assert!(!rebase.success, "{}", rebase.output);
+    assert!(
+        rebase.output.contains("compile (failed)"),
+        "the refusal names the compile check that failed: {}",
+        rebase.output
+    );
+    assert!(
+        rebase.output.contains("restored"),
+        "the refusal says the checkout was restored: {}",
+        rebase.output
+    );
+    assert_eq!(
+        git_output(&fixture.child_checkout, &["rev-parse", "HEAD"]),
+        child_revision
+    );
+    assert_eq!(integrated_worktree(&fixture).rebase, None);
     fixture.shutdown();
 }
 

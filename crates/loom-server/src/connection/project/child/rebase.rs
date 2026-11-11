@@ -11,6 +11,21 @@ use std::time::{Duration, Instant};
 /// back indefinitely.
 pub(crate) const PROJECT_CHILD_REBASE_CHECK_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long one bounded compile check may run before the rebase stops it.
+///
+/// A cold `cargo check` is slower than a format check, so it gets a longer
+/// bound than [`PROJECT_CHILD_REBASE_CHECK_TIMEOUT`] while the tool call stays
+/// bounded.
+pub(crate) const PROJECT_CHILD_REBASE_COMPILE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Most crates one rebase compiles, so a wide change cannot turn one tool call
+/// into a workspace build.
+const MAX_PROJECT_CHILD_REBASE_COMPILE_PACKAGES: usize = 4;
+
+/// Why a Cargo check is reported as skipped instead of run.
+const NO_CARGO_MANIFEST_SKIP: &str =
+    "not run: the child checkout has no Cargo.toml, so it is not a Cargo workspace";
+
 /// How long the readers of a finished check's output are given to reach the end
 /// of its pipes, so a descendant that still holds them cannot stall the rebase.
 const PROJECT_CHILD_CHECK_OUTPUT_GRACE: Duration = Duration::from_secs(2);
@@ -76,6 +91,8 @@ pub(crate) struct ProjectChildRebaseCheckOutcome {
     pub(crate) outcome: ProjectChildRebaseCheckState,
     /// The reason a check was skipped or the bounded tail of its output.
     pub(crate) detail: Option<String>,
+    /// The bound this check was given, so a reader knows how long it could run.
+    pub(crate) timeout_secs: u64,
 }
 
 /// What one rebase of a finished child's own commits changed.
@@ -88,8 +105,8 @@ pub(crate) struct ProjectChildRebaseReport {
     pub(crate) commits_before: usize,
     pub(crate) commits_after: usize,
     pub(crate) checks: Vec<ProjectChildRebaseCheckOutcome>,
-    /// The timeout each check was given, so a reader knows the bound that
-    /// applies.
+    /// The timeout the format check was given; a check that has its own bound
+    /// reports it with the check.
     pub(crate) check_timeout_secs: u64,
 }
 
@@ -107,7 +124,8 @@ impl InProcessConnection {
     ///
     /// The replayed result is then validated by the bounded checks this module
     /// documents. A check that fails stops the rebase and restores the child's
-    /// branch, so a result that no longer formats is never reported as rebased.
+    /// branch, so a result that no longer formats or compiles is never reported
+    /// as rebased.
     /// On success the record names the new base and result revisions and the
     /// rebase it performed.
     pub(crate) fn rebase_project_child(
@@ -238,7 +256,7 @@ impl InProcessConnection {
             )));
         }
 
-        let checks = self.run_project_child_rebase_checks(&child_git);
+        let checks = self.run_project_child_rebase_checks(&child_git, &replay_paths);
         let failed = checks
             .iter()
             .filter(|check| check.outcome.is_failure())
@@ -356,12 +374,14 @@ impl InProcessConnection {
     /// The bounded checks a rebase runs in the child checkout.
     ///
     /// The set is fixed and documented instead of the child's own last commands,
-    /// which Loom does not record: formatting is checked because it is fast and
-    /// deterministic, while a compile and a test run are reported as skipped
-    /// because neither can be bounded to the crates the child touched from a
-    /// tool call. A test may replace the set so it does not invoke a real
-    /// toolchain.
-    fn project_child_rebase_checks(&self, root: &Path) -> Vec<ProjectChildRebaseCheck> {
+    /// which Loom does not record: formatting is checked, and the crates the
+    /// changed paths belong to are compiled, each within its own bound. A test
+    /// may replace the set so it does not invoke a real toolchain.
+    fn project_child_rebase_checks(
+        &self,
+        root: &Path,
+        changed_paths: &[String],
+    ) -> Vec<ProjectChildRebaseCheck> {
         #[cfg(test)]
         if let Some((program, args, timeout)) = self
             .backend
@@ -383,46 +403,21 @@ impl InProcessConnection {
                 skip: None,
             }];
         }
-        let documented = vec![
-            ProjectChildRebaseCheck {
-                name: "fmt".to_owned(),
-                command: "cargo fmt --all -- --check".to_owned(),
-                program: "cargo".to_owned(),
-                args: vec![
-                    "fmt".to_owned(),
-                    "--all".to_owned(),
-                    "--".to_owned(),
-                    "--check".to_owned(),
-                ],
-                timeout: PROJECT_CHILD_REBASE_CHECK_TIMEOUT,
-                requires_cargo_manifest: true,
-                skip: None,
-            },
-            ProjectChildRebaseCheck {
-                name: "clippy".to_owned(),
-                command: "cargo clippy --workspace --all-targets -- -D warnings".to_owned(),
-                program: "cargo".to_owned(),
-                args: Vec::new(),
-                timeout: PROJECT_CHILD_REBASE_CHECK_TIMEOUT,
-                requires_cargo_manifest: true,
-                skip: Some(
-                    "not run: a workspace clippy run is not bounded to the crates this child touched, so the rebase never starts one; run it in the child checkout before integrating"
-                        .to_owned(),
-                ),
-            },
-            ProjectChildRebaseCheck {
-                name: "test".to_owned(),
-                command: "cargo test --workspace --locked".to_owned(),
-                program: "cargo".to_owned(),
-                args: Vec::new(),
-                timeout: PROJECT_CHILD_REBASE_CHECK_TIMEOUT,
-                requires_cargo_manifest: true,
-                skip: Some(
-                    "not run: a test suite is never started from a tool call; run it in the child checkout before integrating"
-                        .to_owned(),
-                ),
-            },
-        ];
+        let mut documented = vec![ProjectChildRebaseCheck {
+            name: "fmt".to_owned(),
+            command: "cargo fmt --all -- --check".to_owned(),
+            program: "cargo".to_owned(),
+            args: vec![
+                "fmt".to_owned(),
+                "--all".to_owned(),
+                "--".to_owned(),
+                "--check".to_owned(),
+            ],
+            timeout: PROJECT_CHILD_REBASE_CHECK_TIMEOUT,
+            requires_cargo_manifest: true,
+            skip: None,
+        }];
+        documented.extend(project_child_rebase_compile_checks(root, changed_paths));
         documented
             .into_iter()
             .map(|mut check| {
@@ -430,10 +425,7 @@ impl InProcessConnection {
                     && check.requires_cargo_manifest
                     && !root.join("Cargo.toml").is_file()
                 {
-                    check.skip = Some(
-                        "not run: the child checkout has no Cargo.toml, so it is not a Cargo workspace"
-                            .to_owned(),
-                    );
+                    check.skip = Some(NO_CARGO_MANIFEST_SKIP.to_owned());
                 }
                 check
             })
@@ -444,13 +436,130 @@ impl InProcessConnection {
     pub(super) fn run_project_child_rebase_checks(
         &self,
         child_git: &GitService,
+        changed_paths: &[String],
     ) -> Vec<ProjectChildRebaseCheckOutcome> {
         let root = child_git.root();
-        self.project_child_rebase_checks(root)
+        self.project_child_rebase_checks(root, changed_paths)
             .iter()
             .map(|check| run_project_child_check(check, root))
             .collect()
     }
+}
+
+/// One crate a rebase compiles before it reports the replay validated.
+struct ProjectChildRebaseCrate {
+    /// The package name the crate's manifest declares.
+    package: String,
+}
+
+/// The compile checks a rebase runs: one `cargo check -p <package>` per crate
+/// the changed paths belong to, capped so a wide change stays one tool call.
+///
+/// A crate past the cap is reported as skipped with its reason instead of being
+/// dropped, so the manager can see what still has to be compiled by hand.
+fn project_child_rebase_compile_checks(
+    root: &Path,
+    changed_paths: &[String],
+) -> Vec<ProjectChildRebaseCheck> {
+    let crates = project_child_rebase_crates(root, changed_paths);
+    if crates.is_empty() {
+        let skip = if root.join("Cargo.toml").is_file() {
+            "not run: the rebase compiles the crates the changed paths belong to, and no changed path is under a crates/<dir>/ directory whose Cargo.toml declares a package"
+                .to_owned()
+        } else {
+            NO_CARGO_MANIFEST_SKIP.to_owned()
+        };
+        return vec![ProjectChildRebaseCheck {
+            name: "compile".to_owned(),
+            command: "cargo check -p <package>".to_owned(),
+            program: "cargo".to_owned(),
+            args: Vec::new(),
+            timeout: PROJECT_CHILD_REBASE_COMPILE_TIMEOUT,
+            requires_cargo_manifest: false,
+            skip: Some(skip),
+        }];
+    }
+    let total = crates.len();
+    crates
+        .into_iter()
+        .enumerate()
+        .map(|(index, krate)| ProjectChildRebaseCheck {
+            name: "compile".to_owned(),
+            command: format!("cargo check -p {}", krate.package),
+            program: "cargo".to_owned(),
+            args: vec!["check".to_owned(), "-p".to_owned(), krate.package.clone()],
+            timeout: PROJECT_CHILD_REBASE_COMPILE_TIMEOUT,
+            requires_cargo_manifest: false,
+            skip: (index >= MAX_PROJECT_CHILD_REBASE_COMPILE_PACKAGES).then(|| {
+                format!(
+                    "not run: one tool call compiles at most {MAX_PROJECT_CHILD_REBASE_COMPILE_PACKAGES} crates and this change touches {total}, so run `cargo check -p {}` in the child checkout before integrating",
+                    krate.package
+                )
+            }),
+        })
+        .collect()
+}
+
+/// The crates the changed paths belong to, in crate-directory order.
+///
+/// A path under `crates/<dir>/` belongs to the package `crates/<dir>/Cargo.toml`
+/// declares. Every other path - the workspace manifest, a document, a CI
+/// workflow - belongs to no crate, so it adds nothing to check. A directory
+/// whose manifest is missing or declares no package name resolves to no crate.
+fn project_child_rebase_crates(
+    root: &Path,
+    changed_paths: &[String],
+) -> Vec<ProjectChildRebaseCrate> {
+    let mut directories = changed_paths
+        .iter()
+        .filter_map(|path| project_child_crate_dir(path))
+        .collect::<Vec<_>>();
+    directories.sort();
+    directories.dedup();
+    directories
+        .into_iter()
+        .filter_map(|directory| {
+            let manifest =
+                std::fs::read_to_string(root.join(&directory).join("Cargo.toml")).ok()?;
+            let package = project_child_crate_package_name(&manifest)?;
+            Some(ProjectChildRebaseCrate { package })
+        })
+        .collect()
+}
+
+/// The `crates/<dir>` directory a changed path belongs to.
+fn project_child_crate_dir(path: &str) -> Option<String> {
+    let directory = path.strip_prefix("crates/")?.split('/').next()?;
+    if directory.is_empty() || matches!(directory, "." | "..") {
+        return None;
+    }
+    Some(format!("crates/{directory}"))
+}
+
+/// The package name a crate manifest declares in its `[package]` section.
+fn project_child_crate_package_name(manifest: &str) -> Option<String> {
+    let mut in_package = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if let Some(section) = line.strip_prefix('[') {
+            in_package = section.trim_end_matches(']').trim() == "package";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "name" {
+            continue;
+        }
+        let name = value.trim().trim_matches(['"', '\'']).trim();
+        if !name.is_empty() {
+            return Some(name.to_owned());
+        }
+    }
+    None
 }
 
 /// The sorted, de-duplicated paths a change touches from `base_revision`.
@@ -529,6 +638,7 @@ fn run_project_child_check(
             command: check.command.clone(),
             outcome: ProjectChildRebaseCheckState::Skipped,
             detail: Some(reason.clone()),
+            timeout_secs: check.timeout.as_secs(),
         };
     }
     let mut command = std::process::Command::new(&check.program);
@@ -553,6 +663,7 @@ fn run_project_child_check(
                 command: check.command.clone(),
                 outcome: ProjectChildRebaseCheckState::Unavailable,
                 detail: Some(format!("could not start '{}': {error}", check.program)),
+                timeout_secs: check.timeout.as_secs(),
             };
         }
     };
@@ -576,6 +687,7 @@ fn run_project_child_check(
                     command: check.command.clone(),
                     outcome: ProjectChildRebaseCheckState::Unavailable,
                     detail: Some(format!("could not wait for '{}': {error}", check.program)),
+                    timeout_secs: check.timeout.as_secs(),
                 };
             }
         }
@@ -601,6 +713,7 @@ fn run_project_child_check(
         command: check.command.clone(),
         outcome,
         detail,
+        timeout_secs: check.timeout.as_secs(),
     }
 }
 
@@ -691,9 +804,154 @@ fn terminate_project_child_check(child: &mut std::process::Child) {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_NAMED_PATHS, MAX_PROJECT_CHILD_CHECK_OUTPUT_BYTES, ProjectChildRebaseCheckState,
-        paths_outside_set, project_child_check_detail, project_child_rebase_paths,
+        MAX_NAMED_PATHS, MAX_PROJECT_CHILD_CHECK_OUTPUT_BYTES,
+        MAX_PROJECT_CHILD_REBASE_COMPILE_PACKAGES, NO_CARGO_MANIFEST_SKIP,
+        PROJECT_CHILD_REBASE_COMPILE_TIMEOUT, ProjectChildRebaseCheckState, paths_outside_set,
+        project_child_check_detail, project_child_crate_dir, project_child_crate_package_name,
+        project_child_rebase_compile_checks, project_child_rebase_crates,
+        project_child_rebase_paths,
     };
+
+    #[test]
+    fn a_changed_path_names_a_crate_directory_and_its_manifest_names_the_package() {
+        assert_eq!(
+            project_child_crate_dir("crates/loom-server/src/lib.rs").as_deref(),
+            Some("crates/loom-server")
+        );
+        assert_eq!(
+            project_child_crate_dir("crates/loom-server/Cargo.toml").as_deref(),
+            Some("crates/loom-server")
+        );
+        for path in ["Cargo.toml", "docs/design.md", ".github/workflows/ci.yml"] {
+            assert_eq!(project_child_crate_dir(path), None, "{path} is in no crate");
+        }
+        assert_eq!(project_child_crate_dir("crates//src/lib.rs"), None);
+        assert_eq!(project_child_crate_dir("crates/../outside.rs"), None);
+
+        // The package name comes from the `[package]` section, not from a
+        // section that also carries a `name` key.
+        assert_eq!(
+            project_child_crate_package_name(
+                "[dependencies]\nname = \"wrong\"\n\n[package]\nname = \"loom-server\"\n"
+            ),
+            Some("loom-server".to_owned())
+        );
+        assert_eq!(
+            project_child_crate_package_name("# a comment\n[package]\nversion = \"1\"\n"),
+            None
+        );
+        assert_eq!(project_child_crate_package_name(""), None);
+    }
+
+    #[test]
+    fn compile_checks_resolve_one_package_per_changed_crate_and_stay_capped() {
+        let root =
+            std::env::temp_dir().join(format!("loom-rebase-crate-checks-{}", uuid::Uuid::new_v4()));
+        let crates = [
+            ("alpha", "loom-alpha"),
+            ("beta", "loom-beta"),
+            ("gamma", "loom-gamma"),
+            ("delta", "loom-delta"),
+            ("epsilon", "loom-epsilon"),
+        ];
+        // The checks follow the crate directories in path order, which is what a
+        // reader can reproduce from the changed paths.
+        let ordered = [
+            ("alpha", "loom-alpha"),
+            ("beta", "loom-beta"),
+            ("delta", "loom-delta"),
+            ("epsilon", "loom-epsilon"),
+            ("gamma", "loom-gamma"),
+        ];
+        for (directory, package) in crates {
+            let crate_dir = root.join("crates").join(directory);
+            std::fs::create_dir_all(&crate_dir).unwrap();
+            std::fs::write(
+                crate_dir.join("Cargo.toml"),
+                format!("[package]\nname = \"{package}\"\nversion = \"0.1.0\"\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
+        // A directory the changed paths name without a manifest resolves to no
+        // crate, like a document, the workspace manifest, or a CI workflow.
+        std::fs::create_dir_all(root.join("crates/documents")).unwrap();
+        let changed_paths = [
+            "crates/alpha/src/lib.rs",
+            "crates/alpha/src/lib.rs",
+            "crates/beta/src/main.rs",
+            "crates/gamma/Cargo.toml",
+            "crates/delta/src/lib.rs",
+            "crates/epsilon/src/lib.rs",
+            "crates/documents/README.md",
+            "Cargo.toml",
+            "docs/design.md",
+            ".github/workflows/ci.yml",
+        ]
+        .map(str::to_owned);
+
+        let resolved = project_child_rebase_crates(&root, &changed_paths);
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|krate| krate.package.as_str())
+                .collect::<Vec<_>>(),
+            ordered
+                .iter()
+                .map(|(_, package)| *package)
+                .collect::<Vec<_>>(),
+            "paths outside crates/ add nothing and a repeated path is one crate"
+        );
+
+        let checks = project_child_rebase_compile_checks(&root, &changed_paths);
+        assert_eq!(checks.len(), ordered.len());
+        for (index, check) in checks.iter().enumerate() {
+            let package = ordered[index].1;
+            assert_eq!(check.name, "compile");
+            assert_eq!(check.command, format!("cargo check -p {package}"));
+            assert_eq!(check.program, "cargo");
+            assert_eq!(check.args, vec!["check", "-p", package]);
+            assert_eq!(check.timeout, PROJECT_CHILD_REBASE_COMPILE_TIMEOUT);
+            if index < MAX_PROJECT_CHILD_REBASE_COMPILE_PACKAGES {
+                assert!(check.skip.is_none(), "{} runs", check.command);
+            } else {
+                let reason = check
+                    .skip
+                    .as_deref()
+                    .expect("a crate past the cap says why it did not run");
+                assert!(
+                    reason.contains(&format!(
+                        "at most {MAX_PROJECT_CHILD_REBASE_COMPILE_PACKAGES} crates"
+                    )),
+                    "{reason}"
+                );
+                assert!(reason.contains(&check.command), "{reason}");
+            }
+        }
+
+        // A checkout whose changed paths resolve to no crate reports one
+        // skipped compile check with its reason instead of running an
+        // unbounded build.
+        let outside = project_child_rebase_compile_checks(&root, &["docs/design.md".to_owned()]);
+        assert_eq!(outside.len(), 1);
+        assert_eq!(outside[0].name, "compile");
+        assert_eq!(outside[0].timeout, PROJECT_CHILD_REBASE_COMPILE_TIMEOUT);
+        let reason = outside[0]
+            .skip
+            .as_deref()
+            .expect("an unresolvable crate set says why it did not run");
+        assert!(
+            reason.contains("no changed path is under a crates/<dir>/ directory"),
+            "{reason}"
+        );
+
+        // Without a manifest the checkout is not a Cargo workspace at all.
+        std::fs::remove_file(root.join("Cargo.toml")).unwrap();
+        let not_cargo = project_child_rebase_compile_checks(&root, &["docs/design.md".to_owned()]);
+        assert_eq!(not_cargo[0].skip.as_deref(), Some(NO_CARGO_MANIFEST_SKIP));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn changed_path_sets_are_named_in_order_without_duplicates_and_stay_bounded() {

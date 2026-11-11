@@ -2057,6 +2057,7 @@ impl ProjectAgentTools {
                             "command": &check.command,
                             "outcome": check.outcome.as_str(),
                             "detail": &check.detail,
+                            "timeout_secs": check.timeout_secs,
                         })).collect::<Vec<_>>(),
                         "check_timeout_secs": rebase.check_timeout_secs,
                         "note": "The child's own commits were replayed onto base_revision and its branch now points at result_revision; it keeps each commit's author and message and created no merge commit. The checks above ran in the child checkout: a check reported as skipped did not run and says why. Review the child again before integrating it, because its result revision changed."

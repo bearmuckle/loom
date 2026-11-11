@@ -834,7 +834,7 @@ impl InProcessConnection {
                 project_child_rebase_paths(gained.iter())
             )));
         }
-        let checks = self.run_project_child_rebase_checks(child_git);
+        let checks = self.run_project_child_rebase_checks(child_git, &replay_paths);
         let failed = checks
             .iter()
             .filter(|check| check.outcome.is_failure())
