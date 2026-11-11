@@ -6,7 +6,7 @@ mod collaboration;
 mod events;
 mod filesystem;
 mod identity;
-mod project;
+pub(crate) mod project;
 mod protocol;
 mod repository;
 mod runs;

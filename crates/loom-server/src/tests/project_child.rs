@@ -880,13 +880,15 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
         resumable_task.task_id,
         ProjectChildControlAction::RetryFailedStep,
     );
-    let ServerResponse::Project(ProjectResponse::ProjectChildControlled { run, .. }) =
-        retry_while_awaiting_approval.result.unwrap()
-    else {
-        panic!("unexpected retry response for a run awaiting approval");
-    };
-    assert!(matches!(run, Some(run)
-        if run.id == run_id && run.state == AgentRunState::AwaitingApproval));
+    // A retry does not fit a run that is waiting for an approval, so it is
+    // refused with the actual reason instead of silently doing nothing.
+    let retry_refusal = retry_while_awaiting_approval.result.unwrap_err();
+    assert_eq!(retry_refusal.code, ErrorCode::InvalidState);
+    assert!(
+        retry_refusal.message.contains("apply_patch") && retry_refusal.message.contains("approval"),
+        "the refusal names the approval the child waits on: {}",
+        retry_refusal.message
+    );
     let approval_events = connection.request(RequestEnvelope::new(ClientRequest::Events(
         EventsRequest::GetSessionEvents {
             activity_detail: loom_protocol::ActivityDetail::Full,
@@ -1559,6 +1561,325 @@ fn cancelling_project_child_cascades_deepest_first_and_survives_restart() {
     );
     drop(reopened);
     fs::remove_dir_all(temp).unwrap();
+}
+
+/// The manager's listing, waiting, and control tools for one code child fixture.
+fn child_reporting_tools(fixture: &ProjectCodeChildFixture) -> ToolExecutor {
+    let extension = fixture
+        .backend
+        .project_agent_tools(
+            fixture.root_id,
+            ModelId::new("deterministic/demo"),
+            ProjectAgentToolGrants {
+                delegation: true,
+                inspection: true,
+                child_control: true,
+                ..ProjectAgentToolGrants::default()
+            },
+        )
+        .unwrap()
+        .expect("manager child reporting tools");
+    ToolExecutor::new_with_workspace(
+        fixture
+            .connection
+            .session_filesystem(fixture.root_id)
+            .unwrap(),
+    )
+    .with_extension(extension)
+}
+
+/// Runs one `list_project_children` call and returns the fixture child's entry.
+fn listed_child(tools: &ToolExecutor, task_id: loom_core::TaskId) -> serde_json::Value {
+    let listing = tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "list_project_children".to_owned(),
+        arguments: serde_json::json!({}),
+    });
+    assert!(listing.success, "{}", listing.output);
+    let listing: serde_json::Value = serde_json::from_str(&listing.output).unwrap();
+    listing["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["task_id"] == serde_json::json!(task_id))
+        .unwrap_or_else(|| panic!("the child should be listed: {listing}"))
+        .clone()
+}
+
+/// Runs one `control_project_child` action through the manager's own tools.
+fn control_child_tool(
+    tools: &ToolExecutor,
+    task_id: loom_core::TaskId,
+    action: &str,
+) -> ToolResult {
+    tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "control_project_child".to_owned(),
+        arguments: serde_json::json!({"task_id": task_id, "action": action}),
+    })
+}
+
+/// Runs one `wait_for_project_children` call for the fixture child.
+fn wait_for_child(tools: &ToolExecutor, task_id: loom_core::TaskId) -> ToolResult {
+    tools.execute(&ToolCall {
+        id: ToolCallId::new(),
+        name: "wait_for_project_children".to_owned(),
+        arguments: serde_json::json!({"task_ids": [task_id]}),
+    })
+}
+
+/// A stopped child reports the reason it stopped, so the manager does not have
+/// to guess which control action applies.
+#[test]
+fn listing_a_stopped_child_reports_why_it_stopped() {
+    // An approval wait names the tool and a digest of what it wants to run.
+    let fixture = project_code_child_fixture();
+    let tools = child_reporting_tools(&fixture);
+    let mut run = ParkedChildRun::new(AgentRunState::AwaitingApproval);
+    run.pending_approval = Some(ToolCall {
+        id: ToolCallId::new(),
+        name: "apply_patch".to_owned(),
+        arguments: serde_json::json!({"path": "README.md"}),
+    });
+    fixture.persist_child_run(run);
+    let child = listed_child(&tools, fixture.task_id);
+    assert_eq!(child["paused_reason"]["reason"], "awaiting_approval");
+    assert_eq!(child["paused_reason"]["tool"], "apply_patch");
+    assert_eq!(
+        child["paused_reason"]["input_digest"]
+            .as_str()
+            .map(str::len),
+        Some(16),
+        "the wait carries a digest instead of the arguments: {child}"
+    );
+    assert_eq!(child["outcome"], "needs_attention");
+    fixture.shutdown();
+
+    // A provider failure is told apart from the approval wait above.
+    let fixture = project_code_child_fixture();
+    let tools = child_reporting_tools(&fixture);
+    let mut run = ParkedChildRun::new(AgentRunState::Failed);
+    run.summary = Some("Agent failed: scripted-project is unavailable (HTTP 503)".to_owned());
+    run.attempts = 2;
+    fixture.persist_child_run(run);
+    let child = listed_child(&tools, fixture.task_id);
+    assert_eq!(child["paused_reason"]["reason"], "provider_error");
+    assert_eq!(child["paused_reason"]["kind"], "provider_unavailable");
+    assert_eq!(child["paused_reason"]["attempts"], 2);
+    assert!(
+        child["paused_reason"]["last_status"]
+            .as_str()
+            .is_some_and(|status| status.contains("HTTP 503")),
+        "a provider outage is visible without reading logs: {child}"
+    );
+    assert_eq!(child["outcome"], "needs_attention");
+    fixture.shutdown();
+
+    // A limit stop reports the budget it reached.
+    let fixture = project_code_child_fixture();
+    let tools = child_reporting_tools(&fixture);
+    let mut run = ParkedChildRun::new(AgentRunState::Failed);
+    run.summary = Some("Agent failed: agent session limit reached".to_owned());
+    run.usage = UsageSnapshot {
+        input_tokens: 10,
+        output_tokens: 2,
+        tool_calls: 4,
+        ..Default::default()
+    };
+    fixture.persist_child_run(run);
+    let child = listed_child(&tools, fixture.task_id);
+    assert_eq!(child["paused_reason"]["reason"], "budget_exhausted");
+    assert_eq!(child["paused_reason"]["steps"], 4);
+    assert_eq!(child["paused_reason"]["tokens"], 12);
+    fixture.shutdown();
+
+    // A failed step names the tool that failed.
+    let fixture = project_code_child_fixture();
+    let tools = child_reporting_tools(&fixture);
+    let mut run = ParkedChildRun::new(AgentRunState::Failed);
+    run.summary = Some(
+        "Agent failed: the model sent undecodable arguments for tool 'run_command' 3 times"
+            .to_owned(),
+    );
+    run.last_failed_call = Some(ToolCall {
+        id: ToolCallId::new(),
+        name: "run_command".to_owned(),
+        arguments: serde_json::json!({}),
+    });
+    fixture.persist_child_run(run);
+    let child = listed_child(&tools, fixture.task_id);
+    assert_eq!(child["paused_reason"]["reason"], "step_failed");
+    assert_eq!(child["paused_reason"]["tool"], "run_command");
+    assert_eq!(
+        child["paused_reason"]["error_kind"],
+        "undecodable_tool_arguments"
+    );
+    fixture.shutdown();
+
+    // A question names the interaction a person has to answer.
+    let fixture = project_code_child_fixture();
+    let tools = child_reporting_tools(&fixture);
+    let mut run = ParkedChildRun::new(AgentRunState::NeedsInput);
+    run.pending_input = Some("Which option should I use?".to_owned());
+    run.pending_question = true;
+    fixture.persist_child_run(run);
+    let child = listed_child(&tools, fixture.task_id);
+    assert_eq!(child["paused_reason"]["reason"], "awaiting_input");
+    assert!(
+        child["paused_reason"]["question_id"]
+            .as_str()
+            .is_some_and(|question| !question.is_empty()),
+        "the wait names the question a person has to answer: {child}"
+    );
+    fixture.shutdown();
+
+    // A stopped child with nothing to explain it reports `unknown` rather than
+    // nothing at all.
+    let fixture = project_code_child_fixture();
+    let tools = child_reporting_tools(&fixture);
+    fixture.persist_child_run(ParkedChildRun::new(AgentRunState::Paused));
+    let child = listed_child(&tools, fixture.task_id);
+    assert_eq!(child["paused_reason"]["reason"], "unknown");
+    assert_eq!(child["outcome"], "needs_attention");
+    fixture.shutdown();
+
+    // A finished child reports no reason and reads as terminal, so a manager is
+    // not pushed into acting on work that is done.
+    let fixture = project_code_child_fixture();
+    let tools = child_reporting_tools(&fixture);
+    fixture.persist_child_run(ParkedChildRun::new(AgentRunState::Completed));
+    complete_project_code_child(&fixture);
+    let child = listed_child(&tools, fixture.task_id);
+    assert_eq!(child["paused_reason"], serde_json::Value::Null);
+    assert_eq!(child["outcome"], "terminal");
+    fixture.shutdown();
+}
+
+/// A wait separates a child that needs attention from one that is terminal.
+#[test]
+fn waiting_for_children_distinguishes_attention_from_terminal() {
+    // The task finished, but its run failed: the wait is ready and the child
+    // still needs the manager's attention.
+    let fixture = project_code_child_fixture();
+    let tools = child_reporting_tools(&fixture);
+    let mut run = ParkedChildRun::new(AgentRunState::Failed);
+    run.summary =
+        Some("Agent failed: scripted-project is rate limited or timed out (HTTP 429)".to_owned());
+    fixture.persist_child_run(run);
+    complete_project_code_child(&fixture);
+    let waited = wait_for_child(&tools, fixture.task_id);
+    assert!(waited.success, "{}", waited.output);
+    let waited: serde_json::Value = serde_json::from_str(&waited.output).unwrap();
+    assert_eq!(waited["return_ready"], true);
+    assert_eq!(waited["outcome"], "needs_attention");
+    assert_eq!(waited["children"][0]["outcome"], "needs_attention");
+    assert_eq!(
+        waited["children"][0]["paused_reason"]["reason"],
+        "provider_error"
+    );
+    assert!(
+        waited["needs_attention"]
+            .as_array()
+            .is_some_and(|children| children.iter().any(|child| child
+                .as_str()
+                .is_some_and(|child| child.contains("provider_error")))),
+        "the wait names the child and its reason: {waited}"
+    );
+    fixture.shutdown();
+
+    // A child that produced its result is terminal.
+    let fixture = project_code_child_fixture();
+    let tools = child_reporting_tools(&fixture);
+    fixture.persist_child_run(ParkedChildRun::new(AgentRunState::Completed));
+    complete_project_code_child(&fixture);
+    let waited = wait_for_child(&tools, fixture.task_id);
+    assert!(waited.success, "{}", waited.output);
+    let waited: serde_json::Value = serde_json::from_str(&waited.output).unwrap();
+    assert_eq!(waited["return_ready"], true);
+    assert_eq!(waited["outcome"], "terminal");
+    assert_eq!(waited["children"][0]["outcome"], "terminal");
+    assert_eq!(
+        waited["children"][0]["paused_reason"],
+        serde_json::Value::Null
+    );
+    assert_eq!(waited["needs_attention"], serde_json::json!([]));
+    fixture.shutdown();
+}
+
+/// A control action that does not fit the child names the actual reason.
+#[test]
+fn a_control_action_that_does_not_fit_names_the_reason() {
+    // A retry does not fit a run waiting for an approval the parent cannot
+    // grant, and neither does a resume.
+    let fixture = project_code_child_fixture();
+    let tools = child_reporting_tools(&fixture);
+    let mut run = ParkedChildRun::new(AgentRunState::AwaitingApproval);
+    run.pending_approval = Some(ToolCall {
+        id: ToolCallId::new(),
+        name: "apply_patch".to_owned(),
+        arguments: serde_json::json!({"path": "README.md"}),
+    });
+    fixture.persist_child_run(run);
+    let retried = control_child_tool(&tools, fixture.task_id, "retry_failed_step");
+    assert!(!retried.success, "{}", retried.output);
+    assert!(
+        retried.output.contains("apply_patch")
+            && retried
+                .output
+                .contains("a parent cannot grant this approval")
+            && retried.output.contains("a person has to resolve the wait"),
+        "the refusal names the approval wait and who can resolve it: {}",
+        retried.output
+    );
+    let continued = control_child_tool(&tools, fixture.task_id, "continue");
+    assert!(!continued.success, "{}", continued.output);
+    assert!(
+        continued.output.contains("approval"),
+        "a resume says the wait needs an approval: {}",
+        continued.output
+    );
+    fixture.shutdown();
+
+    // A resume does not fit a run that stopped at a failed tool step.
+    let fixture = project_code_child_fixture();
+    let tools = child_reporting_tools(&fixture);
+    let mut run = ParkedChildRun::new(AgentRunState::Paused);
+    run.summary =
+        Some("Agent failed: tool execution was interrupted with an unknown outcome".to_owned());
+    run.last_failed_call = Some(ToolCall {
+        id: ToolCallId::new(),
+        name: "run_command".to_owned(),
+        arguments: serde_json::json!({}),
+    });
+    fixture.persist_child_run(run);
+    let continued = control_child_tool(&tools, fixture.task_id, "continue");
+    assert!(!continued.success, "{}", continued.output);
+    assert!(
+        continued.output.contains("run_command") && continued.output.contains("retry_failed_step"),
+        "a resume names the failed step and the action that fits: {}",
+        continued.output
+    );
+    fixture.shutdown();
+
+    // A retry does not fit a run that reached a configured limit, because it
+    // stops again at the same limit.
+    let fixture = project_code_child_fixture();
+    let tools = child_reporting_tools(&fixture);
+    let mut run = ParkedChildRun::new(AgentRunState::Failed);
+    run.summary = Some("Agent failed: agent session limit reached".to_owned());
+    run.usage = UsageSnapshot {
+        tool_calls: 2,
+        ..Default::default()
+    };
+    fixture.persist_child_run(run);
+    let retried = control_child_tool(&tools, fixture.task_id, "retry_failed_step");
+    assert!(!retried.success, "{}", retried.output);
+    assert!(
+        retried.output.contains("limit"),
+        "the refusal names the budget: {}",
+        retried.output
+    );
+    fixture.shutdown();
 }
 
 #[test]

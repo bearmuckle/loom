@@ -34,6 +34,26 @@ fn delegated_task_is_terminal(status: loom_core::DelegatedTaskStatus) -> bool {
     )
 }
 
+/// How a manager reads one child's current state, so a stopped child that needs
+/// a person's answer is not mistaken for one that finished.
+///
+/// `needs_attention` is a child that is parked with a reason (paused, waiting
+/// for approval or input, or failed), `terminal` is one that produced its final
+/// state, and `running` is one that is still working. This is the distinction a
+/// later `until` argument can build on.
+fn project_child_outcome(
+    task: Option<&loom_core::DelegatedTaskRecord>,
+    paused_reason: Option<&ProjectChildPauseReason>,
+) -> &'static str {
+    if paused_reason.is_some() {
+        "needs_attention"
+    } else if task.is_some_and(|task| delegated_task_is_terminal(task.status)) {
+        "terminal"
+    } else {
+        "running"
+    }
+}
+
 impl ToolExtension for ProjectAgentTools {
     fn definitions(&self) -> Vec<ToolDefinition> {
         let mut definitions = Vec::new();
@@ -191,7 +211,7 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_inspect_children {
             definitions.push(ToolDefinition {
                 name: "list_project_children".to_owned(),
-                description: "Inspect the current status of your direct child agents and their delegated tasks in this project. Each child reports its stored result and whether that result reached this session, so a completed child whose result never arrived stays retrievable: pass its task_id to return the whole stored result instead of a bounded excerpt. Each child also reports how many durable inbox messages it has not read yet, so a message you sent can be told apart from one that is still undelivered.".to_owned(),
+                description: "Inspect the current status of your direct child agents and their delegated tasks in this project. Each child reports its stored result and whether that result reached this session, so a completed child whose result never arrived stays retrievable: pass its task_id to return the whole stored result instead of a bounded excerpt. Each child also reports how many durable inbox messages it has not read yet, so a message you sent can be told apart from one that is still undelivered. A stopped child reports its paused_reason and an outcome of needs_attention or terminal, so an approval wait is told apart from a provider outage, an exhausted budget, or a failed tool step before you choose a control action.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -204,7 +224,7 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_wait_children {
             definitions.push(ToolDefinition {
                 name: "wait_for_project_children".to_owned(),
-                description: "Wait until the listed direct child tasks are return-ready, releasing this manager's agent slot while they run. The result includes terminal child states and whether each child's own result reached your transcript; code results still need review and integration before the overall task is complete.".to_owned(),
+                description: "Wait until the listed direct child tasks are return-ready, releasing this manager's agent slot while they run. The result includes terminal child states and whether each child's own result reached your transcript, and reports per child whether it is terminal or needs_attention: a child that stopped without a result reports a paused_reason, so an approval wait is told apart from a provider outage, an exhausted budget, or a failed tool step. Code results still need review and integration before the overall task is complete.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -833,11 +853,21 @@ impl ProjectAgentTools {
                         Err(error) => return ToolResult::failure(call, error.message),
                     };
                     let state = delivery.state(true);
+                    // A child that stopped without a result needs the manager's
+                    // attention even though the wait is ready, so the reason it
+                    // stopped travels with the result.
+                    let paused_reason = match connection.project_child_pause_reason(task) {
+                        Ok(reason) => reason,
+                        Err(error) => return ToolResult::failure(call, error.message),
+                    };
+                    let outcome = project_child_outcome(Some(task), paused_reason.as_ref());
                     children.push(serde_json::json!({
                         "task_id": task.task_id,
                         "child_name": task.child_name,
                         "status": task.status,
                         "code_change": task.code_change,
+                        "outcome": outcome,
+                        "paused_reason": paused_reason,
                         "result_state": state.as_str(),
                         "result_message_id": delivery.message.as_ref().map(|message| message.message_id),
                         "result_project_sequence": delivery.message.as_ref().map(|message| message.project_sequence),
@@ -848,18 +878,37 @@ impl ProjectAgentTools {
                     .iter()
                     .filter(|child| child["result_state"] == "missing")
                     .count();
+                let attention = children
+                    .iter()
+                    .filter(|child| child["outcome"] == "needs_attention")
+                    .map(|child| {
+                        let name = child["child_name"].as_str().unwrap_or_default();
+                        let reason = child["paused_reason"]
+                            .get("reason")
+                            .and_then(|reason| reason.as_str())
+                            .unwrap_or("unknown");
+                        format!("{name} ({reason})")
+                    })
+                    .collect::<Vec<_>>();
+                let outcome = if attention.is_empty() {
+                    "terminal"
+                } else {
+                    "needs_attention"
+                };
                 let note = if missing > 0 {
                     format!(
                         "{missing} of the return-ready children never reported a result; read them with list_project_children before reporting completion. Code child results still require review and integration."
                     )
                 } else {
-                    "result_state reports whether each child's own result has already reached your transcript; an undelivered result is delivered when this wait resumes. Code child results still require review and integration before the manager reports completion."
+                    "result_state reports whether each child's own result has already reached your transcript; an undelivered result is delivered when this wait resumes. outcome reports whether each child is terminal or needs_attention: a child that stopped without a result is not finished, and its paused_reason says why (an approval or a question needs a person in the child's own session, a provider or step failure is retried with retry_failed_step, and an exhausted budget stops again until the limits change). Code child results still require review and integration before the manager reports completion."
                         .to_owned()
                 };
                 ToolResult::success(
                     call,
                     serde_json::to_string(&serde_json::json!({
                         "return_ready": true,
+                        "outcome": outcome,
+                        "needs_attention": attention,
                         "children": children,
                         "note": note,
                     }))
@@ -1344,6 +1393,17 @@ impl ProjectAgentTools {
             let result_state = delivery
                 .as_ref()
                 .map(|(task, delivery)| delivery.state(delegated_task_is_terminal(task.status)));
+            // A stopped child reports why it stopped, read from the state its run
+            // already records, so the manager does not have to tell an approval
+            // wait from a provider outage, a budget stop, or a failed step.
+            let paused_reason = match task {
+                Some(task) => match connection.project_child_pause_reason(task) {
+                    Ok(reason) => reason,
+                    Err(error) => return ToolResult::failure(call, error.message),
+                },
+                None => None,
+            };
+            let outcome = project_child_outcome(task, paused_reason.as_ref());
             let (result_body, result_body_truncated) = match delivery.as_ref() {
                 Some((_, delivery)) => match &delivery.message {
                     Some(message) if arguments.task_id.is_some() => {
@@ -1372,6 +1432,8 @@ impl ProjectAgentTools {
                 "model_id": task.map(|task| task.model_id.as_str()),
                 "run_state": run.as_ref().map(|summary| summary.snapshot.state),
                 "run_summary": run.as_ref().and_then(|summary| summary.snapshot.summary.as_ref()).map(|summary| summary.chars().take(256).collect::<String>()),
+                "paused_reason": paused_reason,
+                "outcome": outcome,
                 "worktree_status": worktree.as_ref().map(|worktree| worktree.status),
                 "result_revision": worktree.as_ref().and_then(|worktree| worktree.result_revision.clone()),
                 "result_revision_is_base": worktree.as_ref().map(|worktree| worktree.result_revision.as_deref().is_none_or(|revision| revision == worktree.base_revision)),
@@ -1419,7 +1481,7 @@ impl ProjectAgentTools {
             output: serde_json::to_string(&serde_json::json!({
                 "children": children,
                 "truncated": truncated,
-                "note": "result_state reports whether each child's stored result reached this session: delivered, undelivered (accepted for delivery but not yet in your transcript), missing (a finished child never reported a result), or pending. undelivered_messages counts the durable inbox messages the child has not read yet, so a message you sent that still waits is distinguishable from one the child consumed. For a code child whose run is not progressing — finished, paused, or blocked waiting for input or approval — worktree_uncommitted_path_count and worktree_uncommitted_line_delta report what its checkout still holds uncommitted, worktree_head_is_base says whether that checkout has no commit of its own yet, and result_revision_is_base says whether no reviewed result revision other than its base has been recorded. integrated_revision names the revision its reviewed result landed at, and landed_by says how it got there: integrated (Loom fast-forwarded, merged, or completed the record), already_present (the parent history already carried the reviewed patch), or replay (you recorded the landing yourself). A child whose run is still running reports none of the checkout fields, because its checkout is in motion. Work that is never reviewed and integrated, or abandoned, is not landed. Pass a child's task_id to return its whole stored result."
+                "note": "result_state reports whether each child's stored result reached this session: delivered, undelivered (accepted for delivery but not yet in your transcript), missing (a finished child never reported a result), or pending. outcome reports what the child means for you: needs_attention (it is stopped and its paused_reason says why), terminal (it produced its final state), or running. paused_reason is derived from the state the child's run already records: awaiting_approval (tool and input_digest), provider_error (kind, attempts, last_status), budget_exhausted (steps, tokens), step_failed (tool, error_kind), awaiting_input (question_id), or unknown when nothing recorded explains the stop. An approval or a question needs a person in the child's own session; a provider or step failure is retried with retry_failed_step. undelivered_messages counts the durable inbox messages the child has not read yet, so a message you sent that still waits is distinguishable from one the child consumed. For a code child whose run is not progressing — finished, paused, or blocked waiting for input or approval — worktree_uncommitted_path_count and worktree_uncommitted_line_delta report what its checkout still holds uncommitted, worktree_head_is_base says whether that checkout has no commit of its own yet, and result_revision_is_base says whether no reviewed result revision other than its base has been recorded. integrated_revision names the revision its reviewed result landed at, and landed_by says how it got there: integrated (Loom fast-forwarded, merged, or completed the record), already_present (the parent history already carried the reviewed patch), or replay (you recorded the landing yourself). A child whose run is still running reports none of the checkout fields, because its checkout is in motion. Work that is never reviewed and integrated, or abandoned, is not landed. Pass a child's task_id to return its whole stored result."
             }))
             .unwrap_or_else(|error| format!("could not encode project child status: {error}")),
         }
@@ -1468,12 +1530,20 @@ impl ProjectAgentTools {
             arguments.onto,
         ) {
             Ok(outcome) => {
+                // The reason the child is still parked travels with the outcome,
+                // so a resumed approval wait says plainly that it still needs a
+                // person's approval instead of inviting a blind resume.
+                let paused_reason = match connection.project_child_pause_reason(&outcome.task) {
+                    Ok(reason) => serde_json::to_value(reason).unwrap_or(Value::Null),
+                    Err(error) => return ToolResult::failure(call, error.message),
+                };
                 let mut output = serde_json::json!({
                     "task_id": outcome.task.task_id,
                     "status": outcome.task.status,
                     "child_session_id": outcome.task.target_session_id,
                     "run_state": outcome.run.as_ref().map(|snapshot| snapshot.state),
                     "run_summary": outcome.run.as_ref().and_then(|snapshot| snapshot.summary.clone()),
+                    "paused_reason": paused_reason.clone(),
                 });
                 if arguments.action == ProjectChildControlAction::Abandon {
                     // The outcome names what the manager left behind and says
@@ -1494,6 +1564,19 @@ impl ProjectAgentTools {
                         "The reviewed result is recorded as landed at this revision, so the completion guard no longer requires this child; nothing was applied to your checkout."
                     );
                 }
+                // A wait the parent cannot resolve says so plainly, so a resume
+                // is never read as an invitation to keep retrying blindly.
+                let still_waiting_on_a_person = matches!(
+                    output["paused_reason"]
+                        .get("reason")
+                        .and_then(|tag| tag.as_str()),
+                    Some("awaiting_approval" | "awaiting_input")
+                );
+                if still_waiting_on_a_person {
+                    output["note"] = serde_json::json!(
+                        "The child is still waiting, and this action cannot resolve that wait: a parent cannot grant a tool approval or answer a child's question, so a person has to do it in the child's own session."
+                    );
+                }
                 if let Some(rebase) = outcome.rebase.as_ref() {
                     // A rebase changed the child's own revision, so the report
                     // names both pairs and what ran to validate the result.
@@ -1503,6 +1586,7 @@ impl ProjectAgentTools {
                         "child_session_id": outcome.task.target_session_id,
                         "run_state": outcome.run.as_ref().map(|snapshot| snapshot.state),
                         "run_summary": outcome.run.as_ref().and_then(|snapshot| snapshot.summary.clone()),
+                        "paused_reason": paused_reason,
                         "previous_base_revision": &rebase.previous_base_revision,
                         "previous_result_revision": &rebase.previous_result_revision,
                         "base_revision": &rebase.base_revision,

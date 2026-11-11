@@ -328,6 +328,28 @@ impl InProcessBackend {
                                 break;
                             }
                             if !progress.continues {
+                                // One line per stop, naming the same reason the
+                                // project tools report and the tool call the run
+                                // stopped at, so reading the log and reading the
+                                // manager's tool output agree.
+                                let state = task_handle.state();
+                                if let Some(reason) = project_child_pause_reason(
+                                    &ProjectChildParkEvidence::from_runtime_state(&state),
+                                ) {
+                                    let last_tool_call = state
+                                        .last_failed_call
+                                        .as_ref()
+                                        .or(state.pending_approval.as_ref())
+                                        .or(state.pending_tool_execution.as_ref())
+                                        .map(|call| call.name.as_str())
+                                        .unwrap_or("none");
+                                    log::info!(
+                                        "run {run_id} in session {} stopped in state {:?}: {}; last tool call: {last_tool_call}",
+                                        task_handle.session_id,
+                                        state.run.state,
+                                        reason.summary()
+                                    );
+                                }
                                 // A direction queued as the run stopped (for
                                 // example while it was asking for input) is
                                 // delivered here so it is not stranded until

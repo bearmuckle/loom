@@ -11,10 +11,11 @@ pub use activity::{
     FileActivityOperation,
 };
 pub use agent::{
-    AGENT_RUN_FAILURE_SUMMARY_PREFIX, AgentEvent, AgentExecutionStateRecord, AgentInteractionKind,
-    AgentInteractionRecord, AgentInteractionStatus, AgentPlan, AgentPlanStep,
-    AgentRunAttemptRecord, AgentRunSnapshot, AgentRunState, AgentToolAttemptRecord,
-    AgentToolAttemptState, AgentToolCallRecord, ApprovalDecision, ProjectJoinContinuation,
+    AGENT_RUN_FAILURE_SUMMARY_PREFIX, AGENT_RUN_LIMIT_FAILURE_REASON, AgentEvent,
+    AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
+    AgentInteractionStatus, AgentPlan, AgentPlanStep, AgentRunAttemptRecord, AgentRunSnapshot,
+    AgentRunState, AgentToolAttemptRecord, AgentToolAttemptState, AgentToolCallRecord,
+    ApprovalDecision, ProjectJoinContinuation,
 };
 pub use config::{
     CredentialRef, CredentialReference, DECIDER_DISPLAY_NAME, DECIDER_PROVIDER_ID,

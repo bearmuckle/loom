@@ -401,29 +401,125 @@ impl ProjectCodeChildFixture {
     /// child that has started and then stopped at that state without driving a
     /// model through it.
     pub(super) fn persist_child_run_state(&self, run_id: loom_core::RunId, state: AgentRunState) {
+        self.persist_child_run_with_id(run_id, ParkedChildRun::new(state));
+    }
+
+    /// Persists one run of this child's session together with the state a test
+    /// describes, and returns its id.
+    pub(super) fn persist_child_run(&self, run: ParkedChildRun) -> loom_core::RunId {
+        self.persist_child_run_with_id(loom_core::RunId::new(), run)
+    }
+
+    /// Persists one run of this child's session under `run_id`.
+    pub(super) fn persist_child_run_with_id(
+        &self,
+        run_id: loom_core::RunId,
+        run: ParkedChildRun,
+    ) -> loom_core::RunId {
         let persistence = self.backend.persistence.as_ref().unwrap();
         let sessions = persistence.load_sessions().unwrap().unwrap();
+        let session_id = self.worktree.child_session_id;
+        let started_at = Timestamp::from_unix_millis(1000);
+        // A run this helper already wrote keeps its attempt rows: the attempt
+        // table is keyed by run and attempt number and the execution state
+        // refers to the attempt row, so a second state for the same run reuses
+        // that attempt instead of colliding with it.
+        let existing_attempts = persistence.load_run_attempts(run_id).unwrap_or_default();
+        let attempt_id = existing_attempts
+            .last()
+            .map(|attempt| attempt.id)
+            .unwrap_or_default();
+        let terminal = matches!(
+            run.state,
+            AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+        );
+        // The attempt history ends at the current attempt, whose state and
+        // completion match the summary the run is persisted with.
+        let attempts = existing_attempts.is_empty().then(|| {
+            (1..=run.attempts.max(1))
+                .map(|number| {
+                    let current = number == run.attempts.max(1);
+                    loom_model::AgentRunAttemptRecord {
+                        run_id,
+                        session_id,
+                        id: if current {
+                            attempt_id
+                        } else {
+                            loom_core::RunAttemptId::new()
+                        },
+                        number,
+                        state: if current {
+                            run.state
+                        } else {
+                            AgentRunState::Failed
+                        },
+                        checkpoint_id: None,
+                        started_at,
+                        completed_at: if !current || terminal {
+                            Some(started_at)
+                        } else {
+                            None
+                        },
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+        let execution = AgentExecutionStateRecord {
+            run_id,
+            session_id,
+            attempt_id,
+            control_revision: 0,
+            state: run.state,
+            step_id: None,
+            step_index: 0,
+            provider_cursor: 0,
+            next_message_id: 0,
+            active_message_id: None,
+            last_project_message_sequence: 0,
+            last_queued_direction_sequence: 0,
+            pending_tool_execution: None,
+            pending_project_join: None,
+            pending_approval: run.pending_approval.clone(),
+            pending_input: run.pending_input.clone(),
+            last_failed_call: run.last_failed_call.clone(),
+        };
+        let interactions = run.pending_question.then(|| {
+            vec![loom_model::AgentInteractionRecord {
+                id: loom_core::InteractionId::new(),
+                run_id,
+                session_id,
+                attempt_id,
+                control_revision: 0,
+                kind: loom_model::AgentInteractionKind::UserInput,
+                status: loom_model::AgentInteractionStatus::Pending,
+                tool_call_id: None,
+                prompt: "Which option should I use?".to_owned(),
+                decision: None,
+                created_at: started_at,
+                resolved_at: None,
+            }]
+        });
         let summary = DurableRunSummary {
             snapshot: AgentRunSnapshot {
                 id: run_id,
-                attempt_id: loom_core::RunAttemptId::new(),
+                attempt_id,
                 control_revision: 0,
-                session_id: self.worktree.child_session_id,
+                session_id,
                 task: "Make a committed code change".to_owned(),
                 jev: None,
                 model: ModelId::new("deterministic/demo"),
-                state,
-                started_at: Timestamp::from_unix_millis(1000),
-                updated_at: Timestamp::from_unix_millis(1000),
-                completed_at: None,
-                summary: None,
+                state: run.state,
+                started_at,
+                updated_at: started_at,
+                completed_at: terminal.then_some(started_at),
+                summary: run.summary,
                 evidence: Vec::new(),
                 approval_policy: None,
             },
-            usage: UsageSnapshot::default(),
-            attempts: None,
-            execution_state: None,
-            interactions: None,
+            usage: run.usage,
+            attempts,
+            execution_state: Some(execution),
+            interactions,
         };
         let summaries = BTreeMap::from([(run_id, summary)]);
         persistence
@@ -445,6 +541,36 @@ impl ProjectCodeChildFixture {
                 feed: None,
             })
             .unwrap();
+        run_id
+    }
+}
+
+/// One run of a fixture child, as a test describes the state it stopped in.
+pub(super) struct ParkedChildRun {
+    pub(super) state: AgentRunState,
+    pub(super) summary: Option<String>,
+    pub(super) usage: UsageSnapshot,
+    pub(super) pending_approval: Option<ToolCall>,
+    pub(super) pending_input: Option<String>,
+    /// Whether the run opened the user-input interaction a person has to answer.
+    pub(super) pending_question: bool,
+    pub(super) last_failed_call: Option<ToolCall>,
+    /// How many attempts the run has been tried for.
+    pub(super) attempts: u32,
+}
+
+impl ParkedChildRun {
+    pub(super) fn new(state: AgentRunState) -> Self {
+        Self {
+            state,
+            summary: None,
+            usage: UsageSnapshot::default(),
+            pending_approval: None,
+            pending_input: None,
+            pending_question: false,
+            last_failed_call: None,
+            attempts: 1,
+        }
     }
 }
 

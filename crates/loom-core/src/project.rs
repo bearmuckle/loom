@@ -121,6 +121,93 @@ pub struct DelegatedTaskRecord {
     pub updated_at: Timestamp,
 }
 
+/// Why a delegated child stopped mid-run.
+///
+/// A stopped child reports `status: blocked` and `run_state: paused` without a
+/// reason, which leaves a manager unable to tell an approval wait from a
+/// provider outage, an exhausted budget, or a failed tool step. This value
+/// carries that reason to the manager.
+///
+/// It is derived when it is read from the state Loom already records — the run
+/// snapshot, the run's execution state (a pending approval, a pending question,
+/// the last failed call), the run's usage against the limits it was created
+/// with, and the recorded failure — so no park path can forget to write it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "reason")]
+pub enum ProjectChildPauseReason {
+    /// The run is parked on a tool call that needs an approval.
+    AwaitingApproval {
+        tool: String,
+        /// Digest of the waiting call's arguments, so two waits for the same
+        /// tool are told apart without echoing the arguments.
+        input_digest: String,
+    },
+    /// The model or provider call failed and left no failed tool step.
+    ProviderError {
+        kind: String,
+        attempts: u32,
+        /// The reason the last attempt recorded, when it recorded one.
+        last_status: Option<String>,
+    },
+    /// The run stopped because a configured session limit is reached.
+    BudgetExhausted { steps: u64, tokens: u64 },
+    /// A tool step failed and the run stopped at it.
+    StepFailed { tool: String, error_kind: String },
+    /// The run is parked waiting for a person's answer to a question.
+    AwaitingInput { question_id: String },
+    /// The run stopped and none of the recorded state explains why.
+    Unknown,
+}
+
+impl ProjectChildPauseReason {
+    /// One-line, manager-facing description of the reason, including what the
+    /// manager can do about it when the reason rules an action out.
+    pub fn summary(&self) -> String {
+        match self {
+            Self::AwaitingApproval { tool, input_digest } => format!(
+                "waiting for an approval of tool '{tool}' (input {input_digest}); a parent cannot grant this approval, so a person has to approve it in the child's session"
+            ),
+            Self::ProviderError {
+                kind,
+                attempts,
+                last_status,
+            } => match last_status {
+                Some(status) => format!(
+                    "the provider call failed ({kind}) on attempt {attempts} of the run: {status}"
+                ),
+                None => format!(
+                    "the provider call failed ({kind}) on attempt {attempts} of the run and recorded no reason"
+                ),
+            },
+            Self::BudgetExhausted { steps, tokens } => format!(
+                "the run reached a configured limit after {steps} tool calls and {tokens} tokens; resuming stops again at the same limit"
+            ),
+            Self::StepFailed { tool, error_kind } => {
+                format!("tool '{tool}' failed ({error_kind}) and the run stopped at it")
+            }
+            Self::AwaitingInput { question_id } => format!(
+                "waiting for an answer to question {question_id}, which only a person can give"
+            ),
+            Self::Unknown => "the run stopped and no recorded state explains why".to_owned(),
+        }
+    }
+
+    /// The action that fits this reason, so a refusal for a mismatched control
+    /// action can name it instead of leaving the manager to guess.
+    pub fn advised_action(&self) -> &'static str {
+        match self {
+            Self::AwaitingApproval { .. } | Self::AwaitingInput { .. } => {
+                "a person has to resolve the wait in the child's session"
+            }
+            Self::ProviderError { .. } | Self::StepFailed { .. } => "retry_failed_step",
+            Self::BudgetExhausted { .. } => {
+                "raise the run limits or delegate a smaller task; a retry stops at the same limit"
+            }
+            Self::Unknown => "read the child's run in its own session",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectWorktreeStatus {
@@ -680,6 +767,96 @@ mod tests {
             legacy_spec.scope, None,
             "a task written before scopes existed declares none"
         );
+    }
+
+    #[test]
+    fn child_pause_reasons_round_trip_and_describe_themselves() {
+        use super::ProjectChildPauseReason;
+
+        let reasons = [
+            ProjectChildPauseReason::AwaitingApproval {
+                tool: "apply_patch".into(),
+                input_digest: "0123abcd".into(),
+            },
+            ProjectChildPauseReason::ProviderError {
+                kind: "provider_unavailable".into(),
+                attempts: 2,
+                last_status: Some("scripted-model is unavailable (HTTP 503)".into()),
+            },
+            ProjectChildPauseReason::BudgetExhausted {
+                steps: 12,
+                tokens: 4_096,
+            },
+            ProjectChildPauseReason::StepFailed {
+                tool: "run_command".into(),
+                error_kind: "tool_execution".into(),
+            },
+            ProjectChildPauseReason::AwaitingInput {
+                question_id: "question".into(),
+            },
+            ProjectChildPauseReason::Unknown,
+        ];
+        for reason in reasons {
+            let encoded = serde_json::to_value(&reason).unwrap();
+            assert!(
+                encoded.get("reason").and_then(|tag| tag.as_str()).is_some(),
+                "every reason carries its machine-readable tag: {encoded}"
+            );
+            assert_eq!(
+                serde_json::from_value::<ProjectChildPauseReason>(encoded).unwrap(),
+                reason
+            );
+            assert!(!reason.summary().is_empty());
+            assert!(!reason.advised_action().is_empty());
+        }
+
+        // The two cases a manager acts on differently say so plainly.
+        assert!(
+            ProjectChildPauseReason::AwaitingApproval {
+                tool: "apply_patch".into(),
+                input_digest: "0123abcd".into(),
+            }
+            .summary()
+            .contains("a parent cannot grant this approval")
+        );
+        assert_eq!(
+            ProjectChildPauseReason::StepFailed {
+                tool: "run_command".into(),
+                error_kind: "tool_execution".into(),
+            }
+            .advised_action(),
+            "retry_failed_step"
+        );
+
+        let tag = |reason: &ProjectChildPauseReason| {
+            serde_json::to_value(reason).unwrap()["reason"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(
+            tag(&ProjectChildPauseReason::AwaitingApproval {
+                tool: "apply_patch".into(),
+                input_digest: "0123abcd".into(),
+            }),
+            "awaiting_approval"
+        );
+        assert_eq!(
+            tag(&ProjectChildPauseReason::ProviderError {
+                kind: "provider_rate_limited".into(),
+                attempts: 1,
+                last_status: None,
+            }),
+            "provider_error"
+        );
+        assert_eq!(
+            tag(&ProjectChildPauseReason::BudgetExhausted {
+                steps: 0,
+                tokens: 0,
+            }),
+            "budget_exhausted"
+        );
+        assert_eq!(tag(&ProjectChildPauseReason::Unknown), "unknown");
     }
 
     #[test]

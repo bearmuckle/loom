@@ -22,12 +22,13 @@ use loom_agent::{
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy,
     Capability, CapabilitySet, DelegatedTaskSpec, ErrorCode, EventSequence, JevPolicy, LoomError,
-    MAX_PROJECT_AGENT_DEPTH, ProjectAgentRecord, ProjectId, ProjectJevPolicy, ProjectSnapshot,
-    ProjectWorktreeBaseRefresh, ProjectWorktreeCleanupDisposition, ProjectWorktreeLandedBy,
-    ProjectWorktreeRecord, ProjectWorktreeStatus, ProtocolVersion, ReadOnlyCommandPolicy,
-    RepositoryId, RequestId, Result, RunAttemptId, SessionEventRecord, SessionJevPolicy,
-    SessionTitleSource, TaskContextReference, Timestamp, UsageSnapshot, WorkspaceId,
-    WorkspaceRecord, sanitize_title, title_from_goal, titles_diverge,
+    MAX_PROJECT_AGENT_DEPTH, ProjectAgentRecord, ProjectChildPauseReason, ProjectId,
+    ProjectJevPolicy, ProjectSnapshot, ProjectWorktreeBaseRefresh,
+    ProjectWorktreeCleanupDisposition, ProjectWorktreeLandedBy, ProjectWorktreeRecord,
+    ProjectWorktreeStatus, ProtocolVersion, ReadOnlyCommandPolicy, RepositoryId, RequestId, Result,
+    RunAttemptId, SessionEventRecord, SessionJevPolicy, SessionTitleSource, TaskContextReference,
+    Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord, sanitize_title, title_from_goal,
+    titles_diverge,
 };
 use loom_model::{
     ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId, ToolCall, ToolDefinition,
@@ -102,6 +103,7 @@ pub mod update;
 mod util;
 
 use activity_detail::*;
+use connection::project::child::pause::{ProjectChildParkEvidence, project_child_pause_reason};
 use fs_copy::*;
 use github::*;
 use run_executor::RunExecutor;

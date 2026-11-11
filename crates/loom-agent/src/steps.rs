@@ -136,7 +136,7 @@ impl AgentRuntime {
                 run_id: self.run.id,
                 status,
             });
-            events.extend(self.finish_failed("agent session limit reached"));
+            events.extend(self.finish_failed(loom_model::AGENT_RUN_LIMIT_FAILURE_REASON));
             return Ok(StepOutcome::Blocked);
         }
         if self
@@ -540,7 +540,7 @@ impl AgentRuntime {
                         status,
                     });
                     ctx.events
-                        .extend(self.finish_failed("agent session limit reached"));
+                        .extend(self.finish_failed(loom_model::AGENT_RUN_LIMIT_FAILURE_REASON));
                     self.step_id = None;
                     ctx.finished = true;
                     return Ok(StreamFlow::Stop);
@@ -1002,7 +1002,7 @@ impl AgentRuntime {
                         status,
                     });
                     ctx.events
-                        .extend(self.finish_failed("agent session limit reached"));
+                        .extend(self.finish_failed(loom_model::AGENT_RUN_LIMIT_FAILURE_REASON));
                     self.step_id = None;
                     ctx.finished = true;
                     return Ok(StreamFlow::Stop);

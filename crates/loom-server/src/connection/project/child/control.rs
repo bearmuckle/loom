@@ -81,6 +81,10 @@ impl InProcessConnection {
                     .map(|summary| summary.snapshot)
             })
             .transpose()?;
+        // The reason a parked child is where it is, read from the state its run
+        // already records, so a refusal names the actual reason instead of
+        // leaving the manager to guess.
+        let paused_reason = self.project_child_pause_reason(&task)?;
         let mut uncommitted_paths = Vec::new();
         let mut worktree = None;
         let mut rebase = None;
@@ -90,6 +94,17 @@ impl InProcessConnection {
                 if let Some(snapshot) = &run {
                     match snapshot.state {
                         AgentRunState::Paused => {
+                            // A run parked on a failed step resumes into the same
+                            // failure, so the action that fits it is the retry.
+                            if matches!(
+                                paused_reason.as_ref(),
+                                Some(ProjectChildPauseReason::StepFailed { .. })
+                            ) {
+                                return Err(project_child_action_mismatch(
+                                    "continue does not fit a run that stopped at a failed tool step".to_owned(),
+                                    paused_reason.as_ref(),
+                                ));
+                            }
                             let response = self.resume_agent_run(snapshot.id)?;
                             let ServerResponse::Run(RunResponse::AgentRun(snapshot)) = response
                             else {
@@ -101,24 +116,31 @@ impl InProcessConnection {
                             };
                             run = Some(snapshot);
                         }
+                        AgentRunState::AwaitingApproval => {
+                            // Resuming does not grant the approval the child
+                            // waits on, so say so instead of inviting a blind
+                            // resume.
+                            return Err(project_child_action_mismatch(
+                                "the child is waiting for an approval that the parent cannot grant"
+                                    .to_owned(),
+                                paused_reason.as_ref(),
+                            ));
+                        }
                         AgentRunState::Planning
                         | AgentRunState::Executing
-                        | AgentRunState::AwaitingApproval
                         | AgentRunState::Evaluating => {}
                         AgentRunState::NeedsInput => {
-                            return Err(LoomError::new(
-                                ErrorCode::InvalidState,
-                                "the child is waiting for user input and cannot continue until it is answered",
-                                false,
+                            return Err(project_child_action_mismatch(
+                                "the child is waiting for user input and cannot continue until it is answered".to_owned(),
+                                paused_reason.as_ref(),
                             ));
                         }
                         AgentRunState::Completed
                         | AgentRunState::Failed
                         | AgentRunState::Cancelled => {
-                            return Err(LoomError::new(
-                                ErrorCode::InvalidState,
-                                "the child run is finished; retry a failed tool step or create a new task",
-                                false,
+                            return Err(project_child_action_mismatch(
+                                "the child run is finished; retry a failed tool step or create a new task".to_owned(),
+                                paused_reason.as_ref(),
                             ));
                         }
                     }
@@ -226,6 +248,18 @@ impl InProcessConnection {
                 })?;
                 match snapshot.state {
                     AgentRunState::Failed => {
+                        // A retry of a run that stopped at a limit stops again at
+                        // the same limit, so the reason is reported instead of
+                        // repeating the stop.
+                        if matches!(
+                            paused_reason.as_ref(),
+                            Some(ProjectChildPauseReason::BudgetExhausted { .. })
+                        ) {
+                            return Err(project_child_action_mismatch(
+                                "retry_failed_step does not fit a run that reached a configured limit".to_owned(),
+                                paused_reason.as_ref(),
+                            ));
+                        }
                         // One rule per failure case: a failure that recorded a
                         // failed tool step is retried at that step, while a
                         // failure that recorded none failed at the model or
@@ -294,16 +328,15 @@ impl InProcessConnection {
                     }
                     AgentRunState::Planning
                     | AgentRunState::Executing
-                    | AgentRunState::AwaitingApproval
                     | AgentRunState::Evaluating => {}
                     AgentRunState::Paused
                     | AgentRunState::NeedsInput
+                    | AgentRunState::AwaitingApproval
                     | AgentRunState::Completed
                     | AgentRunState::Cancelled => {
-                        return Err(LoomError::new(
-                            ErrorCode::InvalidState,
-                            "retry_failed_step requires a failed child run",
-                            false,
+                        return Err(project_child_action_mismatch(
+                            "retry_failed_step requires a failed child run".to_owned(),
+                            paused_reason.as_ref(),
                         ));
                     }
                 }
@@ -792,6 +825,26 @@ impl InProcessConnection {
 /// The runtime entry a failed child run is retried through.
 type ProjectChildRetryEntry = fn(&mut AgentRuntime) -> Result<RunProgress>;
 
+/// Refuses a control action that does not fit the child, naming why it stopped
+/// and the action that does fit.
+///
+/// A refusal that named only the requested action left a manager guessing at the
+/// cause, so the reason the child is parked in travels with the refusal.
+fn project_child_action_mismatch(
+    refusal: String,
+    reason: Option<&ProjectChildPauseReason>,
+) -> LoomError {
+    let message = match reason {
+        Some(reason) => format!(
+            "{refusal}: the child is {}. Use {}.",
+            reason.summary(),
+            reason.advised_action()
+        ),
+        None => refusal,
+    };
+    LoomError::new(ErrorCode::InvalidState, message, false)
+}
+
 /// Chooses the retry entry for one failed child run, one rule per failure case.
 ///
 /// A failure that recorded a failed tool step is retried at that step, because
@@ -836,9 +889,47 @@ fn consume_project_cancellation_failpoint(failpoint: &AtomicUsize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{consume_project_cancellation_failpoint, project_child_retry_entry};
-    use crate::{AgentRuntime, RunProgress};
+    use super::{
+        consume_project_cancellation_failpoint, project_child_action_mismatch,
+        project_child_retry_entry,
+    };
+    use crate::{AgentRuntime, ProjectChildPauseReason, RunProgress};
+    use loom_core::ErrorCode;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn a_mismatched_action_refusal_names_the_reason_and_the_action_that_fits() {
+        let refused = project_child_action_mismatch(
+            "retry_failed_step requires a failed child run".to_owned(),
+            Some(&ProjectChildPauseReason::AwaitingApproval {
+                tool: "apply_patch".to_owned(),
+                input_digest: "0123abcd".to_owned(),
+            }),
+        );
+        assert_eq!(refused.code, ErrorCode::InvalidState);
+        assert!(refused.message.contains("retry_failed_step"));
+        assert!(refused.message.contains("apply_patch"));
+        assert!(
+            refused
+                .message
+                .contains("a parent cannot grant this approval")
+        );
+        assert!(refused.message.contains("a person has to resolve the wait"));
+
+        let refused = project_child_action_mismatch(
+            "continue does not fit a run that stopped at a failed tool step".to_owned(),
+            Some(&ProjectChildPauseReason::StepFailed {
+                tool: "run_command".to_owned(),
+                error_kind: "tool_execution".to_owned(),
+            }),
+        );
+        assert!(refused.message.contains("run_command"));
+        assert!(refused.message.contains("Use retry_failed_step"));
+
+        // Without a reason the refusal keeps its own words.
+        let refused = project_child_action_mismatch("refused".to_owned(), None);
+        assert_eq!(refused.message, "refused");
+    }
 
     /// The chosen entry of a failure case, comparable across the two function
     /// items because both share one signature.

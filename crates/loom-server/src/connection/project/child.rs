@@ -2,6 +2,7 @@ use super::*;
 
 mod control;
 mod create;
+pub(crate) mod pause;
 mod rebase;
 mod recovery;
 mod result;

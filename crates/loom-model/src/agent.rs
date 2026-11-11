@@ -26,6 +26,11 @@ pub enum AgentRunState {
 /// constant instead of repeating the literal.
 pub const AGENT_RUN_FAILURE_SUMMARY_PREFIX: &str = "Agent failed: ";
 
+/// The reason a run records when a configured session limit stopped it. The
+/// producer writes it and a reader of the durable run summary matches it, so a
+/// budget stop is told apart from any other failure.
+pub const AGENT_RUN_LIMIT_FAILURE_REASON: &str = "agent session limit reached";
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentRunSnapshot {
     pub id: RunId,
