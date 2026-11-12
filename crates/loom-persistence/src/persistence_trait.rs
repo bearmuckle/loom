@@ -13,7 +13,7 @@ pub trait CatalogRepository: Send + Sync {
     fn path(&self) -> &Path;
     fn prune_expired_idempotency_records(&self, now: Timestamp) -> Result<usize>;
     fn release_exclusive_writer(&self) -> Result<()>;
-    fn save_state(&self, write: DurableStateWrite<'_>) -> Result<()>;
+    fn save_state(&self, write: DurableStateWrite<'_>) -> Result<DurableSaveOutcome>;
 }
 
 impl CatalogRepository for FilePersistence {
@@ -47,7 +47,7 @@ impl CatalogRepository for FilePersistence {
     fn release_exclusive_writer(&self) -> Result<()> {
         FilePersistence::release_exclusive_writer(self)
     }
-    fn save_state(&self, write: DurableStateWrite<'_>) -> Result<()> {
+    fn save_state(&self, write: DurableStateWrite<'_>) -> Result<DurableSaveOutcome> {
         FilePersistence::save_state(self, write)
     }
 }
@@ -83,7 +83,7 @@ impl<T: CatalogRepository + ?Sized> CatalogRepository for Arc<T> {
     fn release_exclusive_writer(&self) -> Result<()> {
         (**self).release_exclusive_writer()
     }
-    fn save_state(&self, write: DurableStateWrite<'_>) -> Result<()> {
+    fn save_state(&self, write: DurableStateWrite<'_>) -> Result<DurableSaveOutcome> {
         (**self).save_state(write)
     }
 }
@@ -264,12 +264,15 @@ pub trait RunRepository: Send + Sync {
         summaries: &BTreeMap<RunId, DurableRunSummary>,
         feed: &DurableFeedState,
     ) -> Result<()>;
-    fn save_run_checkpoint(&self, write: DurableRunCheckpointWrite<'_>) -> Result<()>;
+    fn save_run_checkpoint(
+        &self,
+        write: DurableRunCheckpointWrite<'_>,
+    ) -> Result<DurableSaveOutcome>;
     fn save_run_checkpoint_with_project_manager_wait(
         &self,
         write: DurableRunCheckpointWrite<'_>,
         wait: &ProjectManagerWaitRecord,
-    ) -> Result<()>;
+    ) -> Result<DurableSaveOutcome>;
 }
 
 impl RunRepository for FilePersistence {
@@ -379,14 +382,17 @@ impl RunRepository for FilePersistence {
     ) -> Result<()> {
         FilePersistence::save_recovery_updates(self, summaries, feed)
     }
-    fn save_run_checkpoint(&self, write: DurableRunCheckpointWrite<'_>) -> Result<()> {
+    fn save_run_checkpoint(
+        &self,
+        write: DurableRunCheckpointWrite<'_>,
+    ) -> Result<DurableSaveOutcome> {
         FilePersistence::save_run_checkpoint(self, write)
     }
     fn save_run_checkpoint_with_project_manager_wait(
         &self,
         write: DurableRunCheckpointWrite<'_>,
         wait: &ProjectManagerWaitRecord,
-    ) -> Result<()> {
+    ) -> Result<DurableSaveOutcome> {
         FilePersistence::save_run_checkpoint_with_project_manager_wait(self, write, wait)
     }
 }
@@ -491,14 +497,17 @@ impl<T: RunRepository + ?Sized> RunRepository for Arc<T> {
     ) -> Result<()> {
         (**self).save_recovery_updates(summaries, feed)
     }
-    fn save_run_checkpoint(&self, write: DurableRunCheckpointWrite<'_>) -> Result<()> {
+    fn save_run_checkpoint(
+        &self,
+        write: DurableRunCheckpointWrite<'_>,
+    ) -> Result<DurableSaveOutcome> {
         (**self).save_run_checkpoint(write)
     }
     fn save_run_checkpoint_with_project_manager_wait(
         &self,
         write: DurableRunCheckpointWrite<'_>,
         wait: &ProjectManagerWaitRecord,
-    ) -> Result<()> {
+    ) -> Result<DurableSaveOutcome> {
         (**self).save_run_checkpoint_with_project_manager_wait(write, wait)
     }
 }

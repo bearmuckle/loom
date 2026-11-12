@@ -516,7 +516,7 @@ fn run_interactions_round_trip_and_commit_atomically_with_the_feed() {
     let save = |sessions: &SessionManagerState,
                 summary: &BTreeMap<RunId, DurableRunSummary>,
                 feed: &DurableFeedState|
-     -> Result<()> {
+     -> Result<DurableSaveOutcome> {
         persistence.save_state(DurableStateWrite {
             sessions,
             workspaces: None,

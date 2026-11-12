@@ -1084,8 +1084,15 @@ fn tool_attempt_state_storage_tracks_activity_outcomes_and_intents() {
     fs::remove_file(path).unwrap();
 }
 
+/// A logical tool call is written once: a later record that carries no arguments
+/// belongs to the call and is accepted, while different arguments keep the value
+/// that was stored first.
+///
+/// The refusal is confined to the run that carries the call: the save commits
+/// every other run and names the refused one, so one divergent record cannot
+/// stop the state of the whole worker.
 #[test]
-fn a_tool_result_without_arguments_keeps_the_stored_call() {
+fn a_stored_tool_call_refuses_a_rewrite_for_its_own_run_only() {
     let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
     let persistence = FilePersistence::open(&path).unwrap();
     let mut sessions = SessionManager::default();
@@ -1165,12 +1172,115 @@ fn a_tool_result_without_arguments_keeps_the_stored_call() {
         ..call.clone()
     };
     save(activity(placeholder, AgentActivityStatus::Cancelled)).unwrap();
-    // Different arguments are still a rewrite of the call and stay refused.
+    // Different arguments are still a rewrite of the call and stay refused, but
+    // only for this run: the save commits everything else and names the run it
+    // left alone, because a refusal that failed the whole save would stop the
+    // worker for every session.
     let rewritten = loom_model::ToolCall {
         arguments: serde_json::json!({"command": "rm -rf /"}),
         ..call
     };
-    assert!(save(activity(rewritten, AgentActivityStatus::Started)).is_err());
+    let outcome = save(activity(rewritten, AgentActivityStatus::Started)).unwrap();
+    assert_eq!(
+        outcome
+            .confined_runs
+            .iter()
+            .map(|confined| confined.run_id)
+            .collect::<Vec<_>>(),
+        vec![run_id]
+    );
+    let nested = &outcome.confined_runs[0].error.message;
+    assert!(
+        nested.contains("'run_command'") && nested.contains("arguments"),
+        "the refusal names the call and the part it refused: {nested}"
+    );
+    let stored = persistence.load_run_tool_calls(run_id).unwrap();
+    assert_eq!(
+        stored
+            .iter()
+            .map(|record| record.call.arguments.clone())
+            .collect::<Vec<_>>(),
+        vec![serde_json::json!({"command": "ls"})],
+        "the stored call keeps the value it was first written with"
+    );
+    // A save that names a healthy run next to the refused one commits the
+    // healthy run, so a bad call costs one run and not the whole state.
+    let healthy_run_id = RunId::new();
+    let mut both_summaries = summaries.clone();
+    both_summaries.insert(
+        healthy_run_id,
+        DurableRunSummary {
+            snapshot: AgentRunSnapshot {
+                id: healthy_run_id,
+                attempt_id: RunAttemptId::new(),
+                ..summaries[&run_id].snapshot.clone()
+            },
+            ..summaries[&run_id].clone()
+        },
+    );
+    let refused_activity = AgentActivityRecord {
+        data: AgentActivityData::ToolCall {
+            call: loom_model::ToolCall {
+                arguments: serde_json::json!({"command": "rm -rf /"}),
+                ..stored[0].call.clone()
+            },
+            result: None,
+        },
+        ..activity(stored[0].call.clone(), AgentActivityStatus::Started)
+    };
+    let healthy_activity = AgentActivityRecord {
+        id: ActivityId::new(),
+        run_id: healthy_run_id,
+        data: AgentActivityData::ToolCall {
+            call: loom_model::ToolCall {
+                id: loom_core::ToolCallId::new(),
+                name: "run_command".to_owned(),
+                arguments: serde_json::json!({"command": "pwd"}),
+            },
+            result: None,
+        },
+        ..activity(stored[0].call.clone(), AgentActivityStatus::Started)
+    };
+    let activities = BTreeMap::from([
+        (run_id, vec![refused_activity]),
+        (healthy_run_id, vec![healthy_activity]),
+    ]);
+    let outcome = persistence
+        .save_state(DurableStateWrite {
+            sessions: &sessions.export_state(),
+            workspaces: None,
+            settings: None,
+            workspace_configs: None,
+            providers: None,
+            usage: None,
+            idempotency: None,
+            run_summaries: Some(&both_summaries),
+            run_runtime_configs: None,
+            run_context_checkpoints: None,
+            run_plans: None,
+            run_messages: None,
+            run_activities: Some(&activities),
+            filesystem_records: None,
+            feed: None,
+        })
+        .unwrap();
+    assert_eq!(
+        outcome
+            .confined_runs
+            .iter()
+            .map(|confined| confined.run_id)
+            .collect::<Vec<_>>(),
+        vec![run_id]
+    );
+    assert_eq!(
+        persistence
+            .load_run_activities(healthy_run_id)
+            .unwrap()
+            .len(),
+        1,
+        "a run the save accepted keeps its committed activity"
+    );
+    fs::remove_file(path).unwrap();
 }
 
 /// A full state save snapshots a run's activities while that run's worker

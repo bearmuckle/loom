@@ -35,13 +35,14 @@ use loom_model::{
     ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId, ToolCall, ToolDefinition,
 };
 use loom_persistence::{
-    DurableArchiveRetentionPolicy, DurableFeedSessionCursor, DurableFeedState,
+    ConfinedRun, DurableArchiveRetentionPolicy, DurableFeedSessionCursor, DurableFeedState,
     DurableFeedWorkspaceCursor, DurableFilesystemDelta, DurableFilesystemEdit,
     DurableFilesystemRecord, DurableIdempotencyRecord, DurableProviderState,
     DurableRunCheckpointWrite, DurableRunContextCheckpoint, DurableRunMessage,
-    DurableRunMessageDelta, DurableRunRuntimeConfig, DurableRunSummary,
+    DurableRunMessageDelta, DurableRunRuntimeConfig, DurableRunSummary, DurableSaveOutcome,
     DurableSessionProjectionRead, DurableSessionSettings, DurableStateWrite, FilePersistence,
     Persistence, ProjectCancellationCascadeRecord, StoredPersonToken,
+    is_confined_tool_call_refusal,
 };
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
@@ -460,6 +461,11 @@ pub struct InProcessBackend {
     self_reference: Mutex<Weak<InProcessBackend>>,
     request_lifecycle: RwLock<u8>,
     persistence_failed: AtomicBool,
+    /// Runs a durable save refused because the persisted logical tool call they
+    /// carry differs from what the runtime holds. Such a run keeps the rows the
+    /// database already holds: writing them again would refuse the save on every
+    /// later write, so its activities are left out until the process restarts.
+    confined_runs: Mutex<std::collections::BTreeSet<loom_core::RunId>>,
     /// Serialises a full state save against run checkpoints. The save holds the
     /// write side from the snapshot it takes to the transaction it commits, and
     /// a run checkpoint holds the read side, so no checkpoint can commit a row

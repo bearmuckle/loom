@@ -1916,7 +1916,10 @@ impl FilePersistence {
 
     /// Atomically checkpoints one worker run, its owner filesystem, and the
     /// captured event-feed state without enumerating or pruning other catalogs.
-    pub fn save_run_checkpoint(&self, write: DurableRunCheckpointWrite<'_>) -> Result<()> {
+    pub fn save_run_checkpoint(
+        &self,
+        write: DurableRunCheckpointWrite<'_>,
+    ) -> Result<DurableSaveOutcome> {
         self.save_run_checkpoint_inner(write, None)
     }
 
@@ -1924,7 +1927,7 @@ impl FilePersistence {
         &self,
         write: DurableRunCheckpointWrite<'_>,
         project_manager_wait: Option<&ProjectManagerWaitRecord>,
-    ) -> Result<()> {
+    ) -> Result<DurableSaveOutcome> {
         let run_id = write.summary.snapshot.id;
         if write.session.id != write.summary.snapshot.session_id
             || write
@@ -1971,7 +1974,6 @@ impl FilePersistence {
         let message_offsets = write.message_delta.map(|delta| {
             BTreeMap::from([(run_id, if delta.reset { 0 } else { delta.start_ordinal })])
         });
-        let activities = BTreeMap::from([(run_id, write.activities.to_vec())]);
         save_session_checkpoint_row(&transaction, write.session, write.session_next_sequence)?;
         save_run_summary_rows(&transaction, &summaries)?;
         save_run_attempt_rows(&transaction, &summaries)?;
@@ -2009,11 +2011,23 @@ impl FilePersistence {
         save_run_runtime_config_rows(&transaction, &runtime_configs)?;
         save_run_context_checkpoint_rows(&transaction, &context_checkpoints)?;
         save_run_plan_rows(&transaction, &plans, Some(&summaries))?;
+        let mut outcome = DurableSaveOutcome::default();
         if let Some(activity_deltas) = write.activity_deltas {
-            save_run_activity_deltas(&transaction, run_id, activity_deltas, &summaries)?;
+            save_run_activity_deltas_confined(
+                &transaction,
+                run_id,
+                activity_deltas,
+                &summaries,
+                &mut outcome.confined_runs,
+            )?;
         } else {
-            save_run_activity_rows(&transaction, &activities)?;
-            save_run_tool_rows(&transaction, &activities, Some(&summaries))?;
+            save_run_activities_rows_confined(
+                &transaction,
+                run_id,
+                write.activities,
+                Some(&summaries),
+                &mut outcome.confined_runs,
+            )?;
         }
         if let Some(wait) = project_manager_wait {
             create_project_manager_wait_on(&transaction, wait)?;
@@ -2041,6 +2055,7 @@ impl FilePersistence {
                 format!("could not commit run checkpoint transaction: {error}"),
                 true,
             )
-        })
+        })?;
+        Ok(outcome)
     }
 }

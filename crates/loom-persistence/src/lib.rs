@@ -462,6 +462,43 @@ pub struct DurableStateWrite<'a> {
     pub feed: Option<&'a DurableFeedState>,
 }
 
+/// The message a durable write returns when a stored logical tool call refuses a
+/// different value for the same call.
+///
+/// Such a refusal is confined to the run that carries the call: it fails that
+/// run and its session, and must never latch the worker-wide persistence
+/// fail-stop.
+pub const CONFINED_TOOL_CALL_PREFIX: &str = "persisted logical tool call is immutable";
+
+/// Whether `error` is the refusal of one run's persisted logical tool call.
+pub fn is_confined_tool_call_refusal(error: &LoomError) -> bool {
+    error.code == ErrorCode::Conflict && error.message.starts_with(CONFINED_TOOL_CALL_PREFIX)
+}
+
+/// A run whose stored logical tool call refused a durable write.
+///
+/// The rows of that run were rolled back to its savepoint, so nothing of the run
+/// changed, while every other record of the same write committed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfinedRun {
+    pub run_id: RunId,
+    pub error: LoomError,
+}
+
+/// What a durable write left undone because a stored logical tool call refused
+/// it. Empty for a write every record of which was accepted.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DurableSaveOutcome {
+    pub confined_runs: Vec<ConfinedRun>,
+}
+
+impl DurableSaveOutcome {
+    /// The refusal a caller reports, naming the first run the write refused.
+    pub fn refusal(&self) -> Option<LoomError> {
+        self.confined_runs.first().map(|run| run.error.clone())
+    }
+}
+
 /// Compatibility of an on-disk Loom state database with the current build.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchemaStatus {

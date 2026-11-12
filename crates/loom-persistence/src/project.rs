@@ -1942,7 +1942,7 @@ impl FilePersistence {
         &self,
         write: DurableRunCheckpointWrite<'_>,
         wait: &ProjectManagerWaitRecord,
-    ) -> Result<()> {
+    ) -> Result<DurableSaveOutcome> {
         validate_project_manager_wait_create(wait)?;
         if write.summary.snapshot.id != wait.run_id
             || write.summary.snapshot.attempt_id != wait.attempt_id

@@ -226,7 +226,10 @@ impl FilePersistence {
     }
 
     /// Persists the typed session catalog without rewriting unrelated state.
-    pub fn save_state_with_sessions(&self, sessions: &SessionManagerState) -> Result<()> {
+    pub fn save_state_with_sessions(
+        &self,
+        sessions: &SessionManagerState,
+    ) -> Result<DurableSaveOutcome> {
         self.save_state(DurableStateWrite {
             sessions,
             workspaces: None,
@@ -252,7 +255,7 @@ impl FilePersistence {
         sessions: &SessionManagerState,
         workspaces: &WorkspaceManagerState,
         feed: Option<&DurableFeedState>,
-    ) -> Result<()> {
+    ) -> Result<DurableSaveOutcome> {
         self.save_state(DurableStateWrite {
             sessions,
             workspaces: Some(workspaces),
@@ -277,7 +280,7 @@ impl FilePersistence {
         &self,
         sessions: &SessionManagerState,
         feed: Option<&DurableFeedState>,
-    ) -> Result<()> {
+    ) -> Result<DurableSaveOutcome> {
         self.save_state(DurableStateWrite {
             sessions,
             workspaces: None,
@@ -297,7 +300,7 @@ impl FilePersistence {
         })
     }
 
-    pub fn save_state(&self, write: DurableStateWrite<'_>) -> Result<()> {
+    pub fn save_state(&self, write: DurableStateWrite<'_>) -> Result<DurableSaveOutcome> {
         let connection = self.connection_for_write()?;
         let transaction = connection.unchecked_transaction().map_err(|error| {
             persistence_error(
@@ -342,9 +345,17 @@ impl FilePersistence {
         if let Some(run_plans) = write.run_plans {
             save_run_plan_rows(&transaction, run_plans, write.run_summaries)?;
         }
+        let mut outcome = DurableSaveOutcome::default();
         if let Some(run_activities) = write.run_activities {
-            save_run_activity_rows(&transaction, run_activities)?;
-            save_run_tool_rows(&transaction, run_activities, write.run_summaries)?;
+            for (run_id, activities) in run_activities {
+                save_run_activities_rows_confined(
+                    &transaction,
+                    *run_id,
+                    activities,
+                    write.run_summaries,
+                    &mut outcome.confined_runs,
+                )?;
+            }
         }
         if let Some(run_messages) = write.run_messages {
             save_run_message_rows(&transaction, run_messages, None, true)?;
@@ -363,7 +374,8 @@ impl FilePersistence {
                 format!("could not commit persistence transaction: {error}"),
                 true,
             )
-        })
+        })?;
+        Ok(outcome)
     }
 
     /// Atomically persists startup recovery updates without rewriting unrelated catalogs.

@@ -1598,3 +1598,154 @@ fn a_run_checkpoint_cannot_commit_inside_a_full_state_save() {
     drop(backend);
     fs::remove_file(&path).unwrap();
 }
+
+/// A persisted logical tool call is written once, so a run that carries a
+/// different value for it cannot be saved. The refusal is confined to that run:
+/// the run and its session fail, the backend keeps serving, and a healthy
+/// session still saves after the refused one.
+///
+/// Before the refusal was confined it latched the worker-wide persistence
+/// fail-stop, so one session resumed from state written by an older build
+/// stopped the whole worker.
+#[test]
+fn a_divergent_logical_tool_call_fails_only_its_session() {
+    let path = std::env::temp_dir().join(format!("loom-confined-call-{}.db", WorkspaceId::new()));
+    let backend = InProcessBackend::new_persistent(&path).unwrap();
+    let workspace_id = WorkspaceId::new();
+    let (divergent_session, healthy_session) = {
+        let mut sessions = backend.sessions().unwrap();
+        let (divergent, _) = sessions
+            .create_in_workspace(workspace_id, "divergent stored call")
+            .unwrap();
+        let (healthy, _) = sessions
+            .create_in_workspace(workspace_id, "healthy session")
+            .unwrap();
+        (divergent.id, healthy.id)
+    };
+    let root = std::env::temp_dir().join(format!("loom-confined-call-{}.work", WorkspaceId::new()));
+    fs::create_dir_all(&root).unwrap();
+
+    let call = |arguments: serde_json::Value| loom_model::ToolCall {
+        id: loom_core::ToolCallId::new(),
+        name: "list_files".to_owned(),
+        arguments,
+    };
+    let register = |session_id: AgentSessionId, arguments: serde_json::Value| {
+        let runtime = AgentRuntime::new(
+            session_id,
+            AgentTask::new(
+                "keep one stored tool call",
+                ModelId::new("deterministic/demo"),
+            )
+            .unwrap(),
+            Box::new(loom_providers::DeterministicProvider::demo()),
+            ToolExecutor::new(&root).unwrap(),
+        );
+        let handle = backend.register_runtime(runtime);
+        let run_id = handle.run_id;
+        handle.locked_state().activities.push(AgentActivityRecord {
+            id: loom_core::ActivityId::new(),
+            run_id,
+            timeline_ordinal: 0,
+            parent_id: None,
+            step_id: None,
+            kind: loom_model::AgentActivityKind::ToolCall,
+            status: AgentActivityStatus::Completed,
+            started_at: Timestamp::now(),
+            completed_at: Some(Timestamp::now()),
+            elapsed_ms: Some(1),
+            data: loom_model::AgentActivityData::ToolCall {
+                call: call(arguments),
+                result: None,
+            },
+        });
+        backend.runs().unwrap().insert(run_id, Arc::clone(&handle));
+        handle
+    };
+    let divergent = register(divergent_session, serde_json::json!({"path": "src"}));
+    let healthy = register(healthy_session, serde_json::json!({"path": "docs"}));
+    // The first save writes both runs' logical tool calls.
+    backend.persist_worker_state().unwrap();
+
+    // A later value for the same call is what a run restored from state written
+    // before the call was immutable carries.
+    {
+        let mut state = divergent.locked_state();
+        let loom_model::AgentActivityData::ToolCall { call, .. } = &mut state.activities[0].data
+        else {
+            panic!("the stored record keeps its tool call");
+        };
+        call.arguments = serde_json::json!({"path": "elsewhere"});
+    }
+    let refused = backend
+        .persist_worker_state()
+        .expect_err("a divergent logical tool call is refused");
+    assert_eq!(refused.code, ErrorCode::Conflict, "{refused:?}");
+    assert!(
+        refused
+            .message
+            .contains("persisted logical tool call is immutable"),
+        "{refused:?}"
+    );
+
+    // The refusal fails that run and its session without latching the fail-stop.
+    assert!(
+        backend.ensure_persistence_healthy().is_ok(),
+        "the backend must keep serving after one run was refused"
+    );
+    assert!(!backend.persistence_failed.load(Ordering::SeqCst));
+    assert_eq!(
+        divergent.state().run.state,
+        AgentRunState::Failed,
+        "the refused run fails"
+    );
+    assert_eq!(
+        backend
+            .sessions()
+            .unwrap()
+            .get(divergent_session)
+            .unwrap()
+            .state,
+        AgentSessionState::Failed,
+        "the session of the refused run fails"
+    );
+
+    // The refused run keeps the rows the database already holds, while the
+    // healthy run saves as usual.
+    let reader = loom_persistence::FilePersistence::open(&path).unwrap();
+    let stored = reader.load_run_tool_calls(divergent.run_id).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].call.arguments, serde_json::json!({"path": "src"}));
+    backend.persist_worker_state().unwrap();
+    assert_eq!(
+        backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_run_activities(healthy.run_id)
+            .unwrap()
+            .len(),
+        1,
+        "a healthy session still writes after the refused one"
+    );
+    assert_ne!(
+        backend
+            .sessions()
+            .unwrap()
+            .get(healthy_session)
+            .unwrap()
+            .state,
+        AgentSessionState::Failed,
+        "the healthy session is untouched"
+    );
+    assert!(backend.ensure_persistence_healthy().is_ok());
+
+    // The confined run is also left out of a later checkpoint instead of
+    // refusing it: its rows stay as the database holds them.
+    backend.persist_run_checkpoint(&divergent).unwrap();
+
+    fs::remove_dir_all(&root).unwrap();
+    let _ = fs::remove_dir_all(&backend.session_root_base);
+    drop(backend);
+    let _ = fs::remove_file(&path);
+}

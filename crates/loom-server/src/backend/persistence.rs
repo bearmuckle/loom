@@ -74,7 +74,92 @@ impl InProcessBackend {
         &self,
         candidate: (loom_core::RequestId, IdempotencyRecord),
     ) -> Result<()> {
-        self.latch_on_persistence_error(self.persist_state_inner(&BTreeMap::new(), Some(candidate)))
+        self.settle_save(self.persist_state_inner(&BTreeMap::new(), Some(candidate)))
+    }
+
+    /// Settles a save, reporting a committed save that refused one run's stored
+    /// logical tool call and latching only a genuine persistence failure.
+    ///
+    /// A refused logical tool call costs that run and its session, which settle
+    /// here; every other record of the same save committed, so the worker keeps
+    /// serving instead of entering the fail-stop.
+    fn settle_save(&self, result: Result<DurableSaveOutcome>) -> Result<()> {
+        match result {
+            Ok(outcome) => {
+                self.settle_confined_runs(&outcome);
+                match outcome.refusal() {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
+            }
+            Err(error) => self.latch_on_persistence_error(Err(error)),
+        }
+    }
+
+    /// Remembers and fails every run a committed save refused.
+    ///
+    /// The run is remembered so a later save leaves its stored activity and
+    /// tool-call rows alone instead of refusing them again, which would refuse
+    /// every later save of every other run in the same transaction.
+    fn settle_confined_runs(&self, outcome: &DurableSaveOutcome) {
+        for confined in &outcome.confined_runs {
+            let run_id = confined.run_id;
+            let first_refusal = self
+                .confined_runs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(run_id);
+            if !first_refusal {
+                continue;
+            }
+            self.fail_confined_run(confined);
+        }
+    }
+
+    /// Fails one run whose stored logical tool call refused its durable write, so
+    /// the mismatch costs that run and its session instead of the whole worker.
+    fn fail_confined_run(&self, confined: &ConfinedRun) {
+        let run_id = confined.run_id;
+        let reason = format!(
+            "the persisted logical tool call of this run refused a later value: {}",
+            confined.error.message
+        );
+        log::error!("[loom-server] failing run {run_id} and its session: {reason}");
+        let handle = self.runs().ok().and_then(|runs| runs.get(&run_id).cloned());
+        let Some(handle) = handle else {
+            return;
+        };
+        match handle.try_runtime() {
+            Ok(mut runtime) => {
+                if let Err(error) = runtime.fail(reason) {
+                    handle.record_failure(error);
+                }
+                handle.refresh(&runtime);
+                handle.set_running(false);
+            }
+            Err(_) => {
+                // A run whose step holds the runtime stays confined: its
+                // activities are left out of later saves, and its next
+                // checkpoint refuses it the same way.
+                log::error!(
+                    "[loom-server] run {run_id} is busy and could not be failed in place; it stays confined"
+                );
+            }
+        }
+        if let Err(error) = self.persist_state() {
+            log::error!(
+                "[loom-server] could not persist the failure of run {run_id}: {}",
+                error.message
+            );
+        }
+    }
+
+    /// The runs whose stored rows a durable save must leave alone.
+    fn confined_runs(&self) -> BTreeSet<loom_core::RunId> {
+        self.confined_runs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Persists the current worker checkpoint without enumerating unrelated runs,
@@ -82,8 +167,7 @@ impl InProcessBackend {
     /// transaction so only the captured event prefix can be acknowledged.
     pub(crate) fn persist_run_checkpoint(&self, handle: &RunHandle) -> Result<()> {
         self.ensure_persistence_healthy()?;
-        let result = self.persist_run_checkpoint_inner(handle);
-        self.latch_on_persistence_error(result)
+        self.settle_save(self.persist_run_checkpoint_inner(handle))
     }
 
     pub(crate) fn persist_worker_state(&self) -> Result<()> {
@@ -103,9 +187,12 @@ impl InProcessBackend {
         }
     }
 
-    pub(crate) fn persist_run_checkpoint_inner(&self, handle: &RunHandle) -> Result<()> {
+    pub(crate) fn persist_run_checkpoint_inner(
+        &self,
+        handle: &RunHandle,
+    ) -> Result<DurableSaveOutcome> {
         let Some(persistence) = &self.persistence else {
-            return Ok(());
+            return Ok(DurableSaveOutcome::default());
         };
         // A checkpoint must not commit between a full state save's snapshot and
         // its transaction: the save would then write rows older than this
@@ -174,17 +261,24 @@ impl InProcessBackend {
                         session_id: state.session_id,
                         summary,
                     });
-            let activities = handle
-                .activity_deltas
-                .lock()
-                .map_err(|_| {
-                    LoomError::new(
-                        ErrorCode::Internal,
-                        "activity delta lock was poisoned",
-                        true,
-                    )
-                })?
-                .ordered_values();
+            // A run a save refused keeps the rows the database already holds:
+            // writing its changed activities again would refuse this checkpoint
+            // too, so the run is left to settle as failed instead.
+            let activities = if self.confined_runs().contains(&handle.run_id) {
+                Vec::new()
+            } else {
+                handle
+                    .activity_deltas
+                    .lock()
+                    .map_err(|_| {
+                        LoomError::new(
+                            ErrorCode::Internal,
+                            "activity delta lock was poisoned",
+                            true,
+                        )
+                    })?
+                    .ordered_values()
+            };
             let cursor = handle.message_checkpoint.lock().map_err(|_| {
                 LoomError::new(
                     ErrorCode::Internal,
@@ -364,10 +458,13 @@ impl InProcessBackend {
             }
             None => persistence.save_run_checkpoint(checkpoint),
         };
-        if let Err(error) = checkpoint_result {
-            self.persistence_failed.store(true, Ordering::SeqCst);
-            return Err(error);
-        }
+        let outcome = match checkpoint_result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.persistence_failed.store(true, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
         // The save may have consolidated this message's streamed fragments into
         // its content, deleting the fragment descriptors. Re-read the cursor
         // before appending more text to the same message.
@@ -409,18 +506,20 @@ impl InProcessBackend {
                 .retain(|activity_id| still_pending.contains(activity_id));
         }
         journal.acknowledge_session_feed(&captured_event_sequences);
-        Ok(())
+        Ok(outcome)
     }
 
     pub(crate) fn persist_state_with_recovery_updates(
         &self,
         recovery_updates: &BTreeMap<loom_core::RunId, DurableRunSummary>,
     ) -> Result<()> {
-        self.latch_on_persistence_error(self.persist_state_inner(recovery_updates, None))
+        self.settle_save(self.persist_state_inner(recovery_updates, None))
     }
 
     pub(crate) fn latch_on_persistence_error<T>(&self, result: Result<T>) -> Result<T> {
-        if let Err(error) = &result {
+        if let Err(error) = &result
+            && !is_confined_tool_call_refusal(error)
+        {
             log::error!(
                 "[loom-server] persistence failed; entering fail-stop and refusing further writes: {}",
                 error.message
@@ -434,9 +533,9 @@ impl InProcessBackend {
         &self,
         recovery_updates: &BTreeMap<loom_core::RunId, DurableRunSummary>,
         idempotency_candidate: Option<(loom_core::RequestId, IdempotencyRecord)>,
-    ) -> Result<()> {
+    ) -> Result<DurableSaveOutcome> {
         let Some(persistence) = &self.persistence else {
-            return Ok(());
+            return Ok(DurableSaveOutcome::default());
         };
         let _state_persist_guard = self.state_persist_gate.write().map_err(|_| {
             LoomError::new(
@@ -540,6 +639,10 @@ impl InProcessBackend {
             .collect::<Result<BTreeMap<_, _>>>()?;
         let mut durable_run_messages = BTreeMap::new();
         let mut durable_run_activities = BTreeMap::new();
+        // A run a save refused keeps the rows the database already holds. Writing
+        // its activities again would refuse every later save of every other run
+        // in the same transaction, so the run is left out until a restart.
+        let confined = self.confined_runs();
         for (run_id, state) in &mut runs {
             durable_run_messages.insert(
                 *run_id,
@@ -548,6 +651,9 @@ impl InProcessBackend {
                     &state.message_timeline_ordinals,
                 )?,
             );
+            if confined.contains(run_id) {
+                continue;
+            }
             durable_run_activities.insert(*run_id, std::mem::take(&mut state.activities));
         }
         log::debug!(
@@ -685,29 +791,33 @@ impl InProcessBackend {
             filesystem_records: Some(&filesystem_records),
             feed: Some(&feed),
         });
-        if let Err(error) = &result {
-            log::error!(
-                "[loom-server] durable state save failed; entering fail-stop: {}",
-                error.message
-            );
-            self.persistence_failed.store(true, Ordering::SeqCst);
-        }
-        if result.is_ok() {
-            // A full save consolidates streamed fragments too; drop the cached
-            // cursors so a later delta re-reads the committed position.
-            for handle in &handles {
-                handle.clear_message_fragment_positions();
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                log::error!(
+                    "[loom-server] durable state save failed; entering fail-stop: {}",
+                    error.message
+                );
+                self.persistence_failed.store(true, Ordering::SeqCst);
+                return Err(error);
             }
-            for (filesystem, generation) in filesystem_generations {
-                filesystem.acknowledge_persisted_generation(generation)?;
-            }
-            journal.pending_events.clear();
-            journal.pending_workspace_events.clear();
-            self.last_feed_pruned_sequence
-                .store(feed.next_sequence.value(), Ordering::Relaxed);
-            self.feed_bytes_since_prune.store(0, Ordering::Relaxed);
+        };
+        // The transaction committed every record, so the streamed fragments and
+        // the captured feed prefix are durable even when one run was refused.
+        // A full save consolidates streamed fragments too; drop the cached
+        // cursors so a later delta re-reads the committed position.
+        for handle in &handles {
+            handle.clear_message_fragment_positions();
         }
-        result
+        for (filesystem, generation) in filesystem_generations {
+            filesystem.acknowledge_persisted_generation(generation)?;
+        }
+        journal.pending_events.clear();
+        journal.pending_workspace_events.clear();
+        self.last_feed_pruned_sequence
+            .store(feed.next_sequence.value(), Ordering::Relaxed);
+        self.feed_bytes_since_prune.store(0, Ordering::Relaxed);
+        Ok(outcome)
     }
 
     pub fn flush(&self) -> Result<()> {

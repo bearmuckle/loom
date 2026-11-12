@@ -20,118 +20,116 @@ use super::*;
 /// exit the process for every run, not just the affected one.
 pub(crate) fn save_run_activity_rows(
     transaction: &Transaction<'_>,
-    activities_by_run: &DurableRunActivities,
+    run_id: RunId,
+    activities: &[AgentActivityRecord],
 ) -> Result<()> {
-    for (run_id, activities) in activities_by_run {
-        let run_id_bytes = run_id.as_uuid().as_bytes();
-        let session_id: Vec<u8> = transaction
+    let run_id_bytes = run_id.as_uuid().as_bytes();
+    let session_id: Vec<u8> = transaction
+        .query_row(
+            "SELECT session_id FROM run_summaries WHERE run_id=?1",
+            [run_id_bytes.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("run {run_id} has no durable summary for its activities: {error}"),
+                true,
+            )
+        })?;
+    let mut seen = BTreeSet::new();
+    // The ordinal the next activity this save appends takes. It is read
+    // once per run and advanced for every appended activity, so a save that
+    // writes several new activities keeps their recorded order.
+    let mut next_ordinal: Option<i64> = None;
+    for (position, activity) in activities.iter().enumerate() {
+        if activity.run_id != run_id || !seen.insert(activity.id) {
+            return Err(LoomError::invalid_request(
+                "run activity keys must be unique and match their owning run",
+            ));
+        }
+        if activity.kind != activity_data_kind(&activity.data) {
+            return Err(LoomError::invalid_request(
+                "run activity kind does not match its data",
+            ));
+        }
+        let timeline_ordinal = i64::try_from(activity.timeline_ordinal).map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "activity timeline ordinal exceeds SQLite's integer range",
+                false,
+            )
+        })?;
+        let activity_id = activity.id.as_uuid().as_bytes().to_vec();
+        let existing_ordinal: Option<i64> = transaction
             .query_row(
-                "SELECT session_id FROM run_summaries WHERE run_id=?1",
-                [run_id_bytes.as_slice()],
+                "SELECT ordinal FROM run_activities
+                     WHERE run_id=?1 AND activity_id=?2",
+                params![run_id_bytes.as_slice(), activity_id.as_slice()],
                 |row| row.get(0),
             )
+            .optional()
             .map_err(|error| {
-                persistence_error(
-                    format!("run {run_id} has no durable summary for its activities: {error}"),
-                    true,
-                )
+                persistence_error(format!("could not read activity position: {error}"), true)
             })?;
-        let mut seen = BTreeSet::new();
-        // The ordinal the next activity this save appends takes. It is read
-        // once per run and advanced for every appended activity, so a save that
-        // writes several new activities keeps their recorded order.
-        let mut next_ordinal: Option<i64> = None;
-        for (position, activity) in activities.iter().enumerate() {
-            if activity.run_id != *run_id || !seen.insert(activity.id) {
-                return Err(LoomError::invalid_request(
-                    "run activity keys must be unique and match their owning run",
-                ));
-            }
-            if activity.kind != activity_data_kind(&activity.data) {
-                return Err(LoomError::invalid_request(
-                    "run activity kind does not match its data",
-                ));
-            }
-            let timeline_ordinal = i64::try_from(activity.timeline_ordinal).map_err(|_| {
-                LoomError::new(
-                    ErrorCode::Persistence,
-                    "activity timeline ordinal exceeds SQLite's integer range",
-                    false,
-                )
-            })?;
-            let activity_id = activity.id.as_uuid().as_bytes().to_vec();
-            let existing_ordinal: Option<i64> = transaction
-                .query_row(
-                    "SELECT ordinal FROM run_activities
-                     WHERE run_id=?1 AND activity_id=?2",
-                    params![run_id_bytes.as_slice(), activity_id.as_slice()],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|error| {
-                    persistence_error(format!("could not read activity position: {error}"), true)
-                })?;
-            let ordinal = match existing_ordinal {
-                // A stored activity keeps the ordinal it was first written at.
-                // The runtime vector holds the same activities in that order,
-                // so a save updates their state and never their place.
-                Some(ordinal) => {
-                    if usize::try_from(ordinal).ok() != Some(position) {
-                        log::warn!(
-                            "[loom-persistence] run {run_id} activity {} is stored at ordinal \
+        let ordinal = match existing_ordinal {
+            // A stored activity keeps the ordinal it was first written at.
+            // The runtime vector holds the same activities in that order,
+            // so a save updates their state and never their place.
+            Some(ordinal) => {
+                if usize::try_from(ordinal).ok() != Some(position) {
+                    log::warn!(
+                        "[loom-persistence] run {run_id} activity {} is stored at ordinal \
                              {ordinal}, but its position in the saved activity list is {position}; \
                              keeping the stored ordinal",
-                            activity.id
-                        );
-                    }
-                    ordinal
+                        activity.id
+                    );
                 }
-                // An activity the save has not stored yet is appended after
-                // every stored activity of the run.
-                None => {
-                    let ordinal = match next_ordinal {
-                        Some(ordinal) => ordinal,
-                        None => next_activity_ordinal(transaction, run_id_bytes)?,
-                    };
-                    next_ordinal = Some(ordinal + 1);
-                    ordinal
-                }
-            };
+                ordinal
+            }
+            // An activity the save has not stored yet is appended after
+            // every stored activity of the run.
+            None => {
+                let ordinal = match next_ordinal {
+                    Some(ordinal) => ordinal,
+                    None => next_activity_ordinal(transaction, run_id_bytes)?,
+                };
+                next_ordinal = Some(ordinal + 1);
+                ordinal
+            }
+        };
 
-            let normalized_data = normalize_activity_tool_data(&activity.data);
-            let data = serde_json::to_vec(&normalized_data).map_err(|error| {
-                LoomError::new(
-                    ErrorCode::Internal,
-                    format!("could not encode run activity data: {error}"),
-                    false,
-                )
-            })?;
-            let data_hash = store_content(transaction, &data)?;
-            let parent_activity_id = activity
-                .parent_id
-                .map(|id| id.as_uuid().as_bytes().to_vec());
-            let step_id = activity.step_id.map(|id| id.as_uuid().as_bytes().to_vec());
-            let tool_call_id = activity_data_tool_call_id(&activity.data)
-                .map(|id| id.as_uuid().as_bytes().to_vec());
-            let started_at = i64::try_from(activity.started_at.as_unix_millis())
-                .map_err(|_| LoomError::invalid_request("activity start time is out of range"))?;
-            let completed_at = activity
-                .completed_at
-                .map(|time| {
-                    i64::try_from(time.as_unix_millis()).map_err(|_| {
-                        LoomError::invalid_request("activity end time is out of range")
-                    })
-                })
-                .transpose()?;
-            let elapsed_ms = activity
-                .elapsed_ms
-                .map(|elapsed| {
-                    i64::try_from(elapsed).map_err(|_| {
-                        LoomError::invalid_request("activity duration is out of range")
-                    })
-                })
-                .transpose()?;
-            transaction
+        let normalized_data = normalize_activity_tool_data(&activity.data);
+        let data = serde_json::to_vec(&normalized_data).map_err(|error| {
+            LoomError::new(
+                ErrorCode::Internal,
+                format!("could not encode run activity data: {error}"),
+                false,
+            )
+        })?;
+        let data_hash = store_content(transaction, &data)?;
+        let parent_activity_id = activity
+            .parent_id
+            .map(|id| id.as_uuid().as_bytes().to_vec());
+        let step_id = activity.step_id.map(|id| id.as_uuid().as_bytes().to_vec());
+        let tool_call_id =
+            activity_data_tool_call_id(&activity.data).map(|id| id.as_uuid().as_bytes().to_vec());
+        let started_at = i64::try_from(activity.started_at.as_unix_millis())
+            .map_err(|_| LoomError::invalid_request("activity start time is out of range"))?;
+        let completed_at = activity
+            .completed_at
+            .map(|time| {
+                i64::try_from(time.as_unix_millis())
+                    .map_err(|_| LoomError::invalid_request("activity end time is out of range"))
+            })
+            .transpose()?;
+        let elapsed_ms = activity
+            .elapsed_ms
+            .map(|elapsed| {
+                i64::try_from(elapsed)
+                    .map_err(|_| LoomError::invalid_request("activity duration is out of range"))
+            })
+            .transpose()?;
+        transaction
                 .execute(
                     "INSERT INTO run_activities(
                         run_id, session_id, activity_id, ordinal, timeline_ordinal, parent_activity_id,
@@ -183,7 +181,6 @@ pub(crate) fn save_run_activity_rows(
                 .map_err(|error| {
                     persistence_error(format!("could not save run activity: {error}"), true)
                 })?;
-        }
     }
     Ok(())
 }
@@ -338,8 +335,8 @@ pub(crate) fn save_run_activity_deltas(
     Ok(())
 }
 
-/// Names the call and the parts of it that differ from the stored call, so a
-/// fail-stop log says which call was refused and why.
+/// Names the call and the parts of it that differ from the stored call, so the
+/// log line and the caller's error say which call was refused and why.
 fn immutable_tool_call_message(
     call: &loom_model::ToolCall,
     session_differs: bool,
@@ -357,11 +354,90 @@ fn immutable_tool_call_message(
         parts.push("arguments");
     }
     format!(
-        "persisted logical tool call is immutable (call {} '{}' differs in: {})",
+        "{CONFINED_TOOL_CALL_PREFIX} (call {} '{}' differs in: {})",
         call.id,
         call.name,
         parts.join(", ")
     )
+}
+
+/// Writes one run's activities and their logical tool calls so a refusal of that
+/// run's stored call rolls back only the run.
+///
+/// A persisted logical tool call is immutable, so a run whose runtime carries a
+/// different value cannot be written. Its rows are rolled back and the run is
+/// named in `confined`, which lets the caller fail that run and its session
+/// while every other run of the same write commits.
+pub(crate) fn save_run_activities_rows_confined(
+    transaction: &Transaction<'_>,
+    run_id: RunId,
+    activities: &[AgentActivityRecord],
+    summaries: Option<&BTreeMap<RunId, DurableRunSummary>>,
+    confined: &mut Vec<ConfinedRun>,
+) -> Result<()> {
+    write_run_confined(transaction, run_id, confined, || {
+        save_run_activity_rows(transaction, run_id, activities)?;
+        save_run_tool_rows(transaction, run_id, activities, summaries)
+    })
+}
+
+/// Writes one run's activity deltas so a refusal of that run's stored call rolls
+/// back only the run, on the same terms as
+/// [`save_run_activities_rows_confined`].
+pub(crate) fn save_run_activity_deltas_confined(
+    transaction: &Transaction<'_>,
+    run_id: RunId,
+    activities: &[AgentActivityRecord],
+    summaries: &BTreeMap<RunId, DurableRunSummary>,
+    confined: &mut Vec<ConfinedRun>,
+) -> Result<()> {
+    write_run_confined(transaction, run_id, confined, || {
+        save_run_activity_deltas(transaction, run_id, activities, summaries)
+    })
+}
+
+/// Runs `write` inside a savepoint named after `run_id`.
+///
+/// A refusal of the run's persisted logical tool call rolls the savepoint back
+/// and names the run in `confined`; any other error is returned unchanged, so a
+/// genuine persistence failure still stops the write instead of being hidden as
+/// a confined run.
+fn write_run_confined(
+    transaction: &Transaction<'_>,
+    run_id: RunId,
+    confined: &mut Vec<ConfinedRun>,
+    write: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let savepoint = format!("loom_run_{}", encode_hash_hex(run_id.as_uuid().as_bytes()));
+    savepoint_statement(transaction, &format!("SAVEPOINT {savepoint}"), run_id)?;
+    match write() {
+        Ok(()) => savepoint_statement(transaction, &format!("RELEASE {savepoint}"), run_id),
+        Err(error) if is_confined_tool_call_refusal(&error) => {
+            savepoint_statement(transaction, &format!("ROLLBACK TO {savepoint}"), run_id)?;
+            savepoint_statement(transaction, &format!("RELEASE {savepoint}"), run_id)?;
+            log::error!(
+                "[loom-persistence] run {run_id} kept its stored logical tool call and was refused the write: {}",
+                error.message
+            );
+            confined.push(ConfinedRun { run_id, error });
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Runs one savepoint statement, naming the run it belongs to on failure.
+fn savepoint_statement(
+    transaction: &Transaction<'_>,
+    statement: &str,
+    run_id: RunId,
+) -> Result<()> {
+    transaction.execute_batch(statement).map_err(|error| {
+        persistence_error(
+            format!("could not {statement} for run {run_id}: {error}"),
+            true,
+        )
+    })
 }
 
 pub(crate) fn save_run_tool_activity_delta(
@@ -411,7 +487,7 @@ pub(crate) fn save_run_tool_activity_delta(
             || (!placeholder && stored_hash != arguments_hash)
         {
             return Err(LoomError::new(
-                ErrorCode::MalformedPayload,
+                ErrorCode::Conflict,
                 immutable_tool_call_message(
                     call,
                     stored_session != session_id,
@@ -605,163 +681,164 @@ pub(crate) fn restore_activity_tool_data(
 /// stored and would otherwise be restored without its logical call.
 pub(crate) fn save_run_tool_rows(
     transaction: &Transaction<'_>,
-    activities_by_run: &DurableRunActivities,
+    run_id: RunId,
+    activities: &[AgentActivityRecord],
     summaries: Option<&BTreeMap<RunId, DurableRunSummary>>,
 ) -> Result<()> {
-    for (run_id, activities) in activities_by_run {
-        let run_id_bytes = run_id.as_uuid().as_bytes();
-        let session_id: Vec<u8> = transaction
-            .query_row(
-                "SELECT session_id FROM run_summaries WHERE run_id=?1",
-                [run_id_bytes.as_slice()],
-                |row| row.get(0),
+    let run_id_bytes = run_id.as_uuid().as_bytes();
+    let session_id: Vec<u8> = transaction
+        .query_row(
+            "SELECT session_id FROM run_summaries WHERE run_id=?1",
+            [run_id_bytes.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("run {run_id} has no durable summary for its tool rows: {error}"),
+                true,
             )
-            .map_err(|error| {
-                persistence_error(
-                    format!("run {run_id} has no durable summary for its tool rows: {error}"),
-                    true,
-                )
-            })?;
-        let execution = summaries
-            .and_then(|summaries| summaries.get(run_id))
-            .and_then(|summary| summary.execution_state.as_ref());
-        let mut logical_calls =
-            BTreeMap::<loom_core::ToolCallId, (&loom_model::ToolCall, Timestamp)>::new();
-        let mut attempts_by_call = BTreeMap::<loom_core::ToolCallId, Vec<StoredToolAttempt>>::new();
-        for activity in activities {
-            if activity.run_id != *run_id {
-                return Err(LoomError::invalid_request(
-                    "run tool activity must match its owning run",
+        })?;
+    let execution = summaries
+        .and_then(|summaries| summaries.get(&run_id))
+        .and_then(|summary| summary.execution_state.as_ref());
+    let mut logical_calls =
+        BTreeMap::<loom_core::ToolCallId, (&loom_model::ToolCall, Timestamp)>::new();
+    let mut attempts_by_call = BTreeMap::<loom_core::ToolCallId, Vec<StoredToolAttempt>>::new();
+    for activity in activities {
+        if activity.run_id != run_id {
+            return Err(LoomError::invalid_request(
+                "run tool activity must match its owning run",
+            ));
+        }
+        let Some((call, result)) = activity_tool_data(&activity.data) else {
+            continue;
+        };
+        if let Some((existing, _)) = logical_calls.get(&call.id) {
+            if existing.name != call.name
+                || (!call.arguments.is_null() && existing.arguments != call.arguments)
+            {
+                return Err(LoomError::new(
+                    ErrorCode::Conflict,
+                    immutable_tool_call_message(
+                        call,
+                        false,
+                        existing.name != call.name,
+                        !call.arguments.is_null() && existing.arguments != call.arguments,
+                    ),
+                    false,
                 ));
             }
-            let Some((call, result)) = activity_tool_data(&activity.data) else {
-                continue;
-            };
-            if let Some((existing, _)) = logical_calls.get(&call.id) {
-                if existing.name != call.name
-                    || (!call.arguments.is_null() && existing.arguments != call.arguments)
+        } else {
+            logical_calls.insert(call.id, (call, activity.started_at));
+            let arguments = serde_json::to_vec(&call.arguments).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("could not encode tool-call arguments: {error}"),
+                    false,
+                )
+            })?;
+            if arguments.len() > MAX_TOOL_ARGUMENT_BYTES {
+                return Err(LoomError::new(
+                    ErrorCode::Persistence,
+                    "tool-call arguments exceed the maximum supported size",
+                    false,
+                ));
+            }
+            let arguments_hash = store_content(transaction, &arguments)?;
+            let created_at = encode_timestamp(activity.started_at)?;
+            let existing: Option<(Vec<u8>, String, Vec<u8>)> = transaction
+                .query_row(
+                    "SELECT session_id, name, arguments_hash FROM run_tool_calls
+                         WHERE run_id=?1 AND tool_call_id=?2",
+                    params![
+                        run_id_bytes.as_slice(),
+                        call.id.as_uuid().as_bytes().as_slice()
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(|error| {
+                    persistence_error(format!("could not read logical tool call: {error}"), true)
+                })?;
+            if let Some((stored_session, stored_name, stored_arguments_hash)) = existing {
+                if stored_session != session_id
+                    || stored_name != call.name
+                    || (!call.arguments.is_null() && stored_arguments_hash != arguments_hash)
                 {
                     return Err(LoomError::new(
-                        ErrorCode::MalformedPayload,
-                        "a logical tool call changed its name or arguments",
+                        ErrorCode::Conflict,
+                        immutable_tool_call_message(
+                            call,
+                            stored_session != session_id,
+                            stored_name != call.name,
+                            stored_arguments_hash != arguments_hash,
+                        ),
                         false,
                     ));
                 }
             } else {
-                logical_calls.insert(call.id, (call, activity.started_at));
-                let arguments = serde_json::to_vec(&call.arguments).map_err(|error| {
-                    LoomError::new(
-                        ErrorCode::MalformedPayload,
-                        format!("could not encode tool-call arguments: {error}"),
-                        false,
-                    )
-                })?;
-                if arguments.len() > MAX_TOOL_ARGUMENT_BYTES {
-                    return Err(LoomError::new(
-                        ErrorCode::Persistence,
-                        "tool-call arguments exceed the maximum supported size",
-                        false,
-                    ));
-                }
-                let arguments_hash = store_content(transaction, &arguments)?;
-                let created_at = encode_timestamp(activity.started_at)?;
-                let existing: Option<(Vec<u8>, String, Vec<u8>)> = transaction
-                    .query_row(
-                        "SELECT session_id, name, arguments_hash FROM run_tool_calls
-                         WHERE run_id=?1 AND tool_call_id=?2",
+                transaction
+                    .execute(
+                        "INSERT INTO run_tool_calls(
+                                run_id, session_id, tool_call_id, name, arguments_hash, created_at
+                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                         params![
                             run_id_bytes.as_slice(),
-                            call.id.as_uuid().as_bytes().as_slice()
+                            session_id.as_slice(),
+                            call.id.as_uuid().as_bytes().as_slice(),
+                            call.name.as_str(),
+                            arguments_hash,
+                            created_at,
                         ],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
-                    .optional()
                     .map_err(|error| {
                         persistence_error(
-                            format!("could not read logical tool call: {error}"),
+                            format!("could not save logical tool call {}: {error}", call.id),
                             true,
                         )
                     })?;
-                if let Some((stored_session, stored_name, stored_arguments_hash)) = existing {
-                    if stored_session != session_id
-                        || stored_name != call.name
-                        || (!call.arguments.is_null() && stored_arguments_hash != arguments_hash)
-                    {
-                        return Err(LoomError::new(
-                            ErrorCode::MalformedPayload,
-                            immutable_tool_call_message(
-                                call,
-                                stored_session != session_id,
-                                stored_name != call.name,
-                                stored_arguments_hash != arguments_hash,
-                            ),
-                            false,
-                        ));
-                    }
-                } else {
-                    transaction
-                        .execute(
-                            "INSERT INTO run_tool_calls(
-                                run_id, session_id, tool_call_id, name, arguments_hash, created_at
-                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                            params![
-                                run_id_bytes.as_slice(),
-                                session_id.as_slice(),
-                                call.id.as_uuid().as_bytes().as_slice(),
-                                call.name.as_str(),
-                                arguments_hash,
-                                created_at,
-                            ],
-                        )
-                        .map_err(|error| {
-                            persistence_error(
-                                format!("could not save logical tool call {}: {error}", call.id),
-                                true,
-                            )
-                        })?;
-                }
             }
-            let state = tool_attempt_state_for(activity, call, execution);
-            let started_at = encode_timestamp(activity.started_at)?;
-            let completed_at = activity.completed_at.map(encode_timestamp).transpose()?;
-            let attempts = attempts_by_call.entry(call.id).or_default();
-            let attempt_number = u32::try_from(attempts.len() + 1).map_err(|_| {
-                LoomError::new(
-                    ErrorCode::Persistence,
-                    "tool call has too many execution attempts",
-                    false,
-                )
-            })?;
-            attempts.push(StoredToolAttempt {
-                activity_id: encode_hash_hex(activity.id.as_uuid().as_bytes()),
-                attempt_number,
-                state: tool_attempt_state_name(state).to_owned(),
-                started_at,
-                completed_at,
-                result: compact_stored_result(result.cloned()),
-            });
         }
-        for (call_id, attempts) in &attempts_by_call {
-            let payload = serde_json::to_string(attempts).map_err(|error| {
-                persistence_error(format!("could not encode tool attempts: {error}"), false)
-            })?;
-            transaction
-                .execute(
-                    "UPDATE run_tool_calls SET attempts=?3
+        let state = tool_attempt_state_for(activity, call, execution);
+        let started_at = encode_timestamp(activity.started_at)?;
+        let completed_at = activity.completed_at.map(encode_timestamp).transpose()?;
+        let attempts = attempts_by_call.entry(call.id).or_default();
+        let attempt_number = u32::try_from(attempts.len() + 1).map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "tool call has too many execution attempts",
+                false,
+            )
+        })?;
+        attempts.push(StoredToolAttempt {
+            activity_id: encode_hash_hex(activity.id.as_uuid().as_bytes()),
+            attempt_number,
+            state: tool_attempt_state_name(state).to_owned(),
+            started_at,
+            completed_at,
+            result: compact_stored_result(result.cloned()),
+        });
+    }
+    for (call_id, attempts) in &attempts_by_call {
+        let payload = serde_json::to_string(attempts).map_err(|error| {
+            persistence_error(format!("could not encode tool attempts: {error}"), false)
+        })?;
+        transaction
+            .execute(
+                "UPDATE run_tool_calls SET attempts=?3
                      WHERE run_id=?1 AND tool_call_id=?2",
-                    params![
-                        run_id_bytes.as_slice(),
-                        call_id.as_uuid().as_bytes().as_slice(),
-                        payload
-                    ],
+                params![
+                    run_id_bytes.as_slice(),
+                    call_id.as_uuid().as_bytes().as_slice(),
+                    payload
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not save tool attempts for {call_id}: {error}"),
+                    true,
                 )
-                .map_err(|error| {
-                    persistence_error(
-                        format!("could not save tool attempts for {call_id}: {error}"),
-                        true,
-                    )
-                })?;
-        }
+            })?;
     }
     Ok(())
 }
