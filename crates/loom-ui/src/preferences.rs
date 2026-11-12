@@ -27,6 +27,13 @@ pub(crate) struct UiPreferences {
     pub(crate) show_issue_references: bool,
     /// Whether the session header links to the session's related pull request.
     pub(crate) show_pull_request_references: bool,
+    /// Whether the pane lists its finished projects or folds them into one
+    /// `Finished (N)` row per worker.
+    ///
+    /// `None` follows the pane's own default: a short list shows them and a
+    /// long one folds them, so an existing user sees the improvement without a
+    /// short list changing shape.
+    pub(crate) finished_projects_shown: Option<bool>,
 }
 
 impl Default for UiPreferences {
@@ -39,6 +46,8 @@ impl Default for UiPreferences {
             // Both kinds show by default; switching both off is "off".
             show_issue_references: true,
             show_pull_request_references: true,
+            // The pane decides from the list length until the user toggles it.
+            finished_projects_shown: None,
         }
     }
 }
@@ -275,6 +284,10 @@ mod tests {
         let defaults = UiPreferences::default();
         assert!(defaults.show_issue_references);
         assert!(defaults.show_pull_request_references);
+        assert_eq!(
+            defaults.finished_projects_shown, None,
+            "the pane follows the list length until the user folds the group"
+        );
     }
 
     #[test]
@@ -287,6 +300,7 @@ mod tests {
             font_scale_percent: 120,
             show_issue_references: false,
             show_pull_request_references: true,
+            finished_projects_shown: Some(false),
         };
 
         UiPreferences::save_to(&path, preferences).unwrap();
@@ -295,6 +309,7 @@ mod tests {
         assert!(serialized.contains("\"output_detail\": \"high\""));
         assert!(serialized.contains("\"theme_choice\": \"dark\""));
         assert!(serialized.contains("\"show_issue_references\": false"));
+        assert!(serialized.contains("\"finished_projects_shown\": false"));
         assert_eq!(UiPreferences::load_from(&path).unwrap(), preferences);
         assert!(!path.with_extension("json.tmp").exists());
         remove_parent(&path);
@@ -317,6 +332,23 @@ mod tests {
                 output_detail: OutputDetail::Low,
                 ..UiPreferences::default()
             }
+        );
+        remove_parent(&path);
+    }
+
+    #[test]
+    fn a_file_without_the_finished_group_setting_follows_the_default() {
+        let path = temporary_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A file written before the setting existed has no field for it, so the
+        // additive field needs no migration.
+        fs::write(&path, r#"{"show_reasoning":true}"#).unwrap();
+
+        assert_eq!(
+            UiPreferences::load_from(&path)
+                .unwrap()
+                .finished_projects_shown,
+            None
         );
         remove_parent(&path);
     }

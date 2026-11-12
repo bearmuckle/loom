@@ -682,6 +682,10 @@ pub(crate) struct LoomView {
     /// Whether the session header links to the session's related pull request.
     /// The same client-local display preference as [`Self::show_issue_references`].
     pub(crate) show_pull_request_references: bool,
+    /// Whether the left pane lists its finished projects or folds them into one
+    /// `Finished (N)` row per worker. Client-local, like the display settings
+    /// above; `None` follows the pane's own default for the list length.
+    pub(crate) finished_projects_shown: Option<bool>,
     /// The most recent successful GitHub write (a create or an update) that
     /// named one issue or pull request.
     ///
@@ -909,6 +913,10 @@ pub(crate) struct ProjectListRow {
     pub(crate) agents: Vec<ProjectAgentRow>,
     /// Whether the project or one of its agents has work in flight.
     pub(crate) active: bool,
+    /// Whether the project is finished: nothing is in flight and its own
+    /// session ended. The pane folds these rows into one group per worker so a
+    /// long list does not keep listing work that is over.
+    pub(crate) finished: bool,
     /// The project's own session pill. It colours the activity dots.
     pub(crate) status: SessionStatusPill,
     /// The pill shown beside the name, for attention states only.
@@ -951,10 +959,18 @@ impl ProjectPendingWork {
 }
 
 /// The projects owned by one worker, in list order.
+///
+/// The finished projects are kept apart from the rest so the pane can fold them
+/// into one group row: they are listed only while that group is expanded.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProjectListSection {
     pub(crate) node_id: String,
+    /// The projects still worth a row of their own, most recently active first.
     pub(crate) rows: Vec<ProjectListRow>,
+    /// The finished projects, most recently active first.
+    pub(crate) finished: Vec<ProjectListRow>,
+    /// Whether the finished group lists its rows, or only its own count.
+    pub(crate) finished_expanded: bool,
 }
 
 /// The left pane's derived content: one row per project, grouped by worker,
@@ -984,16 +1000,29 @@ pub(crate) struct ProjectListInput<'a> {
     pub(crate) pending: &'a BTreeMap<AgentSessionId, ProjectPendingWork>,
     /// The lowercased filter text. It matches project names only.
     pub(crate) filter: &'a str,
+    /// Whether the pane lists its finished projects. `None` follows the
+    /// default: a short list keeps them open, and a long one folds them.
+    pub(crate) show_finished: Option<bool>,
     pub(crate) now_millis: u64,
 }
+
+/// How many finished projects the pane lists before it folds them into a
+/// collapsed group on its own.
+///
+/// The fold is what makes a long list shorter, but on a short list it would
+/// hide one or two rows behind a control the user never needed, so the default
+/// follows the length and any explicit toggle wins over it.
+pub(crate) const FINISHED_AUTO_COLLAPSE_AT: usize = 10;
 
 /// Derive the left pane's project rows.
 ///
 /// A row is built from a project's root session; its delegated agents are
 /// summarised on the row instead of being listed. Sessions no known project
 /// snapshot covers keep a row of their own, so nothing disappears from the
-/// pane. Rows are listed newest-created first, with the incoming list position
-/// breaking ties, in the worker order `group_sessions_by_worker` reports.
+/// pane. Rows are listed most recently active first, with the incoming list
+/// position breaking ties, in the worker order `group_sessions_by_worker`
+/// reports. The finished projects of a worker are kept in a group of their own
+/// so the pane can fold them together.
 pub(crate) fn project_list_model(input: ProjectListInput<'_>) -> ProjectListModel {
     let sessions_by_id = input
         .sessions
@@ -1039,6 +1068,7 @@ pub(crate) fn project_list_model(input: ProjectListInput<'_>) -> ProjectListMode
         input.default_node_id,
     ) {
         let mut rows = Vec::new();
+        let mut finished = Vec::new();
         for session in &group {
             let root = project_roots.get(&session.id).copied();
             // An agent is summarised on its project's row, not listed.
@@ -1077,21 +1107,30 @@ pub(crate) fn project_list_model(input: ProjectListInput<'_>) -> ProjectListMode
             if !input.filter.is_empty() && !source.name.to_lowercase().contains(input.filter) {
                 continue;
             }
-            rows.push(project_list_row(
+            let row = project_list_row(
                 source,
                 agents,
                 &active_sessions,
                 input.source_labels,
                 input.pending.get(&session_id),
                 input.now_millis,
-            ));
+            );
+            if row.finished {
+                finished.push(row);
+            } else {
+                rows.push(row);
+            }
         }
-        rows.sort_by_key(|row| {
+        // The backend lists sessions by activity, and this is the order the
+        // pane wants: the project worked on this morning belongs above the one
+        // created a year ago and abandoned. The incoming position only breaks a
+        // tie, so a backend that sends no activity order still lists stably.
+        let mut recent_first = |row: &ProjectListRow| {
             (
                 std::cmp::Reverse(
                     sessions_by_id
                         .get(&row.session_id)
-                        .map(|session| session.created_at.as_unix_millis())
+                        .map(|session| session.updated_at.as_unix_millis())
                         .unwrap_or(0),
                 ),
                 positions
@@ -1099,13 +1138,22 @@ pub(crate) fn project_list_model(input: ProjectListInput<'_>) -> ProjectListMode
                     .copied()
                     .unwrap_or(usize::MAX),
             )
-        });
+        };
+        rows.sort_by_key(&mut recent_first);
+        finished.sort_by_key(recent_first);
         let rows = nest_sub_projects(rows, &sub_project_parents);
-        sections.push(ProjectListSection { node_id, rows });
+        let finished = nest_sub_projects(finished, &sub_project_parents);
+        sections.push(ProjectListSection {
+            node_id,
+            rows,
+            finished,
+            finished_expanded: false,
+        });
     }
 
     // Highlight the project that owns the active session, so selecting a sub
-    // agent keeps its project row highlighted.
+    // agent keeps its project row highlighted. A finished project is still a
+    // row: the pane keeps it reachable while its group is folded.
     let selected = sessions_by_id
         .contains_key(&input.active_session_id)
         .then(|| {
@@ -1115,10 +1163,31 @@ pub(crate) fn project_list_model(input: ProjectListInput<'_>) -> ProjectListMode
                 .unwrap_or(input.active_session_id)
         })
         .filter(|selected| {
-            sections
-                .iter()
-                .any(|section| section.rows.iter().any(|row| row.session_id == *selected))
+            sections.iter().any(|section| {
+                section
+                    .rows
+                    .iter()
+                    .chain(&section.finished)
+                    .any(|row| row.session_id == *selected)
+            })
         });
+
+    let finished_total = sections
+        .iter()
+        .map(|section| section.finished.len())
+        .sum::<usize>();
+    let show_finished = input
+        .show_finished
+        .unwrap_or(finished_total < FINISHED_AUTO_COLLAPSE_AT);
+    // A filter that matched nothing still worth a row of its own is asking for
+    // the finished projects, so it opens their group for this frame without
+    // touching the setting that decides every other frame.
+    let finished_only = !input.filter.is_empty()
+        && finished_total > 0
+        && sections.iter().all(|section| section.rows.is_empty());
+    for section in &mut sections {
+        section.finished_expanded = show_finished || finished_only;
+    }
     ProjectListModel { sections, selected }
 }
 
@@ -1142,6 +1211,15 @@ fn project_list_row(
         || agents
             .iter()
             .any(|agent| active_sessions.contains(&agent.session_id));
+    // Only an ended run marks a project finished. `Idle` is neither active nor
+    // finished: it is also the state of a project that never ran and of a
+    // session the worker restored, and hiding either would lose work the user
+    // still expects to see.
+    let finished = !active
+        && matches!(
+            session.state,
+            AgentSessionState::Completed | AgentSessionState::Failed | AgentSessionState::Cancelled
+        );
     ProjectListRow {
         session_id: session.id,
         sub_project: false,
@@ -1158,6 +1236,7 @@ fn project_list_row(
         summary: (!agents.is_empty()).then(|| agent_summary_line(&agents)),
         agents,
         active,
+        finished,
         // The dots take the colour of what the row is doing: work the client
         // started reads like work in flight instead of like an idle project.
         status: pending
@@ -2187,6 +2266,7 @@ impl LoomView {
             output_detail: OutputDetail::default(),
             show_issue_references: true,
             show_pull_request_references: true,
+            finished_projects_shown: None,
             latest_write_reference: None,
             latest_read_reference: None,
             pending_reference_calls: BTreeMap::new(),

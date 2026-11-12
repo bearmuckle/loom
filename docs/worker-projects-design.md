@@ -22,6 +22,12 @@ worker picker).
   are grouped under a collapsible per-worker header (status dot and name, then
   resources or the last load error). A single worker keeps the original flat
   list.
+- **Done — finished projects folded.** A project whose own run ended
+  (`Completed`, `Failed`, `Cancelled`) with nothing in flight is listed under one
+  `Finished (N)` row per worker, which opens and folds on click and remembers the
+  choice in the client-local UI preferences. Both groups are ordered most
+  recently active first, and the project that owns the open session keeps its row
+  even while its group is folded.
 - **Done — New project worker picker.** The New project pane has a "Run on"
   picker (default worker first) whenever more than one worker is connected.
   Choosing a worker scopes local-folder availability, clone caching, GitHub
@@ -183,6 +189,14 @@ it is. When two or more are connected, render one collapsible group per worker:
   with the rows directly below it and is omitted.
 - Projects nest with the existing session tree so delegated children keep
   nesting under their project as they do today.
+- Finished projects fold into one `Finished (N)` row at the bottom of their
+  worker's group: a project is finished when its own run ended, no agent is
+  working, and no work the client started is in flight. `Idle` is neither
+  active nor finished, because it is also the state of a project that never ran.
+  The row opens and folds on click; a filter that only matches finished projects
+  opens it for that frame, and the open project keeps its own row either way.
+- Both groups are ordered by last activity, so the top of the pane is the part
+  of it in use rather than the part created last.
 - Offline/failed workers keep their last-known projects visible but subdued,
   with an inline **Reconnect** action, instead of vanishing.
 - A **group by worker** toggle and a flat **worker badge** fallback cover users

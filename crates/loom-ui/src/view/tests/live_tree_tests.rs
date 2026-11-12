@@ -56,12 +56,13 @@ fn tree_rows(view: &LoomView) -> Vec<(AgentSessionId, String)> {
         source_labels: &BTreeMap::new(),
         pending: &BTreeMap::new(),
         filter: "",
+        show_finished: Some(true),
         now_millis: 1,
     });
     model
         .sections
         .into_iter()
-        .flat_map(|section| section.rows)
+        .flat_map(|section| section.rows.into_iter().chain(section.finished))
         .map(|row| (row.session_id, row.name))
         .collect()
 }

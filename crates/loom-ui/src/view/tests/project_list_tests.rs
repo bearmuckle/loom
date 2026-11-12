@@ -5,6 +5,7 @@
 
 use super::loom_view_render_tests::nested_project_view;
 use super::*;
+use crate::view::render::sidebar::{ProjectListEntry, project_list_section_view};
 use gpui_kit::component::Root;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{AppContext, TestAppContext, point, px, size};
@@ -32,6 +33,20 @@ fn session(
         updated_at: Timestamp::from_unix_millis(created_at),
         title_source: loom_core::SessionTitleSource::Auto,
     }
+}
+
+/// A session created and last active at different times, so a test can tell
+/// activity ordering from creation ordering.
+fn touched(
+    id: AgentSessionId,
+    name: &str,
+    state: AgentSessionState,
+    created_at: u64,
+    updated_at: u64,
+) -> AgentSessionSnapshot {
+    let mut snapshot = session(id, name, state, created_at);
+    snapshot.updated_at = Timestamp::from_unix_millis(updated_at);
+    snapshot
 }
 
 fn agent(
@@ -78,6 +93,18 @@ fn list_filtered(
     active: AgentSessionId,
     filter: &str,
 ) -> ProjectListModel {
+    list_showing(sessions, projects, active, filter, None)
+}
+
+/// Derive the list with an explicit answer for whether the finished projects
+/// are listed, which `None` leaves to the pane's own default.
+fn list_showing(
+    sessions: &[AgentSessionSnapshot],
+    projects: &[&ProjectSnapshot],
+    active: AgentSessionId,
+    filter: &str,
+    show_finished: Option<bool>,
+) -> ProjectListModel {
     let owners = BTreeMap::new();
     let source_labels = BTreeMap::new();
     let pending = BTreeMap::new();
@@ -92,12 +119,30 @@ fn list_filtered(
         source_labels: &source_labels,
         pending: &pending,
         filter,
+        show_finished,
         now_millis: 10_000,
     })
 }
 
 fn rows(model: &ProjectListModel) -> &[ProjectListRow] {
     &model.sections[0].rows
+}
+
+/// The finished projects of the first worker section.
+fn finished_rows(model: &ProjectListModel) -> &[ProjectListRow] {
+    &model.sections[0].finished
+}
+
+fn row_names(rows: &[ProjectListRow]) -> Vec<&str> {
+    rows.iter().map(|row| row.name.as_str()).collect()
+}
+
+/// The only row of a one-project pane, whichever group holds it.
+fn only_row(model: &ProjectListModel) -> &ProjectListRow {
+    rows(model)
+        .first()
+        .or_else(|| finished_rows(model).first())
+        .expect("the project keeps a row in one of the groups")
 }
 
 /// A delegated agent is summarised on its project's row instead of being listed
@@ -429,26 +474,299 @@ fn a_looping_branch_chain_is_listed_rather_than_dropped() {
     assert_eq!(names, ["One", "Two"]);
 }
 
-/// Rows are listed newest-created first, not in the activity order the backend
-/// returns.
+/// Rows are listed most recently active first, not newest created first: a
+/// project created a year ago but worked on this morning belongs above one
+/// created yesterday and abandoned.
 #[test]
-fn projects_are_listed_newest_created_first() {
-    let older = AgentSessionId::new();
-    let newer = AgentSessionId::new();
-    // The backend lists by most-recent activity, so the older project arrives
-    // first because it was touched last.
+fn projects_are_listed_most_recently_active_first() {
+    let worked_on = AgentSessionId::new();
+    let abandoned = AgentSessionId::new();
+    // The backend lists by most-recent activity, so the project touched last
+    // arrives first.
     let sessions = vec![
-        session(older, "Older", AgentSessionState::Idle, 1),
-        session(newer, "Newer", AgentSessionState::Idle, 2),
+        touched(worked_on, "Worked on", AgentSessionState::Executing, 1, 900),
+        touched(
+            abandoned,
+            "Abandoned",
+            AgentSessionState::Executing,
+            800,
+            800,
+        ),
     ];
 
-    let model = list(&sessions, &[], newer);
+    let model = list(&sessions, &[], worked_on);
 
-    let names = rows(&model)
-        .iter()
-        .map(|row| row.name.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(names, ["Newer", "Older"]);
+    assert_eq!(row_names(rows(&model)), ["Worked on", "Abandoned"]);
+}
+
+/// The incoming position breaks a tie, so two projects the backend reports at
+/// the same time keep the order it sent them in.
+#[test]
+fn projects_touched_at_the_same_time_keep_the_list_order() {
+    let first = AgentSessionId::new();
+    let second = AgentSessionId::new();
+    let sessions = vec![
+        touched(first, "First", AgentSessionState::Executing, 5, 500),
+        touched(second, "Second", AgentSessionState::Executing, 1, 500),
+    ];
+
+    let model = list(&sessions, &[], first);
+
+    assert_eq!(row_names(rows(&model)), ["First", "Second"]);
+}
+
+/// Only a project whose own run ended counts as finished. `Idle` is neither
+/// active nor finished: it is also the state of a project that never ran and of
+/// a session the worker restored, so folding it away would hide work the user
+/// still expects to see.
+#[test]
+fn only_an_ended_project_is_finished() {
+    for (state, finished) in [
+        (AgentSessionState::Completed, true),
+        (AgentSessionState::Failed, true),
+        (AgentSessionState::Cancelled, true),
+        (AgentSessionState::Idle, false),
+        (AgentSessionState::Queued, false),
+        (AgentSessionState::Planning, false),
+        (AgentSessionState::Executing, false),
+        (AgentSessionState::Evaluating, false),
+        (AgentSessionState::AwaitingApproval, false),
+        (AgentSessionState::NeedsInput, false),
+        (AgentSessionState::Paused, false),
+    ] {
+        let id = AgentSessionId::new();
+        let sessions = vec![session(id, "Project", state, 1)];
+
+        let model = list(&sessions, &[], id);
+
+        let listed = if finished { 0 } else { 1 };
+        assert_eq!(rows(&model).len(), listed, "{state:?}");
+        assert_eq!(finished_rows(&model).len(), 1 - listed, "{state:?}");
+        assert_eq!(only_row(&model).finished, finished, "{state:?}");
+    }
+}
+
+/// A running agent keeps its project out of the finished group even though the
+/// project's own session ended.
+#[test]
+fn a_running_agent_keeps_its_project_listed() {
+    let root = AgentSessionId::new();
+    let child = AgentSessionId::new();
+    let project_id = ProjectId::from_uuid(*root.as_uuid());
+    let sessions = vec![
+        session(root, "Project", AgentSessionState::Completed, 1),
+        session(child, "Worker", AgentSessionState::Executing, 2),
+    ];
+    let snapshot = project(
+        root,
+        vec![
+            agent(root, project_id, None, AgentSessionState::Completed),
+            agent(child, project_id, Some(root), AgentSessionState::Executing),
+        ],
+    );
+
+    let model = list(&sessions, &[&snapshot], root);
+
+    assert_eq!(rows(&model).len(), 1);
+    assert!(finished_rows(&model).is_empty());
+    assert!(!rows(&model)[0].finished);
+}
+
+/// Work the client started keeps a finished project listed until the worker
+/// answers, because the row is doing something right now.
+#[test]
+fn work_in_flight_keeps_a_finished_project_listed() {
+    let id = AgentSessionId::new();
+    let sessions = vec![session(id, "Project", AgentSessionState::Completed, 1)];
+    let owners = BTreeMap::new();
+    let node_order = Vec::new();
+    let source_labels = BTreeMap::new();
+    let pending = BTreeMap::from([(
+        id,
+        ProjectPendingWork {
+            kind: ProjectPendingWorkKind::Archiving,
+            detail: "Archiving…".to_owned(),
+        },
+    )]);
+
+    let model = project_list_model(ProjectListInput {
+        sessions: &sessions,
+        owners: &owners,
+        node_order: &node_order,
+        default_node_id: "node",
+        projects: &[],
+        active_session_id: id,
+        source_labels: &source_labels,
+        pending: &pending,
+        filter: "",
+        show_finished: None,
+        now_millis: 10_000,
+    });
+
+    assert_eq!(rows(&model).len(), 1);
+    assert!(finished_rows(&model).is_empty());
+}
+
+/// The finished projects keep the same activity order as the rest of the pane.
+#[test]
+fn finished_projects_are_listed_most_recently_active_first() {
+    let recent = AgentSessionId::new();
+    let old = AgentSessionId::new();
+    let sessions = vec![
+        touched(old, "Old", AgentSessionState::Completed, 1, 100),
+        touched(recent, "Recent", AgentSessionState::Completed, 2, 200),
+    ];
+
+    let model = list(&sessions, &[], AgentSessionId::new());
+
+    assert_eq!(row_names(finished_rows(&model)), ["Recent", "Old"]);
+}
+
+/// Each worker folds its own finished projects, so one worker's dormant
+/// projects never change another worker's section.
+#[test]
+fn each_worker_folds_its_own_finished_projects() {
+    let first = AgentSessionId::new();
+    let second = AgentSessionId::new();
+    let sessions = vec![
+        session(first, "First", AgentSessionState::Completed, 1),
+        session(second, "Second", AgentSessionState::Completed, 2),
+    ];
+    let owners = BTreeMap::from([(first, "node-a".to_owned()), (second, "node-b".to_owned())]);
+    let node_order = vec!["node-a".to_owned(), "node-b".to_owned()];
+    let source_labels = BTreeMap::new();
+    let pending = BTreeMap::new();
+
+    let model = project_list_model(ProjectListInput {
+        sessions: &sessions,
+        owners: &owners,
+        node_order: &node_order,
+        default_node_id: "node-a",
+        projects: &[],
+        active_session_id: first,
+        source_labels: &source_labels,
+        pending: &pending,
+        filter: "",
+        show_finished: None,
+        now_millis: 10_000,
+    });
+
+    assert_eq!(model.sections.len(), 2);
+    assert_eq!(row_names(&model.sections[0].finished), ["First"]);
+    assert_eq!(row_names(&model.sections[1].finished), ["Second"]);
+    assert!(model.sections.iter().all(|section| section.rows.is_empty()));
+}
+
+/// A short list keeps its finished projects open and a long one folds them, so
+/// an existing user sees the list get shorter without a short list changing
+/// shape. An explicit choice wins over the default either way.
+#[test]
+fn a_long_list_folds_its_finished_projects_by_default() {
+    let finished = |count: usize| {
+        (0..count)
+            .map(|index| {
+                session(
+                    AgentSessionId::new(),
+                    &format!("Done {index}"),
+                    AgentSessionState::Completed,
+                    index as u64 + 2,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let open = AgentSessionId::new();
+    let open_session = session(open, "Open", AgentSessionState::Idle, 1);
+
+    let mut short = finished(FINISHED_AUTO_COLLAPSE_AT - 1);
+    short.push(open_session.clone());
+    let model = list(&short, &[], open);
+    assert!(
+        model.sections[0].finished_expanded,
+        "a short list keeps its finished projects open"
+    );
+
+    let mut long = finished(FINISHED_AUTO_COLLAPSE_AT);
+    long.push(open_session.clone());
+    let model = list(&long, &[], open);
+    assert!(
+        !model.sections[0].finished_expanded,
+        "a long list folds them into one row"
+    );
+    assert_eq!(finished_rows(&model).len(), FINISHED_AUTO_COLLAPSE_AT);
+
+    let sessions = vec![
+        open_session,
+        session(
+            AgentSessionId::new(),
+            "Done",
+            AgentSessionState::Completed,
+            2,
+        ),
+    ];
+    assert!(list_showing(&sessions, &[], open, "", Some(true)).sections[0].finished_expanded);
+    assert!(!list_showing(&sessions, &[], open, "", Some(false)).sections[0].finished_expanded);
+}
+
+/// A filter that only a finished project matches opens their group for that
+/// frame, without changing the setting behind it.
+#[test]
+fn a_filter_that_only_matches_finished_projects_opens_the_group() {
+    let live = AgentSessionId::new();
+    let done = AgentSessionId::new();
+    let sessions = vec![
+        session(live, "Live work", AgentSessionState::Executing, 2),
+        session(done, "Done thing", AgentSessionState::Completed, 1),
+    ];
+
+    let only_finished = list_showing(&sessions, &[], live, "done", Some(false));
+    assert!(rows(&only_finished).is_empty());
+    assert_eq!(row_names(finished_rows(&only_finished)), ["Done thing"]);
+    assert!(
+        only_finished.sections[0].finished_expanded,
+        "the only match must be listed, not folded away"
+    );
+
+    let live_match = list_showing(&sessions, &[], live, "live", Some(false));
+    assert_eq!(row_names(rows(&live_match)), ["Live work"]);
+    assert!(
+        !live_match.sections[0].finished_expanded,
+        "a match among the listed projects leaves the group folded"
+    );
+}
+
+/// The project that owns the open session keeps its row even under a folded
+/// group, so opening a finished project never hides the row it was opened from.
+#[test]
+fn the_open_project_keeps_its_row_under_a_folded_group() {
+    let open = AgentSessionId::new();
+    let other = AgentSessionId::new();
+    let sessions = vec![
+        session(open, "Open", AgentSessionState::Completed, 2),
+        session(other, "Other", AgentSessionState::Completed, 1),
+    ];
+
+    let model = list_showing(&sessions, &[], open, "", Some(false));
+    assert_eq!(model.selected, Some(open));
+    assert!(!model.sections[0].finished_expanded);
+    let entries = project_list_section_view(&model.sections[0], model.selected).entries;
+    assert_eq!(entries.len(), 2, "one group row and the open project's row");
+    assert!(matches!(
+        entries[0],
+        ProjectListEntry::Finished {
+            count: 2,
+            expanded: false
+        }
+    ));
+    assert!(matches!(&entries[1], ProjectListEntry::Project(row) if row.session_id == open));
+
+    let model = list_showing(&sessions, &[], open, "", Some(true));
+    assert_eq!(
+        project_list_section_view(&model.sections[0], model.selected)
+            .entries
+            .len(),
+        3,
+        "an open group lists the group row and both projects"
+    );
 }
 
 /// The filter matches project names only: it never keeps a project because one
@@ -606,7 +924,7 @@ fn only_attention_states_show_a_pill() {
         let sessions = vec![session(id, "Project", state, 1)];
         let model = list(&sessions, &[], id);
         assert_eq!(
-            rows(&model)[0].attention.map(|pill| pill.label),
+            only_row(&model).attention.map(|pill| pill.label),
             Some(label)
         );
     }
@@ -618,7 +936,7 @@ fn only_attention_states_show_a_pill() {
         let id = AgentSessionId::new();
         let sessions = vec![session(id, "Project", state, 1)];
         let model = list(&sessions, &[], id);
-        assert_eq!(rows(&model)[0].attention, None);
+        assert_eq!(only_row(&model).attention, None);
     }
 }
 
@@ -643,6 +961,7 @@ fn the_detail_line_prefers_the_source_and_falls_back_to_the_update_time() {
         source_labels: &no_labels,
         pending: &no_pending,
         filter: "",
+        show_finished: None,
         now_millis: 10_000,
     });
     assert_eq!(rows(&unknown)[0].detail, "updated just now");
@@ -658,6 +977,7 @@ fn the_detail_line_prefers_the_source_and_falls_back_to_the_update_time() {
         source_labels: &source_labels,
         pending: &no_pending,
         filter: "",
+        show_finished: None,
         now_millis: 10_000,
     });
     assert_eq!(rows(&known)[0].detail, "bearmuckle/loom");
@@ -693,6 +1013,7 @@ fn a_project_being_set_up_reports_the_step_and_stays_active() {
         source_labels: &source_labels,
         pending: &pending,
         filter: "",
+        show_finished: None,
         now_millis: 10_000,
     });
 
@@ -746,6 +1067,7 @@ fn a_project_being_archived_reports_the_request() {
         source_labels: &source_labels,
         pending: &pending,
         filter: "",
+        show_finished: None,
         now_millis: 10_000,
     });
 
@@ -1701,6 +2023,75 @@ mod automatic_title_tests {
         })
         .unwrap();
     }
+}
+
+/// The pane folds its finished projects into one row per worker, and clicking
+/// that row lists them and folds them again.
+#[gpui_kit::test]
+fn clicking_the_finished_group_folds_and_lists_the_projects(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let rendered = Rc::new(RefCell::new(None));
+    let rendered_for_window = rendered.clone();
+    let handle = cx.open_window(size(px(1280.), px(800.)), move |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            let node_id = view.default_backend_node_id.clone();
+            let mut open = view.active_session.clone();
+            open.name = "Open".to_owned();
+            open.state = AgentSessionState::Idle;
+            let mut finished = open.clone();
+            finished.id = AgentSessionId::new();
+            finished.name = "Finished one".to_owned();
+            finished.state = AgentSessionState::Completed;
+            let mut second_finished = finished.clone();
+            second_finished.id = AgentSessionId::new();
+            second_finished.name = "Finished two".to_owned();
+            view.sessions = vec![open.clone(), finished, second_finished];
+            view.active_session = open;
+            for session in &view.sessions {
+                view.session_node_ids.insert(session.id, node_id.clone());
+            }
+            view
+        });
+        *rendered_for_window.borrow_mut() = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let view = rendered
+        .borrow_mut()
+        .take()
+        .expect("the window built the view");
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        // A short list keeps the group open: the open project, the group row,
+        // then the two finished projects.
+        assert!(window.find(("project-row", 0usize)).visible());
+        assert!(window.find(("project-finished-group", 1usize)).visible());
+        assert!(window.find(("project-row", 2usize)).visible());
+        window.click(("project-finished-group", 1usize), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).finished_projects_shown, Some(false));
+        assert!(
+            window.try_find(("project-row", 2usize)).is_none(),
+            "a folded group lists none of its projects"
+        );
+        assert!(
+            window.find(("project-row", 0usize)).visible(),
+            "the open project keeps its row"
+        );
+        window.click(("project-finished-group", 1usize), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).finished_projects_shown, Some(true));
+        assert!(window.find(("project-row", 2usize)).visible());
+    })
+    .unwrap();
 }
 
 /// The pane says so when it has no projects to list.

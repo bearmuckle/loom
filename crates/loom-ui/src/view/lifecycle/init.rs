@@ -778,6 +778,7 @@ impl LoomView {
             browser_startup_error: None,
             browser_starting: false,
             browser_connection_lost: None,
+            finished_projects_shown: preferences.finished_projects_shown,
         };
         if discover_models {
             view.refresh_models();
@@ -1193,6 +1194,7 @@ impl LoomView {
             browser_startup_error: startup_error,
             browser_starting: options.is_configured() && !options.demo(),
             browser_connection_lost: None,
+            finished_projects_shown: preferences.finished_projects_shown,
         };
         view.collaboration = demo_collaboration.unwrap_or_default();
         view
@@ -1441,6 +1443,7 @@ impl LoomView {
             browser_startup_error: None,
             browser_starting: false,
             browser_connection_lost: None,
+            finished_projects_shown: preferences.finished_projects_shown,
         }
     }
 
@@ -1826,6 +1829,7 @@ impl LoomView {
             browser_startup_error: None,
             browser_starting: false,
             browser_connection_lost: None,
+            finished_projects_shown: preferences.finished_projects_shown,
         };
         cleanup_guard.disarm();
         Ok(view)

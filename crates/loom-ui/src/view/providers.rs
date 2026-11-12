@@ -1378,6 +1378,7 @@ impl LoomView {
             font_scale_percent: self.font_scale_percent,
             show_issue_references: self.show_issue_references,
             show_pull_request_references: self.show_pull_request_references,
+            finished_projects_shown: self.finished_projects_shown,
         }
         .save();
     }

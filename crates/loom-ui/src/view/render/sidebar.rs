@@ -84,11 +84,78 @@ impl ProjectListData {
     }
 }
 
+/// One entry of the pane's list: a project row, or the row that folds a
+/// worker's finished projects.
+///
+/// The group is an entry of the same list rather than a container, so the
+/// virtual list keeps one item size and the keyboard keeps one set of
+/// coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum ProjectListEntry {
+    Project(ProjectListRow),
+    Finished { count: usize, expanded: bool },
+}
+
+/// What selecting one entry does.
+enum ProjectPaneAction {
+    /// Open the project the row selects.
+    Open(AgentSessionId),
+    /// List or fold the finished projects of the pane.
+    ToggleFinished(bool),
+}
+
+/// One worker's list entries, in list order.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ProjectListSectionView {
+    pub(crate) node_id: String,
+    pub(crate) entries: Vec<ProjectListEntry>,
+}
+
+/// The list entries of one worker section: its projects, then the row that
+/// folds its finished projects, then those projects while the group is open.
+///
+/// The project that owns the open session keeps its row even while the group is
+/// folded, so opening a finished project never hides the row it was opened
+/// from.
+pub(crate) fn project_list_section_view(
+    section: &ProjectListSection,
+    selected: Option<AgentSessionId>,
+) -> ProjectListSectionView {
+    let mut entries = Vec::with_capacity(section.rows.len() + section.finished.len() + 1);
+    entries.extend(section.rows.iter().cloned().map(ProjectListEntry::Project));
+    if !section.finished.is_empty() {
+        entries.push(ProjectListEntry::Finished {
+            count: section.finished.len(),
+            expanded: section.finished_expanded,
+        });
+        if section.finished_expanded {
+            entries.extend(
+                section
+                    .finished
+                    .iter()
+                    .cloned()
+                    .map(ProjectListEntry::Project),
+            );
+        } else if let Some(row) = section
+            .finished
+            .iter()
+            .find(|row| Some(row.session_id) == selected)
+        {
+            // Folded: only the project the user is looking at keeps its row.
+            entries.push(ProjectListEntry::Project(row.clone()));
+        }
+    }
+    ProjectListSectionView {
+        node_id: section.node_id.clone(),
+        entries,
+    }
+}
+
 /// The content the project list was last handed, kept so the view can skip
 /// redundant updates instead of rebuilding the list on every frame.
 #[derive(Clone, Debug)]
 pub(crate) struct ProjectListView {
-    pub(crate) sections: Vec<ProjectListSection>,
+    pub(crate) sections: Vec<ProjectListSectionView>,
     pub(crate) headers: Vec<WorkerSectionHeader>,
     pub(crate) layout: ResponsiveLayout,
     /// The snapshots rows resolve their menus from, shared with every row.
@@ -110,15 +177,23 @@ impl ProjectListView {
     /// The list coordinates of a project row.
     fn index_of(&self, session_id: AgentSessionId) -> Option<IndexPath> {
         for (section, listed) in self.sections.iter().enumerate() {
-            if let Some(row) = listed
-                .rows
-                .iter()
-                .position(|row| row.session_id == session_id)
-            {
+            if let Some(row) = listed.entries.iter().position(|entry| {
+                matches!(entry, ProjectListEntry::Project(row) if row.session_id == session_id)
+            }) {
                 return Some(IndexPath::new(row).section(section));
             }
         }
         None
+    }
+
+    /// What selecting one entry does.
+    fn action_at(&self, ix: IndexPath) -> Option<ProjectPaneAction> {
+        match self.sections.get(ix.section)?.entries.get(ix.row)? {
+            ProjectListEntry::Project(row) => Some(ProjectPaneAction::Open(row.session_id)),
+            ProjectListEntry::Finished { expanded, .. } => {
+                Some(ProjectPaneAction::ToggleFinished(!expanded))
+            }
+        }
     }
 
     /// The flat number of a row. Element ids and the activity animation are
@@ -128,7 +203,7 @@ impl ProjectListView {
         self.sections
             .iter()
             .take(ix.section)
-            .map(|section| section.rows.len())
+            .map(|section| section.entries.len())
             .sum::<usize>()
             + ix.row
     }
@@ -174,7 +249,7 @@ impl ListDelegate for ProjectListDelegate {
         self.content
             .sections
             .get(section)
-            .map_or(0, |section| section.rows.len())
+            .map_or(0, |section| section.entries.len())
     }
 
     fn render_item(
@@ -183,16 +258,21 @@ impl ListDelegate for ProjectListDelegate {
         _window: &mut Window,
         _cx: &mut Context<ListState<Self>>,
     ) -> Option<ListItem> {
-        let row = self.content.sections.get(ix.section)?.rows.get(ix.row)?;
+        let entry = self.content.sections.get(ix.section)?.entries.get(ix.row)?;
         let row_index = self.content.row_number(ix);
         let view = self.view.upgrade();
-        Some(render_project_row(
-            row,
-            row_index,
-            self.content.layout,
-            view.as_ref(),
-            &self.content.data,
-        ))
+        Some(match entry {
+            ProjectListEntry::Project(row) => render_project_row(
+                row,
+                row_index,
+                self.content.layout,
+                view.as_ref(),
+                &self.content.data,
+            ),
+            ProjectListEntry::Finished { count, expanded } => {
+                render_finished_group_row(*count, *expanded, row_index, self.content.layout)
+            }
+        })
     }
 
     fn render_section_header(
@@ -319,6 +399,49 @@ fn render_empty_project_list() -> impl IntoElement {
                 .text_xs()
                 .text_color(rgb(0x64748b))
                 .child("Create a project to start the list"),
+        )
+}
+
+/// Renders the row that folds a worker's finished projects: how many there are
+/// and a chevron for the state of the group.
+///
+/// It is a list item like a project row and shares its height, because the
+/// virtual list lays every item out at one measured size.
+fn render_finished_group_row(
+    count: usize,
+    expanded: bool,
+    row_index: usize,
+    layout: ResponsiveLayout,
+) -> ListItem {
+    let label = format!("Finished ({count})");
+    ListItem::new(("project-finished-group", row_index))
+        .mx_1()
+        .rounded_md()
+        .px_2()
+        .py_0()
+        .h(project_row_height(layout))
+        .child(
+            div()
+                .id(("project-finished-group-content", row_index))
+                .test_support()
+                .aria_label(label.clone())
+                .w_full()
+                .h_full()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(disclosure_chevron(expanded, rgb(0x64748b)))
+                .child(
+                    div()
+                        .id(("project-finished-label", row_index))
+                        .test_support()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_size(layout.nav_row_font_size())
+                        .text_color(rgb(0x8f98a6))
+                        .child(label),
+                ),
         )
 }
 
@@ -775,6 +898,7 @@ impl LoomView {
             source_labels: &self.session_sources,
             pending: &self.session_pending_work,
             filter: &filter,
+            show_finished: self.finished_projects_shown,
             now_millis: Timestamp::now().as_unix_millis(),
         });
         let headers = model
@@ -792,7 +916,11 @@ impl LoomView {
             _ => Rc::new(ProjectListData::new(&self.sessions, &projects)),
         };
         let view_content = ProjectListView {
-            sections: model.sections,
+            sections: model
+                .sections
+                .iter()
+                .map(|section| project_list_section_view(section, model.selected))
+                .collect(),
             headers,
             layout,
             data,
@@ -821,6 +949,27 @@ impl LoomView {
 
         let changed = self.project_list_view.as_ref() != Some(&view_content);
         if changed {
+            // How much of the pane the fold saved, in one line: the row count is
+            // what the complaint was about, so it is worth reading off a log.
+            log::debug!(
+                "project list: {} section(s), {} row(s) for {} project(s), {} finished",
+                view_content.sections.len(),
+                view_content
+                    .sections
+                    .iter()
+                    .map(|section| section.entries.len())
+                    .sum::<usize>(),
+                model
+                    .sections
+                    .iter()
+                    .map(|section| section.rows.len() + section.finished.len())
+                    .sum::<usize>(),
+                model
+                    .sections
+                    .iter()
+                    .map(|section| section.finished.len())
+                    .sum::<usize>(),
+            );
             list.update(cx, |state, cx| {
                 state.delegate_mut().set_content(view_content.clone());
                 cx.notify();
@@ -847,26 +996,47 @@ impl LoomView {
     }
 
     /// Handles the list's own events: a click or Enter opens the project under
-    /// the highlight, while Up/Down only move it.
+    /// the highlight, while Up/Down only move it. The finished group's own row
+    /// folds or lists its projects instead of opening one.
     fn on_project_list_event(&mut self, event: &ListEvent, cx: &mut Context<Self>) {
         let ListEvent::Confirm(ix) = event else {
             return;
         };
-        let session_id = self
+        let Some(action) = self
             .project_list_view
             .as_ref()
-            .and_then(|view| view.sections.get(ix.section))
-            .and_then(|section| section.rows.get(ix.row))
-            .map(|row| row.session_id);
-        let Some(session) = session_id.and_then(|session_id| {
-            self.sessions
-                .iter()
-                .find(|session| session.id == session_id)
-                .cloned()
-        }) else {
+            .and_then(|view| view.action_at(*ix))
+        else {
             return;
         };
-        self.navigate_to_session(session, cx);
+        match action {
+            ProjectPaneAction::ToggleFinished(shown) => {
+                self.set_finished_projects_shown(shown, cx);
+            }
+            ProjectPaneAction::Open(session_id) => {
+                let Some(session) = self
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == session_id)
+                    .cloned()
+                else {
+                    return;
+                };
+                self.navigate_to_session(session, cx);
+            }
+        }
+    }
+
+    /// Lists or folds the pane's finished projects, and keeps the choice for the
+    /// next launch. The setting is client-local: it changes nothing the worker
+    /// or another client sees, and it archives nothing.
+    pub(crate) fn set_finished_projects_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
+        if self.finished_projects_shown == Some(shown) {
+            return;
+        }
+        self.finished_projects_shown = Some(shown);
+        self.persist_ui_preferences();
+        cx.notify();
     }
 
     /// Opens a session from the left pane. A project row and an agent's
