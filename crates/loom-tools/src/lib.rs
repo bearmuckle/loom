@@ -4576,6 +4576,15 @@ pub fn tool_guidance(definitions: &[ToolDefinition]) -> Option<String> {
             "Call ask_user when you need information only the user can provide instead of guessing; pass `options` when the answer is a choice among a few answers, so the user can pick one instead of typing.".to_owned(),
         );
     }
+    if present(ToolKind::Decide) {
+        // The tool's own description is deliberately discouraging, so without
+        // this line the model sees an optional tool with no moment to use it and
+        // calls it rarely and arbitrarily. The advisory contract stays in the
+        // description; this only names when the question is worth asking.
+        guidance.push(
+            "Call decide when ambiguous evidence leaves two or three plausible interpretations and a short closed question would settle which one to investigate next. Treat the answer as one input, never as approval or proof.".to_owned(),
+        );
+    }
     if present(ToolKind::ClaimGoalReached) {
         guidance.push(
             "The session has a goal, so the run does not finish on a plain reply: keep working until you can call claim_goal_reached with the evidence that shows the goal is reached, and use ask_user when you instead need the user.".to_owned(),
@@ -6391,6 +6400,7 @@ mod tests {
         assert!(guidance.contains("Explore the workspace"));
         assert!(!guidance.contains("run_command"));
         assert!(!guidance.contains("approval"));
+        assert!(!guidance.contains("decide"), "{guidance}");
 
         let with_command = tool_definitions()
             .into_iter()
@@ -6421,6 +6431,20 @@ mod tests {
             .collect::<Vec<_>>();
         let guidance = tool_guidance(&without_fetch).expect("file guidance");
         assert!(!guidance.contains("git credentials"), "{guidance}");
+
+        // The decide tool is advertised only when the workspace switch is on and
+        // a decider key resolves, so the prompt names it and its advisory limit
+        // only for the runs that can call it.
+        let with_decide = tool_definitions()
+            .into_iter()
+            .filter(|definition| matches!(definition.name.as_str(), "read_file" | "decide"))
+            .collect::<Vec<_>>();
+        let guidance = tool_guidance(&with_decide).expect("decide guidance");
+        assert!(guidance.contains("Call decide when"), "{guidance}");
+        assert!(
+            guidance.contains("never as approval or proof"),
+            "{guidance}"
+        );
     }
 
     #[test]
