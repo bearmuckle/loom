@@ -5,6 +5,13 @@ pub struct RemoteServerConfig {
     pub bind_addr: SocketAddr,
     pub path: String,
     pub heartbeat_interval: Duration,
+    /// How long one request waits for its blocking operation before the caller
+    /// is answered as abandoned. It defaults to [`DEFAULT_REQUEST_TIMEOUT`].
+    ///
+    /// A request that transfers a source is never given less than
+    /// [`SOURCE_TRANSFER_TIMEOUT`], so a project created from a large
+    /// repository, or from one behind a slow link, is not abandoned while its
+    /// clone is still running.
     pub request_timeout: Duration,
     /// Most bytes the listener accepts in one inbound WebSocket frame. It
     /// defaults to [`DEFAULT_MAX_FRAME_BYTES`] (4 MiB) and is raised with
@@ -587,6 +594,23 @@ impl ConnectionLimits {
     }
 }
 
+/// The deadline one request waits under.
+///
+/// A request that transfers a source clones a repository or copies a folder, so
+/// its duration is the transfer's rather than the worker's own latency. Waiting
+/// the ordinary request timeout for it answered a project created from a large
+/// repository, or from one behind a slow link, as abandoned while its clone was
+/// still running. Such a request is bounded by [`SOURCE_TRANSFER_TIMEOUT`]
+/// instead. A configured request timeout above that value still applies, because
+/// the more patient of the two bounds is the one the operator asked for.
+pub(super) fn request_deadline(request: &ClientRequest, configured: Duration) -> Duration {
+    if request.transfers_source() {
+        configured.max(SOURCE_TRANSFER_TIMEOUT)
+    } else {
+        configured
+    }
+}
+
 /// The error that answers a request whose waiting future was abandoned.
 ///
 /// Cancellation and the request deadline stop only the *wait*: the operation
@@ -867,7 +891,7 @@ pub(super) async fn process_text(
             return None;
         }
     };
-    let request_timeout = limits.request_timeout;
+    let request_timeout = request_deadline(&request.request, limits.request_timeout);
     let connection = connection.clone();
     let outgoing = outgoing.clone();
     let control = control.clone();

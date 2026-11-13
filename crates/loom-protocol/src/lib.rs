@@ -132,6 +132,16 @@ fn default_sub_agent_retention_ms() -> Option<u64> {
     Some(DEFAULT_SUB_AGENT_RETENTION_MS)
 }
 
+/// How long a request that transfers a source may wait for its answer.
+///
+/// Cloning a repository or copying a folder lasts as long as the transfer does,
+/// not as long as the worker's own latency, which is what the ordinary request
+/// deadline bounds. A request that transfers a source is therefore bounded by
+/// this value instead, so a large repository or a slow link finishes instead of
+/// being abandoned by whoever waits for it; see
+/// [`ClientRequest::transfers_source`].
+pub const SOURCE_TRANSFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 impl Default for ArchiveRetentionPolicy {
     fn default() -> Self {
         Self {
@@ -1011,6 +1021,71 @@ impl ClientRequest {
                 | Self::Access(AccessRequest::DenySessionAccessRequest { .. })
                 | Self::Access(AccessRequest::WithdrawSessionAccessRequest { .. })
         )
+    }
+
+    /// Whether this request transfers a source into a session.
+    ///
+    /// These are the requests that clone a repository or copy a folder, so
+    /// their duration is the transfer's: see [`SOURCE_TRANSFER_TIMEOUT`].
+    pub const fn transfers_source(&self) -> bool {
+        matches!(
+            self,
+            Self::Repository(RepositoryRequest::AttachSessionRepository { .. })
+                | Self::Filesystem(FilesystemRequest::ImportSessionDirectory { .. })
+                | Self::Filesystem(FilesystemRequest::AttachSessionDirectory { .. })
+        )
+    }
+}
+
+#[cfg(test)]
+mod source_transfer_request_tests {
+    use super::*;
+
+    /// The requests that bring a repository or folder into a session are the
+    /// ones whose duration is the transfer's, so they are the ones a waiter
+    /// bounds by [`SOURCE_TRANSFER_TIMEOUT`] instead of the request default.
+    #[test]
+    fn cloning_or_copying_a_source_is_classified_as_a_transfer() {
+        let session_id = AgentSessionId::new();
+        for request in [
+            ClientRequest::Repository(RepositoryRequest::AttachSessionRepository {
+                session_id,
+                source: "https://github.com/owner/name.git".to_owned(),
+                path: "repositories/name".to_owned(),
+                revision: None,
+                reuse_local: false,
+            }),
+            ClientRequest::Filesystem(FilesystemRequest::ImportSessionDirectory {
+                session_id,
+                source: "/tmp/source".to_owned(),
+                path: "sources/source".to_owned(),
+            }),
+            ClientRequest::Filesystem(FilesystemRequest::AttachSessionDirectory {
+                session_id,
+                source: "/tmp/source".to_owned(),
+                path: "sources/source".to_owned(),
+            }),
+        ] {
+            assert!(request.transfers_source(), "{request:?}");
+        }
+
+        for request in [
+            ClientRequest::Repository(RepositoryRequest::ListSessionRepositories { session_id }),
+            ClientRequest::Filesystem(FilesystemRequest::ListSessionDirectories { session_id }),
+            ClientRequest::Repository(RepositoryRequest::DetachSessionRepository {
+                session_id,
+                repository_id: RepositoryId::new(),
+            }),
+        ] {
+            assert!(!request.transfers_source(), "{request:?}");
+        }
+
+        // The deadline is long enough to cover a large checkout on a slow link,
+        // which is the case the ordinary request deadline abandoned.
+        assert_eq!(
+            SOURCE_TRANSFER_TIMEOUT,
+            std::time::Duration::from_secs(30 * 60)
+        );
     }
 }
 

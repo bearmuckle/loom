@@ -7,7 +7,7 @@ use super::{
     auth_error_response, bearer_token, client_tls_config, execute_request_with, frame_request_id,
     frame_too_large_close_reason, frame_too_large_error, health_handler, insecure_remote_host,
     is_control_or_interrupt_request, oversized_inbound_frame_action, process_text, request_auth,
-    resolve_max_frame_bytes, try_send_response, websocket_connect_error,
+    request_deadline, resolve_max_frame_bytes, try_send_response, websocket_connect_error,
 };
 use axum::{
     extract::{State, ws::Message},
@@ -17,11 +17,12 @@ use axum::{
     },
     response::IntoResponse,
 };
-use loom_core::{ErrorCode, ProtocolVersion, RequestId};
+use loom_core::{AgentSessionId, ErrorCode, ProtocolVersion, RequestId};
 use loom_protocol::{
-    ClientFrame, ClientRequest, ControlRequest, ControlResponse, RequestEnvelope, ResponseEnvelope,
-    RunRequest, ServerResponse, WorkspaceRequest, decode_response, encode_client_frame,
-    encode_request, encode_response,
+    ClientFrame, ClientRequest, ControlRequest, ControlResponse, FilesystemRequest,
+    RepositoryRequest, RequestEnvelope, ResponseEnvelope, RunRequest, SOURCE_TRANSFER_TIMEOUT,
+    ServerResponse, WorkspaceRequest, decode_response, encode_client_frame, encode_request,
+    encode_response,
 };
 use std::{
     collections::HashMap,
@@ -745,6 +746,44 @@ fn control_and_interrupt_requests_are_classified_apart_from_ordinary_ones() {
         assert!(!is_control_or_interrupt_request(&request), "{request:?}");
         assert_eq!(RequestClass::of(&request), RequestClass::Ordinary);
     }
+}
+
+#[test]
+fn source_transfers_are_bounded_by_the_transfer_deadline() {
+    let session_id = AgentSessionId::new();
+    let attach = ClientRequest::Repository(RepositoryRequest::AttachSessionRepository {
+        session_id,
+        source: "https://github.com/owner/name.git".to_owned(),
+        path: "repositories/name".to_owned(),
+        revision: None,
+        reuse_local: false,
+    });
+    let configured = RemoteServerConfig::default().request_timeout;
+    assert_eq!(
+        request_deadline(&attach, configured),
+        SOURCE_TRANSFER_TIMEOUT
+    );
+    // A configured bound already more patient than the transfer deadline keeps
+    // the value the operator asked for.
+    assert_eq!(
+        request_deadline(&attach, Duration::from_secs(60 * 60)),
+        Duration::from_secs(60 * 60)
+    );
+
+    // Importing a folder copies it, so it lasts as long as the copy does.
+    let import = ClientRequest::Filesystem(FilesystemRequest::ImportSessionDirectory {
+        session_id,
+        source: "/tmp/source".to_owned(),
+        path: "sources/source".to_owned(),
+    });
+    assert_eq!(
+        request_deadline(&import, configured),
+        SOURCE_TRANSFER_TIMEOUT
+    );
+
+    // Everything else is answered within the configured deadline.
+    let list = ClientRequest::Repository(RepositoryRequest::ListSessionRepositories { session_id });
+    assert_eq!(request_deadline(&list, configured), configured);
 }
 
 #[tokio::test]

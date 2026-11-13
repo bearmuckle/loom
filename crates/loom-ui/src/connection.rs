@@ -209,6 +209,24 @@ impl Drop for ConnectionCleanupGuard {
     }
 }
 
+/// The deadline a native client waits for `request`.
+///
+/// A request that transfers a source is bounded by
+/// [`loom_protocol::SOURCE_TRANSFER_TIMEOUT`], the same value the worker bounds
+/// it by. Cloning a large repository or copying a large folder outlives the
+/// ordinary request timeout, and giving up first turned a project created from
+/// such a source into a failed one while its clone was still running. The
+/// ordinary timeout stays the floor, so a deployment that raised it keeps its
+/// larger bound.
+#[cfg(not(target_family = "wasm"))]
+fn request_timeout_for(request: &ClientRequest) -> Duration {
+    if request.transfers_source() {
+        loom_local::DEFAULT_REQUEST_TIMEOUT.max(loom_protocol::SOURCE_TRANSFER_TIMEOUT)
+    } else {
+        loom_local::DEFAULT_REQUEST_TIMEOUT
+    }
+}
+
 impl ClientConnection {
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn remote(
@@ -278,14 +296,15 @@ impl ClientConnection {
     ///
     /// Only used natively, where callers either run this on a dedicated
     /// worker thread (`BackendWorker`) or, during the synchronous startup
-    /// bootstrap, before any window exists. A remote request is bounded by
-    /// [`loom_local::DEFAULT_REQUEST_TIMEOUT`] so a half-open socket cannot
+    /// bootstrap, before any window exists. A remote request is bounded by the
+    /// deadline [`request_timeout_for`] resolves, so a half-open socket cannot
     /// stall the worker thread — and with it every later request — forever;
     /// in-process requests are unbounded because they do not depend on a
     /// socket staying alive.
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn request(&self, request: RequestEnvelope) -> ResponseEnvelope {
-        self.request_with_timeout(request, loom_local::DEFAULT_REQUEST_TIMEOUT)
+        let timeout = request_timeout_for(&request.request);
+        self.request_with_timeout(request, timeout)
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -1257,8 +1276,8 @@ mod tests {
         create_session_in_workspace, create_workspace, describe_startup_connection_error,
         include_discovered_models, list_models, list_workspace_sessions, list_workspaces,
         negotiate, negotiation_capabilities, provider_name_for_id, redact_secret,
-        remote_url_is_secure_for_secrets, resume_github_identity, set_workspace_config,
-        unexpected_response, worker_node_status, workspace_config,
+        remote_url_is_secure_for_secrets, request_timeout_for, resume_github_identity,
+        set_workspace_config, unexpected_response, worker_node_status, workspace_config,
     };
     use loom_core::{
         AgentSessionId, Capability, CapabilitySet, ErrorCode, LoomError as CoreLoomError,
@@ -1275,6 +1294,45 @@ mod tests {
     #[test]
     fn current_client_contract_negotiates_transcript_paging() {
         assert!(negotiation_capabilities().contains(Capability::ReadAgentRunMessages));
+    }
+
+    /// Creating a project from a large repository or a large folder waits as
+    /// long as the transfer takes, which is the deadline the worker bounds the
+    /// same request by. Every other request keeps the ordinary client deadline,
+    /// which is what stops a half-open socket from stalling the worker thread.
+    #[test]
+    fn source_transfers_wait_for_the_transfer_deadline() {
+        let session_id = AgentSessionId::new();
+        for request in [
+            ClientRequest::Repository(loom_protocol::RepositoryRequest::AttachSessionRepository {
+                session_id,
+                source: "https://github.com/owner/name.git".to_owned(),
+                path: "repositories/name".to_owned(),
+                revision: None,
+                reuse_local: false,
+            }),
+            ClientRequest::Filesystem(loom_protocol::FilesystemRequest::AttachSessionDirectory {
+                session_id,
+                source: "/tmp/source".to_owned(),
+                path: "sources/source".to_owned(),
+            }),
+        ] {
+            assert_eq!(
+                request_timeout_for(&request),
+                loom_local::DEFAULT_REQUEST_TIMEOUT.max(loom_protocol::SOURCE_TRANSFER_TIMEOUT),
+                "{request:?}"
+            );
+        }
+
+        let list =
+            ClientRequest::Repository(loom_protocol::RepositoryRequest::ListSessionRepositories {
+                session_id,
+            });
+        assert_eq!(
+            request_timeout_for(&list),
+            loom_local::DEFAULT_REQUEST_TIMEOUT
+        );
+        assert!(loom_protocol::SOURCE_TRANSFER_TIMEOUT > loom_local::DEFAULT_REQUEST_TIMEOUT);
     }
 
     #[test]

@@ -24,8 +24,8 @@ use futures_util::{SinkExt, StreamExt};
 use loom_core::{ErrorCode, LoomError, RequestId, Result};
 use loom_protocol::{
     ClientFrame, ClientRequest, ProjectRequest, RequestEnvelope, ResponseEnvelope, RunRequest,
-    ServerEventEnvelope, TaskRequest, TerminalRequest, decode_client_frame, decode_event,
-    decode_request, encode_client_frame, encode_response,
+    SOURCE_TRANSFER_TIMEOUT, ServerEventEnvelope, TaskRequest, TerminalRequest,
+    decode_client_frame, decode_event, decode_request, encode_client_frame, encode_response,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -43,6 +43,11 @@ use super::{AuthTokenStore, GitHubSignInConfig, InProcessBackend, InProcessConne
 
 const DEFAULT_WS_PATH: &str = "/ws";
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(15);
+/// Deadline applied to a request that transfers no source.
+///
+/// A request that clones a repository or copies a folder lasts as long as the
+/// transfer does, so it is bounded by [`SOURCE_TRANSFER_TIMEOUT`] instead; see
+/// [`server::request_deadline`].
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// The largest single WebSocket frame either side accepts, in bytes (4 MiB).
 ///
