@@ -1,4 +1,7 @@
 use super::*;
+use crate::connection::project::child::result::{
+    PROJECT_MESSAGE_NAME, ProjectChildResultDelivery, manager_was_notified_of_child,
+};
 
 pub(crate) fn json_value<T: Serialize>(value: T) -> Result<Value> {
     serde_json::to_value(value).map_err(|error| {
@@ -298,11 +301,36 @@ impl ProjectMessageRoute {
     }
 }
 
+/// Why a project member is being woken.
+///
+/// A member is woken for a durable message it has not read yet, or because a
+/// child finished and still owes it a report that never reached its transcript.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProjectWake {
+    /// Wake the member only when a durable inbox message is waiting for it.
+    OnInboxMessage,
+    /// Wake the member even when its inbox is empty, so a run worker reads the
+    /// child-finish state at its next safe model-turn boundary.
+    OnChildFinished,
+}
+
 /// A durably accepted project message together with how it will be read, so the
 /// sender can tell a delivered message from one that is still waiting.
 pub(crate) struct AcceptedProjectMessage {
     pub(crate) message: loom_core::AgentMessageRecord,
     pub(crate) route: ProjectMessageRoute,
+}
+
+/// The project a member belongs to: the project of the task that delegated it,
+/// or the member's own session as the root of a project it coordinates.
+pub(crate) fn project_member_project_id(
+    persistence: &dyn Persistence,
+    session_id: AgentSessionId,
+) -> Result<ProjectId> {
+    Ok(persistence
+        .load_delegated_task_for_target(session_id)?
+        .map(|task| task.project_id)
+        .unwrap_or_else(|| ProjectId::from_uuid(*session_id.as_uuid())))
 }
 
 /// The project a member belongs to and the message sequence its durable inbox is
@@ -311,10 +339,7 @@ pub(crate) fn project_member_inbox_position(
     persistence: &dyn Persistence,
     session_id: AgentSessionId,
 ) -> Result<(ProjectId, u64)> {
-    let project_id = persistence
-        .load_delegated_task_for_target(session_id)?
-        .map(|task| task.project_id)
-        .unwrap_or_else(|| ProjectId::from_uuid(*session_id.as_uuid()));
+    let project_id = project_member_project_id(persistence, session_id)?;
     let cursor = match persistence.load_latest_run_summary_for_session(session_id)? {
         Some(summary) => persistence
             .load_run_execution_state(summary.snapshot.id)?
@@ -357,10 +382,7 @@ pub(crate) fn deliver_project_agent_messages(
     runtime: &mut AgentRuntime,
 ) -> Result<bool> {
     let session_id = runtime.session_id();
-    let project_id = persistence
-        .load_delegated_task_for_target(session_id)?
-        .map(|task| task.project_id)
-        .unwrap_or_else(|| ProjectId::from_uuid(*session_id.as_uuid()));
+    let project_id = project_member_project_id(persistence, session_id)?;
     let messages = persistence.list_agent_messages(
         project_id,
         session_id,
@@ -373,6 +395,81 @@ pub(crate) fn deliver_project_agent_messages(
             break;
         }
         delivered = true;
+    }
+    Ok(delivered)
+}
+
+/// Whether a durable manager wait already hands this child's outcome to the
+/// manager, so no separate finish notice is owed.
+///
+/// A manager that parked on `wait_for_project_children` receives the child's
+/// task state and result in that call's tool result. The wait is claimed before
+/// that result is appended, so a claimed or finished wait means the manager is
+/// already being told, and a notice on top of it would only repeat the outcome.
+pub(crate) fn project_child_outcome_is_joined(
+    persistence: &dyn Persistence,
+    manager_session_id: AgentSessionId,
+    task_id: loom_core::TaskId,
+) -> Result<bool> {
+    Ok(persistence
+        .list_project_manager_waits_by_child(task_id)?
+        .iter()
+        .any(|wait| {
+            wait.manager_session_id == manager_session_id
+                && matches!(
+                    wait.status,
+                    loom_core::ProjectManagerWaitStatus::Resuming
+                        | loom_core::ProjectManagerWaitStatus::Consumed
+                )
+        }))
+}
+
+/// Appends the child-finish notices this manager still owes at the safe
+/// model-turn boundary the run worker reached.
+///
+/// A notice is offered only after durable inbox delivery, so a child whose own
+/// result message just arrived is not announced twice. It is offered at every
+/// boundary until the transcript carries it, which makes delivery survive a
+/// restart without a second durable record: the notice names its task id and the
+/// transcript is the record that it was appended. A run that still owes a tool
+/// result, a project join, an approval, or an input answer refuses the turn and
+/// keeps the notice owed instead of splitting a tool call from its result.
+pub(crate) fn deliver_project_child_notices(
+    persistence: &dyn Persistence,
+    runtime: &mut AgentRuntime,
+) -> Result<bool> {
+    let session_id = runtime.session_id();
+    let project_id = project_member_project_id(persistence, session_id)?;
+    // One borrowed pass over the project turns in the transcript: each candidate
+    // task is then checked against those contents instead of copying the whole
+    // transcript once per task at every model-turn boundary.
+    let project_turns: Vec<String> = runtime
+        .transcript()
+        .iter()
+        .filter(|message| message.name.as_deref() == Some(PROJECT_MESSAGE_NAME))
+        .map(|message| message.content.clone())
+        .collect();
+    let mut delivered = false;
+    for task in persistence.list_project_tasks(project_id)? {
+        if task.requester_session_id != session_id {
+            continue;
+        }
+        if manager_was_notified_of_child(&project_turns, task.task_id) {
+            continue;
+        }
+        let delivery = ProjectChildResultDelivery {
+            message: persistence.load_project_task_result(task.task_id, session_id)?,
+            delivered_through: runtime.last_project_message_sequence(),
+        };
+        let Some(notice) = delivery.finished_notice(&task) else {
+            continue;
+        };
+        if project_child_outcome_is_joined(persistence, session_id, task.task_id)? {
+            continue;
+        }
+        if runtime.notify_project_child_finished(notice) {
+            delivered = true;
+        }
     }
     Ok(delivered)
 }

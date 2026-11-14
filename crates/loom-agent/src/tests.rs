@@ -56,6 +56,53 @@ fn repairs_unpaired_tool_messages_for_provider_requests() {
     assert_eq!(repaired[1].content, "archive implementation");
 }
 
+/// A result that an older transcript stored behind an intervening turn is moved
+/// back to its call. This is the shape a run could persist when a child-finish
+/// notice was appended while a tool approval was pending, and a channel refuses
+/// it when a session is resumed on it.
+#[test]
+fn repairs_a_tool_result_that_sits_behind_an_intervening_turn() {
+    let call = ToolCall {
+        id: loom_core::ToolCallId::new(),
+        name: "run_command".to_owned(),
+        arguments: serde_json::json!({"command": "git status"}),
+    };
+    let tool_result = ModelMessage {
+        role: MessageRole::Tool,
+        content: "clean".to_owned(),
+        name: Some(call.name.clone()),
+        tool_call_id: Some(call.id),
+        tool_calls: Vec::new(),
+        reasoning_content: None,
+    };
+    let mut notice = ModelMessage::new(
+        MessageRole::User,
+        "[Project notification] Direct child task 'worker' finished",
+    );
+    notice.name = Some("loom_project_message".to_owned());
+    let source = vec![
+        ModelMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            name: None,
+            tool_call_id: None,
+            tool_calls: vec![call.clone()],
+            reasoning_content: None,
+        },
+        notice.clone(),
+        tool_result.clone(),
+    ];
+
+    let repaired = repair_tool_transcript(source.clone(), &source);
+
+    assert_eq!(repaired.len(), 3);
+    assert_eq!(repaired[1].tool_call_id, Some(call.id));
+    assert_eq!(repaired[1].content, "clean");
+    assert_eq!(repaired[2].content, notice.content);
+    // Repairing twice keeps the same order instead of duplicating the result.
+    assert_eq!(repair_tool_transcript(repaired.clone(), &source), repaired);
+}
+
 /// Provider that blocks in the middle of a completion until it is released
 /// or cancelled, so control requests can be exercised against a busy run.
 struct BlockingProvider {
@@ -1332,6 +1379,86 @@ fn project_messages_append_once_and_advance_the_inbox_cursor() {
     assert_eq!(delivered.role, MessageRole::User);
     assert_eq!(delivered.name.as_deref(), Some("loom_project_message"));
     assert!(delivered.content.contains("compatibility review"));
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// Describes every place a wire transcript would be rejected: an assistant tool
+/// call whose result is not the next message, or a tool message that answers no
+/// open call. OpenAI-compatible routes answer such a request with
+/// "insufficient tool messages following tool_calls message".
+fn tool_pairing_violations(messages: &[ModelMessage]) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut index = 0;
+    while index < messages.len() {
+        let message = &messages[index];
+        index += 1;
+        if message.role == MessageRole::Tool {
+            violations.push(format!(
+                "tool message for {:?} answers no open tool call",
+                message.tool_call_id
+            ));
+            continue;
+        }
+        for call in &message.tool_calls {
+            match messages.get(index) {
+                Some(next)
+                    if next.role == MessageRole::Tool && next.tool_call_id == Some(call.id) =>
+                {
+                    index += 1;
+                }
+                _ => violations.push(format!(
+                    "tool call {} ({}) has no tool message directly after it",
+                    call.id, call.name
+                )),
+            }
+        }
+    }
+    violations
+}
+
+/// A child finishing while the manager waits for a tool approval must not add a
+/// turn between the assistant's tool call and its result: the provider rejects
+/// the whole request when that pair is split. The notice is owed instead, and is
+/// appended once the call it waited behind is answered.
+#[test]
+fn a_project_child_notice_waits_for_a_pending_tool_result() {
+    let (mut runtime, root) = destructive_tool_runtime(loom_core::PolicyDecision::RequireApproval);
+    let events = runtime.start().unwrap();
+    let call_id = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolApprovalRequired { call, .. } => Some(call.id),
+            _ => None,
+        })
+        .expect("the gated call waits for approval");
+    assert_eq!(runtime.snapshot().state, AgentRunState::AwaitingApproval);
+
+    let notice = "[Project notification] Direct child task 'worker' (task 6f1f) finished \
+                  with status Completed without reporting a result."
+        .to_owned();
+    assert!(
+        !runtime.notify_project_child_finished(notice.clone()),
+        "a notice waits while an approved call has no result yet"
+    );
+    assert!(!runtime.messages().iter().any(|message| {
+        message.role == MessageRole::User && message.content.contains("Project notification")
+    }));
+
+    let approved = runtime.approve(call_id).unwrap();
+    assert!(approved.iter().any(|event| matches!(
+        event,
+        AgentEvent::RunCompleted { snapshot } if snapshot.state == AgentRunState::Completed
+    )));
+    // The call it waited behind now has its result, so the notice is delivered.
+    assert!(runtime.notify_project_child_finished(notice));
+
+    let request = runtime.model_request().unwrap().0;
+    assert_eq!(
+        tool_pairing_violations(&request.messages),
+        Vec::<String>::new(),
+        "the notice must not separate a tool call from its result: {:?}",
+        request.messages,
+    );
     fs::remove_dir_all(root).unwrap();
 }
 

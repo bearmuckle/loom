@@ -2431,6 +2431,222 @@ fn child_completion_wakes_a_finished_manager() {
     fs::remove_dir_all(temp).unwrap();
 }
 
+/// A child finishing while the manager waits for a tool approval must not add a
+/// turn between the manager's tool call and its result. A chat-completions route
+/// rejects such a request with HTTP 400 ("an assistant message with 'tool_calls'
+/// must be followed by tool messages responding to each 'tool_call_id';
+/// insufficient tool messages"), so the run fails right after the child
+/// finishes. The notice is owed instead, and lands once the call it waited behind
+/// is answered.
+#[test]
+fn a_child_finishing_while_the_manager_awaits_approval_keeps_its_tool_calls_paired() {
+    let temp = std::env::temp_dir().join(format!(
+        "loom-child-approval-pairing-e2e-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&temp).unwrap();
+    let persistence_path = temp.join("state.sqlite");
+    let mut model = ScriptedOpenAiEndpoint::start();
+    let model_endpoint = model.endpoint.clone();
+    let model_id = ModelId::new("fixture/child-approval-pairing");
+    let backend = InProcessBackend::with_provider_registry_persistent(
+        scripted_project_provider_registry(&model_endpoint, model_id.clone()),
+        &persistence_path,
+    )
+    .unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Child approval pairing e2e".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let root = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Manager".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    // Only commands are gated, so the manager delegates without a prompt and
+    // then parks on a command approval while its child is still running.
+    assert!(matches!(
+        connection
+            .request(RequestEnvelope::new(ClientRequest::Session(
+                SessionRequest::SetSessionApprovalPolicy {
+                    session_id: root,
+                    policy: loom_core::ApprovalPolicy {
+                        command: PolicyDecision::RequireApproval,
+                        write: PolicyDecision::Allow,
+                        ..Default::default()
+                    },
+                    auto_approve_actions: Some(false),
+                },
+            )))
+            .result,
+        Ok(ServerResponse::Session(SessionResponse::ApprovalPolicy(_)))
+    ));
+    let root_run_id = match connection
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::StartSessionAgentRun {
+                session_id: root,
+                task: "Delegate a bounded task and check the checkout meanwhile.".to_owned(),
+                model: model_id.clone(),
+                system_instructions: None,
+                repository_instructions: None,
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
+        response => panic!("unexpected run response: {response:?}"),
+    };
+    let project_id = ProjectId::from_uuid(*root.as_uuid());
+    let persistence = backend.persistence.as_ref().unwrap();
+
+    // Turn one delegates a non-code child.
+    let root_delegate = model.next_for_manager();
+    assert!(request_has_tool(
+        &root_delegate.request,
+        "delegate_project_task"
+    ));
+    model.respond_with_tool(
+        root_delegate,
+        "delegate_project_task",
+        serde_json::json!({
+            "child_name": "worker",
+            "intent": "Do a short piece of work.",
+            "model_id": model_id,
+        }),
+    );
+
+    // Turn two needs approval, so the manager stops with an unanswered call.
+    let root_command = model.next_for_manager();
+    model.respond_with_tool(
+        root_command,
+        "run_command",
+        serde_json::json!({ "command": "git status" }),
+    );
+    let waiting = await_settled_run(&connection, root_run_id);
+    assert_eq!(waiting.state, AgentRunState::AwaitingApproval);
+
+    let child_task = persistence
+        .list_project_tasks(project_id)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.child_name == "worker")
+        .expect("delegation should create the worker task");
+
+    // The child finishes without reporting a result while the manager is still
+    // waiting for approval.
+    let child_turn = model.next_for_child();
+    model.respond_with_text(child_turn, "Child work complete.");
+    let child_run_id = persistence
+        .load_latest_run_summary_for_session(child_task.target_session_id)
+        .unwrap()
+        .expect("child should have a durable run")
+        .snapshot
+        .id;
+    assert_eq!(
+        await_settled_run(&connection, child_run_id).state,
+        AgentRunState::Completed
+    );
+    // Deliver the finish wake explicitly, so the test does not depend on the
+    // child worker's timing and always exercises the blocked manager.
+    backend
+        .notify_parent_of_child_activity(child_task.target_session_id)
+        .unwrap();
+    assert_eq!(
+        await_settled_run(&connection, root_run_id).state,
+        AgentRunState::AwaitingApproval,
+        "a finish wake must leave a manager that waits for approval waiting"
+    );
+
+    let pending = connection
+        .run_handle(root_run_id)
+        .unwrap()
+        .state()
+        .pending_approval
+        .expect("the manager still waits for its command approval");
+    connection
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::ApproveAgentAction {
+                run_id: root_run_id,
+                attempt_id: waiting.attempt_id,
+                expected_control_revision: waiting.control_revision,
+                tool_call_id: pending.id,
+            },
+        )))
+        .result
+        .unwrap();
+
+    // The request after the approval is the one the provider used to refuse.
+    let resumed = model.next_for_manager();
+    assert_tool_calls_are_paired(&resumed.request);
+    let messages = resumed.request["messages"].as_array().unwrap();
+    let tool_result = messages
+        .iter()
+        .position(|message| {
+            message["role"] == "tool" && message["tool_call_id"] == pending.id.to_string()
+        })
+        .expect("the approved command reports its result");
+    let notice = messages
+        .iter()
+        .position(|message| {
+            message["name"] == "loom_project_message"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("[Project notification]"))
+        })
+        .expect("the manager is still told that its child finished");
+    assert!(
+        notice > tool_result,
+        "the finish notice is owed after the tool result it waited behind: {messages:?}"
+    );
+    model.respond_with_text(resumed, "Thanks, I have the child result.");
+    assert_eq!(
+        await_settled_run(&connection, root_run_id).state,
+        AgentRunState::Completed
+    );
+
+    // The durable transcript, not only the assembled request, keeps the pair in
+    // order: that is what every later turn and every restart reads.
+    let durable = persistence.load_run_messages(root_run_id).unwrap();
+    let call_index = durable
+        .iter()
+        .position(|message| message.tool_calls.iter().any(|call| call.id == pending.id))
+        .expect("the approved command call is in the durable transcript");
+    assert_eq!(
+        durable[call_index + 1].tool_call_id,
+        Some(pending.id),
+        "the approved call keeps its result directly after it: {:?}",
+        durable
+            .iter()
+            .map(|message| (message.role, message.name.clone(), message.tool_call_id))
+            .collect::<Vec<_>>()
+    );
+
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    drop(model);
+    fs::remove_dir_all(temp).unwrap();
+}
+
 #[test]
 fn child_report_wakes_a_completed_manager_with_its_message() {
     let temp = std::env::temp_dir().join(format!(

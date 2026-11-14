@@ -62,7 +62,61 @@ impl ProjectChildResultDelivery {
             None => ProjectChildResultState::Pending,
         }
     }
+
+    /// Builds the notice a finished child task owes its manager.
+    ///
+    /// Returns `None` for a child that has not finished, and for one whose own
+    /// result the manager already consumed, so a result that arrived is never
+    /// announced twice and in-flight children are not announced at all. The
+    /// notice names the task id, which is what makes it recognizable in a
+    /// manager transcript: the same notice is offered at every safe model-turn
+    /// boundary until it is appended, so the transcript itself records that it
+    /// was delivered.
+    pub(crate) fn finished_notice(&self, task: &loom_core::DelegatedTaskRecord) -> Option<String> {
+        let terminal = matches!(
+            task.status,
+            loom_core::DelegatedTaskStatus::Completed
+                | loom_core::DelegatedTaskStatus::Failed
+                | loom_core::DelegatedTaskStatus::Cancelled
+        );
+        let state = self.state(terminal);
+        if !state.needs_retrieval() {
+            return None;
+        }
+        Some(match state {
+            ProjectChildResultState::Undelivered => format!(
+                "[Project notification] Direct child task '{}' (task {}) finished with status {:?} and its stored result has not reached this session yet. Read it with list_project_children before reporting completion.",
+                task.child_name, task.task_id, task.status
+            ),
+            _ => format!(
+                "[Project notification] Direct child task '{}' (task {}) finished with status {:?} without reporting a result. Inspect the task and retrieve or re-request the work.",
+                task.child_name, task.task_id, task.status
+            ),
+        })
+    }
 }
+
+/// Whether a manager transcript already carries the finish notice for a task.
+///
+/// A finish notice is not a durable message record: it is derived from the
+/// child's task state and offered at every safe model-turn boundary until it is
+/// appended. The transcript is therefore the record of delivery, and the task
+/// id inside the notice is the marker that identifies it. The caller passes the
+/// contents of the transcript's project turns once, so checking every candidate
+/// task does not copy the transcript.
+pub(crate) fn manager_was_notified_of_child(
+    project_turns: &[String],
+    task_id: loom_core::TaskId,
+) -> bool {
+    let marker = format!("(task {task_id})");
+    project_turns
+        .iter()
+        .any(|content| content.contains(&marker))
+}
+
+/// The participant name every project turn carries on the wire and in the
+/// transcript, so a notice reads as collaborator input instead of a user turn.
+pub(crate) const PROJECT_MESSAGE_NAME: &str = "loom_project_message";
 
 impl InProcessConnection {
     /// Reads a delegated task's stored result and the delivery position of the
@@ -83,35 +137,6 @@ impl InProcessConnection {
             delivered_through: self
                 .project_message_delivery_cursor(persistence, task.requester_session_id)?,
         })
-    }
-
-    /// Builds the project notification a finished child task owes its manager.
-    ///
-    /// Returns `None` when the manager already consumed the child's own result.
-    /// Otherwise the notification names the task, so a result that was accepted
-    /// but never delivered, and a child that finished without reporting at all,
-    /// both surface to the manager instead of silence.
-    pub(crate) fn project_child_finished_notification(
-        &self,
-        persistence: &dyn Persistence,
-        task: &loom_core::DelegatedTaskRecord,
-    ) -> Result<Option<String>> {
-        let state = self
-            .project_child_result_delivery(persistence, task)?
-            .state(true);
-        if !state.needs_retrieval() {
-            return Ok(None);
-        }
-        Ok(Some(match state {
-            ProjectChildResultState::Undelivered => format!(
-                "[Project notification] Direct child task '{}' finished with status {:?} and its stored result has not reached this session yet. Read it with list_project_children before reporting completion.",
-                task.child_name, task.status
-            ),
-            _ => format!(
-                "[Project notification] Direct child task '{}' finished with status {:?} without reporting a result. Inspect the task and retrieve or re-request the work.",
-                task.child_name, task.status
-            ),
-        }))
     }
 
     /// Returns the project-message sequence that `session_id`'s latest run has

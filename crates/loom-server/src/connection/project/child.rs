@@ -6,7 +6,7 @@ pub(crate) mod pause;
 mod queue;
 mod rebase;
 mod recovery;
-mod result;
+pub(crate) mod result;
 mod schedule;
 mod worktree;
 

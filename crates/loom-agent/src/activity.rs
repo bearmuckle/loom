@@ -186,6 +186,17 @@ pub(crate) fn context_projection_digest(messages: &[ModelMessage]) -> Result<Str
     Ok(encoded)
 }
 
+/// Keeps every tool call paired with its result after context assembly or
+/// recovery from an older persisted runtime state.
+///
+/// Each recorded result is emitted directly after the assistant turn that called
+/// the tool it answers, in model order. A result that an older transcript placed
+/// behind an intervening turn is moved up to its call, because a channel refuses
+/// a request whose tool call is not answered directly instead of reordering it
+/// itself. A call with no recorded result anywhere gets the recorded output from
+/// the source transcript, or a placeholder telling the model to continue from
+/// the current state, and a result that answers no call is dropped.
+///
 pub(crate) fn repair_tool_transcript(
     messages: Vec<ModelMessage>,
     source_messages: &[ModelMessage],
@@ -199,38 +210,30 @@ pub(crate) fn repair_tool_transcript(
                 .map(|id| (id, message.clone()))
         })
         .collect();
-    let call_ids: BTreeSet<_> = messages
-        .iter()
-        .flat_map(|message| message.tool_calls.iter().map(|call| call.id))
-        .collect();
-    let output_ids: BTreeSet<_> = messages
-        .iter()
-        .filter_map(|message| {
-            (message.role == MessageRole::Tool)
-                .then_some(message.tool_call_id)
-                .flatten()
-        })
-        .collect();
+    let mut recorded_outputs: BTreeMap<_, _> = BTreeMap::new();
+    for message in &messages {
+        if message.role == MessageRole::Tool
+            && let Some(id) = message.tool_call_id
+        {
+            recorded_outputs
+                .entry(id)
+                .or_insert_with(|| message.clone());
+        }
+    }
     let mut repaired = Vec::with_capacity(messages.len());
     for message in messages {
         if message.role == MessageRole::Tool {
-            if message
-                .tool_call_id
-                .is_some_and(|tool_call_id| call_ids.contains(&tool_call_id))
-            {
-                repaired.push(message);
-            }
+            // Every result is emitted with the call it answers, so one left in
+            // place would either be a duplicate or answer no call at all.
             continue;
         }
         let tool_calls = message.tool_calls.clone();
         repaired.push(message);
         for call in tool_calls {
-            if output_ids.contains(&call.id) {
-                continue;
-            }
             repaired.push(
-                source_outputs
+                recorded_outputs
                     .get(&call.id)
+                    .or_else(|| source_outputs.get(&call.id))
                     .cloned()
                     .unwrap_or_else(|| ModelMessage {
                         role: MessageRole::Tool,
