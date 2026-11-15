@@ -541,6 +541,15 @@ impl InProcessBackend {
             if project.root_session_id == *session_id {
                 continue;
             }
+            // A member of an archived project was archived with it, so it
+            // follows the project's window: the shorter sub-agent window is for
+            // a sub-agent archived on its own inside a live project.
+            if catalog
+                .get(&project.root_session_id)
+                .is_some_and(|root| root.state == AgentSessionState::Archived)
+            {
+                continue;
+            }
             sub_agents.push((std::cmp::Reverse(agent.depth), *session_id));
         }
         sub_agents.sort();

@@ -798,6 +798,34 @@ fn a_sweep_deletes_an_archived_sub_agent_alone_even_when_general_retention_is_of
 }
 
 #[test]
+fn a_sweep_leaves_the_members_of_an_archived_project_to_the_project_window() {
+    let fixture = project_code_child_fixture();
+    complete_project_code_child(&fixture);
+    let child_id = fixture.worktree.child_session_id;
+    archive_session(&fixture.connection, fixture.root_id);
+    assert_eq!(
+        session_state(&fixture.backend, child_id),
+        Some(AgentSessionState::Archived)
+    );
+    // Only the sub-agent window is on, and it has long elapsed: the member was
+    // archived with its project, so it is not swept on its own.
+    fixture
+        .backend
+        .set_archive_retention(ArchiveRetentionPolicy {
+            retention_ms: None,
+            force_discard_worktrees: true,
+            sub_agent_retention_ms: Some(1),
+        })
+        .unwrap();
+    wait_past_a_one_millisecond_window();
+    let report = fixture.backend.sweep_archive_retention().unwrap();
+    assert!(report.deleted_sessions.is_empty());
+    assert!(session_is_present(&fixture.backend, child_id));
+    assert!(session_is_present(&fixture.backend, fixture.root_id));
+    fixture.shutdown();
+}
+
+#[test]
 fn a_persistent_backend_with_a_policy_sweeps_at_startup_before_serving() {
     let (temp, database, backend) = persistent_backend("startup");
     let connection = backend.connect();
