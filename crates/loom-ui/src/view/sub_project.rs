@@ -27,6 +27,13 @@ impl LoomView {
             .any(|session| session.id == project_session_id)
     }
 
+    /// Whether the header offers to archive the conversation on screen: only a
+    /// project itself, because archiving a project archives its whole tree, which
+    /// a delegated agent selected inside it must not do.
+    pub(crate) fn has_header_archive(&self) -> bool {
+        self.has_header_project() && self.header_project_session_id() == self.active_session.id
+    }
+
     /// Opens the dialog that names a sub project of the project on screen.
     pub(crate) fn begin_sub_project_dialog(&mut self, cx: &mut Context<Self>) {
         let parent_session_id = self.header_project_session_id();
@@ -60,18 +67,15 @@ impl LoomView {
         cx.notify();
     }
 
-    /// Archives the project the conversation on screen belongs to.
+    /// Archives the project on screen, when the conversation is the project
+    /// itself and not a delegated agent of it.
     ///
     /// The archive is the same durable transition the project's own menu
     /// performs: the backend archives the tree, the client drops it from the
     /// list, and retention decides when its history is discarded.
     pub(crate) fn archive_header_project(&mut self, cx: &mut Context<Self>) {
         let project_session_id = self.header_project_session_id();
-        if !self
-            .sessions
-            .iter()
-            .any(|session| session.id == project_session_id)
-        {
+        if !self.has_header_archive() {
             self.record_status("No project to archive");
             cx.notify();
             return;

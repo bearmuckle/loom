@@ -547,7 +547,7 @@ impl Render for LoomView {
                                             })),
                                         ))
                                     })
-                                    .child(header_tooltip(
+                                    .when(self.has_header_archive(), |actions| actions.child(header_tooltip(
                                         "archive-project-tooltip",
                                         "Archive project",
                                         header_icon_action(
@@ -560,7 +560,7 @@ impl Render for LoomView {
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.archive_header_project(cx);
                                         })),
-                                    ))
+                                    )))
                             })
                             .child(header_tooltip("session-sources-tooltip", "Session sources",
                         header_icon_action(

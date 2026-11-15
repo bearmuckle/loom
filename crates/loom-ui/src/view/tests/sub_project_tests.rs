@@ -98,10 +98,11 @@ mod header_shortcuts {
         });
     }
 
-    /// The archive shortcut archives the project root, so the whole tree goes
-    /// even while an agent of it is selected.
+    /// The archive shortcut is the project's own: with a delegated agent selected
+    /// it is not offered and does nothing, so the project tree stays; on the
+    /// project itself it archives the root.
     #[gpui_kit::test]
-    fn the_archive_shortcut_archives_the_project_root(cx: &mut TestAppContext) {
+    fn the_archive_shortcut_archives_only_the_project_itself(cx: &mut TestAppContext) {
         let (view, requests) = setup(cx);
         let root = view.update(cx, |view, cx| {
             let root = view
@@ -110,8 +111,24 @@ mod header_shortcuts {
                 .expect("the fixture is a project")
                 .root_session_id;
             view.active_session = view.sessions[1].clone();
+            assert!(!view.has_header_archive());
             view.archive_header_project(cx);
             root
+        });
+        assert!(
+            requests.try_recv().is_err(),
+            "a delegated agent sends no archive"
+        );
+
+        view.update(cx, |view, cx| {
+            view.active_session = view
+                .sessions
+                .iter()
+                .find(|session| session.id == root)
+                .cloned()
+                .expect("the root is listed");
+            assert!(view.has_header_archive());
+            view.archive_header_project(cx);
         });
         let job = requests.try_recv().unwrap();
         assert!(
