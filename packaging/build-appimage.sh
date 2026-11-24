@@ -116,11 +116,11 @@ install -m644 "$WORKSPACE/LICENSES.md" "$APPDIR/usr/share/licenses/loom-ui/LICEN
 #
 # linuxdeploy deliberately does not bundle the libraries on the AppImage
 # excludelist. The glibc family there has to stay out of the image, but the other
-# entries are real dependencies of the client -- `libxcb.so.1` for X11 and
-# `libz.so.1` for the vendored libgit2 -- and an image without them fails to
-# start with "error while loading shared libraries: libxcb.so.1" on a system that
-# does not happen to have them. `--library` deploys each of those explicitly,
-# together with its own dependencies.
+# entries are real dependencies of the client -- `libz.so.1` for the vendored
+# libgit2 -- and an image without them fails to start with "error while loading
+# shared libraries". `--library` deploys each of those explicitly, together with
+# its own dependencies. The client builds no X11 backend, so no `libxcb.so.1`
+# entry appears here.
 libraries=()
 while read -r soname path; do
   case " $GLIBC_LIBRARIES " in

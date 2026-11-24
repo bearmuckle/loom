@@ -22,11 +22,12 @@ ignored = ["getrandom"] # Enables wasm_js for transitive browser dependencies.
 #
 # `depends` names the native libraries this client loads when it starts. All of
 # them are visible in the built binary: `libssl3` and `zlib1g` come from the
-# vendored libgit2 build, `libgcc-s1` from the Rust runtime, and the X11 and
-# input libraries are linked directly. There is deliberately no `libfontconfig1`
-# here: the font stack reads fontconfig files through the pure-Rust
-# `fontconfig_parser`/`fontdb` crates, so the C library is a build-time header
-# dependency rather than a runtime one.
+# vendored libgit2 build, `libgcc-s1` from the Rust runtime, and the Wayland and
+# input libraries are linked directly. The X11 backend is not built, so no
+# `libxcb` or `libxkbcommon-x11` package is needed at runtime. There is
+# deliberately no `libfontconfig1` here: the font stack reads fontconfig files
+# through the pure-Rust `fontconfig_parser`/`fontdb` crates, so the C library is
+# a build-time header dependency rather than a runtime one.
 # `mesa-vulkan-drivers` (or another Vulkan/OpenGL driver) and a font package are
 # runtime data and drivers rather than libraries, so they are recommendations.
 [package.metadata.deb]
@@ -35,7 +36,7 @@ copyright = "2026, Björn Harrtell"
 license-file = ["../../LICENSE-AGPL", "0"]
 section = "devel"
 priority = "optional"
-depends = "libc6 (>= 2.35), libgcc-s1, libssl3, zlib1g, libxcb1, libxcb-xkb1, libxkbcommon0, libxkbcommon-x11-0"
+depends = "libc6 (>= 2.35), libgcc-s1, libssl3, zlib1g, libxkbcommon0"
 recommends = "mesa-vulkan-drivers, fonts-dejavu-core"
 extended-description = """
  Loom is a remote-first coding-agent environment. This package installs the
@@ -62,7 +63,7 @@ assets = [
 # command and give the two architectures different package names.
 [package.metadata.deb.variants.aarch64]
 name = "loom-ui"
-depends = "libc6 (>= 2.39), libgcc-s1, libssl3, zlib1g, libxcb1, libxcb-xkb1, libxkbcommon0, libxkbcommon-x11-0"
+depends = "libc6 (>= 2.39), libgcc-s1, libssl3, zlib1g, libxkbcommon0"
 
 [features]
 # Opt-in pixel capture through GPUI's headless renderer. It needs a Vulkan or

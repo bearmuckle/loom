@@ -71,13 +71,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             libdbus-1-dev \
-            libxcb1-dev \
             libfontconfig1-dev \
             pkg-config \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev
+            libxkbcommon-dev
           # Loom UI links native desktop libraries; visual render tests are
-          # optional local checks.
+          # optional local checks. The client builds no X11 backend, so no
+          # `libxcb` or `libxkbcommon-x11` headers are installed.
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
@@ -120,15 +119,15 @@ jobs:
         run: |
           # `cargo check` needs the headers and pkg-config files the client
           # compiles against, but not the drivers and font data the render
-          # tests need: those are runtime dependencies of the `rust` job.
+          # tests need: those are runtime dependencies of the `rust` job. The
+          # client builds no X11 backend, so no `libxcb` or `libxkbcommon-x11`
+          # headers are installed.
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             libdbus-1-dev \
-            libxcb1-dev \
             libfontconfig1-dev \
             pkg-config \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev
+            libxkbcommon-dev
       # Pinned to the `rust-version` declared in the workspace manifest, so the
       # claim is checked instead of being assumed to hold on stable. The SHA is
       # the head of the action's `1.99.0` branch, which is the branch that

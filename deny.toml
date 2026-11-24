@@ -66,7 +66,15 @@ allow = [
 # and treats a match below this confidence as no licence at all; an unlicensed
 # crate fails the check.
 confidence-threshold = 0.93
-exceptions = []
+exceptions = [
+    # `libfuzzer-sys` declares `(MIT OR Apache-2.0) AND NCSA`. NCSA is
+    # permissive and MIT-like, but it is a new licensing decision, so it is
+    # allowed for this one crate instead of being added to the list above. The
+    # crate is only a `cfg(fuzzing)` dependency of `rav1e`, which the AVIF
+    # encoder `gpui-base` enables inside `image`: no normal build, test build or
+    # shipped binary compiles it, and the lockfile check still walks it.
+    { crate = "libfuzzer-sys", allow = ["NCSA"] },
+]
 
 [bans]
 # Duplicate versions are reported but are not fatal: this workspace carries

@@ -33,17 +33,17 @@ jobs:
         with:
           fetch-depth: 0
       # The same native packages as `.github/workflows/ci.yml`: the GPUI client
-      # links them; visual render tests are optional local checks.
+      # links them; visual render tests are optional local checks. The client
+      # builds no X11 backend, so no `libxcb` or `libxkbcommon-x11` headers are
+      # installed.
       - name: Install native UI dependencies
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             libdbus-1-dev \
-            libxcb1-dev \
             libfontconfig1-dev \
             pkg-config \
-            libxkbcommon-dev \
-            libxkbcommon-x11-dev
+            libxkbcommon-dev
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy, rustfmt
@@ -127,18 +127,18 @@ jobs:
       # On top of the client's native packages, `git2` builds its own libgit2
       # (no distribution ships the version range libgit2-sys accepts for a
       # system libgit2), so the build needs a C toolchain, CMake and OpenSSL.
-      # `patchelf` and `file` are what linuxdeploy and appimagetool use.
+      # `patchelf` and `file` are what linuxdeploy and appimagetool use. The
+      # client builds no X11 backend, so no `libxcb` or `libxkbcommon-x11`
+      # headers are installed.
       - name: Install native dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             libdbus-1-dev \
-            libxcb1-dev \
             libfontconfig1-dev \
             pkg-config \
             libxkbcommon-dev \
-            libxkbcommon-x11-dev \
             build-essential \
             cmake \
             libssl-dev \
