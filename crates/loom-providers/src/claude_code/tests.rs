@@ -1,6 +1,30 @@
 use super::*;
 use serde_json::json;
 
+#[test]
+fn rate_limit_windows_become_rounded_percentages() {
+    let window = |name: &str, utilization: Option<f64>| loom_harness::RateLimitWindow {
+        name: name.into(),
+        utilization,
+        resets_at: None,
+        status: None,
+    };
+    let limits = usage_limits(
+        "allowed_warning".into(),
+        true,
+        vec![
+            window("a", Some(0.876)),
+            window("b", Some(-1.0)),
+            window("c", Some(f64::NAN)),
+            window("d", None),
+        ],
+    );
+    assert_eq!(limits.status, "allowed_warning");
+    assert!(limits.using_overage);
+    let percents: Vec<_> = limits.windows.iter().map(|w| w.used_percent).collect();
+    assert_eq!(percents, vec![Some(88), Some(0), None, None]);
+}
+
 fn descriptor(alias: &str) -> ModelDescriptor {
     ProviderConfig::claude_code("claude")
         .models
@@ -168,6 +192,7 @@ read first
 echo "$first" >> '{args}'
 printf '%s\n' '{{"type":"system","subtype":"init","session_id":"s-9","tools":[]}}'
 printf '%s\n' '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"thinking_delta","thinking":"hm"}}}}}}'
+printf '%s\n' '{{"type":"rate_limit_event","rate_limit_info":{{"status":"allowed","isUsingOverage":false,"unifiedWindows":{{"five_hour":{{"utilization":0.07,"resetsAt":1795566000,"status":"allowed"}}}}}}}}'
 printf '%s\n' '{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"t1","name":"Bash","input":{{"command":"ls"}}}}]}}}}'
 printf '%s\n' '{{"type":"user","message":{{"content":[{{"tool_use_id":"t1","type":"tool_result","content":"boom","is_error":true}}]}}}}'
 printf '%s\n' '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"done"}}}},"parent_tool_use_id":null}}'
@@ -209,6 +234,18 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
     assert!(reasoning.contains("hm"), "{reasoning}");
     assert!(reasoning.contains("→ Bash: ls"), "{reasoning}");
     assert!(reasoning.contains("✗ boom"), "{reasoning}");
+    assert!(sink.events.contains(&ModelStreamEvent::Limits {
+        limits: UsageLimits {
+            status: "allowed".into(),
+            windows: vec![UsageLimitWindow {
+                name: "five_hour".into(),
+                used_percent: Some(7),
+                resets_at: Some(1_795_566_000),
+                status: Some("allowed".into()),
+            }],
+            using_overage: false,
+        },
+    }));
     assert!(sink.events.contains(&ModelStreamEvent::Usage {
         usage: TokenUsage {
             input_tokens: 14,

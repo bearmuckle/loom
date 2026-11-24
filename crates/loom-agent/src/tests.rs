@@ -162,6 +162,12 @@ impl ModelProvider for IncompleteProvider {
         sink: &mut dyn loom_model::ModelStreamSink,
     ) -> Result<()> {
         *self.calls.lock().unwrap() += 1;
+        sink.emit(ModelStreamEvent::Limits {
+            limits: loom_model::UsageLimits {
+                status: "allowed".to_owned(),
+                ..Default::default()
+            },
+        })?;
         sink.emit(ModelStreamEvent::TextDelta {
             text: "partial answer".to_owned(),
         })?;
@@ -2875,7 +2881,12 @@ fn incomplete_model_response_keeps_partial_text_and_fails_without_retrying() {
         ToolExecutor::new(&root).unwrap(),
     );
 
-    runtime.advance_step(&mut Vec::new()).unwrap();
+    let mut events = Vec::new();
+    runtime.advance_step(&mut events).unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::UsageLimitsReported { limits, .. } if limits.status == "allowed"
+    )));
     assert_eq!(runtime.run.state, AgentRunState::Failed);
     assert_eq!(runtime.messages.last().unwrap().content, "partial answer");
     assert_eq!(runtime.usage.output_tokens, 3);

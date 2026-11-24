@@ -13,6 +13,50 @@ const DENIED: &str = r#"{"type":"system","subtype":"permission_denied","tool_nam
 const RATE_LIMIT: &str = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","isUsingOverage":false}}"#;
 const RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"done","stop_reason":"end_turn","session_id":"s-1","total_cost_usd":0.01,"num_turns":2,"duration_ms":2265,"usage":{"input_tokens":2,"cache_creation_input_tokens":2662,"cache_read_input_tokens":649,"output_tokens":4}}"#;
 
+// From a Claude Code 2.1.331 run signed in to a subscription.
+const RATE_LIMIT_WINDOWS: &str = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1795566000,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0.07,"resetsAt":1795566000,"status":"allowed"},"seven_day":{"utilization":0.05,"resetsAt":1795806000,"status":"allowed"}}},"uuid":"u-1","session_id":"s-1"}"#;
+
+#[test]
+fn rate_limits_carry_every_reported_window() {
+    let ClaudeEvent::RateLimit { windows, .. } = one(RATE_LIMIT_WINDOWS) else {
+        panic!("not a rate limit");
+    };
+    assert_eq!(
+        windows,
+        vec![
+            RateLimitWindow {
+                name: "five_hour".into(),
+                utilization: Some(0.07),
+                resets_at: Some(1_795_566_000),
+                status: Some("allowed".into()),
+            },
+            RateLimitWindow {
+                name: "seven_day".into(),
+                utilization: Some(0.05),
+                resets_at: Some(1_795_806_000),
+                status: Some("allowed".into()),
+            },
+        ]
+    );
+}
+
+#[test]
+fn rate_limits_without_window_list_use_the_applying_window() {
+    let line = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":0.9,"resetsAt":10}}"#;
+    let ClaudeEvent::RateLimit { windows, .. } = one(line) else {
+        panic!("not a rate limit");
+    };
+    assert_eq!(
+        windows,
+        vec![RateLimitWindow {
+            name: "seven_day".into(),
+            utilization: Some(0.9),
+            resets_at: Some(10),
+            status: Some("allowed_warning".into()),
+        }]
+    );
+}
+
 fn one(line: &str) -> ClaudeEvent {
     let mut events = parse_line(line).unwrap();
     assert_eq!(events.len(), 1, "{line}");
@@ -66,7 +110,8 @@ fn lines_decode_into_events() {
         ClaudeEvent::RateLimit {
             status: "allowed".into(),
             window: Some("five_hour".into()),
-            is_using_overage: false
+            is_using_overage: false,
+            windows: Vec::new(),
         }
     );
     assert_eq!(

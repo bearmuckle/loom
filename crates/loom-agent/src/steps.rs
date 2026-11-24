@@ -971,6 +971,12 @@ impl AgentRuntime {
                 ctx.saw_tool_call = true;
                 return Ok(StreamFlow::Continue);
             }
+            ModelStreamEvent::Limits { limits } => {
+                ctx.events.push(AgentEvent::UsageLimitsReported {
+                    run_id: self.run.id,
+                    limits,
+                });
+            }
             ModelStreamEvent::Usage { usage } => {
                 self.usage.add_tokens(
                     usage.input_tokens,

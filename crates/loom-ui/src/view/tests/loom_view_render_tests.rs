@@ -4454,6 +4454,24 @@ fn run_tab_figures_fit_a_phone_pane(cx: &mut TestAppContext) {
             cost_micros: 12_500_000,
             elapsed_ms: 3_725_000,
         });
+        view.review.usage.limits = Some(loom_model::UsageLimits {
+            status: "allowed_warning".to_owned(),
+            windows: vec![
+                loom_model::UsageLimitWindow {
+                    name: "five_hour".to_owned(),
+                    used_percent: Some(92),
+                    resets_at: Some(u64::MAX),
+                    status: Some("allowed_warning".to_owned()),
+                },
+                loom_model::UsageLimitWindow {
+                    name: "seven_day_sonnet".to_owned(),
+                    used_percent: None,
+                    resets_at: None,
+                    status: None,
+                },
+            ],
+            using_overage: false,
+        });
         view.plan = Some(crate::state::PlanState {
             steps: vec![
                 "Inspect the repository layout".to_owned(),
@@ -4476,7 +4494,13 @@ fn run_tab_figures_fit_a_phone_pane(cx: &mut TestAppContext) {
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
         let viewport = window.viewport_size();
-        for id in ["run-status", "run-usage", "run-context", "plan-checklist"] {
+        for id in [
+            "run-status",
+            "run-usage",
+            "plan-limits",
+            "run-context",
+            "plan-checklist",
+        ] {
             let bounds = window.find(id).bounds();
             assert!(
                 bounds.right() <= viewport.width,
@@ -4584,6 +4608,27 @@ fn run_usage_events_update_inspector_usage(cx: &mut TestAppContext) {
         let run = view.review.usage.run.as_ref().unwrap();
         assert_eq!(run.tool_calls, 2);
         assert_eq!(run.cost_micros, 5_000);
+    });
+}
+
+#[gpui_kit::test]
+fn reported_plan_limits_survive_a_session_switch(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    cx.update(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        let limits = loom_model::UsageLimits {
+            status: "allowed".to_owned(),
+            ..Default::default()
+        };
+        view.consume_agent_event(&loom_protocol::AgentEvent::UsageLimitsReported {
+            run_id: RunId::new(),
+            limits: limits.clone(),
+        });
+        assert_eq!(view.review.usage.limits.as_ref(), Some(&limits));
+        view.review.usage.session = Some(UsageSnapshot::default());
+        view.activate_session(view.active_session.clone());
+        assert!(view.review.usage.session.is_none());
+        assert_eq!(view.review.usage.limits.as_ref(), Some(&limits));
     });
 }
 

@@ -238,6 +238,35 @@ pub struct TokenUsage {
     pub cached_input_tokens: u64,
 }
 
+/// One account usage-limit window a provider reports, such as a five-hour
+/// plan window.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UsageLimitWindow {
+    /// The provider's name for the window, such as `five_hour`.
+    pub name: String,
+    /// Percent of the window used, rounded, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<u32>,
+    /// When the window resets, in Unix seconds, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at: Option<u64>,
+    /// The provider's status for the window, such as `allowed` or `rejected`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// The account usage limits a provider last reported.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UsageLimits {
+    /// The overall status, such as `allowed`, `allowed_warning`, or `rejected`.
+    pub status: String,
+    #[serde(default)]
+    pub windows: Vec<UsageLimitWindow>,
+    /// Whether usage now draws on paid overage.
+    #[serde(default)]
+    pub using_overage: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ModelStreamEvent {
@@ -263,6 +292,11 @@ pub enum ModelStreamEvent {
     },
     Usage {
         usage: TokenUsage,
+    },
+    /// The account's usage limits. Optional; providers that do not report
+    /// limits never emit this variant.
+    Limits {
+        limits: UsageLimits,
     },
     Completed {
         reason: FinishReason,

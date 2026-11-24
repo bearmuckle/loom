@@ -9,7 +9,7 @@ use super::*;
 
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::tag::{Tag, TagVariant};
-use loom_model::ProviderUsageSummary;
+use loom_model::{ProviderUsageSummary, UsageLimitWindow, UsageLimits};
 
 impl LoomView {
     pub(crate) fn render_inspector_run(
@@ -21,6 +21,9 @@ impl LoomView {
             .child(self.render_run_card())
             .child(self.render_plan_card(cx))
             .child(self.render_usage_card())
+            .when_some(self.review.usage.limits.as_ref(), |column, limits| {
+                column.child(render_limits_card(limits))
+            })
             .child(self.render_context_card(cx))
     }
 
@@ -359,6 +362,79 @@ fn usage_cost(provider: Option<&ProviderUsageSummary>, cost_micros: u64) -> Stri
         .unwrap_or_else(|| "-".to_owned())
 }
 
+/// The account plan limits the provider last reported, one bar per window.
+fn render_limits_card(limits: &UsageLimits) -> impl IntoElement {
+    let now_secs = Timestamp::now().as_unix_millis() / 1_000;
+    let mut body = div()
+        .id("plan-limits")
+        .test_support()
+        .flex()
+        .flex_col()
+        .gap_2();
+    for (index, window) in limits.windows.iter().enumerate() {
+        let label = limit_window_label(&window.name);
+        let mut row = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(metric_caption(format!(
+                "{label} · {}",
+                limit_window_caption(window, now_secs)
+            )));
+        if let Some(percent) = window.used_percent {
+            row = row.child(
+                Progress::new(("plan-limit", index))
+                    .value(percent.min(100) as f32)
+                    .xsmall()
+                    .w_full()
+                    .accessibility_label(format!("{label} limit {percent}% used")),
+            );
+        }
+        body = body.child(row);
+    }
+    if let Some(note) = limits_note(limits) {
+        body = body.child(div().text_xs().text_color(rgb(0xfca5a5)).child(note));
+    }
+    card("Plan limits", body)
+}
+
+/// A readable name for a provider limit window.
+fn limit_window_label(name: &str) -> String {
+    match name {
+        "five_hour" => "5-hour".to_owned(),
+        "seven_day" => "Weekly".to_owned(),
+        "seven_day_opus" => "Weekly (Opus)".to_owned(),
+        "seven_day_sonnet" => "Weekly (Sonnet)".to_owned(),
+        other => other.replace('_', " "),
+    }
+}
+
+/// The used share and reset time of one limit window.
+fn limit_window_caption(window: &UsageLimitWindow, now_secs: u64) -> String {
+    let used = window
+        .used_percent
+        .map(|percent| format!("{percent}% used"))
+        .unwrap_or_else(|| "usage unknown".to_owned());
+    match window.resets_at {
+        Some(at) if at > now_secs => format!(
+            "{used} · resets in {}",
+            format_elapsed_ms((at - now_secs).saturating_mul(1_000))
+        ),
+        Some(_) => format!("{used} · resetting"),
+        None => used,
+    }
+}
+
+/// A warning when the account is limited or drawing on overage.
+fn limits_note(limits: &UsageLimits) -> Option<String> {
+    match limits.status.as_str() {
+        "rejected" => Some("Plan limit reached.".to_owned()),
+        "allowed_warning" => Some("Approaching the plan limit.".to_owned()),
+        _ if limits.using_overage => Some("Using paid overage.".to_owned()),
+        _ => None,
+    }
+}
+
 /// The secondary counts that would otherwise need their own cards.
 fn usage_caption(state: &UsageState, usage: &UsageSnapshot) -> Option<String> {
     let mut parts = Vec::new();
@@ -375,4 +451,57 @@ fn usage_caption(state: &UsageState, usage: &UsageSnapshot) -> Option<String> {
         parts.push(format!("{} requests", provider.requests));
     }
     (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    #[test]
+    fn limit_windows_read_as_names_shares_and_reset_times() {
+        assert_eq!(limit_window_label("five_hour"), "5-hour");
+        assert_eq!(limit_window_label("seven_day"), "Weekly");
+        assert_eq!(limit_window_label("seven_day_opus"), "Weekly (Opus)");
+        assert_eq!(limit_window_label("new_kind"), "new kind");
+        let window = |used_percent, resets_at| UsageLimitWindow {
+            name: "five_hour".to_owned(),
+            used_percent,
+            resets_at,
+            status: None,
+        };
+        assert_eq!(
+            limit_window_caption(&window(Some(7), Some(1_000 + 3 * 3_600 + 720)), 1_000),
+            "7% used · resets in 3h 12m"
+        );
+        assert_eq!(
+            limit_window_caption(&window(Some(100), Some(10)), 20),
+            "100% used · resetting"
+        );
+        assert_eq!(
+            limit_window_caption(&window(None, None), 0),
+            "usage unknown"
+        );
+    }
+
+    #[test]
+    fn limit_notes_warn_only_when_the_account_is_constrained() {
+        let limits = |status: &str, using_overage| UsageLimits {
+            status: status.to_owned(),
+            windows: Vec::new(),
+            using_overage,
+        };
+        assert_eq!(limits_note(&limits("allowed", false)), None);
+        assert_eq!(
+            limits_note(&limits("allowed", true)).as_deref(),
+            Some("Using paid overage.")
+        );
+        assert_eq!(
+            limits_note(&limits("allowed_warning", false)).as_deref(),
+            Some("Approaching the plan limit.")
+        );
+        assert_eq!(
+            limits_note(&limits("rejected", true)).as_deref(),
+            Some("Plan limit reached.")
+        );
+    }
 }

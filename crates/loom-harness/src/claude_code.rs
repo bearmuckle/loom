@@ -210,16 +210,56 @@ pub enum ClaudeEvent {
         tool_name: String,
         message: String,
     },
+    /// The account's plan limits, as the CLI last saw them.
     RateLimit {
         status: String,
         window: Option<String>,
         is_using_overage: bool,
+        /// Every limit window the CLI reported, such as `five_hour` and
+        /// `seven_day`.
+        windows: Vec<RateLimitWindow>,
     },
     Result(ResultSummary),
     /// A well-formed line this module has no meaning for.
     Other {
         kind: String,
     },
+}
+
+/// One plan-limit window from a [`ClaudeEvent::RateLimit`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RateLimitWindow {
+    /// The window's name, such as `five_hour`.
+    pub name: String,
+    /// The share of the window used, from 0 to 1, when reported.
+    pub utilization: Option<f64>,
+    /// When the window resets, in Unix seconds, when reported.
+    pub resets_at: Option<u64>,
+    /// The window's status, such as `allowed` or `rejected`, when reported.
+    pub status: Option<String>,
+}
+
+/// Reads the limit windows of a `rate_limit_info` object.
+///
+/// Newer CLIs list every window under `unifiedWindows`; older ones describe
+/// only the window that applies, with `rateLimitType` and `resetsAt`.
+fn rate_limit_windows(info: &Value) -> Vec<RateLimitWindow> {
+    let window = |name: &str, value: &Value| RateLimitWindow {
+        name: name.to_owned(),
+        utilization: value.get("utilization").and_then(Value::as_f64),
+        resets_at: value.get("resetsAt").and_then(Value::as_u64),
+        status: string_field(value, "status"),
+    };
+    match info.get("unifiedWindows").and_then(Value::as_object) {
+        Some(windows) if !windows.is_empty() => windows
+            .iter()
+            .map(|(name, value)| window(name, value))
+            .collect(),
+        _ => string_field(info, "rateLimitType")
+            .filter(|_| info.get("utilization").is_some() || info.get("resetsAt").is_some())
+            .map(|name| vec![window(&name, info)])
+            .unwrap_or_default(),
+    }
 }
 
 /// The host's answer to a [`ClaudeEvent::PermissionRequest`].
@@ -371,6 +411,7 @@ pub fn parse_line(line: &str) -> Result<Vec<ClaudeEvent>> {
                     .get("isUsingOverage")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                windows: rate_limit_windows(info),
             }]
         }
         "result" => vec![ClaudeEvent::Result(ResultSummary {

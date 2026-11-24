@@ -720,6 +720,7 @@ pub(crate) const fn agent_event_name(event: &AgentEvent) -> &'static str {
         AgentEvent::RunUsage { .. } => "run_usage",
         AgentEvent::RunUsageUpdated { .. } => "run_usage_updated",
         AgentEvent::RunLimitReached { .. } => "run_limit_reached",
+        AgentEvent::UsageLimitsReported { .. } => "usage_limits_reported",
         AgentEvent::RecoveryRequired { .. } => "recovery_required",
         AgentEvent::RunStateChanged { .. } => "run_state_changed",
         AgentEvent::RunCompleted { .. } => "run_completed",

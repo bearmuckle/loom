@@ -10,5 +10,5 @@ pub mod claude_code;
 
 pub use claude_code::{
     ClaudeCodeOptions, ClaudeCodeSession, ClaudeEvent, Next, PermissionDecision, PermissionMode,
-    ResultSummary, TokenCounts, parse_line,
+    RateLimitWindow, ResultSummary, TokenCounts, parse_line,
 };

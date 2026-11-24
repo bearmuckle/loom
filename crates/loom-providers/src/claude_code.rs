@@ -20,7 +20,9 @@
 
 use std::{path::Path, process::Command, time::Duration};
 
-use loom_model::{CLAUDE_CODE_PERMISSION_APPROVED, CLAUDE_CODE_PERMISSION_TOOL};
+use loom_model::{
+    CLAUDE_CODE_PERMISSION_APPROVED, CLAUDE_CODE_PERMISSION_TOOL, UsageLimitWindow, UsageLimits,
+};
 
 use loom_harness::{
     ClaudeCodeOptions, ClaudeCodeSession, ClaudeEvent, Next, PermissionDecision, PermissionMode,
@@ -300,6 +302,31 @@ fn emit(sink: &mut dyn ModelStreamSink, event: ModelStreamEvent) -> Result<Strea
     sink.emit(event)
 }
 
+/// The plan limits from a [`ClaudeEvent::RateLimit`], with each window's share
+/// as a rounded percentage.
+fn usage_limits(
+    status: String,
+    using_overage: bool,
+    windows: Vec<loom_harness::RateLimitWindow>,
+) -> UsageLimits {
+    UsageLimits {
+        status,
+        using_overage,
+        windows: windows
+            .into_iter()
+            .map(|window| UsageLimitWindow {
+                name: window.name,
+                used_percent: window
+                    .utilization
+                    .filter(|share| share.is_finite())
+                    .map(|share| (share.clamp(0.0, 10.0) * 100.0).round() as u32),
+                resets_at: window.resets_at,
+                status: window.status,
+            })
+            .collect(),
+    }
+}
+
 impl ModelProvider for ClaudeCodeProvider {
     fn descriptor(&self) -> &ModelDescriptor {
         &self.descriptor
@@ -461,9 +488,19 @@ impl ModelProvider for ClaudeCodeProvider {
                     self.delivered = request.messages.len() + 1;
                     return Ok(());
                 }
+                ClaudeEvent::RateLimit {
+                    status,
+                    is_using_overage,
+                    windows,
+                    ..
+                } => emit(
+                    sink,
+                    ModelStreamEvent::Limits {
+                        limits: usage_limits(status, is_using_overage, windows),
+                    },
+                )?,
                 ClaudeEvent::PermissionCancelled { .. }
                 | ClaudeEvent::ToolResult { .. }
-                | ClaudeEvent::RateLimit { .. }
                 | ClaudeEvent::Other { .. } => StreamFlow::Continue,
             };
             if flow == StreamFlow::Stop {

@@ -1639,6 +1639,7 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
             AgentEvent::RunLimitReached { status, .. } => {
                 println!("Session limit reached: {:?}", status.exceeded);
             }
+            AgentEvent::UsageLimitsReported { .. } => {}
             AgentEvent::RecoveryRequired { reason, .. } => {
                 println!("Recovery requires attention: {reason}");
             }

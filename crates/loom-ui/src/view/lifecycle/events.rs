@@ -855,6 +855,9 @@ impl LoomView {
             AgentEvent::RunLimitReached { status, .. } => {
                 self.record_status(format!("Limit reached: {:?}", status.exceeded));
             }
+            AgentEvent::UsageLimitsReported { limits, .. } => {
+                self.review.usage.limits = Some(limits.clone());
+            }
             AgentEvent::RecoveryRequired { reason, .. } => {
                 self.record_status(format!("Recovery required: {reason}"));
             }

@@ -5,7 +5,7 @@ use loom_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentActivityRecord, ModelId, TokenUsage, ToolCall, ToolResult};
+use crate::{AgentActivityRecord, ModelId, TokenUsage, ToolCall, ToolResult, UsageLimits};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -319,6 +319,11 @@ pub enum AgentEvent {
     RunLimitReached {
         run_id: RunId,
         status: LimitStatus,
+    },
+    /// The provider reported the account's usage limits during the run.
+    UsageLimitsReported {
+        run_id: RunId,
+        limits: UsageLimits,
     },
     RecoveryRequired {
         run_id: RunId,

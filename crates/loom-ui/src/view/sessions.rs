@@ -40,7 +40,10 @@ impl LoomView {
         self.review.changes.clear();
         self.review.vcs = None;
         self.review.repositories_loaded = false;
-        self.review.usage = UsageState::default();
+        self.review.usage = UsageState {
+            limits: self.review.usage.limits.take(),
+            ..UsageState::default()
+        };
         self.collaboration.reset_session();
     }
 

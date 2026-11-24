@@ -13,7 +13,7 @@ use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, EventSequence, PolicyEvaluation,
     ToolCallId, UsageSnapshot,
 };
-use loom_model::ProviderUsageSummary;
+use loom_model::{ProviderUsageSummary, UsageLimits};
 use loom_protocol::{
     ActivityDetail, AgentPlanProgress, AgentRunState, GitDiff, GitRepositoryStatus,
     SessionFilesystemChange, SessionFilesystemFile,
@@ -59,6 +59,9 @@ pub(crate) struct UsageState {
     pub(crate) run: Option<UsageSnapshot>,
     pub(crate) session_provider: Option<ProviderUsageSummary>,
     pub(crate) run_provider: Option<ProviderUsageSummary>,
+    /// The account plan limits a provider last reported. They belong to the
+    /// account, not the session, so switching sessions keeps them.
+    pub(crate) limits: Option<UsageLimits>,
     pub(crate) loading: bool,
     pub(crate) error: Option<String>,
 }
