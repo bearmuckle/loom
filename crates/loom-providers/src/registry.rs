@@ -751,6 +751,11 @@ impl ProviderRegistry {
         if config.kind == ProviderKind::Deterministic {
             return Ok(config.models);
         }
+        if config.kind == ProviderKind::ClaudeCode {
+            // The CLI takes a fixed set of `--model` aliases and has no
+            // endpoint to ask.
+            return Ok(config.models);
+        }
         if config.is_decider() {
             // The decision endpoint publishes no model catalog, and the entry
             // declares the model it answers under, so discovery never calls it.

@@ -387,3 +387,15 @@ done
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn discovery_reports_the_declared_aliases_without_an_endpoint() {
+    let registry = ProviderRegistry::new();
+    let config = ProviderConfig::claude_code("claude");
+    let declared = config.models.clone();
+    registry.register(config).unwrap();
+    let found = registry
+        .discover_models(&ProviderId::new(loom_model::CLAUDE_CODE_PROVIDER_ID))
+        .unwrap();
+    assert_eq!(found, declared);
+}
