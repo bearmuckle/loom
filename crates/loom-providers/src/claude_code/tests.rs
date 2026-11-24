@@ -169,9 +169,6 @@ echo "$first" >> '{args}'
 printf '%s\n' '{{"type":"system","subtype":"init","session_id":"s-9","tools":[]}}'
 printf '%s\n' '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"thinking_delta","thinking":"hm"}}}}}}'
 printf '%s\n' '{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"t1","name":"Bash","input":{{"command":"ls"}}}}]}}}}'
-printf '%s\n' '{{"type":"control_request","request_id":"r1","request":{{"subtype":"can_use_tool","tool_name":"Bash","input":{{}}}}}}'
-read answer
-echo "$answer" >> '{args}'
 printf '%s\n' '{{"type":"user","message":{{"content":[{{"tool_use_id":"t1","type":"tool_result","content":"boom","is_error":true}}]}}}}'
 printf '%s\n' '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"done"}}}},"parent_tool_use_id":null}}'
 printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s-9","usage":{{"input_tokens":3,"output_tokens":5,"cache_read_input_tokens":7,"cache_creation_input_tokens":11}}}}'
@@ -211,7 +208,6 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
         .collect();
     assert!(reasoning.contains("hm"), "{reasoning}");
     assert!(reasoning.contains("→ Bash: ls"), "{reasoning}");
-    assert!(reasoning.contains("needs approval; refused"), "{reasoning}");
     assert!(reasoning.contains("✗ boom"), "{reasoning}");
     assert!(sink.events.contains(&ModelStreamEvent::Usage {
         usage: TokenUsage {
@@ -229,12 +225,11 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
     assert_eq!(provider.claude_session.as_deref(), Some("s-9"));
     assert_eq!(provider.delivered, 2);
 
-    // The request the script saw: the alias, the first prompt, and a refusal.
+    // The request the script saw: the alias, the first prompt, and the first line.
     let seen = std::fs::read_to_string(&args_file).unwrap();
     assert!(seen.contains("--model opus"), "{seen}");
     assert!(seen.contains("--permission-mode acceptEdits"), "{seen}");
     assert!(seen.contains("list files"), "{seen}");
-    assert!(seen.contains("\"behavior\":\"deny\""), "{seen}");
 
     // A second turn continues the CLI's conversation.
     let mut sink = loom_model::CollectingSink::default();
@@ -280,4 +275,115 @@ fn a_missing_binary_is_reported_by_the_health_check() {
     assert_eq!(error.code, ErrorCode::ProviderUnavailable);
     provider.reset();
     assert_eq!(provider.delivered, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_tool_that_needs_approval_ends_the_turn_and_runs_once_approved() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("loom-claude-approval-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("log.txt");
+    let script = dir.join("claude");
+    // Both turns ask for the same command; the second also sees the answer.
+    let body = format!(
+        r#"#!/bin/sh
+echo "$@" >> '{log}'
+read first
+echo "$first" >> '{log}'
+printf '%s\n' '{{"type":"system","subtype":"init","session_id":"s-4","tools":[]}}'
+printf '%s\n' '{{"type":"control_request","request_id":"r1","request":{{"subtype":"can_use_tool","tool_name":"Bash","input":{{"command":"make"}}}}}}'
+while read line; do
+  echo "$line" >> '{log}'
+  case "$line" in
+    *'"behavior":"allow"'*)
+      printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s-4","usage":{{}}}}'
+      exit 0;;
+    *'"behavior":"deny"'*) ;;
+    *interrupt*)
+      printf '%s\n' '{{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"s-4","usage":{{}}}}'
+      exit 0;;
+  esac
+done
+"#,
+        log = log.display()
+    );
+    std::fs::write(&script, body).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut provider = ClaudeCodeProvider::new(descriptor("sonnet"), &script);
+    provider.bind_workspace(&dir);
+    let user = message(MessageRole::User, "build it");
+    let mut sink = loom_model::CollectingSink::default();
+    provider
+        .stream(
+            &request(vec![user.clone()]),
+            &CancellationToken::default(),
+            &mut sink,
+        )
+        .unwrap();
+    let call = sink
+        .events
+        .iter()
+        .find_map(|event| match event {
+            ModelStreamEvent::ToolCallDelta { call } => Some(call.clone()),
+            _ => None,
+        })
+        .expect("the turn asks for approval");
+    assert_eq!(call.name, CLAUDE_CODE_PERMISSION_TOOL);
+    assert_eq!(call.arguments["tool"], "Bash");
+    assert_eq!(call.arguments["input"], json!({"command": "make"}));
+    assert_eq!(
+        sink.events.last(),
+        Some(&ModelStreamEvent::Completed {
+            reason: FinishReason::ToolCall
+        })
+    );
+    assert_eq!(provider.delivered, 2);
+
+    let mut asked = message(MessageRole::Assistant, "");
+    asked.tool_calls = vec![call.clone()];
+    let mut answer = message(MessageRole::Tool, CLAUDE_CODE_PERMISSION_APPROVED);
+    answer.name = Some(CLAUDE_CODE_PERMISSION_TOOL.to_owned());
+    answer.tool_call_id = Some(call.id);
+    let history = vec![user, asked, answer];
+    assert_eq!(
+        approved_inputs(&history),
+        vec![("Bash".to_owned(), json!({"command": "make"}))]
+    );
+
+    let mut sink = loom_model::CollectingSink::default();
+    provider
+        .stream(
+            &request(history.clone()),
+            &CancellationToken::default(),
+            &mut sink,
+        )
+        .unwrap();
+    assert_eq!(
+        sink.events.last(),
+        Some(&ModelStreamEvent::Completed {
+            reason: FinishReason::Stop
+        })
+    );
+    let seen = std::fs::read_to_string(&log).unwrap();
+    assert!(seen.contains("--resume s-4"), "{seen}");
+    assert!(seen.contains("The user approved Bash"), "{seen}");
+    assert!(seen.contains("\"behavior\":\"allow\""), "{seen}");
+
+    // A rejection is told to the CLI and grants nothing.
+    let mut declined = history;
+    declined[2].content = "tool call rejected by the user".to_owned();
+    assert!(approved_inputs(&declined).is_empty());
+    let (prompt, _) = provider.next_prompt(&request(declined.clone()));
+    assert!(prompt.contains("The user declined Bash"), "{prompt}");
+    // A restarted worker has no CLI session and still hears the decision.
+    provider.reset();
+    let (prompt, _) = provider.next_prompt(&request(declined));
+    assert!(
+        prompt.contains("[User] build it") && prompt.contains("declined Bash"),
+        "{prompt}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

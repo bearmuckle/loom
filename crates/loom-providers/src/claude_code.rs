@@ -10,11 +10,17 @@
 //! The CLI runs in the session's working directory, signed in as the account
 //! that runs the worker. Nothing here reads that login.
 //!
-//! A tool that needs approval is refused, because Loom cannot yet put the
-//! question to the person. Edits inside the working directory and read-only
-//! commands go ahead.
+//! A tool the CLI wants approved ends the turn. The provider refuses the
+//! request, interrupts the CLI and returns a [`CLAUDE_CODE_PERMISSION_TOOL`]
+//! call, which Loom's own policy and approval prompt judge like any other tool
+//! call. Once the person approves it, the next turn tells the CLI to retry and
+//! allows exactly that tool input. A decision lives in the transcript, so a
+//! restarted worker still honours it. Edits inside the working directory and
+//! read-only commands never ask.
 
 use std::{path::Path, process::Command, time::Duration};
+
+use loom_model::{CLAUDE_CODE_PERMISSION_APPROVED, CLAUDE_CODE_PERMISSION_TOOL};
 
 use loom_harness::{
     ClaudeCodeOptions, ClaudeCodeSession, ClaudeEvent, Next, PermissionDecision, PermissionMode,
@@ -78,16 +84,17 @@ impl ClaudeCodeProvider {
             // Compaction removed messages the CLI had seen.
             self.claude_session = None;
         }
-        let user_messages = |from: usize| {
-            request.messages[from.min(request.messages.len())..]
-                .iter()
-                .filter(|message| message.role == MessageRole::User)
-                .map(|message| message.content.as_str())
-                .collect::<Vec<_>>()
-        };
+        let messages = &request.messages;
         if self.claude_session.is_some() {
-            return (user_messages(self.delivered).join("\n\n"), None);
+            let news = (self.delivered.min(messages.len())..messages.len())
+                .filter_map(|index| match messages[index].role {
+                    MessageRole::User => Some(messages[index].content.clone()),
+                    _ => decided_at(messages, index).map(|decided| decided.note()),
+                })
+                .collect::<Vec<_>>();
+            return (news.join("\n\n"), None);
         }
+        let answered = decided_at(messages, messages.len().saturating_sub(1));
         let system = request
             .messages
             .iter()
@@ -100,20 +107,35 @@ impl ClaudeCodeProvider {
             .iter()
             .filter(|message| matches!(message.role, MessageRole::User | MessageRole::Assistant))
             .collect::<Vec<_>>();
+        let recap_of = |turns: &[&ModelMessage]| {
+            turns
+                .iter()
+                .map(|message| {
+                    let who = if message.role == MessageRole::User {
+                        "User"
+                    } else {
+                        "Assistant"
+                    };
+                    format!("[{who}] {}", message.content)
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
         let prompt = match turns.split_last() {
+            _ if answered.is_some() => {
+                let note = answered.map(|decided| decided.note()).unwrap_or_default();
+                if turns.is_empty() {
+                    note
+                } else {
+                    format!(
+                        "This conversation has earlier messages, kept here as a transcript. \
+                         Treat it as history.\n\n{}\n\n{note}",
+                        recap_of(&turns)
+                    )
+                }
+            }
             Some((latest, earlier)) if latest.role == MessageRole::User && !earlier.is_empty() => {
-                let recap = earlier
-                    .iter()
-                    .map(|message| {
-                        let who = if message.role == MessageRole::User {
-                            "User"
-                        } else {
-                            "Assistant"
-                        };
-                        format!("[{who}] {}", message.content)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
+                let recap = recap_of(earlier);
                 format!(
                     "This conversation has earlier messages, kept here as a transcript. \
                      Treat it as history and answer the latest message.\n\n{recap}\n\n\
@@ -127,6 +149,54 @@ impl ClaudeCodeProvider {
         (prompt, (!system.is_empty()).then_some(system))
     }
 
+    /// Ends the turn with the call that asks the person to approve `tool`.
+    fn ask_for_approval(
+        &mut self,
+        request: &ModelRequest,
+        sink: &mut dyn ModelStreamSink,
+        (tool, input): (String, serde_json::Value),
+        summary: Option<loom_harness::ResultSummary>,
+    ) -> Result<()> {
+        if let Some(summary) = summary {
+            emit(
+                sink,
+                ModelStreamEvent::Usage {
+                    usage: TokenUsage {
+                        input_tokens: summary.usage.input + summary.usage.cache_creation,
+                        output_tokens: summary.usage.output,
+                        cached_input_tokens: summary.usage.cache_read,
+                    },
+                },
+            )?;
+            if let Some(id) = summary.session_id {
+                self.claude_session = Some(id);
+            }
+        }
+        let summary = tool_summary(&tool, &input);
+        emit(
+            sink,
+            ModelStreamEvent::ToolCallDelta {
+                call: ToolCall {
+                    id: ToolCallId::new(),
+                    name: CLAUDE_CODE_PERMISSION_TOOL.to_owned(),
+                    arguments: serde_json::json!({
+                        "tool": tool,
+                        "input": input,
+                        "summary": summary.trim_start_matches("→ ").trim_end(),
+                    }),
+                },
+            },
+        )?;
+        emit(
+            sink,
+            ModelStreamEvent::Completed {
+                reason: FinishReason::ToolCall,
+            },
+        )?;
+        self.delivered = request.messages.len() + 1;
+        Ok(())
+    }
+
     fn options(&self, cwd: PathBuf, system: Option<String>) -> ClaudeCodeOptions {
         let mut options = ClaudeCodeOptions::new(cwd);
         options.binary = self.binary.clone();
@@ -136,6 +206,66 @@ impl ClaudeCodeProvider {
         options.append_system_prompt = system;
         options
     }
+}
+
+/// One answered permission call found in a transcript.
+struct Decided {
+    tool: String,
+    input: serde_json::Value,
+    approved: bool,
+}
+
+impl Decided {
+    /// What the CLI is told about the decision.
+    fn note(&self) -> String {
+        if self.approved {
+            format!(
+                "The user approved {}. Run it again now with this input: {}",
+                self.tool, self.input
+            )
+        } else {
+            format!(
+                "The user declined {}. Do not run it; continue another way or say what you need.",
+                self.tool
+            )
+        }
+    }
+}
+
+/// The permission call a tool message at `index` answers, when it is one.
+fn decided_at(messages: &[ModelMessage], index: usize) -> Option<Decided> {
+    let answer = messages.get(index)?;
+    if answer.role != MessageRole::Tool
+        || answer.name.as_deref() != Some(CLAUDE_CODE_PERMISSION_TOOL)
+    {
+        return None;
+    }
+    let call = messages[..index]
+        .iter()
+        .flat_map(|message| message.tool_calls.iter())
+        .find(|call| Some(call.id) == answer.tool_call_id)?;
+    Some(Decided {
+        tool: call
+            .arguments
+            .get("tool")
+            .and_then(serde_json::Value::as_str)?
+            .to_owned(),
+        input: call
+            .arguments
+            .get("input")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        approved: answer.content.trim() == CLAUDE_CODE_PERMISSION_APPROVED,
+    })
+}
+
+/// Every tool input the person approved so far in this transcript.
+fn approved_inputs(messages: &[ModelMessage]) -> Vec<(String, serde_json::Value)> {
+    (0..messages.len())
+        .filter_map(|index| decided_at(messages, index))
+        .filter(|decided| decided.approved)
+        .map(|decided| (decided.tool, decided.input))
+        .collect()
 }
 
 /// The first line of `text`, cut to a length a reasoning line can carry.
@@ -188,6 +318,7 @@ impl ModelProvider for ClaudeCodeProvider {
         let cwd = self.cwd.clone().ok_or_else(|| {
             LoomError::invalid_request("Claude Code needs the session's working directory")
         })?;
+        let approved = approved_inputs(&request.messages);
         let (prompt, system) = self.next_prompt(request);
         if prompt.trim().is_empty() {
             return Err(LoomError::invalid_request(
@@ -198,6 +329,8 @@ impl ModelProvider for ClaudeCodeProvider {
         session.send_user_message(&prompt)?;
         let mut stopping = false;
         let mut stop_deadline = None;
+        // The tool the CLI asked for that the person has not approved yet.
+        let mut asked: Option<(String, serde_json::Value)> = None;
         loop {
             if !stopping && cancel.is_cancelled() {
                 stopping = true;
@@ -205,6 +338,9 @@ impl ModelProvider for ClaudeCodeProvider {
                 let _ = session.interrupt();
             }
             if stop_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                if let (Some(tool), false) = (asked.take(), cancel.is_cancelled()) {
+                    return self.ask_for_approval(request, sink, tool, None);
+                }
                 return Err(loom_model::cancelled_error());
             }
             let event = match session.next_event(POLL) {
@@ -222,7 +358,10 @@ impl ModelProvider for ClaudeCodeProvider {
                 Next::Event(event) => event,
             };
             if stopping {
-                if matches!(event, ClaudeEvent::Result(_)) {
+                if let ClaudeEvent::Result(summary) = event {
+                    if let (Some(tool), false) = (asked.take(), cancel.is_cancelled()) {
+                        return self.ask_for_approval(request, sink, tool, Some(summary));
+                    }
                     return Err(loom_model::cancelled_error());
                 }
                 continue;
@@ -250,21 +389,39 @@ impl ModelProvider for ClaudeCodeProvider {
                 ClaudeEvent::PermissionRequest {
                     request_id,
                     tool_name,
+                    input,
                     ..
                 } => {
-                    session.respond_permission(
-                        &request_id,
-                        &PermissionDecision::Deny {
-                            message: format!(
-                                "{tool_name} needs approval and this worker cannot ask for it \
-                                 yet. Do not retry it; continue without it or say what is needed."
-                            ),
-                        },
-                    )?;
-                    emit(
-                        sink,
-                        reasoning(format!("  ✗ {tool_name} needs approval; refused\n")),
-                    )?
+                    if approved
+                        .iter()
+                        .any(|(tool, allowed)| *tool == tool_name && *allowed == input)
+                    {
+                        session.respond_permission(
+                            &request_id,
+                            &PermissionDecision::Allow { input },
+                        )?;
+                        emit(sink, reasoning(format!("  ✓ {tool_name} approved\n")))?
+                    } else {
+                        session.respond_permission(
+                            &request_id,
+                            &PermissionDecision::Deny {
+                                message: format!(
+                                    "{tool_name} needs the user's approval. Stop now and wait; \
+                                     do not retry it or work around it."
+                                ),
+                            },
+                        )?;
+                        if asked.is_none() {
+                            asked = Some((tool_name.clone(), input));
+                            stopping = true;
+                            stop_deadline = Some(Instant::now() + INTERRUPT_GRACE);
+                            let _ = session.interrupt();
+                        }
+                        emit(
+                            sink,
+                            reasoning(format!("  ? {tool_name} waits for approval\n")),
+                        )?
+                    }
                 }
                 ClaudeEvent::PermissionDenied { tool_name, .. } => emit(
                     sink,

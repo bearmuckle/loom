@@ -30,6 +30,13 @@ pub const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-flash";
 pub const DEEPSEEK_MAX_OUTPUT_TOKENS: u32 = 8_192;
 /// The provider id of the `claude` CLI a worker is told to drive.
 pub const CLAUDE_CODE_PROVIDER_ID: &str = "claude-code";
+
+/// The call a Claude Code turn ends with when the CLI wants a tool the person
+/// has not approved. Approving it runs nothing: the next turn lets the CLI
+/// retry the tool it names in `tool` with `input`.
+pub const CLAUDE_CODE_PERMISSION_TOOL: &str = "claude_code_permission";
+/// The output an approved permission call leaves in the transcript.
+pub const CLAUDE_CODE_PERMISSION_APPROVED: &str = "approved";
 /// The model aliases `claude --model` accepts, offered as Loom models. The
 /// first one lets the CLI pick its own default.
 pub const CLAUDE_CODE_MODELS: [(&str, &str); 4] = [

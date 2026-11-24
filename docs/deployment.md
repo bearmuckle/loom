@@ -332,12 +332,16 @@ a full path) registers the `claude-code` provider, whose models are
 `claude-code:default`, `claude-code:sonnet`, `claude-code:opus`, and
 `claude-code:fable`. Claude Code is an agent, so it runs its own loop and tools
 in the session's working directory and Loom offers it none of its own: Loom's
-tool approval policy, context assembly, and session limits do not apply to it,
-and delegated project tools are unavailable. Its text becomes the assistant
+context assembly and session limits do not apply to it, and delegated project
+tools are unavailable. Its text becomes the assistant
 reply, and what it does on the way (tool calls, refusals) streams as reasoning,
 which is not kept in the transcript. Edits inside the working directory and
-read-only commands go ahead; anything else that Claude Code would ask about is
-refused, because Loom cannot yet put the question to a person.
+read-only commands go ahead. Anything else Claude Code would ask about ends
+the turn with a `claude_code_permission` call that Loom's approval policy
+judges by the tool it names (command, write, network, or read) and the run
+shows in the usual approval prompt. Approving it resumes the CLI, which retries
+that exact tool input; rejecting it tells the CLI to continue another way. The
+decision is part of the transcript, so it survives a worker restart.
 
 The CLI is the one the operator installed and signed in to (`claude`, as the
 account that runs the worker). Loom starts it and never reads, stores, or

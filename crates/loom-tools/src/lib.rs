@@ -73,6 +73,18 @@ fn shared_http_client() -> std::result::Result<reqwest::Client, String> {
 }
 use url::Url;
 
+use loom_model::{CLAUDE_CODE_PERMISSION_APPROVED, CLAUDE_CODE_PERMISSION_TOOL};
+
+/// The action kind a Claude Code tool is judged under.
+fn claude_code_action_kind(tool: &str) -> ActionKind {
+    match tool {
+        "Read" | "Glob" | "Grep" | "LS" | "NotebookRead" | "TodoWrite" => ActionKind::Read,
+        "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => ActionKind::Write,
+        "WebFetch" | "WebSearch" => ActionKind::Network,
+        _ => ActionKind::Command,
+    }
+}
+
 /// A server-owned set of tools attached to one agent session. Extensions can
 /// expose bounded operations without giving the agent arbitrary backend access.
 pub trait ToolExtension: Send + Sync {
@@ -714,6 +726,13 @@ impl ToolExecutor {
     }
 
     pub fn action_kind(&self, call: &ToolCall) -> Option<ActionKind> {
+        if call.name == CLAUDE_CODE_PERMISSION_TOOL {
+            let tool = call
+                .arguments
+                .get("tool")
+                .and_then(serde_json::Value::as_str);
+            return Some(claude_code_action_kind(tool.unwrap_or_default()));
+        }
         match ToolKind::from_name(&call.name) {
             Some(ToolKind::RunCommand) => Some(self.run_command_kind(call)),
             Some(kind) => Some(kind.action_kind()),
@@ -882,6 +901,14 @@ impl ToolExecutor {
     /// run to completion. A cancelled command is terminated together with its
     /// process group and reported as a failed result.
     pub fn execute_with_cancel(&self, call: &ToolCall, cancel: &CancellationToken) -> ToolResult {
+        if call.name == CLAUDE_CODE_PERMISSION_TOOL {
+            return ToolResult {
+                tool_call_id: call.id,
+                name: call.name.clone(),
+                success: true,
+                output: CLAUDE_CODE_PERMISSION_APPROVED.to_owned(),
+            };
+        }
         let Some(kind) = ToolKind::from_name(&call.name) else {
             return self
                 .extension
@@ -9375,6 +9402,32 @@ mod tests {
 #[cfg(test)]
 mod helper_tests {
     use super::*;
+
+    #[test]
+    fn a_claude_code_permission_call_is_judged_by_the_tool_it_names() {
+        let tools = ToolExecutor::new(std::env::temp_dir()).unwrap();
+        let call = |tool: &str| ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: CLAUDE_CODE_PERMISSION_TOOL.to_owned(),
+            arguments: serde_json::json!({ "tool": tool, "input": {} }),
+        };
+        assert_eq!(tools.action_kind(&call("Bash")), Some(ActionKind::Command));
+        assert_eq!(tools.action_kind(&call("Edit")), Some(ActionKind::Write));
+        assert_eq!(
+            tools.action_kind(&call("WebFetch")),
+            Some(ActionKind::Network)
+        );
+        assert_eq!(tools.action_kind(&call("Grep")), Some(ActionKind::Read));
+        let result = tools.execute(&call("Bash"));
+        assert!(result.success && result.output == CLAUDE_CODE_PERMISSION_APPROVED);
+        assert!(
+            tools
+                .definitions()
+                .iter()
+                .all(|definition| definition.name != CLAUDE_CODE_PERMISSION_TOOL),
+            "no model is offered the permission call"
+        );
+    }
 
     #[test]
     fn domain_normalization_and_filtering() {
