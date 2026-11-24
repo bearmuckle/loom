@@ -73,6 +73,8 @@ impl InProcessConnection {
                 Box::new(UnavailableProvider::new(descriptor, error))
             }
         };
+        let mut provider = provider;
+        provider.bind_workspace(workspace.root());
         let tools = ToolExecutor::new_with_workspace(workspace)
             .with_build_cache_root(self.backend.build_cache_root())
             .with_github_token(self.backend.providers.github_account_token().ok())
@@ -528,7 +530,7 @@ impl InProcessConnection {
                 false,
             ));
         }
-        let (credential_pin, provider) = self
+        let (credential_pin, mut provider) = self
             .backend
             .provider_for_new_run(input.session_id, &input.model)?;
         let (input_cost_micros_per_1k, output_cost_micros_per_1k) =
@@ -733,6 +735,7 @@ impl InProcessConnection {
         }
         let checkpoint = workspace.create_checkpoint("before agent run")?;
         input.options.checkpoint_id = Some(checkpoint.id);
+        provider.bind_workspace(workspace.root());
         let tools = ToolExecutor::new_with_workspace(workspace)
             .with_build_cache_root(self.backend.build_cache_root())
             .with_github_token(self.backend.providers.github_account_token().ok())

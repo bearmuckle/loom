@@ -376,6 +376,10 @@ impl ModelProvider for PinnedCredentialProvider {
     fn reset(&mut self) {
         self.inner.reset();
     }
+
+    fn bind_workspace(&mut self, root: &std::path::Path) {
+        self.inner.bind_workspace(root);
+    }
 }
 
 #[cfg(test)]

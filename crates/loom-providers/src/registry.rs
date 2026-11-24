@@ -13,6 +13,10 @@ const OPENAI_COMPATIBLE_API_KEY_ENV: &str = "LOOM_API_KEY";
 /// The single model the gateway advertises; `OPENAI_DEFAULT_MODEL` when unset.
 const OPENAI_COMPATIBLE_MODEL_ENV: &str = "LOOM_MODEL";
 
+/// Names the `claude` executable a worker drives. Setting it is how an operator
+/// turns the Claude Code provider on; the CLI keeps its own login.
+pub const CLAUDE_CODE_BINARY_ENV: &str = "LOOM_CLAUDE_CODE_BINARY";
+
 #[derive(Clone)]
 pub struct ProviderRegistry {
     pub configurations: Arc<Mutex<BTreeMap<ProviderId, ProviderConfig>>>,
@@ -171,6 +175,11 @@ impl ProviderRegistry {
         {
             let model = lookup("LOOM_OLLAMA_MODEL").unwrap_or_else(|| "llama3.2".to_owned());
             registry.register(ProviderConfig::ollama(endpoint, model))?;
+        }
+        if let Some(binary) = lookup(CLAUDE_CODE_BINARY_ENV)
+            && !binary.trim().is_empty()
+        {
+            registry.register(ProviderConfig::claude_code(binary.trim()))?;
         }
         registry.register_configured_gateway(&lookup)?;
         Ok(registry)
@@ -1080,6 +1089,10 @@ impl ProviderRegistry {
                     endpoint, secret, descriptor,
                 ))
             }
+            ProviderKind::ClaudeCode => Box::new(ClaudeCodeProvider::new(
+                descriptor,
+                config.endpoint.as_deref().unwrap_or("claude"),
+            )),
             ProviderKind::GitHubCopilot => Box::new(
                 match pinned_secret.clone() {
                     Some(secret) => self.github_copilot_provider_with_token(&config, secret),
@@ -1351,6 +1364,10 @@ impl ModelProvider for SelectedModelProvider {
     fn reset(&mut self) {
         self.inner.reset();
     }
+
+    fn bind_workspace(&mut self, root: &Path) {
+        self.inner.bind_workspace(root);
+    }
 }
 
 pub struct AccountingProvider {
@@ -1424,6 +1441,10 @@ impl ModelProvider for AccountingProvider {
 
     fn reset(&mut self) {
         self.inner.reset();
+    }
+
+    fn bind_workspace(&mut self, root: &Path) {
+        self.inner.bind_workspace(root);
     }
 }
 
@@ -1503,6 +1524,7 @@ fn provider_kind_name(kind: ProviderKind) -> &'static str {
         ProviderKind::DeepSeek => "deepseek",
         ProviderKind::Ollama => "ollama",
         ProviderKind::GitHubCopilot => "github-copilot",
+        ProviderKind::ClaudeCode => "claude-code",
     }
 }
 

@@ -46,6 +46,7 @@ loom-tools = { path = "crates/loom-tools" }
 loom-sessionfs = { path = "crates/loom-sessionfs" }
 loom-vcs = { path = "crates/loom-vcs" }
 loom-process = { path = "crates/loom-process" }
+loom-harness = { path = "crates/loom-harness" }
 loom-model = { path = "crates/loom-model" }
 loom-protocol = { path = "crates/loom-protocol" }
 loom-providers = { path = "crates/loom-providers" }

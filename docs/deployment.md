@@ -325,6 +325,31 @@ requests carry `User-Agent: loom/<version>`, which Go requires instead of a
 generic HTTP-library agent, and `x-opencode-session: <loom-session-id>`, which
 gives each Loom session one stable upstream conversation.
 
+### Claude Code
+
+Setting `LOOM_CLAUDE_CODE_BINARY` to the `claude` executable (a name on `PATH` or
+a full path) registers the `claude-code` provider, whose models are
+`claude-code:default`, `claude-code:sonnet`, `claude-code:opus`, and
+`claude-code:fable`. Claude Code is an agent, so it runs its own loop and tools
+in the session's working directory and Loom offers it none of its own: Loom's
+tool approval policy, context assembly, and session limits do not apply to it,
+and delegated project tools are unavailable. Its text becomes the assistant
+reply, and what it does on the way (tool calls, refusals) streams as reasoning,
+which is not kept in the transcript. Edits inside the working directory and
+read-only commands go ahead; anything else that Claude Code would ask about is
+refused, because Loom cannot yet put the question to a person.
+
+The CLI is the one the operator installed and signed in to (`claude`, as the
+account that runs the worker). Loom starts it and never reads, stores, or
+forwards that login, and it removes `ANTHROPIC_API_KEY` and
+`ANTHROPIC_AUTH_TOKEN` from the child's environment so a key does not move the
+usage off the plan. Whether Anthropic's terms allow running a plan through a
+program like this is the operator's to check; see the
+[legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance).
+Each turn starts a `claude -p` process that continues the conversation with
+`--resume`; a new run on the same session starts one with a labelled recap of
+the earlier messages, because Loom's journal is the record.
+
 The Jev decision model is a separate entry, `decider`, offered beside the chat
 providers. It is registered keyless, so provider listings show it for setup and
 every Jev surface stays absent until a key resolves. `LOOM_DECIDER_SOURCE`

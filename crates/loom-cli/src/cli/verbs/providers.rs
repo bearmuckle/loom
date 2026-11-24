@@ -344,7 +344,7 @@ fn declared_default(kind: ProviderKind) -> Option<&'static str> {
         ProviderKind::DeepSeek => Some(DEEPSEEK_DEFAULT_MODEL),
         ProviderKind::OpenAi | ProviderKind::OpenAiCompatible => Some(OPENAI_DEFAULT_MODEL),
         ProviderKind::GitHubCopilot => Some(GITHUB_COPILOT_DEFAULT_MODEL),
-        ProviderKind::Deterministic | ProviderKind::Ollama => None,
+        ProviderKind::Deterministic | ProviderKind::Ollama | ProviderKind::ClaudeCode => None,
     }
 }
 

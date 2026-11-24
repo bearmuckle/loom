@@ -28,6 +28,16 @@ pub const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-flash";
 /// context budgeting reserves usable output room instead of the conservative
 /// unknown-model fallback, which is too small for thinking models.
 pub const DEEPSEEK_MAX_OUTPUT_TOKENS: u32 = 8_192;
+/// The provider id of the `claude` CLI a worker is told to drive.
+pub const CLAUDE_CODE_PROVIDER_ID: &str = "claude-code";
+/// The model aliases `claude --model` accepts, offered as Loom models. The
+/// first one lets the CLI pick its own default.
+pub const CLAUDE_CODE_MODELS: [(&str, &str); 4] = [
+    ("default", "Claude Code (default model)"),
+    ("sonnet", "Claude Code · Sonnet"),
+    ("opus", "Claude Code · Opus"),
+    ("fable", "Claude Code · Fable"),
+];
 pub const GITHUB_COPILOT_API_ENDPOINT: &str = "https://api.githubcopilot.com";
 /// The one provider entry a Jev decision model uses.
 ///
@@ -226,6 +236,40 @@ impl ProviderConfig {
             display_name: "Ollama local runtime".to_owned(),
             endpoint: Some(endpoint.into()),
             models: vec![model_descriptor],
+            credential: None,
+            input_cost_micros_per_1k: 0,
+            output_cost_micros_per_1k: 0,
+        }
+    }
+
+    /// The `claude` CLI at `binary`, which runs its own tools in the session's
+    /// working directory. It holds no credential here: the CLI uses the login
+    /// of the account that runs the worker.
+    pub fn claude_code(binary: impl Into<String>) -> Self {
+        let id = ProviderId::new(CLAUDE_CODE_PROVIDER_ID);
+        Self {
+            id: id.clone(),
+            kind: ProviderKind::ClaudeCode,
+            display_name: "Claude Code".to_owned(),
+            endpoint: Some(binary.into()),
+            models: CLAUDE_CODE_MODELS
+                .iter()
+                .map(|(alias, name)| ModelDescriptor {
+                    id: ModelId::new(format!("{CLAUDE_CODE_PROVIDER_ID}:{alias}")),
+                    provider: id.clone(),
+                    display_name: (*name).to_owned(),
+                    context_window: Some(200_000),
+                    max_input_tokens: None,
+                    max_output_tokens: None,
+                    // Claude Code runs its own tools, so Loom offers it none.
+                    capabilities: ModelCapabilities {
+                        streaming: true,
+                        tool_calling: false,
+                        vision: false,
+                        json_mode: false,
+                    },
+                })
+                .collect(),
             credential: None,
             input_cost_micros_per_1k: 0,
             output_cost_micros_per_1k: 0,

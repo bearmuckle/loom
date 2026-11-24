@@ -4769,6 +4769,7 @@ dependencies = [
  "futures-util",
  "log",
  "loom-core",
+ "loom-harness",
  "loom-model",
  "reqwest",
  "serde",

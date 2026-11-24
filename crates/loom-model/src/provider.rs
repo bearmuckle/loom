@@ -123,6 +123,10 @@ pub trait ModelProvider: Send {
     }
 
     fn reset(&mut self) {}
+
+    /// Tells the provider which directory the session's tools work in. Only a
+    /// provider that runs its own tools in that directory has a use for it.
+    fn bind_workspace(&mut self, _root: &std::path::Path) {}
 }
 
 impl dyn ModelProvider + '_ {
@@ -236,6 +240,8 @@ pub enum ProviderKind {
     DeepSeek,
     Ollama,
     GitHubCopilot,
+    /// The `claude` CLI on the worker, signed in by the person who runs it.
+    ClaudeCode,
 }
 
 impl ProviderKind {

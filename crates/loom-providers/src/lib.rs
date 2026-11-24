@@ -9,14 +9,9 @@ use std::{
 };
 
 use loom_core::{AgentSessionId, ErrorCode, LoomError, Result, Timestamp, ToolCallId};
-use loom_model::{
-    CancellationToken, DecisionProvider, FinishReason, MessageRole, ModelCapabilities,
-    ModelDescriptor, ModelId, ModelMessage, ModelRequest, ModelStreamEvent, ModelStreamSink,
-    ProviderId, StreamFlow, TokenUsage, ToolCall,
-};
 pub use loom_model::{
-    CredentialRef, CredentialReference, DECIDER_DISPLAY_NAME, DECIDER_PROVIDER_ID,
-    DEEPSEEK_API_ENDPOINT, DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_MAX_OUTPUT_TOKENS,
+    CLAUDE_CODE_PROVIDER_ID, CredentialRef, CredentialReference, DECIDER_DISPLAY_NAME,
+    DECIDER_PROVIDER_ID, DEEPSEEK_API_ENDPOINT, DEEPSEEK_DEFAULT_MODEL, DEEPSEEK_MAX_OUTPUT_TOKENS,
     DEEPSEEK_PROVIDER_ID, DeciderSource, GITHUB_COPILOT_API_ENDPOINT,
     GITHUB_COPILOT_CREDENTIAL_REF, GITHUB_COPILOT_DEFAULT_MODEL, GITHUB_COPILOT_PROVIDER_ID,
     GITHUB_REPOSITORY_CREDENTIAL_REF, ModelProvider, OPENAI_API_ENDPOINT,
@@ -27,8 +22,14 @@ pub use loom_model::{
     TYPESAFE_DECIDER_MODEL, UnavailableProvider, UsageLedger, declared_context_window,
     deterministic_descriptor, estimate_tokens, github_copilot_descriptor,
 };
+use loom_model::{
+    CancellationToken, DecisionProvider, FinishReason, MessageRole, ModelCapabilities,
+    ModelDescriptor, ModelId, ModelMessage, ModelRequest, ModelStreamEvent, ModelStreamSink,
+    ProviderId, StreamFlow, TokenUsage, ToolCall,
+};
 use serde::Deserialize;
 
+mod claude_code;
 mod credential;
 mod decider;
 mod deterministic;
@@ -41,6 +42,7 @@ mod response;
 mod retry;
 mod tool_arguments;
 
+pub use claude_code::ClaudeCodeProvider;
 pub use credential::*;
 pub use decider::*;
 pub use deterministic::*;
