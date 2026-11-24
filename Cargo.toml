@@ -7,6 +7,7 @@ members = [
     "crates/loom-sessionfs",
     "crates/loom-vcs",
     "crates/loom-process",
+    "crates/loom-harness",
     "crates/loom-model",
     "crates/loom-protocol",
     "crates/loom-providers",

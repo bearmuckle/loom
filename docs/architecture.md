@@ -144,6 +144,10 @@ Suggested backend boundaries:
   snapshots, and repository-instruction discovery.
 - `loom-process`: commands, terminals, task supervision, output streaming, and
   cancellation.
+- `loom-harness`: drivers for external agent harnesses that own their own loop,
+  starting with the Claude Code CLI in headless `stream-json` mode over a piped
+  child. It launches the person's own signed-in `claude` and never reads its
+  credentials. Not wired into runs yet.
 - `loom-vcs`: source-control abstraction and read-only repository status,
   diff, branch, and conflict reporting.
 - `loom-protocol`: versioned request/response/event schemas, the serializable
@@ -403,6 +407,7 @@ crates/
   loom-tools/
   loom-sessionfs/
   loom-process/
+  loom-harness/
   loom-vcs/
   loom-protocol/
   loom-server/
