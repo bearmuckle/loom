@@ -491,7 +491,13 @@ impl LoomView {
                     .when_some(note.heading.clone(), |element, heading| {
                         element.child(div().text_xs().text_color(rgb(accent)).child(heading))
                     })
-                    .child(div().text_sm().child(note.text.clone()))
+                    // TextView, not a plain div, so the message can be selected
+                    // and copied.
+                    .child(render_timeline_text(
+                        "status-banner-text".to_owned(),
+                        note.text.clone(),
+                        text_color,
+                    ))
                     .when_some(note.progress.clone(), |element, progress| {
                         element.child(
                             div()
@@ -535,12 +541,14 @@ impl LoomView {
                                         }),
                                 )
                                 .when(self.status_details_open, |row| {
-                                    row.child(
-                                        div()
-                                            .text_xs()
-                                            .font_family(mono_font())
-                                            .child(details.unwrap_or_default()),
-                                    )
+                                    row.child(div().text_xs().font_family(mono_font()).child(
+                                        render_timeline_text(
+                                            "status-banner-details-text".to_owned(),
+                                            // A fence keeps the raw text literal.
+                                            format!("```\n{}\n```", details.unwrap_or_default()),
+                                            text_color,
+                                        ),
+                                    ))
                                 }),
                         )
                     })
