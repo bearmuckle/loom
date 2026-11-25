@@ -255,6 +255,19 @@ pub struct UsageLimitWindow {
     pub status: Option<String>,
 }
 
+impl UsageLimitWindow {
+    /// A readable name for the window, such as `5-hour` or `Weekly`.
+    pub fn label(&self) -> String {
+        match self.name.as_str() {
+            "five_hour" => "5-hour".to_owned(),
+            "seven_day" => "Weekly".to_owned(),
+            "seven_day_opus" => "Weekly (Opus)".to_owned(),
+            "seven_day_sonnet" => "Weekly (Sonnet)".to_owned(),
+            other => other.replace('_', " "),
+        }
+    }
+}
+
 /// The account usage limits a provider last reported.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct UsageLimits {

@@ -372,7 +372,7 @@ fn render_limits_card(limits: &UsageLimits) -> impl IntoElement {
         .flex_col()
         .gap_2();
     for (index, window) in limits.windows.iter().enumerate() {
-        let label = limit_window_label(&window.name);
+        let label = window.label();
         let mut row = div()
             .flex()
             .flex_col()
@@ -414,17 +414,6 @@ fn limits_age_caption(limits: &UsageLimits, now_secs: u64) -> Option<String> {
             format_elapsed_ms(age.saturating_mul(1_000))
         )
     })
-}
-
-/// A readable name for a provider limit window.
-fn limit_window_label(name: &str) -> String {
-    match name {
-        "five_hour" => "5-hour".to_owned(),
-        "seven_day" => "Weekly".to_owned(),
-        "seven_day_opus" => "Weekly (Opus)".to_owned(),
-        "seven_day_sonnet" => "Weekly (Sonnet)".to_owned(),
-        other => other.replace('_', " "),
-    }
 }
 
 /// The used share and reset time of one limit window.
@@ -477,26 +466,28 @@ mod limit_tests {
 
     #[test]
     fn limit_windows_read_as_names_shares_and_reset_times() {
-        assert_eq!(limit_window_label("five_hour"), "5-hour");
-        assert_eq!(limit_window_label("seven_day"), "Weekly");
-        assert_eq!(limit_window_label("seven_day_opus"), "Weekly (Opus)");
-        assert_eq!(limit_window_label("new_kind"), "new kind");
-        let window = |used_percent, resets_at| UsageLimitWindow {
-            name: "five_hour".to_owned(),
+        let window = |name: &str, used_percent, resets_at| UsageLimitWindow {
+            name: name.to_owned(),
             used_percent,
             resets_at,
             status: None,
         };
+        assert_eq!(window("five_hour", None, None).label(), "5-hour");
+        assert_eq!(window("seven_day", None, None).label(), "Weekly");
+        assert_eq!(window("new_kind", None, None).label(), "new kind");
         assert_eq!(
-            limit_window_caption(&window(Some(7), Some(1_000 + 3 * 3_600 + 720)), 1_000),
+            limit_window_caption(
+                &window("five_hour", Some(7), Some(1_000 + 3 * 3_600 + 720)),
+                1_000
+            ),
             "7% used · resets in 3h 12m"
         );
         assert_eq!(
-            limit_window_caption(&window(Some(100), Some(10)), 20),
+            limit_window_caption(&window("five_hour", Some(100), Some(10)), 20),
             "100% used · resetting"
         );
         assert_eq!(
-            limit_window_caption(&window(None, None), 0),
+            limit_window_caption(&window("five_hour", None, None), 0),
             "usage unknown"
         );
     }

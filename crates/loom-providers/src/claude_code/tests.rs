@@ -73,6 +73,92 @@ fn a_fresh_session_whose_last_turn_is_a_reply_asks_to_continue() {
     assert!(prompt.contains("continue from where it stops"), "{prompt}");
 }
 
+#[test]
+fn a_blocked_account_says_why_and_a_warned_one_does_not() {
+    let window = |name: &str, status: Option<&str>, resets_at| UsageLimitWindow {
+        name: name.to_owned(),
+        used_percent: Some(100),
+        resets_at,
+        status: status.map(str::to_owned),
+    };
+    let limits = |status: &str, window| UsageLimits {
+        status: status.to_owned(),
+        windows: vec![window],
+        using_overage: false,
+        reported_at: None,
+    };
+    assert_eq!(
+        limit_reached_message(&limits(
+            "allowed",
+            window("five_hour", Some("allowed"), None)
+        )),
+        None
+    );
+    assert_eq!(
+        limit_reached_message(&limits(
+            "allowed_warning",
+            window("five_hour", Some("allowed_warning"), None)
+        )),
+        None,
+        "a warning still leaves the account room to run"
+    );
+    assert_eq!(
+        limit_reached_message(&limits(
+            "rejected",
+            window("five_hour", Some("rejected"), None)
+        ))
+        .as_deref(),
+        Some("Claude Code usage limit reached: the 5-hour window is used up")
+    );
+    // The account status alone names a window, and its reset time is given.
+    let now = loom_core::Timestamp::now().as_unix_millis() / 1_000;
+    let blocked = limit_reached_message(&limits(
+        "rejected",
+        window("seven_day", None, Some(now + 3_600 + 720)),
+    ))
+    .unwrap();
+    assert_eq!(
+        blocked,
+        "Claude Code usage limit reached: the Weekly window resets in about 1h 12m"
+    );
+    assert_eq!(
+        limit_reached_message(&UsageLimits {
+            status: "rejected".to_owned(),
+            ..UsageLimits::default()
+        })
+        .as_deref(),
+        Some("Claude Code usage limit reached")
+    );
+}
+
+#[test]
+fn a_silent_turn_is_reported_with_what_the_limits_said() {
+    let limits = |used_percent| UsageLimits {
+        status: "allowed_warning".to_owned(),
+        windows: vec![UsageLimitWindow {
+            name: "five_hour".to_owned(),
+            used_percent,
+            resets_at: None,
+            status: None,
+        }],
+        using_overage: false,
+        reported_at: None,
+    };
+    assert_eq!(
+        empty_turn_message(None),
+        "Claude Code ended the turn without a reply"
+    );
+    assert_eq!(
+        empty_turn_message(Some(&limits(Some(81)))),
+        "Claude Code ended the turn without a reply; it last reported the 5-hour window \
+         81% used"
+    );
+    assert_eq!(
+        empty_turn_message(Some(&limits(None))),
+        "Claude Code ended the turn without a reply"
+    );
+}
+
 fn descriptor(alias: &str) -> ModelDescriptor {
     ProviderConfig::claude_code("claude")
         .models
@@ -232,10 +318,18 @@ fn a_turn_streams_text_reasoning_usage_and_resumes_the_conversation() {
     let dir = std::env::temp_dir().join(format!("loom-claude-provider-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let args_file = dir.join("args.txt");
+    let count_file = dir.join("runs.txt");
     let script = dir.join("claude");
     let body = format!(
         r#"#!/bin/sh
 echo "$@" >> '{args}'
+n=$(( $(cat '{count}' 2>/dev/null || echo 0) + 1 ))
+echo "$n" > '{count}'
+if [ "$n" -ge 4 ]; then
+printf '%s\n' '{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","isUsingOverage":false,"unifiedWindows":{{"seven_day":{{"utilization":1.0,"resetsAt":1795566000,"status":"rejected"}}}}}}}}'
+printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"","session_id":"s-9"}}'
+exit 0
+fi
 read first
 echo "$first" >> '{args}'
 printf '%s\n' '{{"type":"system","subtype":"init","session_id":"s-9","tools":[]}}'
@@ -246,7 +340,8 @@ printf '%s\n' '{{"type":"user","message":{{"content":[{{"tool_use_id":"t1","type
 printf '%s\n' '{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"done"}}}},"parent_tool_use_id":null}}'
 printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s-9","usage":{{"input_tokens":3,"output_tokens":5,"cache_read_input_tokens":7,"cache_creation_input_tokens":11}}}}'
 "#,
-        args = args_file.display()
+        args = args_file.display(),
+        count = count_file.display()
     );
     std::fs::write(&script, body).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -362,6 +457,47 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
         )
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::RequestCancelled);
+
+    // A blocked account fails the turn with the reason, instead of ending it
+    // as a completed turn with no reply, and the limits still reach the sink.
+    let mut sink = loom_model::CollectingSink::default();
+    let error = provider
+        .stream(
+            &request(vec![
+                message(MessageRole::User, "list files"),
+                message(MessageRole::Assistant, "done"),
+                message(MessageRole::User, "again"),
+                message(MessageRole::Assistant, "done"),
+                message(MessageRole::User, "third"),
+                message(MessageRole::Assistant, "done"),
+                message(MessageRole::User, "fourth"),
+            ]),
+            &CancellationToken::default(),
+            &mut sink,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::ProviderUnavailable);
+    assert!(
+        error
+            .message
+            .starts_with("Claude Code usage limit reached: the Weekly window"),
+        "{}",
+        error.message
+    );
+    assert!(
+        sink.events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::Limits { limits } if limits.status == "rejected"
+        )),
+        "the rejected limits reach the card before the turn fails"
+    );
+    assert!(
+        !sink
+            .events
+            .iter()
+            .any(|event| matches!(event, ModelStreamEvent::Completed { .. })),
+        "a blocked turn never reports completion"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

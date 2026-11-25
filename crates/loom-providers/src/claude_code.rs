@@ -348,6 +348,11 @@ impl ReplyText {
     fn tool_call(&mut self) {
         self.new_message = true;
     }
+
+    /// Whether no text was emitted yet.
+    fn is_empty(&self) -> bool {
+        self.last.is_none()
+    }
 }
 
 fn emit(sink: &mut dyn ModelStreamSink, event: ModelStreamEvent) -> Result<StreamFlow> {
@@ -378,6 +383,74 @@ fn usage_limits(
                 status: window.status,
             })
             .collect(),
+    }
+}
+
+/// Why the account cannot run this turn, when it cannot.
+fn limit_reached_message(limits: &UsageLimits) -> Option<String> {
+    if limits.status != "rejected" {
+        return None;
+    }
+    let blocked = limits
+        .windows
+        .iter()
+        .find(|window| window.status.as_deref() == Some("rejected"))
+        .or_else(|| limits.windows.first());
+    let Some(window) = blocked else {
+        return Some("Claude Code usage limit reached".to_owned());
+    };
+    Some(match window.resets_at {
+        Some(at) => format!(
+            "Claude Code usage limit reached: the {} window resets {}",
+            window.label(),
+            wait_until(at)
+        ),
+        None => format!(
+            "Claude Code usage limit reached: the {} window is used up",
+            window.label()
+        ),
+    })
+}
+
+/// What a turn that ended with no reply is reported as.
+fn empty_turn_message(limits: Option<&UsageLimits>) -> String {
+    let used = limits
+        .map(|limits| {
+            limits
+                .windows
+                .iter()
+                .filter_map(|window| {
+                    window
+                        .used_percent
+                        .map(|percent| format!("the {} window {percent}% used", window.label()))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    if used.is_empty() {
+        "Claude Code ended the turn without a reply".to_owned()
+    } else {
+        format!("Claude Code ended the turn without a reply; it last reported {used}")
+    }
+}
+
+/// The wait until `at` in the roughest useful words, such as `in about 3h 12m`.
+fn wait_until(at: u64) -> String {
+    let now = loom_core::Timestamp::now().as_unix_millis() / 1_000;
+    let Some(seconds) = at.checked_sub(now) else {
+        return "now".to_owned();
+    };
+    match seconds {
+        0..=90 => "in about a minute".to_owned(),
+        seconds if seconds < 3_600 => format!("in about {} minutes", seconds.div_ceil(60)),
+        seconds => {
+            let (hours, minutes) = (seconds / 3_600, (seconds % 3_600) / 60);
+            match minutes {
+                0 => format!("in about {hours}h"),
+                minutes => format!("in about {hours}h {minutes}m"),
+            }
+        }
     }
 }
 
@@ -413,6 +486,8 @@ impl ModelProvider for ClaudeCodeProvider {
         // The tool the CLI asked for that the person has not approved yet.
         let mut asked: Option<(String, serde_json::Value)> = None;
         let mut reply = ReplyText::default();
+        // The limits the CLI reported during this turn, if any.
+        let mut seen_limits: Option<UsageLimits> = None;
         loop {
             if !stopping && cancel.is_cancelled() {
                 stopping = true;
@@ -533,6 +608,35 @@ impl ModelProvider for ClaudeCodeProvider {
                             false,
                         ));
                     }
+                    if reply.is_empty() {
+                        // Nothing reached the stream, so the turn would end with
+                        // no message at all. A CLI that kept the reply for its
+                        // final message still said something, so stream that;
+                        // otherwise say what happened instead of completing
+                        // silently, as a blocked account does.
+                        let kept = summary
+                            .result
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|text| !text.is_empty());
+                        match kept {
+                            Some(text) => {
+                                emit(
+                                    sink,
+                                    ModelStreamEvent::TextDelta {
+                                        text: text.to_owned(),
+                                    },
+                                )?;
+                            }
+                            None => {
+                                return Err(LoomError::new(
+                                    ErrorCode::ProviderUnavailable,
+                                    empty_turn_message(seen_limits.as_ref()),
+                                    false,
+                                ));
+                            }
+                        }
+                    }
                     emit(
                         sink,
                         ModelStreamEvent::Usage {
@@ -561,17 +665,32 @@ impl ModelProvider for ClaudeCodeProvider {
                     is_using_overage,
                     windows,
                     ..
-                } => emit(
-                    sink,
-                    ModelStreamEvent::Limits {
-                        limits: usage_limits(
-                            status,
-                            is_using_overage,
-                            windows,
-                            loom_core::Timestamp::now().as_unix_millis() / 1_000,
-                        ),
-                    },
-                )?,
+                } => {
+                    let limits = usage_limits(
+                        status,
+                        is_using_overage,
+                        windows,
+                        loom_core::Timestamp::now().as_unix_millis() / 1_000,
+                    );
+                    let blocked = limit_reached_message(&limits);
+                    emit(
+                        sink,
+                        ModelStreamEvent::Limits {
+                            limits: limits.clone(),
+                        },
+                    )?;
+                    seen_limits = Some(limits);
+                    if let Some(message) = blocked {
+                        // The account cannot run this turn, so fail with the
+                        // reason instead of letting the turn end empty.
+                        return Err(LoomError::new(
+                            ErrorCode::ProviderUnavailable,
+                            message,
+                            false,
+                        ));
+                    }
+                    StreamFlow::Continue
+                }
                 ClaudeEvent::PermissionCancelled { .. }
                 | ClaudeEvent::ToolResult { .. }
                 | ClaudeEvent::Other { .. } => StreamFlow::Continue,
