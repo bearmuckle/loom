@@ -18,11 +18,59 @@ fn rate_limit_windows_become_rounded_percentages() {
             window("c", Some(f64::NAN)),
             window("d", None),
         ],
+        1_700_000_000,
     );
     assert_eq!(limits.status, "allowed_warning");
     assert!(limits.using_overage);
+    assert_eq!(limits.reported_at, Some(1_700_000_000));
     let percents: Vec<_> = limits.windows.iter().map(|w| w.used_percent).collect();
     assert_eq!(percents, vec![Some(88), Some(0), None, None]);
+}
+
+#[test]
+fn text_after_a_tool_call_starts_a_new_paragraph() {
+    let mut reply = ReplyText::default();
+    // A tool call before any text adds no gap.
+    reply.tool_call();
+    assert_eq!(reply.delta("Checking ".into()), "Checking ");
+    assert_eq!(reply.delta("the code.".into()), "the code.");
+    assert_eq!(reply.delta(String::new()), "");
+    reply.tool_call();
+    assert_eq!(reply.delta("Found it.".into()), "\n\nFound it.");
+    assert_eq!(reply.delta(" Next".into()), " Next");
+    reply.tool_call();
+    assert_eq!(reply.delta("\nList:\n".into()), "\nList:\n");
+    reply.tool_call();
+    assert_eq!(reply.delta("Done.".into()), "\nDone.");
+}
+
+#[test]
+fn a_session_with_nothing_new_continues_from_the_journal() {
+    let mut provider = ClaudeCodeProvider::new(descriptor("sonnet"), "claude");
+    provider.claude_session = Some("s-1".to_owned());
+    // The reply the last turn counted was never kept, as when that turn was
+    // cancelled, so the transcript stops at the message the CLI already saw.
+    provider.delivered = 3;
+    let (prompt, system) = provider.next_prompt(&request(vec![
+        message(MessageRole::User, "one"),
+        message(MessageRole::Assistant, "two"),
+        message(MessageRole::User, "three"),
+    ]));
+    assert!(prompt.contains("[User] one"), "{prompt}");
+    assert!(prompt.ends_with("Latest message:\nthree"), "{prompt}");
+    assert_eq!(provider.claude_session, None);
+    assert_eq!(system, None);
+}
+
+#[test]
+fn a_fresh_session_whose_last_turn_is_a_reply_asks_to_continue() {
+    let mut provider = ClaudeCodeProvider::new(descriptor("sonnet"), "claude");
+    let (prompt, _) = provider.next_prompt(&request(vec![
+        message(MessageRole::User, "one"),
+        message(MessageRole::Assistant, "two"),
+    ]));
+    assert!(prompt.contains("[Assistant] two"), "{prompt}");
+    assert!(prompt.contains("continue from where it stops"), "{prompt}");
 }
 
 fn descriptor(alias: &str) -> ModelDescriptor {

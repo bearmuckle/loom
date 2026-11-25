@@ -94,7 +94,14 @@ impl ClaudeCodeProvider {
                     _ => decided_at(messages, index).map(|decided| decided.note()),
                 })
                 .collect::<Vec<_>>();
-            return (news.join("\n\n"), None);
+            if !news.is_empty() {
+                return (news.join("\n\n"), None);
+            }
+            // Nothing is new, so the reply the last turn counted is not in the
+            // transcript: the turn was cancelled or failed before its answer
+            // was kept, and the counter is one ahead of the journal. Sending
+            // nothing would fail the run, so continue from the journal.
+            self.claude_session = None;
         }
         let answered = decided_at(messages, messages.len().saturating_sub(1));
         let system = request
@@ -146,7 +153,15 @@ impl ClaudeCodeProvider {
                 )
             }
             Some((latest, _)) if latest.role == MessageRole::User => latest.content.clone(),
-            _ => String::new(),
+            // The last kept turn is already a reply, as after a cancelled turn,
+            // so the CLI is asked to carry on from it instead of being handed an
+            // empty prompt.
+            Some(_) => format!(
+                "This conversation has earlier messages, kept here as a transcript. \
+                 Treat it as history and continue from where it stops.\n\n{}",
+                recap_of(&turns)
+            ),
+            None => String::new(),
         };
         (prompt, (!system.is_empty()).then_some(system))
     }
@@ -298,6 +313,43 @@ fn tool_summary(name: &str, input: &serde_json::Value) -> String {
     }
 }
 
+/// Joins the text of the assistant messages in one Claude Code turn.
+///
+/// The CLI streams each message's text on its own, and a tool call sits
+/// between two messages. Streamed back to back, the second message would start
+/// on the last word of the first, so it starts a new paragraph instead.
+#[derive(Default)]
+struct ReplyText {
+    last: Option<char>,
+    new_message: bool,
+}
+
+impl ReplyText {
+    /// The text to emit for one delta of the reply.
+    fn delta(&mut self, text: String) -> String {
+        if text.is_empty() {
+            return text;
+        }
+        let previous = self.last;
+        self.last = text.chars().last();
+        if !std::mem::take(&mut self.new_message) {
+            return text;
+        }
+        let gap = match previous {
+            None => "",
+            Some(_) if text.starts_with('\n') => "",
+            Some('\n') => "\n",
+            Some(_) => "\n\n",
+        };
+        format!("{gap}{text}")
+    }
+
+    /// Marks that a tool call ended the current message.
+    fn tool_call(&mut self) {
+        self.new_message = true;
+    }
+}
+
 fn emit(sink: &mut dyn ModelStreamSink, event: ModelStreamEvent) -> Result<StreamFlow> {
     sink.emit(event)
 }
@@ -360,6 +412,7 @@ impl ModelProvider for ClaudeCodeProvider {
         let mut stop_deadline = None;
         // The tool the CLI asked for that the person has not approved yet.
         let mut asked: Option<(String, serde_json::Value)> = None;
+        let mut reply = ReplyText::default();
         loop {
             if !stopping && cancel.is_cancelled() {
                 stopping = true;
@@ -404,10 +457,23 @@ impl ModelProvider for ClaudeCodeProvider {
                 ClaudeEvent::TextDelta {
                     text,
                     parent_tool_use_id: None,
-                } => emit(sink, ModelStreamEvent::TextDelta { text })?,
+                } => emit(
+                    sink,
+                    ModelStreamEvent::TextDelta {
+                        text: reply.delta(text),
+                    },
+                )?,
                 ClaudeEvent::TextDelta { .. } => StreamFlow::Continue,
                 ClaudeEvent::ThinkingDelta { text, .. } => emit(sink, reasoning(text))?,
-                ClaudeEvent::ToolUse { name, input, .. } => {
+                ClaudeEvent::ToolUse {
+                    name,
+                    input,
+                    parent_tool_use_id,
+                    ..
+                } => {
+                    if parent_tool_use_id.is_none() {
+                        reply.tool_call();
+                    }
                     emit(sink, reasoning(tool_summary(&name, &input)))?
                 }
                 ClaudeEvent::ToolResult {
