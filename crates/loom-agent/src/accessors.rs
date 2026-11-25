@@ -91,12 +91,17 @@ impl AgentRuntime {
             self.task.model.as_str(),
             model.as_str()
         );
+        // The tools follow the model: a model served elsewhere cannot act on a
+        // Claude Code permission decision, so that call stops being executable.
+        let carries_permissions =
+            super::lifecycle::carries_claude_code_permissions(provider.as_ref());
         self.task.model = model.clone();
         self.run.model = model;
         self.run.updated_at = Timestamp::now();
         self.options.input_cost_micros_per_1k = input_cost_micros_per_1k;
         self.options.output_cost_micros_per_1k = output_cost_micros_per_1k;
         self.provider = Some(provider);
+        self.tools.set_claude_code_permissions(carries_permissions);
         self.provider_cursor = 0;
         Ok(true)
     }

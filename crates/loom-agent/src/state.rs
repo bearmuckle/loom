@@ -280,6 +280,10 @@ impl AgentRuntime {
                 state.run.id
             );
         }
+        let mut tools = tools;
+        tools.set_claude_code_permissions(super::lifecycle::carries_claude_code_permissions(
+            provider.as_ref(),
+        ));
         Ok(Self {
             session_id: state.session_id,
             task: state.task,

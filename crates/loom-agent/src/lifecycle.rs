@@ -1,5 +1,11 @@
 use super::*;
 
+/// Whether `provider` is the Claude Code harness, the only one whose tools
+/// carry a permission decision back to the CLI.
+pub(crate) fn carries_claude_code_permissions(provider: &dyn ModelProvider) -> bool {
+    provider.descriptor().provider.as_str() == loom_model::CLAUDE_CODE_PROVIDER_ID
+}
+
 impl AgentRuntime {
     pub fn new(
         session_id: AgentSessionId,
@@ -65,6 +71,8 @@ impl AgentRuntime {
             .collect::<Vec<_>>();
         let next_timeline_ordinal =
             u64::try_from(messages.len()).expect("initial message count fits in u64");
+        let mut tools = tools;
+        tools.set_claude_code_permissions(carries_claude_code_permissions(provider.as_ref()));
         Self {
             session_id,
             task,

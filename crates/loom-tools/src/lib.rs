@@ -573,6 +573,10 @@ pub struct ToolExecutor {
     /// action instead of a command action. Disabled unless the operator opted
     /// in, so the default policy gates every command.
     read_only_commands: ReadOnlyCommandPolicy,
+    /// Whether this run is served by Claude Code, whose harness carries a
+    /// permission decision back to the CLI through a tool call. A run served by
+    /// any other model cannot act on that call, so it is not executed there.
+    claude_code_permissions: bool,
 }
 
 impl ToolExecutor {
@@ -598,7 +602,25 @@ impl ToolExecutor {
             extension: None,
             build_cache: None,
             read_only_commands: ReadOnlyCommandPolicy::disabled(),
+            claude_code_permissions: false,
         }
+    }
+
+    /// Enables the tool call that carries a permission decision to Claude Code.
+    ///
+    /// Only a run served by the Claude Code harness has anything to carry the
+    /// decision to. Elsewhere the call is unknown, so a model that imitates the
+    /// calls in an earlier Claude Code transcript is told so instead of being
+    /// handed an approval that stands in for a result.
+    pub fn with_claude_code_permissions(mut self, enabled: bool) -> Self {
+        self.claude_code_permissions = enabled;
+        self
+    }
+
+    /// Enables or disables the decision carrier after construction, for a run
+    /// that switches to a model served elsewhere.
+    pub fn set_claude_code_permissions(&mut self, enabled: bool) {
+        self.claude_code_permissions = enabled;
     }
 
     /// Lets a command that provably only reads be evaluated under the read
@@ -726,7 +748,7 @@ impl ToolExecutor {
     }
 
     pub fn action_kind(&self, call: &ToolCall) -> Option<ActionKind> {
-        if call.name == CLAUDE_CODE_PERMISSION_TOOL {
+        if call.name == CLAUDE_CODE_PERMISSION_TOOL && self.claude_code_permissions {
             let tool = call
                 .arguments
                 .get("tool")
@@ -902,6 +924,16 @@ impl ToolExecutor {
     /// process group and reported as a failed result.
     pub fn execute_with_cancel(&self, call: &ToolCall, cancel: &CancellationToken) -> ToolResult {
         if call.name == CLAUDE_CODE_PERMISSION_TOOL {
+            if !self.claude_code_permissions {
+                return ToolResult::failure(
+                    call,
+                    format!(
+                        "unknown tool '{}': it carries a permission decision to Claude Code and \
+                         does nothing for this model",
+                        call.name
+                    ),
+                );
+            }
             return ToolResult {
                 tool_call_id: call.id,
                 name: call.name.clone(),
@@ -9405,7 +9437,9 @@ mod helper_tests {
 
     #[test]
     fn a_claude_code_permission_call_is_judged_by_the_tool_it_names() {
-        let tools = ToolExecutor::new(std::env::temp_dir()).unwrap();
+        let tools = ToolExecutor::new(std::env::temp_dir())
+            .unwrap()
+            .with_claude_code_permissions(true);
         let call = |tool: &str| ToolCall {
             id: loom_core::ToolCallId::new(),
             name: CLAUDE_CODE_PERMISSION_TOOL.to_owned(),
@@ -9427,6 +9461,31 @@ mod helper_tests {
                 .all(|definition| definition.name != CLAUDE_CODE_PERMISSION_TOOL),
             "no model is offered the permission call"
         );
+    }
+
+    #[test]
+    fn the_permission_call_only_exists_for_a_claude_code_run() {
+        let call = ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: CLAUDE_CODE_PERMISSION_TOOL.to_owned(),
+            arguments: serde_json::json!({ "tool": "Bash", "input": { "command": "echo ok" } }),
+        };
+        let elsewhere = ToolExecutor::new(std::env::temp_dir()).unwrap();
+        assert_eq!(
+            elsewhere.action_kind(&call),
+            None,
+            "not judged as a command"
+        );
+        let result = elsewhere.execute(&call);
+        assert!(!result.success, "{} was approved", result.output);
+        assert!(
+            result
+                .output
+                .starts_with("unknown tool 'claude_code_permission'"),
+            "{}",
+            result.output
+        );
+        assert!(!result.output.contains(CLAUDE_CODE_PERMISSION_APPROVED));
     }
 
     #[test]
