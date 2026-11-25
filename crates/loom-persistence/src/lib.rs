@@ -32,8 +32,8 @@ use loom_model::{
     AgentRunState, AgentToolAttemptRecord, AgentToolAttemptState, AgentToolCallRecord,
     ApprovalDecision, MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES, MAX_AGENT_RUN_MESSAGE_PAGE_SIZE,
     ModelId, ProviderConfig, ProviderHealth, ProviderId, ProviderUsageKey, ProviderUsageSummary,
-    ServerEventEnvelope, ToolResult, UsageLedger, WorkspaceEventEnvelope, WorkspaceFeedEvent,
-    tool_result_kind,
+    ServerEventEnvelope, ToolResult, UsageLedger, UsageLimits, WorkspaceEventEnvelope,
+    WorkspaceFeedEvent, tool_result_kind,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params, types::Value as SqlValue};
 use serde::{Serialize, de::DeserializeOwned};
@@ -75,7 +75,7 @@ pub use schema::*;
 /// column where the payload column already exists. The upgrade path
 /// additionally re-applies the idempotent baseline batches, so a bump is what
 /// hands new baseline objects (such as indexes) to existing databases.
-const DATABASE_SCHEMA_VERSION: u32 = 21;
+const DATABASE_SCHEMA_VERSION: u32 = 22;
 /// Oldest schema version that the migration ladder can upgrade in place.
 const DATABASE_MIN_MIGRATABLE_VERSION: u32 = 2;
 /// Maximum UTF-8 bytes stored for a raw or provider-qualified model selector.
@@ -230,6 +230,8 @@ impl Default for DurableArchiveRetentionPolicy {
 pub struct DurableProviderState {
     pub configs: BTreeMap<ProviderId, ProviderConfig>,
     pub health: BTreeMap<ProviderId, ProviderHealth>,
+    /// The account usage limits each provider last reported.
+    pub usage_limits: BTreeMap<ProviderId, UsageLimits>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

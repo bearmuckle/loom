@@ -317,6 +317,7 @@ impl LoomView {
                     view.github_connected = providers
                         .iter()
                         .any(|provider| provider.kind == ProviderKind::GitHubCopilot);
+                    view.review.usage.adopt_stored_limits(&providers);
                     view.providers = providers;
                 }
                 Err(error) => view.record_backend_error("list providers", error),
@@ -761,6 +762,7 @@ impl LoomView {
                     view.github_connected = providers
                         .iter()
                         .any(|provider| provider.kind == ProviderKind::GitHubCopilot);
+                    view.review.usage.adopt_stored_limits(&providers);
                     view.providers = providers;
                 }
                 Err(error) => view.record_backend_error("list providers", error),

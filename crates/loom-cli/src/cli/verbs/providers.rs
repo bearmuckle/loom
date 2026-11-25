@@ -431,6 +431,7 @@ mod tests {
             credential_id: credential.map(str::to_owned),
             api_key_configurable: true,
             health: ProviderHealth::default(),
+            usage_limits: None,
         }
     }
 

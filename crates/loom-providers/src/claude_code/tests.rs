@@ -234,8 +234,19 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
     assert!(reasoning.contains("hm"), "{reasoning}");
     assert!(reasoning.contains("→ Bash: ls"), "{reasoning}");
     assert!(reasoning.contains("✗ boom"), "{reasoning}");
-    assert!(sink.events.contains(&ModelStreamEvent::Limits {
-        limits: UsageLimits {
+    let mut limits = sink
+        .events
+        .iter()
+        .find_map(|event| match event {
+            ModelStreamEvent::Limits { limits } => Some(limits.clone()),
+            _ => None,
+        })
+        .expect("the rate-limit line becomes a limits event");
+    assert!(limits.reported_at.is_some());
+    limits.reported_at = None;
+    assert_eq!(
+        limits,
+        UsageLimits {
             status: "allowed".into(),
             windows: vec![UsageLimitWindow {
                 name: "five_hour".into(),
@@ -244,8 +255,9 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
                 status: Some("allowed".into()),
             }],
             using_overage: false,
-        },
-    }));
+            reported_at: None,
+        }
+    );
     assert!(sink.events.contains(&ModelStreamEvent::Usage {
         usage: TokenUsage {
             input_tokens: 14,

@@ -653,6 +653,7 @@ impl InProcessBackend {
                 .map(|config| (config.id.clone(), config))
                 .collect(),
             health: self.providers.export_health()?,
+            usage_limits: self.providers.export_usage_limits()?,
         };
         let workspace_records = self.workspace_records()?.export_state();
         let provider_usage = self.providers.usage()?;

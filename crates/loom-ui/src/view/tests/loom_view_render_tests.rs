@@ -3156,6 +3156,7 @@ fn settings_and_provider_dialogs_render_configured_entries(cx: &mut TestAppConte
                 credential_id: Some("gateway-key".to_owned()),
                 api_key_configurable: true,
                 health: ProviderHealth::default(),
+                usage_limits: None,
             },
             ProviderSummary {
                 id: github_provider_id,
@@ -3165,6 +3166,7 @@ fn settings_and_provider_dialogs_render_configured_entries(cx: &mut TestAppConte
                 credential_id: None,
                 api_key_configurable: false,
                 health: ProviderHealth::default(),
+                usage_limits: None,
             },
             ProviderSummary {
                 id: loom_model::ProviderId::new("empty-ollama"),
@@ -3174,6 +3176,7 @@ fn settings_and_provider_dialogs_render_configured_entries(cx: &mut TestAppConte
                 credential_id: None,
                 api_key_configurable: false,
                 health: ProviderHealth::default(),
+                usage_limits: None,
             },
         ];
     });
@@ -3206,6 +3209,7 @@ fn provider_cards_refresh_the_catalog_of_every_configured_provider(cx: &mut Test
                 credential_id: Some("github-copilot".to_owned()),
                 api_key_configurable: false,
                 health: ProviderHealth::default(),
+                usage_limits: None,
             },
             ProviderSummary {
                 id: loom_model::ProviderId::new("company-gateway"),
@@ -3215,6 +3219,7 @@ fn provider_cards_refresh_the_catalog_of_every_configured_provider(cx: &mut Test
                 credential_id: Some("gateway-key".to_owned()),
                 api_key_configurable: true,
                 health: ProviderHealth::default(),
+                usage_limits: None,
             },
         ];
         view
@@ -4471,6 +4476,7 @@ fn run_tab_figures_fit_a_phone_pane(cx: &mut TestAppContext) {
                 },
             ],
             using_overage: false,
+            reported_at: None,
         });
         view.plan = Some(crate::state::PlanState {
             steps: vec![

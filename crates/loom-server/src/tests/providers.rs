@@ -1290,3 +1290,60 @@ fn a_run_whose_model_left_the_catalog_keeps_its_provider() {
     );
     fs::remove_dir_all(&backend.session_root_base).unwrap();
 }
+
+#[test]
+fn reported_usage_limits_survive_a_worker_restart() {
+    let root = std::env::temp_dir().join(format!("loom-usage-limits-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("backend.sqlite");
+    let model = ModelId::new("deterministic/demo");
+    let limits = loom_model::UsageLimits {
+        status: "allowed_warning".to_owned(),
+        windows: vec![loom_model::UsageLimitWindow {
+            name: "five_hour".to_owned(),
+            used_percent: Some(81),
+            resets_at: Some(1_795_566_000),
+            status: Some("allowed_warning".to_owned()),
+        }],
+        using_overage: false,
+        reported_at: Some(1_795_550_000),
+    };
+    let backend = InProcessBackend::new_persistent(&path).unwrap();
+    let provider_id = backend
+        .provider_registry()
+        .provider_id_for_model(&model)
+        .unwrap();
+    backend.record_usage_limits(&model, &limits);
+    // A model no provider serves is logged and ignored.
+    backend.record_usage_limits(&ModelId::new("nowhere/unknown"), &limits);
+    backend.persist_state().unwrap();
+    drop(backend);
+
+    let reopened = InProcessBackend::new_persistent(&path).unwrap();
+    let connection = reopened.connect();
+    negotiate_m3(&connection);
+    let providers = match connection
+        .request(RequestEnvelope::new(ClientRequest::Provider(
+            ProviderRequest::ListProviders,
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Provider(ProviderResponse::Providers { providers }) => providers,
+        response => panic!("unexpected provider response: {response:?}"),
+    };
+    let summary = providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .expect("the provider that reported limits is listed");
+    assert_eq!(summary.usage_limits.as_ref(), Some(&limits));
+    assert!(
+        providers
+            .iter()
+            .filter(|provider| provider.id != provider_id)
+            .all(|provider| provider.usage_limits.is_none())
+    );
+    drop(connection);
+    drop(reopened);
+    fs::remove_dir_all(root).unwrap();
+}

@@ -571,6 +571,10 @@ CREATE TABLE IF NOT EXISTS provider_health (
     provider_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(provider_id)) > 0),
     health TEXT NOT NULL CHECK(length(health) <= 16384)
 ) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS provider_usage_limits (
+    provider_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(provider_id)) > 0),
+    limits TEXT NOT NULL CHECK(length(limits) <= 16384)
+) WITHOUT ROWID, STRICT;
 CREATE TABLE IF NOT EXISTS provider_usage_totals (
     provider_id TEXT NOT NULL CHECK(length(trim(provider_id)) > 0),
     model_id TEXT NOT NULL CHECK(length(trim(model_id)) > 0),
@@ -1446,6 +1450,12 @@ fn migrate_schema_transaction(connection: &Connection, from_version: u32) -> Res
                         })?;
                 }
                 version = 21;
+            }
+            // v22 keeps the account usage limits each provider last reported, a
+            // new baseline table. A database written before it has no stored
+            // limits, so a client shows none until the next report.
+            21 => {
+                version = 22;
             }
             other => return Err(unsupported_database_error(other)),
         }

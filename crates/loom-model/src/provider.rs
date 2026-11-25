@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     DECIDER_PROVIDER_ID, ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ModelRequest,
-    ModelStreamEvent, ProviderId, TokenUsage,
+    ModelStreamEvent, ProviderId, TokenUsage, UsageLimits,
 };
 
 /// Cooperative cancellation shared between a run and the provider serving it.
@@ -293,6 +293,11 @@ pub struct ProviderSummary {
     #[serde(default)]
     pub api_key_configurable: bool,
     pub health: ProviderHealth,
+    /// The account usage limits this provider last reported, kept by the
+    /// backend so a client can show them before the next run. Missing on
+    /// older peers and on providers that never report limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_limits: Option<UsageLimits>,
 }
 
 impl ProviderSummary {
@@ -370,6 +375,7 @@ mod tests {
             credential_id: None,
             api_key_configurable: true,
             health: ProviderHealth::default(),
+            usage_limits: None,
         };
         assert!(summary.is_decider());
 

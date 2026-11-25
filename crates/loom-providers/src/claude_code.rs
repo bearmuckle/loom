@@ -308,10 +308,12 @@ fn usage_limits(
     status: String,
     using_overage: bool,
     windows: Vec<loom_harness::RateLimitWindow>,
+    reported_at: u64,
 ) -> UsageLimits {
     UsageLimits {
         status,
         using_overage,
+        reported_at: Some(reported_at),
         windows: windows
             .into_iter()
             .map(|window| UsageLimitWindow {
@@ -496,7 +498,12 @@ impl ModelProvider for ClaudeCodeProvider {
                 } => emit(
                     sink,
                     ModelStreamEvent::Limits {
-                        limits: usage_limits(status, is_using_overage, windows),
+                        limits: usage_limits(
+                            status,
+                            is_using_overage,
+                            windows,
+                            loom_core::Timestamp::now().as_unix_millis() / 1_000,
+                        ),
                     },
                 )?,
                 ClaudeEvent::PermissionCancelled { .. }

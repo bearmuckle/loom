@@ -13,7 +13,7 @@ use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, EventSequence, PolicyEvaluation,
     ToolCallId, UsageSnapshot,
 };
-use loom_model::{ProviderUsageSummary, UsageLimits};
+use loom_model::{ProviderSummary, ProviderUsageSummary, UsageLimits};
 use loom_protocol::{
     ActivityDetail, AgentPlanProgress, AgentRunState, GitDiff, GitRepositoryStatus,
     SessionFilesystemChange, SessionFilesystemFile,
@@ -76,6 +76,26 @@ impl UsageState {
         self.run_provider
             .as_ref()
             .or(self.session_provider.as_ref())
+    }
+
+    /// Shows the newest limits a backend kept for its providers, so the card
+    /// has figures before the next run. Limits reported live since then are
+    /// newer and stay.
+    pub(crate) fn adopt_stored_limits(&mut self, providers: &[ProviderSummary]) {
+        let Some(stored) = providers
+            .iter()
+            .filter_map(|provider| provider.usage_limits.as_ref())
+            .max_by_key(|limits| limits.reported_at)
+        else {
+            return;
+        };
+        if self
+            .limits
+            .as_ref()
+            .is_none_or(|current| current.reported_at < stored.reported_at)
+        {
+            self.limits = Some(stored.clone());
+        }
     }
 }
 

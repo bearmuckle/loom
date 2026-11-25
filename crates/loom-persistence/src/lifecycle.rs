@@ -318,6 +318,7 @@ impl FilePersistence {
         if let Some(providers) = write.providers {
             save_provider_config_rows(&transaction, &providers.configs)?;
             save_provider_health_rows(&transaction, &providers.health)?;
+            save_provider_usage_limit_rows(&transaction, &providers.usage_limits)?;
         }
         if let Some(usage) = write.usage {
             save_usage_totals(&transaction, usage)?;

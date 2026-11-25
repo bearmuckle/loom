@@ -76,6 +76,9 @@ impl InProcessBackend {
                 // it reads them from the cached state instead of the runtime,
                 // whose lock the run loop already holds.
                 match event {
+                    AgentEvent::UsageLimitsReported { limits, .. } => {
+                        backend.record_usage_limits(&handle.state().run.model, limits);
+                    }
                     AgentEvent::PlanProposed { plan, .. } => {
                         let goal = handle.state().run.task;
                         backend.maybe_auto_title(session_id, plan.title.as_deref(), &goal);
@@ -93,6 +96,25 @@ impl InProcessBackend {
                 }
             }
         })
+    }
+
+    /// Keeps the limits a run's provider reported, so a client sees them
+    /// before the next run. They reach the database with the next state save.
+    pub(crate) fn record_usage_limits(&self, model: &ModelId, limits: &loom_model::UsageLimits) {
+        let recorded = self
+            .providers
+            .provider_id_for_model(model)
+            .and_then(|provider_id| {
+                self.providers
+                    .record_usage_limits(provider_id, limits.clone())
+            });
+        if let Err(error) = recorded {
+            log::warn!(
+                "could not keep the usage limits reported for model '{}': {}",
+                model.as_str(),
+                error.message
+            );
+        }
     }
 
     /// Wraps a runtime in a handle and attaches the journaling observer.

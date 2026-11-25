@@ -265,6 +265,7 @@ struct PersistedBackendState {
     auto_approve_actions: BTreeMap<AgentSessionId, bool>,
     provider_configs: Vec<ProviderConfig>,
     provider_health: BTreeMap<ProviderId, ProviderHealth>,
+    provider_usage_limits: BTreeMap<ProviderId, loom_model::UsageLimits>,
     workspace_configs: BTreeMap<WorkspaceId, WorkspaceConfig>,
     provider_usage: UsageLedger,
     idempotency: BTreeMap<loom_core::RequestId, IdempotencyRecord>,

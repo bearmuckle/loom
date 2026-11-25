@@ -381,7 +381,10 @@ fn render_limits_card(limits: &UsageLimits) -> impl IntoElement {
                 "{label} · {}",
                 limit_window_caption(window, now_secs)
             )));
-        if let Some(percent) = window.used_percent {
+        // A window that reset since the report no longer has this usage, so
+        // only its caption remains.
+        let reset = window.resets_at.is_some_and(|at| at <= now_secs);
+        if let Some(percent) = window.used_percent.filter(|_| !reset) {
             row = row.child(
                 Progress::new(("plan-limit", index))
                     .value(percent.min(100) as f32)
@@ -395,7 +398,22 @@ fn render_limits_card(limits: &UsageLimits) -> impl IntoElement {
     if let Some(note) = limits_note(limits) {
         body = body.child(div().text_xs().text_color(rgb(0xfca5a5)).child(note));
     }
+    if let Some(age) = limits_age_caption(limits, now_secs) {
+        body = body.child(metric_caption(age));
+    }
     card("Plan limits", body)
+}
+
+/// How old stored limits are, once they are older than a minute. Live limits
+/// arrive during a run, so only a kept copy from an earlier run says this.
+fn limits_age_caption(limits: &UsageLimits, now_secs: u64) -> Option<String> {
+    let age = now_secs.checked_sub(limits.reported_at?)?;
+    (age >= 60).then(|| {
+        format!(
+            "Reported {} ago",
+            format_elapsed_ms(age.saturating_mul(1_000))
+        )
+    })
 }
 
 /// A readable name for a provider limit window.
@@ -484,11 +502,68 @@ mod limit_tests {
     }
 
     #[test]
+    fn stored_limits_say_how_old_they_are() {
+        let limits = |reported_at| UsageLimits {
+            status: "allowed".to_owned(),
+            windows: Vec::new(),
+            using_overage: false,
+            reported_at,
+        };
+        assert_eq!(limits_age_caption(&limits(None), 1_000), None);
+        assert_eq!(limits_age_caption(&limits(Some(990)), 1_000), None);
+        assert_eq!(limits_age_caption(&limits(Some(2_000)), 1_000), None);
+        assert_eq!(
+            limits_age_caption(&limits(Some(1_000)), 1_000 + 2 * 3_600 + 300).as_deref(),
+            Some("Reported 2h 5m ago")
+        );
+    }
+
+    #[test]
+    fn the_newest_stored_limits_fill_the_card_unless_live_ones_are_newer() {
+        let limits = |status: &str, reported_at| UsageLimits {
+            status: status.to_owned(),
+            windows: Vec::new(),
+            using_overage: false,
+            reported_at: Some(reported_at),
+        };
+        let provider = |id: &str, usage_limits| loom_model::ProviderSummary {
+            id: loom_model::ProviderId::new(id),
+            kind: loom_model::ProviderKind::ClaudeCode,
+            display_name: id.to_owned(),
+            models: Vec::new(),
+            credential_id: None,
+            api_key_configurable: false,
+            health: loom_model::ProviderHealth::default(),
+            usage_limits,
+        };
+        let providers = vec![
+            provider("none", None),
+            provider("older", Some(limits("older", 10))),
+            provider("newer", Some(limits("newer", 20))),
+        ];
+        let mut usage = crate::state::UsageState::default();
+        usage.adopt_stored_limits(&[provider("none", None)]);
+        assert_eq!(usage.limits, None);
+        usage.adopt_stored_limits(&providers);
+        assert_eq!(
+            usage.limits.as_ref().map(|l| l.status.as_str()),
+            Some("newer")
+        );
+        usage.limits = Some(limits("live", 30));
+        usage.adopt_stored_limits(&providers);
+        assert_eq!(
+            usage.limits.as_ref().map(|l| l.status.as_str()),
+            Some("live")
+        );
+    }
+
+    #[test]
     fn limit_notes_warn_only_when_the_account_is_constrained() {
         let limits = |status: &str, using_overage| UsageLimits {
             status: status.to_owned(),
             windows: Vec::new(),
             using_overage,
+            reported_at: None,
         };
         assert_eq!(limits_note(&limits("allowed", false)), None);
         assert_eq!(

@@ -375,6 +375,8 @@ impl InProcessBackend {
             self.providers
                 .restore_health(persistence.load_provider_health()?)?;
             self.providers
+                .restore_usage_limits(persistence.load_provider_usage_limits()?)?;
+            self.providers
                 .restore_usage(persistence.load_provider_usage()?)?;
             *self.workspace_configs()? = persistence.load_workspace_configs()?;
             if migrated {
@@ -402,6 +404,7 @@ impl InProcessBackend {
             auto_approve_actions: session_settings.auto_approve_actions,
             provider_configs: persistence.load_provider_configs()?,
             provider_health: persistence.load_provider_health()?,
+            provider_usage_limits: persistence.load_provider_usage_limits()?,
             workspace_configs: persistence.load_workspace_configs()?,
             provider_usage: persistence.load_provider_usage()?,
             idempotency: persistence
@@ -460,6 +463,8 @@ impl InProcessBackend {
         }
         self.providers.restore_configs(provider_configs)?;
         self.providers.restore_health(state.provider_health)?;
+        self.providers
+            .restore_usage_limits(state.provider_usage_limits)?;
         self.providers.restore_usage(state.provider_usage)?;
         *self.workspace_configs()? = state.workspace_configs;
 

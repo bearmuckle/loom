@@ -304,6 +304,20 @@ fn session_and_workspace_settings_are_bounded_indexed_and_atomic() {
     let provider_state = DurableProviderState {
         configs: BTreeMap::from([(provider_id.clone(), provider_config.clone())]),
         health: BTreeMap::from([(provider_id.clone(), ProviderHealth::default())]),
+        usage_limits: BTreeMap::from([(
+            provider_id.clone(),
+            loom_model::UsageLimits {
+                status: "allowed".to_owned(),
+                windows: vec![loom_model::UsageLimitWindow {
+                    name: "five_hour".to_owned(),
+                    used_percent: Some(7),
+                    resets_at: Some(1_795_566_000),
+                    status: Some("allowed".to_owned()),
+                }],
+                using_overage: false,
+                reported_at: Some(1_795_550_000),
+            },
+        )]),
     };
     let model_id = ModelId::new("deterministic-model");
     let mut usage = UsageLedger::default();
@@ -593,6 +607,10 @@ fn session_and_workspace_settings_are_bounded_indexed_and_atomic() {
     assert_eq!(
         persistence.load_provider_health().unwrap(),
         provider_state.health
+    );
+    assert_eq!(
+        persistence.load_provider_usage_limits().unwrap(),
+        provider_state.usage_limits
     );
     assert_eq!(persistence.load_provider_usage().unwrap(), usage);
     assert_eq!(

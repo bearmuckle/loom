@@ -265,6 +265,10 @@ pub struct UsageLimits {
     /// Whether usage now draws on paid overage.
     #[serde(default)]
     pub using_overage: bool,
+    /// When the provider reported these limits, in Unix seconds, so a stored
+    /// copy can say how old it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -487,6 +491,7 @@ mod tests {
             credential_id,
             api_key_configurable: false,
             health: ProviderHealth::default(),
+            usage_limits: None,
         };
 
         assert!(ProviderKind::DeepSeek.requires_credential());

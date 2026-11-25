@@ -19,7 +19,7 @@ pub use loom_model::{
     OPENAI_PROVIDER_ID, OPENCODE_DECIDER_ENDPOINT, OPENCODE_DECIDER_MODEL, ProviderConfig,
     ProviderDescriptor, ProviderHealth, ProviderHealthState, ProviderKind, ProviderSummary,
     ProviderUsageKey, ProviderUsageRecord, ProviderUsageSummary, TYPESAFE_DECIDER_ENDPOINT,
-    TYPESAFE_DECIDER_MODEL, UnavailableProvider, UsageLedger, declared_context_window,
+    TYPESAFE_DECIDER_MODEL, UnavailableProvider, UsageLedger, UsageLimits, declared_context_window,
     deterministic_descriptor, estimate_tokens, github_copilot_descriptor,
 };
 use loom_model::{

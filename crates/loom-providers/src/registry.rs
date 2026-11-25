@@ -24,6 +24,8 @@ pub struct ProviderRegistry {
     pub api_key_credentials: Arc<Mutex<Option<Arc<dyn CredentialStore>>>>,
     pub health: Arc<Mutex<BTreeMap<ProviderId, ProviderHealth>>>,
     pub usage: Arc<Mutex<UsageLedger>>,
+    /// The account usage limits each provider last reported.
+    pub usage_limits: Arc<Mutex<BTreeMap<ProviderId, UsageLimits>>>,
 }
 
 impl fmt::Debug for ProviderRegistry {
@@ -55,6 +57,7 @@ impl ProviderRegistry {
             credentials,
             api_key_credentials: Arc::new(Mutex::new(None)),
             health: Arc::new(Mutex::new(BTreeMap::new())),
+            usage_limits: Arc::new(Mutex::new(BTreeMap::new())),
             usage: Arc::new(Mutex::new(UsageLedger::default())),
         }
     }
@@ -645,6 +648,10 @@ impl ProviderRegistry {
             .health
             .lock()
             .map_err(|_| internal_lock_error("provider health"))?;
+        let usage_limits = self
+            .usage_limits
+            .lock()
+            .map_err(|_| internal_lock_error("provider usage limits"))?;
         Ok(configurations
             .values()
             .filter(|config| self.is_configured(config))
@@ -662,6 +669,7 @@ impl ProviderRegistry {
                     ProviderKind::OpenAi | ProviderKind::OpenAiCompatible | ProviderKind::DeepSeek
                 ),
                 health: health.get(&config.id).cloned().unwrap_or_default(),
+                usage_limits: usage_limits.get(&config.id).cloned(),
             })
             .collect())
     }
@@ -1245,6 +1253,31 @@ impl ProviderRegistry {
             .health
             .lock()
             .map_err(|_| internal_lock_error("provider health"))? = health;
+        Ok(())
+    }
+
+    /// Keeps the limits `provider_id` just reported, replacing older ones.
+    pub fn record_usage_limits(&self, provider_id: ProviderId, limits: UsageLimits) -> Result<()> {
+        self.usage_limits
+            .lock()
+            .map_err(|_| internal_lock_error("provider usage limits"))?
+            .insert(provider_id, limits);
+        Ok(())
+    }
+
+    pub fn export_usage_limits(&self) -> Result<BTreeMap<ProviderId, UsageLimits>> {
+        Ok(self
+            .usage_limits
+            .lock()
+            .map_err(|_| internal_lock_error("provider usage limits"))?
+            .clone())
+    }
+
+    pub fn restore_usage_limits(&self, limits: BTreeMap<ProviderId, UsageLimits>) -> Result<()> {
+        *self
+            .usage_limits
+            .lock()
+            .map_err(|_| internal_lock_error("provider usage limits"))? = limits;
         Ok(())
     }
 

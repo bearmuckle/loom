@@ -519,37 +519,51 @@ impl FilePersistence {
     }
 
     pub fn load_provider_health(&self) -> Result<BTreeMap<ProviderId, ProviderHealth>> {
+        self.load_provider_json_rows("provider_health", "health", "provider health")
+    }
+
+    pub fn load_provider_usage_limits(&self) -> Result<BTreeMap<ProviderId, UsageLimits>> {
+        self.load_provider_json_rows("provider_usage_limits", "limits", "provider usage limits")
+    }
+
+    /// Reads one JSON value per provider from `table`.
+    fn load_provider_json_rows<T: DeserializeOwned>(
+        &self,
+        table: &str,
+        value_column: &str,
+        label: &str,
+    ) -> Result<BTreeMap<ProviderId, T>> {
         if !self.path.exists() {
             return Ok(BTreeMap::new());
         }
         let connection = self.connection()?;
         let mut statement = connection
-            .prepare("SELECT provider_id, health FROM provider_health ORDER BY provider_id")
+            .prepare(&format!(
+                "SELECT provider_id, {value_column} FROM {table} ORDER BY provider_id"
+            ))
             .map_err(|error| {
-                persistence_error(format!("could not prepare provider health: {error}"), true)
+                persistence_error(format!("could not prepare {label}: {error}"), true)
             })?;
         let rows = statement
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
-            .map_err(|error| {
-                persistence_error(format!("could not read provider health: {error}"), true)
-            })?;
-        let mut health = BTreeMap::new();
+            .map_err(|error| persistence_error(format!("could not read {label}: {error}"), true))?;
+        let mut values = BTreeMap::new();
         for row in rows {
-            let (provider_id, state) = row.map_err(|error| {
-                persistence_error(format!("could not read provider health: {error}"), true)
+            let (provider_id, value) = row.map_err(|error| {
+                persistence_error(format!("could not read {label}: {error}"), true)
             })?;
-            let state = serde_json::from_str(&state).map_err(|error| {
+            let value = serde_json::from_str(&value).map_err(|error| {
                 LoomError::new(
                     ErrorCode::MalformedPayload,
-                    format!("persisted provider health is malformed: {error}"),
+                    format!("persisted {label} is malformed: {error}"),
                     false,
                 )
             })?;
-            health.insert(ProviderId::new(provider_id), state);
+            values.insert(ProviderId::new(provider_id), value);
         }
-        Ok(health)
+        Ok(values)
     }
 
     pub fn load_provider_usage(&self) -> Result<UsageLedger> {
@@ -1749,6 +1763,19 @@ pub(crate) fn save_provider_health_rows(
         "provider_health",
         "health",
         health.iter(),
+        16_384,
+    )
+}
+
+pub(crate) fn save_provider_usage_limit_rows(
+    transaction: &Transaction<'_>,
+    limits: &BTreeMap<ProviderId, UsageLimits>,
+) -> Result<()> {
+    save_provider_json_rows(
+        transaction,
+        "provider_usage_limits",
+        "limits",
+        limits.iter(),
         16_384,
     )
 }

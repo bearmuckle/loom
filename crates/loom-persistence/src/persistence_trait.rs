@@ -7,6 +7,7 @@ pub trait CatalogRepository: Send + Sync {
     fn load_idempotency_records(&self) -> Result<BTreeMap<RequestId, DurableIdempotencyRecord>>;
     fn load_provider_configs(&self) -> Result<Vec<ProviderConfig>>;
     fn load_provider_health(&self) -> Result<BTreeMap<ProviderId, ProviderHealth>>;
+    fn load_provider_usage_limits(&self) -> Result<BTreeMap<ProviderId, UsageLimits>>;
     fn load_provider_usage(&self) -> Result<UsageLedger>;
     fn load_workspace_configs(&self) -> Result<BTreeMap<WorkspaceId, WorkspaceConfig>>;
     fn load_workspaces(&self) -> Result<Option<WorkspaceManagerState>>;
@@ -28,6 +29,9 @@ impl CatalogRepository for FilePersistence {
     }
     fn load_provider_health(&self) -> Result<BTreeMap<ProviderId, ProviderHealth>> {
         FilePersistence::load_provider_health(self)
+    }
+    fn load_provider_usage_limits(&self) -> Result<BTreeMap<ProviderId, UsageLimits>> {
+        FilePersistence::load_provider_usage_limits(self)
     }
     fn load_provider_usage(&self) -> Result<UsageLedger> {
         FilePersistence::load_provider_usage(self)
@@ -64,6 +68,9 @@ impl<T: CatalogRepository + ?Sized> CatalogRepository for Arc<T> {
     }
     fn load_provider_health(&self) -> Result<BTreeMap<ProviderId, ProviderHealth>> {
         (**self).load_provider_health()
+    }
+    fn load_provider_usage_limits(&self) -> Result<BTreeMap<ProviderId, UsageLimits>> {
+        (**self).load_provider_usage_limits()
     }
     fn load_provider_usage(&self) -> Result<UsageLedger> {
         (**self).load_provider_usage()

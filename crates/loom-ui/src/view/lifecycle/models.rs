@@ -97,6 +97,7 @@ impl LoomView {
                 if view.providers_node_id.as_deref() == Some(node_id.as_str()) {
                     match provider_response.result {
                         Ok(ServerResponse::Provider(ProviderResponse::Providers { providers })) => {
+                            view.review.usage.adopt_stored_limits(&providers);
                             view.providers = providers;
                         }
                         Err(error) => view.record_backend_error("list providers", error),
