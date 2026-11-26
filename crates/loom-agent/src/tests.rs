@@ -794,6 +794,90 @@ fn a_pause_request_stops_a_run_that_is_waiting_on_the_model() {
     assert!(!control.is_stopping());
 }
 
+/// Provider that records the workspace it is bound to.
+struct WorkspaceRecordingProvider {
+    descriptor: loom_model::ModelDescriptor,
+    bound: Arc<Mutex<Option<PathBuf>>>,
+}
+
+impl ModelProvider for WorkspaceRecordingProvider {
+    fn descriptor(&self) -> &loom_model::ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn bind_workspace(&mut self, root: &std::path::Path) {
+        *self.bound.lock().unwrap() = Some(root.to_path_buf());
+    }
+
+    fn stream(
+        &mut self,
+        _request: &ModelRequest,
+        _cancel: &CancellationToken,
+        sink: &mut dyn loom_model::ModelStreamSink,
+    ) -> Result<()> {
+        sink.emit(ModelStreamEvent::Completed {
+            reason: loom_model::FinishReason::Stop,
+        })?;
+        Ok(())
+    }
+}
+
+fn recording_descriptor(model: &str, provider: &str) -> loom_model::ModelDescriptor {
+    loom_model::ModelDescriptor {
+        id: ModelId::new(model),
+        provider: loom_model::ProviderId::new(provider),
+        display_name: "Workspace recording provider".to_owned(),
+        context_window: Some(8_192),
+        max_input_tokens: None,
+        max_output_tokens: None,
+        capabilities: loom_model::ModelCapabilities::default(),
+    }
+}
+
+#[test]
+fn switching_model_binds_the_new_provider_to_the_workspace() {
+    let root = workspace();
+    let tools = ToolExecutor::new(&root).unwrap();
+    let task = AgentTask::new("switch", ModelId::new("first/demo")).unwrap();
+    let bound = Arc::new(Mutex::new(None));
+    let mut runtime = AgentRuntime::new(
+        AgentSessionId::new(),
+        task,
+        Box::new(WorkspaceRecordingProvider {
+            descriptor: recording_descriptor("first/demo", "first"),
+            bound: Arc::new(Mutex::new(None)),
+        }),
+        tools,
+    );
+
+    let changed = runtime
+        .set_model(
+            ModelId::new("second/demo"),
+            Box::new(WorkspaceRecordingProvider {
+                descriptor: recording_descriptor("second/demo", "second"),
+                bound: Arc::clone(&bound),
+            }),
+            0,
+            0,
+        )
+        .unwrap();
+
+    assert!(changed);
+    // A harness that runs in the session's checkout needs the directory, and a
+    // provider created for the switch has never been told it.
+    assert_eq!(*bound.lock().unwrap(), Some(root.clone()));
+
+    // A provider replaced for a fresh credential is bound as well.
+    let rebound = Arc::new(Mutex::new(None));
+    runtime
+        .replace_provider(Box::new(WorkspaceRecordingProvider {
+            descriptor: recording_descriptor("second/demo", "second"),
+            bound: Arc::clone(&rebound),
+        }))
+        .unwrap();
+    assert_eq!(*rebound.lock().unwrap(), Some(root.clone()));
+}
+
 #[test]
 fn a_single_completion_runs_all_of_its_executable_tool_calls() {
     let root = workspace();

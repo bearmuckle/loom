@@ -95,6 +95,11 @@ impl AgentRuntime {
         // Claude Code permission decision, so that call stops being executable.
         let carries_permissions =
             super::lifecycle::carries_claude_code_permissions(provider.as_ref());
+        // A provider created for the switch has not seen the workspace yet. A
+        // harness that runs in the session's checkout, as Claude Code does,
+        // needs the directory before its next turn.
+        let mut provider = provider;
+        provider.bind_workspace(self.tools.root());
         self.task.model = model.clone();
         self.run.model = model;
         self.run.updated_at = Timestamp::now();
@@ -129,6 +134,10 @@ impl AgentRuntime {
             self.run.id,
             self.task.model.as_str()
         );
+        // The replacement is a newly built provider, so it is told the workspace
+        // as the one it replaces was.
+        let mut provider = provider;
+        provider.bind_workspace(self.tools.root());
         self.provider = Some(provider);
         Ok(())
     }
