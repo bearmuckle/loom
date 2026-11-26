@@ -78,6 +78,7 @@ use sysinfo::System;
 mod activity_detail;
 mod auth;
 mod backend;
+mod build_cache;
 
 use backend::{
     CachedMirrorRefresh, MirrorFreshness, ProcessService, RepositoryService, RunService,
@@ -431,6 +432,8 @@ pub struct InProcessBackend {
     /// Per-instance root for session build output. Present for a durable
     /// backend, absent for the in-memory one.
     build_cache_base: Option<PathBuf>,
+    /// How much build output is kept, and for how long.
+    build_cache_retention: crate::build_cache::BuildCacheRetention,
     /// Configured archive-retention policy; read through
     /// [`InProcessBackend::archive_retention`].
     archive_retention: Mutex<loom_protocol::ArchiveRetentionPolicy>,

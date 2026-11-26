@@ -323,6 +323,7 @@ fn a_turn_streams_text_reasoning_usage_and_resumes_the_conversation() {
     let body = format!(
         r#"#!/bin/sh
 echo "$@" >> '{args}'
+printf 'env:%s|%s|%s\n' "${{CARGO_TARGET_DIR}}" "${{CARGO_INCREMENTAL}}" "${{CARGO_PROFILE_DEV_DEBUG}}" >> '{args}'
 n=$(( $(cat '{count}' 2>/dev/null || echo 0) + 1 ))
 echo "$n" > '{count}'
 if [ "$n" -ge 4 ]; then
@@ -348,6 +349,8 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
 
     let mut provider = ClaudeCodeProvider::new(descriptor("opus"), &script);
     provider.bind_workspace(&dir);
+    let build_cache = dir.join("build-cache");
+    provider.bind_build_cache(Some(&build_cache));
     let mut sink = loom_model::CollectingSink::default();
     provider
         .stream(
@@ -422,6 +425,13 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
     assert!(seen.contains("--model opus"), "{seen}");
     assert!(seen.contains("--permission-mode acceptEdits"), "{seen}");
     assert!(seen.contains("list files"), "{seen}");
+    // The CLI's builds land in the session cache, bounded like the tool's own.
+    let expected_env = format!("env:{}|0|0", build_cache.to_string_lossy());
+    assert!(
+        seen.contains(&expected_env),
+        "the CLI must build into '{}': {seen}",
+        build_cache.display()
+    );
 
     // A second turn continues the CLI's conversation.
     let mut sink = loom_model::CollectingSink::default();

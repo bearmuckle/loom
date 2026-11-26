@@ -99,6 +99,16 @@ defaulting to 10 minutes, applied even when general retention is off.
 [deployment](docs/deployment.md) documents the
 duration syntax and the sweep.
 
+Each session builds into its own Cargo target directory beside the worker's
+state, never inside the checkout, and that cache is bounded instead of left to
+the person to reclaim. `LOOM_BUILD_CACHE_MAX_BYTES` caps the whole cache (20 GiB
+by default, with a `K`, `M`, `G` or `T` suffix accepted) and
+`LOOM_BUILD_CACHE_MAX_IDLE_DAYS` drops a session's cache after that many days
+without a write (14 by default). A session's cache is also removed when it is
+archived or deleted. Agent builds run without debug info and without incremental
+state, so a target directory stays small; the sweep also runs on the
+archive-retention schedule.
+
 ## Headless client
 
 `loom-cli` is the headless client of the versioned protocol, built by the

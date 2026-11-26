@@ -80,6 +80,8 @@ pub struct ClaudeCodeOptions {
     /// Keep `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` in the child's
     /// environment, which makes Claude Code bill that key.
     pub inherit_api_key_env: bool,
+    /// Extra environment for the child, such as where its builds write.
+    pub env: Vec<(String, String)>,
 }
 
 impl ClaudeCodeOptions {
@@ -95,6 +97,7 @@ impl ClaudeCodeOptions {
             mcp_config: None,
             setting_sources: None,
             inherit_api_key_env: false,
+            env: Vec::new(),
         }
     }
 
@@ -476,6 +479,9 @@ impl ClaudeCodeSession {
             command
                 .env_remove("ANTHROPIC_API_KEY")
                 .env_remove("ANTHROPIC_AUTH_TOKEN");
+        }
+        for (key, value) in &options.env {
+            command.env(key, value);
         }
         let mut child = command.spawn().map_err(|error| {
             LoomError::new(

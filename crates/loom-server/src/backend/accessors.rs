@@ -626,10 +626,18 @@ impl InProcessBackend {
         }
     }
 
-    /// Removes caches left behind by sessions that no longer exist, and by
-    /// archived sessions (which no longer run), so a crash between the state
-    /// change and the cache removal cannot leak build output forever.
-    pub(crate) fn sweep_orphan_build_caches(&self) -> Result<()> {
+    /// How much build output is kept, and for how long.
+    pub(crate) fn build_cache_retention(&self) -> crate::build_cache::BuildCacheRetention {
+        self.build_cache_retention
+    }
+
+    /// Removes caches that no longer earn their space: those left by sessions
+    /// that no longer exist or are archived, those idle past the retention
+    /// window, and the least recently written of the rest until what remains
+    /// fits under the byte cap.
+    ///
+    /// Output is reproducible, so this only ever costs a rebuild.
+    pub(crate) fn sweep_build_caches(&self) -> Result<()> {
         let Some(base) = &self.build_cache_base else {
             return Ok(());
         };
@@ -653,28 +661,58 @@ impl InProcessBackend {
             }
         };
         let mut removed = 0_usize;
+        let mut live = Vec::new();
         for entry in entries.flatten() {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            let remove = match known.get(&name) {
+            let path = entry.path();
+            let orphaned = match known.get(&name) {
                 None => true,
                 Some(state) => *state == AgentSessionState::Archived,
             };
-            if !remove {
+            if orphaned {
+                removed += usize::from(remove_build_cache_dir(&path));
                 continue;
             }
-            match fs::remove_dir_all(entry.path()) {
-                Ok(()) => removed += 1,
-                Err(error) => log::warn!(
-                    "[loom-server] could not remove orphaned session build cache '{}': {error}",
-                    entry.path().display()
-                ),
-            }
+            let (bytes, last_write) = crate::build_cache::measure_build_cache(&path);
+            live.push(crate::build_cache::BuildCacheEntry {
+                path,
+                bytes,
+                last_write,
+            });
         }
-        if removed > 0 {
-            log::info!("[loom-server] removed {removed} orphaned session build cache(s)");
+        let expired = crate::build_cache::expired_build_caches(
+            live,
+            self.build_cache_retention,
+            std::time::SystemTime::now(),
+        );
+        let evicted = expired.len();
+        for path in expired {
+            remove_build_cache_dir(&path);
+        }
+        if removed + evicted > 0 {
+            log::info!(
+                "[loom-server] removed {} session build cache(s), {removed} orphaned and \
+                 {evicted} over the retention policy",
+                removed + evicted
+            );
         }
         Ok(())
+    }
+}
+
+/// Removes one build cache directory, best effort.
+fn remove_build_cache_dir(path: &std::path::Path) -> bool {
+    match fs::remove_dir_all(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            log::warn!(
+                "[loom-server] could not remove session build cache '{}': {error}",
+                path.display()
+            );
+            false
+        }
     }
 }

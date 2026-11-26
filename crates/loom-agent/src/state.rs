@@ -284,6 +284,8 @@ impl AgentRuntime {
         tools.set_claude_code_permissions(super::lifecycle::carries_claude_code_permissions(
             provider.as_ref(),
         ));
+        let mut provider = provider;
+        super::lifecycle::bind_provider(provider.as_mut(), &tools);
         Ok(Self {
             session_id: state.session_id,
             task: state.task,

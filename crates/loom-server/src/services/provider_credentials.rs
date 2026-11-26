@@ -380,6 +380,10 @@ impl ModelProvider for PinnedCredentialProvider {
     fn bind_workspace(&mut self, root: &std::path::Path) {
         self.inner.bind_workspace(root);
     }
+
+    fn bind_build_cache(&mut self, dir: Option<&std::path::Path>) {
+        self.inner.bind_build_cache(dir);
+    }
 }
 
 #[cfg(test)]

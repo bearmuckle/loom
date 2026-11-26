@@ -127,6 +127,14 @@ pub trait ModelProvider: Send {
     /// Tells the provider which directory the session's tools work in. Only a
     /// provider that runs its own tools in that directory has a use for it.
     fn bind_workspace(&mut self, _root: &std::path::Path) {}
+
+    /// Tells the provider where a session's build output belongs.
+    ///
+    /// A harness that runs commands in the session's checkout can send their
+    /// build output to that directory, so it lands beside the instance state
+    /// instead of inside the checkout. Providers that never run a build keep the
+    /// default and ignore it.
+    fn bind_build_cache(&mut self, _dir: Option<&std::path::Path>) {}
 }
 
 impl dyn ModelProvider + '_ {

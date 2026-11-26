@@ -220,6 +220,14 @@ pub(crate) fn run_archive_maintenance(backend: &InProcessBackend) -> Result<Arch
             error.message
         ),
     }
+    // Build output is reclaimed on the same schedule, so a worker that never
+    // archives a session still bounds its build cache.
+    if let Err(error) = backend.sweep_build_caches() {
+        log::warn!(
+            "[loom-server] build cache maintenance failed: {}",
+            error.message
+        );
+    }
     backend.sweep_archive_retention()
 }
 

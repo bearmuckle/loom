@@ -851,6 +851,12 @@ impl ToolExecutor {
         &self.root
     }
 
+    /// The Cargo target directory this session's commands build into, when the
+    /// instance keeps one.
+    pub fn build_cache_root(&self) -> Option<&Path> {
+        self.build_cache.as_deref()
+    }
+
     pub fn workspace_root(&self) -> &Path {
         &self.root
     }
@@ -1433,6 +1439,12 @@ impl ToolExecutor {
         if let Some(build_cache) = &self.build_cache {
             command.env("CARGO_TARGET_DIR", build_cache);
         }
+        // A build's size is bounded the same way whoever runs it: no debug info
+        // and no incremental state keeps a target directory to what the agent
+        // needs to compile, at the cost of backtrace symbols.
+        command
+            .env("CARGO_INCREMENTAL", "0")
+            .env("CARGO_PROFILE_DEV_DEBUG", "0");
         // Run the command in its own process group so a timeout can terminate
         // the whole tree instead of only the direct child.
         #[cfg(unix)]
@@ -5790,7 +5802,7 @@ mod tests {
             "run_command",
             serde_json::json!({
                 "command": "sh",
-                "args": ["-c", "printf '%s' \"$CARGO_TARGET_DIR\""]
+                "args": ["-c", "printf '%s|%s|%s' \"$CARGO_TARGET_DIR\" \"$CARGO_INCREMENTAL\" \"$CARGO_PROFILE_DEV_DEBUG\""]
             }),
         ));
         assert!(printed.success, "{}", printed.output);
@@ -5801,6 +5813,13 @@ mod tests {
                 .contains(&expected.to_string_lossy().to_string()),
             "the command must build into '{}': {}",
             expected.display(),
+            printed.output
+        );
+        // A build's size is bounded whether or not the cache is configured:
+        // no incremental state and no debug info.
+        assert!(
+            printed.output.contains("|0|0"),
+            "the build must be bounded: {}",
             printed.output
         );
         fs::remove_dir_all(root).unwrap();

@@ -292,6 +292,16 @@ impl InProcessBackend {
         let build_cache_base = persistence
             .as_ref()
             .map(|persistence| persistence.path().with_extension("build-cache"));
+        // Build output is bounded rather than left to the person to reclaim.
+        // An unusable value fails the start and names the input to fix.
+        let build_cache_retention = crate::build_cache::resolve_build_cache_retention(
+            std::env::var(crate::build_cache::BUILD_CACHE_MAX_BYTES_ENV)
+                .ok()
+                .as_deref(),
+            std::env::var(crate::build_cache::BUILD_CACHE_MAX_IDLE_ENV)
+                .ok()
+                .as_deref(),
+        )?;
         let mut supported_capabilities = vec![
             Capability::CreateAgentSession,
             Capability::ReadAgentSession,
@@ -378,6 +388,7 @@ impl InProcessBackend {
             run_executor: RunExecutor::with_defaults(),
             session_root_base,
             build_cache_base,
+            build_cache_retention,
             archive_retention: Mutex::new(loom_protocol::ArchiveRetentionPolicy::default()),
             archive_retention_stored: AtomicBool::new(false),
             read_only_commands: AtomicBool::new(false),
@@ -435,12 +446,15 @@ impl InProcessBackend {
         // overrides a stored policy instead of the built-in default.
         backend.restore_archive_retention()?;
         if let Some(build_cache) = backend.build_cache_root() {
+            let retention = backend.build_cache_retention();
             log::info!(
-                "[loom-server] session build cache: {}",
-                build_cache.display()
+                "[loom-server] session build cache: {} (cap {} MiB, idle {} day(s))",
+                build_cache.display(),
+                retention.max_bytes / (1024 * 1024),
+                retention.max_idle.as_secs() / (24 * 60 * 60)
             );
         }
-        backend.sweep_orphan_build_caches()?;
+        backend.sweep_build_caches()?;
         Ok(backend)
     }
 }

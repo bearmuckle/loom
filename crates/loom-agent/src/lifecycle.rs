@@ -6,6 +6,16 @@ pub(crate) fn carries_claude_code_permissions(provider: &dyn ModelProvider) -> b
     provider.descriptor().provider.as_str() == loom_model::CLAUDE_CODE_PROVIDER_ID
 }
 
+/// Tells `provider` where the run works and where its build output belongs.
+///
+/// A provider built for a run, a model switch or a fresh credential is new and
+/// has been told neither, while a harness that runs its own tools in the
+/// checkout needs both.
+pub(crate) fn bind_provider(provider: &mut dyn ModelProvider, tools: &ToolExecutor) {
+    provider.bind_workspace(tools.root());
+    provider.bind_build_cache(tools.build_cache_root());
+}
+
 impl AgentRuntime {
     pub fn new(
         session_id: AgentSessionId,
@@ -73,6 +83,8 @@ impl AgentRuntime {
             u64::try_from(messages.len()).expect("initial message count fits in u64");
         let mut tools = tools;
         tools.set_claude_code_permissions(carries_claude_code_permissions(provider.as_ref()));
+        let mut provider = provider;
+        bind_provider(provider.as_mut(), &tools);
         Self {
             session_id,
             task,

@@ -43,6 +43,8 @@ pub struct ClaudeCodeProvider {
     descriptor: ModelDescriptor,
     binary: PathBuf,
     cwd: Option<PathBuf>,
+    /// Where this session's build output belongs, when the instance keeps one.
+    build_cache: Option<PathBuf>,
     /// The CLI's own id for the conversation, so later turns continue it.
     claude_session: Option<String>,
     /// How many messages of the request the CLI has already seen, counting the
@@ -56,6 +58,7 @@ impl ClaudeCodeProvider {
             descriptor,
             binary: binary.into(),
             cwd: None,
+            build_cache: None,
             claude_session: None,
             delivered: 0,
         }
@@ -221,7 +224,29 @@ impl ClaudeCodeProvider {
         options.resume = self.claude_session.clone();
         options.permission_mode = PermissionMode::AcceptEdits;
         options.append_system_prompt = system;
+        options.env = self.build_env();
         options
+    }
+
+    /// The environment the CLI runs builds with.
+    ///
+    /// The CLI runs its own commands in the session's checkout, so without this
+    /// a `cargo build` writes a target directory inside the checkout, where the
+    /// instance's build-cache retention cannot reclaim it. Agent builds also
+    /// favour small output: full debug info makes a target directory several
+    /// times larger, and incremental state is dead weight between turns.
+    fn build_env(&self) -> Vec<(String, String)> {
+        let mut env = vec![
+            ("CARGO_INCREMENTAL".to_owned(), "0".to_owned()),
+            ("CARGO_PROFILE_DEV_DEBUG".to_owned(), "0".to_owned()),
+        ];
+        if let Some(dir) = &self.build_cache {
+            env.push((
+                "CARGO_TARGET_DIR".to_owned(),
+                dir.to_string_lossy().into_owned(),
+            ));
+        }
+        env
     }
 }
 
@@ -461,6 +486,10 @@ impl ModelProvider for ClaudeCodeProvider {
 
     fn bind_workspace(&mut self, root: &Path) {
         self.cwd = Some(root.to_path_buf());
+    }
+
+    fn bind_build_cache(&mut self, dir: Option<&Path>) {
+        self.build_cache = dir.map(Path::to_path_buf);
     }
 
     fn stream(

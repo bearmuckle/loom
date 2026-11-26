@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, sync::atomic::AtomicUsize};
+use std::{fs, path::Path, path::PathBuf, sync::atomic::AtomicUsize};
 
 use loom_core::{AgentSessionId, LimitKind, SessionLimits};
 use loom_providers::DeterministicProvider;
@@ -794,10 +794,11 @@ fn a_pause_request_stops_a_run_that_is_waiting_on_the_model() {
     assert!(!control.is_stopping());
 }
 
-/// Provider that records the workspace it is bound to.
+/// Provider that records the workspace and build cache it is bound to.
 struct WorkspaceRecordingProvider {
     descriptor: loom_model::ModelDescriptor,
     bound: Arc<Mutex<Option<PathBuf>>>,
+    build_cache: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl ModelProvider for WorkspaceRecordingProvider {
@@ -807,6 +808,10 @@ impl ModelProvider for WorkspaceRecordingProvider {
 
     fn bind_workspace(&mut self, root: &std::path::Path) {
         *self.bound.lock().unwrap() = Some(root.to_path_buf());
+    }
+
+    fn bind_build_cache(&mut self, dir: Option<&std::path::Path>) {
+        *self.build_cache.lock().unwrap() = dir.map(Path::to_path_buf);
     }
 
     fn stream(
@@ -837,15 +842,24 @@ fn recording_descriptor(model: &str, provider: &str) -> loom_model::ModelDescrip
 #[test]
 fn switching_model_binds_the_new_provider_to_the_workspace() {
     let root = workspace();
-    let tools = ToolExecutor::new(&root).unwrap();
+    let tools = ToolExecutor::new(&root)
+        .unwrap()
+        .with_build_cache_root(Some(root.join("build-cache")));
+    let expected_cache = tools.build_cache_root().map(Path::to_path_buf);
+    assert!(
+        expected_cache.is_some(),
+        "the run must have a build cache to bind"
+    );
     let task = AgentTask::new("switch", ModelId::new("first/demo")).unwrap();
     let bound = Arc::new(Mutex::new(None));
+    let cache = Arc::new(Mutex::new(None));
     let mut runtime = AgentRuntime::new(
         AgentSessionId::new(),
         task,
         Box::new(WorkspaceRecordingProvider {
             descriptor: recording_descriptor("first/demo", "first"),
             bound: Arc::new(Mutex::new(None)),
+            build_cache: Arc::new(Mutex::new(None)),
         }),
         tools,
     );
@@ -856,6 +870,7 @@ fn switching_model_binds_the_new_provider_to_the_workspace() {
             Box::new(WorkspaceRecordingProvider {
                 descriptor: recording_descriptor("second/demo", "second"),
                 bound: Arc::clone(&bound),
+                build_cache: Arc::clone(&cache),
             }),
             0,
             0,
@@ -866,16 +881,20 @@ fn switching_model_binds_the_new_provider_to_the_workspace() {
     // A harness that runs in the session's checkout needs the directory, and a
     // provider created for the switch has never been told it.
     assert_eq!(*bound.lock().unwrap(), Some(root.clone()));
+    assert_eq!(*cache.lock().unwrap(), expected_cache);
 
     // A provider replaced for a fresh credential is bound as well.
     let rebound = Arc::new(Mutex::new(None));
+    let rebuilt = Arc::new(Mutex::new(None));
     runtime
         .replace_provider(Box::new(WorkspaceRecordingProvider {
             descriptor: recording_descriptor("second/demo", "second"),
             bound: Arc::clone(&rebound),
+            build_cache: Arc::clone(&rebuilt),
         }))
         .unwrap();
     assert_eq!(*rebound.lock().unwrap(), Some(root.clone()));
+    assert_eq!(*rebuilt.lock().unwrap(), expected_cache);
 }
 
 #[test]

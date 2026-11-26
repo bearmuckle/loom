@@ -479,6 +479,56 @@ fn startup_reclaims_orphaned_build_caches() {
 }
 
 #[test]
+fn a_live_sessions_fresh_build_cache_survives_a_sweep() {
+    let persistence =
+        std::env::temp_dir().join(format!("loom-build-cache-live-{}.db", uuid::Uuid::new_v4()));
+    let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+    let workspace = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Build cache".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let session_id = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "build cache".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    let cache = backend
+        .build_cache_for_session(session_id)
+        .expect("a durable backend owns a build cache");
+    fs::create_dir_all(cache.join("debug")).unwrap();
+    fs::write(cache.join("debug/artifact"), b"build output").unwrap();
+
+    // A session that still exists and was written moments ago keeps its cache:
+    // the sweep only drops what is orphaned or past the retention policy.
+    backend.sweep_build_caches().unwrap();
+    assert!(
+        cache.join("debug/artifact").exists(),
+        "a fresh cache of a live session must survive the sweep"
+    );
+    backend.shutdown().unwrap();
+    drop(backend);
+    let _ = fs::remove_file(&persistence);
+}
+
+#[test]
 fn archiving_a_session_with_a_stale_active_state_recovers() {
     let persistence =
         std::env::temp_dir().join(format!("loom-stale-archive-{}.db", uuid::Uuid::new_v4()));
