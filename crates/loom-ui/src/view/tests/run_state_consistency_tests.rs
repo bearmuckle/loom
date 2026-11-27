@@ -170,17 +170,11 @@ fn finished_after_tools_state_agrees_across_footer_pills_timer_composer_and_cont
         assert!(window.try_find(("project-status", 0usize)).is_none());
 
         // Model footer shows the model used for the run on the rendered Select,
-        // never "No model is configured".
+        // never "No model is configured", without repeating the value in label.
         let model_select = window.find("session-model-select");
-        let model_label = model_select.label();
-        assert_eq!(
-            model_label,
-            Some("Model for this session: Anthropic · claude-sonnet-4")
-        );
-        assert_ne!(
-            model_label,
-            Some("Model for this session: No model is configured")
-        );
+        assert_eq!(model_select.label(), Some("Model for this session"));
+        assert_eq!(model_select.value(), Some("Anthropic · claude-sonnet-4"));
+        assert_ne!(model_select.value(), Some("No model is configured"));
 
         view.read_with(cx, |view, _| {
             assert!(!view.run_can_pause());
@@ -252,7 +246,11 @@ fn genuinely_running_state_shows_active_status_timer_hint_and_controls(cx: &mut 
         assert_eq!(window.find("run-card-status").label(), Some("Reviewing"));
         assert_eq!(
             window.find("session-model-select").label(),
-            Some("Model for this session: OpenAI · gpt-5")
+            Some("Model for this session")
+        );
+        assert_eq!(
+            window.find("session-model-select").value(),
+            Some("OpenAI · gpt-5")
         );
 
         view.read_with(cx, |view, _| {
@@ -327,6 +325,7 @@ fn paused_state_freezes_timer_hides_pause_and_agrees_across_all_surfaces(cx: &mu
             events,
             Some(EventSequence::new(2)),
             Some(EventSequence::new(1)),
+            None,
             Some(fallback),
         );
         view
@@ -361,7 +360,11 @@ fn paused_state_freezes_timer_hides_pause_and_agrees_across_all_surfaces(cx: &mu
         // Model footer shows the run's model on the rendered Select, not "No model is configured".
         assert_eq!(
             window.find("session-model-select").label(),
-            Some("Model for this session: Anthropic · claude-sonnet-4")
+            Some("Model for this session")
+        );
+        assert_eq!(
+            window.find("session-model-select").value(),
+            Some("Anthropic · claude-sonnet-4")
         );
 
         view.read_with(cx, |view, _| {
@@ -417,7 +420,11 @@ fn no_model_state_shows_no_model_configured_and_no_run_controls(cx: &mut TestApp
         assert_eq!(window.find("run-card-status").label(), Some("Ready"));
         assert_eq!(
             window.find("session-model-select").label(),
-            Some("Model for this session: No model is configured")
+            Some("Model for this session")
+        );
+        assert_eq!(
+            window.find("session-model-select").value(),
+            Some("No model is configured")
         );
         let _ = view;
     })
@@ -700,6 +707,7 @@ fn archived_idle_and_queued_states_are_not_overwritten_by_previous_run(cx: &mut 
                 Vec::new(),
                 Some(EventSequence::new(10)),
                 Some(EventSequence::new(10)),
+                Some(AgentSessionState::Archived),
                 Some(archived_fallback),
             );
         });
@@ -717,6 +725,140 @@ fn archived_idle_and_queued_states_are_not_overwritten_by_previous_run(cx: &mut 
             assert_eq!(presentation.elapsed_ms, None);
             assert_eq!(presentation.run_model, Some(anthropic_sonnet()));
         });
+
+        // 5. Reopening a restored Idle session at head with a historical Failed
+        // fallback run must stay Idle ("Ready"), hide elapsed time and Retry,
+        // and preserve `active_run_id` for transcript paging.
+        let failed_run_id = RunId::new();
+        view.update(cx, |view, _| {
+            let session_id = view.active_session.id;
+            view.active_session.state = AgentSessionState::Idle;
+            view.session_state = AgentSessionState::Idle;
+            let failed_fallback = AgentRunSnapshotProjection {
+                run: run_snapshot_with_times(
+                    session_id,
+                    failed_run_id,
+                    anthropic_sonnet(),
+                    AgentRunState::Failed,
+                    started_at,
+                    settled_at,
+                    Some(settled_at),
+                ),
+                plan: Vec::new(),
+                plan_progress: Default::default(),
+                messages: Vec::new(),
+                message_timeline_ordinals: Vec::new(),
+                pending_approval: None,
+                pending_input: None,
+                usage: UsageSnapshot::default(),
+                activities: Vec::new(),
+            };
+            view.rebuild_projection_from_events_after(
+                Vec::new(),
+                Some(EventSequence::new(12)),
+                Some(EventSequence::new(12)),
+                Some(AgentSessionState::Idle),
+                Some(failed_fallback),
+            );
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("run-status-label").label(), Some("Ready"));
+        assert!(window.try_find("run-status-elapsed").is_none());
+        assert!(window.try_find("retry-run").is_none());
+        assert!(window.try_find(("project-status", 0usize)).is_none());
+        view.read_with(cx, |view, _| {
+            let presentation = view.session_run_presentation();
+            assert_eq!(view.session_state, AgentSessionState::Idle);
+            assert_eq!(view.active_session.state, AgentSessionState::Idle);
+            assert_eq!(view.active_run_id, Some(failed_run_id));
+            assert_eq!(presentation.run_state, None);
+            assert_eq!(presentation.elapsed_ms, None);
+        });
+
+        // 6. Resyncing a Queued session via `apply_event_snapshot_with_durable`
+        // at head (`latest_sequence == durable_sequence`) with a historical
+        // Completed fallback run preserves Queued and hides the old timer.
+        let queued_fallback_run_id = RunId::new();
+        view.update(cx, |view, _| {
+            let session_id = view.active_session.id;
+            let completed_fallback = AgentRunSnapshotProjection {
+                run: run_snapshot_with_times(
+                    session_id,
+                    queued_fallback_run_id,
+                    anthropic_sonnet(),
+                    AgentRunState::Completed,
+                    started_at,
+                    settled_at,
+                    Some(settled_at),
+                ),
+                plan: Vec::new(),
+                plan_progress: Default::default(),
+                messages: Vec::new(),
+                message_timeline_ordinals: Vec::new(),
+                pending_approval: None,
+                pending_input: None,
+                usage: UsageSnapshot::default(),
+                activities: Vec::new(),
+            };
+            view.apply_event_snapshot_with_durable(
+                Vec::new(),
+                EventSequence::new(15),
+                Some(EventSequence::new(15)),
+                Some(AgentSessionState::Queued),
+                Some(completed_fallback),
+                Some(AgentSessionState::Queued),
+            );
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("run-status-label").label(), Some("Queued"));
+        assert!(window.try_find("run-status-elapsed").is_none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.session_state, AgentSessionState::Queued);
+            assert_eq!(view.active_session.state, AgentSessionState::Queued);
+            assert_eq!(view.active_run_id, Some(queued_fallback_run_id));
+            assert_eq!(view.session_run_presentation().elapsed_ms, None);
+        });
+
+        // 7. Archiving and restoring a NeedsInput or Paused run must route a
+        // follow-up composer message via StartRun (never AnswerAgentQuestion or
+        // DirectAgent against stale pre-archive run state).
+        for pre_archive_state in [AgentRunState::NeedsInput, AgentRunState::Paused] {
+            view.update(cx, |view, _| {
+                let run = run_snapshot_with_times(
+                    view.active_session.id,
+                    RunId::new(),
+                    anthropic_sonnet(),
+                    pre_archive_state,
+                    started_at,
+                    settled_at,
+                    None,
+                );
+                let run_revision = loom_protocol::RunRevision {
+                    attempt_id: run.attempt_id,
+                    control_revision: run.control_revision,
+                    action_sequence: 1,
+                };
+                view.collaboration.observe_revision(run.id, run_revision);
+                view.adopt_active_run(run);
+                if pre_archive_state == AgentRunState::NeedsInput {
+                    view.pending_input = Some("Which branch?".to_owned());
+                }
+                let session_id = view.active_session.id;
+                view.consume_event(&ServerEvent::AgentSessionArchived { session_id });
+                view.consume_event(&ServerEvent::AgentSessionRestored { session_id });
+            });
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.composer_route_for("start fresh"),
+                    crate::collaboration::ComposerRoute::StartRun,
+                    "restored session after {pre_archive_state:?} must route via StartRun"
+                );
+                assert_eq!(
+                    view.active_run.as_ref().map(|run| run.state),
+                    Some(AgentRunState::Cancelled)
+                );
+            });
+        }
     })
     .unwrap();
 }
@@ -996,6 +1138,7 @@ fn elapsed_timer_never_snaps_backwards_on_live_pause_or_block_and_clears_cross_r
             events,
             Some(EventSequence::new(3)),
             Some(EventSequence::new(1)),
+            None,
             Some(fallback),
         );
         assert_eq!(view.session_run_presentation().elapsed_ms, Some(42_000));
@@ -1210,6 +1353,7 @@ fn snapshot_tail_skips_covered_events_and_mid_run_model_switch_survives_refresh(
             vec![covered_event, non_state_tail_event],
             EventSequence::new(8),
             Some(EventSequence::new(5)),
+            Some(AgentSessionState::Evaluating),
             Some(fallback),
             Some(AgentSessionState::Paused),
         );
@@ -1232,6 +1376,211 @@ fn snapshot_tail_skips_covered_events_and_mid_run_model_switch_survives_refresh(
         view.model = switched_model.clone();
         view.models.clear();
         assert_eq!(view.model_picker_placeholder(), "OpenAI · gpt-5");
+
+        view.active_run_id = None;
+        view.active_run = None;
+        view.run_state = None;
+        view.session_state = AgentSessionState::Idle;
+    });
+}
+
+#[gpui_kit::test]
+fn poll_resync_snapshot_syncs_session_state_across_polling_footer_and_sidebar(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let now = Timestamp::now();
+
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        let run = run_snapshot_with_times(
+            view.active_session.id,
+            RunId::new(),
+            anthropic_sonnet(),
+            AgentRunState::Evaluating,
+            now,
+            now,
+            None,
+        );
+        view.adopt_active_run(run);
+        view
+    });
+
+    cx.update_window(handle.into(), |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        window.render_frame(cx);
+        assert_eq!(window.find("run-status-label").label(), Some("Reviewing"));
+        assert!(window.try_find("loom-mark").is_some());
+
+        // 1. Poll resync snapshot transitions Evaluating -> Idle while the
+        // durable reload is in flight: must stop polling and stay Idle across
+        // a render frame without sync_project_list reverting it to Evaluating.
+        view.update(cx, |view, _| {
+            let mut snapshot_session = view.active_session.clone();
+            snapshot_session.state = AgentSessionState::Idle;
+            view.reset_for_poll_resync(snapshot_session, Some("epoch-2".to_owned()));
+            assert!(!view.run_is_active());
+            assert!(!view.run_should_poll());
+            assert_eq!(view.session_state, AgentSessionState::Idle);
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("run-status-label").label(), Some("Ready"));
+        assert!(window.try_find("loom-mark").is_none());
+        assert!(window.try_find(("project-activity", 0usize)).is_none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.session_state, AgentSessionState::Idle);
+            assert_eq!(view.active_session.state, AgentSessionState::Idle);
+            assert_eq!(view.sessions[0].state, AgentSessionState::Idle);
+            assert!(!view.run_is_active());
+            assert!(!view.run_should_poll());
+        });
+
+        // 2. Poll resync snapshot transitions Evaluating -> Completed across a
+        // render frame: stops polling and shows Complete without loom-mark.
+        view.update(cx, |view, _| {
+            let run = run_snapshot_with_times(
+                view.active_session.id,
+                RunId::new(),
+                anthropic_sonnet(),
+                AgentRunState::Evaluating,
+                now,
+                now,
+                None,
+            );
+            view.adopt_active_run(run);
+            let mut completed_session = view.active_session.clone();
+            completed_session.state = AgentSessionState::Completed;
+            view.reset_for_poll_resync(completed_session, Some("epoch-3".to_owned()));
+            assert!(!view.run_is_active());
+            assert!(!view.run_should_poll());
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("run-status-label").label(), Some("Complete"));
+        assert!(window.try_find("loom-mark").is_none());
+        assert!(window.try_find(("project-activity", 0usize)).is_none());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.session_state, AgentSessionState::Completed);
+            assert_eq!(view.active_session.state, AgentSessionState::Completed);
+            assert_eq!(view.sessions[0].state, AgentSessionState::Completed);
+        });
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn per_run_pending_usage_and_plan_state_do_not_leak_across_run_switches_or_stale_tail_replay(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let now_ms = Timestamp::now().as_unix_millis();
+    let run1_started = Timestamp::from_unix_millis(now_ms.saturating_sub(60_000));
+    let run2_started = Timestamp::from_unix_millis(now_ms.saturating_sub(5_000));
+    let run1_id = RunId::new();
+    let run2_id = RunId::new();
+
+    let view = cx.new(|cx| LoomView::new_for_test(cx.focus_handle()));
+    view.update(cx, |view, _| {
+        let session_id = view.active_session.id;
+        let run1 = run_snapshot_with_times(
+            session_id,
+            run1_id,
+            anthropic_sonnet(),
+            AgentRunState::AwaitingApproval,
+            run1_started,
+            run1_started,
+            None,
+        );
+        view.adopt_active_run(run1.clone());
+        view.pending_approval = Some(ToolCall {
+            id: ToolCallId::new(),
+            name: "run_command".to_owned(),
+            arguments: serde_json::json!({"command": "rm -rf /tmp/old"}),
+        });
+        view.pending_input = Some("Old question".to_owned());
+        view.approval_request_in_flight = true;
+        view.plan = Some(PlanState::new(vec!["Old step".to_owned()]));
+        view.review.usage.run = Some(UsageSnapshot {
+            elapsed_ms: 15_000,
+            input_tokens: 999,
+            ..UsageSnapshot::default()
+        });
+
+        // Adopting a different run in Paused must clear the prior run's pending
+        // approval, pending input, in-flight approval flag, plan, and usage.
+        let run2 = run_snapshot_with_times(
+            session_id,
+            run2_id,
+            anthropic_sonnet(),
+            AgentRunState::Paused,
+            run2_started,
+            run2_started,
+            None,
+        );
+        view.adopt_active_run(run2.clone());
+        assert!(view.pending_approval.is_none());
+        assert!(view.pending_input.is_none());
+        assert!(!view.approval_request_in_flight);
+        assert!(view.plan.is_none());
+        assert!(view.review.usage.run.is_none());
+
+        // Replaying stale tail events from run1 while run2 is active must not
+        // mutate run2's plan, pending approval/input, usage, or run state.
+        view.consume_agent_event(&AgentEvent::PlanProposed {
+            run_id: run1_id,
+            plan: loom_protocol::AgentPlan {
+                title: Some("Stale plan".to_owned()),
+                steps: vec![loom_protocol::AgentPlanStep {
+                    id: "old".to_owned(),
+                    description: "Stale run1 step".to_owned(),
+                }],
+            },
+        });
+        view.consume_agent_event(&AgentEvent::ToolApprovalRequired {
+            run_id: run1_id,
+            attempt_id: run1.attempt_id,
+            control_revision: 2,
+            interaction_id: loom_core::InteractionId::new(),
+            call: ToolCall {
+                id: ToolCallId::new(),
+                name: "run_command".to_owned(),
+                arguments: serde_json::json!({"command": "echo stale"}),
+            },
+        });
+        view.consume_agent_event(&AgentEvent::NeedsInput {
+            run_id: run1_id,
+            attempt_id: run1.attempt_id,
+            control_revision: 3,
+            interaction_id: loom_core::InteractionId::new(),
+            prompt: "Stale run1 prompt".to_owned(),
+        });
+        view.consume_agent_event(&AgentEvent::RunUsageUpdated {
+            run_id: run1_id,
+            usage: UsageSnapshot {
+                elapsed_ms: 44_000,
+                input_tokens: 1_234,
+                ..UsageSnapshot::default()
+            },
+        });
+        let run1_completed = run_snapshot_with_times(
+            session_id,
+            run1_id,
+            anthropic_sonnet(),
+            AgentRunState::Completed,
+            run1_started,
+            run1_started,
+            Some(run1_started),
+        );
+        view.consume_agent_event(&AgentEvent::RunCompleted {
+            snapshot: run1_completed,
+        });
+
+        assert_eq!(view.active_run_id, Some(run2_id));
+        assert_eq!(view.run_state, Some(AgentRunState::Paused));
+        assert!(view.plan.is_none());
+        assert!(view.pending_approval.is_none());
+        assert!(view.pending_input.is_none());
+        assert!(view.review.usage.run.is_none());
 
         view.active_run_id = None;
         view.active_run = None;

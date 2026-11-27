@@ -298,9 +298,7 @@ impl LoomView {
                         // page) instead of replaying the tail over a cleared
                         // projection, which used to collapse the conversation
                         // to whatever the snapshot happened to carry.
-                        view.event_stream_epoch = stream_epoch;
-                        view.active_session = session;
-                        view.reset_projection();
+                        view.reset_for_poll_resync(session, stream_epoch);
                         let session_id = view.active_session.id;
                         view.begin_session_data_load(session_id, cx);
                     }
@@ -328,6 +326,21 @@ impl LoomView {
                 }
             },
         );
+    }
+
+    /// Resets the current run projection when a poll response falls back to a
+    /// snapshot resync, keeping `session_state`, sidebar rows, and cached
+    /// project snapshots aligned with the snapshot's session state while the
+    /// durable reload is in flight.
+    pub(crate) fn reset_for_poll_resync(
+        &mut self,
+        session: AgentSessionSnapshot,
+        stream_epoch: Option<String>,
+    ) {
+        self.event_stream_epoch = stream_epoch;
+        self.active_session = session;
+        self.reset_projection();
+        self.sync_session_state(self.active_session.state);
     }
 
     pub(crate) fn run_is_active(&self) -> bool {

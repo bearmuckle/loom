@@ -202,6 +202,9 @@ impl LoomView {
         self.review.usage.run = None;
         self.review.usage.run_provider = None;
         self.context_inspection = None;
+        self.pending_approval = None;
+        self.pending_input = None;
+        self.approval_request_in_flight = false;
     }
 
     /// Adopts an authoritative run snapshot and keeps `active_run_id`,
@@ -393,7 +396,8 @@ impl LoomView {
         if !self.session_permissions().can_act {
             return;
         }
-        if self.approval_request_in_flight {
+        if self.approval_request_in_flight || !self.session_run_presentation().has_pending_approval
+        {
             return;
         }
         let (Some(run_id), Some(call)) = (self.active_run_id, self.pending_approval.clone()) else {
@@ -424,7 +428,8 @@ impl LoomView {
         if !self.session_permissions().can_act {
             return;
         }
-        if self.approval_request_in_flight {
+        if self.approval_request_in_flight || !self.session_run_presentation().has_pending_approval
+        {
             return;
         }
         let (Some(run_id), Some(call)) = (self.active_run_id, self.pending_approval.clone()) else {
