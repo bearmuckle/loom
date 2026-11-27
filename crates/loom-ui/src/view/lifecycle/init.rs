@@ -85,7 +85,7 @@ impl LoomView {
                         Some(worker_connection_failure_detail(
                             transport_failure_stage(&initial.url),
                             &error,
-                            None,
+                            Some(&token),
                         )),
                         focus_handle,
                     ));
@@ -251,7 +251,7 @@ impl LoomView {
                         view.connect_setup_target(worker.url, worker.token, true, cx);
                     }
                     Err(error) => {
-                        view.fail_setup(WorkerConnectionStage::LocalProvision, &error, cx)
+                        view.fail_setup(WorkerConnectionStage::LocalProvision, &error, None, cx)
                     }
                 }
                 cx.notify();
@@ -429,10 +429,10 @@ impl LoomView {
                                     });
                                 std::mem::swap(view, initialized);
                             }
-                            Err(error) => view.fail_setup(stage, error, cx),
+                            Err(error) => view.fail_setup(stage, error, Some(&connect_token), cx),
                         }
                     }
-                    Err(error) => view.fail_setup(stage, &error, cx),
+                    Err(error) => view.fail_setup(stage, &error, Some(&connect_token), cx),
                 }
                 cx.notify();
             });
@@ -446,12 +446,13 @@ impl LoomView {
         &mut self,
         stage: WorkerConnectionStage,
         error: &LoomError,
+        secret: Option<&str>,
         cx: &mut Context<Self>,
     ) {
         if let Some(setup) = self.setup.as_mut() {
             setup.busy = false;
             setup.progress = None;
-            setup.error = Some(worker_connection_failure_detail(stage, error, None));
+            setup.error = Some(worker_connection_failure_detail(stage, error, secret));
         }
         cx.notify();
     }
@@ -1952,6 +1953,12 @@ impl LoomView {
         })
     }
 
+    fn scroll_workers_settings_to_bottom(&self) {
+        if self.settings_section() == Some(SettingsSection::Workers) {
+            self.settings_scroll_handle.scroll_to_bottom();
+        }
+    }
+
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn connect_worker_node(&mut self, cx: &mut Context<Self>) {
         let url = self
@@ -1971,7 +1978,7 @@ impl LoomView {
         self.worker_connect_error = None;
         if let Err(message) = validate_worker_connect_url(&url, true) {
             self.worker_connect_error = Some(message);
-            self.settings_scroll_handle.scroll_to_bottom();
+            self.scroll_workers_settings_to_bottom();
             cx.notify();
             return;
         }
@@ -1979,14 +1986,14 @@ impl LoomView {
             Ok(id) => id,
             Err(message) => {
                 self.worker_connect_error = Some(message);
-                self.settings_scroll_handle.scroll_to_bottom();
+                self.scroll_workers_settings_to_bottom();
                 cx.notify();
                 return;
             }
         };
         // Keep the new in-progress row and its Remove button on screen even
         // when earlier workers fill the 1280x800 Settings viewport.
-        self.settings_scroll_handle.scroll_to_bottom();
+        self.scroll_workers_settings_to_bottom();
         // The token is optional: without one the client connects unsigned and
         // signs in with GitHub, and with one it is an operator connection that
         // works exactly as before.
@@ -2160,10 +2167,10 @@ impl LoomView {
                             &url,
                             stage,
                             &error,
-                            None,
+                            Some(&submitted_token),
                             cleanup_failed,
                         );
-                        view.settings_scroll_handle.scroll_to_bottom();
+                        view.scroll_workers_settings_to_bottom();
                     }
                     Err(_) => {}
                 }
@@ -2196,7 +2203,7 @@ impl LoomView {
         self.worker_connect_error = None;
         if let Err(message) = validate_worker_connect_url(&url, false) {
             self.worker_connect_error = Some(message);
-            self.settings_scroll_handle.scroll_to_bottom();
+            self.scroll_workers_settings_to_bottom();
             cx.notify();
             return;
         }
@@ -2204,12 +2211,12 @@ impl LoomView {
             Ok(id) => id,
             Err(message) => {
                 self.worker_connect_error = Some(message);
-                self.settings_scroll_handle.scroll_to_bottom();
+                self.scroll_workers_settings_to_bottom();
                 cx.notify();
                 return;
             }
         };
-        self.settings_scroll_handle.scroll_to_bottom();
+        self.scroll_workers_settings_to_bottom();
         // Without a token the browser connects unsigned and signs in with
         // GitHub; with one it is an operator connection as before.
         let submitted_url = url.clone();
@@ -2350,7 +2357,7 @@ impl LoomView {
                             Some(&token),
                             cleanup_failed,
                         );
-                        view.settings_scroll_handle.scroll_to_bottom();
+                        view.scroll_workers_settings_to_bottom();
                     }
                     Err(_) => {}
                 }
@@ -2432,7 +2439,7 @@ impl LoomView {
                             Some(&token),
                             false,
                         );
-                        view.settings_scroll_handle.scroll_to_bottom();
+                        view.scroll_workers_settings_to_bottom();
                     }
                     Err(_) => {}
                 }

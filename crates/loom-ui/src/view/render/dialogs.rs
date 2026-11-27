@@ -1866,6 +1866,7 @@ impl LoomView {
                                 element.child(
                                     Button::new(format!("worker-node-providers-{id}"))
                                         .label("Providers")
+                                        .accessibility_label(format!("Providers for {display_name}"))
                                         .small()
                                         .on_click(cx.listener(move |view, _, _, cx| {
                                             view.open_providers_for_node(node_id.clone(), cx)

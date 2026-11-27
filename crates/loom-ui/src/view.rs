@@ -37,7 +37,7 @@ use gpui_kit::{
     Animation, AnimationExt, App, AsyncApp, ClickEvent, ClipboardItem, Context, Element, Entity,
     FocusHandle, Focusable, FontWeight, HighlightStyle, MouseButton, Pixels, Render, Rgba, Role,
     ScrollHandle, StyledText, Subscription, WeakEntity, Window, WindowAppearance,
-    WindowControlArea, div, point, prelude::*, px,
+    WindowControlArea, div, prelude::*, px,
 };
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, ErrorCode,

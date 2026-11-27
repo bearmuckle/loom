@@ -59,8 +59,7 @@ impl LoomView {
             self.discard_surface_content(replaced);
         }
         if reset_settings_scroll {
-            self.settings_scroll_handle
-                .set_offset(point(px(0.), px(0.)));
+            self.settings_scroll_handle = ScrollHandle::new();
         }
         // The phone's session drawer and the review column are secondary
         // chrome: a covering surface replaces them, instead of every opener
