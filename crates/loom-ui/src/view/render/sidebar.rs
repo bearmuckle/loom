@@ -1096,7 +1096,7 @@ impl LoomView {
                 // reads at the same scale as the list rows; desktop keeps the
                 // compact field used across the rest of the sidebar.
                 let field = if layout.phone { field } else { field.small() };
-                element.child(field)
+                element.child(focusable_input(input, field))
             })
             .child(
                 div()

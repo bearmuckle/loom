@@ -58,6 +58,7 @@ mod sidebar_navigation_tests;
 mod startup_tests;
 mod state_toggle_tests;
 mod sub_project_tests;
+mod touch_keyboard_tests;
 mod transcript_action_tests;
 mod transcript_paging_tests;
 #[cfg(feature = "visual-tests")]
