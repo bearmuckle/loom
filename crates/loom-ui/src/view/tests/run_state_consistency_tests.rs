@@ -1588,3 +1588,248 @@ fn per_run_pending_usage_and_plan_state_do_not_leak_across_run_switches_or_stale
         view.session_state = AgentSessionState::Idle;
     });
 }
+
+#[gpui_kit::test]
+fn terminal_run_elapsed_stays_consistent_when_updated_at_advances_and_workspace_feed_replays(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let now_ms = Timestamp::now().as_unix_millis();
+    let started_at = Timestamp::from_unix_millis(now_ms.saturating_sub(45_500));
+    let completed_at = Timestamp::from_unix_millis(started_at.as_unix_millis() + 2_000);
+    let later_updated_at = Timestamp::from_unix_millis(now_ms);
+    let run_id = RunId::new();
+
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.review.open = true;
+        view.review.tab = InspectorTab::Run;
+
+        let mut completed = run_snapshot_with_times(
+            view.active_session.id,
+            run_id,
+            anthropic_sonnet(),
+            AgentRunState::Completed,
+            started_at,
+            later_updated_at,
+            Some(completed_at),
+        );
+        completed.summary = Some("Finished demo task".to_owned());
+        view.adopt_active_run(completed);
+        view
+    });
+
+    cx.update_window(handle.into(), |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        // 1. Live terminal run whose updated_at moved past completed_at still
+        // reports completed_at - started_at (2.0s).
+        window.render_frame(cx);
+        assert_eq!(window.find("run-status-label").label(), Some("Complete"));
+        assert_eq!(window.find("run-status-elapsed").label(), Some("2.0s"));
+        assert_eq!(window.find("run-card-elapsed").label(), Some("2s"));
+
+        // 2. After reopening from a durable snapshot at sequence 15 and then
+        // receiving a fresh client's initial `after_sequence: None` workspace
+        // feed replay (Planning -> Executing -> Evaluating -> Completed at
+        // sequences <= 15), completed_at, summary, and elapsed time must stay
+        // unchanged at 2.0s rather than wiping completed_at and stamping
+        // updated_at = now() (45.5s).
+        view.update(cx, |view, cx| {
+            let session_id = view.active_session.id;
+            let mut snapshot = run_snapshot_with_times(
+                session_id,
+                run_id,
+                anthropic_sonnet(),
+                AgentRunState::Completed,
+                started_at,
+                later_updated_at,
+                Some(completed_at),
+            );
+            snapshot.summary = Some("Finished demo task".to_owned());
+            let fallback = AgentRunSnapshotProjection {
+                run: snapshot,
+                plan: Vec::new(),
+                plan_progress: Default::default(),
+                messages: Vec::new(),
+                message_timeline_ordinals: Vec::new(),
+                pending_approval: None,
+                pending_input: None,
+                usage: UsageSnapshot {
+                    elapsed_ms: 2_000,
+                    ..UsageSnapshot::default()
+                },
+                activities: Vec::new(),
+            };
+            view.rebuild_projection_from_events_after(
+                Vec::new(),
+                Some(EventSequence::new(15)),
+                Some(EventSequence::new(15)),
+                Some(AgentSessionState::Completed),
+                Some(fallback),
+            );
+            let node_id = view.default_backend_node_id.clone();
+            let replay = [
+                (2u64, AgentSessionState::Idle, AgentSessionState::Planning),
+                (3, AgentSessionState::Planning, AgentSessionState::Executing),
+                (
+                    4,
+                    AgentSessionState::Executing,
+                    AgentSessionState::Evaluating,
+                ),
+                (
+                    15,
+                    AgentSessionState::Evaluating,
+                    AgentSessionState::Completed,
+                ),
+            ]
+            .into_iter()
+            .map(|(seq, previous, current)| ServerEventEnvelope {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                sequence: EventSequence::new(seq),
+                session_id,
+                event: ServerEvent::AgentSessionStateChanged { previous, current },
+            })
+            .collect();
+            view.apply_workspace_lifecycle_events(&node_id, replay, cx);
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("run-status-label").label(), Some("Complete"));
+        assert_eq!(window.find("run-status-elapsed").label(), Some("2.0s"));
+        assert_eq!(window.find("run-card-elapsed").label(), Some("2s"));
+        view.read_with(cx, |view, _| {
+            let run = view.active_run.as_ref().expect("active run present");
+            assert_eq!(run.completed_at, Some(completed_at));
+            assert_eq!(run.summary.as_deref(), Some("Finished demo task"));
+            assert_eq!(view.session_run_presentation().elapsed_ms, Some(2_000));
+        });
+
+        // 3. Even if a terminal run lacks completed_at while updated_at moved
+        // past completion, prefer the server's usage.elapsed_ms over updated_at.
+        view.update(cx, |view, _| {
+            let run = view.active_run.as_mut().expect("active run present");
+            run.completed_at = None;
+            run.updated_at = later_updated_at;
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("run-status-elapsed").label(), Some("2.0s"));
+        assert_eq!(window.find("run-card-elapsed").label(), Some("2s"));
+
+        view.update(cx, |view, _| {
+            view.active_run_id = None;
+            view.active_run = None;
+            view.run_state = None;
+            view.session_state = AgentSessionState::Idle;
+        });
+    })
+    .unwrap();
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[gpui_kit::test]
+fn reopened_demo_run_preserves_completed_elapsed_across_workspace_feed_poll(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let backend = crate::local_backend::OwnedBackend::new();
+    let connection = ClientConnection::InProcess(Box::new(backend.connect()));
+    let _negotiation = crate::connection::negotiate(&connection).unwrap();
+    let workspace = crate::connection::create_workspace(&connection, "Reopen elapsed").unwrap();
+    let session =
+        crate::connection::create_session_in_workspace(&connection, workspace.id, "Demo session")
+            .unwrap();
+    let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id: session.id,
+            task: "say hello".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            system_instructions: None,
+            repository_instructions: None,
+        },
+    )));
+    assert!(matches!(
+        started.result,
+        Ok(ServerResponse::Run(RunResponse::AgentRunStarted(_)))
+    ));
+
+    // Wait for the deterministic demo run to finish.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let snap = connection.request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::GetAgentSessionSnapshot {
+                activity_detail: loom_protocol::ActivityDetail::Full,
+                session_id: session.id,
+            },
+        )));
+        if let Ok(ServerResponse::Session(SessionResponse::AgentSessionSnapshot(projection))) =
+            snap.result
+            && projection.session.state == AgentSessionState::Completed
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "deterministic demo run did not complete"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Fetch the initial workspace lifecycle feed (after_sequence: None) exactly
+    // as a restarted client's first workspace-feed poll receives it.
+    let feed = connection.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetWorkspaceSessionEvents {
+            workspace_id: workspace.id,
+            after_sequence: None,
+            stream_epoch: None,
+        },
+    )));
+    let Ok(ServerResponse::Events(EventsResponse::WorkspaceSessionEvents { events, .. })) =
+        feed.result
+    else {
+        panic!("expected workspace session events response");
+    };
+    assert!(
+        events
+            .iter()
+            .any(|env| matches!(env.event, ServerEvent::AgentSessionStateChanged { .. })),
+        "workspace feed should contain historical session state transitions"
+    );
+
+    // Pause briefly so wall-clock now() is measurably past completed_at.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let view = cx.new(|cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.connection = ClientConnection::InProcess(Box::new(backend.connect()));
+        let _ = crate::connection::negotiate(&view.connection).unwrap();
+        view.workspace_id = workspace.id;
+        view.load_session(session.clone());
+        view
+    });
+
+    view.update(cx, |view, cx| {
+        let run_before = view
+            .active_run
+            .clone()
+            .expect("reopened session has completed run");
+        assert!(run_before.completed_at.is_some());
+        let elapsed_before = view
+            .session_run_presentation()
+            .elapsed_ms
+            .expect("completed run has elapsed_ms");
+
+        let node_id = view.default_backend_node_id.clone();
+        view.apply_workspace_lifecycle_events(&node_id, events, cx);
+
+        let run_after = view
+            .active_run
+            .as_ref()
+            .expect("active run remains present after workspace feed replay");
+        assert_eq!(run_after.completed_at, run_before.completed_at);
+        assert_eq!(run_after.summary, run_before.summary);
+        assert_eq!(
+            view.session_run_presentation().elapsed_ms,
+            Some(elapsed_before)
+        );
+    });
+}

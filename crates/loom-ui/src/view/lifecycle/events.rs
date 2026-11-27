@@ -433,6 +433,16 @@ impl LoomView {
         let mut reload = false;
         for envelope in events {
             let session_id = envelope.session_id;
+            // The open session's own event stream and durable projection own
+            // its state through `after_sequence`. Replaying older workspace
+            // lifecycle events (for example on a fresh client's initial
+            // `after_sequence: None` workspace poll after reopening a completed
+            // session) must not regress the active session's state or wipe
+            // `completed_at` / `summary` / `updated_at`.
+            let stale_for_active = session_id == self.active_session.id
+                && self
+                    .after_sequence
+                    .is_some_and(|applied| envelope.sequence <= applied);
             match envelope.event {
                 ServerEvent::AgentSessionCreated { snapshot }
                 | ServerEvent::AgentSessionForked { snapshot, .. } => {
@@ -445,34 +455,44 @@ impl LoomView {
                     }
                 }
                 ServerEvent::AgentSessionStateChanged { current, .. } => {
-                    self.apply_workspace_session_state(session_id, current);
+                    if !stale_for_active {
+                        self.apply_workspace_session_state(session_id, current);
+                    }
                 }
                 ServerEvent::AgentSessionRenamed {
                     session_id,
                     name,
                     source,
                 } => {
-                    self.update_workspace_session(session_id, &|session| {
-                        session.name = name.clone();
-                        session.title_source = source;
-                    });
+                    if !stale_for_active {
+                        self.update_workspace_session(session_id, &|session| {
+                            session.name = name.clone();
+                            session.title_source = source;
+                        });
+                    }
                 }
                 ServerEvent::AgentSessionTitleSourceChanged { session_id, source } => {
-                    self.update_workspace_session(session_id, &|session| {
-                        session.title_source = source;
-                    });
+                    if !stale_for_active {
+                        self.update_workspace_session(session_id, &|session| {
+                            session.title_source = source;
+                        });
+                    }
                 }
                 ServerEvent::AgentSessionGoalChanged { session_id, goal } => {
-                    self.update_workspace_session(session_id, &|session| {
-                        session.goal = goal.clone();
-                    });
+                    if !stale_for_active {
+                        self.update_workspace_session(session_id, &|session| {
+                            session.goal = goal.clone();
+                        });
+                    }
                 }
                 ServerEvent::AgentSessionArchived { session_id } => {
                     // A cascade archives a project's descendants as well, and
                     // every one of them arrives as its own event, so each is
                     // applied to the session it names.
                     if session_id == self.active_session.id {
-                        self.sync_session_state(AgentSessionState::Archived);
+                        if !stale_for_active {
+                            self.sync_session_state(AgentSessionState::Archived);
+                        }
                     } else {
                         self.forget_archived_session(session_id);
                     }
