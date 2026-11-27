@@ -877,7 +877,8 @@ impl LoomView {
         // Only the question the run is still waiting on can be answered: the
         // choices of an answered question stay as a record of what it offered,
         // so they are shut instead of silently sending a stale answer.
-        let open = self.pending_input.is_some() && self.session_permissions().can_act;
+        let open =
+            self.session_run_presentation().has_pending_input && self.session_permissions().can_act;
         let mut card = div()
             .id(("agent-question", key))
             .test_support()
@@ -1012,7 +1013,7 @@ impl LoomView {
     /// elapsed, and the interrupt hint. Run state lives here instead of the
     /// session header.
     pub(crate) fn render_run_status(&self) -> gpui_kit::Div {
-        let running = self.run_is_active();
+        let presentation = self.session_run_presentation();
         let mut row = div()
             .flex()
             .items_center()
@@ -1020,73 +1021,58 @@ impl LoomView {
             .mb_2()
             .min_h(px(16.))
             .text_xs();
-        if running || self.sending_message || self.pending_input.is_some() {
-            let color = self
-                .run_state
-                .map(run_state_color)
-                .unwrap_or_else(|| rgb(0x93c5fd));
-            row = row.child(loom_mark(color));
+        if presentation.show_mark {
+            row = row.child(loom_mark(presentation.status_color));
         }
-        if let Some(state) = self.run_state {
-            let label = if self.project_has_live_children() && !self.run_is_active() {
-                "Waiting for sub-agents".to_owned()
-            } else {
-                run_state_label(Some(state)).to_owned()
-            };
-            let color = run_state_color(state);
-            row = row.child(div().text_color(color).child(label));
-            // A failed run names the reason it failed next to the state label,
-            // so the status row describes the failure instead of only labeling
-            // it. The reason is presentation state from the active run's
-            // snapshot; no other state adds one.
-            if state == AgentRunState::Failed
-                && let Some(reason) = run_failure_reason(
-                    self.active_run
-                        .as_ref()
-                        .and_then(|run| run.summary.as_deref()),
-                )
-            {
-                row = row.child(
-                    div()
-                        .id("run-failure-reason")
-                        .test_support()
-                        .text_color(color)
-                        .child(reason),
-                );
-            }
-        } else if self.sending_message {
-            row = row.child(div().text_color(rgb(0x93c5fd)).child("Sending"));
-        } else if self.pending_input.is_some() {
+        row = row.child(
+            div()
+                .id("run-status-label")
+                .test_support()
+                .aria_label(presentation.status_label)
+                .text_color(presentation.status_color)
+                .child(presentation.status_label),
+        );
+        // A failed run names the reason it failed next to the state label,
+        // so the status row describes the failure instead of only labeling
+        // it. The reason is presentation state from the active run's
+        // snapshot; no other state adds one.
+        if presentation.run_state == Some(AgentRunState::Failed)
+            && let Some(reason) = run_failure_reason(
+                self.matched_active_run()
+                    .and_then(|run| run.summary.as_deref()),
+            )
+        {
             row = row.child(
                 div()
-                    .text_color(rgb(0xfbbf24))
-                    .child("Waiting for your answer"),
+                    .id("run-failure-reason")
+                    .test_support()
+                    .text_color(presentation.status_color)
+                    .child(reason),
             );
-        } else {
-            row = row.child(div().text_color(rgb(0x64748b)).child("Ready"));
         }
-        if let Some(elapsed) = self.run_elapsed_label() {
+        if let Some(elapsed) = presentation.elapsed_ms.map(format_duration) {
             row = row.child(
                 div()
+                    .id("run-status-elapsed")
+                    .test_support()
+                    .aria_label(elapsed.clone())
                     .font_family(mono_font())
                     .text_color(rgb(0x64748b))
                     .child(elapsed),
             );
         }
         row = row.child(div().flex_1());
-        if running {
-            row = row.child(div().text_color(rgb(0x64748b)).child("esc to interrupt"));
+        if presentation.show_interrupt_hint {
+            row = row.child(
+                div()
+                    .id("run-status-interrupt-hint")
+                    .test_support()
+                    .aria_label("esc to interrupt")
+                    .text_color(rgb(0x64748b))
+                    .child("esc to interrupt"),
+            );
         }
         row
-    }
-
-    pub(crate) fn run_elapsed_label(&self) -> Option<String> {
-        let run = self.active_run.as_ref()?;
-        let end = run.completed_at.unwrap_or_else(Timestamp::now);
-        let milliseconds = end
-            .as_unix_millis()
-            .saturating_sub(run.started_at.as_unix_millis());
-        Some(format_duration(milliseconds))
     }
 }
 

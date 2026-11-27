@@ -80,7 +80,8 @@ use crate::{
         ReviewState, SubProjectDialogState, SystemNote, SystemTone, ThemeChoice, TimelineItem,
         ToolPart, ToolPartStatus, UsageState, bounded, bounded_to, finish_assistant_turn,
         has_tool_part, push_assistant_evidence, push_assistant_reasoning, push_assistant_text,
-        session_state_for_run, upsert_tool_part,
+        run_state_for_session, run_state_is_active, run_state_is_terminal, session_state_for_run,
+        upsert_tool_part,
     },
     syntax::{self, Language},
     theme::{

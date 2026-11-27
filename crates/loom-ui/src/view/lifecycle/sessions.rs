@@ -135,9 +135,19 @@ impl LoomView {
                     .sessions
                     .iter()
                     .find(|session| session.id == view.active_session.id)
+                    .cloned()
                 {
-                    view.active_session = active.clone();
-                    view.session_state = active.state;
+                    let preserved_state = view.effective_run_state().map(session_state_for_run);
+                    view.active_session = active;
+                    if let Some(state) = preserved_state {
+                        // The open session's own stream owns its run state so a
+                        // lagging session-list refresh cannot desync it.
+                        view.active_session.state = state;
+                        view.session_state = state;
+                        view.update_session_list();
+                    } else {
+                        view.sync_session_state(view.active_session.state);
+                    }
                 }
                 if open_landing
                     && !view

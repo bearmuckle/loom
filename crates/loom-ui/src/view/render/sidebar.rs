@@ -743,6 +743,23 @@ impl LoomView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Keep the active session's sidebar row and cached project snapshots
+        // aligned with the single derived run-state presentation so pills and
+        // activity dots never disagree with the open session's footer.
+        let derived_session_state = self.session_run_presentation().session_state;
+        if self.active_session.state != derived_session_state
+            || self.session_state != derived_session_state
+            || self
+                .sessions
+                .iter()
+                .find(|session| session.id == self.active_session.id)
+                .is_some_and(|session| session.state != derived_session_state)
+        {
+            self.session_state = derived_session_state;
+            self.active_session.state = derived_session_state;
+            self.update_session_list();
+            self.sync_active_session_in_project_snapshots();
+        }
         let filter = self
             .session_filter_input
             .as_ref()

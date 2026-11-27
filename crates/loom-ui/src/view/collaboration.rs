@@ -609,11 +609,7 @@ impl LoomView {
         if self.active_run_id.is_some_and(|id| id != run.id) {
             return;
         }
-        self.active_run_id = Some(run.id);
-        self.run_state = Some(run.state);
-        self.session_state = session_state_for_run(run.state);
-        self.active_session.state = self.session_state;
-        self.active_run = Some(run);
+        self.adopt_active_run(run);
     }
 
     /// Applies one attributed history entry: agent-directed messages

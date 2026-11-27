@@ -45,6 +45,7 @@ mod render_state_tests;
 mod responsive_layout_tests;
 mod review_path_tests;
 mod review_project_action_tests;
+mod run_state_consistency_tests;
 mod session_follow_tests;
 mod session_header_render_tests;
 mod session_load_tests;

@@ -331,10 +331,7 @@ impl LoomView {
     }
 
     pub(crate) fn run_is_active(&self) -> bool {
-        matches!(
-            self.run_state,
-            Some(AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating)
-        )
+        self.effective_run_state().is_some_and(run_state_is_active)
     }
 
     /// Whether this client's own run keeps the stream polled.
@@ -343,7 +340,7 @@ impl LoomView {
     /// server resumes it when its children finish, so polling must continue
     /// past the active states or the wait never appears to complete.
     pub(crate) fn run_should_poll(&self) -> bool {
-        self.run_is_active() || matches!(self.run_state, Some(AgentRunState::Paused))
+        self.run_is_active() || self.effective_run_state() == Some(AgentRunState::Paused)
     }
 
     /// Whether the session event stream should keep being polled.
@@ -401,7 +398,7 @@ impl LoomView {
     pub(crate) fn session_poll_delay_millis(&self) -> u64 {
         if self.run_is_active() {
             ACTIVE_RUN_POLL_MILLIS
-        } else if matches!(self.run_state, Some(AgentRunState::Paused)) {
+        } else if self.effective_run_state() == Some(AgentRunState::Paused) {
             PAUSED_RUN_POLL_MILLIS
         } else {
             IDLE_SESSION_POLL_MILLIS
