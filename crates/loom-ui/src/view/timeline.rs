@@ -95,6 +95,10 @@ impl Render for TimelineView {
         }
         if item_count == 0 && !conversation_opening {
             div()
+                .id("timeline-empty")
+                .test_support()
+                .role(Role::Log)
+                .aria_label("Session transcript")
                 .size_full()
                 .p_6()
                 .child(
@@ -104,6 +108,10 @@ impl Render for TimelineView {
                         .justify_center()
                         .child(
                             div()
+                                .id("timeline-empty-status")
+                                .test_support()
+                                .role(Role::Status)
+                                .aria_label("Ready when you are")
                                 .w_full()
                                 .max_w(TIMELINE_CONTENT_MAX_WIDTH)
                                 .p_5()
@@ -160,6 +168,8 @@ impl Render for TimelineView {
                             div()
                                 .id("timeline-opening")
                                 .test_support()
+                                .role(Role::Status)
+                                .aria_label("Opening the conversation")
                                 .w_full()
                                 .max_w(TIMELINE_CONTENT_MAX_WIDTH)
                                 .p_5()
@@ -207,8 +217,16 @@ impl Render for TimelineView {
                         });
                     }
                     let view = parent_for_rows.read(cx);
+                    let total_items = view.timeline.len();
                     let item = &view.timeline[index];
+                    let accessible_name = timeline_item_accessible_name(item, &view.collaboration);
                     div()
+                        .id(("timeline-item", index))
+                        .test_support()
+                        .role(Role::Article)
+                        .aria_label(accessible_name)
+                        .aria_position_in_set(index)
+                        .aria_size_of_set(total_items)
                         .w_full()
                         .flex()
                         .justify_center()
@@ -227,4 +245,143 @@ impl Render for TimelineView {
                 .into_any_element()
         }
     }
+}
+
+/// Maximum number of characters included in the summary portion of a transcript
+/// entry's accessible name.
+const ACCESSIBLE_PREVIEW_MAX_CHARS: usize = 120;
+
+/// Speaker label shown on a user message row.
+pub(crate) fn user_message_speaker(
+    text: &str,
+    collaboration: &crate::collaboration::CollaborationState,
+) -> String {
+    match collaboration.author_of(text) {
+        Some(author @ loom_core::Author::Participant { .. }) => {
+            format!("{} -> Agent", crate::collaboration::author_label(author))
+        }
+        _ => "You".to_owned(),
+    }
+}
+
+/// Concise accessible name for one transcript row, combining speaker/kind with
+/// a single-line preview so assistive technology can scan messages in order.
+pub(crate) fn timeline_item_accessible_name(
+    item: &TimelineItem,
+    collaboration: &crate::collaboration::CollaborationState,
+) -> String {
+    match item {
+        TimelineItem::User(text) => {
+            let speaker = user_message_speaker(text, collaboration);
+            let preview = accessible_preview(text);
+            if preview.is_empty() {
+                speaker
+            } else {
+                format!("{speaker}: {preview}")
+            }
+        }
+        TimelineItem::Assistant(turn) => {
+            let summary = assistant_turn_accessible_summary(turn);
+            if summary.is_empty() {
+                "Agent".to_owned()
+            } else {
+                format!("Agent: {summary}")
+            }
+        }
+        TimelineItem::Collaboration(entry) => {
+            let heading = crate::collaboration::entry_heading(entry);
+            let preview = accessible_preview(&crate::collaboration::entry_text(entry));
+            let is_peer = matches!(
+                entry.kind,
+                loom_core::CollaborationEntryKind::PeerMessage { .. }
+            );
+            let speaker = if is_peer {
+                format!("{heading} (Peer chat)")
+            } else {
+                heading
+            };
+            if preview.is_empty() {
+                speaker
+            } else {
+                format!("{speaker}: {preview}")
+            }
+        }
+        TimelineItem::System(note) => {
+            let preview = accessible_preview(&note.text);
+            match note
+                .heading
+                .as_deref()
+                .map(str::trim)
+                .filter(|heading| !heading.is_empty())
+            {
+                Some(heading) if !preview.is_empty() => format!("System: {heading}: {preview}"),
+                Some(heading) => format!("System: {heading}"),
+                None if !preview.is_empty() => format!("System: {preview}"),
+                None => "System".to_owned(),
+            }
+        }
+    }
+}
+
+fn assistant_turn_accessible_summary(turn: &AssistantTurn) -> String {
+    if let Some(preview) = turn.parts.iter().find_map(|part| match part {
+        AssistantPart::Text(text) => {
+            let preview = accessible_preview(text);
+            (!preview.is_empty()).then_some(preview)
+        }
+        _ => None,
+    }) {
+        return preview;
+    }
+    let tools = run_tool_parts(&turn.parts);
+    if !tools.is_empty() {
+        let status = tool_group_status(&tools);
+        return format!(
+            "Tools used: {}, {}",
+            tool_usage_summary(&tools),
+            status.label()
+        );
+    }
+    if let Some(preview) = turn.parts.iter().find_map(|part| match part {
+        AssistantPart::Reasoning(text) => {
+            let preview = accessible_preview(text);
+            (!preview.is_empty()).then_some(format!("Reasoning: {preview}"))
+        }
+        _ => None,
+    }) {
+        return preview;
+    }
+    if turn
+        .parts
+        .iter()
+        .any(|part| matches!(part, AssistantPart::Evidence(links) if !links.is_empty()))
+    {
+        return "Evidence".to_owned();
+    }
+    String::new()
+}
+
+fn accessible_preview(text: &str) -> String {
+    let mut out = String::new();
+    let mut count = 0usize;
+    for word in text.split_whitespace() {
+        let word_chars = word.chars().count();
+        if !out.is_empty() {
+            if count + 1 >= ACCESSIBLE_PREVIEW_MAX_CHARS {
+                out.push_str("...");
+                return out;
+            }
+            out.push(' ');
+            count += 1;
+        }
+        if count + word_chars > ACCESSIBLE_PREVIEW_MAX_CHARS {
+            let take = ACCESSIBLE_PREVIEW_MAX_CHARS.saturating_sub(count + 3);
+            out.extend(word.chars().take(take));
+            out.push_str("...");
+            return out;
+        }
+        out.push_str(word);
+        count += word_chars;
+    }
+    out
 }

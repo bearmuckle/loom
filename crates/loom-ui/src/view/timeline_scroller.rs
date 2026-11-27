@@ -20,6 +20,7 @@
 
 use std::{ops::Range, time::Duration};
 
+use gpui_kit::TestSupportExt as _;
 use gpui_kit::base::motion::{Transition, transition};
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, IconName, button::Button, button::ButtonVariants as _,
@@ -334,9 +335,11 @@ impl RenderOnce for TimelineScroller {
 
         let viewport = div()
             .id((root_id.clone(), "viewport"))
+            .test_support()
             // Announce appended rows as a log region, like the transcript
             // content of a web chat client.
             .role(Role::Log)
+            .aria_label("Session transcript")
             .size_full()
             .min_h_0()
             .min_w_0()
@@ -387,6 +390,7 @@ impl RenderOnce for TimelineScroller {
                             Button::new((root_id, "jump-to-latest"))
                                 .secondary()
                                 .icon(IconName::ArrowDown)
+                                .accessibility_label(jump_button_label.clone())
                                 .tooltip(jump_button_label)
                                 .rounded(jump_button_radius)
                                 .border_1()

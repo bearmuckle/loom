@@ -15,7 +15,16 @@ impl LoomView {
             .items_center()
             .gap_2()
             .child(div().w(px(3.)).h(px(13.)).rounded_full().bg(rgb(0x9ad7bd)))
-            .child(div().text_xs().text_color(rgb(0x9ad7bd)).child("Agent"));
+            .child(
+                div()
+                    .id(("timeline-speaker", index))
+                    .test_support()
+                    .role(Role::Label)
+                    .aria_value("Agent")
+                    .text_xs()
+                    .text_color(rgb(0x9ad7bd))
+                    .child("Agent"),
+            );
         let mut body = div().px_3().py_2().flex().flex_col().gap_1().child(role);
 
         // Every reasoning part in the response is gathered into one disclosure
@@ -622,6 +631,8 @@ impl LoomView {
                 div()
                     .id(("tool-failure-note", tool_element_id(index, part_index)))
                     .test_support()
+                    .role(Role::Label)
+                    .aria_value(reason.clone())
                     .ml(px(20.))
                     .pt_1()
                     .text_xs()
@@ -637,6 +648,8 @@ impl LoomView {
                 div()
                     .id(("tool-policy-note", tool_element_id(index, part_index)))
                     .test_support()
+                    .role(Role::Label)
+                    .aria_value(note.clone())
                     .ml(px(20.))
                     .pt_1()
                     .text_xs()
@@ -771,12 +784,7 @@ impl LoomView {
                 }
                 // In a shared session the sender is named with their role, so
                 // a direction reads "Name · Role -> Agent" rather than "You".
-                let speaker = match self.collaboration.author_of(text) {
-                    Some(author @ loom_core::Author::Participant { .. }) => {
-                        format!("{} -> Agent", crate::collaboration::author_label(author))
-                    }
-                    _ => "You".to_owned(),
-                };
+                let speaker = timeline::user_message_speaker(text, &self.collaboration);
                 div()
                     .w_full()
                     .px_3()
@@ -792,7 +800,16 @@ impl LoomView {
                                     .items_center()
                                     .justify_end()
                                     .gap_2()
-                                    .child(div().text_xs().text_color(rgb(0xbfdbfe)).child(speaker))
+                                    .child(
+                                        div()
+                                            .id(("timeline-speaker", index))
+                                            .test_support()
+                                            .role(Role::Label)
+                                            .aria_value(speaker.clone())
+                                            .text_xs()
+                                            .text_color(rgb(0xbfdbfe))
+                                            .child(speaker),
+                                    )
                                     .child(
                                         div().w(px(3.)).h(px(13.)).rounded_full().bg(rgb(0x60a5fa)),
                                     ),
@@ -827,7 +844,16 @@ impl LoomView {
                     .bg(surface)
                     .text_color(rgb(text_color));
                 if let Some(heading) = &note.heading {
-                    card = card.child(div().text_xs().text_color(accent).child(heading.clone()));
+                    card = card.child(
+                        div()
+                            .id(("timeline-speaker", index))
+                            .test_support()
+                            .role(Role::Label)
+                            .aria_value(heading.clone())
+                            .text_xs()
+                            .text_color(accent)
+                            .child(heading.clone()),
+                    );
                 }
                 card = card.child(render_timeline_text(
                     format!("timeline-system-{index}"),
@@ -910,6 +936,8 @@ impl LoomView {
                 div()
                     .id(("agent-question-text", key))
                     .test_support()
+                    .role(Role::Label)
+                    .aria_value(question.prompt.clone())
                     .w_full()
                     .min_w(px(0.))
                     .aria_label(question.prompt.clone())
@@ -1127,7 +1155,16 @@ fn render_collaboration_entry(
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(div().text_xs().text_color(rgb(0x86efac)).child(heading))
+                            .child(
+                                div()
+                                    .id(("timeline-speaker", index))
+                                    .test_support()
+                                    .role(Role::Label)
+                                    .aria_value(heading.clone())
+                                    .text_xs()
+                                    .text_color(rgb(0x86efac))
+                                    .child(heading),
+                            )
                             .child(
                                 div()
                                     .text_xs()
@@ -1152,7 +1189,23 @@ fn render_collaboration_entry(
         .items_center()
         .gap_2()
         .text_xs()
-        .child(div().text_color(rgb(0x93c5fd)).child(heading))
-        .child(div().text_color(rgb(0x94a3b8)).child(text))
+        .child(
+            div()
+                .id(("timeline-speaker", index))
+                .test_support()
+                .role(Role::Label)
+                .aria_value(heading.clone())
+                .text_color(rgb(0x93c5fd))
+                .child(heading),
+        )
+        .child(
+            div()
+                .id(("collaboration-entry-text", index))
+                .test_support()
+                .role(Role::Label)
+                .aria_value(text.clone())
+                .text_color(rgb(0x94a3b8))
+                .child(text),
+        )
         .into_any()
 }

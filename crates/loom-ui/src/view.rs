@@ -1739,6 +1739,7 @@ fn about_value(id: &'static str, text: String, color: Rgba) -> impl IntoElement 
 
 /// A `- value +` control used by numeric settings rows.
 fn settings_stepper(
+    value_id: &'static str,
     decrease: impl IntoElement,
     value: String,
     increase: impl IntoElement,
@@ -1748,7 +1749,17 @@ fn settings_stepper(
         .items_center()
         .gap_2()
         .child(decrease)
-        .child(div().w(px(52.)).text_center().text_sm().child(value))
+        .child(
+            div()
+                .id(value_id)
+                .test_support()
+                .role(Role::Label)
+                .aria_value(value.clone())
+                .w(px(52.))
+                .text_center()
+                .text_sm()
+                .child(value),
+        )
         .child(increase)
 }
 

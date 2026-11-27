@@ -1389,8 +1389,12 @@ impl LoomView {
                             "Session indicator pulse threshold",
                             "Pulse when CPU usage is above this value",
                             settings_stepper(
+                                "cpu-pulse-threshold-value",
                                 Button::new("cpu-pulse-threshold-decrease")
                                     .label("-")
+                                    .accessibility_label(
+                                        "Decrease session indicator pulse threshold",
+                                    )
                                     .small()
                                     .disabled(
                                         !self.is_connected()
@@ -1406,6 +1410,9 @@ impl LoomView {
                                 ),
                                 Button::new("cpu-pulse-threshold-increase")
                                     .label("+")
+                                    .accessibility_label(
+                                        "Increase session indicator pulse threshold",
+                                    )
                                     .small()
                                     .disabled(
                                         !self.is_connected()
@@ -1423,8 +1430,10 @@ impl LoomView {
                             "Parallel project agents",
                             "Maximum delegated agents running at once",
                             settings_stepper(
+                                "project-agent-concurrency-value",
                                 Button::new("project-agent-concurrency-decrease")
                                     .label("-")
+                                    .accessibility_label("Decrease parallel project agents")
                                     .small()
                                     .disabled(
                                         !self.is_connected()
@@ -1437,6 +1446,7 @@ impl LoomView {
                                 self.workspace_config.project_agent_concurrency.to_string(),
                                 Button::new("project-agent-concurrency-increase")
                                     .label("+")
+                                    .accessibility_label("Increase parallel project agents")
                                     .small()
                                     .disabled(
                                         !self.is_connected()
@@ -1454,8 +1464,10 @@ impl LoomView {
                             "Run queue timeout",
                             "How long a run may wait for a free agent slot before it is rejected",
                             settings_stepper(
+                                "run-admission-timeout-value",
                                 Button::new("run-admission-timeout-decrease")
                                     .label("-")
+                                    .accessibility_label("Decrease run queue timeout")
                                     .small()
                                     .disabled(
                                         !self.is_connected()
@@ -1471,6 +1483,7 @@ impl LoomView {
                                 ),
                                 Button::new("run-admission-timeout-increase")
                                     .label("+")
+                                    .accessibility_label("Increase run queue timeout")
                                     .small()
                                     .disabled(
                                         !self.is_connected()
@@ -2008,6 +2021,7 @@ impl LoomView {
                                 .child(
                                     Button::new("font-scale-decrease")
                                         .label("-")
+                                        .accessibility_label("Decrease font size")
                                         .small()
                                         .disabled(self.font_scale_percent <= MIN_FONT_SCALE_PERCENT)
                                         .on_click(cx.listener(|this, _, window, cx| {
@@ -2018,16 +2032,22 @@ impl LoomView {
                                             );
                                         })),
                                 )
-                                .child(
+                                .child({
+                                    let value = format!("{}%", self.font_scale_percent);
                                     div()
+                                        .id("font-scale-value")
+                                        .test_support()
+                                        .role(Role::Label)
+                                        .aria_value(value.clone())
                                         .w(px(52.))
                                         .text_center()
                                         .text_sm()
-                                        .child(format!("{}%", self.font_scale_percent)),
-                                )
+                                        .child(value)
+                                })
                                 .child(
                                     Button::new("font-scale-increase")
                                         .label("+")
+                                        .accessibility_label("Increase font size")
                                         .small()
                                         .disabled(self.font_scale_percent >= MAX_FONT_SCALE_PERCENT)
                                         .on_click(cx.listener(|this, _, window, cx| {
@@ -2041,6 +2061,7 @@ impl LoomView {
                                 .child(
                                     Button::new("font-scale-reset")
                                         .label("Reset")
+                                        .accessibility_label("Reset font size")
                                         .ghost()
                                         .small()
                                         .disabled(
