@@ -1024,10 +1024,18 @@ fn the_agent_summary_lists_its_agents_in_the_rows_typography(cx: &mut TestAppCon
     cx.update_window(handle.into(), |_, window, _| {
         assert_eq!(
             window.find(("project-agent-row", 0usize)).label(),
-            Some("Manager · Working")
+            Some("Manager")
         );
         assert_eq!(
             window.find(("project-agent-row", 1usize)).label(),
+            Some("Worker")
+        );
+        assert_eq!(
+            window.find(("project-agent-open", 0usize)).label(),
+            Some("Manager · Working")
+        );
+        assert_eq!(
+            window.find(("project-agent-open", 1usize)).label(),
             Some("Worker · Done")
         );
         assert_eq!(
@@ -1061,7 +1069,7 @@ fn clicking_an_agent_in_the_status_panel_opens_its_transcript(cx: &mut TestAppCo
     let (handle, view) = open_nested_project(cx);
     open_agent_status_panel(cx, handle);
     cx.update_window(handle.into(), |_, window, cx| {
-        window.click(("project-agent-row", 1usize), cx);
+        window.click(("project-agent-open", 1usize), cx);
     })
     .unwrap();
     cx.run_until_parked();

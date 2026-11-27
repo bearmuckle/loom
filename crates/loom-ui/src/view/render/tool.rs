@@ -863,6 +863,10 @@ impl LoomView {
                 if note.retryable {
                     card = card.child(
                         div()
+                            .id(("system-note-retry", index))
+                            .test_support()
+                            .role(Role::Label)
+                            .aria_value("Retry by sending another message.")
                             .mt_1()
                             .text_xs()
                             .text_color(accent)
@@ -1167,6 +1171,10 @@ fn render_collaboration_entry(
                             )
                             .child(
                                 div()
+                                    .id(("peer-chat-disclaimer", index))
+                                    .test_support()
+                                    .role(Role::Label)
+                                    .aria_value("Peer chat · not sent to the agent")
                                     .text_xs()
                                     .text_color(rgb(0x64748b))
                                     .child("Peer chat · not sent to the agent"),

@@ -8,6 +8,7 @@
 use super::*;
 
 use gpui_kit::Anchor;
+use gpui_kit::base::Button as BaseButton;
 use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::popover::{Popover, PopoverState};
 
@@ -252,6 +253,9 @@ fn render_worker_section_row(
         .role(Role::Heading)
         .aria_level(2)
         .aria_label(name.clone())
+        .when(!subtitle.is_empty(), |element| {
+            element.aria_description(subtitle.clone())
+        })
         .w_full()
         .px_2()
         .pt_3()
@@ -474,6 +478,7 @@ fn render_project_row(
         None => content.into_any_element(),
     };
     ListItem::new(("project-row", row_index))
+        .role(Role::ListItem)
         .accessibility_label(row.name.clone())
         .mx_1()
         .rounded_md()
@@ -554,6 +559,7 @@ fn project_agents_summary(
                 &panel_view,
                 &popover,
                 &actions_menu_open,
+                window.text_style().line_height,
             )
         })
 }
@@ -564,6 +570,7 @@ fn project_agents_summary(
 /// A row opens that agent's transcript. Its trailing ellipsis opens the agent's
 /// child controls, which stay a menu because a menu is the right control for
 /// actions.
+#[allow(clippy::too_many_arguments)]
 fn project_agent_status_panel(
     row_index: usize,
     agents: &[ProjectAgentRow],
@@ -572,6 +579,7 @@ fn project_agent_status_panel(
     view: &Entity<LoomView>,
     popover: &Entity<PopoverState>,
     actions_menu_open: &Entity<bool>,
+    line_height: gpui_kit::DefiniteLength,
 ) -> gpui_kit::AnyElement {
     let dismiss = popover.clone();
     let menu_open = actions_menu_open.clone();
@@ -609,53 +617,65 @@ fn project_agent_status_panel(
             div()
                 .id(("project-agent-row", index))
                 .test_support()
-                .role(Role::Button)
-                .aria_label(format!("{} · {}", agent.name, pill.label))
+                .role(Role::Group)
+                .aria_label(agent.name.clone())
                 .flex()
                 .items_center()
-                .gap_2()
-                .px_1()
-                .py_0p5()
-                .rounded_sm()
-                .cursor_pointer()
-                .hover(|row| row.bg(rgb(0x1b1d24)))
-                .on_click(move |_, window, cx| {
-                    // The row is the agent's transcript action; the panel has
-                    // done its job once the agent is on screen.
-                    row_popover.update(cx, |state, cx| state.dismiss(window, cx));
-                    let Some(session) = row_data.sessions.get(&agent_session_id).cloned() else {
-                        return;
-                    };
-                    row_view.update(cx, |view, cx| view.open_agent_transcript(session, cx));
-                })
+                .gap_1()
                 .child(
-                    div()
-                        .w(px(8.))
-                        .h(px(8.))
-                        .flex_shrink_0()
-                        .rounded_full()
-                        .bg(rgb(pill.foreground)),
-                )
-                .child(
-                    div()
+                    BaseButton::new(("project-agent-open", index))
+                        .accessibility_label(format!("{} · {}", agent.name, pill.label))
+                        .line_height(line_height)
+                        .flex()
                         .flex_1()
                         .min_w(px(0.))
-                        .truncate()
-                        .text_xs()
-                        .text_color(rgb(0xe5e7eb))
-                        .child(agent.name.clone()),
-                )
-                .child(
-                    div()
-                        .id(("project-agent-status", index))
-                        .test_support()
-                        .role(Role::Label)
-                        .aria_value(pill.label)
-                        .aria_label(pill.label)
-                        .flex_shrink_0()
-                        .text_xs()
-                        .text_color(rgb(0x8f98a6))
-                        .child(pill.label),
+                        .items_center()
+                        .gap_2()
+                        .px_1()
+                        .py_0p5()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(|row| row.bg(rgb(0x1b1d24)))
+                        .on_click(move |_, window, cx| {
+                            // The open button is the agent's transcript action;
+                            // the panel has done its job once the agent is on
+                            // screen.
+                            row_popover.update(cx, |state, cx| state.dismiss(window, cx));
+                            let Some(session) = row_data.sessions.get(&agent_session_id).cloned()
+                            else {
+                                return;
+                            };
+                            row_view.update(cx, |view, cx| view.open_agent_transcript(session, cx));
+                        })
+                        .child(
+                            div()
+                                .w(px(8.))
+                                .h(px(8.))
+                                .flex_shrink_0()
+                                .rounded_full()
+                                .bg(rgb(pill.foreground)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_xs()
+                                .text_color(rgb(0xe5e7eb))
+                                .child(agent.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .id(("project-agent-status", index))
+                                .test_support()
+                                .role(Role::Label)
+                                .aria_value(pill.label)
+                                .aria_label(pill.label)
+                                .flex_shrink_0()
+                                .text_xs()
+                                .text_color(rgb(0x8f98a6))
+                                .child(pill.label),
+                        ),
                 )
                 .child(
                     Button::new(("project-agent-actions", index))

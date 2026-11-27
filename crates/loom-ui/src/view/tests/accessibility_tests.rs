@@ -1,10 +1,11 @@
 //! Accessibility node role, name, value, and state tests for Loom's UI.
 
+use super::loom_view_render_tests::nested_project_view;
 use super::*;
 use crate::collaboration::CollaborationState;
 use crate::state::{
-    AssistantPart, AssistantTurn, EvidenceText, SystemNote, SystemTone, TimelineItem, ToolPart,
-    ToolPartStatus,
+    ASK_USER_TOOL, AssistantPart, AssistantTurn, EvidenceText, OutputDetail, SystemNote,
+    SystemTone, TimelineItem, ToolPart, ToolPartStatus,
 };
 use gpui_kit::component::Root;
 use gpui_kit::test::TestWindowExt;
@@ -55,41 +56,49 @@ fn settings_switches_report_role_label_and_checked_state(cx: &mut TestAppContext
             window.render_frame(cx);
             let settings = window.within("settings-dialog");
 
-            let auto_approve_switch = settings.find("session-auto-approve-toggle");
-            assert_eq!(auto_approve_switch.role(), Some(Role::Switch));
-            assert_eq!(
-                auto_approve_switch.label(),
-                Some("Auto-approve non-destructive actions")
-            );
-            assert_eq!(auto_approve_switch.checked(), Some(auto_approve));
-
-            let destructive_switch = settings.find("session-ask-before-destructive-toggle");
-            assert_eq!(destructive_switch.role(), Some(Role::Switch));
-            assert_eq!(
-                destructive_switch.label(),
-                Some("Ask before destructive actions")
-            );
-            assert_eq!(destructive_switch.checked(), Some(!auto_approve));
-
-            let archive_switch = settings.find("auto-archive-completed-agents-toggle");
-            assert_eq!(archive_switch.role(), Some(Role::Switch));
-            assert_eq!(archive_switch.checked(), Some(auto_approve));
-
-            let title_switch = settings.find("auto-title-projects-toggle");
-            assert_eq!(title_switch.role(), Some(Role::Switch));
-            assert_eq!(title_switch.checked(), Some(auto_approve));
-
-            let reasoning_switch = settings.find("show-reasoning-toggle");
-            assert_eq!(reasoning_switch.role(), Some(Role::Switch));
-            assert_eq!(reasoning_switch.checked(), Some(!auto_approve));
-
-            let issue_links_switch = settings.find("show-issue-references-toggle");
-            assert_eq!(issue_links_switch.role(), Some(Role::Switch));
-            assert_eq!(issue_links_switch.checked(), Some(auto_approve));
-
-            let pr_links_switch = settings.find("show-pull-request-references-toggle");
-            assert_eq!(pr_links_switch.role(), Some(Role::Switch));
-            assert_eq!(pr_links_switch.checked(), Some(auto_approve));
+            for (id, expected_label, expected_checked) in [
+                (
+                    "session-auto-approve-toggle",
+                    "Auto-approve non-destructive actions",
+                    auto_approve,
+                ),
+                (
+                    "session-ask-before-destructive-toggle",
+                    "Ask before destructive actions",
+                    !auto_approve,
+                ),
+                (
+                    "auto-archive-completed-agents-toggle",
+                    "Auto-archive completed sub agents",
+                    auto_approve,
+                ),
+                (
+                    "auto-title-projects-toggle",
+                    "Automatic project titles",
+                    auto_approve,
+                ),
+                (
+                    "show-reasoning-toggle",
+                    "Show model reasoning",
+                    !auto_approve,
+                ),
+                (
+                    "show-issue-references-toggle",
+                    "Session issue links",
+                    auto_approve,
+                ),
+                (
+                    "show-pull-request-references-toggle",
+                    "Session pull request links",
+                    auto_approve,
+                ),
+            ] {
+                let switch = settings.find(id);
+                assert!(switch.role().is_some(), "{id} must publish an a11y role");
+                assert_eq!(switch.role(), Some(Role::Switch), "{id} role");
+                assert_eq!(switch.label(), Some(expected_label), "{id} label");
+                assert_eq!(switch.checked(), Some(expected_checked), "{id} checked");
+            }
         })
         .unwrap();
     }
@@ -140,6 +149,7 @@ fn settings_steppers_expose_descriptive_labels_and_value_readouts(cx: &mut TestA
             ),
         ] {
             let button = settings.find(id);
+            assert!(button.role().is_some(), "{id} must publish an a11y role");
             assert_eq!(button.role(), Some(Role::Button), "{id} role");
             assert_eq!(button.label(), Some(expected_label), "{id} label");
             assert_eq!(
@@ -155,6 +165,7 @@ fn settings_steppers_expose_descriptive_labels_and_value_readouts(cx: &mut TestA
             ("run-admission-timeout-value", "30 min"),
         ] {
             let value = settings.find(id);
+            assert!(value.role().is_some(), "{id} must publish an a11y role");
             assert_eq!(value.role(), Some(Role::Label), "{id} role");
             assert_eq!(value.value(), Some(expected_value), "{id} value");
         }
@@ -179,11 +190,13 @@ fn settings_steppers_expose_descriptive_labels_and_value_readouts(cx: &mut TestA
             ("font-scale-reset", "Reset font size"),
         ] {
             let button = settings.find(id);
+            assert!(button.role().is_some(), "{id} must publish an a11y role");
             assert_eq!(button.role(), Some(Role::Button), "{id} role");
             assert_eq!(button.label(), Some(expected_label), "{id} label");
             assert_eq!(settings.find_by_label(expected_label).path(), button.path());
         }
         let readout = settings.find("font-scale-value");
+        assert!(readout.role().is_some());
         assert_eq!(readout.role(), Some(Role::Label));
         assert_eq!(readout.value(), Some("100%"));
     })
@@ -217,15 +230,25 @@ fn project_list_items_and_sections_expose_accessible_names_and_roles(cx: &mut Te
         window.render_frame(cx);
 
         let region = window.find("session-list");
+        assert!(region.role().is_some());
         assert_eq!(region.role(), Some(Role::Region));
         assert_eq!(region.label(), Some("Projects"));
 
         let first_row = window.find(("project-row", 0usize));
+        assert!(
+            first_row.role().is_some(),
+            "project-row must publish a role so GPUI writes its label to AccessKit"
+        );
+        assert_eq!(first_row.role(), Some(Role::ListItem));
         assert_eq!(first_row.label(), Some("Alpha Project"));
+
         let first_name = window.find(("project-name", 0usize));
+        assert!(first_name.role().is_some());
         assert_eq!(first_name.role(), Some(Role::Label));
         assert_eq!(first_name.value(), Some("Alpha Project"));
+
         let first_detail = window.find(("project-detail", 0usize));
+        assert!(first_detail.role().is_some());
         assert_eq!(first_detail.role(), Some(Role::Label));
         assert_eq!(
             first_detail.value(),
@@ -233,11 +256,17 @@ fn project_list_items_and_sections_expose_accessible_names_and_roles(cx: &mut Te
         );
 
         let second_row = window.find(("project-row", 1usize));
+        assert!(second_row.role().is_some());
+        assert_eq!(second_row.role(), Some(Role::ListItem));
         assert_eq!(second_row.label(), Some("Beta Project"));
+
         let second_name = window.find(("project-name", 1usize));
+        assert!(second_name.role().is_some());
         assert_eq!(second_name.role(), Some(Role::Label));
         assert_eq!(second_name.value(), Some("Beta Project"));
+
         let second_status = window.find(("project-status", 1usize));
+        assert!(second_status.role().is_some());
         assert_eq!(second_status.role(), Some(Role::Label));
         assert_eq!(second_status.value(), Some("Paused"));
 
@@ -248,7 +277,47 @@ fn project_list_items_and_sections_expose_accessible_names_and_roles(cx: &mut Te
             !headings.is_empty(),
             "worker section header exposes a heading role in the project list"
         );
+        assert_eq!(headings[0].role(), Some(Role::Heading));
         assert!(headings[0].label().is_some_and(|label| !label.is_empty()));
+        assert!(
+            headings[0]
+                .description()
+                .is_some_and(|description| !description.is_empty()),
+            "worker section heading carries its subtitle as aria_description"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn delegated_agent_popover_rows_separate_open_and_actions_buttons(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+        let view = cx.new(|cx| nested_project_view(cx.focus_handle()));
+        Root::new(view, window, cx)
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("project-agents", 0usize), cx);
+        window.render_frame(cx);
+
+        for (index, name, status) in [(0usize, "Manager", "Working"), (1usize, "Worker", "Done")] {
+            let row = window.find(("project-agent-row", index));
+            assert_eq!(row.role(), Some(Role::Group));
+            assert_eq!(row.label(), Some(name));
+
+            let open = window.find(("project-agent-open", index));
+            assert_eq!(open.role(), Some(Role::Button));
+            assert_eq!(open.label(), Some(format!("{name} · {status}").as_str()));
+
+            let actions = window.find(("project-agent-actions", index));
+            assert_eq!(actions.role(), Some(Role::Button));
+            assert_eq!(actions.label(), Some("Agent actions"));
+            assert!(
+                !actions.path().starts_with(open.path()),
+                "Agent actions button must be a sibling of project-agent-open, not nested inside it"
+            );
+        }
     })
     .unwrap();
 }
@@ -286,6 +355,9 @@ fn session_transcript_exposes_log_and_structured_message_articles(cx: &mut TestA
     });
     cx.update_window(opening_window.into(), |_, window, cx| {
         window.render_frame(cx);
+        let log = window.find("timeline-opening-log");
+        assert_eq!(log.role(), Some(Role::Log));
+        assert_eq!(log.label(), Some("Session transcript"));
         let opening = window.find("timeline-opening");
         assert_eq!(opening.role(), Some(Role::Status));
         assert_eq!(opening.label(), Some("Opening the conversation"));
@@ -315,13 +387,30 @@ fn session_transcript_exposes_log_and_structured_message_articles(cx: &mut TestA
                     ],
                     streaming: false,
                 }),
+                TimelineItem::Collaboration(Box::new(CollaborationEntry {
+                    session_id: view.active_session.id,
+                    run_id: None,
+                    author: Author::Participant {
+                        participant: ParticipantIdentity {
+                            id: loom_core::ParticipantId::new(),
+                            display_name: "Alice".to_owned(),
+                        },
+                        role: loom_core::SessionRole::Participant,
+                    },
+                    recipient: Recipient::People,
+                    kind: CollaborationEntryKind::PeerMessage {
+                        text: "Checking this together".to_owned(),
+                    },
+                    revision: None,
+                    created_at: Timestamp::from_unix_millis(1),
+                })),
                 TimelineItem::System(SystemNote {
                     heading: Some("Notice".to_owned()),
                     text: "Worker reconnected".to_owned(),
                     details: None,
                     progress: None,
                     tone: SystemTone::Neutral,
-                    retryable: false,
+                    retryable: true,
                 }),
             ];
             view
@@ -338,7 +427,7 @@ fn session_transcript_exposes_log_and_structured_message_articles(cx: &mut TestA
         let articles = window
             .within("timeline-scroller")
             .find_all_by_role(Role::Article);
-        assert_eq!(articles.len(), 3);
+        assert_eq!(articles.len(), 4);
 
         let user_item = window.find(("timeline-item", 0usize));
         assert_eq!(user_item.role(), Some(Role::Article));
@@ -360,47 +449,91 @@ fn session_transcript_exposes_log_and_structured_message_articles(cx: &mut TestA
         assert_eq!(assistant_speaker.role(), Some(Role::Label));
         assert_eq!(assistant_speaker.value(), Some("Agent"));
 
-        let system_item = window.find(("timeline-item", 2usize));
+        let peer_item = window.find(("timeline-item", 2usize));
+        assert_eq!(peer_item.role(), Some(Role::Article));
+        assert!(
+            peer_item
+                .label()
+                .is_some_and(|label| label.contains("(Peer chat): Checking this together"))
+        );
+        let peer_disclaimer = window.find(("peer-chat-disclaimer", 2usize));
+        assert_eq!(peer_disclaimer.role(), Some(Role::Label));
+        assert_eq!(
+            peer_disclaimer.value(),
+            Some("Peer chat · not sent to the agent")
+        );
+
+        let system_item = window.find(("timeline-item", 3usize));
         assert_eq!(system_item.role(), Some(Role::Article));
         assert_eq!(
             system_item.label(),
             Some("System: Notice: Worker reconnected")
         );
-        let system_heading = window.find(("timeline-speaker", 2usize));
+        let system_heading = window.find(("timeline-speaker", 3usize));
         assert_eq!(system_heading.role(), Some(Role::Label));
         assert_eq!(system_heading.value(), Some("Notice"));
+        let retry_hint = window.find(("system-note-retry", 3usize));
+        assert_eq!(retry_hint.role(), Some(Role::Label));
+        assert_eq!(
+            retry_hint.value(),
+            Some("Retry by sending another message.")
+        );
     })
     .unwrap();
 }
 
 #[test]
-fn timeline_item_accessible_name_summarizes_every_entry_kind() {
+fn timeline_item_accessible_name_matches_painted_content() {
     let collaboration = CollaborationState::default();
+    let name_for = |item: &TimelineItem, output_detail: OutputDetail, show_reasoning: bool| {
+        timeline::timeline_item_accessible_name_with(
+            item,
+            &collaboration,
+            output_detail,
+            show_reasoning,
+            |part| part.detail.clone(),
+        )
+    };
 
     assert_eq!(
-        timeline::timeline_item_accessible_name(
+        name_for(
             &TimelineItem::User("  first line\n\tsecond line  ".to_owned()),
-            &collaboration,
+            OutputDetail::Medium,
+            false,
         ),
         "You: first line second line"
     );
-
     assert_eq!(
-        timeline::timeline_item_accessible_name(
+        name_for(
             &TimelineItem::User("   ".to_owned()),
-            &collaboration,
+            OutputDetail::Medium,
+            false
         ),
         "You"
     );
 
-    let long_prompt = "word ".repeat(40);
-    let long_name =
-        timeline::timeline_item_accessible_name(&TimelineItem::User(long_prompt), &collaboration);
-    assert!(long_name.starts_with("You: "));
-    assert!(long_name.ends_with("..."));
-    assert!(long_name.len() <= "You: ".len() + 123);
+    // ask_user turns announce "Agent asks: <preview>" and never count as Tools used.
+    let ask_turn = TimelineItem::Assistant(AssistantTurn {
+        parts: vec![AssistantPart::Tool(Box::new(ToolPart {
+            id: ToolCallId::new(),
+            name: ASK_USER_TOOL.to_owned(),
+            title: "ask_user".to_owned(),
+            detail: Some("Which target should I build?".to_owned()),
+            status: ToolPartStatus::AwaitingInput,
+            output: None,
+            elapsed_ms: None,
+            approval_pending: false,
+            policy: None,
+        }))],
+        streaming: false,
+    });
+    assert_eq!(
+        name_for(&ask_turn, OutputDetail::Low, false),
+        "Agent asks: Which target should I build?"
+    );
 
-    let tool_only = TimelineItem::Assistant(AssistantTurn {
+    // Regular tools respect output_detail unless they need attention.
+    let read_tool = TimelineItem::Assistant(AssistantTurn {
         parts: vec![AssistantPart::Tool(Box::new(ToolPart {
             id: ToolCallId::new(),
             name: "read_file".to_owned(),
@@ -414,21 +547,51 @@ fn timeline_item_accessible_name_summarizes_every_entry_kind() {
         }))],
         streaming: false,
     });
-    let tool_only_name = timeline::timeline_item_accessible_name(&tool_only, &collaboration);
-    assert!(tool_only_name.starts_with("Agent: Tools used: "));
+    let medium_tool_name = name_for(&read_tool, OutputDetail::Medium, false);
+    assert!(medium_tool_name.starts_with("Agent: Tools used: "));
     assert!(
-        tool_only_name.ends_with(&format!(", {}", ToolPartStatus::Completed.label())),
-        "unexpected tool summary name: {tool_only_name}"
+        medium_tool_name.ends_with(&format!(", {}", ToolPartStatus::Completed.label())),
+        "unexpected tool summary name: {medium_tool_name}"
+    );
+    assert_eq!(
+        name_for(&read_tool, OutputDetail::Low, false),
+        "Agent",
+        "Low output detail hides completed tool activity"
     );
 
+    let approval_tool = TimelineItem::Assistant(AssistantTurn {
+        parts: vec![AssistantPart::Tool(Box::new(ToolPart {
+            id: ToolCallId::new(),
+            name: "run_command".to_owned(),
+            title: "run_command rm -rf".to_owned(),
+            detail: None,
+            status: ToolPartStatus::AwaitingApproval,
+            output: None,
+            elapsed_ms: None,
+            approval_pending: true,
+            policy: None,
+        }))],
+        streaming: false,
+    });
+    assert!(
+        name_for(&approval_tool, OutputDetail::Low, false).starts_with("Agent: Tools used: "),
+        "Low output detail keeps attention-needing tool runs visible"
+    );
+
+    // Reasoning respects both show_reasoning and output_detail.
     let reasoning_only = TimelineItem::Assistant(AssistantTurn {
         parts: vec![AssistantPart::Reasoning("Checking the layout".to_owned())],
         streaming: false,
     });
     assert_eq!(
-        timeline::timeline_item_accessible_name(&reasoning_only, &collaboration),
+        name_for(&reasoning_only, OutputDetail::Medium, true),
         "Agent: Reasoning: Checking the layout"
     );
+    assert_eq!(
+        name_for(&reasoning_only, OutputDetail::Medium, false),
+        "Agent"
+    );
+    assert_eq!(name_for(&reasoning_only, OutputDetail::Low, true), "Agent");
 
     let evidence_only = TimelineItem::Assistant(AssistantTurn {
         parts: vec![AssistantPart::Evidence(vec![EvidenceText {
@@ -438,7 +601,7 @@ fn timeline_item_accessible_name_summarizes_every_entry_kind() {
         streaming: false,
     });
     assert_eq!(
-        timeline::timeline_item_accessible_name(&evidence_only, &collaboration),
+        name_for(&evidence_only, OutputDetail::Medium, false),
         "Agent: Evidence"
     );
 
@@ -447,7 +610,7 @@ fn timeline_item_accessible_name_summarizes_every_entry_kind() {
         streaming: true,
     });
     assert_eq!(
-        timeline::timeline_item_accessible_name(&empty_assistant, &collaboration),
+        name_for(&empty_assistant, OutputDetail::Medium, true),
         "Agent"
     );
 
@@ -468,7 +631,7 @@ fn timeline_item_accessible_name_summarizes_every_entry_kind() {
         revision: None,
         created_at: Timestamp::from_unix_millis(1),
     }));
-    let peer_name = timeline::timeline_item_accessible_name(&peer_entry, &collaboration);
+    let peer_name = name_for(&peer_entry, OutputDetail::Medium, false);
     assert!(peer_name.contains("Alice"));
     assert!(peer_name.contains("(Peer chat): Looks good to me"));
 
@@ -481,7 +644,41 @@ fn timeline_item_accessible_name_summarizes_every_entry_kind() {
         retryable: false,
     });
     assert_eq!(
-        timeline::timeline_item_accessible_name(&plain_system, &collaboration),
+        name_for(&plain_system, OutputDetail::Medium, false),
         "System: Connection restored"
     );
+}
+
+#[test]
+fn accessible_preview_truncates_cleanly_without_dangling_spaces_or_mid_word_slices() {
+    // Exact 120-character single token fits without ellipsis.
+    let exact_120 = "a".repeat(120);
+    assert_eq!(timeline::accessible_preview(&exact_120), exact_120);
+
+    // Single >120-character token truncates to 117 chars + "...".
+    let single_long = "x".repeat(150);
+    let single_preview = timeline::accessible_preview(&single_long);
+    assert_eq!(single_preview.chars().count(), 120);
+    assert!(single_preview.ends_with("..."));
+    assert!(!single_preview.ends_with(" ..."));
+
+    // First token of 118 chars followed by another word must not emit " ...".
+    let first_118_plus_next = format!("{} next", "b".repeat(118));
+    let preview_118 = timeline::accessible_preview(&first_118_plus_next);
+    assert_eq!(preview_118.chars().count(), 120);
+    assert!(preview_118.ends_with("..."));
+    assert!(!preview_118.ends_with(" ..."));
+
+    // Multi-word input hitting 118 chars + next word stops at the prior word boundary.
+    let words_118_plus_next = format!("{} {} next", "c".repeat(100), "d".repeat(17));
+    let multi_118 = timeline::accessible_preview(&words_118_plus_next);
+    assert_eq!(multi_118, format!("{}...", "c".repeat(100)));
+    assert!(!multi_118.ends_with(" ..."));
+
+    // Repeated short words truncate on a whole word boundary without mid-word cuts.
+    let repeated = "word ".repeat(40);
+    let repeated_preview = timeline::accessible_preview(&repeated);
+    assert!(repeated_preview.chars().count() <= 120);
+    assert!(repeated_preview.ends_with("word..."));
+    assert!(!repeated_preview.ends_with(" ..."));
 }
