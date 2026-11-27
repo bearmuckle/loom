@@ -1753,13 +1753,18 @@ impl LoomView {
             SettingsSection::Workers => {
                 let mut card = settings_card();
                 if self.worker_nodes.is_empty() {
+                    let empty_message = "No worker connected. Add one below to load your sessions.";
                     card = card.child(
                         div()
+                            .id("worker-nodes-empty")
+                            .test_support()
+                            .role(Role::Label)
+                            .aria_label(empty_message)
                             .px_4()
                             .py_3()
                             .text_xs()
                             .text_color(rgb(0x8f98a6))
-                            .child("No worker connected. Add one below to load your sessions."),
+                            .child(empty_message),
                     );
                 }
                 card = card.children(self.worker_nodes.iter().enumerate().map(|(index, node)| {
@@ -1767,6 +1772,7 @@ impl LoomView {
                     let status = &node.status;
                     let node_id = status.node_id.clone();
                     let resources = &status.resources;
+                    let display_name = worker_node_display_name(node);
                     let connection_label = match node.connection_state {
                         WorkerConnectionState::Disconnected => "not connected",
                         WorkerConnectionState::Connecting => "connecting",
@@ -1774,7 +1780,13 @@ impl LoomView {
                         WorkerConnectionState::Connected => "connected · offline",
                         WorkerConnectionState::Failed => "connection failed",
                     };
+                    let status_heading = format!("{display_name} · {connection_label}");
+                    let resource_summary = format_worker_node_resources(resources);
+                    let identity_summary = format!("Reported as {}", node.status.name);
+                    let failed = node.connection_state == WorkerConnectionState::Failed;
                     div()
+                        .id(format!("worker-node-row-{id}"))
+                        .test_support()
                         .w_full()
                         .flex()
                         .flex_wrap()
@@ -1789,39 +1801,50 @@ impl LoomView {
                             div()
                                 .flex_1()
                                 .min_w(px(0.))
-                                .child(div().text_sm().text_color(rgb(0xe5e7eb)).child(format!(
-                                    "{} · {}",
-                                    worker_node_display_name(node),
-                                    connection_label,
-                                )))
                                 .child(
                                     div()
+                                        .id(format!("worker-node-status-{id}"))
+                                        .test_support()
+                                        .role(Role::Label)
+                                        .aria_label(status_heading.clone())
+                                        .text_sm()
+                                        .text_color(rgb(0xe5e7eb))
+                                        .child(status_heading),
+                                )
+                                .child(
+                                    div()
+                                        .id(format!("worker-node-resources-{id}"))
+                                        .test_support()
+                                        .role(Role::Label)
+                                        .aria_label(resource_summary.clone())
                                         .text_xs()
                                         .text_color(rgb(0x8f98a6))
-                                        .child(format_worker_node_resources(resources)),
+                                        .child(resource_summary),
                                 )
                                 .child(
                                     div()
                                         .id(format!("worker-node-identity-{id}"))
                                         .test_support()
+                                        .role(Role::Label)
+                                        .aria_label(identity_summary.clone())
                                         .text_xs()
                                         .text_color(rgb(0x64748b))
-                                        .child(format!("Reported as {}", node.status.name)),
+                                        .child(identity_summary),
                                 )
                                 .when_some(node.connection_detail.as_deref(), |element, detail| {
                                     element.child(
                                         div()
+                                            .id(format!("worker-node-detail-{id}"))
+                                            .test_support()
+                                            .role(if failed { Role::Alert } else { Role::Status })
+                                            .aria_label(detail.to_owned())
                                             .mt_1()
                                             .text_xs()
-                                            .text_color(
-                                                if node.connection_state
-                                                    == WorkerConnectionState::Failed
-                                                {
-                                                    rgb(0xfca5a5)
-                                                } else {
-                                                    rgb(0xfcd34d)
-                                                },
-                                            )
+                                            .text_color(if failed {
+                                                rgb(0xfca5a5)
+                                            } else {
+                                                rgb(0xfcd34d)
+                                            })
                                             .child(detail.to_owned()),
                                     )
                                 }),
@@ -1830,6 +1853,7 @@ impl LoomView {
                             element.child(
                                 Button::new(format!("remove-worker-node-{id}"))
                                     .label("Remove")
+                                    .accessibility_label(format!("Remove {display_name}"))
                                     .small()
                                     .on_click(cx.listener(move |view, _, _, cx| {
                                         view.remove_worker_node(id, cx)
@@ -1851,6 +1875,15 @@ impl LoomView {
                         )
                 }));
 
+                let connect_hint = if cfg!(target_family = "wasm") {
+                    "Enter a ws:// or wss:// worker URL. Leave the access token empty to sign in \
+                     with GitHub. URLs are shared; access tokens are not."
+                } else {
+                    "Enter a ws:// or wss:// worker URL, or ssh://user@host to install and connect \
+                     a worker over SSH. Leave the access token empty to sign in with GitHub. URLs \
+                     are shared; access tokens are not."
+                };
+
                 div()
                     .w_full()
                     .flex()
@@ -1860,6 +1893,10 @@ impl LoomView {
                     .when_some(self.browser_startup_error.as_deref(), |element, error| {
                         element.child(
                             div()
+                                .id("worker-browser-startup-error")
+                                .test_support()
+                                .role(Role::Alert)
+                                .aria_label(error.to_owned())
                                 .text_xs()
                                 .text_color(rgb(0xfca5a5))
                                 .child(error.to_owned()),
@@ -1868,38 +1905,63 @@ impl LoomView {
                     .child(card)
                     .child(
                         div()
+                            .id("worker-connect-form")
+                            .test_support()
                             .w_full()
                             .flex()
-                            .items_center()
+                            .flex_col()
                             .gap_2()
+                            .when_some(self.node_input_state.as_ref(), |form, url_input| {
+                                form.child(
+                                    KitInput::new(url_input)
+                                        .id("worker-node-url-input")
+                                        .aria_label("Worker URL")
+                                        .small(),
+                                )
+                            })
+                            .when_some(self.node_token_input_state.as_ref(), |form, token_input| {
+                                form.child(
+                                    KitInput::new(token_input)
+                                        .id("worker-node-token-input")
+                                        .aria_label("Access token (optional)")
+                                        .content_type(InputContentType::Password)
+                                        .small(),
+                                )
+                            })
                             .child(
-                                div().flex_1().child(
-                                    KitInput::new(self.node_input_state.as_ref().expect(
-                                        "worker connection input initialized before rendering",
-                                    ))
-                                    .id("worker-node-connection-input")
-                                    .small(),
+                                div().flex().justify_end().child(
+                                    Button::new("connect-worker-node")
+                                        .label("Connect")
+                                        .primary()
+                                        .small()
+                                        .on_click(cx.listener(|view, _, _, cx| {
+                                            view.connect_worker_node(cx)
+                                        })),
                                 ),
                             )
-                            .child(
-                                Button::new("connect-worker-node")
-                                    .label("Connect")
-                                    .small()
-                                    .on_click(
-                                        cx.listener(|view, _, _, cx| view.connect_worker_node(cx)),
-                                    ),
-                            ),
+                            .when_some(self.worker_connect_error.as_deref(), |form, error| {
+                                form.child(
+                                    div()
+                                        .id("worker-connect-error")
+                                        .test_support()
+                                        .role(Role::Alert)
+                                        .aria_label(error.to_owned())
+                                        .text_xs()
+                                        .text_color(rgb(0xfca5a5))
+                                        .child(error.to_owned()),
+                                )
+                            }),
                     )
-                    .child(div().text_xs().text_color(rgb(0x64748b)).child(
-                        if cfg!(target_family = "wasm") {
-                            "Use: ws://host:port/ws [access token] · Leave the token empty to \
-                             sign in with GitHub. URLs are shared; access tokens are not"
-                        } else {
-                            "Use: ws://host:port/ws [access token] · Leave the token empty to \
-                             sign in with GitHub. Or ssh://user@host to install and connect a \
-                             worker over SSH. URLs are shared; access tokens are not"
-                        },
-                    ))
+                    .child(
+                        div()
+                            .id("worker-connect-hint")
+                            .test_support()
+                            .role(Role::Label)
+                            .aria_label(connect_hint)
+                            .text_xs()
+                            .text_color(rgb(0x64748b))
+                            .child(connect_hint),
+                    )
                     .child(self.render_worker_sign_in_row(cx))
                     .into_any_element()
             }
@@ -2104,6 +2166,8 @@ impl LoomView {
         div()
             .id("settings-dialog")
             .test_support()
+            .role(Role::Dialog)
+            .aria_label("Settings")
             .occlude()
             .size_full()
             .absolute()
@@ -2124,28 +2188,24 @@ impl LoomView {
                     .when(phone, |element| element.py_3())
                     .border_b_1()
                     .border_color(rgb(0x242833))
-                    .child(div().text_sm().text_color(rgb(0xf3f4f6)).child("Settings"))
                     .child(
                         div()
-                            .id("close-settings")
+                            .id("settings-dialog-title")
                             .test_support()
-                            .w(px(28.))
-                            .h(px(28.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_lg()
-                            .bg(rgb(0x20242c))
-                            .hover(|style| style.bg(rgb(0x293244)))
-                            .text_color(rgb(0xb7c0d0))
-                            .cursor_pointer()
-                            .tooltip(|_, cx| {
-                                cx.new(|_| LoomTooltip {
-                                    text: "Close settings".into(),
-                                })
-                                .into()
-                            })
-                            .child(Icon::new(IconName::Close).size_4())
+                            .role(Role::Heading)
+                            .aria_level(1)
+                            .aria_label("Settings")
+                            .text_sm()
+                            .text_color(rgb(0xf3f4f6))
+                            .child("Settings"),
+                    )
+                    .child(
+                        Button::new("close-settings")
+                            .icon(Icon::new(IconName::Close))
+                            .ghost()
+                            .small()
+                            .accessibility_label("Close settings")
+                            .tooltip("Close settings")
                             .on_click(cx.listener(Self::close_settings)),
                     ),
             )
@@ -2158,17 +2218,32 @@ impl LoomView {
                     .child(settings_nav(section, phone, cx))
                     .child(
                         div()
-                            .id("settings-content")
-                            .test_support()
+                            .relative()
                             .flex_1()
                             .min_w(px(0.))
                             .min_h(px(0.))
                             .w_full()
                             .h_full()
-                            .p_4()
-                            .when(!phone, |element| element.p_6())
-                            .overflow_y_scroll()
-                            .child(content),
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .id("settings-content")
+                                    .test_support()
+                                    .size_full()
+                                    .p_4()
+                                    .when(!phone, |element| element.p_6().pr(px(28.)))
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.settings_scroll_handle)
+                                    .child(content),
+                            )
+                            .child(
+                                div().absolute().inset_0().child(
+                                    Scrollbar::vertical(&self.settings_scroll_handle)
+                                        .id("settings-content-scrollbar")
+                                        .mode(ScrollbarMode::Always)
+                                        .viewport_from_layout(),
+                                ),
+                            ),
                     ),
             )
             .into_any()

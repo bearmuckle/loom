@@ -53,8 +53,14 @@ impl LoomView {
     /// behind holds is dropped, so opening it again starts from its own state
     /// rather than from the state it had when it was covered.
     pub(crate) fn show_surface(&mut self, surface: CoveringSurface) {
+        let reset_settings_scroll = matches!(surface, CoveringSurface::Settings(_))
+            && self.covering_surface != Some(surface);
         if let Some(replaced) = self.covering_surface.replace(surface) {
             self.discard_surface_content(replaced);
+        }
+        if reset_settings_scroll {
+            self.settings_scroll_handle
+                .set_offset(point(px(0.), px(0.)));
         }
         // The phone's session drawer and the review column are secondary
         // chrome: a covering surface replaces them, instead of every opener
@@ -96,7 +102,10 @@ impl LoomView {
     /// archived-session entries are a loaded listing rather than a dialog.
     fn discard_surface_content(&mut self, surface: CoveringSurface) {
         match surface {
-            CoveringSurface::Settings(_) | CoveringSurface::ArchivedSessions => {}
+            CoveringSurface::Settings(_) => {
+                self.worker_connect_error = None;
+            }
+            CoveringSurface::ArchivedSessions => {}
             CoveringSurface::NewProject => {
                 self.source_dialog = None;
                 self.source_path_input = None;

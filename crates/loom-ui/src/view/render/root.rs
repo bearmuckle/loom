@@ -149,22 +149,60 @@ impl Render for LoomView {
         }
         if self.node_input_state.is_none() {
             let initial_value = self.node_input_initial.clone();
-            let input = cx.new(|cx| InputState::new(window, cx).default_value(initial_value));
-            if self.settings_open() {
+            let placeholder = if cfg!(target_family = "wasm") {
+                "ws://host:port/ws or wss://host:port/ws"
+            } else {
+                "ws://127.0.0.1:8765/ws or ssh://user@host"
+            };
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(placeholder)
+                    .default_value(initial_value)
+            });
+            if self.settings_section() == Some(SettingsSection::Workers) {
                 input.update(cx, |state, cx| state.focus(window, cx));
             }
             self.input_subscriptions.push(cx.subscribe(
                 &input,
-                |view, _, event: &InputEvent, cx| {
-                    if matches!(event, InputEvent::PressEnter { .. }) {
-                        view.connect_worker_node(cx);
+                |view, _, event: &InputEvent, cx| match event {
+                    InputEvent::Change => {
+                        if view.worker_connect_error.take().is_some() {
+                            cx.notify();
+                        }
                     }
+                    InputEvent::PressEnter { .. } => view.connect_worker_node(cx),
+                    _ => {}
                 },
             ));
             self.node_input_state = Some(input);
         }
+        if self.node_token_input_state.is_none() {
+            let initial_token = self.node_token_initial.clone();
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Access token (optional)")
+                    .default_value(initial_token)
+                    .masked(true)
+            });
+            self.input_subscriptions.push(cx.subscribe(
+                &input,
+                |view, _, event: &InputEvent, cx| match event {
+                    InputEvent::Change => {
+                        if view.worker_connect_error.take().is_some() {
+                            cx.notify();
+                        }
+                    }
+                    InputEvent::PressEnter { .. } => view.connect_worker_node(cx),
+                    _ => {}
+                },
+            ));
+            self.node_token_input_state = Some(input);
+        }
         if self.clear_node_on_render {
             if let Some(input) = self.node_input_state.as_ref() {
+                input.update(cx, |state, cx| state.set_value("", window, cx));
+            }
+            if let Some(input) = self.node_token_input_state.as_ref() {
                 input.update(cx, |state, cx| state.set_value("", window, cx));
             }
             self.clear_node_on_render = false;

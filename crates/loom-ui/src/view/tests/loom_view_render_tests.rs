@@ -2091,30 +2091,55 @@ fn worker_connection_rejects_empty_credentialed_and_duplicate_inputs(cx: &mut Te
     let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
         let mut view = LoomView::new_for_test(cx.focus_handle());
         view.connect_worker_node(cx);
-        view.node_input_initial = "wss://user:secret@worker.example/ws token".to_owned();
-        view.connect_worker_node(cx);
-        assert_eq!(view.worker_nodes.len(), 1);
-        assert_eq!(
-            view.worker_nodes[0].connection_state,
-            WorkerConnectionState::Failed
-        );
+        assert!(view.worker_nodes.is_empty());
         assert!(
-            view.worker_nodes[0]
-                .connection_detail
+            view.worker_connect_error
+                .as_deref()
+                .unwrap()
+                .contains("Enter the worker URL")
+        );
+
+        view.node_input_initial = "wss://user:secret@worker.example/ws".to_owned();
+        view.node_token_initial = "token".to_owned();
+        view.connect_worker_node(cx);
+        assert!(view.worker_nodes.is_empty());
+        assert!(
+            view.worker_connect_error
                 .as_deref()
                 .unwrap()
                 .contains("Do not include credentials")
         );
+
+        view.node_input_initial = "ws://127.0.0.1:1/ws leaked-token".to_owned();
+        view.node_token_initial.clear();
         view.connect_worker_node(cx);
-        assert_eq!(view.worker_nodes.len(), 1);
+        assert!(view.worker_nodes.is_empty());
+        assert!(
+            view.worker_connect_error
+                .as_deref()
+                .unwrap()
+                .contains("its own field")
+        );
+
         // A URL without a token is a valid unsigned connection, so the attempt
         // starts instead of being refused for the missing token.
         view.node_input_initial = "ws://127.0.0.1:1/ws".to_owned();
         view.connect_worker_node(cx);
-        assert_eq!(view.worker_nodes.len(), 2);
+        assert!(view.worker_connect_error.is_none());
+        assert_eq!(view.worker_nodes.len(), 1);
         assert_eq!(
-            view.worker_nodes[1].connection_state,
+            view.worker_nodes[0].connection_state,
             WorkerConnectionState::Connecting
+        );
+
+        // A duplicate attempt while already connecting surfaces an inline error.
+        view.connect_worker_node(cx);
+        assert_eq!(view.worker_nodes.len(), 1);
+        assert!(
+            view.worker_connect_error
+                .as_deref()
+                .unwrap()
+                .contains("already in progress")
         );
         view
     });
@@ -2127,7 +2152,8 @@ async fn worker_connection_failure_after_valid_input_is_reported(cx: &mut TestAp
     cx.update(gpui_kit::init);
     let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
         let mut view = LoomView::new_for_test(cx.focus_handle());
-        view.node_input_initial = "ws://127.0.0.1:1/ws test-token".to_owned();
+        view.node_input_initial = "ws://127.0.0.1:1/ws".to_owned();
+        view.node_token_initial = "test-token".to_owned();
         view.connect_worker_node(cx);
         assert_eq!(view.worker_nodes.len(), 1);
         view

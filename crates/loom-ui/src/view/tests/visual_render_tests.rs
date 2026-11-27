@@ -478,3 +478,108 @@ fn run_states_render_distinct_consistent_frames() {
         "an idle session with a configured model should differ visually from the no-model state"
     );
 }
+
+#[test]
+fn settings_agents_scrolls_and_paints_different_frames_at_1280x800() {
+    let top = capture(|view| {
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Agents));
+    });
+    let scrolled = capture(|view| {
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Agents));
+        view.settings_scroll_handle.scroll_to_bottom();
+    });
+    assert_ne!(
+        top.fingerprint(),
+        scrolled.fingerprint(),
+        "scrolling Settings -> Agents at 1280x800 must reveal clipped rows"
+    );
+}
+
+#[test]
+fn settings_workers_inline_error_and_failed_row_paint_at_1280x800() {
+    let baseline = capture(|view| {
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Workers));
+    });
+    let with_error = capture(|view| {
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Workers));
+        view.worker_connect_error =
+            Some("Enter the worker URL, for example ws://127.0.0.1:8765/ws.".to_owned());
+    });
+    let with_failed_worker = capture(|view| {
+        view.show_surface(CoveringSurface::Settings(SettingsSection::Workers));
+        let id = view
+            .begin_worker_node_connection("ws://127.0.0.1:9999/ws")
+            .expect("placeholder created");
+        view.set_worker_node_connection_failure(
+            id,
+            "ws://127.0.0.1:9999/ws",
+            "The worker refused the connection. Check that its server is running and the URL and \
+             port are correct."
+                .to_owned(),
+        );
+        view.settings_scroll_handle.scroll_to_bottom();
+    });
+    assert_ne!(
+        baseline.fingerprint(),
+        with_error.fingerprint(),
+        "Settings -> Workers inline validation error must paint visibly"
+    );
+    assert_ne!(
+        baseline.fingerprint(),
+        with_failed_worker.fingerprint(),
+        "Settings -> Workers failed remote worker row must paint visibly at 1280x800"
+    );
+}
+
+#[test]
+fn first_run_worker_setup_paints_cleanly_at_1280x800() {
+    let mut cx = HeadlessAppContext::with_platform(
+        text_system(),
+        Arc::new(gpui_kit::assets::Assets),
+        current_headless_renderer,
+    );
+    cx.update(gpui_kit::init);
+    let options = UiOptions {
+        project: None,
+        task: "setup".to_owned(),
+        model: ModelId::new("deterministic/demo"),
+        remote: None,
+        token: None,
+        reset_state: false,
+        server_binary: None,
+        ca: None,
+        allow_insecure_remote: false,
+    };
+    let (handle, _view) = cx
+        .update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: view_size(),
+                    })),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                cx,
+                |_window, cx| {
+                    cx.new(|cx| LoomView::new_setup(&options, None, None, cx.focus_handle()))
+                },
+            )
+        })
+        .expect("open headless setup window");
+
+    cx.update_window(handle, |_, window, cx| window.render_frame(cx))
+        .expect("render first-run setup frame");
+    let image = cx
+        .capture_screenshot(handle)
+        .expect("capture first-run setup screenshot");
+    let frame = Frame {
+        width: image.width(),
+        height: image.height(),
+        rgba: image.into_raw(),
+    };
+    assert!(frame.has_aspect_ratio(1280, 800));
+    assert!(frame.distinct_colors() > 8);
+}
