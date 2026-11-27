@@ -357,6 +357,22 @@ impl InProcessBackend {
         Ok(workspace)
     }
 
+    /// Refreshes the GitHub Copilot model catalog when a restored credential
+    /// allows it.
+    ///
+    /// This is discovery's second entry point beside the device login: a worker
+    /// that comes back holding a Copilot credential asks Copilot for the models
+    /// the account may call. It is best effort, so a worker whose account cannot
+    /// be reached still starts with the catalog it restored.
+    fn refresh_github_copilot_models(&self) {
+        if let Err(error) = self.providers.refresh_github_copilot_models() {
+            log::warn!(
+                "[loom-server] could not refresh the GitHub Copilot model catalog: {}",
+                error.message
+            );
+        }
+    }
+
     pub(crate) fn restore_persisted(self: &Arc<Self>) -> Result<()> {
         let Some(persistence) = self.persistence.clone() else {
             return Ok(());
@@ -372,6 +388,7 @@ impl InProcessBackend {
                 .providers
                 .migrate_api_key_credentials(&mut provider_configs)?;
             self.providers.restore_configs(provider_configs)?;
+            self.refresh_github_copilot_models();
             self.providers
                 .restore_health(persistence.load_provider_health()?)?;
             self.providers
@@ -462,6 +479,7 @@ impl InProcessBackend {
             needs_persist = true;
         }
         self.providers.restore_configs(provider_configs)?;
+        self.refresh_github_copilot_models();
         self.providers.restore_health(state.provider_health)?;
         self.providers
             .restore_usage_limits(state.provider_usage_limits)?;

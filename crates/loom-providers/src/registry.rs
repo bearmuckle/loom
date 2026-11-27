@@ -456,7 +456,31 @@ impl ProviderRegistry {
         self.register(ProviderConfig::github_copilot(credential))
     }
 
+    /// Stores the GitHub Copilot access token, registers the provider, and asks
+    /// Copilot which models the account may call.
+    ///
+    /// The provider is registered with the `gpt-6-luna` placeholder first so a
+    /// login always leaves a usable provider behind. Discovery replaces that
+    /// catalog; a failure keeps the placeholder and is logged, because the
+    /// sign-in itself succeeded and an account without a catalog is not a login
+    /// error.
     pub fn configure_github_copilot(&self, access_token: String) -> Result<()> {
+        self.configure_github_copilot_at(
+            access_token,
+            GITHUB_COPILOT_API_ENDPOINT,
+            GITHUB_COPILOT_TOKEN_URL,
+        )
+    }
+
+    /// [`ProviderRegistry::configure_github_copilot`] with the Copilot endpoints
+    /// injected, so a test can serve discovery from a local fixture instead of
+    /// reaching the real service.
+    pub fn configure_github_copilot_at(
+        &self,
+        access_token: String,
+        api_endpoint: impl Into<String>,
+        token_endpoint: impl Into<String>,
+    ) -> Result<()> {
         if access_token.trim().is_empty() {
             return Err(LoomError::invalid_request(
                 "GitHub Copilot access token must not be empty",
@@ -464,7 +488,93 @@ impl ProviderRegistry {
         }
         let credential = CredentialRef::new(GITHUB_COPILOT_CREDENTIAL_REF);
         self.credentials.store(&credential, access_token)?;
-        self.register(ProviderConfig::github_copilot(credential))
+        let mut config = ProviderConfig::github_copilot(credential);
+        config.endpoint = Some(api_endpoint.into());
+        self.register(config)?;
+        self.refresh_github_copilot_models_at(token_endpoint)
+    }
+
+    /// Replaces the registered GitHub Copilot catalog with the models Copilot
+    /// reports for the stored credential.
+    ///
+    /// This is the start-up half of the login-time discovery: a worker that
+    /// comes back holding a Copilot credential asks for the catalog again, so a
+    /// model the account gained or lost since the last run is picked up. A
+    /// failure is logged and leaves the catalog the registry already holds in
+    /// place.
+    pub fn refresh_github_copilot_models(&self) -> Result<()> {
+        self.refresh_github_copilot_models_at(GITHUB_COPILOT_TOKEN_URL)
+    }
+
+    /// [`ProviderRegistry::refresh_github_copilot_models`] with the token
+    /// endpoint injected, so a start-up test can serve discovery from a local
+    /// fixture instead of reaching the real service.
+    pub fn refresh_github_copilot_models_at(
+        &self,
+        token_endpoint: impl Into<String>,
+    ) -> Result<()> {
+        let token_endpoint = token_endpoint.into();
+        self.refresh_github_copilot_catalog(&token_endpoint)
+    }
+
+    fn refresh_github_copilot_catalog(&self, token_endpoint: &str) -> Result<()> {
+        let provider_id = ProviderId::new(GITHUB_COPILOT_PROVIDER_ID);
+        let config = match self
+            .configurations
+            .lock()
+            .map_err(|_| internal_lock_error("provider configuration"))?
+            .get(&provider_id)
+        {
+            Some(config) => config.clone(),
+            None => return Ok(()),
+        };
+        let Some(reference) = config.credential.as_ref() else {
+            return Ok(());
+        };
+        // A worker that has never signed in still holds the provider entry so a
+        // person can configure it, so an unresolvable credential is the normal
+        // signed-out state rather than a discovery failure.
+        let Ok(github_token) = self.resolve_credential(reference) else {
+            return Ok(());
+        };
+        let provider = GitHubCopilotProvider::with_endpoints(
+            config
+                .endpoint
+                .as_deref()
+                .unwrap_or(GITHUB_COPILOT_API_ENDPOINT),
+            token_endpoint,
+            github_token,
+            config
+                .models
+                .first()
+                .cloned()
+                .unwrap_or_else(github_copilot_descriptor),
+        );
+        let models = match provider.discover_models() {
+            Ok(models) => models,
+            Err(error) => {
+                log::warn!(
+                    "[loom-providers] GitHub Copilot model discovery failed, keeping the {} \
+                     registered model(s): {}",
+                    config.models.len(),
+                    error.message
+                );
+                return Ok(());
+            }
+        };
+        log::info!(
+            "[loom-providers] discovered {} GitHub Copilot model(s)",
+            models.len()
+        );
+        if let Some(config) = self
+            .configurations
+            .lock()
+            .map_err(|_| internal_lock_error("provider configuration"))?
+            .get_mut(&provider_id)
+        {
+            config.models = models;
+        }
+        Ok(())
     }
 
     /// Attach a user supplied API key to an already registered API-key provider.
@@ -1189,7 +1299,15 @@ impl ProviderRegistry {
             .clone();
         for mut config in configs {
             if let Some(current) = existing.get(&config.id) {
-                if config.kind == ProviderKind::GitHubCopilot && config.models.len() <= 1 {
+                if config.kind == ProviderKind::GitHubCopilot
+                    && config.models.len() <= 1
+                    && config
+                        .models
+                        .first()
+                        .is_none_or(|model| model.id.as_str() == GITHUB_COPILOT_DEFAULT_MODEL)
+                {
+                    // The saved catalog is only the placeholder, so a catalog
+                    // this process already discovered is the fresher one.
                     continue;
                 }
                 if config.kind != current.kind {
@@ -1225,7 +1343,7 @@ impl ProviderRegistry {
                 continue;
             }
             if config.kind == ProviderKind::GitHubCopilot {
-                config.models = vec![github_copilot_descriptor()];
+                config.models = restored_github_copilot_catalog(&config.models);
             } else if let Some(current) = existing.get(&config.id)
                 && current.kind == config.kind
             {
@@ -1352,6 +1470,26 @@ impl ProviderRegistry {
 
     pub fn health_check(&self, provider_id: &ProviderId) -> Result<ProviderHealth> {
         self.check_health(provider_id)
+    }
+}
+
+/// The catalog a persisted GitHub Copilot configuration restores.
+///
+/// A successful discovery persists the models Copilot reported, so a restart
+/// keeps them instead of reverting to the `gpt-6-luna` placeholder. The saved
+/// list is only trusted while every entry claims the Copilot provider and
+/// carries an id: a mangled list falls back to the placeholder rather than
+/// cataloguing a model that cannot be called.
+fn restored_github_copilot_catalog(models: &[ModelDescriptor]) -> Vec<ModelDescriptor> {
+    let trusted = !models.is_empty()
+        && models.iter().all(|model| {
+            model.provider.as_str() == GITHUB_COPILOT_PROVIDER_ID
+                && !model.id.as_str().trim().is_empty()
+        });
+    if trusted {
+        models.to_vec()
+    } else {
+        vec![github_copilot_descriptor()]
     }
 }
 
