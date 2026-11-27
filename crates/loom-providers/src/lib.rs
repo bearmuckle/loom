@@ -748,6 +748,145 @@ mod tests {
         server.join().unwrap();
     }
 
+    /// Serves one Copilot token exchange and one `/models` response, so a test
+    /// can drive discovery through the registry the way a device login does.
+    fn serve_copilot_catalog(
+        models: &'static str,
+    ) -> (
+        String,
+        String,
+        thread::JoinHandle<std::result::Result<(), String>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut token_stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            read_request_headers(&mut token_stream)?;
+            write_response(
+                &mut token_stream,
+                "application/json",
+                &format!(r#"{{"token":"copilot-token","endpoints":{{"api":"http://{address}"}}}}"#),
+            )?;
+
+            let (mut models_stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            read_request_headers(&mut models_stream)?;
+            write_response(&mut models_stream, "application/json", models)?;
+            Ok(())
+        });
+        (
+            format!("http://{address}"),
+            format!("http://{address}/token"),
+            server,
+        )
+    }
+
+    fn copilot_model_ids(registry: &ProviderRegistry) -> Vec<String> {
+        registry
+            .models()
+            .unwrap()
+            .iter()
+            .map(|model| model.id.as_str().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn copilot_login_registers_the_discovered_model_catalog() {
+        let (api_endpoint, token_endpoint, server) = serve_copilot_catalog(
+            r#"{"data":[
+                {"id":"gpt-6-astra","capabilities":{"supports":{"tool_calls":true}}},
+                {"id":"gpt-6-sol","capabilities":{"supports":{"tool_calls":true}}},
+                {"id":"chat-only","capabilities":{"supports":{"tool_calls":false}}}
+            ]}"#,
+        );
+        let registry =
+            ProviderRegistry::with_credentials(Arc::new(InMemoryCredentialStore::default()));
+
+        registry
+            .configure_github_copilot_at("github-secret".to_owned(), api_endpoint, token_endpoint)
+            .unwrap();
+        server.join().unwrap().unwrap();
+
+        assert_eq!(copilot_model_ids(&registry), ["gpt-6-astra", "gpt-6-sol"]);
+    }
+
+    #[test]
+    fn copilot_catalog_survives_a_persist_and_restore() {
+        let credentials = Arc::new(InMemoryCredentialStore::default());
+        let (api_endpoint, token_endpoint, server) = serve_copilot_catalog(
+            r#"{"data":[
+                {"id":"gpt-6-astra","capabilities":{"supports":{"tool_calls":true}}},
+                {"id":"gpt-6-sol","capabilities":{"supports":{"tool_calls":true}}}
+            ]}"#,
+        );
+        let registry = ProviderRegistry::with_credentials(credentials.clone());
+        registry
+            .configure_github_copilot_at(
+                "github-secret".to_owned(),
+                api_endpoint.clone(),
+                token_endpoint,
+            )
+            .unwrap();
+        server.join().unwrap().unwrap();
+        let persisted = registry.export_configs().unwrap();
+
+        let restored = ProviderRegistry::with_credentials(credentials);
+        restored.restore_configs(persisted).unwrap();
+
+        assert_eq!(copilot_model_ids(&restored), ["gpt-6-astra", "gpt-6-sol"]);
+        assert_eq!(
+            restored.export_configs().unwrap()[0].endpoint,
+            Some(api_endpoint)
+        );
+    }
+
+    #[test]
+    fn copilot_discovery_failure_keeps_the_placeholder_model() {
+        let (token_endpoint, server) =
+            serve_once(r#"{"error":"unauthorized"}"#, "application/json");
+        let registry =
+            ProviderRegistry::with_credentials(Arc::new(InMemoryCredentialStore::default()));
+
+        registry
+            .configure_github_copilot_at(
+                "github-secret".to_owned(),
+                "http://127.0.0.1:1",
+                token_endpoint,
+            )
+            .unwrap();
+        server.join().unwrap().unwrap();
+
+        assert_eq!(copilot_model_ids(&registry), [GITHUB_COPILOT_DEFAULT_MODEL]);
+    }
+
+    #[test]
+    fn copilot_startup_refreshes_the_catalog_of_a_restored_credential() {
+        let credentials = Arc::new(InMemoryCredentialStore::default());
+        credentials
+            .store(
+                &CredentialRef::new(GITHUB_COPILOT_CREDENTIAL_REF),
+                "github-secret".to_owned(),
+            )
+            .unwrap();
+        let (api_endpoint, token_endpoint, server) = serve_copilot_catalog(
+            r#"{"data":[
+                {"id":"gpt-6-astra","capabilities":{"supports":{"tool_calls":true}}}
+            ]}"#,
+        );
+        let mut persisted =
+            ProviderConfig::github_copilot(CredentialRef::new(GITHUB_COPILOT_CREDENTIAL_REF));
+        persisted.endpoint = Some(api_endpoint.clone());
+        let registry = ProviderRegistry::with_credentials(credentials);
+        registry.restore_configs(vec![persisted]).unwrap();
+        assert_eq!(copilot_model_ids(&registry), [GITHUB_COPILOT_DEFAULT_MODEL]);
+
+        registry
+            .refresh_github_copilot_models_at(token_endpoint)
+            .unwrap();
+        server.join().unwrap().unwrap();
+
+        assert_eq!(copilot_model_ids(&registry), ["gpt-6-astra"]);
+    }
+
     fn collect(provider: &mut impl ModelProvider, request: &ModelRequest) -> Vec<ModelStreamEvent> {
         let mut sink = CollectingSink::default();
         provider
@@ -2074,50 +2213,62 @@ mod tests {
     }
 
     #[test]
-    fn registry_restores_copilot_configs_without_trusting_saved_model_lists() {
+    fn registry_restores_the_persisted_copilot_catalog() {
         let credentials = Arc::new(InMemoryCredentialStore::default());
-        let registry = ProviderRegistry::with_credentials(credentials.clone());
-        registry
-            .configure_github_copilot("github-secret".to_owned())
+        credentials
+            .store(
+                &CredentialRef::new(GITHUB_COPILOT_CREDENTIAL_REF),
+                "github-secret".to_owned(),
+            )
             .unwrap();
-        let copilot_model = ModelId::new(GITHUB_COPILOT_DEFAULT_MODEL);
-        assert_eq!(
-            registry
-                .create_provider(&copilot_model)
-                .unwrap()
-                .descriptor()
-                .id,
-            copilot_model
-        );
-        let mut configs = registry.export_configs().unwrap();
-        let copilot_provider = configs[0].id.clone();
-        configs[0].models.push(ModelDescriptor {
-            id: ModelId::new("untrusted/saved-model"),
-            provider: copilot_provider,
-            display_name: "Untrusted saved model".to_owned(),
-            context_window: None,
+        let persisted_model = |id: &str, provider: &str| ModelDescriptor {
+            id: ModelId::new(id),
+            provider: ProviderId::new(provider),
+            display_name: id.to_owned(),
+            context_window: Some(128_000),
             max_input_tokens: None,
             max_output_tokens: None,
             capabilities: ModelCapabilities::default(),
-        });
-        configs.push(ProviderConfig::github_copilot(CredentialRef::new(
-            "missing",
-        )));
-        configs.push(ProviderConfig::deterministic());
-        registry.restore_configs(configs).unwrap();
-        let restored = registry.export_configs().unwrap();
-        let copilot = restored
-            .iter()
-            .find(|config| config.kind == ProviderKind::GitHubCopilot)
+        };
+        let mut persisted =
+            ProviderConfig::github_copilot(CredentialRef::new(GITHUB_COPILOT_CREDENTIAL_REF));
+        persisted.models = vec![
+            persisted_model("gpt-6-astra", GITHUB_COPILOT_PROVIDER_ID),
+            persisted_model("gpt-6-sol", GITHUB_COPILOT_PROVIDER_ID),
+        ];
+
+        let registry = ProviderRegistry::with_credentials(credentials.clone());
+        registry.restore_configs(vec![persisted.clone()]).unwrap();
+        assert_eq!(copilot_model_ids(&registry), ["gpt-6-astra", "gpt-6-sol"]);
+        assert!(registry.create_provider(&ModelId::new("gpt-6-sol")).is_ok());
+
+        // A saved list whose entries belong to another provider is no Copilot
+        // catalog, so it restores as the placeholder instead of cataloguing a
+        // model that cannot be called. A configuration whose credential is gone
+        // is dropped entirely.
+        let mut mangled = persisted;
+        mangled.models = vec![persisted_model("gpt-4o", OPENAI_PROVIDER_ID)];
+        let strict = ProviderRegistry::with_credentials(credentials.clone());
+        strict
+            .restore_configs(vec![
+                mangled,
+                ProviderConfig::github_copilot(CredentialRef::new("missing")),
+            ])
             .unwrap();
-        assert_eq!(copilot.models.len(), 1);
-        assert!(
-            !copilot
-                .models
-                .iter()
-                .any(|model| model.id.as_str() == "untrusted/saved-model")
-        );
-        assert_eq!(registry.list_providers().unwrap().len(), 1);
+        assert_eq!(copilot_model_ids(&strict), [GITHUB_COPILOT_DEFAULT_MODEL]);
+        assert_eq!(strict.list_providers().unwrap().len(), 1);
+
+        // A one-model discovered catalog still replaces the placeholder, so an
+        // account whose only agentic model is not the placeholder keeps it.
+        let single = ProviderRegistry::with_credentials(credentials);
+        single
+            .register_github_copilot(CredentialRef::new(GITHUB_COPILOT_CREDENTIAL_REF))
+            .unwrap();
+        let mut one_model =
+            ProviderConfig::github_copilot(CredentialRef::new(GITHUB_COPILOT_CREDENTIAL_REF));
+        one_model.models = vec![persisted_model("gpt-6-astra", GITHUB_COPILOT_PROVIDER_ID)];
+        single.restore_configs(vec![one_model]).unwrap();
+        assert_eq!(copilot_model_ids(&single), ["gpt-6-astra"]);
     }
 
     #[test]
@@ -2253,9 +2404,18 @@ mod tests {
     fn github_account_token_prefers_repository_access() {
         let credentials = Arc::new(InMemoryCredentialStore::default());
         let registry = ProviderRegistry::with_credentials(credentials);
+        // The Copilot endpoints are injected so the login's model discovery
+        // stays off the network; this test only asserts the stored token.
+        let (token_endpoint, server) =
+            serve_once(r#"{"error":"unauthorized"}"#, "application/json");
         registry
-            .configure_github_copilot("copilot-secret".to_owned())
+            .configure_github_copilot_at(
+                "copilot-secret".to_owned(),
+                "http://127.0.0.1:1",
+                token_endpoint,
+            )
             .unwrap();
+        server.join().unwrap().unwrap();
         assert_eq!(registry.github_account_token().unwrap(), "copilot-secret");
 
         registry
