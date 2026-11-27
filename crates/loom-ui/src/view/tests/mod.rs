@@ -14,6 +14,7 @@
 
 use super::*;
 
+mod accessibility_tests;
 mod agent_question_tests;
 mod archived_session_tests;
 mod collaboration_tests;
