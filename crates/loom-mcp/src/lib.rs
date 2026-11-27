@@ -13,4 +13,6 @@ pub mod runner;
 pub mod stdio;
 pub mod tools;
 
-pub use config::{AppState, Config, Secret, TlsConfig, validate_bind};
+pub use config::{
+    AppState, Config, HttpLimits, Secret, TlsConfig, allowed_hosts, normalize_host, validate_bind,
+};

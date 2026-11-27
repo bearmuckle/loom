@@ -2617,6 +2617,32 @@ fn arity(name: &str) -> Option<bool> {
     })
 }
 
+/// Whether any token before `--` is a help flag, not the value of another
+/// flag. This keeps `run --task -h` from printing help instead of running.
+fn has_help_flag(arguments: &[String]) -> bool {
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument == "--" {
+            break;
+        }
+        if argument == "--help" || argument == "-h" {
+            return true;
+        }
+        if argument.starts_with('-') {
+            let (name, inline) = match argument.split_once('=') {
+                Some((name, _)) => (name, true),
+                None => (argument.as_str(), false),
+            };
+            if arity(name) == Some(true) && !inline {
+                index += 1;
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
 struct Flag {
     name: String,
     value: Option<String>,
@@ -2672,11 +2698,9 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Parsed, String> {
     // would otherwise be rejected, so asking for help always explains the
     // surface instead of failing on one token. A line that names a verb gets
     // that verb's own page; one that names none, or names an unknown verb,
-    // gets the global manual.
-    if arguments
-        .iter()
-        .any(|argument| argument == "--help" || argument == "-h")
-    {
+    // gets the global manual. Only a help flag, never a help-shaped value of
+    // another flag, wins.
+    if has_help_flag(arguments) {
         return Ok(Parsed::Help(help_text(arguments)));
     }
     let (flags, positionals) = split(arguments)?;
@@ -2983,8 +3007,19 @@ fn split(arguments: &[String]) -> Result<(Vec<Flag>, Vec<String>), String> {
     let mut flags = Vec::new();
     let mut positionals = Vec::new();
     let mut index = 0;
+    let mut options_ended = false;
     while index < arguments.len() {
         let argument = &arguments[index];
+        if options_ended {
+            positionals.push(argument.clone());
+            index += 1;
+            continue;
+        }
+        if argument == "--" {
+            options_ended = true;
+            index += 1;
+            continue;
+        }
         index += 1;
         if !argument.starts_with('-') {
             positionals.push(argument.clone());

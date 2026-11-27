@@ -60,33 +60,64 @@ fn rpc_error(id: Value, error: &RpcError) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": object })
 }
 
-/// Handles one parsed JSON-RPC message. `None` means the message was a
-/// notification and produced no response.
+/// Handles one parsed JSON-RPC message. `None` means the message was a valid
+/// notification and produced no response; a malformed message always produces
+/// an error so it is never mistaken for an acknowledged notification.
 pub async fn handle_message(state: &AppState, message: &Value) -> Option<Value> {
-    let Some(method) = message.get("method").and_then(Value::as_str) else {
-        return message
-            .get("id")
-            .cloned()
-            .map(|id| rpc_error(id, &RpcError::invalid_request("message has no method")));
+    if let Err(reason) = validate_message(message) {
+        return Some(rpc_error(
+            error_id(message),
+            &RpcError::invalid_request(reason),
+        ));
+    }
+    let method = message.get("method").and_then(Value::as_str).unwrap();
+    let Some(id) = message.get("id").cloned() else {
+        // Notifications: acknowledged and ignored.
+        return None;
     };
-    let id = message.get("id").cloned();
-    match id {
-        None => {
-            // Notifications: acknowledged and ignored.
-            match method {
-                "notifications/initialized" | "notifications/cancelled" => {}
-                _ => {}
-            }
-            None
+    let params = message.get("params").cloned().unwrap_or(Value::Null);
+    let response = match dispatch(state, method, &params).await {
+        Ok(result) => rpc_result(id, result),
+        Err(error) => rpc_error(id, &error),
+    };
+    Some(response)
+}
+
+fn validate_message(message: &Value) -> Result<(), &'static str> {
+    if !message.is_object() {
+        return Err("message must be a JSON object");
+    }
+    let Some(Value::String(version)) = message.get("jsonrpc") else {
+        return Err("message must declare \"jsonrpc\": \"2.0\"");
+    };
+    if version != "2.0" {
+        return Err("message must declare \"jsonrpc\": \"2.0\"");
+    }
+    match message.get("method") {
+        Some(Value::String(method)) if !method.is_empty() => {}
+        Some(Value::String(_)) => return Err("method must not be empty"),
+        Some(_) => return Err("method must be a string"),
+        None => return Err("message has no method"),
+    }
+    if let Some(params) = message.get("params")
+        && !params.is_object()
+        && !params.is_array()
+    {
+        return Err("params must be an object or array");
+    }
+    if let Some(id) = message.get("id") {
+        match id {
+            Value::String(_) | Value::Number(_) => {}
+            _ => return Err("id must be a string or number"),
         }
-        Some(id) => {
-            let params = message.get("params").cloned().unwrap_or(Value::Null);
-            let response = match dispatch(state, method, &params).await {
-                Ok(result) => rpc_result(id, result),
-                Err(error) => rpc_error(id, &error),
-            };
-            Some(response)
-        }
+    }
+    Ok(())
+}
+
+fn error_id(message: &Value) -> Value {
+    match message.get("id") {
+        Some(id @ (Value::String(_) | Value::Number(_))) => id.clone(),
+        _ => Value::Null,
     }
 }
 
@@ -109,7 +140,7 @@ fn initialize(params: &Value) -> Result<Value, RpcError> {
     let requested = params
         .get("protocolVersion")
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .ok_or_else(|| RpcError::invalid_params("initialize requires a protocolVersion string"))?;
     if !PROTOCOL_VERSIONS.contains(&requested) {
         return Err(RpcError::invalid_params(format!(
             "unsupported protocol version '{requested}'; supported versions: {}",
@@ -132,7 +163,7 @@ fn initialize(params: &Value) -> Result<Value, RpcError> {
 fn tools_list(state: &AppState) -> Value {
     let tools = tools::tool_specs()
         .into_iter()
-        .filter(|spec| tools::tool_allowed(spec.name, state.config.read_only))
+        .filter(|spec| tools::tool_allowed(spec.name, &state.config))
         .map(|spec| spec.to_json())
         .collect::<Vec<_>>();
     json!({ "tools": tools })
@@ -141,26 +172,29 @@ fn tools_list(state: &AppState) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, Secret};
+    use crate::config::{Config, HttpLimits, Secret};
 
-    fn state(read_only: bool) -> AppState {
+    fn state(read_only: bool, allow_mutating: bool) -> AppState {
         AppState {
             config: Config {
                 connect: "ws://127.0.0.1:1/ws".to_owned(),
-                token: Secret::new("token".to_owned()),
+                token: Secret::new("token".to_owned()).unwrap(),
                 ca_file: None,
                 allow_insecure_remote: false,
                 max_frame_bytes: None,
                 bind: "127.0.0.1:8766".parse().unwrap(),
                 tls: None,
                 read_only,
+                allow_mutating,
+                allowed_hosts: Vec::new(),
             },
+            limits: HttpLimits::default(),
         }
     }
 
     #[tokio::test]
     async fn initialize_echoes_a_supported_version() {
-        let state = state(false);
+        let state = state(false, false);
         let request = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -184,10 +218,19 @@ mod tests {
                 .unwrap()
                 .contains("unsupported protocol version")
         );
+
+        let missing = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "initialize",
+            "params": {},
+        });
+        let response = handle_message(&state, &missing).await.unwrap();
+        assert_eq!(response["error"]["code"], -32602);
     }
 
     #[test]
-    fn tools_list_hides_mutating_tools_in_read_only_mode() {
+    fn tools_list_hides_mutating_tools_until_opt_in() {
         let names = |state: &AppState| {
             tools_list(state)["tools"]
                 .as_array()
@@ -197,7 +240,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            names(&state(false)),
+            names(&state(false, true)),
             vec![
                 "ls",
                 "status",
@@ -211,19 +254,48 @@ mod tests {
             ]
         );
         assert_eq!(
-            names(&state(true)),
+            names(&state(false, false)),
+            vec!["ls", "status", "models_list", "providers_list"]
+        );
+        assert_eq!(
+            names(&state(true, true)),
             vec!["ls", "status", "models_list", "providers_list"]
         );
     }
 
     #[tokio::test]
     async fn notifications_are_acknowledged_and_unknown_methods_error() {
-        let state = state(false);
+        let state = state(false, false);
         let notification = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
         assert!(handle_message(&state, &notification).await.is_none());
 
         let unknown = json!({ "jsonrpc": "2.0", "id": 3, "method": "bogus" });
         let response = handle_message(&state, &unknown).await.unwrap();
         assert_eq!(response["error"]["code"], -32601);
+    }
+
+    #[tokio::test]
+    async fn malformed_messages_return_invalid_request_errors() {
+        let state = state(false, false);
+        for (message, expected_id) in [
+            (json!(123), Value::Null),
+            (json!({}), Value::Null),
+            (json!([]), Value::Null),
+            (json!({ "id": 1, "method": "ping" }), json!(1)),
+            (
+                json!({ "jsonrpc": "2.0", "method": "ping", "params": 7 }),
+                Value::Null,
+            ),
+            (
+                json!({ "jsonrpc": "2.0", "id": {}, "method": "ping" }),
+                Value::Null,
+            ),
+        ] {
+            let response = handle_message(&state, &message)
+                .await
+                .expect("a malformed message still gets a response");
+            assert_eq!(response["error"]["code"], -32600, "{message}");
+            assert_eq!(response["id"], expected_id, "{message}");
+        }
     }
 }
