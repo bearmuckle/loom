@@ -1042,9 +1042,8 @@ pub async fn run_remote(
             };
         }
         Ok(Parsed::Run(mut invocation)) => {
-            let effective_url = invocation.globals.connect.as_deref().unwrap_or(url);
             if args::requires_secure_connection(&invocation.verb)
-                && !loom_local::remote_url_is_secure_for_secrets(effective_url)
+                && !loom_local::remote_url_is_secure_for_secrets(url)
             {
                 return Execution::failed(
                     args::verb_name(&invocation.verb),
@@ -1052,9 +1051,9 @@ pub async fn run_remote(
                     Failure::Usage(args::INSECURE_COPILOT_LOGIN_MESSAGE.to_owned()),
                 );
             }
-            if invocation.globals.connect.is_none() {
-                invocation.globals.connect = Some(url.to_owned());
-            }
+            // Pin the verb's URL to the actual socket URL so a `--connect`
+            // token inside `arguments` cannot disagree with the transport.
+            invocation.globals.connect = Some(url.to_owned());
             invocation
         }
         Err(message) => {

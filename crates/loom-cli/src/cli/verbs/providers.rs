@@ -36,6 +36,7 @@ use crate::cli::args::{
 };
 use crate::cli::client::Client;
 use crate::cli::exit;
+use crate::cli::text::escape;
 
 use super::{Caller, Failure, Outcome, emit, handshake};
 
@@ -300,8 +301,9 @@ pub(super) async fn login<C: Client>(
     invocation: &Invocation,
     args: &ProviderLoginArgs,
     out: &mut dyn Write,
+    err: &mut dyn Write,
 ) -> Result<Outcome, Failure> {
-    ensure_secure_connection(invocation)?;
+    ensure_secure_connection(client, invocation)?;
     let mut caller = Caller::new(client);
     handshake(&mut caller, &invocation.verb).await?;
     let (request_id, response) = caller
@@ -325,19 +327,29 @@ pub(super) async fn login<C: Client>(
         }
     };
 
+    let safe_uri = escape(&verification_uri);
+    let safe_code = escape(&user_code);
+    let safe_login_id = escape(&login_id);
+
     if !invocation.globals.json {
         if args.no_wait {
             emit(
                 out,
-                &format!("url {verification_uri}\nuser_code {user_code}\nlogin_id {login_id}\n"),
+                &format!("url {safe_uri}\nuser_code {safe_code}\nlogin_id {safe_login_id}\n"),
             )?;
         } else {
-            emit(
-                out,
-                &format!("url {verification_uri}\nuser_code {user_code}\n"),
-            )?;
+            emit(out, &format!("url {safe_uri}\nuser_code {safe_code}\n"))?;
             let _ = out.flush();
         }
+    } else if !args.no_wait {
+        // Under `--json` without `--no-wait`, stdout must remain a single final
+        // JSON envelope, so emit the public verification URL and user code on
+        // stderr and flush before blocking in the poll loop.
+        emit(
+            err,
+            &format!("url {safe_uri}\nuser_code {safe_code}\nlogin_id {safe_login_id}\n"),
+        )?;
+        let _ = err.flush();
     }
 
     if args.no_wait {
@@ -428,7 +440,7 @@ pub(super) async fn login_status<C: Client>(
     login_id: &str,
     out: &mut dyn Write,
 ) -> Result<Outcome, Failure> {
-    ensure_secure_connection(invocation)?;
+    ensure_secure_connection(client, invocation)?;
     let mut caller = Caller::new(client);
     handshake(&mut caller, &invocation.verb).await?;
     let (request_id, response) = caller
@@ -470,7 +482,10 @@ pub(super) async fn login_status<C: Client>(
     Ok(Outcome::new(data, caller.primary).with_code(code))
 }
 
-fn ensure_secure_connection(invocation: &Invocation) -> Result<(), Failure> {
+fn ensure_secure_connection<C: Client>(client: &C, invocation: &Invocation) -> Result<(), Failure> {
+    if !client.is_secure_for_secrets() {
+        return Err(Failure::Usage(INSECURE_COPILOT_LOGIN_MESSAGE.to_owned()));
+    }
     if let Some(url) = invocation.globals.connect.as_deref()
         && !loom_local::remote_url_is_secure_for_secrets(url)
     {

@@ -873,9 +873,12 @@ code (`url <verification-uri>` and `user_code <user-code>`, plus
 `login_id <id>` under `--no-wait`), flushes stdout, and then polls
 `Provider/GetGitHubCopilotLoginStatus` at the start response's `interval`
 (clamped to `1..=10` seconds, matching `loom-ui`) until the flow reaches
-`configured`, `failed`, or the poll deadline. `--timeout <seconds>` bounds the
-poll and defaults to the start response's `expires_in`. On completion, text mode
-prints `status configured`.
+`configured`, `failed`, or the poll deadline. Under `--json` without
+`--no-wait`, those same public `url`, `user_code`, and `login_id` lines are
+written and flushed on stderr before polling begins so stdout stays a single
+final JSON envelope. `--timeout <seconds>` bounds the poll and defaults to the
+start response's `expires_in`. On completion, text mode prints
+`status configured`.
 
 `--no-wait` returns immediately after `StartGitHubCopilotLogin` with exit `0`
 so an agent or script can display the verification URL and user code to a person

@@ -20,6 +20,14 @@ pub trait Client {
         &'a mut self,
         envelope: RequestEnvelope,
     ) -> Pin<Box<dyn Future<Output = Result<ResponseEnvelope, LoomError>> + 'a>>;
+
+    /// Whether this client's transport satisfies the secure-connection rule for
+    /// sensitive flows (`wss://` or loopback `ws://`). In-process clients never
+    /// leave the process and default to `true`; [`RemoteClient`] reports the
+    /// security of the actual WebSocket URL it connected to.
+    fn is_secure_for_secrets(&self) -> bool {
+        true
+    }
 }
 
 /// A client for a verb that answers without a worker.
@@ -43,6 +51,10 @@ impl Client for Offline {
             ))
         })
     }
+
+    fn is_secure_for_secrets(&self) -> bool {
+        false
+    }
 }
 
 /// A client backed by a WebSocket connection to a worker.
@@ -62,6 +74,10 @@ impl Client for RemoteClient {
         envelope: RequestEnvelope,
     ) -> Pin<Box<dyn Future<Output = Result<ResponseEnvelope, LoomError>> + 'a>> {
         Box::pin(async move { self.connection.request(envelope).await })
+    }
+
+    fn is_secure_for_secrets(&self) -> bool {
+        self.connection.secure_for_secrets()
     }
 }
 
@@ -172,6 +188,10 @@ pub(crate) mod testing {
                 }
                 Ok(response)
             })
+        }
+
+        fn is_secure_for_secrets(&self) -> bool {
+            self.inner.is_secure_for_secrets()
         }
     }
 }
