@@ -150,7 +150,7 @@ impl LoomView {
     /// timestamp so the footer and inspector never snap backwards or climb
     /// while stopped.
     fn run_elapsed_ms_for(&self, run_state: Option<AgentRunState>, is_active: bool) -> Option<u64> {
-        run_state?;
+        let run_state = run_state?;
         let usage_elapsed = self
             .review
             .usage
@@ -161,6 +161,16 @@ impl LoomView {
             if let Some(completed_at) = run.completed_at {
                 return Some(
                     completed_at
+                        .as_unix_millis()
+                        .saturating_sub(run.started_at.as_unix_millis()),
+                );
+            }
+            if run_state_is_terminal(run_state) {
+                if usage_elapsed > 0 {
+                    return Some(usage_elapsed);
+                }
+                return Some(
+                    run.updated_at
                         .as_unix_millis()
                         .saturating_sub(run.started_at.as_unix_millis()),
                 );

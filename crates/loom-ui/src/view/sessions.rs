@@ -826,8 +826,8 @@ impl LoomView {
             Err(error) => {
                 self.rebuild_projection_from_events_after(
                     Vec::new(),
-                    None,
-                    None,
+                    fallback_latest_sequence,
+                    fallback_latest_sequence,
                     fallback_session_state,
                     fallback_run,
                 );
