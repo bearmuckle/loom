@@ -41,6 +41,8 @@
 //! | `providers add` | `Provider/ConfigureOpenAiCompatibleProvider` |
 //! | `providers remove` | `Provider/RemoveProvider` |
 //! | `providers discover` | `Provider/DiscoverProviderModels` |
+//! | `providers login` | `Provider/StartGitHubCopilotLogin`, plus `Provider/GetGitHubCopilotLoginStatus` polling unless `--no-wait` |
+//! | `providers login-status` | `Provider/GetGitHubCopilotLoginStatus` |
 //! | `jev status`, `jev ask` | none: the local key file and the decision model |
 //! | `jev triage` | `Session/GetAgentSessionSnapshotMetadata`, `Filesystem/GetSessionFilesystemSnapshot`, plus `Collaboration/GetRunRevision` and `Collaboration/ControlRun` with `Approve` under `--apply` |
 //! | `delete` | `Project/GetProjectSnapshotForSession`, `Session/DeleteAgentSession` |
@@ -96,8 +98,8 @@
 //! `cache prune` is read-only in the same sense: `--yes` removes build output on
 //! the worker's machine, but the only requests it sends are reads.
 //! `retention set`, `providers set-key`, `providers add`, `providers remove`,
-//! and `delete` are operator-level
-//! mutations: a token without `configure_archive_retention`,
+//! `providers login`, `providers login-status`, and `delete` are
+//! operator-level mutations: a token without `configure_archive_retention`,
 //! `configure_providers`, or `delete_agent_session` is refused at negotiation
 //! with exit `3`.
 //!
@@ -172,6 +174,17 @@
 //! replace its models with the endpoint's own `/models` catalog. The key of an
 //! operator-added provider is stored by the same `set-key` path as any other
 //! API-key provider, so no separate key mechanism exists.
+//! `github-copilot` is not `api-key-configurable`: `providers login --provider
+//! github-copilot` and `providers login-status --login-id <id>` are the
+//! supported headless sign-in path. They reuse the worker's device-login
+//! protocol (`Provider/StartGitHubCopilotLogin` and
+//! `Provider/GetGitHubCopilotLoginStatus`), negotiate `configure_providers`,
+//! enforce the same secure-connection rule as `loom-ui` (`wss://` or loopback
+//! `ws://`, which `--allow-insecure-remote` never overrides), and never print,
+//! log, or store an access token or credential reference on the client. Exit
+//! codes: `0` when `configured` (or after a successful start with `--no-wait`),
+//! `4` (`deadline_exceeded`) on poll timeout or `pending` status, and `1` on
+//! `failed`.
 //! `retention get` prints `window`, `force-discard`, and
 //! `sub-agent`, with a disabled window as `off`. `retention set` merges the
 //! flags it was given into the policy the worker already stores (a flag that is
@@ -565,6 +578,15 @@ pub fn main(arguments: Vec<String>) -> i32 {
         invocation.globals.connect.take(),
         std::env::var("LOOM_URL").ok(),
     );
+    if args::requires_secure_connection(&invocation.verb)
+        && !loom_local::remote_url_is_secure_for_secrets(&url)
+    {
+        return report_usage_stdio(
+            args::INSECURE_COPILOT_LOGIN_MESSAGE,
+            invocation.globals.json,
+            args::verb_name(&invocation.verb),
+        );
+    }
     let state_directory = loom_core::state_dir();
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let token_file = match args::resolve_token_file(
@@ -897,47 +919,18 @@ impl Execution {
 /// embedding binary drives; the binary and the tests share the same parse and
 /// dispatch underneath it.
 pub async fn execute<C: Client>(client: &mut C, arguments: &[String]) -> Execution {
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    let (verb, result) = match args::parse(arguments) {
-        Ok(Parsed::Help(text)) => {
-            let _ = out.write_all(text.as_bytes());
-            (
-                args::named_verb(arguments).to_owned(),
-                Ok(Outcome::new(serde_json::Value::Null, None)),
-            )
-        }
-        Ok(Parsed::Run(invocation)) => {
-            let json = invocation.globals.json;
-            let verb = args::verb_name(&invocation.verb);
-            let result = match verbs::run(client, &invocation, &mut out, &mut err).await {
-                Ok(outcome) => {
-                    if json {
-                        write_json(
-                            &mut out,
-                            &serde_json::json!({
-                                "ok": true,
-                                "verb": verb,
-                                "request_id": outcome.request_id.map(|id| id.to_string()),
-                                "replayed": outcome.replayed,
-                                "data": outcome.data,
-                            }),
-                        );
-                    }
-                    Ok(outcome)
-                }
-                Err(failure) => {
-                    if json {
-                        write_json(&mut out, &failure.envelope(verb));
-                    } else {
-                        let _ = writeln!(err, "error {} {}", failure.code(), failure.message());
-                    }
-                    Err(failure)
-                }
-            };
-            (verb.to_owned(), result)
-        }
+    match args::parse(arguments) {
+        Ok(Parsed::Help(text)) => Execution {
+            verb: args::named_verb(arguments).to_owned(),
+            exit_code: exit::OK,
+            result: Ok(Outcome::new(serde_json::Value::Null, None)),
+            stdout: text.to_owned(),
+            stderr: String::new(),
+        },
+        Ok(Parsed::Run(invocation)) => execute_parsed(client, &invocation).await,
         Err(message) => {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
             let json = args::wants_json(arguments);
             let verb = args::named_verb(arguments);
             let failure = Failure::Usage(message);
@@ -946,7 +939,46 @@ pub async fn execute<C: Client>(client: &mut C, arguments: &[String]) -> Executi
             } else {
                 let _ = writeln!(err, "error {} {}", failure.code(), failure.message());
             }
-            (verb.to_owned(), Err(failure))
+            let exit_code = failure.exit_code();
+            Execution {
+                verb: verb.to_owned(),
+                exit_code,
+                result: Err(failure),
+                stdout: String::from_utf8_lossy(&out).into_owned(),
+                stderr: String::from_utf8_lossy(&err).into_owned(),
+            }
+        }
+    }
+}
+
+async fn execute_parsed<C: Client>(client: &mut C, invocation: &Invocation) -> Execution {
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let json = invocation.globals.json;
+    let verb = args::verb_name(&invocation.verb);
+    let result = match verbs::run(client, invocation, &mut out, &mut err).await {
+        Ok(outcome) => {
+            if json {
+                write_json(
+                    &mut out,
+                    &serde_json::json!({
+                        "ok": true,
+                        "verb": verb,
+                        "request_id": outcome.request_id.map(|id| id.to_string()),
+                        "replayed": outcome.replayed,
+                        "data": outcome.data,
+                    }),
+                );
+            }
+            Ok(outcome)
+        }
+        Err(failure) => {
+            if json {
+                write_json(&mut out, &failure.envelope(verb));
+            } else {
+                let _ = writeln!(err, "error {} {}", failure.code(), failure.message());
+            }
+            Err(failure)
         }
     };
     let exit_code = match &result {
@@ -954,7 +986,7 @@ pub async fn execute<C: Client>(client: &mut C, arguments: &[String]) -> Executi
         Err(failure) => failure.exit_code(),
     };
     Execution {
-        verb,
+        verb: verb.to_owned(),
         exit_code,
         result,
         stdout: String::from_utf8_lossy(&out).into_owned(),
@@ -999,6 +1031,40 @@ pub async fn run_remote(
     max_frame_bytes: Option<usize>,
     ca_file: Option<&std::path::Path>,
 ) -> Execution {
+    let invocation = match args::parse(arguments) {
+        Ok(Parsed::Help(text)) => {
+            return Execution {
+                verb: args::named_verb(arguments).to_owned(),
+                exit_code: exit::OK,
+                result: Ok(Outcome::new(serde_json::Value::Null, None)),
+                stdout: text.to_owned(),
+                stderr: String::new(),
+            };
+        }
+        Ok(Parsed::Run(mut invocation)) => {
+            let effective_url = invocation.globals.connect.as_deref().unwrap_or(url);
+            if args::requires_secure_connection(&invocation.verb)
+                && !loom_local::remote_url_is_secure_for_secrets(effective_url)
+            {
+                return Execution::failed(
+                    args::verb_name(&invocation.verb),
+                    exit::USAGE,
+                    Failure::Usage(args::INSECURE_COPILOT_LOGIN_MESSAGE.to_owned()),
+                );
+            }
+            if invocation.globals.connect.is_none() {
+                invocation.globals.connect = Some(url.to_owned());
+            }
+            invocation
+        }
+        Err(message) => {
+            return Execution::failed(
+                args::named_verb(arguments),
+                exit::USAGE,
+                Failure::Usage(message),
+            );
+        }
+    };
     let mut transport = loom_local::WebSocketTransport::new(url, token)
         .with_insecure_remote_allowed(allow_insecure_remote);
     if let Some(max_frame_bytes) = max_frame_bytes {
@@ -1006,7 +1072,7 @@ pub async fn run_remote(
             Ok(transport) => transport,
             Err(error) => {
                 return Execution::failed(
-                    args::named_verb(arguments),
+                    args::verb_name(&invocation.verb),
                     exit::USAGE,
                     Failure::Usage(error.message),
                 );
@@ -1018,7 +1084,7 @@ pub async fn run_remote(
             Ok(transport) => transport,
             Err(error) => {
                 return Execution::failed(
-                    args::named_verb(arguments),
+                    args::verb_name(&invocation.verb),
                     exit::USAGE,
                     Failure::Usage(error.message),
                 );
@@ -1028,12 +1094,12 @@ pub async fn run_remote(
     match transport.connect().await {
         Ok(connection) => {
             let mut client = RemoteClient::new(connection);
-            execute(&mut client, arguments).await
+            execute_parsed(&mut client, &invocation).await
         }
         Err(error) => {
             let code = exit::for_connect_error(&error);
             Execution::failed(
-                args::named_verb(arguments),
+                args::verb_name(&invocation.verb),
                 code,
                 Failure::Transport {
                     request_id: None,

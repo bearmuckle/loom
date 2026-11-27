@@ -75,6 +75,8 @@ error invalid_request could not read the token file \
 | `providers discover --provider <id>` | Replace one provider's model catalog with the one its endpoint's `/models` answers with. |
 | `models list [--provider <id>]` | The models of the configured providers, one default per provider. No secrets. |
 | `providers set-key --provider <id> (--from-env <NAME> \| --key-file <path>)` | Store an API key for `openai`, `deepseek`, or an OpenAI-compatible provider. |
+| `providers login --provider github-copilot [--no-wait] [--timeout <seconds>]` | Start the worker's GitHub Copilot device-login flow, print the public verification URL and user code, and poll until configured, failed, or timed out. Requires `wss://` or loopback `ws://`. |
+| `providers login-status --login-id <id>` | Poll an in-flight GitHub Copilot device login once (`pending`, `configured`, or `failed`). Requires `wss://` or loopback `ws://`. |
 | `jev status [--source <opencode\|typesafe>] [--key-file <path>] [--endpoint <url>] [--model <id>]` | Whether a Jev key is configured, the path it is read from, and the endpoint and model a call would use. No key is printed, and no worker is contacted. |
 | `jev ask (--state <text> \| --state-file <path>) --question <text> (--option <label>[=<when it applies>])...` | One raw choice question to the decision model: the choice, its confidence, and the probabilities. |
 | `jev triage --session <id> [--apply] [--threshold <0..1>] [--request-id <uuid>]` | A suggested verdict (`approve` or `ask_user`) for the approval a session waits on. `--apply` approves the call only under the documented guards. |
@@ -105,7 +107,8 @@ token. `cache prune` sends only reads, but `--yes` removes build output on the
 worker's machine. `run` starts a run; `send`,
 `project send`, `answer`, `approve`, `deny`, and `stop` control one; `wait`,
 `status`, `liveness`, and `result` read one. `retention set`, `providers
-set-key`, `providers add`, `providers remove`, `session archive`, `session
+set-key`, `providers add`, `providers remove`, `providers login`, `providers
+login-status`, `session archive`, `session
 delete` (and its `delete` alias), `project
 archive`, `project delete`, `project models set`, `project worktree integrate`,
 and `project worktree cleanup` are operator-level mutations. No verb waits for a run except `wait`,
@@ -851,12 +854,63 @@ blank key exit `2` and send no request. The command prints
 `provider <id> credential set` and nothing else. The worker stores the secret in
 its instance credential store, next to the state database, and the provider
 record keeps only an opaque reference. `github-copilot` is not an API-key
-provider; `set-key` refuses it. A provider id the worker does not have is
+provider (`providers list` reports `api-key-configurable=false`); `set-key`
+refuses it, and `providers login` / `providers login-status` is the supported
+headless sign-in path. A provider id the worker does not have is
 `not_found` (exit `5`).
 
+### `providers login` and `providers login-status`
+
+`providers login --provider github-copilot [--no-wait] [--timeout <seconds>]`
+starts the same worker-side device-login flow as `loom-ui`'s "Sign in to
+Copilot" button by sending `Provider/StartGitHubCopilotLogin`. The worker
+performs the OAuth exchange and stores the credential; this client never
+handles, prints, logs, or stores an access token or credential reference, and
+there is no `--from-env` or `--key-file` path for Copilot.
+
+In text mode, `providers login` prints only the public verification URL and user
+code (`url <verification-uri>` and `user_code <user-code>`, plus
+`login_id <id>` under `--no-wait`), flushes stdout, and then polls
+`Provider/GetGitHubCopilotLoginStatus` at the start response's `interval`
+(clamped to `1..=10` seconds, matching `loom-ui`) until the flow reaches
+`configured`, `failed`, or the poll deadline. `--timeout <seconds>` bounds the
+poll and defaults to the start response's `expires_in`. On completion, text mode
+prints `status configured`.
+
+`--no-wait` returns immediately after `StartGitHubCopilotLogin` with exit `0`
+so an agent or script can display the verification URL and user code to a person
+and poll separately with `providers login-status --login-id <id>`. `--json`
+reports:
+
+```json
+{"provider":"github-copilot","login_id":"…","url":"…","user_code":"…","expires_in":900,"interval":5,"status":"pending"}
+```
+
+(with `"status":"configured"` when a waiting login succeeds). `url` is mapped
+from the protocol's `verification_uri`.
+
+`providers login-status --login-id <id>` sends one
+`Provider/GetGitHubCopilotLoginStatus`. Text mode prints only the status word
+(`pending`, `configured`, or `failed`). `--json` reports
+`{"login_id":"…","status":"pending"|"configured"|"failed","message":"…"}`
+(with `message` present only when `status` is `failed`).
+
+Exit codes:
+
+- `0` when `configured`, or after a successful `providers login --no-wait` start
+- `4` (`deadline_exceeded`) when `providers login` times out while still
+  `pending`, or when `providers login-status` observes `pending`
+- `1` when status is `failed` (with the worker's error message, never a token)
+
+Both verbs enforce the same secure-connection rule as `loom-ui`: the worker URL
+must be `wss://` or loopback `ws://` (`127.0.0.1`, `localhost`, `[::1]`).
+`--allow-insecure-remote` never overrides this check; an insecure URL is refused
+with exit `2` before any request is sent.
+
 `providers list`, `providers discover`, and `models list` need `list_providers`.
-`providers set-key`, `providers add`, and `providers remove` need
-`configure_providers`; a token without it exits `3`.
+`providers set-key`, `providers add`, `providers remove`, `providers login`, and
+`providers login-status` need `configure_providers`; a token without it exits
+`3`.
 
 ## Jev supervision
 
@@ -1212,6 +1266,11 @@ loom-cli doctor
 # See which providers have a credential, then store an OpenAI key from the environment.
 loom-cli providers list
 loom-cli providers set-key --provider openai --from-env OPENAI_API_KEY
+
+# Sign in to GitHub Copilot through the worker's device flow (or start without waiting and poll).
+loom-cli providers login --provider github-copilot
+loom-cli providers login --provider github-copilot --no-wait --json
+loom-cli providers login-status --login-id <login-id> --json
 
 # Register OpenCode Go as a gateway, store its key from a file, and refresh its
 # model list from the endpoint.

@@ -208,16 +208,26 @@ async fn read_only_mode_rejects_mutating_tools() {
     let error = blocked.expect_err("run must be rejected in read-only mode");
     assert!(error.message.contains("disabled"), "{error:?}");
 
-    for name in ["send", "approve", "deny", "archive"] {
+    for name in [
+        "send",
+        "approve",
+        "deny",
+        "archive",
+        "copilot_login_start",
+        "copilot_login_status",
+    ] {
         let arguments = match name {
             "archive" => json!({ "session": "s1" }),
             "send" => json!({ "run": "r1", "text": "x" }),
+            "copilot_login_start" => json!({ "provider": "github-copilot", "no_wait": true }),
+            "copilot_login_status" => json!({ "login_id": "login-1" }),
             _ => json!({ "run": "r1", "tool_call": "t1" }),
         };
         assert!(
             tools::call_tool(&state, &json!({ "name": name, "arguments": arguments }))
                 .await
-                .is_err()
+                .is_err(),
+            "{name} must be rejected in read-only mode"
         );
     }
 
@@ -277,7 +287,21 @@ async fn streamable_http_endpoint_authenticates_and_serves_tools() {
         .unwrap();
     assert_eq!(list.status(), 200);
     let list_body: Value = list.json().await.unwrap();
-    assert_eq!(list_body["result"]["tools"].as_array().unwrap().len(), 9);
+    let listed_tools = list_body["result"]["tools"].as_array().unwrap();
+    assert_eq!(listed_tools.len(), 11);
+    for mutating_name in ["copilot_login_start", "copilot_login_status"] {
+        let tool = listed_tools
+            .iter()
+            .find(|tool| tool["name"] == mutating_name)
+            .unwrap_or_else(|| panic!("missing {mutating_name}"));
+        assert_eq!(tool["annotations"]["destructiveHint"], true, "{tool}");
+        let serialized = tool.to_string();
+        assert!(!serialized.contains("access_token"), "{serialized}");
+        assert!(
+            !serialized.contains("ConfigureGitHubCopilot"),
+            "{serialized}"
+        );
+    }
 
     let call = client
         .post(&endpoint)
@@ -453,4 +477,248 @@ async fn mutating_tools_are_opt_in_and_archive_runs_end_to_end() {
     running.shutdown();
     let _ = running.task.await;
     worker.server.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn copilot_login_tools_run_against_stub_worker_without_tokens_and_refuse_insecure_url() {
+    use std::sync::Mutex;
+
+    use axum::{
+        Router,
+        extract::{
+            State,
+            ws::{Message, WebSocket, WebSocketUpgrade},
+        },
+        response::IntoResponse,
+        routing::get,
+    };
+    use loom_protocol::{
+        GitHubCopilotLoginStatus, NegotiationResult, ProviderRequest, ProviderResponse,
+        ResponseEnvelope,
+    };
+
+    let status_state = Arc::new(Mutex::new(GitHubCopilotLoginStatus::Pending));
+
+    async fn handle_socket(mut socket: WebSocket, status: Arc<Mutex<GitHubCopilotLoginStatus>>) {
+        while let Some(Ok(message)) = socket.recv().await {
+            let bytes = match message {
+                Message::Text(text) => text.as_bytes().to_vec(),
+                Message::Binary(bin) => bin.to_vec(),
+                Message::Close(_) => break,
+                _ => continue,
+            };
+            let request = loom_protocol::decode_request(&bytes).expect("decode request");
+            let response = match request.request {
+                ClientRequest::Control(ControlRequest::Negotiate { capabilities, .. }) => {
+                    ResponseEnvelope::success(
+                        request.request_id,
+                        ServerResponse::Control(ControlResponse::Negotiated(NegotiationResult {
+                            protocol_version: CURRENT_PROTOCOL_VERSION,
+                            capabilities,
+                        })),
+                    )
+                }
+                ClientRequest::Provider(ProviderRequest::StartGitHubCopilotLogin) => {
+                    ResponseEnvelope::success(
+                        request.request_id,
+                        ServerResponse::Provider(ProviderResponse::GitHubCopilotLoginStarted {
+                            login_id: "login-mcp-1".to_owned(),
+                            user_code: "USER-CODE".to_owned(),
+                            verification_uri: "https://example.test/device".to_owned(),
+                            expires_in: 60,
+                            interval: 1,
+                        }),
+                    )
+                }
+                ClientRequest::Provider(ProviderRequest::GetGitHubCopilotLoginStatus {
+                    ..
+                }) => {
+                    let current = status.lock().unwrap().clone();
+                    ResponseEnvelope::success(
+                        request.request_id,
+                        ServerResponse::Provider(ProviderResponse::GitHubCopilotLoginStatus {
+                            status: current,
+                        }),
+                    )
+                }
+                other => panic!("unexpected request to copilot stub worker: {other:?}"),
+            };
+            let encoded = loom_protocol::encode_response(&response).expect("encode response");
+            let text = String::from_utf8(encoded).expect("utf-8 response");
+            if socket.send(Message::Text(text.into())).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    async fn ws_handler(
+        ws: WebSocketUpgrade,
+        State(status): State<Arc<Mutex<GitHubCopilotLoginStatus>>>,
+    ) -> impl IntoResponse {
+        ws.on_upgrade(move |socket| handle_socket(socket, status))
+    }
+
+    let app = Router::new()
+        .route("/ws", get(ws_handler))
+        .with_state(status_state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral stub worker");
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let stub_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+    });
+
+    let stub_url = format!("ws://{addr}/ws");
+    let fake_bearer = "stub-operator-bearer-token";
+    let mut cfg = config(&stub_url, fake_bearer, false);
+    cfg.allow_mutating = true;
+    let state = AppState {
+        config: cfg,
+        limits: HttpLimits::default(),
+    };
+
+    let assert_clean = |value: &Value| {
+        let serialized = value.to_string();
+        for forbidden in [
+            fake_bearer,
+            "access_token",
+            "ConfigureGitHubCopilot",
+            "credential_id",
+            "api_key",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "MCP tool result must never contain '{forbidden}': {serialized}"
+            );
+        }
+    };
+
+    // 1. Start with no_wait: returns the same JSON data shape as the CLI.
+    let started = tools::call_tool(
+        &state,
+        &json!({
+            "name": "copilot_login_start",
+            "arguments": { "provider": "github-copilot", "no_wait": true },
+        }),
+    )
+    .await
+    .expect("copilot_login_start succeeds");
+    assert_eq!(started["isError"], false, "{started}");
+    assert_eq!(started["structuredContent"]["exit_code"], 0);
+    assert_eq!(
+        started["structuredContent"]["data"],
+        json!({
+            "provider": "github-copilot",
+            "login_id": "login-mcp-1",
+            "url": "https://example.test/device",
+            "user_code": "USER-CODE",
+            "expires_in": 60,
+            "interval": 1,
+            "status": "pending",
+        })
+    );
+    assert_clean(&started);
+
+    // 2. Poll pending -> exit 4 with status: pending.
+    let pending = tools::call_tool(
+        &state,
+        &json!({
+            "name": "copilot_login_status",
+            "arguments": { "login_id": "login-mcp-1" },
+        }),
+    )
+    .await
+    .expect("copilot_login_status pending");
+    assert_eq!(pending["structuredContent"]["exit_code"], 4);
+    assert_eq!(
+        pending["structuredContent"]["data"],
+        json!({ "login_id": "login-mcp-1", "status": "pending" })
+    );
+    assert_clean(&pending);
+
+    // 3. Flip to configured -> exit 0 with status: configured.
+    *status_state.lock().unwrap() = GitHubCopilotLoginStatus::Configured;
+    let configured = tools::call_tool(
+        &state,
+        &json!({
+            "name": "copilot_login_status",
+            "arguments": { "login_id": "login-mcp-1" },
+        }),
+    )
+    .await
+    .expect("copilot_login_status configured");
+    assert_eq!(configured["isError"], false, "{configured}");
+    assert_eq!(configured["structuredContent"]["exit_code"], 0);
+    assert_eq!(
+        configured["structuredContent"]["data"],
+        json!({ "login_id": "login-mcp-1", "status": "configured" })
+    );
+    assert_clean(&configured);
+
+    // 4. Flip to failed -> exit 1 with status: failed and message.
+    *status_state.lock().unwrap() = GitHubCopilotLoginStatus::Failed {
+        message: "device code denied".to_owned(),
+    };
+    let failed = tools::call_tool(
+        &state,
+        &json!({
+            "name": "copilot_login_status",
+            "arguments": { "login_id": "login-mcp-1" },
+        }),
+    )
+    .await
+    .expect("copilot_login_status failed");
+    assert_eq!(failed["isError"], true, "{failed}");
+    assert_eq!(failed["structuredContent"]["exit_code"], 1);
+    assert_eq!(
+        failed["structuredContent"]["data"],
+        json!({
+            "login_id": "login-mcp-1",
+            "status": "failed",
+            "message": "device code denied",
+        })
+    );
+    assert_clean(&failed);
+
+    // 5. Insecure non-loopback ws:// is refused even when allow_insecure_remote is true.
+    let mut insecure_cfg = config("ws://worker.example/ws", fake_bearer, false);
+    insecure_cfg.allow_mutating = true;
+    insecure_cfg.allow_insecure_remote = true;
+    let insecure_state = AppState {
+        config: insecure_cfg,
+        limits: HttpLimits::default(),
+    };
+    for (name, arguments) in [
+        (
+            "copilot_login_start",
+            json!({ "provider": "github-copilot", "no_wait": true }),
+        ),
+        ("copilot_login_status", json!({ "login_id": "login-mcp-1" })),
+    ] {
+        let refused = tools::call_tool(
+            &insecure_state,
+            &json!({ "name": name, "arguments": arguments }),
+        )
+        .await
+        .expect("insecure refusal returns structured error result");
+        assert_eq!(refused["isError"], true, "{name}: {refused}");
+        assert_eq!(
+            refused["structuredContent"]["exit_code"], 2,
+            "{name}: {refused}"
+        );
+        assert_eq!(
+            refused["structuredContent"]["error"]["code"], "invalid_request",
+            "{name}: {refused}"
+        );
+        assert_clean(&refused);
+    }
+
+    let _ = shutdown_tx.send(());
+    let _ = stub_task.await;
 }

@@ -31,7 +31,8 @@ pub use connection::{DEFAULT_REQUEST_TIMEOUT, RemoteConnection, RemoteConnection
 /// Clients re-export this capability so they report what the transport can
 /// really do instead of trusting a URL scheme.
 pub use transport::{
-    DEFAULT_MAX_FRAME_BYTES, MAX_FRAME_BYTES_ENV, WEBSOCKET_TLS_SUPPORTED, resolve_max_frame_bytes,
+    DEFAULT_MAX_FRAME_BYTES, MAX_FRAME_BYTES_ENV, WEBSOCKET_TLS_SUPPORTED,
+    remote_url_is_secure_for_secrets, resolve_max_frame_bytes,
 };
 pub use transport::{WebSocketConnection, WebSocketTransport};
 

@@ -305,7 +305,11 @@ pub(crate) fn used_capabilities(verb: &Verb) -> CapabilitySet {
         Verb::ProvidersList | Verb::ModelsList { .. } => {
             capabilities.push(Capability::ListProviders);
         }
-        Verb::ProvidersSetKey(_) | Verb::ProvidersAdd(_) | Verb::ProvidersRemove { .. } => {
+        Verb::ProvidersSetKey(_)
+        | Verb::ProvidersAdd(_)
+        | Verb::ProvidersRemove { .. }
+        | Verb::ProvidersLogin(_)
+        | Verb::ProvidersLoginStatus { .. } => {
             capabilities.push(Capability::ConfigureProviders);
         }
         Verb::ProvidersDiscover { .. } => capabilities.push(Capability::ListProviders),
@@ -784,6 +788,10 @@ pub(crate) async fn run<C: Client>(
         }
         Verb::ProvidersDiscover { provider } => {
             providers::discover(client, invocation, provider, out).await
+        }
+        Verb::ProvidersLogin(args) => providers::login(client, invocation, args, out).await,
+        Verb::ProvidersLoginStatus { login_id } => {
+            providers::login_status(client, invocation, login_id, out).await
         }
         Verb::JevStatus(flags) => jev::status(client, invocation, flags, out).await,
         Verb::JevAsk(args) => jev::ask(client, invocation, args, out).await,
