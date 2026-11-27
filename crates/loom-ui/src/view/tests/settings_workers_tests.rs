@@ -147,6 +147,20 @@ fn settings_workers_uses_separate_masked_token_and_exposes_inline_validation_err
             token_state.read(cx).presentation().is_masked(),
             "Settings -> Workers token field must mask input"
         );
+        // Entering a secret token must never expose its value in the a11y tree.
+        token_state.update(cx, |state, cx| {
+            state.set_value("dummy-secret-token", window, cx);
+        });
+        window.render_frame(cx);
+        let token_field = window
+            .within("settings-dialog")
+            .find_by_label("Access token (optional)");
+        assert_eq!(token_field.role(), Some(Role::PasswordInput));
+        assert_eq!(
+            token_field.value(),
+            None,
+            "masked token input must not expose its value to accessibility"
+        );
 
         // Empty Connect shows an inline error exposed as Role::Alert.
         window
