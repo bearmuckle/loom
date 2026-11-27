@@ -533,6 +533,12 @@ mod tests;
 use std::io::Write;
 
 pub use client::{Client, RemoteClient};
+pub use verbs::{Failure, Outcome};
+
+/// The resolved worker connection inputs and token file, re-exported so an
+/// embedding binary (such as `loom-mcp`) applies exactly the same precedence
+/// as the `loom-cli` binary instead of reimplementing it.
+pub use args::{TokenFile, resolve_connect, resolve_token_file};
 
 use args::{Invocation, Parsed};
 
@@ -704,7 +710,7 @@ pub async fn run_command<C: Client>(
 
 /// Runs an already parsed invocation, so a caller that needed the parsed flags
 /// before connecting does not parse (and read a task file) twice.
-pub async fn run_parsed<C: Client>(
+pub(crate) async fn run_parsed<C: Client>(
     client: &mut C,
     invocation: &Invocation,
     out: &mut dyn Write,
@@ -847,4 +853,193 @@ fn report_transport(
 
 pub(crate) fn write_json(out: &mut dyn Write, value: &serde_json::Value) {
     let _ = writeln!(out, "{value}");
+}
+
+/// The structured result of one verb execution: the exit code, the rendered
+/// stdout and stderr, and the payload a `--json` envelope would carry.
+pub struct Execution {
+    /// The verb name, such as `status` or `session archive`.
+    pub verb: String,
+    pub exit_code: i32,
+    pub result: Result<Outcome, Failure>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl Execution {
+    /// The full `--json` envelope this execution reports.
+    pub fn envelope(&self) -> serde_json::Value {
+        match &self.result {
+            Ok(outcome) => serde_json::json!({
+                "ok": true,
+                "verb": self.verb,
+                "request_id": outcome.request_id.map(|id| id.to_string()),
+                "replayed": outcome.replayed,
+                "data": outcome.data,
+            }),
+            Err(failure) => failure.envelope(&self.verb),
+        }
+    }
+
+    fn failed(verb: &str, exit_code: i32, failure: Failure) -> Self {
+        Self {
+            verb: verb.to_owned(),
+            exit_code,
+            result: Err(failure),
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+}
+
+/// Runs one verb against an already connected client, returning its structured
+/// execution instead of printing to the process streams. This is the seam an
+/// embedding binary drives; the binary and the tests share the same parse and
+/// dispatch underneath it.
+pub async fn execute<C: Client>(client: &mut C, arguments: &[String]) -> Execution {
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let (verb, result) = match args::parse(arguments) {
+        Ok(Parsed::Help(text)) => {
+            let _ = out.write_all(text.as_bytes());
+            (
+                args::named_verb(arguments).to_owned(),
+                Ok(Outcome::new(serde_json::Value::Null, None)),
+            )
+        }
+        Ok(Parsed::Run(invocation)) => {
+            let json = invocation.globals.json;
+            let verb = args::verb_name(&invocation.verb);
+            let result = match verbs::run(client, &invocation, &mut out, &mut err).await {
+                Ok(outcome) => {
+                    if json {
+                        write_json(
+                            &mut out,
+                            &serde_json::json!({
+                                "ok": true,
+                                "verb": verb,
+                                "request_id": outcome.request_id.map(|id| id.to_string()),
+                                "replayed": outcome.replayed,
+                                "data": outcome.data,
+                            }),
+                        );
+                    }
+                    Ok(outcome)
+                }
+                Err(failure) => {
+                    if json {
+                        write_json(&mut out, &failure.envelope(verb));
+                    } else {
+                        let _ = writeln!(err, "error {} {}", failure.code(), failure.message());
+                    }
+                    Err(failure)
+                }
+            };
+            (verb.to_owned(), result)
+        }
+        Err(message) => {
+            let json = args::wants_json(arguments);
+            let verb = args::named_verb(arguments);
+            let failure = Failure::Usage(message);
+            if json {
+                write_json(&mut out, &failure.envelope(verb));
+            } else {
+                let _ = writeln!(err, "error {} {}", failure.code(), failure.message());
+            }
+            (verb.to_owned(), Err(failure))
+        }
+    };
+    let exit_code = match &result {
+        Ok(outcome) => outcome.exit_code,
+        Err(failure) => failure.exit_code(),
+    };
+    Execution {
+        verb,
+        exit_code,
+        result,
+        stdout: String::from_utf8_lossy(&out).into_owned(),
+        stderr: String::from_utf8_lossy(&err).into_owned(),
+    }
+}
+
+/// Resolves the worker URL with the binary's precedence: `flag`, then
+/// `LOOM_URL`, then the loopback default. An embedding binary calls this once
+/// at startup and stores the result.
+pub fn resolve_connect_from_env(flag: Option<String>) -> String {
+    resolve_connect(flag, std::env::var("LOOM_URL").ok())
+}
+
+/// Resolves the token file with the binary's precedence: `flag`, then
+/// `LOOM_TOKEN_FILE`, then the path derived from the worker URL inside the
+/// state directory. A leading `~/` is expanded with `HOME`.
+pub fn resolve_token_file_from_env(
+    flag: Option<std::path::PathBuf>,
+    connect: &str,
+) -> Result<TokenFile, String> {
+    resolve_token_file(
+        flag,
+        std::env::var_os("LOOM_TOKEN_FILE").map(std::path::PathBuf::from),
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+        &loom_core::state_dir(),
+        connect,
+    )
+}
+
+/// Runs one verb against a worker reached by URL and bearer token, returning
+/// its structured execution. This is the full `loom-cli` per-command path
+/// (transport setup, connect, parse, dispatch) without touching the process
+/// streams or the environment.
+pub async fn run_remote(
+    arguments: &[String],
+    url: &str,
+    token: &str,
+    allow_insecure_remote: bool,
+    max_frame_bytes: Option<usize>,
+    ca_file: Option<&std::path::Path>,
+) -> Execution {
+    let mut transport = loom_local::WebSocketTransport::new(url, token)
+        .with_insecure_remote_allowed(allow_insecure_remote);
+    if let Some(max_frame_bytes) = max_frame_bytes {
+        transport = match transport.with_max_frame_bytes(max_frame_bytes) {
+            Ok(transport) => transport,
+            Err(error) => {
+                return Execution::failed(
+                    args::named_verb(arguments),
+                    exit::USAGE,
+                    Failure::Usage(error.message),
+                );
+            }
+        };
+    }
+    if let Some(ca_file) = ca_file {
+        transport = match transport.with_ca_certificate_file(ca_file) {
+            Ok(transport) => transport,
+            Err(error) => {
+                return Execution::failed(
+                    args::named_verb(arguments),
+                    exit::USAGE,
+                    Failure::Usage(error.message),
+                );
+            }
+        };
+    }
+    match transport.connect().await {
+        Ok(connection) => {
+            let mut client = RemoteClient::new(connection);
+            execute(&mut client, arguments).await
+        }
+        Err(error) => {
+            let code = exit::for_connect_error(&error);
+            Execution::failed(
+                args::named_verb(arguments),
+                code,
+                Failure::Transport {
+                    request_id: None,
+                    error,
+                },
+            )
+        }
+    }
 }

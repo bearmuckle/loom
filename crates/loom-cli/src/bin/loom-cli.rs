@@ -7,8 +7,7 @@
 //! verbatim with its unit tests, leaving this file argument collection and
 //! process exit.
 
-#[path = "../cli/mod.rs"]
-mod cli;
+use loom_cli::cli;
 
 fn main() {
     let arguments = std::env::args().skip(1).collect();
