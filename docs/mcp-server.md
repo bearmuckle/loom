@@ -103,7 +103,10 @@ authentication never auto-allows `approve`/`deny`/`run`/`send`/`archive`/
 `copilot_login_start`/`copilot_login_status`. `copilot_login_start` and
 `copilot_login_status` return only the public device-login payload and status
 (never a token) and enforce the same `wss://` or loopback `ws://` rule as
-`loom-cli` (not overridable by `--allow-insecure-remote`).
+`loom-cli` (not overridable by `--allow-insecure-remote`). `copilot_login_start`
+defaults `no_wait` to `true` and rejects `no_wait: false` (and `timeout`) so
+the caller can show the returned `url` and `user_code` to a person and then
+poll with `copilot_login_status`.
 
 ## Resources
 

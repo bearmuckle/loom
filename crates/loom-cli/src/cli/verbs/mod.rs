@@ -789,7 +789,7 @@ pub(crate) async fn run<C: Client>(
         Verb::ProvidersDiscover { provider } => {
             providers::discover(client, invocation, provider, out).await
         }
-        Verb::ProvidersLogin(args) => providers::login(client, invocation, args, out).await,
+        Verb::ProvidersLogin(args) => providers::login(client, invocation, args, out, err).await,
         Verb::ProvidersLoginStatus { login_id } => {
             providers::login_status(client, invocation, login_id, out).await
         }

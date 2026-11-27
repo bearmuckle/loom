@@ -13044,7 +13044,9 @@ struct StubCopilotClient {
     interval: u64,
     statuses: std::collections::VecDeque<loom_protocol::GitHubCopilotLoginStatus>,
     deny_capability: bool,
+    secure_for_secrets: bool,
     recorded_requests: Vec<ClientRequest>,
+    on_poll: Option<Box<dyn FnMut()>>,
 }
 
 impl StubCopilotClient {
@@ -13057,12 +13059,18 @@ impl StubCopilotClient {
             interval: 5,
             statuses: statuses.into_iter().collect(),
             deny_capability: false,
+            secure_for_secrets: true,
             recorded_requests: Vec::new(),
+            on_poll: None,
         }
     }
 }
 
 impl Client for StubCopilotClient {
+    fn is_secure_for_secrets(&self) -> bool {
+        self.secure_for_secrets
+    }
+
     fn request<'a>(
         &'a mut self,
         envelope: RequestEnvelope,
@@ -13115,6 +13123,9 @@ impl Client for StubCopilotClient {
             ClientRequest::Provider(
                 loom_protocol::ProviderRequest::GetGitHubCopilotLoginStatus { .. },
             ) => {
+                if let Some(callback) = self.on_poll.as_mut() {
+                    callback();
+                }
                 if self.deny_capability {
                     ResponseEnvelope::failure(
                         envelope.request_id,
@@ -13306,20 +13317,65 @@ async fn providers_login_polls_until_configured_and_never_emits_tokens() {
     assert_no_token_fields(&text.stdout);
     assert_no_token_fields(&text.stderr);
 
-    let mut json_client = StubCopilotClient::new([Status::Configured]);
-    let json_outcome = run_async(
+    // `--json` without `--no-wait` must write and flush the public verification
+    // URL and user code to stderr *before* polling begins so a human sees the
+    // code while stdout stays a single final JSON envelope.
+    struct SharedWriter(Rc<RefCell<Vec<u8>>>);
+    impl std::io::Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let stderr_buf = Rc::new(RefCell::new(Vec::new()));
+    let seen_before_poll = Rc::new(Cell::new(false));
+    let mut json_client = StubCopilotClient::new([Status::Pending, Status::Configured]);
+    json_client.interval = 1;
+    let stderr_check = Rc::clone(&stderr_buf);
+    let seen_flag = Rc::clone(&seen_before_poll);
+    json_client.on_poll = Some(Box::new(move || {
+        let text = String::from_utf8_lossy(&stderr_check.borrow()).into_owned();
+        if text.contains("url https://example.test/device\n")
+            && text.contains("user_code USER-CODE\n")
+        {
+            seen_flag.set(true);
+        }
+    }));
+
+    let mut out = Vec::new();
+    let mut err_writer = SharedWriter(Rc::clone(&stderr_buf));
+    let code = run_command(
         &mut json_client,
-        &[
+        &owned(&[
             "providers",
             "login",
             "--provider",
             "github-copilot",
             "--json",
-        ],
+        ]),
+        &mut out,
+        &mut err_writer,
     )
     .await;
+    let json_outcome = Outcome {
+        code,
+        stdout: String::from_utf8(out).expect("UTF-8 stdout"),
+        stderr: String::from_utf8(stderr_buf.borrow().clone()).expect("UTF-8 stderr"),
+    };
     assert_eq!(json_outcome.code, exit::OK, "{}", json_outcome.stderr);
-    assert_eq!(json_outcome.stderr, "");
+    assert!(
+        seen_before_poll.get(),
+        "url and user_code must be written to stderr before the first status poll: {:?}",
+        json_outcome.stderr
+    );
+    assert_eq!(
+        json_outcome.stderr,
+        "url https://example.test/device\nuser_code USER-CODE\nlogin_id login-fake-1\n"
+    );
     let envelope = json_envelope(&json_outcome);
     assert_eq!(envelope["ok"], true);
     assert_eq!(envelope["verb"], "providers login");
@@ -13328,9 +13384,31 @@ async fn providers_login_polls_until_configured_and_never_emits_tokens() {
     assert_eq!(envelope["data"]["url"], "https://example.test/device");
     assert_eq!(envelope["data"]["user_code"], "USER-CODE");
     assert_eq!(envelope["data"]["expires_in"], 900);
-    assert_eq!(envelope["data"]["interval"], 5);
+    assert_eq!(envelope["data"]["interval"], 1);
     assert_eq!(envelope["data"]["status"], "configured");
     assert_no_token_fields(&json_outcome.stdout);
+    assert_no_token_fields(&json_outcome.stderr);
+
+    // Wire strings containing control characters / newlines are escaped in text output.
+    let mut hostile_client = StubCopilotClient::new([]);
+    hostile_client.verification_uri = "https://example.test/device\ninjected".to_owned();
+    hostile_client.user_code = "USER\rCODE".to_owned();
+    let escaped = run_async(
+        &mut hostile_client,
+        &[
+            "providers",
+            "login",
+            "--provider",
+            "github-copilot",
+            "--no-wait",
+        ],
+    )
+    .await;
+    assert_eq!(escaped.code, exit::OK, "{}", escaped.stderr);
+    assert_eq!(
+        escaped.stdout,
+        "url https://example.test/device\\ninjected\nuser_code USER\\rCODE\nlogin_id login-fake-1\n"
+    );
 }
 
 #[tokio::test]
@@ -13641,30 +13719,97 @@ async fn providers_login_refuses_insecure_remote_urls_even_with_override_flag() 
     }
 
     // `run_remote` (used by loom-mcp) must also refuse before attempting to connect,
-    // even when `allow_insecure_remote` is true.
-    let remote = crate::cli::run_remote(
-        &owned(&[
+    // even when `allow_insecure_remote` is true — AND even if `arguments` carries a
+    // spoofed loopback `--connect` flag.
+    for remote_args in [
+        owned(&[
             "providers",
             "login",
             "--provider",
             "github-copilot",
             "--no-wait",
         ]),
-        "ws://worker.example/ws",
-        "fake-bearer-for-test",
-        true,
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(remote.exit_code, exit::USAGE);
-    let failure = remote.result.err().expect("insecure URL must fail");
-    assert_eq!(failure.code(), "invalid_request");
-    assert!(
-        failure.message().contains("wss:// or loopback ws://"),
-        "{}",
-        failure.message()
-    );
+        owned(&[
+            "--connect",
+            "ws://127.0.0.1:8765/ws",
+            "providers",
+            "login",
+            "--provider",
+            "github-copilot",
+            "--no-wait",
+        ]),
+        owned(&[
+            "--connect",
+            "ws://127.0.0.1:8765/ws",
+            "providers",
+            "login-status",
+            "--login-id",
+            "login-fake-1",
+        ]),
+    ] {
+        let remote = crate::cli::run_remote(
+            &remote_args,
+            "ws://worker.example/ws",
+            "fake-bearer-for-test",
+            true,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(remote.exit_code, exit::USAGE, "{remote_args:?}");
+        let failure = remote.result.err().expect("insecure URL must fail");
+        assert_eq!(failure.code(), "invalid_request");
+        assert!(
+            failure.message().contains("wss:// or loopback ws://"),
+            "{}",
+            failure.message()
+        );
+    }
+
+    // `cli::execute` against an insecure remote client (where `is_secure_for_secrets()`
+    // is false) must be refused even when `--connect` is omitted or set to loopback,
+    // including through `Wrapped<C>`.
+    for exec_args in [
+        owned(&[
+            "providers",
+            "login",
+            "--provider",
+            "github-copilot",
+            "--no-wait",
+        ]),
+        owned(&[
+            "--connect",
+            "ws://127.0.0.1:8765/ws",
+            "providers",
+            "login",
+            "--provider",
+            "github-copilot",
+            "--no-wait",
+        ]),
+        owned(&["providers", "login-status", "--login-id", "login-fake-1"]),
+    ] {
+        let mut insecure_client = StubCopilotClient::new([]);
+        insecure_client.secure_for_secrets = false;
+        let execution = crate::cli::execute(&mut insecure_client, &exec_args).await;
+        assert_eq!(execution.exit_code, exit::USAGE, "{exec_args:?}");
+        let failure = execution.result.err().expect("insecure client must fail");
+        assert_eq!(failure.code(), "invalid_request");
+        assert!(
+            failure.message().contains("wss:// or loopback ws://"),
+            "{}",
+            failure.message()
+        );
+        assert!(
+            insecure_client.recorded_requests.is_empty(),
+            "no request may be sent over an insecure client"
+        );
+
+        let mut inner = StubCopilotClient::new([]);
+        inner.secure_for_secrets = false;
+        let mut wrapped = Wrapped::new(inner);
+        let wrapped_exec = crate::cli::execute(&mut wrapped, &exec_args).await;
+        assert_eq!(wrapped_exec.exit_code, exit::USAGE, "{exec_args:?}");
+    }
 
     // Secure URLs (wss:// and loopback ws://) are accepted.
     for secure_url in [

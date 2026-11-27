@@ -210,6 +210,7 @@ impl WebSocketTransport {
         })?;
         apply_bearer_token(&mut request, &self.bearer_token)?;
         let connector = self.tls_client_config.clone().map(Connector::Rustls);
+        let secure_for_secrets = remote_url_is_secure_for_secrets(&self.url);
         let (socket, _) = connect_async_tls_with_config(request, None, false, connector)
             .await
             .map_err(websocket_connect_error)?;
@@ -217,6 +218,7 @@ impl WebSocketTransport {
             socket,
             max_frame_bytes: self.max_frame_bytes,
             events: VecDeque::new(),
+            secure_for_secrets,
         })
     }
 }
@@ -227,9 +229,18 @@ pub struct WebSocketConnection {
     /// Events read while a request was in flight, oldest first and bounded by
     /// [`CLIENT_EVENT_BUFFER_CAPACITY`].
     events: VecDeque<ServerEventEnvelope>,
+    /// Whether the connected worker URL satisfies
+    /// [`remote_url_is_secure_for_secrets`] (`wss://` or loopback `ws://`).
+    secure_for_secrets: bool,
 }
 
 impl WebSocketConnection {
+    /// Whether this connection's worker URL is encrypted (`wss://`) or loopback
+    /// (`ws://` to loopback), so sensitive flows such as GitHub Copilot device
+    /// login are permitted over it.
+    pub fn secure_for_secrets(&self) -> bool {
+        self.secure_for_secrets
+    }
     pub async fn request(&mut self, request: RequestEnvelope) -> Result<ResponseEnvelope> {
         let request_id = request.request_id;
         let bytes = loom_protocol::encode_request(&request).map_err(|error| {
@@ -800,6 +811,7 @@ mod tests {
                 .connect()
                 .await
                 .unwrap();
+            assert!(connection.secure_for_secrets());
             assert!(connection.request(request()).await.unwrap().result.is_ok());
             connection.close().await.unwrap();
 

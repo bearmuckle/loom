@@ -481,7 +481,10 @@ async fn mutating_tools_are_opt_in_and_archive_runs_end_to_end() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn copilot_login_tools_run_against_stub_worker_without_tokens_and_refuse_insecure_url() {
-    use std::sync::Mutex;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use axum::{
         Router,
@@ -497,9 +500,18 @@ async fn copilot_login_tools_run_against_stub_worker_without_tokens_and_refuse_i
         ResponseEnvelope,
     };
 
-    let status_state = Arc::new(Mutex::new(GitHubCopilotLoginStatus::Pending));
+    #[derive(Clone)]
+    struct StubState {
+        status: Arc<Mutex<GitHubCopilotLoginStatus>>,
+        status_polls: Arc<AtomicUsize>,
+    }
 
-    async fn handle_socket(mut socket: WebSocket, status: Arc<Mutex<GitHubCopilotLoginStatus>>) {
+    let stub_state = StubState {
+        status: Arc::new(Mutex::new(GitHubCopilotLoginStatus::Pending)),
+        status_polls: Arc::new(AtomicUsize::new(0)),
+    };
+
+    async fn handle_socket(mut socket: WebSocket, state: StubState) {
         while let Some(Ok(message)) = socket.recv().await {
             let bytes = match message {
                 Message::Text(text) => text.as_bytes().to_vec(),
@@ -533,7 +545,8 @@ async fn copilot_login_tools_run_against_stub_worker_without_tokens_and_refuse_i
                 ClientRequest::Provider(ProviderRequest::GetGitHubCopilotLoginStatus {
                     ..
                 }) => {
-                    let current = status.lock().unwrap().clone();
+                    state.status_polls.fetch_add(1, Ordering::SeqCst);
+                    let current = state.status.lock().unwrap().clone();
                     ResponseEnvelope::success(
                         request.request_id,
                         ServerResponse::Provider(ProviderResponse::GitHubCopilotLoginStatus {
@@ -551,16 +564,13 @@ async fn copilot_login_tools_run_against_stub_worker_without_tokens_and_refuse_i
         }
     }
 
-    async fn ws_handler(
-        ws: WebSocketUpgrade,
-        State(status): State<Arc<Mutex<GitHubCopilotLoginStatus>>>,
-    ) -> impl IntoResponse {
-        ws.on_upgrade(move |socket| handle_socket(socket, status))
+    async fn ws_handler(ws: WebSocketUpgrade, State(state): State<StubState>) -> impl IntoResponse {
+        ws.on_upgrade(move |socket| handle_socket(socket, state))
     }
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
-        .with_state(status_state.clone());
+        .with_state(stub_state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral stub worker");
@@ -599,16 +609,17 @@ async fn copilot_login_tools_run_against_stub_worker_without_tokens_and_refuse_i
         }
     };
 
-    // 1. Start with no_wait: returns the same JSON data shape as the CLI.
+    // 1. Start with default `{}`: defaults no_wait to true, returns public
+    // url/user_code/login_id immediately, and performs zero status polls.
     let started = tools::call_tool(
         &state,
         &json!({
             "name": "copilot_login_start",
-            "arguments": { "provider": "github-copilot", "no_wait": true },
+            "arguments": {},
         }),
     )
     .await
-    .expect("copilot_login_start succeeds");
+    .expect("copilot_login_start succeeds with default arguments");
     assert_eq!(started["isError"], false, "{started}");
     assert_eq!(started["structuredContent"]["exit_code"], 0);
     assert_eq!(
@@ -623,7 +634,28 @@ async fn copilot_login_tools_run_against_stub_worker_without_tokens_and_refuse_i
             "status": "pending",
         })
     );
+    assert_eq!(
+        stub_state.status_polls.load(Ordering::SeqCst),
+        0,
+        "copilot_login_start with default arguments must not poll status"
+    );
     assert_clean(&started);
+
+    // Explicitly passing `no_wait: false` is rejected before contacting the worker.
+    let wait_rejected = tools::call_tool(
+        &state,
+        &json!({
+            "name": "copilot_login_start",
+            "arguments": { "no_wait": false },
+        }),
+    )
+    .await
+    .expect_err("copilot_login_start must reject no_wait: false");
+    assert!(
+        wait_rejected.message.contains("copilot_login_status"),
+        "{wait_rejected:?}"
+    );
+    assert_eq!(stub_state.status_polls.load(Ordering::SeqCst), 0);
 
     // 2. Poll pending -> exit 4 with status: pending.
     let pending = tools::call_tool(
@@ -643,7 +675,7 @@ async fn copilot_login_tools_run_against_stub_worker_without_tokens_and_refuse_i
     assert_clean(&pending);
 
     // 3. Flip to configured -> exit 0 with status: configured.
-    *status_state.lock().unwrap() = GitHubCopilotLoginStatus::Configured;
+    *stub_state.status.lock().unwrap() = GitHubCopilotLoginStatus::Configured;
     let configured = tools::call_tool(
         &state,
         &json!({
@@ -662,7 +694,7 @@ async fn copilot_login_tools_run_against_stub_worker_without_tokens_and_refuse_i
     assert_clean(&configured);
 
     // 4. Flip to failed -> exit 1 with status: failed and message.
-    *status_state.lock().unwrap() = GitHubCopilotLoginStatus::Failed {
+    *stub_state.status.lock().unwrap() = GitHubCopilotLoginStatus::Failed {
         message: "device code denied".to_owned(),
     };
     let failed = tools::call_tool(
