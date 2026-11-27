@@ -192,7 +192,7 @@ fn phone_touch_tap_on_settings_workers_url_padding_and_center_focuses_input(
             assert!(!input.read(cx).focus_handle(cx).is_focused(window));
         });
 
-        let bounds = window.find("worker-node-connection-input").bounds();
+        let bounds = window.find("worker-node-url-input").bounds();
         // Tap inside `BaseInput`'s left padding (`input_px` = 8px for small):
         // without the wrapper handler, `BaseInput` focuses its frame handle
         // instead of `InputState`.
@@ -343,7 +343,7 @@ fn desktop_mouse_click_on_settings_workers_input_padding_and_text_works(cx: &mut
 
         // Desktop mouse click in the left padding focuses the input without
         // switching input modality to touch.
-        window.click_at("worker-node-connection-input", point(px(3.), px(12.)), cx);
+        window.click_at("worker-node-url-input", point(px(3.), px(12.)), cx);
         window.render_frame(cx);
         assert!(!window.last_input_was_touch());
         view.update(cx, |view, cx| {
