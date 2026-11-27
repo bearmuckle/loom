@@ -142,6 +142,95 @@ mod header_shortcuts {
         refuse(job);
     }
 
+    /// Clicking the session header's archive button opens a confirmation
+    /// popover instead of archiving immediately. Cancelling sends nothing;
+    /// confirming submits the archive for the project root.
+    #[gpui_kit::test]
+    fn clicking_header_archive_requires_confirmation_before_archiving(cx: &mut TestAppContext) {
+        let (backend, requests) = BackendWorker::deferred_for_test();
+        let (handle, view) = open_view_window(cx, backend);
+        let root = view.read_with(cx, |view, _| {
+            view.project_snapshot
+                .as_ref()
+                .expect("the fixture is a project")
+                .root_session_id
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            // Drain any startup background lookups unrelated to archive.
+            while let Ok(job) = requests.try_recv() {
+                refuse(job);
+            }
+            window.click("archive-project", cx);
+            window.render_frame(cx);
+            assert!(
+                window.find("archive-project-confirm-popover").visible(),
+                "clicking archive must open the confirmation popover"
+            );
+        })
+        .unwrap();
+        while let Ok(job) = requests.try_recv() {
+            assert!(
+                !matches!(
+                    job.request.request,
+                    ClientRequest::Session(SessionRequest::ArchiveAgentSession { .. })
+                ),
+                "opening the confirmation popover must not archive immediately"
+            );
+            refuse(job);
+        }
+
+        // Cancelling closes the popover without archiving.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("cancel-archive-project", cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("archive-project-confirm-popover").is_none(),
+                "cancelling must dismiss the archive confirmation popover"
+            );
+        })
+        .unwrap();
+        while let Ok(job) = requests.try_recv() {
+            assert!(
+                !matches!(
+                    job.request.request,
+                    ClientRequest::Session(SessionRequest::ArchiveAgentSession { .. })
+                ),
+                "cancelling the confirmation popover must not send an archive request"
+            );
+            refuse(job);
+        }
+
+        // Re-opening and confirming submits the archive for the project root.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("archive-project", cx);
+            window.render_frame(cx);
+            assert!(window.find("archive-project-confirm-popover").visible());
+            window.click("confirm-archive-project", cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("archive-project-confirm-popover").is_none(),
+                "confirming must dismiss the archive confirmation popover"
+            );
+        })
+        .unwrap();
+        let mut archived_root = false;
+        while let Ok(job) = requests.try_recv() {
+            if matches!(
+                job.request.request,
+                ClientRequest::Session(SessionRequest::ArchiveAgentSession { session_id })
+                    if session_id == root
+            ) {
+                archived_root = true;
+            }
+            refuse(job);
+        }
+        assert!(
+            archived_root,
+            "confirming the popover must archive the project root"
+        );
+    }
+
     /// The sub project shortcut names a branch of the project on screen: the
     /// worker creates the project, and the client attaches the parent's sources
     /// to it so the branch starts where the project is.

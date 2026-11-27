@@ -583,3 +583,24 @@ fn first_run_worker_setup_paints_cleanly_at_1280x800() {
     assert!(frame.has_aspect_ratio(1280, 800));
     assert!(frame.distinct_colors() > 8);
 }
+
+#[test]
+fn header_toolbars_paint_separated_archive_action_on_active_project() {
+    let empty = capture(|_| {});
+    let project = capture(|view| {
+        view.active_session.name = "Refactor toolbars".to_owned();
+        view.sessions = vec![view.active_session.clone()];
+        let session_id = view.active_session.id;
+        view.session_node_ids
+            .insert(session_id, view.default_backend_node_id.clone());
+    });
+    assert!(
+        project.has_aspect_ratio(1280, 800),
+        "project view should keep the 1280x800 aspect ratio"
+    );
+    assert_ne!(
+        project.fingerprint(),
+        empty.fingerprint(),
+        "active project header toolbars must paint distinctly over the empty view"
+    );
+}

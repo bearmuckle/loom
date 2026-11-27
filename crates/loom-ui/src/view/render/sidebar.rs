@@ -698,36 +698,61 @@ impl LoomView {
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
         let _ = view;
-        Button::new("new-session")
-            .icon(Icon::new(IconName::Plus))
-            .ghost()
-            .when(layout.phone, |button| button.large())
-            .h(layout.pane_action_size())
-            .w(layout.pane_action_size())
-            .accessibility_label("New project")
-            .on_click(cx.listener(Self::new_session))
-            .into_any_element()
+        header_icon_action(
+            Button::new("new-session")
+                .icon(Icon::new(IconName::Plus))
+                .ghost(),
+            layout,
+        )
+        .accessibility_label("New project")
+        .tooltip("New project")
+        .on_click(cx.listener(Self::new_session))
+        .into_any_element()
     }
 
-    /// Opens the archived-session management surface. The icon sits beside the
-    /// new-project action because the surface manages sessions, not settings.
+    /// Opens the archived-session management surface.
     pub(crate) fn render_archived_sessions_button(
         &self,
         layout: ResponsiveLayout,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
-        Button::new("archived-sessions")
-            .icon(Icon::new(AssetIconName::Archive))
-            .ghost()
-            .when(layout.phone, |button| button.large())
-            .h(layout.pane_action_size())
-            .w(layout.pane_action_size())
-            .accessibility_label("Archived sessions")
-            .tooltip("Archived sessions")
-            .on_click(cx.listener(|view, _, _, cx| {
-                view.open_archived_sessions(cx);
-            }))
-            .into_any_element()
+        header_icon_action(
+            Button::new("archived-sessions")
+                .icon(Icon::new(AssetIconName::Archive))
+                .ghost(),
+            layout,
+        )
+        .accessibility_label("Archived sessions")
+        .tooltip("Archived sessions")
+        .on_click(cx.listener(|view, _, _, cx| {
+            view.open_archived_sessions(cx);
+        }))
+        .into_any_element()
+    }
+
+    /// Opens the Settings surface from the projects pane header.
+    pub(crate) fn render_settings_button(
+        &self,
+        view: &Entity<Self>,
+        layout: ResponsiveLayout,
+    ) -> gpui_kit::AnyElement {
+        header_icon_action(
+            Button::new("settings-button")
+                .icon(Icon::new(IconName::Settings))
+                .ghost(),
+            layout,
+        )
+        .accessibility_label("Settings")
+        .tooltip("Settings")
+        .on_click({
+            let view = view.clone();
+            move |_, _, cx| {
+                view.update(cx, |view, cx| {
+                    view.open_settings_from_menu(cx);
+                });
+            }
+        })
+        .into_any_element()
     }
 
     /// Derives the pane's project rows and hands them to the list, creating it
@@ -988,6 +1013,7 @@ impl LoomView {
                                 .h(layout.control_size())
                                 .w(layout.control_size())
                                 .accessibility_label("Back")
+                                .tooltip("Back")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.session_drawer_open = false;
                                     cx.notify();
@@ -1000,31 +1026,34 @@ impl LoomView {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().text_xs().text_color(rgb(0x8f98a6)).child("Projects"))
+                    .gap_2()
                     .child(
+                        // Pair creation directly with the Projects heading so
+                        // New stays spatially apart from Archived sessions and
+                        // Settings on the trailing edge.
                         div()
                             .flex()
                             .items_center()
+                            .min_w(px(0.))
                             .gap_1()
-                            .child(self.render_new_session_button(view, layout, cx))
-                            .child(self.render_archived_sessions_button(layout, cx))
                             .child(
-                                Button::new("settings-button")
-                                    .icon(Icon::new(IconName::Settings))
-                                    .ghost()
-                                    .when(layout.phone, |button| button.large())
-                                    .h(layout.pane_action_size())
-                                    .w(layout.pane_action_size())
-                                    .accessibility_label("Settings")
-                                    .on_click({
-                                        let view = view.clone();
-                                        move |_, _, cx| {
-                                            view.update(cx, |view, cx| {
-                                                view.open_settings_from_menu(cx);
-                                            });
-                                        }
-                                    }),
-                            ),
+                                div()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(rgb(0x8f98a6))
+                                    .child("Projects"),
+                            )
+                            .child(self.render_new_session_button(view, layout, cx)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap_1()
+                            .child(self.render_archived_sessions_button(layout, cx))
+                            .child(self.render_settings_button(view, layout)),
                     ),
             )
             .when_some(self.session_filter_input.as_ref(), |element, input| {

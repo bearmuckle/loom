@@ -1,5 +1,10 @@
 use super::*;
+use gpui_kit::Anchor;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::button::ButtonCustomVariant;
 use gpui_kit::component::link::Link;
+use gpui_kit::component::popover::Popover;
+use gpui_kit::component::separator::Separator;
 
 impl Render for LoomView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -568,170 +573,330 @@ impl Render for LoomView {
                     )
                     .child(
                         session_header_actions()
-                            // A project on screen offers the two shortcuts that
-                            // turn it into a branch: a sub project of it, or its
-                            // archive. Nothing is offered for an empty session.
-                            .when(self.has_header_project(), |actions| {
-                                actions
-                                    .when(self.can_manage_sources(), |actions| {
-                                        actions.child(header_tooltip(
-                                            "new-sub-project-tooltip",
-                                            "New sub project",
-                                            header_icon_action(
-                                                Button::new("new-sub-project")
-                                                    .icon(Icon::new(AssetIconName::Plus))
-                                                    .ghost(),
-                                                layout,
-                                            )
-                                            .accessibility_label("New sub project")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.begin_sub_project_dialog(cx);
-                                            })),
-                                        ))
-                                    })
-                                    .when(self.has_header_archive(), |actions| actions.child(header_tooltip(
-                                        "archive-project-tooltip",
-                                        "Archive project",
+                            // Constructive workspace actions sit on the left:
+                            // branching a sub project and managing attached
+                            // sources. Destructive archive is separated from
+                            // them visually, spatially, and by confirmation.
+                            .when(
+                                self.has_header_project() && self.can_manage_sources(),
+                                |actions| {
+                                    actions.child(
                                         header_icon_action(
-                                            Button::new("archive-project")
-                                                .icon(Icon::new(AssetIconName::Archive))
+                                            Button::new("new-sub-project")
+                                                .icon(Icon::new(AssetIconName::Plus))
                                                 .ghost(),
                                             layout,
                                         )
-                                        .accessibility_label("Archive project")
+                                        .accessibility_label("New sub project")
+                                        .tooltip("New sub project")
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.archive_header_project(cx);
+                                            this.begin_sub_project_dialog(cx);
                                         })),
-                                    )))
-                            })
-                            .child(header_tooltip("session-sources-tooltip", "Session sources",
-                        header_icon_action(
-                        Button::new("session-sources")
-                            .icon(Icon::new(AssetIconName::ListTree))
-                            .ghost(),
-                        layout,
-                        )
-                            .accessibility_label("Session sources")
-                            .dropdown_menu({
-                                let view = view.clone();
-                                let repositories = self.session_repositories.clone();
-                                let directories = self.session_directories.clone();
-                                let selected_repository_id = self.selected_repository_id;
-                                // Only owners attach or detach sources; others
-                                // review the checkouts already attached.
-                                let manage = self.can_manage_sources();
-                                move |mut menu, window, cx| {
-                                    menu = menu.label("Session sources");
-                                    let add_view = view.clone();
-                                    if manage {
-                                    menu = menu.item(PopupMenuItem::new("Add source…").on_click(
-                                        move |_, _, cx| {
-                                            add_view.update(cx, |this, cx| {
-                                                this.begin_source_dialog(
-                                                    SessionSourceDialogPurpose::AddToSession,
-                                                    cx,
-                                                );
-                                            });
-                                        },
-                                    ));
-                                    }
-                                    if directories.is_empty() && repositories.is_empty() {
-                                        menu = menu.separator().label("No sources attached");
-                                    } else {
-                                        menu = menu.separator();
-                                    }
-                                    for directory in &directories {
-                                        let detach_view = view.clone();
-                                        let path = directory.path.clone();
-                                        let root_repository = repositories.iter().find(|repository| repository.path == directory.path);
-                                        let name = Path::new(&directory.source)
-                                            .file_name()
-                                            .map(|name| name.to_string_lossy().into_owned())
-                                            .unwrap_or_else(|| directory.source.clone());
-                                        let label = if root_repository.is_some() {
-                                            format!("Git repository: {name}")
+                                    )
+                                },
+                            )
+                            .child(
+                                header_icon_action(
+                                    Button::new("session-sources")
+                                        .icon(Icon::new(AssetIconName::ListTree))
+                                        .ghost(),
+                                    layout,
+                                )
+                                .accessibility_label("Session sources")
+                                .tooltip("Session sources")
+                                .dropdown_menu({
+                                    let view = view.clone();
+                                    let repositories = self.session_repositories.clone();
+                                    let directories = self.session_directories.clone();
+                                    let selected_repository_id = self.selected_repository_id;
+                                    // Only owners attach or detach sources; others
+                                    // review the checkouts already attached.
+                                    let manage = self.can_manage_sources();
+                                    move |mut menu, window, cx| {
+                                        menu = menu.label("Session sources");
+                                        let add_view = view.clone();
+                                        if manage {
+                                            menu = menu.item(
+                                                PopupMenuItem::new("Add source…").on_click(
+                                                    move |_, _, cx| {
+                                                        add_view.update(cx, |this, cx| {
+                                                            this.begin_source_dialog(
+                                                                SessionSourceDialogPurpose::AddToSession,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    },
+                                                ),
+                                            );
+                                        }
+                                        if directories.is_empty() && repositories.is_empty() {
+                                            menu = menu.separator().label("No sources attached");
                                         } else {
-                                            format!("Folder: {name}")
-                                        };
-                                        let source_menu = PopupMenu::build(window, cx, |mut menu, _, _| {
-                                            menu = menu.label(directory.source.clone());
-                                            if let Some(repository) = root_repository {
+                                            menu = menu.separator();
+                                        }
+                                        for directory in &directories {
+                                            let detach_view = view.clone();
+                                            let path = directory.path.clone();
+                                            let root_repository = repositories
+                                                .iter()
+                                                .find(|repository| repository.path == directory.path);
+                                            let name = Path::new(&directory.source)
+                                                .file_name()
+                                                .map(|name| name.to_string_lossy().into_owned())
+                                                .unwrap_or_else(|| directory.source.clone());
+                                            let label = if root_repository.is_some() {
+                                                format!("Git repository: {name}")
+                                            } else {
+                                                format!("Folder: {name}")
+                                            };
+                                            let source_menu =
+                                                PopupMenu::build(window, cx, |mut menu, _, _| {
+                                                    menu = menu.label(directory.source.clone());
+                                                    if let Some(repository) = root_repository {
+                                                        let repository_id = repository.id;
+                                                        let select_view = view.clone();
+                                                        menu = menu.item(
+                                                            PopupMenuItem::new("Select for review")
+                                                                .checked(
+                                                                    selected_repository_id
+                                                                        == Some(repository_id),
+                                                                )
+                                                                .on_click(move |_, _, cx| {
+                                                                    select_view.update(
+                                                                        cx,
+                                                                        |this, cx| {
+                                                                            this.select_session_repository(
+                                                                                repository_id,
+                                                                                cx,
+                                                                            );
+                                                                        },
+                                                                    );
+                                                                }),
+                                                        );
+                                                    }
+                                                    if !manage {
+                                                        return menu;
+                                                    }
+                                                    menu.item(
+                                                        PopupMenuItem::new("Detach source")
+                                                            .on_click(move |_, _, cx| {
+                                                                detach_view.update(
+                                                                    cx,
+                                                                    |this, cx| {
+                                                                        this.detach_session_directory(
+                                                                            path.clone(),
+                                                                            cx,
+                                                                        );
+                                                                    },
+                                                                );
+                                                            }),
+                                                    )
+                                                });
+                                            menu = menu
+                                                .item(PopupMenuItem::submenu(label, source_menu));
+                                        }
+                                        let other_repositories = repositories
+                                            .iter()
+                                            .filter(|repository| {
+                                                !directories.iter().any(|directory| {
+                                                    directory.path == repository.path
+                                                })
+                                            })
+                                            .collect::<Vec<_>>();
+                                        if !other_repositories.is_empty() {
+                                            menu = menu.separator().label("Git repositories");
+                                            for repository in other_repositories {
                                                 let repository_id = repository.id;
                                                 let select_view = view.clone();
-                                                menu = menu.item(
-                                                    PopupMenuItem::new("Select for review")
-                                                        .checked(selected_repository_id == Some(repository_id))
-                                                        .on_click(move |_, _, cx| {
-                                                            select_view.update(cx, |this, cx| {
-                                                                this.select_session_repository(repository_id, cx);
-                                                            });
-                                                        }),
-                                                );
-                                            }
-                                            if !manage {
-                                                return menu;
-                                            }
-                                            menu.item(PopupMenuItem::new("Detach source")
-                                                .on_click(move |_, _, cx| {
-                                                    detach_view.update(cx, |this, cx| {
-                                                        this.detach_session_directory(path.clone(), cx);
+                                                let detach_view = view.clone();
+                                                let source_menu =
+                                                    PopupMenu::build(window, cx, |menu, _, _| {
+                                                        let menu = menu
+                                                            .label(repository.source.clone())
+                                                            .item(
+                                                                PopupMenuItem::new(
+                                                                    "Select for review",
+                                                                )
+                                                                .checked(
+                                                                    selected_repository_id
+                                                                        == Some(repository_id),
+                                                                )
+                                                                .on_click(move |_, _, cx| {
+                                                                    select_view.update(
+                                                                        cx,
+                                                                        |this, cx| {
+                                                                            this.select_session_repository(
+                                                                                repository_id,
+                                                                                cx,
+                                                                            );
+                                                                        },
+                                                                    );
+                                                                }),
+                                                            );
+                                                        if !manage {
+                                                            return menu;
+                                                        }
+                                                        menu.item(
+                                                            PopupMenuItem::new("Detach source")
+                                                                .on_click(move |_, _, cx| {
+                                                                    detach_view.update(
+                                                                        cx,
+                                                                        |this, cx| {
+                                                                            this.detach_session_repository(
+                                                                                repository_id,
+                                                                                cx,
+                                                                            );
+                                                                        },
+                                                                    );
+                                                                }),
+                                                        )
                                                     });
-                                                }))
-                                        });
-                                        menu = menu.item(PopupMenuItem::submenu(
-                                            label, source_menu,
-                                        ));
-                                    }
-                                    let other_repositories = repositories.iter().filter(|repository| {
-                                        !directories.iter().any(|directory| directory.path == repository.path)
-                                    }).collect::<Vec<_>>();
-                                    if !other_repositories.is_empty() {
-                                        menu = menu.separator().label("Git repositories");
-                                        for repository in other_repositories {
-                                            let repository_id = repository.id;
-                                            let select_view = view.clone();
-                                            let detach_view = view.clone();
-                                            let source_menu = PopupMenu::build(window, cx, |menu, _, _| {
-                                                let menu = menu.label(repository.source.clone()).item(
-                                                    PopupMenuItem::new("Select for review")
-                                                        .checked(selected_repository_id == Some(repository_id))
-                                                        .on_click(move |_, _, cx| {
-                                                            select_view.update(cx, |this, cx| {
-                                                                this.select_session_repository(repository_id, cx);
-                                                            });
-                                                        }),
-                                                )
-;
-                                                if !manage {
-                                                    return menu;
-                                                }
-                                                menu.item(
-                                                    PopupMenuItem::new("Detach source")
-                                                        .on_click(move |_, _, cx| {
-                                                            detach_view.update(cx, |this, cx| {
-                                                                this.detach_session_repository(repository_id, cx);
-                                                            });
-                                                        }),
-                                                )
-                                            });
-                                            let name = Path::new(&repository.source)
-                                                .file_name()
-                                                .map(|name| {
-                                                    // The recorded source is the
-                                                    // clone URL or path, so drop
-                                                    // its `.git` suffix.
-                                                    name.to_string_lossy()
-                                                        .trim_end_matches(".git")
-                                                        .to_owned()
-                                                })
-                                                .unwrap_or_else(|| repository.source.clone());
-                                            menu = menu.item(PopupMenuItem::submenu(name, source_menu));
+                                                let name = Path::new(&repository.source)
+                                                    .file_name()
+                                                    .map(|name| {
+                                                        // The recorded source is the
+                                                        // clone URL or path, so drop
+                                                        // its `.git` suffix.
+                                                        name.to_string_lossy()
+                                                            .trim_end_matches(".git")
+                                                            .to_owned()
+                                                    })
+                                                    .unwrap_or_else(|| repository.source.clone());
+                                                menu = menu.item(PopupMenuItem::submenu(
+                                                    name,
+                                                    source_menu,
+                                                ));
+                                            }
                                         }
+                                        menu
                                     }
-                                    menu
-                                }
-                            }),
-                            ))
+                                }),
+                            )
+                            .when(self.has_header_archive(), |actions| {
+                                let archive_view = view.clone();
+                                let project_name = self.active_session.name.clone();
+                                let danger_ghost = ButtonCustomVariant::new(cx)
+                                    .foreground(cx.theme().danger)
+                                    .hover(cx.theme().danger.opacity(0.15))
+                                    .active(cx.theme().danger.opacity(0.25));
+                                actions
+                                    .child(
+                                        div()
+                                            .id("session-header-archive-separator")
+                                            .test_support()
+                                            .flex()
+                                            .items_center()
+                                            .mx_1()
+                                            .child(Separator::vertical().w(px(1.)).h(px(16.))),
+                                    )
+                                    .child(
+                                        Popover::new("archive-project-popover")
+                                            .anchor(Anchor::TopRight)
+                                            .offset(px(4.))
+                                            .trigger(
+                                                header_icon_action(
+                                                    Button::new("archive-project")
+                                                        .icon(Icon::new(AssetIconName::Archive))
+                                                        .custom(danger_ghost),
+                                                    layout,
+                                                )
+                                                .accessibility_label("Archive project")
+                                                .tooltip("Archive project"),
+                                            )
+                                            .content(move |_, _, cx| {
+                                                let popover = cx.entity();
+                                                let cancel_popover = popover.clone();
+                                                let confirm_popover = popover.clone();
+                                                let confirm_view = archive_view.clone();
+                                                div()
+                                                    .id("archive-project-confirm-popover")
+                                                    .test_support()
+                                                    .w(px(260.))
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap_2()
+                                                    .child(
+                                                        div()
+                                                            .text_sm()
+                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                            .text_color(rgb(0xf3f4f6))
+                                                            .child("Archive project?"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(rgb(0x8f98a6))
+                                                            .child(format!(
+                                                                "Moves {project_name} to Archived sessions. You can restore it later."
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .mt_1()
+                                                            .flex()
+                                                            .justify_end()
+                                                            .gap_2()
+                                                            .child(
+                                                                Button::new(
+                                                                    "cancel-archive-project",
+                                                                )
+                                                                .label("Cancel")
+                                                                .ghost()
+                                                                .small()
+                                                                .on_click(
+                                                                    move |_, window, cx| {
+                                                                        cancel_popover.update(
+                                                                            cx,
+                                                                            |state, cx| {
+                                                                                state.dismiss(
+                                                                                    window, cx,
+                                                                                );
+                                                                            },
+                                                                        );
+                                                                    },
+                                                                ),
+                                                            )
+                                                            .child(
+                                                                Button::new(
+                                                                    "confirm-archive-project",
+                                                                )
+                                                                .label("Archive")
+                                                                .danger()
+                                                                .small()
+                                                                .on_click(
+                                                                    move |_, window, cx| {
+                                                                        confirm_popover.update(
+                                                                            cx,
+                                                                            |state, cx| {
+                                                                                state.dismiss(
+                                                                                    window, cx,
+                                                                                );
+                                                                            },
+                                                                        );
+                                                                        confirm_view.update(
+                                                                            cx,
+                                                                            |this, cx| {
+                                                                                this.archive_header_project(
+                                                                                    cx,
+                                                                                );
+                                                                            },
+                                                                        );
+                                                                    },
+                                                                ),
+                                                            ),
+                                                    )
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("session-header-panel-separator")
+                                            .test_support()
+                                            .flex()
+                                            .items_center()
+                                            .mx_1()
+                                            .child(Separator::vertical().w(px(1.)).h(px(16.))),
+                                    )
+                            })
                             .child({
                                 let toggle = header_icon_action(
                                     Button::new("toggle-review-sidebar")
@@ -744,6 +909,7 @@ impl Render for LoomView {
                                     layout,
                                 )
                                     .accessibility_label("Toggle side panel")
+                                    .tooltip("Toggle side panel")
                                     .when(self.review.open, |button| button.secondary())
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.toggle_review_pane(cx);
