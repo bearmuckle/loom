@@ -276,21 +276,9 @@ impl LoomView {
         };
         let url = value(&setup.url_input);
         let token = value(&setup.token_input);
-        if url.is_empty() {
+        if let Err(message) = validate_worker_connect_url(&url, true) {
             if let Some(setup) = self.setup.as_mut() {
-                setup.error =
-                    Some("Enter the worker URL, for example ws://127.0.0.1:8765/ws.".to_owned());
-            }
-            cx.notify();
-            return;
-        }
-        if worker_url_embeds_credential(&url) {
-            if let Some(setup) = self.setup.as_mut() {
-                setup.error = Some(
-                    "Do not include credentials in the URL. Enter the access token in its own \
-                     field."
-                        .to_owned(),
-                );
+                setup.error = Some(message);
             }
             cx.notify();
             return;
@@ -773,8 +761,12 @@ impl LoomView {
             worker_nodes,
             worker_node_polls_scheduled: BTreeSet::new(),
             workspace_config,
+            settings_scroll_handle: ScrollHandle::new(),
             node_input_initial: String::new(),
+            node_token_initial: String::new(),
             node_input_state: None,
+            node_token_input_state: None,
+            worker_connect_error: None,
             run_poll_scheduled: false,
             browser_startup_error: None,
             browser_starting: false,
@@ -975,9 +967,8 @@ impl LoomView {
             // name; it reads like any session written before titles existed.
             title_source: loom_core::SessionTitleSource::Auto,
         };
-        let node_input_initial = format!("{} {}", options.remote(), options.token())
-            .trim()
-            .to_owned();
+        let node_input_initial = options.remote().trim().to_owned();
+        let node_token_initial = options.token().trim().to_owned();
         let preferences = UiPreferences::load();
         let demo_session =
             demo_mode.then(|| Self::demo_multi_user_state(active_session.id, timestamp));
@@ -1184,8 +1175,12 @@ impl LoomView {
             worker_nodes: demo_mode.then(Self::demo_worker_node).into_iter().collect(),
             worker_node_polls_scheduled: BTreeSet::new(),
             workspace_config: WorkspaceConfig::default(),
+            settings_scroll_handle: ScrollHandle::new(),
             node_input_initial,
+            node_token_initial,
             node_input_state: None,
+            node_token_input_state: None,
+            worker_connect_error: None,
             run_poll_scheduled: false,
             browser_workspace: options.workspace().map(str::to_owned),
             browser_model: options.model().cloned(),
@@ -1428,8 +1423,12 @@ impl LoomView {
             worker_nodes,
             worker_node_polls_scheduled: BTreeSet::new(),
             workspace_config,
+            settings_scroll_handle: ScrollHandle::new(),
             node_input_initial: String::new(),
+            node_token_initial: String::new(),
             node_input_state: None,
+            node_token_input_state: None,
+            worker_connect_error: None,
             run_poll_scheduled: false,
             #[cfg(target_family = "wasm")]
             browser_workspace: None,
@@ -1819,8 +1818,12 @@ impl LoomView {
             worker_nodes,
             worker_node_polls_scheduled: BTreeSet::new(),
             workspace_config,
+            settings_scroll_handle: ScrollHandle::new(),
             node_input_initial: String::new(),
+            node_token_initial: String::new(),
             node_input_state: None,
+            node_token_input_state: None,
+            worker_connect_error: None,
             run_poll_scheduled: false,
             browser_workspace: options.workspace().map(str::to_owned),
             browser_model: options.model().cloned(),
@@ -1947,45 +1950,46 @@ impl LoomView {
 
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn connect_worker_node(&mut self, cx: &mut Context<Self>) {
-        let value = self
+        let url = self
             .node_input_state
             .as_ref()
             .map(|input| input.read(cx).value().to_string())
             .unwrap_or_else(|| self.node_input_initial.clone())
             .trim()
             .to_owned();
-        let mut parts = value.split_whitespace();
-        let Some(url) = parts.next() else {
-            self.record_status("Enter a worker URL, optionally followed by its access token");
+        let token = self
+            .node_token_input_state
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_else(|| self.node_token_initial.clone())
+            .trim()
+            .to_owned();
+        self.worker_connect_error = None;
+        if let Err(message) = validate_worker_connect_url(&url, true) {
+            self.worker_connect_error = Some(message);
+            self.settings_scroll_handle.scroll_to_bottom();
             cx.notify();
             return;
-        };
-        let url = url.to_owned();
+        }
         let id = match self.begin_worker_node_connection(&url) {
             Ok(id) => id,
             Err(message) => {
-                self.record_status(message);
+                self.worker_connect_error = Some(message);
+                self.settings_scroll_handle.scroll_to_bottom();
                 cx.notify();
                 return;
             }
         };
-        if worker_url_embeds_credential(&url) {
-            self.set_worker_node_connection_failure(
-                id,
-                &url,
-                "Do not include credentials in the URL. Enter the worker access token after the URL."
-                    .to_owned(),
-            );
-            cx.notify();
-            return;
-        }
+        // Keep the new in-progress row and its Remove button on screen even
+        // when earlier workers fill the 1280x800 Settings viewport.
+        self.settings_scroll_handle.scroll_to_bottom();
         // The token is optional: without one the client connects unsigned and
         // signs in with GitHub, and with one it is an operator connection that
         // works exactly as before.
-        let token = parts.next().map(str::to_owned).unwrap_or_default();
         let workspace_id = self.workspace_id;
         let remote_options = self.remote_options.clone();
-        let submitted_value = value;
+        let submitted_url = url.clone();
+        let submitted_token = token.clone();
         let node_url = url.clone();
         let connect_url = url.clone();
         cx.notify();
@@ -2123,11 +2127,14 @@ impl LoomView {
                             credential_detail,
                             cx,
                         );
-                        if view
-                            .node_input_state
-                            .as_ref()
-                            .is_some_and(|input| input.read(cx).value().as_ref() == submitted_value)
-                        {
+                        let url_matches = view.node_input_state.as_ref().is_some_and(|input| {
+                            input.read(cx).value().trim() == submitted_url
+                        });
+                        let token_matches =
+                            view.node_token_input_state.as_ref().is_none_or(|input| {
+                                input.read(cx).value().trim() == submitted_token
+                            });
+                        if url_matches && token_matches {
                             view.clear_node_on_render = true;
                         }
                     }
@@ -2152,6 +2159,7 @@ impl LoomView {
                             None,
                             cleanup_failed,
                         );
+                        view.settings_scroll_handle.scroll_to_bottom();
                     }
                     Err(_) => {}
                 }
@@ -2163,63 +2171,48 @@ impl LoomView {
 
     #[cfg(target_family = "wasm")]
     pub(crate) fn connect_worker_node(&mut self, cx: &mut Context<Self>) {
-        let value = self
+        let url = self
             .node_input_state
             .as_ref()
             .map(|input| input.read(cx).value().to_string())
-            .unwrap_or_default()
+            .unwrap_or_else(|| self.node_input_initial.clone())
+            .trim()
+            .to_owned();
+        let token = self
+            .node_token_input_state
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_else(|| self.node_token_initial.clone())
             .trim()
             .to_owned();
         // Only a bootstrap this call actually starts may hold the startup
         // screen; a validation refusal below must leave the client on the
         // settings screen instead of a connecting screen that never connects.
         self.browser_starting = false;
-        let mut parts = value.split_whitespace();
-        let Some(url) = parts.next() else {
-            self.record_status("Enter a worker URL, optionally followed by its access token");
+        self.worker_connect_error = None;
+        if let Err(message) = validate_worker_connect_url(&url, false) {
+            self.worker_connect_error = Some(message);
+            self.settings_scroll_handle.scroll_to_bottom();
             cx.notify();
             return;
-        };
-        let url = url.to_owned();
+        }
         let id = match self.begin_worker_node_connection(&url) {
             Ok(id) => id,
             Err(message) => {
-                self.record_status(message);
+                self.worker_connect_error = Some(message);
+                self.settings_scroll_handle.scroll_to_bottom();
                 cx.notify();
                 return;
             }
         };
-        if worker_url_embeds_credential(&url) {
-            self.set_worker_node_connection_failure(
-                id,
-                &url,
-                "Do not include credentials in the URL. Enter the worker access token after the URL."
-                    .to_owned(),
-            );
-            cx.notify();
-            return;
-        }
-        if is_ssh_worker_url(&url) {
-            // SSH provisions a worker; it is not a transport a browser can
-            // open. The deploy belongs to the native client, which tunnels to
-            // the worker it installed.
-            self.set_worker_node_connection_failure(
-                id,
-                &url,
-                "SSH deployment is only available in the native client. Connect the browser to a \
-                 ws:// or wss:// worker instead."
-                    .to_owned(),
-            );
-            cx.notify();
-            return;
-        }
+        self.settings_scroll_handle.scroll_to_bottom();
         // Without a token the browser connects unsigned and signs in with
         // GitHub; with one it is an operator connection as before.
-        let token = parts.next().map(str::to_owned).unwrap_or_default();
-        let submitted_value = value;
+        let submitted_url = url.clone();
+        let submitted_token = token.clone();
         if !self.connected {
             self.browser_startup_error = None;
-            self.connect_browser_bootstrap(id, url, token, submitted_value, cx);
+            self.connect_browser_bootstrap(id, url, token, submitted_url, submitted_token, cx);
             return;
         }
         let node_url = url.clone();
@@ -2321,11 +2314,14 @@ impl LoomView {
                             view.remember_identity(status.node_id.clone(), identity);
                         }
                         view.add_worker_node(connection, status, connected_url, None, cx);
-                        if view
-                            .node_input_state
-                            .as_ref()
-                            .is_some_and(|input| input.read(cx).value().as_ref() == submitted_value)
-                        {
+                        let url_matches = view.node_input_state.as_ref().is_some_and(|input| {
+                            input.read(cx).value().trim() == submitted_url
+                        });
+                        let token_matches =
+                            view.node_token_input_state.as_ref().is_none_or(|input| {
+                                input.read(cx).value().trim() == submitted_token
+                            });
+                        if url_matches && token_matches {
                             view.clear_node_on_render = true;
                         }
                     }
@@ -2350,6 +2346,7 @@ impl LoomView {
                             Some(&token),
                             cleanup_failed,
                         );
+                        view.settings_scroll_handle.scroll_to_bottom();
                     }
                     Err(_) => {}
                 }
@@ -2365,7 +2362,8 @@ impl LoomView {
         id: u64,
         url: String,
         token: String,
-        submitted_value: String,
+        submitted_url: String,
+        submitted_token: String,
         cx: &mut Context<Self>,
     ) {
         // The startup screen covers the bootstrap until the landing project is
@@ -2401,11 +2399,15 @@ impl LoomView {
                         if !view.sessions.is_empty() {
                             view.open_browser_landing_session(active_session, cx);
                         }
-                        if view
+                        let url_matches = view
                             .node_input_state
                             .as_ref()
-                            .is_some_and(|input| input.read(cx).value().as_ref() == submitted_value)
-                        {
+                            .is_some_and(|input| input.read(cx).value().trim() == submitted_url);
+                        let token_matches = view
+                            .node_token_input_state
+                            .as_ref()
+                            .is_none_or(|input| input.read(cx).value().trim() == submitted_token);
+                        if url_matches && token_matches {
                             view.clear_node_on_render = true;
                         }
                     }
@@ -2426,6 +2428,7 @@ impl LoomView {
                             Some(&token),
                             false,
                         );
+                        view.settings_scroll_handle.scroll_to_bottom();
                     }
                     Err(_) => {}
                 }

@@ -3118,7 +3118,7 @@ pub(crate) fn worker_connection_failure_detail(
         return "Could not read this worker's saved credential from the OS credential store. Re-enter its URL and access token.".to_owned();
     }
     if stage == WorkerConnectionStage::InputValidation {
-        return "Enter a worker URL followed by its access token.".to_owned();
+        return "Enter the worker URL, for example ws://127.0.0.1:8765/ws.".to_owned();
     }
     if matches!(
         error.code,
@@ -3269,6 +3269,48 @@ pub(crate) fn safe_worker_url_label(url: &str) -> String {
         .next()
         .unwrap_or(without_query)
         .to_owned()
+}
+
+/// Validates a worker URL entered in the first-run setup or Settings -> Workers
+/// form. The access token lives in its own masked field, so URLs carrying
+/// whitespace or embedded credentials are rejected before any connection row is
+/// created.
+pub(crate) fn validate_worker_connect_url(url: &str, allow_ssh: bool) -> Result<(), String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("Enter the worker URL, for example ws://127.0.0.1:8765/ws.".to_owned());
+    }
+    if url.split_whitespace().count() > 1 {
+        return Err(
+            "Enter only the worker URL here. Enter the access token in its own field.".to_owned(),
+        );
+    }
+    if worker_url_embeds_credential(url) {
+        return Err(
+            "Do not include credentials in the URL. Enter the access token in its own field."
+                .to_owned(),
+        );
+    }
+    if !allow_ssh && is_ssh_worker_url(url) {
+        return Err(
+            "SSH deployment is only available in the native client. Connect the browser to a \
+             ws:// or wss:// worker instead."
+                .to_owned(),
+        );
+    }
+    let valid_scheme = url.starts_with("ws://")
+        || url.starts_with("wss://")
+        || (allow_ssh && is_ssh_worker_url(url));
+    if !valid_scheme {
+        return Err(if allow_ssh {
+            "Invalid worker URL. Use a ws:// or wss:// WebSocket URL, or ssh://user@host."
+        } else {
+            "Invalid worker URL. Use a ws:// or wss:// WebSocket URL with the worker's WebSocket \
+             path."
+        }
+        .to_owned());
+    }
+    Ok(())
 }
 
 pub(crate) fn worker_url_embeds_credential(url: &str) -> bool {

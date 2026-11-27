@@ -137,7 +137,7 @@ fn connection_error_details_are_actionable_and_do_not_echo_tokens() {
         &LoomError::invalid_request("empty input"),
         None,
     );
-    assert!(input.contains("URL followed by its access token"));
+    assert!(input.contains("Enter the worker URL"));
     let cancelled = worker_connection_failure_detail(
         WorkerConnectionStage::Negotiation,
         &LoomError::new(ErrorCode::RequestCancelled, "closed", false),
@@ -317,6 +317,38 @@ fn duplicate_connection_attempts_are_blocked_and_url_labels_hide_credentials() {
     assert!(!worker_url_embeds_credential(
         "wss://worker.example/ws?theme=dark"
     ));
+
+    // Shared URL validation covers empty input, pasted `URL token`, embedded
+    // credentials, invalid schemes, and browser-side SSH rejection.
+    assert!(
+        super::validate_worker_connect_url("", true)
+            .unwrap_err()
+            .contains("Enter the worker URL")
+    );
+    assert!(
+        super::validate_worker_connect_url("ws://127.0.0.1:9999/ws dummy-token", true)
+            .unwrap_err()
+            .contains("its own field")
+    );
+    assert!(
+        super::validate_worker_connect_url("ws://user:dummy@127.0.0.1:9999/ws", true)
+            .unwrap_err()
+            .contains("Do not include credentials")
+    );
+    let native_bad = super::validate_worker_connect_url("not-a-url", true).unwrap_err();
+    assert!(native_bad.contains("ws:// or wss://"));
+    assert!(native_bad.contains("ssh://"));
+    let wasm_bad = super::validate_worker_connect_url("not-a-url", false).unwrap_err();
+    assert!(wasm_bad.contains("ws:// or wss://"));
+    assert!(!wasm_bad.contains("ssh://"));
+    assert!(super::validate_worker_connect_url("ssh://dev@box", true).is_ok());
+    assert!(
+        super::validate_worker_connect_url("ssh://dev@box", false)
+            .unwrap_err()
+            .contains("native client")
+    );
+    assert!(super::validate_worker_connect_url("ws://127.0.0.1:9999/ws", true).is_ok());
+    assert!(super::validate_worker_connect_url("wss://worker.example/ws", false).is_ok());
 }
 
 #[test]

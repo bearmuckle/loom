@@ -179,6 +179,7 @@ impl LoomView {
         node.connection_detail = Some(detail);
     }
 
+    #[cfg(any(not(target_family = "wasm"), test))]
     pub(crate) fn set_worker_node_connection_failure(
         &mut self,
         id: u64,
