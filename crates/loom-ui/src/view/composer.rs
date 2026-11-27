@@ -39,18 +39,45 @@ impl LoomView {
     /// Starts editing the composer from a tap anywhere in the field.
     ///
     /// The composer field's wrapper calls this so a tap on the padding around
-    /// the text element also focuses the input. The keyboard request must run
-    /// inside the tap's own user gesture on platforms that require one,
-    /// because the web platform raises the virtual keyboard only from its
-    /// `pointerup` heuristic, which additionally requires the tap to land
-    /// inside the text element's own bounds and therefore never fires for the
-    /// padding.
+    /// the text element also focuses the input. Touch taps in GPUI resolve into
+    /// a synthesized `MouseDown`/`MouseUp` synchronously inside the browser's
+    /// `pointerup` user gesture, and `track_focus` calls `prevent_default()`,
+    /// which skips the web platform's fallback `pointerup` keyboard heuristic.
+    /// Requesting the keyboard explicitly here keeps padding taps and direct
+    /// focus actions (such as "Answer in your own words") raising the software
+    /// keyboard inside the gesture.
     pub(crate) fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.session_permissions().can_act {
+            return;
+        }
         let Some(input) = self.composer_input.clone() else {
             return;
         };
         input.update(cx, |state, cx| state.focus(window, cx));
         window.request_virtual_keyboard();
+    }
+
+    /// Focuses the composer from a pointer or touch tap on the field wrapper.
+    ///
+    /// When the tap landed inside the inner `Textarea`, `gpui-base` already
+    /// focused the input, placed the caret, marked default prevented via
+    /// `track_focus`, and (for touch) requested the virtual keyboard; skipping
+    /// a second request avoids duplicate `blur()`/`focus()` cycles on mobile
+    /// browsers. Taps on the wrapper's padding bypass the inner text element,
+    /// so this focuses the composer and requests the keyboard explicitly.
+    pub(crate) fn focus_composer_on_tap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::Focusable as _;
+
+        if !self.session_permissions().can_act {
+            return;
+        }
+        let Some(input) = self.composer_input.clone() else {
+            return;
+        };
+        if input.read(cx).focus_handle(cx).is_focused(window) && window.default_prevented() {
+            return;
+        }
+        self.focus_composer(window, cx);
     }
 
     pub(crate) fn run_slash_command(&mut self, text: &str, cx: &mut Context<Self>) {

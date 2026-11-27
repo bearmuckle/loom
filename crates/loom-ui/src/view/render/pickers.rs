@@ -424,19 +424,21 @@ impl LoomView {
                                     .flex()
                                     .flex_col()
                                     .gap_2()
-                                    .child(
+                                    .child(focusable_input(
+                                        &url_input,
                                         KitInput::new(&url_input)
                                             .id("worker-setup-url")
                                             .aria_label("Worker URL")
                                             .small(),
-                                    )
-                                    .child(
+                                    ))
+                                    .child(focusable_input(
+                                        &token_input,
                                         KitInput::new(&token_input)
                                             .id("worker-setup-token")
                                             .aria_label("Access token (optional)")
                                             .content_type(InputContentType::Password)
                                             .small(),
-                                    )
+                                    ))
                                     .child(
                                         div().flex().justify_end().child(
                                             Button::new("worker-setup-connect")

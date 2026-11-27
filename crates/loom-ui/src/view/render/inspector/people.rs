@@ -113,7 +113,10 @@ impl LoomView {
                     }),
             );
             if let Some(input) = self.access_note_input.as_ref() {
-                body = body.child(KitInput::new(input).id("access-request-note").small());
+                body = body.child(focusable_input(
+                    input,
+                    KitInput::new(input).id("access-request-note").small(),
+                ));
             }
             body = body
                 .child(controls)
@@ -252,11 +255,12 @@ impl LoomView {
                             ),
                     )
                     .when_some(self.access_deny_inputs.get(&request_id), |row, input| {
-                        row.child(
+                        row.child(focusable_input(
+                            input,
                             KitInput::new(input)
                                 .id(("access-deny-reason", index))
                                 .small(),
-                        )
+                        ))
                     }),
             );
         }

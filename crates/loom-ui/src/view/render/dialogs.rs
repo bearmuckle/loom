@@ -173,17 +173,19 @@ impl LoomView {
                         .text_color(rgb(0x8f98a6))
                         .child(format!("Current name: {}", dialog.session.name)),
                 )
-                .child(
-                    div().mt_3().child(
-                        KitInput::new(
-                            self.rename_input_state
-                                .as_ref()
-                                .expect("rename input initialized before rendering"),
-                        )
-                        .id("rename-session-input")
-                        .small(),
-                    ),
-                )
+                .child({
+                    let rename_input = self
+                        .rename_input_state
+                        .as_ref()
+                        .expect("rename input initialized before rendering");
+                    focusable_input(
+                        rename_input,
+                        KitInput::new(rename_input)
+                            .id("rename-session-input")
+                            .small(),
+                    )
+                    .mt_3()
+                })
                 .child(
                     div()
                         .mt_3()
@@ -267,17 +269,19 @@ impl LoomView {
                             dialog.parent_name
                         )),
                 )
-                .child(
-                    div().mt_3().child(
-                        KitInput::new(
-                            self.sub_project_input_state
-                                .as_ref()
-                                .expect("sub project input initialized before rendering"),
-                        )
-                        .id("sub-project-name-input")
-                        .small(),
-                    ),
-                )
+                .child({
+                    let sub_project_input = self
+                        .sub_project_input_state
+                        .as_ref()
+                        .expect("sub project input initialized before rendering");
+                    focusable_input(
+                        sub_project_input,
+                        KitInput::new(sub_project_input)
+                            .id("sub-project-name-input")
+                            .small(),
+                    )
+                    .mt_3()
+                })
                 .child(
                     div()
                         .mt_3()
@@ -485,26 +489,26 @@ impl LoomView {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_h(px(34.))
-                                .px_2()
-                                .rounded_sm()
-                                .bg(rgb(0x0f1115))
-                                .border_1()
-                                .border_color(rgb(0x3b4555))
-                                .child(
-                                    KitInput::new(
-                                        self.source_path_input
-                                            .as_ref()
-                                            .expect("source input initialized before rendering"),
-                                    )
+                        .child({
+                            let source_input = self
+                                .source_path_input
+                                .as_ref()
+                                .expect("source input initialized before rendering");
+                            focusable_input(
+                                source_input,
+                                KitInput::new(source_input)
                                     .id("local-session-directory-path")
                                     .appearance(false)
                                     .bordered(false),
-                                ),
-                        )
+                            )
+                            .flex_1()
+                            .min_h(px(34.))
+                            .px_2()
+                            .rounded_sm()
+                            .bg(rgb(0x0f1115))
+                            .border_1()
+                            .border_color(rgb(0x3b4555))
+                        })
                         .when(cfg!(not(target_family = "wasm")), |row| {
                             row.child(
                                 Button::new("browse-local-session-directory")
@@ -614,16 +618,16 @@ impl LoomView {
                         .child("Find another repository")
                         .child(div().flex_1().h(px(1.)).bg(rgb(0x232c39))),
                 );
-                github_body = github_body.child(
-                    KitInput::new(
-                        self.repository_filter_input
-                            .as_ref()
-                            .expect("repository filter initialized before rendering"),
-                    )
-                    .id("github-repository-filter")
-                    .small()
-                    .into_any_element(),
-                );
+                let filter_input = self
+                    .repository_filter_input
+                    .as_ref()
+                    .expect("repository filter initialized before rendering");
+                github_body = github_body.child(focusable_input(
+                    filter_input,
+                    KitInput::new(filter_input)
+                        .id("github-repository-filter")
+                        .small(),
+                ));
                 github_body = if !query_ready {
                     github_body.child(
                     div()
@@ -1926,21 +1930,23 @@ impl LoomView {
                             .flex_col()
                             .gap_2()
                             .when_some(self.node_input_state.as_ref(), |form, url_input| {
-                                form.child(
+                                form.child(focusable_input(
+                                    url_input,
                                     KitInput::new(url_input)
                                         .id("worker-node-url-input")
                                         .aria_label("Worker URL")
                                         .small(),
-                                )
+                                ))
                             })
                             .when_some(self.node_token_input_state.as_ref(), |form, token_input| {
-                                form.child(
+                                form.child(focusable_input(
+                                    token_input,
                                     KitInput::new(token_input)
                                         .id("worker-node-token-input")
                                         .aria_label("Access token (optional)")
                                         .content_type(InputContentType::Password)
                                         .small(),
-                                )
+                                ))
                             })
                             .child(
                                 div().flex().justify_end().child(
@@ -2344,11 +2350,14 @@ impl LoomView {
                         .pb_3();
                     if let Some(input) = self.provider_api_key_inputs.get(&provider.id) {
                         actions = actions.child(
-                            div().flex_1().min_w(px(160.)).child(
+                            focusable_input(
+                                input,
                                 KitInput::new(input)
                                     .id(format!("provider-api-key-input-{}", provider.id.as_str()))
                                     .small(),
-                            ),
+                            )
+                            .flex_1()
+                            .min_w(px(160.)),
                         );
                     }
                     let save_id = provider_id.clone();
@@ -2474,7 +2483,10 @@ impl LoomView {
                         .flex_col()
                         .gap_1()
                         .child(div().text_xs().text_color(rgb(0x8f98a6)).child(label))
-                        .child(KitInput::new(input).id(format!("{id}-input")).small()),
+                        .child(focusable_input(
+                            input,
+                            KitInput::new(input).id(format!("{id}-input")).small(),
+                        )),
                 );
             }
         }

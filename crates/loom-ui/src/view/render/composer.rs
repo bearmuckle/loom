@@ -229,15 +229,15 @@ impl LoomView {
                             .p_3()
                             // The wrapper, not only the text element, is the
                             // field's tap target: a tap on the padding must
-                            // start editing, and the keyboard request has to
-                            // happen inside that tap's user gesture because
-                            // the web platform raises the virtual keyboard
-                            // only from its own `pointerup` heuristic, which
-                            // requires the tap to be inside the text element.
+                            // start editing and request the virtual keyboard
+                            // inside the tap's user gesture without duplicating
+                            // the inner textarea's own touch keyboard request.
                             .cursor_text()
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|this, _, window, cx| this.focus_composer(window, cx)),
+                                cx.listener(|this, _, window, cx| {
+                                    this.focus_composer_on_tap(window, cx);
+                                }),
                             )
                             .child(
                                 Textarea::new(composer)
@@ -693,6 +693,12 @@ impl LoomView {
                             .gap_2()
                             .border_b_1()
                             .border_color(rgb(0x293244))
+                            .when_some(self.command_palette_input.clone(), |row, input| {
+                                row.cursor_text()
+                                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                        focus_input_on_tap(&input, window, cx)
+                                    })
+                            })
                             .child(
                                 Icon::new(command_palette_icon())
                                     .size_4()

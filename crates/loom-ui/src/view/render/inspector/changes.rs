@@ -39,10 +39,9 @@ impl LoomView {
         let mut visible_repository_files = 0usize;
         if let Some(input) = self.review_filter_input.as_ref() {
             body = body.child(
-                div()
+                focusable_input(input, KitInput::new(input).id("review-file-filter").small())
                     .w_full()
-                    .pb_1()
-                    .child(KitInput::new(input).id("review-file-filter").small()),
+                    .pb_1(),
             );
         }
 
