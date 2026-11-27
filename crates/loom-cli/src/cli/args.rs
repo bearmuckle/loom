@@ -3996,14 +3996,14 @@ fn no_positionals(verb: &str, rest: &[String]) -> Result<(), String> {
 /// so the URL a cursor file is scoped to is the one that was connected to. An
 /// empty or whitespace-only environment value is treated as unset, so it never
 /// produces an unusable link.
-pub(crate) fn resolve_connect(flag: Option<String>, environment: Option<String>) -> String {
+pub fn resolve_connect(flag: Option<String>, environment: Option<String>) -> String {
     flag.or_else(|| environment.filter(|url| !url.trim().is_empty()))
         .unwrap_or_else(|| DEFAULT_CONNECT_URL.to_owned())
 }
 
 /// Where a command reads its bearer token.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TokenFile {
+pub struct TokenFile {
     pub path: PathBuf,
     /// The worker URL the path was derived from, or `None` when the caller named
     /// the file. A read error names it, so a missing default says which URL it
@@ -4026,7 +4026,7 @@ pub(crate) struct TokenFile {
 ///
 /// A blank environment value is treated as unset, like `LOOM_URL`, so an empty
 /// variable falls through to the derived path instead of naming no file.
-pub(crate) fn resolve_token_file(
+pub fn resolve_token_file(
     flag: Option<PathBuf>,
     environment: Option<PathBuf>,
     home: Option<&Path>,

@@ -4717,6 +4717,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-mcp"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "env_logger",
+ "log",
+ "loom-cli",
+ "loom-core",
+ "loom-protocol",
+ "loom-server",
+ "reqwest",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "loom-model"
 version = "0.1.0"
 dependencies = [
