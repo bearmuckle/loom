@@ -961,7 +961,7 @@ capabilities; Agent Client Protocol (ACP v1) stays inside the worker.
   harness `remote_session_id`, and `available_models` from the harness catalog.
   Updates emit `ServerEvent::AgentSessionBackendUpdated`.
 - **Requests**:
-  - `Workspace/CreateAcpAgentSessionInWorkspace { workspace_id, name, harness, command?, auth_method?, interactive }`
-  - `Provider/ProbeAcpHarness { harness, command?, auth_method? }` → `Provider/AcpHarnessProbe`
+  - `Workspace/CreateAcpAgentSessionInWorkspace { workspace_id, name, harness, auth_method?, interactive }` (requires `AcpAgentSessions` + `CreateAgentSession`, workspace-authorized; harness command is configured strictly on the worker side, never over the wire)
+  - `Provider/ProbeAcpHarness { harness, auth_method? }` → `Provider/AcpHarnessProbe` (requires unrestricted operator scope + `AcpAgentSessions` + `ConfigureProviders`)
 - See [antigravity-acp.md](antigravity-acp.md) for Antigravity (`agy acp`)
   setup, auth methods, interactive-only enforcement, and policy disclosures.

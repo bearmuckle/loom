@@ -486,7 +486,7 @@ impl InProcessBackend {
             let mut snapshot = summary.snapshot.clone();
             let run_state = snapshot.state;
             let usage = summary.usage.clone();
-            self.sessions()?.get(snapshot.session_id)?;
+            let session = self.sessions()?.get(snapshot.session_id)?;
             run_summaries.insert(
                 run_id,
                 PersistedRunSummary {
@@ -505,10 +505,15 @@ impl InProcessBackend {
                     .map(|state| state.pending_project_join.is_some()),
             );
             if safely_deferred {
-                if matches!(
+                let needs_pause_recovery = matches!(
                     run_state,
                     AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
-                ) {
+                ) || (session.is_acp()
+                    && matches!(
+                        run_state,
+                        AgentRunState::AwaitingApproval | AgentRunState::NeedsInput
+                    ));
+                if needs_pause_recovery {
                     let updated_at = Timestamp::now();
                     snapshot.state = AgentRunState::Paused;
                     snapshot.updated_at = updated_at;
@@ -521,6 +526,25 @@ impl InProcessBackend {
                         )
                     })?;
                     execution.state = AgentRunState::Paused;
+                    let mut recovered_interactions = None;
+                    if session.is_acp() {
+                        // The previous ACP harness child died when the worker stopped,
+                        // so any pending live permission prompt can no longer be answered.
+                        execution.pending_approval = None;
+                        execution.pending_input = None;
+                        let mut interactions = persistence.load_run_interactions(run_id)?;
+                        let mut changed = false;
+                        for interaction in &mut interactions {
+                            if interaction.status == loom_model::AgentInteractionStatus::Pending {
+                                interaction.status = loom_model::AgentInteractionStatus::Abandoned;
+                                interaction.resolved_at = Some(updated_at);
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            recovered_interactions = Some(interactions);
+                        }
+                    }
                     let mut attempts = persistence.load_run_attempts(run_id)?;
                     let attempt_count = attempts.len();
                     let attempt = attempts
@@ -568,7 +592,7 @@ impl InProcessBackend {
                     summary.snapshot = snapshot.clone();
                     summary.attempts = Some(attempts);
                     summary.execution_state = execution_state;
-                    summary.interactions = None;
+                    summary.interactions = recovered_interactions;
                     recovery_updates.insert(run_id, summary);
                     run_summaries.insert(
                         run_id,
@@ -641,6 +665,55 @@ impl InProcessBackend {
                 ));
             }
             let session = self.sessions()?.get(runtime_state.session_id)?;
+            if session.is_acp() {
+                let mut recovery_events = Vec::new();
+                if matches!(
+                    runtime_state.run.state,
+                    AgentRunState::Planning
+                        | AgentRunState::Executing
+                        | AgentRunState::Evaluating
+                        | AgentRunState::AwaitingApproval
+                        | AgentRunState::NeedsInput
+                ) {
+                    let now = Timestamp::now();
+                    runtime_state.run.state = AgentRunState::Paused;
+                    runtime_state.run.updated_at = now;
+                    runtime_state.run.completed_at = None;
+                    runtime_state.pending_approval = None;
+                    runtime_state.pending_input = None;
+                    runtime_state.active_message_id = None;
+                    for interaction in &mut runtime_state.interactions {
+                        if interaction.status == loom_model::AgentInteractionStatus::Pending {
+                            interaction.status = loom_model::AgentInteractionStatus::Abandoned;
+                            interaction.resolved_at = Some(now);
+                        }
+                    }
+                    if let Some(attempt) = runtime_state
+                        .attempts
+                        .iter_mut()
+                        .find(|attempt| attempt.id == runtime_state.run.attempt_id)
+                    {
+                        attempt.state = AgentRunState::Paused;
+                        attempt.completed_at = None;
+                    }
+                    recovery_events.push(AgentEvent::RunStateChanged {
+                        run_id,
+                        state: AgentRunState::Paused,
+                    });
+                }
+                let handle = Arc::new(RunHandle::new_acp(runtime_state));
+                if !recovery_events.is_empty()
+                    && let Some(summary) = run_summaries.get_mut(&run_id)
+                {
+                    summary.snapshot = handle.state().run;
+                }
+                restored_runs.insert(run_id, handle);
+                if !recovery_events.is_empty() {
+                    self.append_recovery_events(session.id, recovery_events)?;
+                    needs_persist = true;
+                }
+                continue;
+            }
             let workspace = self.restore_session_filesystem(session.id)?;
             let mut recovery_reason = None;
             let provider = match self.provider_for_run(

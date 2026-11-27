@@ -14,6 +14,7 @@
 
 pub mod antigravity;
 pub mod client;
+#[cfg(any(test, feature = "test-support"))]
 pub mod stub;
 
 #[cfg(test)]
@@ -152,22 +153,15 @@ pub struct AcpPermissionRequest {
 }
 
 impl AcpPermissionRequest {
-    /// Selects the preferred allow option id offered by the agent.
+    /// Selects a single-action allow option id offered by the agent.
+    ///
+    /// Never selects `"allow_always"` (which would silently disable future
+    /// interactive approvals) and never falls back to an arbitrary first option.
     pub fn allow_option_id(&self) -> Option<&str> {
         self.options
             .iter()
             .find(|option| option.kind == "allow_once")
-            .or_else(|| {
-                self.options
-                    .iter()
-                    .find(|option| option.kind == "allow_always")
-            })
-            .or_else(|| {
-                self.options
-                    .iter()
-                    .find(|option| option.kind.starts_with("allow"))
-            })
-            .or_else(|| self.options.first())
+            .or_else(|| self.options.iter().find(|option| option.kind == "allow"))
             .map(|option| option.option_id.as_str())
     }
 
@@ -245,6 +239,7 @@ pub enum AcpNext {
 
 pub use antigravity::{
     ANTIGRAVITY_COMMAND_ENV, AntigravityRunContext, antigravity_notices, check_interactive_only,
-    check_interactive_only_with_env, discover_antigravity_command, validate_auth_method,
+    check_interactive_only_with_ci_policy, check_interactive_only_with_env,
+    discover_antigravity_command, redact_acp_text, validate_auth_method,
 };
-pub use client::AcpClient;
+pub use client::{AcpClient, AcpKillHandle};

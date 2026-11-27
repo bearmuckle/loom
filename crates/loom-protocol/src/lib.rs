@@ -15,18 +15,7 @@ pub use loom_core::{
     ANTIGRAVITY_AUTH_GEMINI_API_KEY, ANTIGRAVITY_AUTH_OAUTH_PERSONAL, ANTIGRAVITY_HARNESS_ID,
     ANTIGRAVITY_INTERACTIONS_NOTICE, ANTIGRAVITY_TERMS_RISK_NOTICE,
     ANTIGRAVITY_UNREGISTERED_CLIENT_NOTICE, AcpCapabilities, AcpModelCatalogEntry,
-    AcpSessionBackend, CURRENT_PROTOCOL_VERSION, Checkpoint, CheckpointFile, ClonedRepository,
-    ContextAssemblyOptions, ContextBudget, ContextFileKind, ContextFileReference,
-    ContextInspection, ContextItem, ContextItemKind, ContextSummary,
-    DEFAULT_RUN_ADMISSION_TIMEOUT_SECS, GITHUB_REPOSITORY_QUERY_MIN_CHARS, GitHubRepository,
-    JevPolicy, JevSettings, MAX_PROJECT_AGENT_CONCURRENCY, MAX_RUN_ADMISSION_TIMEOUT_SECS,
-    MIN_PROJECT_AGENT_CONCURRENCY, MIN_RUN_ADMISSION_TIMEOUT_SECS, ProjectJevPolicy, RevertResult,
-    SessionBackendDescriptor, SessionDirectory, SessionFilesystemChange, SessionFilesystemFile,
-    SessionFilesystemSnapshot, SessionJevPolicy, SessionRepository, TaskArtifact, TaskEvent,
-    TaskEventRecord, TaskEvidenceLink, TaskKind, TaskSnapshot, TaskSpec, TaskStatus, TerminalEvent,
-    TerminalEventRecord, TerminalSnapshot, TerminalStatus, TerminalStream, UndoResult,
-    WorkerNodeConfig, WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl, WorkspaceEdit,
-    WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind, WorkspaceRecord,
+    AcpSessionBackend, SessionBackendDescriptor,
 };
 pub use loom_core::{
     AccessRequestDecision, AccessRequestId, CredentialId, GitHubSignInStatus,
@@ -37,6 +26,20 @@ pub use loom_core::{
 pub use loom_core::{
     Author, CollaborationEntry, CollaborationEntryKind, MAX_COLLABORATION_TEXT_BYTES, Recipient,
     RunControlAction, RunRevision,
+};
+pub use loom_core::{
+    CURRENT_PROTOCOL_VERSION, Checkpoint, CheckpointFile, ClonedRepository, ContextAssemblyOptions,
+    ContextBudget, ContextFileKind, ContextFileReference, ContextInspection, ContextItem,
+    ContextItemKind, ContextSummary, DEFAULT_RUN_ADMISSION_TIMEOUT_SECS,
+    GITHUB_REPOSITORY_QUERY_MIN_CHARS, GitHubRepository, JevPolicy, JevSettings,
+    MAX_PROJECT_AGENT_CONCURRENCY, MAX_RUN_ADMISSION_TIMEOUT_SECS, MIN_PROJECT_AGENT_CONCURRENCY,
+    MIN_RUN_ADMISSION_TIMEOUT_SECS, ProjectJevPolicy, RevertResult, SessionDirectory,
+    SessionFilesystemChange, SessionFilesystemFile, SessionFilesystemSnapshot, SessionJevPolicy,
+    SessionRepository, TaskArtifact, TaskEvent, TaskEventRecord, TaskEvidenceLink, TaskKind,
+    TaskSnapshot, TaskSpec, TaskStatus, TerminalEvent, TerminalEventRecord, TerminalSnapshot,
+    TerminalStatus, TerminalStream, UndoResult, WorkerNodeConfig, WorkspaceChangeKind,
+    WorkspaceConfig, WorkspaceControl, WorkspaceEdit, WorkspaceEditResult, WorkspaceEntry,
+    WorkspaceEntryKind, WorkspaceRecord,
 };
 pub use loom_core::{
     GitBranch, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,

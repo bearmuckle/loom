@@ -11,7 +11,7 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         Arc, Mutex,
-        mpsc::{self, Receiver, RecvTimeoutError},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
     },
     thread,
     time::{Duration, Instant},
@@ -27,7 +27,8 @@ use super::{
     ACP_PROTOCOL_VERSION, AcpAuthMethod, AcpEvent, AcpInitializeResult, AcpNext, AcpOptions,
     AcpPermissionOption, AcpPermissionOutcome, AcpPermissionRequest, AcpPlanEntry, AcpPromptResult,
     AcpSessionInfo, AcpToolCall, AcpToolCallUpdate, AcpUsageUpdate, LOOM_ACP_CLIENT_NAME,
-    LOOM_ACP_CLIENT_TITLE, LOOM_ACP_CLIENT_VERSION, antigravity::validate_auth_method,
+    LOOM_ACP_CLIENT_TITLE, LOOM_ACP_CLIENT_VERSION,
+    antigravity::{redact_acp_text, validate_auth_method},
 };
 
 /// Bound kept from stderr for error reports (matches `loom-harness` / `loom-process` bounds).
@@ -36,6 +37,8 @@ const STDERR_TAIL_BYTES: usize = 16 * 1024;
 const MAX_JSON_LINE_BYTES: usize = 16 * 1024 * 1024;
 /// Bound on a single forwarded stderr line.
 const MAX_STDERR_LINE_BYTES: usize = 4 * 1024;
+/// Bounded wire-message channel capacity so an unpolled child cannot grow memory without limit.
+const WIRE_CHANNEL_CAPACITY: usize = 4096;
 /// Poll quantum while awaiting handshake/auth responses.
 const WAIT_POLL: Duration = Duration::from_millis(50);
 
@@ -61,9 +64,25 @@ struct JsonRpcError {
     message: String,
 }
 
+/// Out-of-band kill handle for terminating an [`AcpClient`] child process
+/// without blocking on a turn loop that owns `&mut AcpClient`.
+#[derive(Clone)]
+pub struct AcpKillHandle {
+    child: Arc<Mutex<Child>>,
+}
+
+impl AcpKillHandle {
+    /// Kills and reaps the underlying child process if it is still alive.
+    pub fn kill(&self) {
+        let mut child = self.child.lock().unwrap_or_else(|error| error.into_inner());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 /// One live supervised ACP harness subprocess.
 pub struct AcpClient {
-    child: Child,
+    child: Arc<Mutex<Child>>,
     stdin: Option<ChildStdin>,
     rx: Receiver<WireMessage>,
     stderr_tail: Arc<Mutex<String>>,
@@ -144,7 +163,7 @@ impl AcpClient {
         })?;
         let stderr = child.stderr.take();
 
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(WIRE_CHANNEL_CAPACITY);
         let stdout_tx = tx.clone();
         thread::Builder::new()
             .name("loom-acp-stdout".to_owned())
@@ -167,7 +186,7 @@ impl AcpClient {
         }
 
         Ok(Self {
-            child,
+            child: Arc::new(Mutex::new(child)),
             stdin,
             rx,
             stderr_tail,
@@ -175,6 +194,14 @@ impl AcpClient {
             command_display: options.command.display.clone(),
             active_prompt_id: None,
         })
+    }
+
+    /// Returns a cloneable handle that can terminate this subprocess without
+    /// waiting for `&mut AcpClient`.
+    pub fn kill_handle(&self) -> AcpKillHandle {
+        AcpKillHandle {
+            child: Arc::clone(&self.child),
+        }
     }
 
     /// Performs ACP `initialize` using Loom's own `clientInfo` (`loom` + crate version).
@@ -434,9 +461,72 @@ impl AcpClient {
         }
     }
 
+    /// Non-blocking poll for one queued wire event (drains unsupported client
+    /// requests automatically so the harness does not stall while waiting on
+    /// an operator permission decision).
+    pub fn try_next_event(&mut self) -> AcpNext {
+        loop {
+            match self.rx.try_recv() {
+                Ok(WireMessage::Event(event)) => return AcpNext::Event(Box::new(event)),
+                Ok(WireMessage::UnsupportedClientRequest { id, method }) => {
+                    let _ = self.respond_method_not_found(&id, &method);
+                }
+                Ok(WireMessage::Response { id, result, error }) => {
+                    if let Some(event) = self.handle_prompt_response(id, result, error) {
+                        return AcpNext::Event(Box::new(event));
+                    }
+                }
+                Ok(WireMessage::StdoutClosed) | Err(TryRecvError::Disconnected) => {
+                    let exit_code = self.try_exit_code();
+                    return AcpNext::Exited {
+                        exit_code,
+                        stderr_tail: self.stderr_tail(),
+                    };
+                }
+                Err(TryRecvError::Empty) => return AcpNext::Idle,
+            }
+        }
+    }
+
+    fn handle_prompt_response(
+        &mut self,
+        id: u64,
+        result: Option<Value>,
+        error: Option<JsonRpcError>,
+    ) -> Option<AcpEvent> {
+        if self.active_prompt_id == Some(id) {
+            self.active_prompt_id = None;
+            if let Some(error) = error {
+                return Some(AcpEvent::PromptFailed {
+                    request_id: id,
+                    code: error.code,
+                    message: error.message,
+                });
+            }
+            let payload = result.unwrap_or(Value::Null);
+            let stop_reason = payload
+                .get("stopReason")
+                .and_then(Value::as_str)
+                .unwrap_or("end_turn")
+                .to_owned();
+            let usage = payload.get("usage").and_then(parse_usage_update);
+            return Some(AcpEvent::PromptFinished(AcpPromptResult {
+                request_id: id,
+                stop_reason,
+                usage,
+            }));
+        }
+        log::debug!(
+            "[loom-harness::acp] ignored out-of-band response for id {id} from '{}'",
+            self.command_display
+        );
+        None
+    }
+
     /// Returns whether the child process has already exited.
     pub fn has_exited(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_)))
+        let mut child = self.child.lock().unwrap_or_else(|error| error.into_inner());
+        matches!(child.try_wait(), Ok(Some(_)))
     }
 
     /// Returns the bounded tail of the child's stderr.
@@ -450,18 +540,23 @@ impl AcpClient {
     /// Kills and reaps the child subprocess cleanly.
     pub fn kill(&mut self) {
         self.stdin = None;
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let mut child = self.child.lock().unwrap_or_else(|error| error.into_inner());
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     fn try_exit_code(&mut self) -> Option<i32> {
-        if let Ok(Some(status)) = self.child.try_wait() {
-            return status.code();
+        {
+            let mut child = self.child.lock().unwrap_or_else(|error| error.into_inner());
+            if let Ok(Some(status)) = child.try_wait() {
+                return status.code();
+            }
         }
         // Give the child a brief window to finish exiting after closing stdout.
         for _ in 0..10 {
             thread::sleep(Duration::from_millis(5));
-            if let Ok(Some(status)) = self.child.try_wait() {
+            let mut child = self.child.lock().unwrap_or_else(|error| error.into_inner());
+            if let Ok(Some(status)) = child.try_wait() {
                 return status.code();
             }
         }
@@ -608,7 +703,7 @@ impl Drop for AcpClient {
     }
 }
 
-fn read_stdout_loop(stdout: impl Read, tx: mpsc::Sender<WireMessage>) {
+fn read_stdout_loop(stdout: impl Read, tx: SyncSender<WireMessage>) {
     let mut reader = BufReader::new(stdout);
     let mut buf = Vec::new();
     loop {
@@ -666,7 +761,7 @@ fn read_bounded_line(
     }
 }
 
-fn read_stderr_loop(stderr: impl Read, tail: &Mutex<String>, tx: mpsc::Sender<WireMessage>) {
+fn read_stderr_loop(stderr: impl Read, tail: &Mutex<String>, tx: SyncSender<WireMessage>) {
     let mut reader = BufReader::new(stderr);
     let mut buf = Vec::new();
     loop {
@@ -677,10 +772,11 @@ fn read_stderr_loop(stderr: impl Read, tail: &Mutex<String>, tx: mpsc::Sender<Wi
         if read == 0 {
             break;
         }
-        let line = String::from_utf8_lossy(&buf);
+        let raw_line = String::from_utf8_lossy(&buf);
+        let redacted = redact_acp_text(&raw_line);
         {
             let mut guard = tail.lock().unwrap_or_else(|error| error.into_inner());
-            guard.push_str(&line);
+            guard.push_str(&redacted);
             if guard.len() > STDERR_TAIL_BYTES {
                 let mut cut = guard.len() - STDERR_TAIL_BYTES;
                 while !guard.is_char_boundary(cut) {
@@ -689,9 +785,12 @@ fn read_stderr_loop(stderr: impl Read, tail: &Mutex<String>, tx: mpsc::Sender<Wi
                 guard.drain(..cut);
             }
         }
-        let trimmed = line.trim();
+        let trimmed = redacted.trim();
         if !trimmed.is_empty() {
-            let _ = tx.send(WireMessage::Event(AcpEvent::StderrLine(trimmed.to_owned())));
+            // Non-blocking send so noisy stderr never backpressures or deadlocks
+            // the stderr pipe when the receiver is busy; stderr_tail retains the
+            // bounded tail regardless.
+            let _ = tx.try_send(WireMessage::Event(AcpEvent::StderrLine(trimmed.to_owned())));
         }
     }
 }

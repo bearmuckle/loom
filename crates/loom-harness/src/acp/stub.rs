@@ -229,6 +229,115 @@ pub fn run_stub_stdio() {
                         );
                         std::process::exit(42);
                     }
+                    "hang" => {
+                        send(
+                            &mut stdout,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "method": "session/update",
+                                "params": {
+                                    "sessionId": session_id,
+                                    "update": {
+                                        "sessionUpdate": "agent_message_chunk",
+                                        "content": { "type": "text", "text": "wedged..." }
+                                    }
+                                }
+                            }),
+                        );
+                        // Deliberately ignore session/cancel and wait until killed
+                        // so cancel-grace kill and turn-timeout paths are testable.
+                        loop {
+                            line.clear();
+                            match reader.read_line(&mut line) {
+                                Ok(0) | Err(_) => return,
+                                Ok(_) => {
+                                    if let Ok(incoming) = serde_json::from_str::<Value>(line.trim())
+                                    {
+                                        record(&incoming);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "unsupported_req" => {
+                        send(
+                            &mut stdout,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": "client-req-42",
+                                "method": "custom/unsupported_ping",
+                                "params": {}
+                            }),
+                        );
+                        loop {
+                            line.clear();
+                            let Ok(n) = reader.read_line(&mut line) else {
+                                return;
+                            };
+                            if n == 0 {
+                                return;
+                            }
+                            if let Ok(incoming) = serde_json::from_str::<Value>(line.trim()) {
+                                record(&incoming);
+                                if incoming.get("id") == Some(&json!("client-req-42")) {
+                                    break;
+                                }
+                            }
+                        }
+                        send(
+                            &mut stdout,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": { "stopReason": "end_turn" }
+                            }),
+                        );
+                    }
+                    "prompt_error" => {
+                        send(
+                            &mut stdout,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "error": {
+                                    "code": -32001,
+                                    "message": "stub prompt failure"
+                                }
+                            }),
+                        );
+                    }
+                    "secret_stderr" => {
+                        let _ = writeln!(
+                            stderr,
+                            "Login failed: Bearer ya29.a0AfH6SM_secret_oauth_token_123 \
+                             key=AIzaSyD1234567890abcdef1234567890 \
+                             url=https://accounts.google.com/o/oauth2/auth?client_id=ok&code=4/0AX_secret_code&access_token=tok_xyz \
+                             GEMINI_API_KEY=AIzaSyAnotherSecretKey9999999"
+                        );
+                        let _ = stderr.flush();
+                        send(
+                            &mut stdout,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "method": "session/update",
+                                "params": {
+                                    "sessionId": session_id,
+                                    "update": {
+                                        "sessionUpdate": "agent_message_chunk",
+                                        "content": { "type": "text", "text": "done after stderr" }
+                                    }
+                                }
+                            }),
+                        );
+                        send(
+                            &mut stdout,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": { "stopReason": "end_turn" }
+                            }),
+                        );
+                    }
                     "cancel" => {
                         send(
                             &mut stdout,

@@ -48,6 +48,15 @@ impl InProcessConnection {
                 false,
             ));
         }
+        let session = self.backend.sessions()?.get(state.session_id)?;
+        if session.is_acp() {
+            let handle = Arc::new(RunHandle::new_acp(state));
+            self.backend.runs()?.insert(run_id, Arc::clone(&handle));
+            if let Some(error) = handle.take_failure() {
+                return Err(error);
+            }
+            return Ok(handle);
+        }
         let workspace = self.backend.restore_session_filesystem(state.session_id)?;
         let provider = match self.backend.provider_for_run(
             state.session_id,
@@ -483,6 +492,31 @@ impl InProcessConnection {
                 (None, None) => {}
             }
         }
+        if session.is_acp() {
+            let has_active_acp_run = self
+                .backend
+                .runs()?
+                .values()
+                .filter(|handle| handle.session_id == session.id)
+                .any(|handle| {
+                    handle.is_running()
+                        || matches!(
+                            handle.state().run.state,
+                            AgentRunState::Planning
+                                | AgentRunState::Executing
+                                | AgentRunState::Evaluating
+                                | AgentRunState::AwaitingApproval
+                        )
+                });
+            if has_active_acp_run {
+                return Err(LoomError::new(
+                    ErrorCode::InvalidState,
+                    "ACP session already has an active run",
+                    false,
+                ));
+            }
+            return self.start_acp_run(&session, input);
+        }
         if session.state != AgentSessionState::Idle {
             // A client whose projection still shows the session's run as
             // finished sends its next direction as a new run. While the run is
@@ -529,9 +563,6 @@ impl InProcessConnection {
                 "agent session is already running or completed",
                 false,
             ));
-        }
-        if session.is_acp() {
-            return self.start_acp_run(&session, input);
         }
         let (credential_pin, mut provider) = self
             .backend
@@ -855,6 +886,25 @@ impl InProcessConnection {
             // A queued switch back to the current model must not apply after a
             // later request made it stale.
             handle.clear_model_switch();
+            return Ok(ServerResponse::Run(RunResponse::AgentRun(
+                handle.snapshot(),
+            )));
+        }
+        if handle.is_acp {
+            if model.as_str().trim().is_empty() {
+                return Err(LoomError::invalid_request("model id must not be empty"));
+            }
+            {
+                let mut state = handle.locked_state();
+                state.run.model = model.clone();
+                state.task.model = model.clone();
+                state.run.updated_at = Timestamp::now();
+            }
+            self.backend.record_agent_event(
+                handle.session_id,
+                AgentEvent::ModelChanged { run_id, model },
+            )?;
+            self.backend.persist_state()?;
             return Ok(ServerResponse::Run(RunResponse::AgentRun(
                 handle.snapshot(),
             )));

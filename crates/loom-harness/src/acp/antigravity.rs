@@ -113,22 +113,41 @@ fn parse_command_override(raw: &str) -> Result<AcpCommandSpec> {
         return Ok(AcpCommandSpec {
             program,
             args: vec!["acp".to_owned(), "--stdio".to_owned()],
-            display: format!("{first} acp"),
+            display: "agy acp".to_owned(),
             supports_agy_profile_flags: true,
         });
     }
     let is_agy_acp = stem == "agy" && rest.first().map(String::as_str) == Some("acp");
-    let display = if rest.is_empty() {
-        first.clone()
-    } else {
-        format!("{first} {}", rest.join(" "))
-    };
+    let display = sanitize_command_display(&program, is_agy_acp);
     Ok(AcpCommandSpec {
         program,
         args: rest.to_vec(),
         display,
         supports_agy_profile_flags: is_agy_acp,
     })
+}
+
+/// Returns a sanitized display label for a resolved ACP harness command.
+///
+/// Never includes raw command arguments or inline environment assignments, so
+/// persisted session metadata and events cannot leak flags or secrets.
+fn sanitize_command_display(program: &Path, is_agy_acp: bool) -> String {
+    if is_agy_acp {
+        return "agy acp".to_owned();
+    }
+    let stem = program
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default();
+    if stem == "antigravity-acp" {
+        return "antigravity-acp".to_owned();
+    }
+    program
+        .file_name()
+        .and_then(OsStr::to_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("acp-harness")
+        .to_owned()
 }
 
 fn split_command_tokens(raw: &str) -> Result<Vec<String>> {
@@ -259,16 +278,23 @@ pub struct AntigravityRunContext {
 /// Enforces that Antigravity ACP runs are strictly interactive (person-present).
 ///
 /// Refuses headless, scheduled, CI, overnight, delegated, and auto-approve runs
-/// with a clear error. In test builds, CI runner environment variables are
-/// checked through [`check_interactive_only_with_env`] so unit/integration tests
-/// can exercise CI rejection explicitly without failing under GitHub Actions.
+/// with a clear error.
 pub fn check_interactive_only(harness: &str, ctx: AntigravityRunContext) -> Result<()> {
+    check_interactive_only_with_ci_policy(harness, ctx, true)
+}
+
+/// Enforces that Antigravity ACP runs are strictly interactive, with an
+/// explicit toggle for whether ambient `CI` / `GITHUB_ACTIONS` environment
+/// variables are checked (always `true` in production; tests running under CI
+/// can opt out explicitly on their test backend).
+pub fn check_interactive_only_with_ci_policy(
+    harness: &str,
+    ctx: AntigravityRunContext,
+    enforce_ci_env: bool,
+) -> Result<()> {
     check_interactive_only_with_env(harness, ctx, |name| {
-        #[cfg(test)]
-        {
-            if matches!(name, "CI" | "GITHUB_ACTIONS") {
-                return None;
-            }
+        if !enforce_ci_env && matches!(name, "CI" | "GITHUB_ACTIONS") {
+            return None;
         }
         std::env::var(name).ok()
     })
@@ -332,4 +358,139 @@ fn is_truthy_env(value: &str) -> bool {
             trimmed.to_ascii_lowercase().as_str(),
             "0" | "false" | "no" | "off"
         )
+}
+
+/// Redacts common credential, OAuth token, API key, and authorization-code
+/// patterns from ACP harness stderr or diagnostic strings before Loom stores
+/// them in the durable journal or run summaries.
+///
+/// This filter operates purely on token/parameter patterns and never reads
+/// `GEMINI_API_KEY` or any credential store.
+pub fn redact_acp_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        // Google API keys: `AIza[0-9A-Za-z_-]{10,}`
+        if bytes[i..].starts_with(b"AIza") {
+            let mut end = i + 4;
+            while end < len && is_token_char(bytes[end]) {
+                end += 1;
+            }
+            if end - i >= 14 {
+                out.push_str("[REDACTED_GOOGLE_KEY]");
+                i = end;
+                continue;
+            }
+        }
+
+        // Google OAuth access tokens: `ya29.[0-9A-Za-z._-]+`
+        if bytes[i..].starts_with(b"ya29.") {
+            let mut end = i + 5;
+            while end < len && (is_token_char(bytes[end]) || bytes[end] == b'.') {
+                end += 1;
+            }
+            if end > i + 5 {
+                out.push_str("[REDACTED_OAUTH_TOKEN]");
+                i = end;
+                continue;
+            }
+        }
+
+        // `Bearer <token>` (case-insensitive)
+        if i + 7 <= len
+            && bytes[i..i + 6].eq_ignore_ascii_case(b"bearer")
+            && bytes[i + 6].is_ascii_whitespace()
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+        {
+            let mut val_start = i + 6;
+            while val_start < len && bytes[val_start].is_ascii_whitespace() {
+                val_start += 1;
+            }
+            let mut val_end = val_start;
+            while val_end < len && is_bearer_token_char(bytes[val_end]) {
+                val_end += 1;
+            }
+            if val_end > val_start {
+                out.push_str(&input[i..val_start]);
+                out.push_str("[REDACTED]");
+                i = val_end;
+                continue;
+            }
+        }
+
+        // Sensitive query parameters or key=value pairs (`access_token=`,
+        // `refresh_token=`, `id_token=`, `client_secret=`, `api_key=`,
+        // `apikey=`, `gemini_api_key=`, `authorization=`, `code=`, `key=`).
+        if let Some((key_len, val_end)) = match_sensitive_kv(input, i) {
+            out.push_str(&input[i..i + key_len + 1]);
+            out.push_str("[REDACTED]");
+            i = val_end;
+            continue;
+        }
+
+        let ch = input[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+fn is_token_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')
+}
+
+fn is_bearer_token_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'~' | b'+' | b'/' | b'=')
+}
+
+fn is_kv_value_char(b: u8) -> bool {
+    !b.is_ascii_whitespace()
+        && !matches!(
+            b,
+            b'&' | b'"' | b'\'' | b'`' | b',' | b';' | b')' | b']' | b'}' | b'>' | b'#'
+        )
+}
+
+const SENSITIVE_KV_KEYS: &[&str] = &[
+    "gemini_api_key",
+    "refresh_token",
+    "client_secret",
+    "authorization",
+    "access_token",
+    "id_token",
+    "api_key",
+    "apikey",
+    "token",
+    "code",
+    "key",
+];
+
+fn match_sensitive_kv(input: &str, start: usize) -> Option<(usize, usize)> {
+    let bytes = input.as_bytes();
+    // Ensure key starts at a token boundary (`?`, `&`, whitespace, punctuation, or start).
+    if start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+        return None;
+    }
+    let rest = &bytes[start..];
+    for key in SENSITIVE_KV_KEYS {
+        let klen = key.len();
+        if rest.len() > klen
+            && rest[..klen].eq_ignore_ascii_case(key.as_bytes())
+            && rest[klen] == b'='
+        {
+            let val_start = start + klen + 1;
+            let mut val_end = val_start;
+            while val_end < bytes.len() && is_kv_value_char(bytes[val_end]) {
+                val_end += 1;
+            }
+            if val_end > val_start {
+                return Some((klen, val_end));
+            }
+        }
+    }
+    None
 }

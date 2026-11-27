@@ -6,9 +6,9 @@ Loom can run Google's official, unmodified Antigravity ACP agent (`agy acp` / `a
 
 Loom acts as a thin ACP **host** in the worker (`loom-harness::acp` + `loom-server::acp_host`), rather than adding a new HTTP model vendor inside `loom-providers`:
 
-- **Binary discovery & override**: On the worker, Loom looks for `agy` (invoked as `agy acp --stdio`) and then `antigravity-acp` (invoked as `antigravity-acp --stdio`) on `PATH`. You can specify a manual command override either per session or via `LOOM_ANTIGRAVITY_ACP_COMMAND`. Loom never ships, patches, or forks the Antigravity binary.
-- **One supervised process per session**: Each ACP session spawns one piped-stdio JSON-RPC 2.0 child process (newline-delimited JSON, never a PTY), rooted at the session working directory (`cwd`), with bounded stdout/stderr buffering and clean child shutdown on archive, delete, or worker exit.
-- **Isolated profile directory**: Loom chooses and creates an isolated per-session directory (`0700`) under the worker's state tree and passes it to `agy acp` via `--app-data-dir` and `--gemini-dir` (and `LOOM_ACP_PROFILE_DIR`). Loom **only chooses the directory path and never reads, lists, or copies any file inside it**.
+- **Binary discovery & worker-side override**: On the worker, Loom looks for `agy` (invoked as `agy acp --stdio`) and then `antigravity-acp` (invoked as `antigravity-acp --stdio`) on `PATH`. Operators can override the binary path on the worker via `LOOM_ANTIGRAVITY_ACP_COMMAND` (never supplied by clients over the wire). Persisted session metadata stores only a sanitized program label, never raw arguments or environment assignments. Loom never ships, patches, or forks the Antigravity binary.
+- **One supervised process per session**: Each ACP session spawns one piped-stdio JSON-RPC 2.0 child process (newline-delimited JSON, never a PTY), rooted at the session working directory (`cwd`), with bounded stdout/stderr buffering, secret-pattern redaction on stderr/diagnostics, permission and turn-inactivity timeouts, and clean child shutdown on cancel-grace expiry, archive, delete, or worker shutdown.
+- **Isolated Loom-owned profile directory**: Loom chooses and creates one isolated profile directory (`0700`) per worker/account (`<state_dir>/acp-profiles/antigravity/<account>`, defaulting to `default`) and passes it to `agy acp` via `--app-data-dir` and `--gemini-dir` (and `LOOM_ACP_PROFILE_DIR`). Reusing this isolated directory across sessions lets an `oauth-personal` sign-in persist across sessions without touching the user's personal `~/.gemini` or `~/.antigravity`, and is removed only by explicit operator action. Loom **only chooses the directory path and never reads, lists, or copies any file inside it**.
 - **ACP v1 flow**:
   1. `initialize` — Loom sends its own `clientInfo` (`name: "loom"`, version from crate metadata). Loom never impersonates T3 Code or any other product.
   2. `authenticate` — Only methods advertised by the agent in `initialize` are accepted (default `oauth-personal`; explicit ToS-safe option `gemini-api-key`).
@@ -37,7 +37,8 @@ Loom acts as a thin ACP **host** in the worker (`loom-harness::acp` + `loom-serv
 The ACP harness owns its conversation state. Loom records the backend descriptor (`antigravity`, harness command, negotiated ACP protocol version, and advertised capabilities) on the session record (`AgentSessionSnapshot.backend`):
 
 - Real session resume (`session/load` or `session/resume`) is attempted **only** when the harness advertises `loadSession` or `sessionCapabilities.resume` in `initialize`.
-- When the harness does not advertise resume capability, Loom does **not** claim durable journal replay; restarting the harness begins a fresh ACP session and surfaces that honestly in session activity and in the Run inspector.
+- When the harness does not advertise resume capability (or `session/load` / `session/resume` fails), Loom does **not** claim native journal replay; restarting the harness starts a fresh ACP session, sends a clearly labelled local transcript recap on the first turn when prior messages exist, and surfaces that honestly in session activity and in the Run inspector.
+- Forking an ACP session clears `remote_session_id` so the fork starts an independent harness conversation.
 
 ## Policy limits, Terms risk, and disclosures
 

@@ -293,9 +293,12 @@ impl InProcessBackend {
             }
         }
         // Build output is reproducible and belongs to a session that no longer
-        // exists, so reclaim it with the checkouts.
+        // exists, so reclaim it with the checkouts. Also terminate any live ACP
+        // harness subprocess bound to the deleted session; the worker-scoped
+        // Antigravity profile directory itself is preserved across sessions.
         for id in &deleted_ids {
             self.remove_build_cache(*id);
+            self.acp_sessions.close_session(*id);
         }
         // Drop every in-memory trace before the durable rows, so neither the
         // state save that follows this request nor a later request can observe

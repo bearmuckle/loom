@@ -14,7 +14,8 @@ use std::{
 
 use loom_core::{
     ANTIGRAVITY_AUTH_GEMINI_API_KEY, ANTIGRAVITY_AUTH_OAUTH_PERSONAL, ANTIGRAVITY_HARNESS_ID,
-    ApprovalPolicy, Capability, CapabilitySet, ErrorCode, SessionBackendDescriptor, WorkspaceId,
+    ApprovalPolicy, Capability, CapabilitySet, ErrorCode, PolicyDecision, SessionBackendDescriptor,
+    WorkspaceId,
 };
 use loom_model::{AgentRunState, ModelId};
 use loom_protocol::{
@@ -23,7 +24,7 @@ use loom_protocol::{
     RunResponse, ServerEvent, ServerResponse, SessionRequest, SessionResponse, WorkspaceRequest,
     WorkspaceResponse,
 };
-use loom_server::{InProcessBackend, InProcessConnection};
+use loom_server::{AuthTokenStore, AuthorizationScope, InProcessBackend, InProcessConnection};
 use serde_json::Value;
 
 fn stub_command() -> String {
@@ -39,6 +40,37 @@ fn stub_command_with_env(vars: &[(&str, &str)]) -> String {
     }
     parts.push(exe.display().to_string());
     parts.join(" ")
+}
+
+/// Creates a test backend with `enforce_ci_env = false` (so integration tests
+/// run cleanly under GitHub Actions where `CI=true`) and an optional worker-side
+/// ACP command override. The `CI=true` rejection path itself is tested
+/// explicitly with default `enforce_ci_env = true` below.
+fn new_test_backend(command: Option<String>) -> Arc<InProcessBackend> {
+    let backend = InProcessBackend::new();
+    backend.set_acp_ci_env_guard(false);
+    backend.set_acp_command_override(command);
+    backend
+}
+
+fn new_persistent_test_backend(
+    db_path: &std::path::Path,
+    command: Option<String>,
+) -> Arc<InProcessBackend> {
+    let backend = InProcessBackend::new_persistent(db_path).unwrap();
+    backend.set_acp_ci_env_guard(false);
+    backend.set_acp_command_override(command);
+    backend
+}
+
+fn reopen_persistent_test_backend(
+    db_path: &std::path::Path,
+    command: Option<String>,
+) -> Arc<InProcessBackend> {
+    let backend = InProcessBackend::open_persistent(db_path).unwrap();
+    backend.set_acp_ci_env_guard(false);
+    backend.set_acp_command_override(command);
+    backend
 }
 
 fn negotiate_with(connection: &InProcessConnection, caps: impl IntoIterator<Item = Capability>) {
@@ -62,6 +94,8 @@ fn negotiate_all(connection: &InProcessConnection) {
             Capability::CreateAgentSession,
             Capability::ReadAgentSession,
             Capability::ControlAgentSession,
+            Capability::DeleteAgentSession,
+            Capability::ForkAgentSession,
             Capability::StartAgentRun,
             Capability::ReadAgentRun,
             Capability::ControlAgentRun,
@@ -70,6 +104,7 @@ fn negotiate_all(connection: &InProcessConnection) {
             Capability::SubscribeSessionEvents,
             Capability::ReadUsage,
             Capability::ListProviders,
+            Capability::ConfigureProviders,
             Capability::AcpAgentSessions,
         ],
     );
@@ -87,6 +122,73 @@ fn create_workspace(connection: &InProcessConnection, name: &str) -> WorkspaceId
     {
         ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(ws)) => ws.id,
         other => panic!("unexpected workspace response: {other:?}"),
+    }
+}
+
+fn create_acp_session(
+    connection: &InProcessConnection,
+    workspace_id: WorkspaceId,
+    name: &str,
+    auth_method: Option<&str>,
+) -> loom_core::AgentSessionSnapshot {
+    match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAcpAgentSessionInWorkspace {
+                workspace_id,
+                name: name.to_owned(),
+                harness: ANTIGRAVITY_HARNESS_ID.to_owned(),
+                auth_method: auth_method.map(str::to_owned),
+                interactive: true,
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(s)) => s,
+        other => panic!("unexpected session: {other:?}"),
+    }
+}
+
+fn start_run(
+    connection: &InProcessConnection,
+    session_id: loom_core::AgentSessionId,
+    task: &str,
+    model: &str,
+) -> loom_protocol::AgentRunSnapshot {
+    match connection
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::StartSessionAgentRun {
+                session_id,
+                task: task.to_owned(),
+                model: ModelId::new(model),
+                system_instructions: None,
+                repository_instructions: None,
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Run(RunResponse::AgentRunStarted(r)) => r,
+        other => panic!("unexpected run: {other:?}"),
+    }
+}
+
+fn run_projection(
+    connection: &InProcessConnection,
+    run_id: loom_core::RunId,
+) -> Box<loom_protocol::AgentRunSnapshotProjection> {
+    match connection
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::GetAgentRunSnapshot {
+                run_id,
+                activity_detail: ActivityDetail::Full,
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Run(RunResponse::AgentRunSnapshot(proj)) => proj,
+        other => panic!("unexpected projection: {other:?}"),
     }
 }
 
@@ -158,8 +260,8 @@ fn session_events(
     }
 }
 
-fn test_capability_gate_refuses_older_clients() {
-    let backend = InProcessBackend::new();
+fn test_capability_gate_and_authorization_refuse_unprivileged_clients() {
+    let backend = new_test_backend(Some(stub_command()));
     let old_client = backend.connect();
     // Negotiate without AcpAgentSessions.
     negotiate_with(
@@ -170,6 +272,7 @@ fn test_capability_gate_refuses_older_clients() {
             Capability::CreateAgentSession,
             Capability::StartAgentRun,
             Capability::ListProviders,
+            Capability::ConfigureProviders,
         ],
     );
     let workspace_id = create_workspace(&old_client, "Compat");
@@ -180,7 +283,6 @@ fn test_capability_gate_refuses_older_clients() {
                 workspace_id,
                 name: "ACP".to_owned(),
                 harness: ANTIGRAVITY_HARNESS_ID.to_owned(),
-                command: Some(stub_command()),
                 auth_method: None,
                 interactive: true,
             },
@@ -193,7 +295,6 @@ fn test_capability_gate_refuses_older_clients() {
         .request(RequestEnvelope::new(ClientRequest::Provider(
             ProviderRequest::ProbeAcpHarness {
                 harness: ANTIGRAVITY_HARNESS_ID.to_owned(),
-                command: Some(stub_command()),
                 auth_method: None,
             },
         )))
@@ -201,27 +302,41 @@ fn test_capability_gate_refuses_older_clients() {
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::CapabilityDenied);
 
-    // Even if another newer client created an ACP session, an older client
-    // without AcpAgentSessions cannot start a run in it.
-    let new_client = backend.connect();
-    negotiate_all(&new_client);
-    let acp_session = match new_client
+    // R2: AcpAgentSessions alone is insufficient without CreateAgentSession / ConfigureProviders.
+    let acp_only = backend.connect();
+    negotiate_with(
+        &acp_only,
+        [Capability::JsonProtocol, Capability::AcpAgentSessions],
+    );
+    let err = acp_only
         .request(RequestEnvelope::new(ClientRequest::Workspace(
             WorkspaceRequest::CreateAcpAgentSessionInWorkspace {
                 workspace_id,
-                name: "ACP".to_owned(),
+                name: "NoCreateCap".to_owned(),
                 harness: ANTIGRAVITY_HARNESS_ID.to_owned(),
-                command: Some(stub_command()),
                 auth_method: None,
                 interactive: true,
             },
         )))
         .result
-        .unwrap()
-    {
-        ServerResponse::Session(SessionResponse::AgentSessionCreated(s)) => s,
-        other => panic!("unexpected session: {other:?}"),
-    };
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::CapabilityDenied);
+
+    let err = acp_only
+        .request(RequestEnvelope::new(ClientRequest::Provider(
+            ProviderRequest::ProbeAcpHarness {
+                harness: ANTIGRAVITY_HARNESS_ID.to_owned(),
+                auth_method: None,
+            },
+        )))
+        .result
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::CapabilityDenied);
+
+    // Full client creates an ACP session; older client still cannot start a run in it.
+    let new_client = backend.connect();
+    negotiate_all(&new_client);
+    let acp_session = create_acp_session(&new_client, workspace_id, "ACP", None);
 
     let err = old_client
         .request(RequestEnvelope::new(ClientRequest::Run(
@@ -236,10 +351,65 @@ fn test_capability_gate_refuses_older_clients() {
         .result
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::CapabilityDenied);
+
+    // R2: Session-scoped token cannot probe the worker's ACP harness.
+    let tokens = Arc::new(AuthTokenStore::new());
+    let issued = tokens
+        .issue(AuthorizationScope::for_sessions(
+            [acp_session.id],
+            CapabilitySet::new([
+                Capability::JsonProtocol,
+                Capability::AcpAgentSessions,
+                Capability::ConfigureProviders,
+            ]),
+        ))
+        .unwrap();
+    let scoped = backend.connect_authenticated(tokens.authenticate(&issued.token).unwrap());
+    negotiate_with(
+        &scoped,
+        [
+            Capability::JsonProtocol,
+            Capability::AcpAgentSessions,
+            Capability::ConfigureProviders,
+        ],
+    );
+    let err = scoped
+        .request(RequestEnvelope::new(ClientRequest::Provider(
+            ProviderRequest::ProbeAcpHarness {
+                harness: ANTIGRAVITY_HARNESS_ID.to_owned(),
+                auth_method: None,
+            },
+        )))
+        .result
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::AuthorizationDenied);
+
+    // R2: Participant-bound connection (non-operator) cannot probe the worker's ACP harness.
+    let participant = loom_core::ParticipantIdentity {
+        id: loom_core::ParticipantId::new(),
+        display_name: "Alice".to_owned(),
+    };
+    let part_issued = tokens
+        .issue_for_participant(AuthorizationScope::all(), participant)
+        .unwrap();
+    let participant_conn =
+        backend.connect_authenticated(tokens.authenticate(&part_issued.token).unwrap());
+    negotiate_all(&participant_conn);
+    let err = participant_conn
+        .request(RequestEnvelope::new(ClientRequest::Provider(
+            ProviderRequest::ProbeAcpHarness {
+                harness: ANTIGRAVITY_HARNESS_ID.to_owned(),
+                auth_method: None,
+            },
+        )))
+        .result
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::AuthorizationDenied);
 }
 
-fn test_probe_discovers_catalog_and_policy_notices() {
-    let backend = InProcessBackend::new();
+fn test_probe_discovers_catalog_and_sanitizes_command_display() {
+    let cmd = stub_command_with_env(&[("INLINE_MARKER_SECRET", "must_never_leak")]);
+    let backend = new_test_backend(Some(cmd));
     let conn = backend.connect();
     negotiate_all(&conn);
 
@@ -247,7 +417,6 @@ fn test_probe_discovers_catalog_and_policy_notices() {
         .request(RequestEnvelope::new(ClientRequest::Provider(
             ProviderRequest::ProbeAcpHarness {
                 harness: ANTIGRAVITY_HARNESS_ID.to_owned(),
-                command: Some(stub_command()),
                 auth_method: Some(ANTIGRAVITY_AUTH_GEMINI_API_KEY.to_owned()),
             },
         )))
@@ -264,14 +433,19 @@ fn test_probe_discovers_catalog_and_policy_notices() {
     assert!(probe.interactive_only);
     assert_eq!(probe.models.len(), 2);
     assert_eq!(probe.models[0].id, "gemini-catalog-pro");
+    // R2: discovered_command must never leak raw command arguments or inline env assignments.
+    let discovered = probe.discovered_command.unwrap_or_default();
+    assert!(!discovered.contains("INLINE_MARKER_SECRET"), "{discovered}");
+    assert!(!discovered.contains("must_never_leak"), "{discovered}");
+
     let notices = probe.notices.join("\n").to_ascii_lowercase();
     assert!(notices.contains("terms"));
     assert!(notices.contains("interactions"));
     assert!(notices.contains("not a google-registered acp client"));
 }
 
-fn test_interactive_only_guard_refuses_headless_and_auto_approve() {
-    let backend = InProcessBackend::new();
+fn test_interactive_only_guard_refuses_headless_partial_auto_approve_and_ci() {
+    let backend = new_test_backend(Some(stub_command()));
     let conn = backend.connect();
     negotiate_all(&conn);
     let workspace_id = create_workspace(&conn, "Policy");
@@ -283,7 +457,6 @@ fn test_interactive_only_guard_refuses_headless_and_auto_approve() {
                 workspace_id,
                 name: "Headless".to_owned(),
                 harness: ANTIGRAVITY_HARNESS_ID.to_owned(),
-                command: Some(stub_command()),
                 auth_method: None,
                 interactive: false,
             },
@@ -294,23 +467,7 @@ fn test_interactive_only_guard_refuses_headless_and_auto_approve() {
     assert!(err.message.contains("interactive-only"));
 
     // Interactive session starts with auto_approve_actions = false and refuses enabling auto-approve.
-    let session = match conn
-        .request(RequestEnvelope::new(ClientRequest::Workspace(
-            WorkspaceRequest::CreateAcpAgentSessionInWorkspace {
-                workspace_id,
-                name: "Interactive".to_owned(),
-                harness: ANTIGRAVITY_HARNESS_ID.to_owned(),
-                command: Some(stub_command()),
-                auth_method: None,
-                interactive: true,
-            },
-        )))
-        .result
-        .unwrap()
-    {
-        ServerResponse::Session(SessionResponse::AgentSessionCreated(s)) => s,
-        other => panic!("unexpected session: {other:?}"),
-    };
+    let session = create_acp_session(&conn, workspace_id, "Interactive", None);
 
     let err = conn
         .request(RequestEnvelope::new(ClientRequest::Session(
@@ -336,9 +493,67 @@ fn test_interactive_only_guard_refuses_headless_and_auto_approve() {
         .result
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::InvalidRequest);
+
+    // R5: A custom partial auto-approve policy (`!= ApprovalPolicy::auto_approve()`)
+    // that sets write/command/network to Allow must also be refused.
+    let partial_auto = ApprovalPolicy {
+        read: PolicyDecision::RequireApproval,
+        write: PolicyDecision::Allow,
+        command: PolicyDecision::Allow,
+        network: PolicyDecision::Allow,
+        destructive: PolicyDecision::Allow,
+    };
+    assert_ne!(partial_auto, ApprovalPolicy::auto_approve());
+    let err = conn
+        .request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::SetSessionApprovalPolicy {
+                session_id: session.id,
+                policy: partial_auto,
+                auto_approve_actions: Some(false),
+            },
+        )))
+        .result
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidRequest);
+
+    // R1 & R5: When CI/GITHUB_ACTIONS is set and default enforce_ci_env=true is active,
+    // ProbeAcpHarness and CreateAcpAgentSessionInWorkspace must be refused.
+    if std::env::var("CI").is_ok() || std::env::var("GITHUB_ACTIONS").is_ok() {
+        let strict_backend = InProcessBackend::new();
+        strict_backend.set_acp_command_override(Some(stub_command()));
+        let strict_conn = strict_backend.connect();
+        negotiate_all(&strict_conn);
+        let strict_ws = create_workspace(&strict_conn, "CI-Strict");
+        let err = strict_conn
+            .request(RequestEnvelope::new(ClientRequest::Provider(
+                ProviderRequest::ProbeAcpHarness {
+                    harness: ANTIGRAVITY_HARNESS_ID.to_owned(),
+                    auth_method: None,
+                },
+            )))
+            .result
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidRequest);
+        assert!(err.message.contains("interactive-only"));
+
+        let err = strict_conn
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::CreateAcpAgentSessionInWorkspace {
+                    workspace_id: strict_ws,
+                    name: "CI-Session".to_owned(),
+                    harness: ANTIGRAVITY_HARNESS_ID.to_owned(),
+                    auth_method: None,
+                    interactive: true,
+                },
+            )))
+            .result
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidRequest);
+        assert!(err.message.contains("interactive-only"));
+    }
 }
 
-fn test_full_acp_turn_mapping_client_info_no_prompt_injection_and_persistence() {
+fn test_full_acp_turn_multi_turn_model_switch_fork_profile_reuse_and_delete() {
     let dir = std::env::temp_dir().join(format!(
         "loom-server-acp-full-{}",
         loom_core::RequestId::new()
@@ -351,28 +566,12 @@ fn test_full_acp_turn_mapping_client_info_no_prompt_injection_and_persistence() 
         ("LOOM_ACP_STUB_SCENARIO", "stderr"),
     ]);
 
-    let backend = InProcessBackend::new_persistent(&db_path).unwrap();
+    let backend = new_persistent_test_backend(&db_path, Some(cmd));
     let conn = backend.connect();
     negotiate_all(&conn);
     let workspace_id = create_workspace(&conn, "Antigravity");
 
-    let session = match conn
-        .request(RequestEnvelope::new(ClientRequest::Workspace(
-            WorkspaceRequest::CreateAcpAgentSessionInWorkspace {
-                workspace_id,
-                name: "AGY Session".to_owned(),
-                harness: ANTIGRAVITY_HARNESS_ID.to_owned(),
-                command: Some(cmd),
-                auth_method: None,
-                interactive: true,
-            },
-        )))
-        .result
-        .unwrap()
-    {
-        ServerResponse::Session(SessionResponse::AgentSessionCreated(s)) => s,
-        other => panic!("unexpected session: {other:?}"),
-    };
+    let session = create_acp_session(&conn, workspace_id, "AGY Session", None);
     assert!(session.is_antigravity());
     assert!(!session.supports_durable_resume());
 
@@ -397,19 +596,7 @@ fn test_full_acp_turn_mapping_client_info_no_prompt_injection_and_persistence() 
     assert_eq!(settled.state, AgentRunState::Completed);
 
     // Inspect projection: plan, usage, tool activity, stderr activity, assistant reply, reasoning.
-    let projection = match conn
-        .request(RequestEnvelope::new(ClientRequest::Run(
-            RunRequest::GetAgentRunSnapshot {
-                run_id: run.id,
-                activity_detail: ActivityDetail::Full,
-            },
-        )))
-        .result
-        .unwrap()
-    {
-        ServerResponse::Run(RunResponse::AgentRunSnapshot(proj)) => proj,
-        other => panic!("unexpected projection: {other:?}"),
-    };
+    let projection = run_projection(&conn, run.id);
     assert_eq!(projection.plan.len(), 2);
     assert_eq!(projection.usage.input_tokens, 42);
     assert_eq!(projection.usage.output_tokens, 17);
@@ -441,7 +628,7 @@ fn test_full_acp_turn_mapping_client_info_no_prompt_injection_and_persistence() 
         projection.activities
     );
 
-    // Verify events included ReasoningDelta & PlanProposed & UsageUpdated.
+    // Verify events included ReasoningDelta.
     let events = session_events(&conn, session.id);
     assert!(events.iter().any(|e| matches!(
         e,
@@ -450,7 +637,59 @@ fn test_full_acp_turn_mapping_client_info_no_prompt_injection_and_persistence() 
         } if text.contains("thinking through request")
     )));
 
-    // Verify session record updated with protocol version, capabilities, remote_session_id, models.
+    // R8: SetAgentRunModel works on ACP runs without failing on ProviderRegistry lookup.
+    let updated_run = match conn
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::SetAgentRunModel {
+                run_id: run.id,
+                model: ModelId::new("gemini-catalog-flash"),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Run(RunResponse::AgentRun(r)) => r,
+        other => panic!("unexpected set model response: {other:?}"),
+    };
+    assert_eq!(updated_run.model.as_str(), "gemini-catalog-flash");
+
+    // R10: Multi-turn follow-up via SendAgentMessage on the same live ACP run.
+    conn.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::SendAgentMessage {
+            run_id: run.id,
+            attempt_id: updated_run.attempt_id,
+            expected_control_revision: updated_run.control_revision,
+            message: "Follow-up question".to_owned(),
+        },
+    )))
+    .result
+    .unwrap();
+    let settled2 = await_run_state(&conn, run.id, |s| s == AgentRunState::Completed);
+    assert_eq!(settled2.state, AgentRunState::Completed);
+    let proj2 = run_projection(&conn, run.id);
+    assert!(
+        proj2
+            .messages
+            .iter()
+            .any(|m| m.content.contains("Echo: Follow-up question")),
+        "follow-up message missing: {:?}",
+        proj2.messages
+    );
+
+    // R3: Calling StartSessionAgentRun a second time on a completed ACP session succeeds.
+    let run2 = start_run(&conn, session.id, "Second run prompt", "default");
+    let settled_run2 = await_settled(&conn, run2.id);
+    assert_eq!(settled_run2.state, AgentRunState::Completed);
+    let proj_run2 = run_projection(&conn, run2.id);
+    assert!(
+        proj_run2
+            .messages
+            .iter()
+            .any(|m| m.content.contains("Echo: Second run prompt"))
+    );
+
+    // Verify session record updated with protocol version, capabilities, remote_session_id, models,
+    // and sanitized command label (never raw env/args).
     let updated_session = match conn
         .request(RequestEnvelope::new(ClientRequest::Session(
             SessionRequest::GetAgentSession {
@@ -466,6 +705,7 @@ fn test_full_acp_turn_mapping_client_info_no_prompt_injection_and_persistence() 
     match updated_session.backend.as_ref().unwrap() {
         SessionBackendDescriptor::Acp(acp) => {
             assert_eq!(acp.harness, ANTIGRAVITY_HARNESS_ID);
+            assert!(!acp.command.contains("LOOM_ACP_STUB_RECORD"));
             assert_eq!(acp.protocol_version, Some(1));
             assert_eq!(
                 acp.auth_method.as_deref(),
@@ -478,25 +718,78 @@ fn test_full_acp_turn_mapping_client_info_no_prompt_injection_and_persistence() 
         other => panic!("unexpected backend: {other:?}"),
     }
 
-    // Verify recorded JSON-RPC wire traffic: Loom's own clientInfo, no Loom system prompt injection, isolated profile dir.
+    // R4: Forking an ACP session clears remote_session_id.
+    let forked = match conn
+        .request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::ForkAgentSession {
+                session_id: session.id,
+                name: "AGY Fork".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionForked(s)) => s,
+        other => panic!("unexpected fork response: {other:?}"),
+    };
+    let forked_acp = forked.backend.as_ref().unwrap().as_acp().unwrap();
+    assert_eq!(forked_acp.remote_session_id, None);
+
+    // R4: A second ACP session reuses the same worker-scoped isolated profile directory.
+    let session2 = create_acp_session(&conn, workspace_id, "AGY Session 2", None);
+    let run_s2 = start_run(&conn, session2.id, "Check profile reuse", "default");
+    assert_eq!(
+        await_settled(&conn, run_s2.id).state,
+        AgentRunState::Completed
+    );
+
+    // Verify recorded JSON-RPC wire traffic: Loom's own clientInfo, no prompt injection,
+    // and both sessions used the SAME worker-scoped isolated profile directory.
     let recorded = fs::read_to_string(&record_path).unwrap();
     assert!(recorded.contains("\"name\":\"loom\""));
     assert!(!recorded.to_ascii_lowercase().contains("t3code"));
     assert!(!recorded.contains("SHOULD NOT BE INJECTED"));
     assert!(!recorded.contains("ALSO NOT INJECTED"));
     assert!(!recorded.contains("General agent instructions"));
-    let lines = recorded
+    let profile_dirs: Vec<String> = recorded
         .lines()
-        .map(|l| serde_json::from_str::<Value>(l).unwrap())
-        .collect::<Vec<_>>();
-    let started = &lines[0];
-    let profile_dir = started["profile_dir"].as_str().expect("profile dir set");
-    assert!(PathBuf::from(profile_dir).is_dir());
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter_map(|v| {
+            v.get("profile_dir")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    assert!(
+        profile_dirs.len() >= 2,
+        "expected 2 spawns: {profile_dirs:?}"
+    );
+    assert_eq!(profile_dirs[0], profile_dirs[1]);
+    assert!(PathBuf::from(&profile_dirs[0]).is_dir());
+
+    // R4: Deleting an archived ACP session terminates its live subprocess.
+    assert!(backend.has_live_acp_process(session2.id));
+    conn.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::ArchiveAgentSession {
+            session_id: session2.id,
+        },
+    )))
+    .result
+    .unwrap();
+    conn.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::DeleteAgentSession {
+            session_id: session2.id,
+            force: false,
+        },
+    )))
+    .result
+    .unwrap();
+    assert!(!backend.has_live_acp_process(session2.id));
 
     // Verify SQLite persistence round-trip preserves session backend descriptor.
     drop(conn);
-    drop(backend);
-    let reopened = InProcessBackend::open_persistent(&db_path).unwrap();
+    backend.shutdown().unwrap();
+    let reopened = reopen_persistent_test_backend(&db_path, None);
     let conn2 = reopened.connect();
     negotiate_all(&conn2);
     let persisted_session = match conn2
@@ -514,52 +807,217 @@ fn test_full_acp_turn_mapping_client_info_no_prompt_injection_and_persistence() 
     assert_eq!(persisted_session.backend, updated_session.backend);
 
     drop(conn2);
-    drop(reopened);
+    reopened.shutdown().unwrap();
     let _ = fs::remove_dir_all(&dir);
 }
 
-fn test_permission_allow_deny_and_cancel_through_approval_ui() {
-    for mode in ["allow", "deny", "cancel"] {
-        let backend = InProcessBackend::new();
+fn test_server_restart_rehydrates_acp_runs_with_load_session_recap_and_pending_approval() {
+    // (a) With loadSession advertised: server restart rehydrates ACP run and calls session/load.
+    {
+        let dir = std::env::temp_dir().join(format!(
+            "loom-server-acp-restart-load-{}",
+            loom_core::RequestId::new()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("state.db");
+        let record_path = dir.join("record.jsonl");
+        let cmd = stub_command_with_env(&[
+            ("LOOM_ACP_STUB_RECORD", record_path.to_str().unwrap()),
+            ("LOOM_ACP_STUB_LOAD_SESSION", "1"),
+        ]);
+
+        let backend = new_persistent_test_backend(&db_path, Some(cmd.clone()));
+        let conn = backend.connect();
+        negotiate_all(&conn);
+        let ws = create_workspace(&conn, "RestartLoad");
+        let session = create_acp_session(&conn, ws, "LoadSess", None);
+        let run = start_run(&conn, session.id, "First turn", "default");
+        let done = await_settled(&conn, run.id);
+        assert_eq!(done.state, AgentRunState::Completed);
+        drop(conn);
+        backend.shutdown().unwrap();
+
+        let reopened = reopen_persistent_test_backend(&db_path, Some(cmd));
+        let conn2 = reopened.connect();
+        negotiate_all(&conn2);
+        conn2
+            .request(RequestEnvelope::new(ClientRequest::Run(
+                RunRequest::SendAgentMessage {
+                    run_id: run.id,
+                    attempt_id: done.attempt_id,
+                    expected_control_revision: done.control_revision,
+                    message: "After restart with loadSession".to_owned(),
+                },
+            )))
+            .result
+            .unwrap();
+        let done2 = await_run_state(&conn2, run.id, |s| s == AgentRunState::Completed);
+        assert_eq!(done2.state, AgentRunState::Completed);
+        let proj = run_projection(&conn2, run.id);
+        assert!(
+            proj.messages
+                .iter()
+                .any(|m| m.content.contains("Echo: After restart with loadSession"))
+        );
+        // Should NOT have injected a recap because native session/load succeeded.
+        assert!(
+            !proj
+                .messages
+                .iter()
+                .any(|m| m.content.contains("Loom local transcript recap"))
+        );
+        let recorded = fs::read_to_string(&record_path).unwrap();
+        assert!(
+            recorded.contains("\"method\":\"session/load\""),
+            "expected session/load after restart: {recorded}"
+        );
+        drop(conn2);
+        reopened.shutdown().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // (b) Without loadSession: server restart rehydrates ACP run and sends a labelled local recap.
+    {
+        let dir = std::env::temp_dir().join(format!(
+            "loom-server-acp-restart-recap-{}",
+            loom_core::RequestId::new()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("state.db");
+        let cmd = stub_command();
+
+        let backend = new_persistent_test_backend(&db_path, Some(cmd.clone()));
+        let conn = backend.connect();
+        negotiate_all(&conn);
+        let ws = create_workspace(&conn, "RestartRecap");
+        let session = create_acp_session(&conn, ws, "RecapSess", None);
+        let run = start_run(&conn, session.id, "Remember alpha-42", "default");
+        let done = await_settled(&conn, run.id);
+        assert_eq!(done.state, AgentRunState::Completed);
+        drop(conn);
+        backend.shutdown().unwrap();
+
+        let reopened = reopen_persistent_test_backend(&db_path, Some(cmd));
+        let conn2 = reopened.connect();
+        negotiate_all(&conn2);
+        conn2
+            .request(RequestEnvelope::new(ClientRequest::Run(
+                RunRequest::SendAgentMessage {
+                    run_id: run.id,
+                    attempt_id: done.attempt_id,
+                    expected_control_revision: done.control_revision,
+                    message: "What was the code?".to_owned(),
+                },
+            )))
+            .result
+            .unwrap();
+        let done2 = await_run_state(&conn2, run.id, |s| s == AgentRunState::Completed);
+        assert_eq!(done2.state, AgentRunState::Completed);
+        let proj = run_projection(&conn2, run.id);
+        // Stub echoes the full prompt sent to session/prompt, verifying the labelled recap.
+        assert!(
+            proj.messages.iter().any(|m| {
+                m.content.contains("Loom local transcript recap")
+                    && m.content.contains("Remember alpha-42")
+                    && m.content.contains("What was the code?")
+            }),
+            "expected labelled recap in echoed prompt: {:?}",
+            proj.messages
+        );
+        drop(conn2);
+        reopened.shutdown().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // (c) Restart while AwaitingApproval recovers to Paused with pending_approval cleared.
+    {
+        let dir = std::env::temp_dir().join(format!(
+            "loom-server-acp-restart-perm-{}",
+            loom_core::RequestId::new()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("state.db");
+        let perm_cmd = stub_command_with_env(&[("LOOM_ACP_STUB_SCENARIO", "permission")]);
+
+        let backend = new_persistent_test_backend(&db_path, Some(perm_cmd));
+        let conn = backend.connect();
+        negotiate_all(&conn);
+        let ws = create_workspace(&conn, "RestartPerm");
+        let session = create_acp_session(&conn, ws, "PermRestart", None);
+        let run = start_run(&conn, session.id, "Need approval", "default");
+        let waiting = await_settled(&conn, run.id);
+        assert_eq!(waiting.state, AgentRunState::AwaitingApproval);
+
+        // Snapshot the SQLite files while the run is durably checkpointed in
+        // AwaitingApproval, shut down the original backend cleanly, then restore
+        // the pre-shutdown snapshot over `db_path` to simulate an abrupt crash.
+        let crash_dir = dir.join("after-crash");
+        fs::create_dir_all(&crash_dir).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let src = dir.join(format!("state.db{suffix}"));
+            if src.exists() {
+                fs::copy(&src, crash_dir.join(format!("state.db{suffix}"))).unwrap();
+            }
+        }
+        drop(conn);
+        backend.shutdown().unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let dst = dir.join(format!("state.db{suffix}"));
+            let snap = crash_dir.join(format!("state.db{suffix}"));
+            if snap.exists() {
+                fs::copy(&snap, &dst).unwrap();
+            } else {
+                let _ = fs::remove_file(&dst);
+            }
+        }
+
+        let reopened = reopen_persistent_test_backend(&db_path, Some(stub_command()));
+        let conn2 = reopened.connect();
+        negotiate_all(&conn2);
+        let proj = run_projection(&conn2, run.id);
+        assert_eq!(proj.run.state, AgentRunState::Paused);
+        assert!(
+            proj.pending_approval.is_none(),
+            "stale pending approval must be cleared on restart"
+        );
+        // Operator can cleanly send a follow-up message after recovery.
+        conn2
+            .request(RequestEnvelope::new(ClientRequest::Run(
+                RunRequest::SendAgentMessage {
+                    run_id: run.id,
+                    attempt_id: proj.run.attempt_id,
+                    expected_control_revision: proj.run.control_revision,
+                    message: "Continue after crash".to_owned(),
+                },
+            )))
+            .result
+            .unwrap();
+        let done = await_run_state(&conn2, run.id, |s| s == AgentRunState::Completed);
+        assert_eq!(done.state, AgentRunState::Completed);
+        drop(conn2);
+        reopened.shutdown().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+fn test_permission_allow_deny_cancel_and_timeout_through_approval_ui() {
+    for mode in ["allow", "deny", "cancel", "timeout"] {
+        let cmd = stub_command_with_env(&[("LOOM_ACP_STUB_SCENARIO", "permission")]);
+        let backend = new_test_backend(Some(cmd));
+        if mode == "timeout" {
+            backend.set_acp_timeouts(Duration::from_millis(300), Duration::from_secs(30));
+        }
         let conn = backend.connect();
         negotiate_all(&conn);
         let workspace_id = create_workspace(&conn, &format!("Perm-{mode}"));
-        let cmd = stub_command_with_env(&[("LOOM_ACP_STUB_SCENARIO", "permission")]);
-        let session = match conn
-            .request(RequestEnvelope::new(ClientRequest::Workspace(
-                WorkspaceRequest::CreateAcpAgentSessionInWorkspace {
-                    workspace_id,
-                    name: format!("Perm-{mode}"),
-                    harness: ANTIGRAVITY_HARNESS_ID.to_owned(),
-                    command: Some(cmd),
-                    auth_method: Some(ANTIGRAVITY_AUTH_GEMINI_API_KEY.to_owned()),
-                    interactive: true,
-                },
-            )))
-            .result
-            .unwrap()
-        {
-            ServerResponse::Session(SessionResponse::AgentSessionCreated(s)) => s,
-            other => panic!("unexpected session: {other:?}"),
-        };
+        let session = create_acp_session(
+            &conn,
+            workspace_id,
+            &format!("Perm-{mode}"),
+            Some(ANTIGRAVITY_AUTH_GEMINI_API_KEY),
+        );
 
-        let run = match conn
-            .request(RequestEnvelope::new(ClientRequest::Run(
-                RunRequest::StartSessionAgentRun {
-                    session_id: session.id,
-                    task: "Run cargo test".to_owned(),
-                    model: ModelId::new("default"),
-                    system_instructions: None,
-                    repository_instructions: None,
-                },
-            )))
-            .result
-            .unwrap()
-        {
-            ServerResponse::Run(RunResponse::AgentRunStarted(r)) => r,
-            other => panic!("unexpected run: {other:?}"),
-        };
-
+        let run = start_run(&conn, session.id, "Run cargo test", "default");
         let waiting = await_settled(&conn, run.id);
         assert_eq!(
             waiting.state,
@@ -567,19 +1025,7 @@ fn test_permission_allow_deny_and_cancel_through_approval_ui() {
             "mode={mode}"
         );
 
-        let proj = match conn
-            .request(RequestEnvelope::new(ClientRequest::Run(
-                RunRequest::GetAgentRunSnapshot {
-                    run_id: run.id,
-                    activity_detail: ActivityDetail::Full,
-                },
-            )))
-            .result
-            .unwrap()
-        {
-            ServerResponse::Run(RunResponse::AgentRunSnapshot(proj)) => proj,
-            other => panic!("unexpected proj: {other:?}"),
-        };
+        let proj = run_projection(&conn, run.id);
         let pending = proj.pending_approval.expect("pending approval present");
         assert_eq!(pending.name, "acp_permission");
 
@@ -597,19 +1043,7 @@ fn test_permission_allow_deny_and_cancel_through_approval_ui() {
                 .unwrap();
                 let done = await_run_state(&conn, run.id, |s| s == AgentRunState::Completed);
                 assert_eq!(done.state, AgentRunState::Completed);
-                let final_proj = match conn
-                    .request(RequestEnvelope::new(ClientRequest::Run(
-                        RunRequest::GetAgentRunSnapshot {
-                            run_id: run.id,
-                            activity_detail: ActivityDetail::Full,
-                        },
-                    )))
-                    .result
-                    .unwrap()
-                {
-                    ServerResponse::Run(RunResponse::AgentRunSnapshot(p)) => p,
-                    other => panic!("unexpected proj: {other:?}"),
-                };
+                let final_proj = run_projection(&conn, run.id);
                 assert!(
                     final_proj
                         .messages
@@ -631,19 +1065,7 @@ fn test_permission_allow_deny_and_cancel_through_approval_ui() {
                 .unwrap();
                 let done = await_run_state(&conn, run.id, |s| s == AgentRunState::Completed);
                 assert_eq!(done.state, AgentRunState::Completed);
-                let final_proj = match conn
-                    .request(RequestEnvelope::new(ClientRequest::Run(
-                        RunRequest::GetAgentRunSnapshot {
-                            run_id: run.id,
-                            activity_detail: ActivityDetail::Full,
-                        },
-                    )))
-                    .result
-                    .unwrap()
-                {
-                    ServerResponse::Run(RunResponse::AgentRunSnapshot(p)) => p,
-                    other => panic!("unexpected proj: {other:?}"),
-                };
+                let final_proj = run_projection(&conn, run.id);
                 assert!(
                     final_proj
                         .messages
@@ -660,54 +1082,34 @@ fn test_permission_allow_deny_and_cancel_through_approval_ui() {
                 let done = await_run_state(&conn, run.id, |s| s == AgentRunState::Cancelled);
                 assert_eq!(done.state, AgentRunState::Cancelled);
             }
+            "timeout" => {
+                // R6: Unanswered permission prompt times out and rejects instead of blocking forever.
+                let done = await_run_state(&conn, run.id, |s| s == AgentRunState::Completed);
+                assert_eq!(done.state, AgentRunState::Completed);
+                let final_proj = run_projection(&conn, run.id);
+                assert!(
+                    final_proj
+                        .messages
+                        .iter()
+                        .any(|m| m.content.contains("command rejected by operator"))
+                );
+            }
             _ => unreachable!(),
         }
+        backend.shutdown().unwrap();
     }
 }
 
-fn test_cancel_mid_turn_crash_unadvertised_auth_and_missing_binary() {
-    let backend = InProcessBackend::new();
-    let conn = backend.connect();
-    negotiate_all(&conn);
-    let workspace_id = create_workspace(&conn, "Errors");
-
+fn test_cancel_wedged_timeout_crash_auth_missing_redaction_and_shutdown() {
     // 1. Cancel mid-turn
     {
         let cmd = stub_command_with_env(&[("LOOM_ACP_STUB_SCENARIO", "cancel")]);
-        let session = match conn
-            .request(RequestEnvelope::new(ClientRequest::Workspace(
-                WorkspaceRequest::CreateAcpAgentSessionInWorkspace {
-                    workspace_id,
-                    name: "Cancel".to_owned(),
-                    harness: ANTIGRAVITY_HARNESS_ID.to_owned(),
-                    command: Some(cmd),
-                    auth_method: None,
-                    interactive: true,
-                },
-            )))
-            .result
-            .unwrap()
-        {
-            ServerResponse::Session(SessionResponse::AgentSessionCreated(s)) => s,
-            other => panic!("{other:?}"),
-        };
-        let run = match conn
-            .request(RequestEnvelope::new(ClientRequest::Run(
-                RunRequest::StartSessionAgentRun {
-                    session_id: session.id,
-                    task: "Long task".to_owned(),
-                    model: ModelId::new("default"),
-                    system_instructions: None,
-                    repository_instructions: None,
-                },
-            )))
-            .result
-            .unwrap()
-        {
-            ServerResponse::Run(RunResponse::AgentRunStarted(r)) => r,
-            other => panic!("{other:?}"),
-        };
-        // Wait briefly for streaming to start, then interrupt.
+        let backend = new_test_backend(Some(cmd));
+        let conn = backend.connect();
+        negotiate_all(&conn);
+        let workspace_id = create_workspace(&conn, "Cancel");
+        let session = create_acp_session(&conn, workspace_id, "Cancel", None);
+        let run = start_run(&conn, session.id, "Long task", "default");
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if session_events(&conn, session.id).iter().any(|e| {
@@ -729,44 +1131,75 @@ fn test_cancel_mid_turn_crash_unadvertised_auth_and_missing_binary() {
         .unwrap();
         let settled = await_settled(&conn, run.id);
         assert_eq!(settled.state, AgentRunState::Cancelled);
+        // R7: shutdown() kills remaining idle ACP child processes cleanly.
+        assert!(backend.has_live_acp_process(session.id));
+        backend.shutdown().unwrap();
+        assert!(!backend.has_live_acp_process(session.id));
     }
 
-    // 2. Harness exits mid-run (crash -> visible activity + Failed)
+    // 2. R7: Wedged harness ignoring session/cancel is killed after CANCEL_GRACE.
+    {
+        let cmd = stub_command_with_env(&[("LOOM_ACP_STUB_SCENARIO", "hang")]);
+        let backend = new_test_backend(Some(cmd));
+        let conn = backend.connect();
+        negotiate_all(&conn);
+        let workspace_id = create_workspace(&conn, "Wedged");
+        let session = create_acp_session(&conn, workspace_id, "Wedged", None);
+        let run = start_run(&conn, session.id, "Hang forever", "default");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if session_events(&conn, session.id).iter().any(|e| {
+                matches!(
+                    e,
+                    ServerEvent::Agent {
+                        event: AgentEvent::AssistantMessageDelta { .. }
+                    }
+                )
+            }) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        conn.request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::InterruptAgentRun { run_id: run.id },
+        )))
+        .result
+        .unwrap();
+        let settled = await_settled(&conn, run.id);
+        assert_eq!(settled.state, AgentRunState::Cancelled);
+        assert!(
+            !backend.has_live_acp_process(session.id),
+            "wedged child must be killed and cleared after cancel grace"
+        );
+        backend.shutdown().unwrap();
+    }
+
+    // 3. R6: Turn inactivity timeout kills wedged harness and fails run cleanly.
+    {
+        let cmd = stub_command_with_env(&[("LOOM_ACP_STUB_SCENARIO", "hang")]);
+        let backend = new_test_backend(Some(cmd));
+        backend.set_acp_timeouts(Duration::from_secs(30), Duration::from_millis(350));
+        let conn = backend.connect();
+        negotiate_all(&conn);
+        let workspace_id = create_workspace(&conn, "TurnTimeout");
+        let session = create_acp_session(&conn, workspace_id, "TurnTimeout", None);
+        let run = start_run(&conn, session.id, "Hang until timeout", "default");
+        let settled = await_settled(&conn, run.id);
+        assert_eq!(settled.state, AgentRunState::Failed);
+        assert!(settled.summary.unwrap_or_default().contains("timed out"));
+        assert!(!backend.has_live_acp_process(session.id));
+        backend.shutdown().unwrap();
+    }
+
+    // 4. Harness exits mid-run (crash -> visible activity + Failed)
     {
         let cmd = stub_command_with_env(&[("LOOM_ACP_STUB_SCENARIO", "crash")]);
-        let session = match conn
-            .request(RequestEnvelope::new(ClientRequest::Workspace(
-                WorkspaceRequest::CreateAcpAgentSessionInWorkspace {
-                    workspace_id,
-                    name: "Crash".to_owned(),
-                    harness: ANTIGRAVITY_HARNESS_ID.to_owned(),
-                    command: Some(cmd),
-                    auth_method: None,
-                    interactive: true,
-                },
-            )))
-            .result
-            .unwrap()
-        {
-            ServerResponse::Session(SessionResponse::AgentSessionCreated(s)) => s,
-            other => panic!("{other:?}"),
-        };
-        let run = match conn
-            .request(RequestEnvelope::new(ClientRequest::Run(
-                RunRequest::StartSessionAgentRun {
-                    session_id: session.id,
-                    task: "Crash now".to_owned(),
-                    model: ModelId::new("default"),
-                    system_instructions: None,
-                    repository_instructions: None,
-                },
-            )))
-            .result
-            .unwrap()
-        {
-            ServerResponse::Run(RunResponse::AgentRunStarted(r)) => r,
-            other => panic!("{other:?}"),
-        };
+        let backend = new_test_backend(Some(cmd));
+        let conn = backend.connect();
+        negotiate_all(&conn);
+        let workspace_id = create_workspace(&conn, "Crash");
+        let session = create_acp_session(&conn, workspace_id, "Crash", None);
+        let run = start_run(&conn, session.id, "Crash now", "default");
         let settled = await_settled(&conn, run.id);
         assert_eq!(settled.state, AgentRunState::Failed);
         let summary = settled.summary.unwrap_or_default();
@@ -774,44 +1207,46 @@ fn test_cancel_mid_turn_crash_unadvertised_auth_and_missing_binary() {
             summary.contains("42") || summary.contains("fatal harness crash"),
             "{summary}"
         );
+        backend.shutdown().unwrap();
     }
 
-    // 3. Unadvertised auth method -> clear failure as session activity with gemini-api-key hint
+    // 5. R9: Secrets emitted on harness stderr are redacted before reaching activities/journal.
+    {
+        let cmd = stub_command_with_env(&[("LOOM_ACP_STUB_SCENARIO", "secret_stderr")]);
+        let backend = new_test_backend(Some(cmd));
+        let conn = backend.connect();
+        negotiate_all(&conn);
+        let workspace_id = create_workspace(&conn, "SecretStderr");
+        let session = create_acp_session(&conn, workspace_id, "SecretStderr", None);
+        let run = start_run(&conn, session.id, "Log secrets", "default");
+        let settled = await_settled(&conn, run.id);
+        assert_eq!(settled.state, AgentRunState::Completed);
+        let proj = run_projection(&conn, run.id);
+        let serialized = serde_json::to_string(&proj.activities).unwrap();
+        assert!(serialized.contains("acp_stderr"));
+        assert!(!serialized.contains("ya29.a0AfH6SM_secret_oauth_token_123"));
+        assert!(!serialized.contains("AIzaSyD1234567890abcdef1234567890"));
+        assert!(!serialized.contains("4/0AX_secret_code"));
+        assert!(!serialized.contains("tok_xyz"));
+        assert!(!serialized.contains("AIzaSyAnotherSecretKey9999999"));
+        assert!(serialized.contains("[REDACTED]"));
+        backend.shutdown().unwrap();
+    }
+
+    // 6. Unadvertised auth method -> clear failure as session activity with gemini-api-key hint
     {
         let cmd = stub_command_with_env(&[("LOOM_ACP_STUB_AUTH_METHODS", "gemini-api-key")]);
-        let session = match conn
-            .request(RequestEnvelope::new(ClientRequest::Workspace(
-                WorkspaceRequest::CreateAcpAgentSessionInWorkspace {
-                    workspace_id,
-                    name: "UnadvertisedAuth".to_owned(),
-                    harness: ANTIGRAVITY_HARNESS_ID.to_owned(),
-                    command: Some(cmd),
-                    auth_method: Some("oauth-personal".to_owned()),
-                    interactive: true,
-                },
-            )))
-            .result
-            .unwrap()
-        {
-            ServerResponse::Session(SessionResponse::AgentSessionCreated(s)) => s,
-            other => panic!("{other:?}"),
-        };
-        let run = match conn
-            .request(RequestEnvelope::new(ClientRequest::Run(
-                RunRequest::StartSessionAgentRun {
-                    session_id: session.id,
-                    task: "Hi".to_owned(),
-                    model: ModelId::new("default"),
-                    system_instructions: None,
-                    repository_instructions: None,
-                },
-            )))
-            .result
-            .unwrap()
-        {
-            ServerResponse::Run(RunResponse::AgentRunStarted(r)) => r,
-            other => panic!("{other:?}"),
-        };
+        let backend = new_test_backend(Some(cmd));
+        let conn = backend.connect();
+        negotiate_all(&conn);
+        let workspace_id = create_workspace(&conn, "UnadvertisedAuth");
+        let session = create_acp_session(
+            &conn,
+            workspace_id,
+            "UnadvertisedAuth",
+            Some("oauth-personal"),
+        );
+        let run = start_run(&conn, session.id, "Hi", "default");
         let settled = await_settled(&conn, run.id);
         assert_eq!(settled.state, AgentRunState::Failed);
         let summary = settled.summary.unwrap_or_default();
@@ -819,47 +1254,22 @@ fn test_cancel_mid_turn_crash_unadvertised_auth_and_missing_binary() {
             summary.contains("oauth-personal") && summary.contains("gemini-api-key"),
             "{summary}"
         );
+        backend.shutdown().unwrap();
     }
 
-    // 4. Missing binary -> clear failure as session activity with gemini-api-key hint
+    // 7. Missing binary -> clear failure as session activity with gemini-api-key hint
     {
-        let session = match conn
-            .request(RequestEnvelope::new(ClientRequest::Workspace(
-                WorkspaceRequest::CreateAcpAgentSessionInWorkspace {
-                    workspace_id,
-                    name: "MissingBin".to_owned(),
-                    harness: ANTIGRAVITY_HARNESS_ID.to_owned(),
-                    command: Some("/nonexistent/loom-missing-agy-binary".to_owned()),
-                    auth_method: None,
-                    interactive: true,
-                },
-            )))
-            .result
-            .unwrap()
-        {
-            ServerResponse::Session(SessionResponse::AgentSessionCreated(s)) => s,
-            other => panic!("{other:?}"),
-        };
-        let run = match conn
-            .request(RequestEnvelope::new(ClientRequest::Run(
-                RunRequest::StartSessionAgentRun {
-                    session_id: session.id,
-                    task: "Hi".to_owned(),
-                    model: ModelId::new("default"),
-                    system_instructions: None,
-                    repository_instructions: None,
-                },
-            )))
-            .result
-            .unwrap()
-        {
-            ServerResponse::Run(RunResponse::AgentRunStarted(r)) => r,
-            other => panic!("{other:?}"),
-        };
+        let backend = new_test_backend(Some("/nonexistent/loom-missing-agy-binary".to_owned()));
+        let conn = backend.connect();
+        negotiate_all(&conn);
+        let workspace_id = create_workspace(&conn, "MissingBin");
+        let session = create_acp_session(&conn, workspace_id, "MissingBin", None);
+        let run = start_run(&conn, session.id, "Hi", "default");
         let settled = await_settled(&conn, run.id);
         assert_eq!(settled.state, AgentRunState::Failed);
         let summary = settled.summary.unwrap_or_default();
         assert!(summary.contains("gemini-api-key"), "{summary}");
+        backend.shutdown().unwrap();
     }
 }
 
@@ -875,7 +1285,6 @@ fn test_live_agy_initialize_opt_in() {
         .request(RequestEnvelope::new(ClientRequest::Provider(
             ProviderRequest::ProbeAcpHarness {
                 harness: ANTIGRAVITY_HARNESS_ID.to_owned(),
-                command: None,
                 auth_method: None,
             },
         )))
@@ -896,28 +1305,32 @@ fn main() {
     }
     let tests: &[(&str, fn())] = &[
         (
-            "capability_gate_refuses_older_clients",
-            test_capability_gate_refuses_older_clients,
+            "capability_gate_and_authorization_refuse_unprivileged_clients",
+            test_capability_gate_and_authorization_refuse_unprivileged_clients,
         ),
         (
-            "probe_discovers_catalog_and_policy_notices",
-            test_probe_discovers_catalog_and_policy_notices,
+            "probe_discovers_catalog_and_sanitizes_command_display",
+            test_probe_discovers_catalog_and_sanitizes_command_display,
         ),
         (
-            "interactive_only_guard_refuses_headless_and_auto_approve",
-            test_interactive_only_guard_refuses_headless_and_auto_approve,
+            "interactive_only_guard_refuses_headless_partial_auto_approve_and_ci",
+            test_interactive_only_guard_refuses_headless_partial_auto_approve_and_ci,
         ),
         (
-            "full_acp_turn_mapping_client_info_no_prompt_injection_and_persistence",
-            test_full_acp_turn_mapping_client_info_no_prompt_injection_and_persistence,
+            "full_acp_turn_multi_turn_model_switch_fork_profile_reuse_and_delete",
+            test_full_acp_turn_multi_turn_model_switch_fork_profile_reuse_and_delete,
         ),
         (
-            "permission_allow_deny_and_cancel_through_approval_ui",
-            test_permission_allow_deny_and_cancel_through_approval_ui,
+            "server_restart_rehydrates_acp_runs_with_load_session_recap_and_pending_approval",
+            test_server_restart_rehydrates_acp_runs_with_load_session_recap_and_pending_approval,
         ),
         (
-            "cancel_mid_turn_crash_unadvertised_auth_and_missing_binary",
-            test_cancel_mid_turn_crash_unadvertised_auth_and_missing_binary,
+            "permission_allow_deny_cancel_and_timeout_through_approval_ui",
+            test_permission_allow_deny_cancel_and_timeout_through_approval_ui,
+        ),
+        (
+            "cancel_wedged_timeout_crash_auth_missing_redaction_and_shutdown",
+            test_cancel_wedged_timeout_crash_auth_missing_redaction_and_shutdown,
         ),
         (
             "live_agy_initialize_opt_in",

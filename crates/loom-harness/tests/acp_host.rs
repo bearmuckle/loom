@@ -375,6 +375,184 @@ fn test_cancel_mid_turn_and_harness_crash_and_missing_binary() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+fn test_session_load_unsupported_request_prompt_error_and_stderr_redaction() {
+    let dir = temp_dir("protocol-edge");
+    let record = dir.join("record.jsonl");
+
+    // 1. session/load when loadSession is advertised
+    {
+        let mut client = spawn_stub(
+            &dir,
+            None,
+            &[
+                ("LOOM_ACP_STUB_LOAD_SESSION", "1"),
+                ("LOOM_ACP_STUB_RECORD", record.to_str().unwrap()),
+            ],
+        );
+        let init = client.initialize(Duration::from_secs(5)).unwrap();
+        assert!(init.capabilities.load_session);
+        assert!(init.capabilities.supports_resume());
+        client
+            .authenticate(
+                None,
+                &init.auth_methods,
+                Duration::from_secs(5),
+                None,
+                &mut |_| {},
+            )
+            .unwrap();
+        let loaded = client
+            .session_load("persisted-sess-99", &dir, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(loaded.session_id, "persisted-sess-99");
+        client.kill();
+    }
+
+    // 2. Unsupported agent->client request gets JSON-RPC -32601 automatically
+    {
+        let _ = fs::remove_file(&record);
+        let mut client = spawn_stub(
+            &dir,
+            None,
+            &[
+                ("LOOM_ACP_STUB_SCENARIO", "unsupported_req"),
+                ("LOOM_ACP_STUB_RECORD", record.to_str().unwrap()),
+            ],
+        );
+        let init = client.initialize(Duration::from_secs(5)).unwrap();
+        client
+            .authenticate(
+                None,
+                &init.auth_methods,
+                Duration::from_secs(5),
+                None,
+                &mut |_| {},
+            )
+            .unwrap();
+        let session = client.session_new(&dir, Duration::from_secs(5)).unwrap();
+        let _ = client.start_prompt(&session.session_id, "Ping").unwrap();
+        let mut finished = false;
+        for _ in 0..50 {
+            if let AcpNext::Event(event) = client.next_event(Duration::from_millis(200))
+                && matches!(*event, AcpEvent::PromptFinished(_))
+            {
+                finished = true;
+                break;
+            }
+        }
+        assert!(finished);
+        client.kill();
+
+        let recorded = fs::read_to_string(&record).unwrap();
+        let err_reply = recorded
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|v| v.get("id") == Some(&serde_json::json!("client-req-42")))
+            .expect("host replied to unsupported agent->client request");
+        assert_eq!(err_reply["error"]["code"], -32601);
+    }
+
+    // 3. PromptFailed JSON-RPC error surfaces cleanly
+    {
+        let mut client = spawn_stub(&dir, None, &[("LOOM_ACP_STUB_SCENARIO", "prompt_error")]);
+        let init = client.initialize(Duration::from_secs(5)).unwrap();
+        client
+            .authenticate(
+                None,
+                &init.auth_methods,
+                Duration::from_secs(5),
+                None,
+                &mut |_| {},
+            )
+            .unwrap();
+        let session = client.session_new(&dir, Duration::from_secs(5)).unwrap();
+        let _ = client.start_prompt(&session.session_id, "Fail").unwrap();
+        let mut saw_failed = false;
+        for _ in 0..50 {
+            if let AcpNext::Event(event) = client.next_event(Duration::from_millis(200))
+                && let AcpEvent::PromptFailed { code, message, .. } = *event
+            {
+                assert_eq!(code, -32001);
+                assert!(message.contains("stub prompt failure"));
+                saw_failed = true;
+                break;
+            }
+        }
+        assert!(saw_failed);
+        client.kill();
+    }
+
+    // 4. Secret stderr lines and stderr_tail are redacted at the source
+    {
+        let mut client = spawn_stub(&dir, None, &[("LOOM_ACP_STUB_SCENARIO", "secret_stderr")]);
+        let init = client.initialize(Duration::from_secs(5)).unwrap();
+        client
+            .authenticate(
+                None,
+                &init.auth_methods,
+                Duration::from_secs(5),
+                None,
+                &mut |_| {},
+            )
+            .unwrap();
+        let session = client.session_new(&dir, Duration::from_secs(5)).unwrap();
+        let _ = client.start_prompt(&session.session_id, "Stderr").unwrap();
+        let mut stderr_lines = Vec::new();
+        for _ in 0..50 {
+            if let AcpNext::Event(event) = client.next_event(Duration::from_millis(200)) {
+                match *event {
+                    AcpEvent::StderrLine(line) => stderr_lines.push(line),
+                    AcpEvent::PromptFinished(_) => break,
+                    _ => {}
+                }
+            }
+        }
+        let joined = stderr_lines.join("\n");
+        let tail = client.stderr_tail();
+        for surface in [&joined, &tail] {
+            assert!(!surface.contains("ya29.a0AfH6SM_secret_oauth_token_123"));
+            assert!(!surface.contains("AIzaSyD1234567890abcdef1234567890"));
+            assert!(!surface.contains("4/0AX_secret_code"));
+            assert!(!surface.contains("tok_xyz"));
+            assert!(!surface.contains("AIzaSyAnotherSecretKey9999999"));
+        }
+        assert!(tail.contains("[REDACTED]"));
+        client.kill();
+    }
+
+    // 5. Out-of-band AcpKillHandle terminates a wedged child cleanly
+    {
+        let mut client = spawn_stub(&dir, None, &[("LOOM_ACP_STUB_SCENARIO", "hang")]);
+        let kill_handle = client.kill_handle();
+        let init = client.initialize(Duration::from_secs(5)).unwrap();
+        client
+            .authenticate(
+                None,
+                &init.auth_methods,
+                Duration::from_secs(5),
+                None,
+                &mut |_| {},
+            )
+            .unwrap();
+        let session = client.session_new(&dir, Duration::from_secs(5)).unwrap();
+        let _ = client.start_prompt(&session.session_id, "Hang").unwrap();
+        kill_handle.kill();
+        let mut saw_exit = false;
+        for _ in 0..50 {
+            if matches!(
+                client.next_event(Duration::from_millis(200)),
+                AcpNext::Exited { .. }
+            ) {
+                saw_exit = true;
+                break;
+            }
+        }
+        assert!(saw_exit);
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 fn main() {
     if std::env::var_os("LOOM_ACP_STUB_MODE").is_some() {
         loom_harness::acp::stub::run_stub_stdio();
@@ -392,6 +570,10 @@ fn main() {
         (
             "cancel_mid_turn_and_harness_crash_and_missing_binary",
             test_cancel_mid_turn_and_harness_crash_and_missing_binary,
+        ),
+        (
+            "session_load_unsupported_request_prompt_error_and_stderr_redaction",
+            test_session_load_unsupported_request_prompt_error_and_stderr_redaction,
         ),
     ];
     if std::env::args().any(|arg| arg == "--list") {

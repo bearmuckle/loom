@@ -11,7 +11,7 @@
 //! credentials or `GEMINI_API_KEY`.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, PoisonError,
@@ -23,15 +23,16 @@ use std::{
 use loom_agent::{AgentEvent, AgentRunSnapshot, AgentRunState, AgentRuntimeState, AgentTask};
 use loom_core::{
     ANTIGRAVITY_AUTH_OAUTH_PERSONAL, ANTIGRAVITY_HARNESS_ID, AcpCapabilities, ActivityId,
-    AgentSessionId, ApprovalPolicy, Capability, ErrorCode, InteractionId, LoomError, Result,
-    RunAttemptId, RunId, SessionBackendDescriptor, Timestamp, ToolCallId, UsageSnapshot,
-    WorkspaceId,
+    AgentSessionId, ApprovalPolicy, Capability, ErrorCode, InteractionId, LoomError, ParticipantId,
+    PolicyDecision, Result, RunAttemptId, RunId, SessionBackendDescriptor, Timestamp, ToolCallId,
+    UsageSnapshot, WorkspaceId,
 };
 use loom_harness::acp::{
-    ANTIGRAVITY_COMMAND_ENV, AcpClient, AcpCommandSpec, AcpEvent, AcpInitializeResult, AcpNext,
-    AcpOptions, AcpPermissionOutcome, AcpPermissionRequest, AcpPlanEntry, AcpSessionInfo,
-    AcpToolCall, AcpToolCallUpdate, AcpUsageUpdate, AntigravityRunContext, antigravity_notices,
-    check_interactive_only, discover_antigravity_command,
+    ANTIGRAVITY_COMMAND_ENV, AcpClient, AcpCommandSpec, AcpEvent, AcpInitializeResult,
+    AcpKillHandle, AcpNext, AcpOptions, AcpPermissionOutcome, AcpPermissionRequest, AcpPlanEntry,
+    AcpSessionInfo, AcpToolCall, AcpToolCallUpdate, AcpUsageUpdate, AntigravityRunContext,
+    antigravity_notices, check_interactive_only_with_ci_policy, discover_antigravity_command,
+    redact_acp_text,
 };
 use loom_model::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
@@ -48,6 +49,42 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(300);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
+const DEFAULT_PERMISSION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MAX_RECAP_MESSAGES: usize = 12;
+const MAX_RECAP_BYTES: usize = 8 * 1024;
+
+/// Worker-side configuration for ACP harness execution.
+///
+/// Command overrides live strictly on the worker (never accepted over the
+/// client wire protocol), and `enforce_ci_env` defaults to `true` in production.
+#[derive(Clone, Debug)]
+pub(crate) struct AcpWorkerConfig {
+    pub(crate) command_override: Option<String>,
+    pub(crate) enforce_ci_env: bool,
+    pub(crate) permission_timeout: Duration,
+    pub(crate) turn_timeout: Duration,
+}
+
+impl Default for AcpWorkerConfig {
+    fn default() -> Self {
+        Self {
+            command_override: None,
+            enforce_ci_env: true,
+            permission_timeout: DEFAULT_PERMISSION_TIMEOUT,
+            turn_timeout: DEFAULT_TURN_TIMEOUT,
+        }
+    }
+}
+
+/// Returns whether `policy` would auto-approve mutating, command, or network
+/// actions without an operator present.
+pub(crate) fn policy_allows_unattended_actions(policy: &ApprovalPolicy) -> bool {
+    *policy == ApprovalPolicy::auto_approve()
+        || matches!(policy.write, PolicyDecision::Allow)
+        || matches!(policy.command, PolicyDecision::Allow)
+        || matches!(policy.network, PolicyDecision::Allow)
+}
 
 /// Operator resolution for an active ACP `session/request_permission` prompt.
 #[derive(Clone, Debug)]
@@ -78,6 +115,34 @@ struct LiveAcpSession {
 
 struct AcpSessionEntry {
     live: Mutex<Option<LiveAcpSession>>,
+    kill_handle: Mutex<Option<AcpKillHandle>>,
+}
+
+impl AcpSessionEntry {
+    fn set_kill_handle(&self, handle: Option<AcpKillHandle>) {
+        *self
+            .kill_handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = handle;
+    }
+
+    /// Terminates the live child process immediately without blocking on an
+    /// active turn holding `self.live`.
+    fn kill_now(&self) {
+        if let Some(handle) = self
+            .kill_handle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            handle.kill();
+        }
+        if let Ok(mut guard) = self.live.try_lock()
+            && let Some(mut live) = guard.take()
+        {
+            live.client.kill();
+        }
+    }
 }
 
 /// Worker-wide registry of live ACP harness subprocesses and pending permission prompts.
@@ -93,6 +158,7 @@ impl AcpSessionManager {
         Arc::clone(guard.entry(session_id).or_insert_with(|| {
             Arc::new(AcpSessionEntry {
                 live: Mutex::new(None),
+                kill_handle: Mutex::new(None),
             })
         }))
     }
@@ -125,14 +191,8 @@ impl AcpSessionManager {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&session_id);
-        if let Some(entry) = entry
-            && let Some(mut live) = entry
-                .live
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take()
-        {
-            live.client.kill();
+        if let Some(entry) = entry {
+            entry.kill_now();
         }
     }
 
@@ -150,14 +210,7 @@ impl AcpSessionManager {
         let entries =
             std::mem::take(&mut *self.sessions.lock().unwrap_or_else(PoisonError::into_inner));
         for (_, entry) in entries {
-            if let Some(mut live) = entry
-                .live
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take()
-            {
-                live.client.kill();
-            }
+            entry.kill_now();
         }
     }
 }
@@ -179,33 +232,154 @@ fn validate_harness_name(harness: &str) -> Result<String> {
     )))
 }
 
-fn resolve_command_for_harness(
+/// Returns the isolated Loom-owned profile directory for `harness`, scoped per
+/// configured account/participant (or `"default"` for the worker operator).
+///
+/// Reused across sessions so `oauth-personal` sign-in persists across turns and
+/// sessions without touching the user's personal `~/.gemini` or `~/.antigravity`.
+/// Loom only creates and passes this directory path; it never reads its contents.
+fn profile_dir_for_harness(
+    session_root_base: &Path,
     harness: &str,
-    command_override: Option<&str>,
-) -> Result<AcpCommandSpec> {
-    let _ = validate_harness_name(harness)?;
-    let env_override = std::env::var(ANTIGRAVITY_COMMAND_ENV).ok();
-    let path_env = loom_core::child_path();
-    discover_antigravity_command(
-        command_override,
-        env_override.as_deref(),
-        path_env.as_deref(),
-    )
-}
-
-fn session_command_override(command: &str) -> Option<&str> {
-    let trimmed = command.trim();
-    if trimmed.is_empty() || trimmed == "agy acp" || trimmed == "antigravity-acp" {
-        None
-    } else {
-        Some(trimmed)
-    }
-}
-
-fn profile_dir_for_session(session_root_base: &Path, session_id: AgentSessionId) -> PathBuf {
+    participant_id: Option<ParticipantId>,
+) -> PathBuf {
+    let account = participant_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "default".to_owned());
     session_root_base
         .join("acp-profiles")
-        .join(session_id.to_string())
+        .join(harness)
+        .join(account)
+}
+
+fn build_acp_recap_prompt(prior_messages: &[ModelMessage], current_prompt: &str) -> String {
+    let relevant: Vec<&ModelMessage> = prior_messages
+        .iter()
+        .filter(|msg| {
+            matches!(msg.role, MessageRole::User | MessageRole::Assistant)
+                && !msg.content.trim().is_empty()
+        })
+        .collect();
+    if relevant.is_empty() {
+        return current_prompt.to_owned();
+    }
+    let start = relevant.len().saturating_sub(MAX_RECAP_MESSAGES);
+    let mut recap = String::from(
+        "[Loom local transcript recap — the ACP harness does not advertise loadSession/resume, \
+         so this is a labelled local recap rather than native harness replay]\n",
+    );
+    for msg in &relevant[start..] {
+        let role = match msg.role {
+            MessageRole::User => "User",
+            MessageRole::Assistant => "Assistant",
+            _ => continue,
+        };
+        let snippet = msg.content.trim();
+        let entry = format!("- {role}: {snippet}\n");
+        if recap.len() + entry.len() > MAX_RECAP_BYTES {
+            let remaining = MAX_RECAP_BYTES.saturating_sub(recap.len());
+            if remaining > 32 {
+                let mut end = remaining.saturating_sub(4);
+                while end > 0 && !entry.is_char_boundary(end) {
+                    end -= 1;
+                }
+                recap.push_str(&entry[..end]);
+                recap.push_str("...\n");
+            }
+            break;
+        }
+        recap.push_str(&entry);
+    }
+    recap.push_str("[End of local transcript recap]\n\n");
+    recap.push_str(current_prompt);
+    recap
+}
+
+impl InProcessBackend {
+    /// Configures a worker-side ACP harness command override (for example from
+    /// operator worker configuration or integration tests). Never exposed over
+    /// the client wire protocol.
+    pub fn set_acp_command_override(&self, command: Option<String>) {
+        self.acp_config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .command_override = command;
+    }
+
+    /// Configures whether the interactive-only guard inspects ambient `CI` /
+    /// `GITHUB_ACTIONS` environment variables. Always `true` by default; tests
+    /// running under CI may opt out explicitly on their test backend.
+    pub fn set_acp_ci_env_guard(&self, enforce: bool) {
+        self.acp_config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .enforce_ci_env = enforce;
+    }
+
+    /// Overrides the permission-wait and turn-inactivity timeouts for ACP runs
+    /// on this worker.
+    pub fn set_acp_timeouts(&self, permission_timeout: Duration, turn_timeout: Duration) {
+        let mut config = self
+            .acp_config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        config.permission_timeout = permission_timeout;
+        config.turn_timeout = turn_timeout;
+    }
+
+    pub(crate) fn acp_config(&self) -> AcpWorkerConfig {
+        self.acp_config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn check_acp_interactive(
+        &self,
+        harness: &str,
+        ctx: AntigravityRunContext,
+    ) -> Result<()> {
+        let enforce_ci = self.acp_config().enforce_ci_env;
+        check_interactive_only_with_ci_policy(harness, ctx, enforce_ci)
+    }
+
+    pub(crate) fn resolve_acp_command(&self, harness: &str) -> Result<AcpCommandSpec> {
+        let _ = validate_harness_name(harness)?;
+        let worker_override = self.acp_config().command_override;
+        let env_override = std::env::var(ANTIGRAVITY_COMMAND_ENV).ok();
+        let path_env = loom_core::child_path();
+        discover_antigravity_command(
+            worker_override.as_deref(),
+            env_override.as_deref(),
+            path_env.as_deref(),
+        )
+    }
+
+    pub(crate) fn is_delegated_session(&self, session_id: AgentSessionId) -> bool {
+        self.persistence
+            .as_ref()
+            .and_then(|persistence| persistence.load_delegated_task_for_target(session_id).ok())
+            .flatten()
+            .is_some()
+    }
+
+    /// Returns whether this worker currently tracks a live ACP subprocess for `session_id`.
+    pub fn has_live_acp_process(&self, session_id: AgentSessionId) -> bool {
+        let entry = self
+            .acp_sessions
+            .sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&session_id)
+            .cloned();
+        entry.is_some_and(|entry| {
+            entry
+                .kill_handle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_some()
+        })
+    }
 }
 
 fn next_timeline_ordinal(state: &AgentRuntimeState) -> u64 {
@@ -233,17 +407,44 @@ fn build_env_for_acp(build_cache: Option<&Path>) -> Vec<(String, String)> {
 }
 
 impl InProcessConnection {
+    fn require_negotiated_capability(&self, capability: Capability) -> Result<()> {
+        let negotiated = self
+            .negotiated_capabilities()?
+            .clone()
+            .ok_or_else(|| LoomError::invalid_request("connection must negotiate first"))?;
+        if !negotiated.contains(capability) {
+            return Err(LoomError::new(
+                ErrorCode::CapabilityDenied,
+                format!("connection did not negotiate capability {capability:?}"),
+                false,
+            ));
+        }
+        Ok(())
+    }
+
     /// Probes the Antigravity ACP harness on the worker without reading or
     /// persisting any credential files or API keys.
+    ///
+    /// Uses only the worker-configured command (never client-supplied command
+    /// strings) and requires `AcpAgentSessions` + `ConfigureProviders`.
     pub(crate) fn probe_acp_harness(
         &self,
         harness: String,
-        command: Option<String>,
         auth_method: Option<String>,
     ) -> Result<ServerResponse> {
+        self.require_negotiated_capability(Capability::AcpAgentSessions)?;
+        self.require_negotiated_capability(Capability::ConfigureProviders)?;
         let harness = validate_harness_name(&harness)?;
+        self.backend.check_acp_interactive(
+            &harness,
+            AntigravityRunContext {
+                interactive: true,
+                auto_approve_actions: false,
+                delegated_or_scheduled: false,
+            },
+        )?;
         let notices = antigravity_notices();
-        let spec = match resolve_command_for_harness(&harness, command.as_deref()) {
+        let spec = match self.backend.resolve_acp_command(&harness) {
             Ok(spec) => spec,
             Err(error) => {
                 return Ok(ServerResponse::Provider(ProviderResponse::AcpHarnessProbe(
@@ -258,7 +459,7 @@ impl InProcessConnection {
                         models: Vec::new(),
                         interactive_only: true,
                         notices,
-                        error: Some(error.message),
+                        error: Some(redact_acp_text(&error.message)),
                     },
                 )));
             }
@@ -269,7 +470,13 @@ impl InProcessConnection {
             .session_root_base
             .join("acp-probe")
             .join(loom_core::RequestId::new().to_string());
-        let profile_dir = probe_dir.join("profile");
+        // Reuse the worker/account-scoped isolated profile directory instead of
+        // creating and deleting an ephemeral profile on every probe.
+        let profile_dir = profile_dir_for_harness(
+            &self.backend.session_root_base,
+            &harness,
+            self.participant().map(|p| p.id),
+        );
         let _ = std::fs::create_dir_all(&probe_dir);
 
         let mut client = match AcpClient::spawn(&AcpOptions {
@@ -293,7 +500,7 @@ impl InProcessConnection {
                         models: Vec::new(),
                         interactive_only: true,
                         notices,
-                        error: Some(error.message),
+                        error: Some(redact_acp_text(&error.message)),
                     },
                 )));
             }
@@ -316,7 +523,7 @@ impl InProcessConnection {
                         models: Vec::new(),
                         interactive_only: true,
                         notices,
-                        error: Some(error.message),
+                        error: Some(redact_acp_text(&error.message)),
                     },
                 )));
             }
@@ -338,9 +545,9 @@ impl InProcessConnection {
             ) {
                 Ok(_) => match client.session_new(&probe_dir, HANDSHAKE_TIMEOUT) {
                     Ok(session) => models = session.models,
-                    Err(error) => probe_error = Some(error.message),
+                    Err(error) => probe_error = Some(redact_acp_text(&error.message)),
                 },
-                Err(error) => probe_error = Some(error.message),
+                Err(error) => probe_error = Some(redact_acp_text(&error.message)),
             }
         }
 
@@ -370,10 +577,11 @@ impl InProcessConnection {
         workspace_id: WorkspaceId,
         name: String,
         harness: String,
-        command: Option<String>,
         auth_method: Option<String>,
         interactive: bool,
     ) -> Result<loom_core::AgentSessionSnapshot> {
+        self.require_negotiated_capability(Capability::AcpAgentSessions)?;
+        self.require_negotiated_capability(Capability::CreateAgentSession)?;
         self.backend.workspace_records()?.get(workspace_id)?;
         if name.trim().is_empty() {
             return Err(LoomError::invalid_request(
@@ -381,7 +589,7 @@ impl InProcessConnection {
             ));
         }
         let harness = validate_harness_name(&harness)?;
-        check_interactive_only(
+        self.backend.check_acp_interactive(
             &harness,
             AntigravityRunContext {
                 interactive,
@@ -390,16 +598,11 @@ impl InProcessConnection {
             },
         )?;
 
-        let command_display = command
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-            .or_else(|| {
-                resolve_command_for_harness(&harness, None)
-                    .ok()
-                    .map(|spec| spec.display)
-            })
+        let command_display = self
+            .backend
+            .resolve_acp_command(&harness)
+            .ok()
+            .map(|spec| spec.display)
             .unwrap_or_else(|| "agy acp".to_owned());
 
         let selected_auth = auth_method
@@ -455,17 +658,7 @@ impl InProcessConnection {
         session: &loom_core::AgentSessionSnapshot,
         input: crate::StartRunInput,
     ) -> Result<ServerResponse> {
-        let negotiated = self
-            .negotiated_capabilities()?
-            .clone()
-            .ok_or_else(|| LoomError::invalid_request("connection must negotiate first"))?;
-        if !negotiated.contains(Capability::AcpAgentSessions) {
-            return Err(LoomError::new(
-                ErrorCode::CapabilityDenied,
-                "connection did not negotiate capability AcpAgentSessions",
-                false,
-            ));
-        }
+        self.require_negotiated_capability(Capability::AcpAgentSessions)?;
 
         let Some(acp) = session
             .backend
@@ -477,18 +670,19 @@ impl InProcessConnection {
             ));
         };
         let harness = acp.harness.clone();
-        let command = acp.command.clone();
         let auth_method = acp.auth_method.clone();
 
         let policy = self.policy(session.id)?;
         let auto_approve =
-            self.auto_approve_actions(session.id)? || policy == ApprovalPolicy::auto_approve();
-        check_interactive_only(
+            self.auto_approve_actions(session.id)? || policy_allows_unattended_actions(&policy);
+        let delegated_or_scheduled =
+            input.project_task_id.is_some() || self.backend.is_delegated_session(session.id);
+        self.backend.check_acp_interactive(
             &harness,
             AntigravityRunContext {
                 interactive: true,
                 auto_approve_actions: auto_approve,
-                delegated_or_scheduled: input.project_task_id.is_some(),
+                delegated_or_scheduled,
             },
         )?;
 
@@ -582,8 +776,8 @@ impl InProcessConnection {
             Arc::clone(&handle),
             AcpTurnSpec {
                 harness,
-                command,
                 auth_method,
+                participant_id: self.participant().map(|p| p.id),
                 cwd,
                 prompt: input.task,
                 requested_model: input.model,
@@ -603,6 +797,7 @@ impl InProcessConnection {
         expected_control_revision: u64,
         message: String,
     ) -> Result<ServerResponse> {
+        self.require_negotiated_capability(Capability::AcpAgentSessions)?;
         if message.trim().is_empty() {
             return Err(LoomError::invalid_request(
                 "agent message must not be empty",
@@ -619,17 +814,17 @@ impl InProcessConnection {
             ));
         };
         let harness = acp.harness.clone();
-        let command = acp.command.clone();
         let auth_method = acp.auth_method.clone();
         let policy = self.policy(session.id)?;
         let auto_approve =
-            self.auto_approve_actions(session.id)? || policy == ApprovalPolicy::auto_approve();
-        check_interactive_only(
+            self.auto_approve_actions(session.id)? || policy_allows_unattended_actions(&policy);
+        let delegated_or_scheduled = self.backend.is_delegated_session(session.id);
+        self.backend.check_acp_interactive(
             &harness,
             AntigravityRunContext {
                 interactive: true,
                 auto_approve_actions: auto_approve,
-                delegated_or_scheduled: false,
+                delegated_or_scheduled,
             },
         )?;
         if handle.is_running() {
@@ -686,8 +881,8 @@ impl InProcessConnection {
             Arc::clone(handle),
             AcpTurnSpec {
                 harness,
-                command,
                 auth_method,
+                participant_id: self.participant().map(|p| p.id),
                 cwd,
                 prompt: message,
                 requested_model: model,
@@ -778,8 +973,8 @@ impl InProcessConnection {
 
 pub(crate) struct AcpTurnSpec {
     harness: String,
-    command: String,
     auth_method: Option<String>,
+    participant_id: Option<ParticipantId>,
     cwd: PathBuf,
     prompt: String,
     requested_model: ModelId,
@@ -851,22 +1046,27 @@ impl InProcessBackend {
     fn drive_acp_turn(self: &Arc<Self>, handle: &Arc<RunHandle>, spec: AcpTurnSpec) {
         let entry = self.acp_sessions.entry(handle.session_id);
         let mut live_guard = entry.live.lock().unwrap_or_else(PoisonError::into_inner);
+        let config = self.acp_config();
 
         // Reuse existing live subprocess when healthy; otherwise spawn + handshake + auth.
         let need_spawn = match live_guard.as_mut() {
             Some(live) => live.client.has_exited(),
             None => true,
         };
+        let mut needs_recap = false;
         if need_spawn {
             *live_guard = None;
-            let live = match self.start_live_acp_session(handle, &spec) {
-                Ok(live) => live,
+            entry.set_kill_handle(None);
+            let (live, recap) = match self.start_live_acp_session(handle, &spec) {
+                Ok(started) => started,
                 Err(error) => {
                     let _ = self.fail_acp_run(handle, error);
                     return;
                 }
             };
+            entry.set_kill_handle(Some(live.client.kill_handle()));
             *live_guard = Some(live);
+            needs_recap = recap;
         }
 
         let Some(live) = live_guard.as_mut() else {
@@ -889,10 +1089,10 @@ impl InProcessBackend {
                 self.record_acp_notice_activity(
                     handle,
                     "acp_set_model",
-                    format!(
+                    redact_acp_text(&format!(
                         "model selection '{requested}' was rejected by harness: {}",
                         error.message
-                    ),
+                    )),
                     AgentActivityStatus::Failed,
                 );
             } else {
@@ -900,9 +1100,19 @@ impl InProcessBackend {
             }
         }
 
+        let prompt_to_send = if needs_recap {
+            let prior = self.collect_prior_acp_messages(handle);
+            build_acp_recap_prompt(&prior, &spec.prompt)
+        } else {
+            spec.prompt.clone()
+        };
+
         let acp_session_id = live.session.session_id.clone();
-        if let Err(error) = live.client.start_prompt(&acp_session_id, &spec.prompt) {
+        let command_display = live.command_display.clone();
+        if let Err(error) = live.client.start_prompt(&acp_session_id, &prompt_to_send) {
+            live.client.kill();
             *live_guard = None;
+            entry.set_kill_handle(None);
             let _ = self.fail_acp_run(handle, error);
             return;
         }
@@ -911,7 +1121,9 @@ impl InProcessBackend {
             String,
             (ActivityId, ToolCall, Timestamp, Option<String>),
         > = BTreeMap::new();
+        let mut buffered_events: VecDeque<AcpEvent> = VecDeque::new();
         let mut cancel_sent_at: Option<Instant> = None;
+        let mut last_activity = Instant::now();
         let assistant_message_id = {
             let mut state = handle.locked_state();
             let id = state.next_message_id;
@@ -927,29 +1139,58 @@ impl InProcessBackend {
                     let _ = live.client.cancel_session(&acp_session_id);
                     cancel_sent_at = Some(Instant::now());
                 } else if cancel_sent_at.is_some_and(|at| at.elapsed() >= CANCEL_GRACE) {
+                    // Kill and clear the wedged child process so no unfinished turn
+                    // or orphan subprocess survives past cancel grace.
+                    live.client.kill();
+                    *live_guard = None;
+                    entry.set_kill_handle(None);
                     let _ = self.cancel_acp_run(handle);
                     return;
                 }
+            } else if last_activity.elapsed() >= config.turn_timeout {
+                let _ = live.client.cancel_session(&acp_session_id);
+                live.client.kill();
+                *live_guard = None;
+                entry.set_kill_handle(None);
+                let _ = self.fail_acp_run(
+                    handle,
+                    LoomError::new(
+                        ErrorCode::DeadlineExceeded,
+                        format!(
+                            "ACP harness '{}' timed out after {}s without activity",
+                            command_display,
+                            config.turn_timeout.as_secs()
+                        ),
+                        true,
+                    ),
+                );
+                return;
             }
 
-            match live.client.next_event(POLL_INTERVAL) {
+            let next = if let Some(event) = buffered_events.pop_front() {
+                AcpNext::Event(Box::new(event))
+            } else {
+                live.client.next_event(POLL_INTERVAL)
+            };
+
+            match next {
                 AcpNext::Idle => continue,
                 AcpNext::Exited {
                     exit_code,
                     stderr_tail,
                 } => {
                     *live_guard = None;
-                    let detail = if stderr_tail.trim().is_empty() {
+                    entry.set_kill_handle(None);
+                    let safe_tail = redact_acp_text(stderr_tail.trim());
+                    let detail = if safe_tail.is_empty() {
                         format!(
                             "ACP harness '{}' exited mid-run (code {:?})",
-                            spec.command, exit_code
+                            command_display, exit_code
                         )
                     } else {
                         format!(
                             "ACP harness '{}' exited mid-run (code {:?}): {}",
-                            spec.command,
-                            exit_code,
-                            stderr_tail.trim()
+                            command_display, exit_code, safe_tail
                         )
                     };
                     let _ = self.fail_acp_run(
@@ -958,56 +1199,46 @@ impl InProcessBackend {
                     );
                     return;
                 }
-                AcpNext::Event(event) => match *event {
-                    AcpEvent::MessageChunk(text) if !text.is_empty() => {
-                        self.append_acp_assistant_text(handle, &mut assistant_msg_index, &text);
-                        let _ = self.emit_acp_event(
-                            handle,
-                            AgentEvent::AssistantMessageDelta {
-                                run_id: handle.run_id,
-                                message_id: assistant_message_id,
-                                text,
-                            },
-                        );
-                    }
-                    AcpEvent::ThoughtChunk(text) if !text.is_empty() => {
-                        self.append_acp_assistant_reasoning(
-                            handle,
-                            &mut assistant_msg_index,
-                            &text,
-                        );
-                        let _ = self.emit_acp_event(
-                            handle,
-                            AgentEvent::ReasoningDelta {
-                                run_id: handle.run_id,
-                                message_id: assistant_message_id,
-                                text,
-                            },
-                        );
-                    }
-                    AcpEvent::ToolCall(tc) => {
-                        let activity = self.build_acp_tool_activity(handle, &tc);
-                        let tool_call = activity_tool_call(&activity);
-                        tool_activities.insert(
-                            tc.tool_call_id.clone(),
-                            (activity.id, tool_call, activity.started_at, tc.kind.clone()),
-                        );
-                        {
-                            let mut state = handle.locked_state();
-                            state.usage.add_tool_call();
+                AcpNext::Event(event) => {
+                    last_activity = Instant::now();
+                    match *event {
+                        AcpEvent::MessageChunk(text) if !text.is_empty() => {
+                            self.append_acp_assistant_text(handle, &mut assistant_msg_index, &text);
+                            let _ = self.emit_acp_event(
+                                handle,
+                                AgentEvent::AssistantMessageDelta {
+                                    run_id: handle.run_id,
+                                    message_id: assistant_message_id,
+                                    text,
+                                },
+                            );
                         }
-                        let _ = self.emit_acp_event(
-                            handle,
-                            AgentEvent::ActivityRecorded {
-                                run_id: handle.run_id,
-                                activity,
-                            },
-                        );
-                    }
-                    AcpEvent::ToolCallUpdate(update) => {
-                        if let Some(activity) =
-                            self.update_acp_tool_activity(handle, &mut tool_activities, &update)
-                        {
+                        AcpEvent::ThoughtChunk(text) if !text.is_empty() => {
+                            self.append_acp_assistant_reasoning(
+                                handle,
+                                &mut assistant_msg_index,
+                                &text,
+                            );
+                            let _ = self.emit_acp_event(
+                                handle,
+                                AgentEvent::ReasoningDelta {
+                                    run_id: handle.run_id,
+                                    message_id: assistant_message_id,
+                                    text,
+                                },
+                            );
+                        }
+                        AcpEvent::ToolCall(tc) => {
+                            let activity = self.build_acp_tool_activity(handle, &tc);
+                            let tool_call = activity_tool_call(&activity);
+                            tool_activities.insert(
+                                tc.tool_call_id.clone(),
+                                (activity.id, tool_call, activity.started_at, tc.kind.clone()),
+                            );
+                            {
+                                let mut state = handle.locked_state();
+                                state.usage.add_tool_call();
+                            }
                             let _ = self.emit_acp_event(
                                 handle,
                                 AgentEvent::ActivityRecorded {
@@ -1016,100 +1247,169 @@ impl InProcessBackend {
                                 },
                             );
                         }
-                    }
-                    AcpEvent::Plan(entries) => {
-                        let plan = map_acp_plan(&entries);
-                        {
-                            handle.locked_state().plan = plan.clone();
-                        }
-                        let _ = self.emit_acp_event(
-                            handle,
-                            AgentEvent::PlanProposed {
-                                run_id: handle.run_id,
-                                plan,
-                            },
-                        );
-                    }
-                    AcpEvent::UsageUpdate(usage) => {
-                        self.apply_acp_usage(handle, &usage);
-                    }
-                    AcpEvent::ModelsUpdated {
-                        models,
-                        current_model_id,
-                        model_config_option_id,
-                    } => {
-                        live.session.models = models.clone();
-                        if current_model_id.is_some() {
-                            live.session.current_model_id = current_model_id;
-                        }
-                        if model_config_option_id.is_some() {
-                            live.session.model_config_option_id = model_config_option_id;
-                        }
-                        self.sync_acp_session_backend(handle.session_id, live);
-                    }
-                    AcpEvent::StderrLine(line) => {
-                        self.record_acp_notice_activity(
-                            handle,
-                            "acp_stderr",
-                            line,
-                            AgentActivityStatus::Completed,
-                        );
-                    }
-                    AcpEvent::PermissionRequest(req) => {
-                        let outcome =
-                            self.handle_acp_permission_request(handle, live, &acp_session_id, &req);
-                        match outcome {
-                            PermissionWaitResult::Answered => {}
-                            PermissionWaitResult::Cancelled => {
-                                cancel_sent_at = Some(Instant::now());
-                            }
-                            PermissionWaitResult::HarnessExited { detail } => {
-                                *live_guard = None;
-                                let _ = self.fail_acp_run(
+                        AcpEvent::ToolCallUpdate(update) => {
+                            if let Some(activity) =
+                                self.update_acp_tool_activity(handle, &mut tool_activities, &update)
+                            {
+                                let _ = self.emit_acp_event(
                                     handle,
-                                    LoomError::new(ErrorCode::ProviderUnavailable, detail, true),
+                                    AgentEvent::ActivityRecorded {
+                                        run_id: handle.run_id,
+                                        activity,
+                                    },
                                 );
-                                return;
                             }
                         }
-                    }
-                    AcpEvent::PromptFinished(result) => {
-                        if let Some(usage) = &result.usage {
-                            self.apply_acp_usage(handle, usage);
+                        AcpEvent::Plan(entries) => {
+                            let plan = map_acp_plan(&entries);
+                            {
+                                handle.locked_state().plan = plan.clone();
+                            }
+                            let _ = self.emit_acp_event(
+                                handle,
+                                AgentEvent::PlanProposed {
+                                    run_id: handle.run_id,
+                                    plan,
+                                },
+                            );
                         }
-                        if result.stop_reason == "cancelled"
-                            || handle.control.is_interrupt_requested()
-                        {
-                            let _ = self.cancel_acp_run(handle);
-                        } else {
-                            let _ = self.complete_acp_run(handle);
+                        AcpEvent::UsageUpdate(usage) => {
+                            self.apply_acp_usage(handle, &usage);
                         }
-                        return;
+                        AcpEvent::ModelsUpdated {
+                            models,
+                            current_model_id,
+                            model_config_option_id,
+                        } => {
+                            live.session.models = models.clone();
+                            if current_model_id.is_some() {
+                                live.session.current_model_id = current_model_id;
+                            }
+                            if model_config_option_id.is_some() {
+                                live.session.model_config_option_id = model_config_option_id;
+                            }
+                            self.sync_acp_session_backend(handle.session_id, live);
+                        }
+                        AcpEvent::StderrLine(line) => {
+                            self.record_acp_notice_activity(
+                                handle,
+                                "acp_stderr",
+                                redact_acp_text(&line),
+                                AgentActivityStatus::Completed,
+                            );
+                        }
+                        AcpEvent::PermissionRequest(req) => {
+                            let outcome = self.handle_acp_permission_request(
+                                handle,
+                                live,
+                                &acp_session_id,
+                                &req,
+                                config.permission_timeout,
+                                &mut buffered_events,
+                            );
+                            last_activity = Instant::now();
+                            match outcome {
+                                PermissionWaitResult::Answered => {}
+                                PermissionWaitResult::Cancelled => {
+                                    cancel_sent_at = Some(Instant::now());
+                                }
+                                PermissionWaitResult::HarnessExited { detail } => {
+                                    *live_guard = None;
+                                    entry.set_kill_handle(None);
+                                    let _ = self.fail_acp_run(
+                                        handle,
+                                        LoomError::new(
+                                            ErrorCode::ProviderUnavailable,
+                                            detail,
+                                            true,
+                                        ),
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                        AcpEvent::PromptFinished(result) => {
+                            if let Some(usage) = &result.usage {
+                                self.apply_acp_usage(handle, usage);
+                            }
+                            if result.stop_reason == "cancelled"
+                                || handle.control.is_interrupt_requested()
+                            {
+                                let _ = self.cancel_acp_run(handle);
+                            } else {
+                                let _ = self.complete_acp_run(handle);
+                            }
+                            return;
+                        }
+                        AcpEvent::PromptFailed { code, message, .. } => {
+                            if live.client.has_exited() {
+                                *live_guard = None;
+                                entry.set_kill_handle(None);
+                            }
+                            let _ = self.fail_acp_run(
+                                handle,
+                                LoomError::new(
+                                    ErrorCode::ProviderUnavailable,
+                                    format!(
+                                        "ACP prompt failed (code {code}): {}",
+                                        redact_acp_text(&message)
+                                    ),
+                                    false,
+                                ),
+                            );
+                            return;
+                        }
+                        AcpEvent::MessageChunk(_)
+                        | AcpEvent::ThoughtChunk(_)
+                        | AcpEvent::Other { .. } => {}
                     }
-                    AcpEvent::PromptFailed { code, message, .. } => {
-                        let _ = self.fail_acp_run(
-                            handle,
-                            LoomError::new(
-                                ErrorCode::ProviderUnavailable,
-                                format!("ACP prompt failed (code {code}): {message}"),
-                                false,
-                            ),
-                        );
-                        return;
-                    }
-                    AcpEvent::MessageChunk(_)
-                    | AcpEvent::ThoughtChunk(_)
-                    | AcpEvent::Other { .. } => {}
-                },
+                }
             }
         }
+    }
+
+    /// Collects prior transcript messages for labelled local recap when a fresh
+    /// ACP harness session is started without native `loadSession`/`resume`.
+    fn collect_prior_acp_messages(&self, handle: &Arc<RunHandle>) -> Vec<ModelMessage> {
+        let mut messages = {
+            let state = handle.locked_state();
+            // Exclude the current turn's newly appended user prompt at the tail.
+            if state.messages.len() > 1 {
+                state.messages[..state.messages.len() - 1].to_vec()
+            } else {
+                Vec::new()
+            }
+        };
+        if !messages.is_empty() {
+            return messages;
+        }
+        // If a brand-new RunId was started on an existing ACP session after a
+        // restart, check earlier persisted runs in this session.
+        if let Some(persistence) = self.persistence.as_ref()
+            && let Ok(persisted) = self.persisted_runs()
+        {
+            let mut prior_runs: Vec<(Timestamp, RunId)> = persisted
+                .iter()
+                .filter(|(run_id, summary)| {
+                    **run_id != handle.run_id && summary.snapshot.session_id == handle.session_id
+                })
+                .map(|(run_id, summary)| (summary.snapshot.started_at, *run_id))
+                .collect();
+            prior_runs.sort_by_key(|(started_at, _)| *started_at);
+            for (_, run_id) in prior_runs {
+                if let Ok(run_msgs) = persistence.load_run_messages(run_id) {
+                    messages.extend(crate::run_projection::persisted_run_messages(run_msgs));
+                }
+            }
+        }
+        messages
     }
 
     fn start_live_acp_session(
         self: &Arc<Self>,
         handle: &Arc<RunHandle>,
         spec: &AcpTurnSpec,
-    ) -> Result<LiveAcpSession> {
+    ) -> Result<(LiveAcpSession, bool)> {
         let prior_remote_session_id = self
             .sessions()
             .ok()
@@ -1122,9 +1422,9 @@ impl InProcessBackend {
                     .and_then(|acp| acp.remote_session_id.clone())
             });
 
-        let command_spec =
-            resolve_command_for_harness(&spec.harness, session_command_override(&spec.command))?;
-        let profile_dir = profile_dir_for_session(&self.session_root_base, handle.session_id);
+        let command_spec = self.resolve_acp_command(&spec.harness)?;
+        let profile_dir =
+            profile_dir_for_harness(&self.session_root_base, &spec.harness, spec.participant_id);
         let build_cache = self.build_cache_root();
         let mut client = AcpClient::spawn(&AcpOptions {
             command: command_spec.clone(),
@@ -1141,7 +1441,7 @@ impl InProcessBackend {
                 self.record_acp_notice_activity(
                     handle,
                     "acp_auth",
-                    line,
+                    redact_acp_text(&line),
                     AgentActivityStatus::Completed,
                 );
             }
@@ -1155,40 +1455,56 @@ impl InProcessBackend {
         )?;
 
         // Honest resume: only call session/load or session/resume when the
-        // harness explicitly advertised it. Otherwise start fresh without
-        // claiming replay.
-        let session = match prior_remote_session_id.as_deref() {
+        // harness explicitly advertised it. Otherwise start fresh and send a
+        // labelled local recap without claiming native harness replay.
+        let (session, needs_recap) = match prior_remote_session_id.as_deref() {
             Some(remote_id) if init.capabilities.load_session => {
                 match client.session_load(remote_id, &spec.cwd, HANDSHAKE_TIMEOUT) {
-                    Ok(loaded) => loaded,
+                    Ok(loaded) => {
+                        self.record_acp_notice_activity(
+                            handle,
+                            "acp_resume",
+                            format!("Resumed ACP harness session '{remote_id}' via session/load"),
+                            AgentActivityStatus::Completed,
+                        );
+                        (loaded, false)
+                    }
                     Err(error) => {
                         self.record_acp_notice_activity(
                             handle,
                             "acp_resume",
                             format!(
-                                "ACP session/load failed ({}); starting a new harness session without claiming replay",
-                                error.message
+                                "ACP session/load failed ({}); starting a new harness session with a labelled local recap (no native replay claimed)",
+                                redact_acp_text(&error.message)
                             ),
                             AgentActivityStatus::Completed,
                         );
-                        client.session_new(&spec.cwd, HANDSHAKE_TIMEOUT)?
+                        (client.session_new(&spec.cwd, HANDSHAKE_TIMEOUT)?, true)
                     }
                 }
             }
             Some(remote_id) if init.capabilities.resume_session => {
                 match client.session_resume(remote_id, &spec.cwd, HANDSHAKE_TIMEOUT) {
-                    Ok(resumed) => resumed,
+                    Ok(resumed) => {
+                        self.record_acp_notice_activity(
+                            handle,
+                            "acp_resume",
+                            format!("Resumed ACP harness session '{remote_id}' via session/resume"),
+                            AgentActivityStatus::Completed,
+                        );
+                        (resumed, false)
+                    }
                     Err(error) => {
                         self.record_acp_notice_activity(
                             handle,
                             "acp_resume",
                             format!(
-                                "ACP session/resume failed ({}); starting a new harness session without claiming replay",
-                                error.message
+                                "ACP session/resume failed ({}); starting a new harness session with a labelled local recap (no native replay claimed)",
+                                redact_acp_text(&error.message)
                             ),
                             AgentActivityStatus::Completed,
                         );
-                        client.session_new(&spec.cwd, HANDSHAKE_TIMEOUT)?
+                        (client.session_new(&spec.cwd, HANDSHAKE_TIMEOUT)?, true)
                     }
                 }
             }
@@ -1196,12 +1512,12 @@ impl InProcessBackend {
                 self.record_acp_notice_activity(
                     handle,
                     "acp_resume",
-                    "ACP harness does not advertise loadSession/resume; starting a new harness session (no conversation replay claimed)".to_owned(),
+                    "ACP harness does not advertise loadSession/resume; starting a new harness session with a labelled local recap (no native conversation replay claimed)".to_owned(),
                     AgentActivityStatus::Completed,
                 );
-                client.session_new(&spec.cwd, HANDSHAKE_TIMEOUT)?
+                (client.session_new(&spec.cwd, HANDSHAKE_TIMEOUT)?, true)
             }
-            None => client.session_new(&spec.cwd, HANDSHAKE_TIMEOUT)?,
+            None => (client.session_new(&spec.cwd, HANDSHAKE_TIMEOUT)?, false),
         };
 
         let live = LiveAcpSession {
@@ -1212,7 +1528,7 @@ impl InProcessBackend {
             auth_method,
         };
         self.sync_acp_session_backend(handle.session_id, &live);
-        Ok(live)
+        Ok((live, needs_recap))
     }
 
     fn sync_acp_session_backend(
@@ -1239,12 +1555,15 @@ impl InProcessBackend {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_acp_permission_request(
         self: &Arc<Self>,
         handle: &Arc<RunHandle>,
         live: &mut LiveAcpSession,
         acp_session_id: &str,
         req: &AcpPermissionRequest,
+        permission_timeout: Duration,
+        buffered_events: &mut VecDeque<AcpEvent>,
     ) -> PermissionWaitResult {
         let tool_call_id = ToolCallId::new();
         let interaction_id = InteractionId::new();
@@ -1351,7 +1670,37 @@ impl InProcessBackend {
             },
         );
 
+        let wait_started = Instant::now();
         loop {
+            // Drain harness events (stderr, unsupported client requests, exit)
+            // while waiting on operator approval so the bounded channel never
+            // backs up or misses an early exit.
+            loop {
+                match live.client.try_next_event() {
+                    AcpNext::Idle => break,
+                    AcpNext::Exited { stderr_tail, .. } => {
+                        let _ = self.acp_sessions.take_permission(handle.run_id);
+                        return PermissionWaitResult::HarnessExited {
+                            detail: format!(
+                                "ACP harness exited while waiting for permission: {}",
+                                redact_acp_text(stderr_tail.trim())
+                            ),
+                        };
+                    }
+                    AcpNext::Event(event) => match *event {
+                        AcpEvent::StderrLine(line) => {
+                            self.record_acp_notice_activity(
+                                handle,
+                                "acp_stderr",
+                                redact_acp_text(&line),
+                                AgentActivityStatus::Completed,
+                            );
+                        }
+                        other => buffered_events.push_back(other),
+                    },
+                }
+            }
+
             if handle.control.is_interrupt_requested() {
                 let _ = self.acp_sessions.take_permission(handle.run_id);
                 let _ = live
@@ -1370,12 +1719,71 @@ impl InProcessBackend {
                 );
                 return PermissionWaitResult::Cancelled;
             }
+            if wait_started.elapsed() >= permission_timeout {
+                let _ = self.acp_sessions.take_permission(handle.run_id);
+                let new_revision = {
+                    let mut state = handle.locked_state();
+                    state.run.control_revision = state.run.control_revision.saturating_add(1);
+                    state.pending_approval = None;
+                    if let Some(interaction) = state
+                        .interactions
+                        .iter_mut()
+                        .find(|item| item.id == interaction_id)
+                    {
+                        interaction.status = AgentInteractionStatus::Rejected;
+                        interaction.decision = Some(ApprovalDecision::Rejected);
+                        interaction.resolved_at = Some(Timestamp::now());
+                    }
+                    state.run.control_revision
+                };
+                let _ = self.emit_acp_event(
+                    handle,
+                    AgentEvent::ToolApprovalDecided {
+                        run_id: handle.run_id,
+                        attempt_id,
+                        control_revision: new_revision,
+                        interaction_id,
+                        tool_call_id,
+                        decision: ApprovalDecision::Rejected,
+                    },
+                );
+                let _ = self.emit_acp_event(
+                    handle,
+                    AgentEvent::RunStateChanged {
+                        run_id: handle.run_id,
+                        state: AgentRunState::Executing,
+                    },
+                );
+                let outcome = match req.reject_option_id() {
+                    Some(option_id) => AcpPermissionOutcome::Selected {
+                        option_id: option_id.to_owned(),
+                    },
+                    None => AcpPermissionOutcome::Cancelled,
+                };
+                let _ = live.client.respond_permission(&req.request_id, &outcome);
+                self.finish_permission_activity(
+                    handle,
+                    activity_id,
+                    timeline_ordinal,
+                    now,
+                    call,
+                    AgentActivityStatus::Failed,
+                    "permission prompt timed out",
+                    false,
+                );
+                return if matches!(outcome, AcpPermissionOutcome::Cancelled) {
+                    let _ = live.client.cancel_session(acp_session_id);
+                    PermissionWaitResult::Cancelled
+                } else {
+                    PermissionWaitResult::Answered
+                };
+            }
             if live.client.has_exited() {
                 let _ = self.acp_sessions.take_permission(handle.run_id);
                 return PermissionWaitResult::HarnessExited {
                     detail: format!(
                         "ACP harness exited while waiting for permission: {}",
-                        live.client.stderr_tail().trim()
+                        redact_acp_text(live.client.stderr_tail().trim())
                     ),
                 };
             }
@@ -1779,7 +2187,8 @@ impl InProcessBackend {
         self.emit_acp_event(handle, AgentEvent::RunCompleted { snapshot })
     }
 
-    fn fail_acp_run(self: &Arc<Self>, handle: &Arc<RunHandle>, error: LoomError) -> Result<()> {
+    fn fail_acp_run(self: &Arc<Self>, handle: &Arc<RunHandle>, mut error: LoomError) -> Result<()> {
+        error.message = redact_acp_text(&error.message);
         self.record_acp_notice_activity(
             handle,
             "acp_harness_error",

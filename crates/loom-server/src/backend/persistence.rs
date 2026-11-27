@@ -808,6 +808,9 @@ impl InProcessBackend {
                 settle_error.get_or_insert(error);
             }
         }
+        // Terminate any remaining idle or wedged ACP harness child processes so
+        // shutdown never leaves orphan `agy acp` children behind.
+        self.acp_sessions.shutdown_all();
         // A fail-stopped backend must not write more state, but shutdown still
         // has to release database ownership so a restart can reopen it.
         let persist_result = if self.persistence_failed.load(Ordering::SeqCst) {

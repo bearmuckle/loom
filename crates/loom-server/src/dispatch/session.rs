@@ -198,7 +198,7 @@ impl InProcessConnection {
                 let session = self.backend.sessions()?.get(session_id)?;
                 if session.is_antigravity()
                     && (auto_approve_actions == Some(true)
-                        || policy == ApprovalPolicy::auto_approve())
+                        || crate::acp_host::policy_allows_unattended_actions(&policy))
                 {
                     return Err(LoomError::invalid_request(
                         "Antigravity ACP backend is interactive-only: auto-approve mode is refused.",

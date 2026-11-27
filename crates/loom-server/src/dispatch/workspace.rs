@@ -75,7 +75,6 @@ impl InProcessConnection {
                 workspace_id,
                 name,
                 harness,
-                command,
                 auth_method,
                 interactive,
             }) => Ok(ServerResponse::Session(
@@ -83,7 +82,6 @@ impl InProcessConnection {
                     workspace_id,
                     name,
                     harness,
-                    command,
                     auth_method,
                     interactive,
                 )?),

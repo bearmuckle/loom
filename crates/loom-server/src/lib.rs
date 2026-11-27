@@ -431,6 +431,7 @@ pub struct InProcessBackend {
     persistence: Option<Arc<dyn Persistence>>,
     run_executor: RunExecutor,
     acp_sessions: acp_host::AcpSessionManager,
+    acp_config: Mutex<acp_host::AcpWorkerConfig>,
     session_root_base: PathBuf,
     /// Per-instance root for session build output. Present for a durable
     /// backend, absent for the in-memory one.

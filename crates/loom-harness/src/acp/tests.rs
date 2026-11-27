@@ -9,7 +9,8 @@ use serde_json::json;
 use super::{
     AcpAuthMethod, AcpEvent, AcpPermissionOption, AcpPermissionRequest, AntigravityRunContext,
     LOOM_ACP_CLIENT_NAME, LOOM_ACP_CLIENT_VERSION, antigravity_notices,
-    check_interactive_only_with_env, client, discover_antigravity_command, validate_auth_method,
+    check_interactive_only_with_env, client, discover_antigravity_command, redact_acp_text,
+    validate_auth_method,
 };
 
 #[test]
@@ -246,6 +247,85 @@ fn permission_request_selects_allow_and_reject_option_ids() {
     };
     assert_eq!(request.allow_option_id(), Some("allow-1"));
     assert_eq!(request.reject_option_id(), Some("deny-1"));
+
+    // R6: allow_option_id must NEVER pick allow_always or an arbitrary first option.
+    let allow_always_only = AcpPermissionRequest {
+        request_id: json!(2),
+        session_id: None,
+        tool_call_id: None,
+        title: "Run test".to_owned(),
+        kind: None,
+        raw_input: json!({}),
+        options: vec![
+            AcpPermissionOption {
+                option_id: "always-1".to_owned(),
+                name: "Always allow".to_owned(),
+                kind: "allow_always".to_owned(),
+            },
+            AcpPermissionOption {
+                option_id: "deny-1".to_owned(),
+                name: "Reject".to_owned(),
+                kind: "reject_once".to_owned(),
+            },
+        ],
+    };
+    assert_eq!(allow_always_only.allow_option_id(), None);
+    assert_eq!(allow_always_only.reject_option_id(), Some("deny-1"));
+
+    let reject_only = AcpPermissionRequest {
+        request_id: json!(3),
+        session_id: None,
+        tool_call_id: None,
+        title: "Run test".to_owned(),
+        kind: None,
+        raw_input: json!({}),
+        options: vec![AcpPermissionOption {
+            option_id: "deny-1".to_owned(),
+            name: "Reject".to_owned(),
+            kind: "reject_once".to_owned(),
+        }],
+    };
+    assert_eq!(reject_only.allow_option_id(), None);
+}
+
+#[test]
+fn command_override_display_never_includes_raw_args_or_env_assignments() {
+    let spec = discover_antigravity_command(
+        Some("env SECRET_KEY=topsecret /opt/tools/agy-wrapper --flag=value"),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(spec.display, "env");
+    assert!(!spec.display.contains("SECRET_KEY"));
+    assert!(!spec.display.contains("topsecret"));
+    assert!(!spec.display.contains("--flag"));
+
+    let agy_spec =
+        discover_antigravity_command(Some("/usr/local/bin/agy acp --custom"), None, None).unwrap();
+    assert_eq!(agy_spec.display, "agy acp");
+    assert!(!agy_spec.display.contains("--custom"));
+}
+
+#[test]
+fn stderr_redactor_masks_google_keys_oauth_tokens_and_query_secrets() {
+    let raw = "Error: Bearer ya29.a0AfH6SM_secret_tok key=AIzaSyD1234567890abcdef1234567890 \
+               https://accounts.google.com/o/oauth2/v2/auth?client_id=public123&code=4/0AX_secret&access_token=tok_abc&refresh_token=ref_def \
+               GEMINI_API_KEY=AIzaSyAnotherKey9876543210";
+    let redacted = redact_acp_text(raw);
+    assert!(!redacted.contains("ya29.a0AfH6SM_secret_tok"));
+    assert!(!redacted.contains("AIzaSyD1234567890abcdef1234567890"));
+    assert!(!redacted.contains("4/0AX_secret"));
+    assert!(!redacted.contains("tok_abc"));
+    assert!(!redacted.contains("ref_def"));
+    assert!(!redacted.contains("AIzaSyAnotherKey9876543210"));
+    // Non-secret login URL prefix and client_id stay readable for the operator.
+    assert!(redacted.contains("https://accounts.google.com/o/oauth2/v2/auth?client_id=public123"));
+    assert!(redacted.contains("Bearer [REDACTED]"));
+    assert!(redacted.contains("code=[REDACTED]"));
+    assert!(redacted.contains("access_token=[REDACTED]"));
+    assert!(redacted.contains("refresh_token=[REDACTED]"));
+    assert!(redacted.contains("GEMINI_API_KEY=[REDACTED]"));
 }
 
 #[test]

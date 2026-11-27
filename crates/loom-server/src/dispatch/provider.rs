@@ -160,9 +160,8 @@ impl InProcessConnection {
             }
             ClientRequest::Provider(ProviderRequest::ProbeAcpHarness {
                 harness,
-                command,
                 auth_method,
-            }) => self.probe_acp_harness(harness, command, auth_method),
+            }) => self.probe_acp_harness(harness, auth_method),
             _ => unreachable!("request was routed to the wrong dispatch domain"),
         }
     }

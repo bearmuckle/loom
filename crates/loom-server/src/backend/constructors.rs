@@ -388,6 +388,7 @@ impl InProcessBackend {
             persistence,
             run_executor: RunExecutor::with_defaults(),
             acp_sessions: acp_host::AcpSessionManager::default(),
+            acp_config: Mutex::new(acp_host::AcpWorkerConfig::default()),
             session_root_base,
             build_cache_base,
             build_cache_retention,

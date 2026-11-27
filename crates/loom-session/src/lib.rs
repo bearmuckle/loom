@@ -437,6 +437,12 @@ impl SessionManager {
                 "forked agent session name must not be empty",
             ));
         }
+        let mut forked_backend = source.backend;
+        if let Some(SessionBackendDescriptor::Acp(ref mut acp)) = forked_backend {
+            // A forked session starts its own harness conversation rather than
+            // mutating the parent session's remote ACP session id.
+            acp.remote_session_id = None;
+        }
         let now = Timestamp::now();
         let snapshot = AgentSessionSnapshot {
             id,
@@ -447,7 +453,7 @@ impl SessionManager {
             created_at: now,
             updated_at: now,
             title_source: SessionTitleSource::Auto,
-            backend: source.backend,
+            backend: forked_backend,
         };
         self.sessions.insert(snapshot.id, snapshot.clone());
         let record = self.record(

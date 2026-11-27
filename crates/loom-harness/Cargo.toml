@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+test-support = []
+
 [[test]]
 name = "acp_host"
 harness = false
@@ -15,3 +18,6 @@ loom-core.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+loom-harness = { path = ".", features = ["test-support"] }

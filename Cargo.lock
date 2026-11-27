@@ -4683,6 +4683,7 @@ version = "0.1.0"
 dependencies = [
  "log",
  "loom-core",
+ "loom-harness",
  "serde",
  "serde_json",
 ]

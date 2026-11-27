@@ -758,7 +758,7 @@ fn session_snapshot_request_targets_its_session() {
         session_id_for_request(
             &ClientRequest::Session(SessionRequest::GetAgentSessionSnapshot {
                 activity_detail: loom_protocol::ActivityDetail::Full,
-                session_id,
+                session_id
             }),
             AgentSessionId::new()
         ),
