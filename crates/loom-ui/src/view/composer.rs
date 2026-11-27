@@ -74,10 +74,11 @@ impl LoomView {
         let Some(input) = self.composer_input.clone() else {
             return;
         };
-        if input.read(cx).focus_handle(cx).is_focused(window) && window.default_prevented() {
-            return;
+        if !input.read(cx).focus_handle(cx).is_focused(window) {
+            self.focus_composer(window, cx);
+        } else if !window.default_prevented() {
+            window.request_virtual_keyboard();
         }
-        self.focus_composer(window, cx);
     }
 
     pub(crate) fn run_slash_command(&mut self, text: &str, cx: &mut Context<Self>) {

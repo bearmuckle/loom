@@ -74,12 +74,25 @@ fn phone_touch_tap_on_composer_padding_and_text_focuses_composer(cx: &mut TestAp
         });
         window.input("pad ", cx);
 
+        // Tapping the wrapper padding again while already focused keeps focus
+        // and exercises the keyboard re-request path without re-focusing.
+        touch_tap_at(
+            window,
+            2,
+            point(bounds.origin.x + px(4.), bounds.origin.y + px(4.)),
+            cx,
+        );
+        view.update(cx, |view, cx| {
+            let input = view.composer_input.clone().expect("composer input");
+            assert!(input.read(cx).focus_handle(cx).is_focused(window));
+        });
+
         // Blur again and tap directly on the inner `Textarea`.
         view.update(cx, |view, cx| {
             view.composer_focus_handle.focus(window, cx);
         });
         window.render_frame(cx);
-        touch_tap_at(window, 2, bounds.center(), cx);
+        touch_tap_at(window, 3, bounds.center(), cx);
         assert!(window.last_input_was_touch());
         view.update(cx, |view, cx| {
             let input = view.composer_input.clone().expect("composer input");
