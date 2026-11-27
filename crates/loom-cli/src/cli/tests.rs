@@ -4764,6 +4764,29 @@ fn help_short_circuits_parsing_whatever_else_is_given() {
 }
 
 #[test]
+fn help_shaped_values_are_not_treated_as_help() {
+    let workspace = "11111111-1111-4111-8111-111111111111";
+    assert!(matches!(
+        parse(&["run", "--workspace", workspace, "--task", "-h"]),
+        Ok(Parsed::Run(_))
+    ));
+    assert!(matches!(
+        parse(&["run", "--workspace", workspace, "--task", "--help"]),
+        Ok(Parsed::Run(_))
+    ));
+    assert!(matches!(
+        parse(&["run", "--workspace", workspace, "--task=-h"]),
+        Ok(Parsed::Run(_))
+    ));
+    match parse(&["status", "--session", "-abc"]) {
+        Ok(Parsed::Run(_)) => {}
+        Ok(Parsed::Help(_)) => panic!("status --session -abc was parsed as help"),
+        Err(error) => panic!("status --session -abc was rejected: {error}"),
+    }
+    assert!(matches!(parse(&["run", "--help"]), Ok(Parsed::Help(_))));
+}
+
+#[test]
 fn a_verb_help_page_prints_its_own_usage_and_examples() {
     let fixture = fixture();
     let mut client = InProcessClient::new(&fixture.backend);

@@ -4,21 +4,43 @@ use std::{
     fmt,
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
 
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+use tokio::sync::Semaphore;
+
+/// The default cap on JSON-RPC requests processed at once.
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 64;
+/// The default wall-clock bound for one JSON-RPC request.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// The default largest accepted JSON-RPC batch.
+pub const DEFAULT_MAX_BATCH_REQUESTS: usize = 32;
 
 /// A bearer secret that never appears in a `Debug` representation.
+///
+/// The raw value is kept so it can be presented to the worker, while
+/// authentication against a caller compares only SHA-256 digests, exactly like
+/// the worker's own token store.
 #[derive(Clone)]
-pub struct Secret(String);
+pub struct Secret {
+    value: String,
+    digest: [u8; 32],
+}
 
 impl Secret {
-    pub fn new(value: String) -> Self {
-        Self(value)
+    pub fn new(value: String) -> Result<Self, String> {
+        if value.trim().is_empty() {
+            return Err("the operator token must not be empty".to_owned());
+        }
+        let digest: [u8; 32] = Sha256::digest(value.as_bytes()).into();
+        Ok(Self { value, digest })
     }
 
     pub fn expose(&self) -> &str {
-        &self.0
+        &self.value
     }
 }
 
@@ -54,8 +76,14 @@ pub struct Config {
     pub bind: SocketAddr,
     /// TLS material for the MCP listener; both present or both absent.
     pub tls: Option<TlsConfig>,
-    /// Expose only read tools; mutating tools are rejected.
+    /// Expose only read tools; mutating tools are rejected. This is the
+    /// default unless `--allow-mutating-tools` is given.
     pub read_only: bool,
+    /// Opt in to exposing the mutating tools.
+    pub allow_mutating: bool,
+    /// Extra hostnames (without a port) accepted in `Host` and `Origin`
+    /// headers, in addition to the bind address and loopback aliases.
+    pub allowed_hosts: Vec<String>,
 }
 
 impl fmt::Debug for Config {
@@ -70,26 +98,47 @@ impl fmt::Debug for Config {
             .field("bind", &self.bind)
             .field("tls", &self.tls)
             .field("read_only", &self.read_only)
+            .field("allow_mutating", &self.allow_mutating)
+            .field("allowed_hosts", &self.allowed_hosts)
             .finish()
     }
 }
 
 impl Config {
-    /// Whether a presented bearer token matches the operator token, compared in
-    /// constant time so the secret is not leaked through timing.
+    /// Whether a presented bearer token matches the operator token, compared as
+    /// SHA-256 digests in constant time so neither the token nor its length is
+    /// leaked through timing.
     pub fn authenticates(&self, presented: &str) -> bool {
-        let expected = self.token.expose().as_bytes();
-        let presented = presented.as_bytes();
-        if expected.len() != presented.len() {
-            return false;
+        let presented: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
+        bool::from(self.token.digest.ct_eq(&presented))
+    }
+}
+
+/// Per-transport resource limits shared by every HTTP handler.
+#[derive(Clone)]
+pub struct HttpLimits {
+    /// The semaphore capping concurrent JSON-RPC requests.
+    pub concurrent: Arc<Semaphore>,
+    /// The wall-clock bound for one JSON-RPC request.
+    pub request_timeout: Duration,
+    /// The largest accepted JSON-RPC batch.
+    pub max_batch_requests: usize,
+}
+
+impl Default for HttpLimits {
+    fn default() -> Self {
+        Self {
+            concurrent: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_REQUESTS)),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            max_batch_requests: DEFAULT_MAX_BATCH_REQUESTS,
         }
-        bool::from(expected.ct_eq(presented))
     }
 }
 
 /// The state shared by every handler in one server.
 pub struct AppState {
     pub config: Config,
+    pub limits: HttpLimits,
 }
 
 /// Validates that a non-loopback bind is only served with TLS or an explicit
@@ -116,6 +165,42 @@ pub fn validate_bind(config: &Config) -> Result<(), String> {
          overlay",
         config.bind
     ))
+}
+
+/// The hostnames the HTTP transport accepts in `Host` and `Origin` headers.
+///
+/// The bind address and, for a loopback bind, its localhost aliases are always
+/// allowed; `--allowed-host` adds the hostnames a TLS reverse proxy or overlay
+/// presents. Every value is normalized to lower case without brackets or a
+/// trailing dot.
+pub fn allowed_hosts(config: &Config) -> Vec<String> {
+    let mut hosts = config
+        .allowed_hosts
+        .iter()
+        .map(|host| normalize_host(host))
+        .collect::<Vec<_>>();
+    let ip = config.bind.ip();
+    if ip.is_loopback() {
+        hosts.extend([
+            "127.0.0.1".to_owned(),
+            "localhost".to_owned(),
+            "::1".to_owned(),
+        ]);
+    } else if !ip.is_unspecified() {
+        hosts.push(ip.to_string());
+    }
+    hosts.sort();
+    hosts.dedup();
+    hosts
+}
+
+/// Normalizes a `Host`/`Origin` host for comparison: lower case, no IPv6
+/// brackets, and no trailing dot.
+pub fn normalize_host(host: &str) -> String {
+    host.trim()
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
 }
 
 /// Reads the TLS material and builds the rustls server configuration the MCP
@@ -182,13 +267,15 @@ mod tests {
     fn config(bind: SocketAddr, tls: Option<TlsConfig>, allow_insecure_remote: bool) -> Config {
         Config {
             connect: "ws://127.0.0.1:1/ws".to_owned(),
-            token: Secret::new("operator-secret".to_owned()),
+            token: Secret::new("operator-secret".to_owned()).unwrap(),
             ca_file: None,
             allow_insecure_remote,
             max_frame_bytes: None,
             bind,
             tls,
             read_only: false,
+            allow_mutating: false,
+            allowed_hosts: Vec::new(),
         }
     }
 
@@ -230,5 +317,28 @@ mod tests {
         let debug = format!("{:?}", config);
         assert!(!debug.contains("operator-secret"), "{debug}");
         assert!(debug.contains("<redacted>"), "{debug}");
+    }
+
+    #[test]
+    fn an_empty_or_blank_token_is_rejected_at_construction() {
+        assert!(Secret::new(String::new()).is_err());
+        assert!(Secret::new("  \n".to_owned()).is_err());
+        assert!(Secret::new("operator-secret".to_owned()).is_ok());
+    }
+
+    #[test]
+    fn allowed_hosts_derive_from_the_bind_and_explicit_hosts() {
+        let loopback: SocketAddr = "127.0.0.1:8766".parse().unwrap();
+        let mut loopback_config = config(loopback, None, false);
+        loopback_config.allowed_hosts = vec!["Example.COM.".to_owned(), "[::1]".to_owned()];
+        let hosts = allowed_hosts(&loopback_config);
+        assert!(hosts.contains(&"127.0.0.1".to_owned()));
+        assert!(hosts.contains(&"localhost".to_owned()));
+        assert!(hosts.contains(&"::1".to_owned()));
+        assert!(hosts.contains(&"example.com".to_owned()));
+
+        let tailnet: SocketAddr = "100.64.0.1:8766".parse().unwrap();
+        let tailnet = config(tailnet, None, true);
+        assert_eq!(allowed_hosts(&tailnet), vec!["100.64.0.1".to_owned()]);
     }
 }

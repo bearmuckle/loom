@@ -12,6 +12,7 @@ path = "src/bin/loom-mcp.rs"
 
 [dependencies]
 loom-cli.workspace = true
+loom-core.workspace = true
 axum.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
@@ -22,6 +23,7 @@ serde_json.workspace = true
 log.workspace = true
 env_logger.workspace = true
 subtle.workspace = true
+sha2.workspace = true
 
 # The tests drive the verbs against a real in-process worker served over the
 # WebSocket transport, then exercise the streamable HTTP endpoint end to end.

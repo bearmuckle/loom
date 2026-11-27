@@ -5,7 +5,7 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use loom_cli::cli::{resolve_connect_from_env, resolve_token_file_from_env};
-use loom_mcp::{AppState, Config, Secret, TlsConfig, config::read_token};
+use loom_mcp::{AppState, Config, HttpLimits, Secret, TlsConfig, config::read_token};
 
 /// The bind address used when `--bind` is not supplied.
 const DEFAULT_BIND: &str = "127.0.0.1:8766";
@@ -40,6 +40,8 @@ struct Options {
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     read_only: bool,
+    allow_mutating: bool,
+    allowed_hosts: Vec<String>,
     stdio: bool,
 }
 
@@ -55,6 +57,8 @@ impl Default for Options {
             tls_cert: None,
             tls_key: None,
             read_only: false,
+            allow_mutating: false,
+            allowed_hosts: Vec::new(),
             stdio: false,
         }
     }
@@ -101,6 +105,10 @@ where
             }
             "--allow-insecure-remote" => options.allow_insecure_remote = true,
             "--read-only" => options.read_only = true,
+            "--allow-mutating-tools" => options.allow_mutating = true,
+            "--allowed-host" => options
+                .allowed_hosts
+                .push(required_value(&mut args, "--allowed-host")?),
             "--stdio" => options.stdio = true,
             "--help" | "-h" => return Ok(Parsed::Help),
             "--version" | "-V" => return Ok(Parsed::Version),
@@ -125,6 +133,11 @@ where
             }
             value if value.starts_with("--tls-key=") => {
                 options.tls_key = Some(PathBuf::from(&value["--tls-key=".len()..]));
+            }
+            value if value.starts_with("--allowed-host=") => {
+                options
+                    .allowed_hosts
+                    .push(value["--allowed-host=".len()..].to_owned());
             }
             unknown => {
                 return Err(format!(
@@ -190,16 +203,19 @@ fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), String> {
         }
     };
     let read_only = options.read_only;
+    let allow_mutating = options.allow_mutating;
     let tls_configured = tls.is_some();
     let config = Config {
         connect: connect.clone(),
-        token: Secret::new(token),
+        token: Secret::new(token)?,
         ca_file: options.ca_file,
         allow_insecure_remote: options.allow_insecure_remote,
         max_frame_bytes: options.max_frame_bytes,
         bind: options.bind,
         tls,
         read_only,
+        allow_mutating,
+        allowed_hosts: options.allowed_hosts,
     };
 
     if options.stdio {
@@ -207,11 +223,20 @@ fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), String> {
             .enable_all()
             .build()
             .map_err(|error| format!("could not start the async runtime: {error}"))?;
-        let state = Arc::new(AppState { config });
+        let state = Arc::new(AppState {
+            config,
+            limits: HttpLimits::default(),
+        });
         log::info!(
             "loom-mcp serving stdio for worker {}{}",
             connect,
-            if read_only { " in read-only mode" } else { "" }
+            if read_only {
+                " in read-only mode"
+            } else if allow_mutating {
+                " with mutating tools enabled"
+            } else {
+                ""
+            }
         );
         return runtime.block_on(loom_mcp::stdio::serve(state));
     }
@@ -231,10 +256,23 @@ fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), String> {
                 " (http)"
             },
             connect,
-            if read_only { " in read-only mode" } else { "" },
+            if read_only {
+                " in read-only mode"
+            } else if allow_mutating {
+                " with mutating tools enabled"
+            } else {
+                ""
+            },
         );
-        tokio::signal::ctrl_c().await.ok();
-        running.task.abort();
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|error| format!("could not install the SIGTERM handler: {error}"))?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+        running.shutdown();
+        let _ = running.task.await;
         Ok(())
     })
 }
@@ -242,7 +280,8 @@ fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), String> {
 fn help_text() -> String {
     "Usage: loom-mcp [--connect <url>] [--token-file <path>] [--ca-file <pem>] \
      [--max-frame-bytes <bytes>] [--bind <addr>] [--tls-cert <pem> --tls-key <pem>] \
-     [--allow-insecure-remote] [--read-only] [--stdio]\n\
+     [--allow-insecure-remote] [--allowed-host <host>]... [--read-only] \
+     [--allow-mutating-tools] [--stdio]\n\
      \n\
      An MCP server that mirrors loom-cli over streamable HTTP (the default) or\n\
      stdio. It is a client of the existing worker WebSocket protocol, not a\n\
@@ -261,8 +300,13 @@ fn help_text() -> String {
      \x20 --bind <addr>           MCP listen address (default 127.0.0.1:8766)\n\
      \x20 --tls-cert <pem>        serve the MCP listener over HTTPS with this chain\n\
      \x20 --tls-key <pem>         PEM private key matching --tls-cert\n\
+     \x20 --allowed-host <host>   also accept this hostname in Host/Origin headers;\n\
+     \x20                        repeatable, and the bind address plus localhost are\n\
+     \x20                        always accepted\n\
      \x20 --read-only             expose only the read tools (ls, status, models,\n\
      \x20                        providers, and the log resources)\n\
+     \x20 --allow-mutating-tools  opt in to the mutating tools (run, send, approve,\n\
+     \x20                        deny, archive); off by default\n\
      \x20 --stdio                 serve newline-delimited JSON-RPC on stdio instead of\n\
      \x20                        HTTP\n\
      \x20 -h, --help              print this help and exit\n\
