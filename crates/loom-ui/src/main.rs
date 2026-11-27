@@ -33,7 +33,7 @@ use crate::{browser::BrowserOptions, view::LoomView};
 use gpui_kit::{App, prelude::*};
 #[cfg(not(target_family = "wasm"))]
 use gpui_kit::{
-    Bounds, TitlebarOptions, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    Bounds, Pixels, TitlebarOptions, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
     WindowDecorations, WindowOptions, point, px, size,
 };
 #[cfg(not(target_family = "wasm"))]
@@ -64,6 +64,35 @@ pub(crate) const MAX_TIMELINE_OUTPUT: usize = 32 * 1024;
 pub(crate) const MAX_REVIEW_CHANGES: usize = 80;
 pub(crate) const MAX_REVIEW_DIFF: usize = 48 * 1024;
 
+/// Wayland `app_id` and X11 `WM_CLASS` published by the native window.
+///
+/// Matches `StartupWMClass=loom-ui` in `packaging/loom.desktop` so compositors,
+/// window rules, and taskbars identify the running client reliably.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) const NATIVE_APP_ID: &str = "loom-ui";
+
+#[cfg(not(target_family = "wasm"))]
+fn native_window_options(bounds: Bounds<Pixels>) -> WindowOptions {
+    WindowOptions {
+        app_id: Some(NATIVE_APP_ID.to_owned()),
+        focus: true,
+        titlebar: Some(TitlebarOptions {
+            title: None,
+            appears_transparent: true,
+            traffic_light_position: Some(point(px(9.), px(9.))),
+        }),
+        app_owns_titlebar_drag: true,
+        window_background: WindowBackgroundAppearance::Transparent,
+        window_decorations: Some(WindowDecorations::Client),
+        is_movable: true,
+        is_resizable: true,
+        is_minimizable: true,
+        window_min_size: Some(size(px(720.), px(480.))),
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        ..Default::default()
+    }
+}
+
 #[cfg(not(target_family = "wasm"))]
 fn main() {
     init_logging();
@@ -90,6 +119,7 @@ fn main() {
         .run(move |cx: &mut App| {
             info!("initializing GPUI components");
             gpui_kit::init(cx);
+            cx.set_app_identity(NATIVE_APP_ID, "Loom");
             crate::theme::apply_theme(WindowAppearance::Dark, cx);
             let view = match LoomView::try_new(&options, cx.focus_handle()) {
                 Ok(view) => view,
@@ -109,23 +139,7 @@ fn main() {
 
             let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
             let window = match cx.open_window(
-                WindowOptions {
-                    focus: true,
-                    titlebar: Some(TitlebarOptions {
-                        title: None,
-                        appears_transparent: true,
-                        traffic_light_position: Some(point(px(9.), px(9.))),
-                    }),
-                    app_owns_titlebar_drag: true,
-                    window_background: WindowBackgroundAppearance::Transparent,
-                    window_decorations: Some(WindowDecorations::Client),
-                    is_movable: true,
-                    is_resizable: true,
-                    is_minimizable: true,
-                    window_min_size: Some(size(px(720.), px(480.))),
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    ..Default::default()
-                },
+                native_window_options(bounds),
                 // The component `Root` hosts the per-window `WindowState` that
                 // dialogs and inputs require. gpui-component's `window_border` is
                 // solely responsible for client-side window chrome, so Loom does
@@ -354,5 +368,30 @@ mod tests {
         ttf_parser::Face::parse(bytes, 0)
             .map(|face| face.glyph_index(character).is_some())
             .unwrap_or(false)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn native_window_options_carry_desktop_app_id() {
+        let bounds = super::Bounds {
+            origin: super::point(super::px(0.), super::px(0.)),
+            size: super::size(super::px(1200.), super::px(780.)),
+        };
+        let options = super::native_window_options(bounds);
+        assert_eq!(options.app_id.as_deref(), Some(super::NATIVE_APP_ID));
+        assert_eq!(super::NATIVE_APP_ID, "loom-ui");
+
+        let desktop_entry = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/loom.desktop"),
+        )
+        .expect("read shipped desktop entry");
+        let startup_wm_class = desktop_entry
+            .lines()
+            .find_map(|line| line.strip_prefix("StartupWMClass="));
+        assert_eq!(
+            startup_wm_class,
+            options.app_id.as_deref(),
+            "native WindowOptions.app_id must match StartupWMClass in packaging/loom.desktop"
+        );
     }
 }

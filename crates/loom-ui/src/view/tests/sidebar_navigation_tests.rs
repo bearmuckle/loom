@@ -6,10 +6,11 @@ use super::{
 };
 use crate::theme::BASE_FONT_SIZE;
 use gpui_kit::component::Root;
-use gpui_kit::test::TestWindowExt as _;
+use gpui_kit::test::{TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::{AppContext, Entity, TestAppContext, WindowHandle, point, px, size};
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
 
 /// Opens a 1280x800 window over a configured view and returns both.
 #[allow(clippy::type_complexity)]
@@ -714,4 +715,178 @@ fn the_pane_project_name_ignores_the_larger_default_base() {
     // The phone row is already pinned in pixels, so it needs no adjustment.
     assert_eq!(phone.project_row_font_size().0, phone.nav_row_font_size().0);
     assert!(phone.project_row_font_size().0 > desktop.project_row_font_size().0);
+}
+
+/// Every icon-only action in the projects header and session header must expose
+/// both an AccessKit label and a tooltip description, and Archive must be
+/// spatially and visually separated from New in both headers.
+#[gpui_kit::test]
+fn header_toolbar_actions_have_accessible_names_and_separate_archive_from_new(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_kit::init);
+    let (handle, _) = open_view_window(cx, |_| {});
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+
+        for (id, expected) in [
+            ("new-session", "New project"),
+            ("archived-sessions", "Archived sessions"),
+            ("settings-button", "Settings"),
+            ("new-sub-project", "New sub project"),
+            ("session-sources", "Session sources"),
+            ("archive-project", "Archive project"),
+            ("toggle-review-sidebar", "Toggle side panel"),
+        ] {
+            let button = window.find(id);
+            assert!(button.visible(), "{id} should be visible");
+            assert_eq!(
+                button.label(),
+                Some(expected),
+                "{id} must expose its AccessKit label"
+            );
+            assert_eq!(
+                window.find_by_label(expected).bounds(),
+                button.bounds(),
+                "{id} must be queryable by its AccessKit name {expected:?}"
+            );
+            assert_eq!(
+                button.description(),
+                Some(expected),
+                "{id} must expose its tooltip description"
+            );
+            let bounds = button.bounds();
+            assert_eq!(bounds.size.width, bounds.size.height, "{id} stays square");
+            assert!(
+                bounds.size.width >= px(32.),
+                "{id} keeps a usable hit target: {bounds:?}"
+            );
+        }
+
+        // Project header: New sits beside the Projects heading while Archived
+        // sessions and Settings sit on the trailing edge.
+        let new_project = window.find("new-session").bounds();
+        let archived = window.find("archived-sessions").bounds();
+        let settings = window.find("settings-button").bounds();
+        assert!(
+            archived.left() - new_project.right() > px(16.),
+            "New project ({new_project:?}) must be spatially separated from Archived sessions ({archived:?})"
+        );
+        assert!(archived.right() <= settings.left());
+
+        // Session header: New sub project and Session sources precede a
+        // separator, followed by Archive project, another separator, and the
+        // side-panel toggle.
+        let new_sub = window.find("new-sub-project").bounds();
+        let sources = window.find("session-sources").bounds();
+        let archive_sep = window.find("session-header-archive-separator").bounds();
+        let archive_project = window.find("archive-project").bounds();
+        let panel_sep = window.find("session-header-panel-separator").bounds();
+        let toggle_panel = window.find("toggle-review-sidebar").bounds();
+        assert!(new_sub.right() <= sources.left());
+        assert!(sources.right() <= archive_sep.left());
+        assert!(archive_sep.right() <= archive_project.left());
+        assert!(archive_project.right() <= panel_sep.left());
+        assert!(panel_sep.right() <= toggle_panel.left());
+        assert!(
+            archive_project.left() - new_sub.right() >= sources.size.width,
+            "Archive project ({archive_project:?}) must not sit next to New sub project ({new_sub:?})"
+        );
+        assert!(toggle_panel.right() <= window.viewport_size().width);
+    })
+    .unwrap();
+}
+
+/// On a phone viewport the session header keeps all four actions (including the
+/// separated archive button) inside the viewport at finger-sized hit targets.
+#[gpui_kit::test]
+fn session_header_actions_fit_at_phone_width_with_archive_separated(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(390.), px(844.)), |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.active_session.name = "A long project name that truncates cleanly".to_owned();
+            view.sessions = vec![view.active_session.clone()];
+            let session_id = view.active_session.id;
+            view.session_node_ids
+                .insert(session_id, view.default_backend_node_id.clone());
+            view
+        });
+        Root::new(view, window, cx)
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let viewport = window.viewport_size();
+        let mut previous_right = px(0.);
+        for id in [
+            "new-sub-project",
+            "session-sources",
+            "archive-project",
+            "toggle-review-sidebar",
+        ] {
+            let button = window.find(id);
+            assert!(button.visible(), "{id} must be visible on phone");
+            let bounds = button.bounds();
+            assert_eq!(bounds.size.width, px(44.), "{id} phone width: {bounds:?}");
+            assert_eq!(bounds.size.height, px(44.), "{id} phone height: {bounds:?}");
+            assert!(
+                bounds.right() <= viewport.width,
+                "{id} overflowed phone viewport: {bounds:?}"
+            );
+            assert!(bounds.left() >= previous_right);
+            previous_right = bounds.right();
+        }
+        let new_sub = window.find("new-sub-project").bounds();
+        let archive_project = window.find("archive-project").bounds();
+        assert!(archive_project.left() - new_sub.right() >= px(44.));
+    })
+    .unwrap();
+}
+
+/// Hovering each icon-only toolbar action shows its managed tooltip after the
+/// hover delay and hides it once the pointer leaves.
+#[gpui_kit::test]
+fn header_toolbar_buttons_show_tooltips_on_hover(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let (handle, _) = open_view_window(cx, |_| {});
+    for id in [
+        "new-session",
+        "archived-sessions",
+        "settings-button",
+        "new-sub-project",
+        "session-sources",
+        "archive-project",
+        "toggle-review-sidebar",
+    ] {
+        let quads_immediately_after_hover = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                window.hover(id, cx);
+                window.painted_quads().len()
+            })
+            .unwrap();
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.run_until_parked();
+        let quads_with_tooltip = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                window.painted_quads().len()
+            })
+            .unwrap();
+        assert!(
+            quads_with_tooltip > quads_immediately_after_hover,
+            "hovering {id} should paint a tooltip after the show delay ({quads_with_tooltip} <= {quads_immediately_after_hover})"
+        );
+        // Move the pointer off the toolbar and wait out the grace period so the
+        // next button starts from a clean hover-delay cycle.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.hover("window-titlebar", cx);
+        })
+        .unwrap();
+        cx.executor().advance_clock(Duration::from_millis(400));
+        cx.run_until_parked();
+    }
 }
