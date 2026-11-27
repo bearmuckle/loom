@@ -67,15 +67,37 @@ impl LoomView {
         cx.notify();
     }
 
-    /// Archives the project on screen, when the conversation is the project
-    /// itself and not a delegated agent of it.
+    /// Whether `session_id` is a listed project root that the header may
+    /// archive (never a delegated agent inside a project).
+    pub(crate) fn can_archive_project_session(&self, session_id: AgentSessionId) -> bool {
+        if !self.sessions.iter().any(|session| session.id == session_id) {
+            return false;
+        }
+        !self
+            .project_snapshot
+            .iter()
+            .chain(self.project_tree_snapshots.iter())
+            .any(|project| {
+                project.root_session_id != session_id
+                    && project
+                        .agents
+                        .iter()
+                        .any(|agent| agent.session_id == session_id)
+            })
+    }
+
+    /// Archives `project_session_id` when it is a listed project root and not a
+    /// delegated agent inside a project.
     ///
-    /// The archive is the same durable transition the project's own menu
-    /// performs: the backend archives the tree, the client drops it from the
-    /// list, and retention decides when its history is discarded.
-    pub(crate) fn archive_header_project(&mut self, cx: &mut Context<Self>) {
-        let project_session_id = self.header_project_session_id();
-        if !self.has_header_archive() {
+    /// The target session is passed explicitly so confirming an open header
+    /// popover can never archive a different project if the active selection
+    /// changed in the meantime.
+    pub(crate) fn archive_header_project(
+        &mut self,
+        project_session_id: AgentSessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_archive_project_session(project_session_id) {
             self.record_status("No project to archive");
             cx.notify();
             return;
